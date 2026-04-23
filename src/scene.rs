@@ -10,14 +10,18 @@ use bevy::{
 use crate::{
     character::{CharacterCatalog, CharacterDefinition, load_character_catalog},
     effect::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
-    script::{BatchSubmissionItem, BatchSubmitMode, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse, spawn_script_runtime},
+    script::{
+        BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
+        ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse,
+        spawn_script_runtime,
+    },
     storage::{
         SaveSlotSummary, StorageError, UserSettings, list_save_slots, load_save_data,
         read_user_settings, write_user_settings,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
-        SceneSnapshot, SpriteSnapshot, StoredValue, UiStylePatch,
+        SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot, UiStylePatch,
     },
     transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
@@ -109,17 +113,61 @@ pub struct StageState {
     pub transition: Option<Entity>,
     pub screen_effect: Option<Entity>,
     pub sprites: HashMap<String, Entity>,
+    pub character_positions: HashMap<String, Vec2>,
     pub bgm: Option<Entity>,
 }
 
 #[derive(Resource, Default)]
 pub struct DialogueState {
     pub waiting: Option<PendingDialogueAdvance>,
+    pub span_entities: Vec<Entity>,
+    pub reveal: Option<DialogueRevealState>,
+    pub effect: DialogueTextEffect,
 }
 
 pub struct PendingDialogueAdvance {
     pub animation_id: Option<String>,
     pub done: Option<mpsc::Sender<ScriptResponse>>,
+}
+
+pub struct DialogueRevealState {
+    pub spans: Vec<Entity>,
+    pub next_index: usize,
+    pub accumulator: f32,
+    pub interval: f32,
+    pub fade_seconds: f32,
+    pub animation_id: Option<String>,
+    pub done: Option<mpsc::Sender<ScriptResponse>>,
+}
+
+#[derive(Clone)]
+pub struct DialogueTextEffect {
+    pub mode: DialogueTextEffectMode,
+    pub cps: f32,
+    pub fade_seconds: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DialogueTextEffectMode {
+    Instant,
+    TypewriterFade,
+}
+
+impl Default for DialogueTextEffect {
+    fn default() -> Self {
+        Self {
+            mode: DialogueTextEffectMode::TypewriterFade,
+            cps: 30.0,
+            fade_seconds: 0.12,
+        }
+    }
+}
+
+#[derive(Component)]
+pub struct DialogueCharSpan {
+    pub target_alpha: f32,
+    pub age: f32,
+    pub revealed: bool,
 }
 
 #[derive(Resource, Default)]
@@ -226,11 +274,24 @@ pub struct CharacterShakeEffect {
     pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
+#[derive(Component)]
+pub struct CharacterTimelineEffect {
+    pub origin: Vec3,
+    pub actor_id: String,
+    pub actor_origin: Vec2,
+    pub keyframes: Vec<ResolvedCharacterKeyframe>,
+    pub elapsed: f32,
+    pub duration: f32,
+    pub animation_id: Option<String>,
+    pub done: Option<mpsc::Sender<ScriptResponse>>,
+}
+
 #[derive(Clone, Copy)]
 pub enum CharacterMotionKind {
     Jump { height: f32 },
     Shake { amplitude: f32 },
 }
+
 
 #[derive(Component)]
 pub struct OverlayMarker;
@@ -356,6 +417,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub dialogue_border: Query<'w, 's, &'static mut BorderColor, With<DialogueRoot>>,
     pub speaker_text: Query<'w, 's, &'static mut Text, (With<SpeakerText>, Without<LineText>)>,
     pub line_text: Query<'w, 's, &'static mut Text, (With<LineText>, Without<SpeakerText>)>,
+    pub line_text_entity: Query<'w, 's, Entity, (With<LineText>, Without<SpeakerText>)>,
     pub speaker_color: Query<
         'w,
         's,
@@ -453,7 +515,9 @@ pub fn setup_stage(
         ));
     });
 
-    *shared_state.0.lock().unwrap() = SceneSnapshot::default();
+    let mut snapshot = SceneSnapshot::default();
+    snapshot.text_effect = text_effect_snapshot(&DialogueTextEffect::default());
+    *shared_state.0.lock().unwrap() = snapshot;
 }
 
 pub fn setup_frontend(mut commands: Commands, asset_server: Res<AssetServer>, vfs: Res<VfsResource>) {
@@ -1240,6 +1304,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut dialogue_border = ctx.dialogue_border;
     let mut speaker_text = ctx.speaker_text;
     let mut line_text = ctx.line_text;
+    let line_text_entity = ctx.line_text_entity;
     let mut speaker_color = ctx.speaker_color;
     let mut line_color = ctx.line_color;
     let mut hint_color = ctx.hint_color;
@@ -1628,21 +1693,53 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if let Ok(mut speaker_node) = speaker_text.single_mut() {
                     **speaker_node = speaker.clone();
                 }
-                if let Ok(mut line_node) = line_text.single_mut() {
-                    **line_node = text.clone();
+                if let Ok(line_root) = line_text_entity.single() {
+                    set_dialogue_line_text(
+                        &mut commands,
+                        &mut dialogue_state,
+                        line_root,
+                        &mut line_text,
+                        &ui_style,
+                        &text,
+                        0,
+                        None,
+                        None,
+                    );
                 }
                 dialogue_state.waiting = Some(PendingDialogueAdvance { animation_id, done });
                 shared_state.0.lock().unwrap().dialogue = Some(DialogueSnapshot { speaker, text });
             }
-            ScriptCommand::SetDialogue { speaker, text } => {
+            ScriptCommand::AwaitDialogueAdvance { done } => {
+                dialogue_state.waiting = Some(PendingDialogueAdvance {
+                    animation_id: None,
+                    done: Some(done),
+                });
+            }
+            ScriptCommand::SetDialogue {
+                speaker,
+                text,
+                reveal_from,
+                animation_id,
+                done,
+            } => {
                 if let Ok(mut visibility) = dialogue_root.single_mut() {
                     *visibility = Visibility::Visible;
                 }
                 if let Ok(mut speaker_node) = speaker_text.single_mut() {
                     **speaker_node = speaker.clone();
                 }
-                if let Ok(mut line_node) = line_text.single_mut() {
-                    **line_node = text.clone();
+                if let Ok(line_root) = line_text_entity.single() {
+                    set_dialogue_line_text(
+                        &mut commands,
+                        &mut dialogue_state,
+                        line_root,
+                        &mut line_text,
+                        &ui_style,
+                        &text,
+                        reveal_from.unwrap_or_else(|| text.chars().count()),
+                        animation_id,
+                        done,
+                    );
                 }
                 shared_state.0.lock().unwrap().dialogue = Some(DialogueSnapshot { speaker, text });
             }
@@ -1650,6 +1747,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if let Some(waiting) = dialogue_state.waiting.take() {
                     complete_missing_animation(&mut animations, waiting.animation_id, waiting.done);
                 }
+                clear_dialogue_spans(&mut commands, &mut dialogue_state);
                 if let Ok(mut visibility) = dialogue_root.single_mut() {
                     *visibility = Visibility::Hidden;
                 }
@@ -1660,6 +1758,14 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     **line_node = String::new();
                 }
                 shared_state.0.lock().unwrap().dialogue = None;
+            }
+            ScriptCommand::SetTextEffect(effect) => {
+                apply_text_effect_spec(&mut dialogue_state.effect, effect);
+                shared_state.0.lock().unwrap().text_effect = text_effect_snapshot(&dialogue_state.effect);
+            }
+            ScriptCommand::ResetTextEffect => {
+                dialogue_state.effect = DialogueTextEffect::default();
+                shared_state.0.lock().unwrap().text_effect = text_effect_snapshot(&dialogue_state.effect);
             }
             ScriptCommand::ApplyUserSettings(settings) => {
                 *user_settings = settings;
@@ -1718,6 +1824,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 };
 
                 despawn_character_actor(&mut commands, &mut stage, &mut pending_characters, &actor_id);
+                stage.character_positions.insert(actor_id.clone(), position);
                 queue_character_show(
                     &mut commands,
                     &asset_server,
@@ -1735,6 +1842,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             }
             ScriptCommand::HideCharacter { actor_id } => {
                 despawn_character_actor(&mut commands, &mut stage, &mut pending_characters, &actor_id);
+                stage.character_positions.remove(&actor_id);
             }
             ScriptCommand::JumpCharacter {
                 actor_id,
@@ -1769,6 +1877,23 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &actor_id,
                     CharacterMotionKind::Shake { amplitude },
                     duration,
+                    animation_id,
+                    done,
+                    &mut animations,
+                );
+            }
+            ScriptCommand::AnimateCharacter {
+                actor_id,
+                keyframes,
+                animation_id,
+                done,
+            } => {
+                apply_character_timeline(
+                    &mut commands,
+                    &mut stage,
+                    &shared_state,
+                    &actor_id,
+                    keyframes,
                     animation_id,
                     done,
                     &mut animations,
@@ -2253,6 +2378,9 @@ pub fn advance_dialogue_on_input(
     mouse: Res<ButtonInput<MouseButton>>,
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,
+    inline_control: Res<InlineDialogueControlResource>,
+    mut pending_cancels: ResMut<PendingAnimationCancels>,
+    mut dialogue_chars: Query<&mut DialogueCharSpan>,
     choice_state: Res<ChoiceState>,
 ) {
     if choice_state.waiting.is_some() {
@@ -2267,6 +2395,23 @@ pub fn advance_dialogue_on_input(
         return;
     }
 
+    let mut inline = inline_control.0.lock().unwrap();
+    if inline.active {
+        inline.skip_requested = true;
+        if let Some(handle) = inline.current_handle.clone() {
+            pending_cancels.ids.push(handle);
+        }
+        drop(inline);
+        reveal_all_dialogue_chars(&mut dialogue_state, &mut dialogue_chars);
+        return;
+    }
+    drop(inline);
+
+    if dialogue_reveal_has_hidden_chars(&dialogue_state) {
+        reveal_all_dialogue_chars(&mut dialogue_state, &mut dialogue_chars);
+        return;
+    }
+
     if let Some(waiting) = dialogue_state.waiting.take() {
         if let Some(animation_id) = waiting.animation_id {
             animations.completed.insert(animation_id);
@@ -2274,6 +2419,60 @@ pub fn advance_dialogue_on_input(
         if let Some(done) = waiting.done {
             let _ = done.send(ScriptResponse::Continue);
         }
+    }
+}
+
+pub fn animate_dialogue_text_reveal(
+    time: Res<Time>,
+    mut dialogue_state: ResMut<DialogueState>,
+    mut animations: ResMut<AnimationState>,
+    mut dialogue_chars: Query<(&mut TextColor, &mut DialogueCharSpan)>,
+) {
+    let Some(reveal) = dialogue_state.reveal.as_mut() else {
+        return;
+    };
+
+    reveal.accumulator += time.delta_secs();
+    while reveal.next_index < reveal.spans.len() && reveal.accumulator >= reveal.interval {
+        reveal.accumulator -= reveal.interval;
+        if let Some(entity) = reveal.spans.get(reveal.next_index).copied()
+            && let Ok((_, mut span)) = dialogue_chars.get_mut(entity)
+        {
+            span.revealed = true;
+            span.age = 0.0;
+        }
+        reveal.next_index += 1;
+    }
+
+    let mut fully_visible = reveal.next_index >= reveal.spans.len();
+    for &entity in &reveal.spans {
+        if let Ok((mut color, mut span)) = dialogue_chars.get_mut(entity) {
+            if span.revealed {
+                span.age = (span.age + time.delta_secs()).min(reveal.fade_seconds);
+                let alpha = if reveal.fade_seconds <= f32::EPSILON {
+                    span.target_alpha
+                } else {
+                    span.target_alpha * (span.age / reveal.fade_seconds).clamp(0.0, 1.0)
+                };
+                color.0.set_alpha(alpha);
+                if span.age + f32::EPSILON < reveal.fade_seconds {
+                    fully_visible = false;
+                }
+            } else {
+                color.0.set_alpha(0.0);
+                fully_visible = false;
+            }
+        }
+    }
+
+    if fully_visible {
+        if let Some(animation_id) = reveal.animation_id.take() {
+            animations.completed.insert(animation_id);
+        }
+        if let Some(done) = reveal.done.take() {
+            let _ = done.send(ScriptResponse::Continue);
+        }
+        dialogue_state.reveal = None;
     }
 }
 
@@ -2315,8 +2514,13 @@ pub fn apply_animation_cancellations(
     mut bgm_fades: Query<(Entity, &mut BgmFade)>,
     mut motion_queries: ParamSet<(
         Query<'_, '_, &'static mut Transform, With<MainCamera>>,
-        Query<'_, '_, (Entity, &'static mut Transform, &'static mut CharacterJumpEffect), Without<MainCamera>>,
-        Query<'_, '_, (Entity, &'static mut Transform, &'static mut CharacterShakeEffect), Without<MainCamera>>,
+        Query<'_, '_, (
+            Entity,
+            &'static mut Transform,
+            Option<&'static mut CharacterJumpEffect>,
+            Option<&'static mut CharacterShakeEffect>,
+            Option<&'static mut CharacterTimelineEffect>,
+        ), Without<MainCamera>>,
     )>,
     mut transitions: Query<(Entity, &mut RuleTransitionPlayer)>,
     mut effects: Query<(Entity, &mut CustomScreenEffectPlayer)>,
@@ -2421,28 +2625,54 @@ pub fn apply_animation_cancellations(
         }
     }
 
-    for (entity, mut transform, mut effect) in &mut motion_queries.p1() {
-        if effect
-            .animation_id
+    for (entity, mut transform, jump, shake, timeline) in &mut motion_queries.p1() {
+        let mut reset_translation = false;
+        let origin = timeline
             .as_ref()
-            .is_some_and(|animation_id| cancelled.contains(animation_id))
+            .map(|effect| effect.origin)
+            .or_else(|| jump.as_ref().map(|effect| effect.origin))
+            .or_else(|| shake.as_ref().map(|effect| effect.origin));
+
+        if let Some(mut effect) = jump
+            && effect
+                .animation_id
+                .as_ref()
+                .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            transform.translation.y = effect.origin.y;
             complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
             commands.entity(entity).try_remove::<CharacterJumpEffect>();
+            reset_translation = true;
         }
-    }
 
-    for (entity, mut transform, mut effect) in &mut motion_queries.p2() {
-        if effect
-            .animation_id
-            .as_ref()
-            .is_some_and(|animation_id| cancelled.contains(animation_id))
+        if let Some(mut effect) = shake
+            && effect
+                .animation_id
+                .as_ref()
+                .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            transform.translation.x = effect.origin.x;
-            transform.translation.y = effect.origin.y;
             complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
             commands.entity(entity).try_remove::<CharacterShakeEffect>();
+            reset_translation = true;
+        }
+
+        if let Some(mut effect) = timeline
+            && effect
+                .animation_id
+                .as_ref()
+                .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            if let Some(final_keyframe) = effect.keyframes.last() {
+                stage.character_positions.insert(effect.actor_id.clone(), final_keyframe.position);
+            }
+            complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+            commands.entity(entity).try_remove::<CharacterTimelineEffect>();
+            reset_translation = true;
+        }
+
+        if reset_translation {
+            if let Some(origin) = origin {
+                transform.translation = origin;
+            }
         }
     }
 
@@ -2565,66 +2795,66 @@ pub fn animate_character_motion_effects(
     mut commands: Commands,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
-    mut movers: ParamSet<(
-        Query<'_, '_, (Entity, &'static mut Transform, &'static mut CharacterJumpEffect), (Without<CharacterShakeEffect>, Without<MainCamera>)>,
-        Query<'_, '_, (Entity, &'static mut Transform, &'static mut CharacterJumpEffect, &'static mut CharacterShakeEffect), Without<MainCamera>>,
-        Query<'_, '_, (Entity, &'static mut Transform, &'static mut CharacterShakeEffect), (Without<CharacterJumpEffect>, Without<MainCamera>)>,
-    )>,
+    mut stage: ResMut<StageState>,
+    mut movers: Query<
+        (
+            Entity,
+            &'static mut Transform,
+            Option<&'static mut CharacterJumpEffect>,
+            Option<&'static mut CharacterShakeEffect>,
+            Option<&'static mut CharacterTimelineEffect>,
+        ),
+        Without<MainCamera>,
+    >,
 ) {
-    for (entity, mut transform, mut jump, mut shake) in &mut movers.p1() {
-        jump.timer.tick(time.delta());
-        shake.timer.tick(time.delta());
+    for (entity, mut transform, jump, shake, timeline) in &mut movers {
+        let base_origin = timeline
+            .as_ref()
+            .map(|effect| effect.origin)
+            .or_else(|| jump.as_ref().map(|effect| effect.origin))
+            .or_else(|| shake.as_ref().map(|effect| effect.origin))
+            .unwrap_or(transform.translation);
 
-        let jump_progress = tween_fraction(&jump.timer);
-        let jump_offset = (std::f32::consts::PI * jump_progress).sin().max(0.0) * jump.height;
+        let mut translation = base_origin;
 
-        let shake_decay = 1.0 - tween_fraction(&shake.timer);
-        let shake_elapsed = shake.timer.elapsed_secs();
-        let shake_offset = Vec3::new(
-            (shake_elapsed * 52.0).sin() * shake.amplitude * shake_decay,
-            (shake_elapsed * 39.0).cos() * shake.amplitude * 0.35 * shake_decay,
-            0.0,
-        );
+        if let Some(mut effect) = timeline {
+            effect.elapsed = (effect.elapsed + time.delta_secs()).min(effect.duration);
+            let actor_position = character_timeline_position(effect.actor_origin, &effect.keyframes, effect.elapsed);
+            translation += (actor_position - effect.actor_origin).extend(0.0);
+            stage.character_positions.insert(effect.actor_id.clone(), actor_position);
 
-        transform.translation = jump.origin + Vec3::new(0.0, jump_offset, 0.0) + shake_offset;
-
-        if jump.timer.is_finished() {
-            complete_missing_animation(&mut animations, jump.animation_id.take(), jump.done.take());
-            commands.entity(entity).try_remove::<CharacterJumpEffect>();
+            if effect.elapsed >= effect.duration {
+                complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+                commands.entity(entity).try_remove::<CharacterTimelineEffect>();
+            }
         }
-        if shake.timer.is_finished() {
-            complete_missing_animation(&mut animations, shake.animation_id.take(), shake.done.take());
-            commands.entity(entity).try_remove::<CharacterShakeEffect>();
+
+        if let Some(mut effect) = jump {
+            effect.timer.tick(time.delta());
+            let progress = tween_fraction(&effect.timer);
+            translation.y += (std::f32::consts::PI * progress).sin().max(0.0) * effect.height;
+            if effect.timer.is_finished() {
+                complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+                commands.entity(entity).try_remove::<CharacterJumpEffect>();
+            }
         }
-    }
 
-    for (entity, mut transform, mut jump) in &mut movers.p0() {
-        jump.timer.tick(time.delta());
-        let progress = tween_fraction(&jump.timer);
-        let arc = (std::f32::consts::PI * progress).sin().max(0.0);
-        transform.translation = jump.origin + Vec3::new(0.0, jump.height * arc, 0.0);
-
-        if jump.timer.is_finished() {
-            complete_missing_animation(&mut animations, jump.animation_id.take(), jump.done.take());
-            commands.entity(entity).try_remove::<CharacterJumpEffect>();
+        if let Some(mut effect) = shake {
+            effect.timer.tick(time.delta());
+            let decay = 1.0 - tween_fraction(&effect.timer);
+            let elapsed = effect.timer.elapsed_secs();
+            translation += Vec3::new(
+                (elapsed * 52.0).sin() * effect.amplitude * decay,
+                (elapsed * 39.0).cos() * effect.amplitude * 0.35 * decay,
+                0.0,
+            );
+            if effect.timer.is_finished() {
+                complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+                commands.entity(entity).try_remove::<CharacterShakeEffect>();
+            }
         }
-    }
 
-    for (entity, mut transform, mut shake) in &mut movers.p2() {
-        shake.timer.tick(time.delta());
-        let decay = 1.0 - tween_fraction(&shake.timer);
-        let elapsed = shake.timer.elapsed_secs();
-        let offset = Vec3::new(
-            (elapsed * 52.0).sin() * shake.amplitude * decay,
-            (elapsed * 39.0).cos() * shake.amplitude * 0.35 * decay,
-            0.0,
-        );
-        transform.translation = shake.origin + offset;
-
-        if shake.timer.is_finished() {
-            complete_missing_animation(&mut animations, shake.animation_id.take(), shake.done.take());
-            commands.entity(entity).try_remove::<CharacterShakeEffect>();
-        }
+        transform.translation = translation;
     }
 }
 
@@ -2877,6 +3107,7 @@ pub fn poll_pending_character_shows(
 pub fn sync_scene_snapshot(
     shared_state: Res<SceneSharedState>,
     stage: Res<StageState>,
+    dialogue_state: Res<DialogueState>,
     background_layers: Query<&BackgroundLayer>,
     bgms: Query<(&BgmChannel, Option<&AudioSink>)>,
     overlay: Query<&Sprite, With<OverlayMarker>>,
@@ -2905,6 +3136,11 @@ pub fn sync_scene_snapshot(
         .collect::<Vec<_>>();
     sprite_snapshots.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot.sprites = sprite_snapshots;
+    snapshot.character_positions = stage
+        .character_positions
+        .iter()
+        .map(|(actor_id, position)| (actor_id.clone(), [position.x, position.y]))
+        .collect();
 
     snapshot.bgm = stage.bgm.and_then(|entity| {
         bgms.get(entity).ok().map(|(bgm, sink)| AudioSnapshot {
@@ -2916,6 +3152,8 @@ pub fn sync_scene_snapshot(
     if let Ok(overlay_sprite) = overlay.single() {
         snapshot.overlay_alpha = overlay_sprite.color.alpha();
     }
+
+    snapshot.text_effect = text_effect_snapshot(&dialogue_state.effect);
 }
 
 fn queue_character_show(
@@ -3036,6 +3274,130 @@ fn apply_character_motion(
                     animation_id: (index == 0).then(|| pending_animation.take()).flatten(),
                     done: (index == 0).then(|| pending_done.take()).flatten(),
                 });
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_character_timeline(
+    commands: &mut Commands,
+    stage: &mut StageState,
+    shared_state: &SceneSharedState,
+    actor_id: &str,
+    keyframes: Vec<ResolvedCharacterKeyframe>,
+    animation_id: Option<String>,
+    done: Option<mpsc::Sender<ScriptResponse>>,
+    animations: &mut AnimationState,
+) {
+    let Some(actor_origin) = stage.character_positions.get(actor_id).copied() else {
+        complete_missing_animation(animations, animation_id, done);
+        return;
+    };
+
+    let duration = keyframes.last().map(|frame| frame.time).unwrap_or(0.0);
+    if duration <= f32::EPSILON {
+        if let Some(final_position) = keyframes.last().map(|frame| frame.position) {
+            stage.character_positions.insert(actor_id.to_string(), final_position);
+        }
+        complete_missing_animation(animations, animation_id, done);
+        return;
+    }
+
+    let prefix = character_part_prefix(actor_id);
+    let snapshot = shared_state.0.lock().unwrap().clone();
+    let mut part_ids = snapshot
+        .sprites
+        .iter()
+        .filter(|sprite| sprite.id.starts_with(&prefix))
+        .map(|sprite| (sprite.id.clone(), sprite.x, sprite.y, sprite.layer))
+        .collect::<Vec<_>>();
+    part_ids.sort_by(|left, right| left.0.cmp(&right.0));
+
+    if part_ids.is_empty() {
+        complete_missing_animation(animations, animation_id, done);
+        return;
+    }
+
+    let mut pending_animation = animation_id;
+    let mut pending_done = done;
+    for (index, (id, x, y, layer)) in part_ids.into_iter().enumerate() {
+        let Some(entity) = stage.sprites.get(&id).copied() else {
+            continue;
+        };
+        commands.entity(entity).insert(CharacterTimelineEffect {
+            origin: Vec3::new(x, y, STAGE_Z_SPRITE + layer),
+            actor_id: actor_id.to_string(),
+            actor_origin,
+            keyframes: keyframes.clone(),
+            elapsed: 0.0,
+            duration,
+            animation_id: (index == 0).then(|| pending_animation.take()).flatten(),
+            done: (index == 0).then(|| pending_done.take()).flatten(),
+        });
+    }
+}
+
+fn character_timeline_position(
+    actor_origin: Vec2,
+    keyframes: &[ResolvedCharacterKeyframe],
+    elapsed: f32,
+) -> Vec2 {
+    let Some(first) = keyframes.first() else {
+        return actor_origin;
+    };
+
+    if elapsed <= first.time {
+        return interpolate_character_position(actor_origin, 0.0, first.clone(), elapsed);
+    }
+
+    let mut previous = ResolvedCharacterKeyframe {
+        time: 0.0,
+        position: actor_origin,
+        ease: CharacterEase::Linear,
+    };
+    for keyframe in keyframes {
+        if elapsed <= keyframe.time {
+            return interpolate_character_position(previous.position, previous.time, keyframe.clone(), elapsed);
+        }
+        previous = keyframe.clone();
+    }
+
+    keyframes.last().map(|frame| frame.position).unwrap_or(actor_origin)
+}
+
+fn interpolate_character_position(
+    start: Vec2,
+    start_time: f32,
+    end: ResolvedCharacterKeyframe,
+    elapsed: f32,
+) -> Vec2 {
+    let duration = (end.time - start_time).max(f32::EPSILON);
+    let fraction = ((elapsed - start_time) / duration).clamp(0.0, 1.0);
+    let fraction = apply_character_ease(end.ease, fraction);
+    start.lerp(end.position, fraction)
+}
+
+fn apply_character_ease(ease: CharacterEase, t: f32) -> f32 {
+    match ease {
+        CharacterEase::Linear => t,
+        CharacterEase::Ease | CharacterEase::EaseInOut => t * t * (3.0 - 2.0 * t),
+        CharacterEase::EaseIn => t * t,
+        CharacterEase::EaseOut => 1.0 - (1.0 - t) * (1.0 - t),
+        CharacterEase::Bounce => {
+            let n1 = 7.5625;
+            let d1 = 2.75;
+            if t < 1.0 / d1 {
+                n1 * t * t
+            } else if t < 2.0 / d1 {
+                let t = t - 1.5 / d1;
+                n1 * t * t + 0.75
+            } else if t < 2.5 / d1 {
+                let t = t - 2.25 / d1;
+                n1 * t * t + 0.9375
+            } else {
+                let t = t - 2.625 / d1;
+                n1 * t * t + 0.984375
             }
         }
     }
@@ -3177,6 +3539,148 @@ fn apply_ui_style_patch(ui_style: &mut UiStyle, patch: UiStylePatch) {
     if let Some(color) = patch.choice_text_color {
         ui_style.choice_text_color = color_from_rgba(color);
     }
+}
+
+fn clear_dialogue_spans(commands: &mut Commands, dialogue_state: &mut DialogueState) {
+    for entity in dialogue_state.span_entities.drain(..) {
+        commands.entity(entity).try_despawn();
+    }
+    dialogue_state.reveal = None;
+}
+
+fn set_dialogue_line_text(
+    commands: &mut Commands,
+    dialogue_state: &mut DialogueState,
+    line_root: Entity,
+    line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
+    ui_style: &UiStyle,
+    text: &str,
+    visible_prefix_chars: usize,
+    animation_id: Option<String>,
+    done: Option<mpsc::Sender<ScriptResponse>>,
+) {
+    clear_dialogue_spans(commands, dialogue_state);
+
+    if let Ok(mut line_node) = line_text.single_mut() {
+        **line_node = String::new();
+    }
+
+    let chars = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    let target_alpha = ui_style.line_color.alpha();
+    let reveal_enabled = dialogue_state.effect.mode != DialogueTextEffectMode::Instant;
+    let visible_prefix_chars = visible_prefix_chars.min(chars.len());
+
+    for (index, ch) in chars.iter().enumerate() {
+        let revealed = !reveal_enabled || index < visible_prefix_chars;
+        let initial_alpha = if revealed { target_alpha } else { 0.0 };
+        let entity = commands
+            .spawn((
+                TextSpan::new(ch.clone()),
+                TextColor(ui_style.line_color.with_alpha(initial_alpha)),
+                DialogueCharSpan {
+                    target_alpha,
+                    age: if revealed {
+                        dialogue_state.effect.fade_seconds
+                    } else {
+                        0.0
+                    },
+                    revealed,
+                },
+            ))
+            .id();
+        commands.entity(line_root).add_child(entity);
+        dialogue_state.span_entities.push(entity);
+    }
+
+    if reveal_enabled && visible_prefix_chars < chars.len() {
+        dialogue_state.reveal = Some(DialogueRevealState {
+            spans: dialogue_state.span_entities.clone(),
+            next_index: visible_prefix_chars,
+            accumulator: 0.0,
+            interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+            fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
+            animation_id,
+            done,
+        });
+    } else {
+        dialogue_state.reveal = None;
+        if let Some(animation_id) = animation_id {
+            if let Some(done) = done {
+                let _ = done.send(ScriptResponse::Continue);
+            }
+            let _ = animation_id;
+        } else if let Some(done) = done {
+            let _ = done.send(ScriptResponse::Continue);
+        }
+    }
+}
+
+fn dialogue_reveal_has_hidden_chars(dialogue_state: &DialogueState) -> bool {
+    dialogue_state
+        .reveal
+        .as_ref()
+        .is_some_and(|reveal| reveal.next_index < reveal.spans.len())
+}
+
+fn reveal_all_dialogue_chars(
+    dialogue_state: &mut DialogueState,
+    dialogue_chars: &mut Query<&mut DialogueCharSpan>,
+) {
+    let Some(reveal) = dialogue_state.reveal.as_mut() else {
+        return;
+    };
+
+    for &entity in &reveal.spans {
+        if let Ok(mut span) = dialogue_chars.get_mut(entity) {
+            span.revealed = true;
+            span.age = reveal.fade_seconds;
+        }
+    }
+    reveal.next_index = reveal.spans.len();
+    reveal.accumulator = 0.0;
+}
+
+fn apply_text_effect_spec(effect: &mut DialogueTextEffect, spec: crate::script::DialogueTextEffectSpec) {
+    if let Some(mode) = spec.mode.as_deref() {
+        effect.mode = match mode {
+            "instant" => DialogueTextEffectMode::Instant,
+            _ => DialogueTextEffectMode::TypewriterFade,
+        };
+    }
+    if let Some(cps) = spec.cps {
+        effect.cps = cps.max(1.0);
+    }
+    if let Some(fade_seconds) = spec.fade_seconds {
+        effect.fade_seconds = fade_seconds.max(0.0);
+    }
+    if let Some(fade_ms) = spec.fade_ms {
+        effect.fade_seconds = (fade_ms / 1000.0).max(0.0);
+    }
+}
+
+fn text_effect_snapshot(effect: &DialogueTextEffect) -> TextEffectSnapshot {
+    TextEffectSnapshot {
+        mode: match effect.mode {
+            DialogueTextEffectMode::Instant => "instant".to_string(),
+            DialogueTextEffectMode::TypewriterFade => "typewriter_fade".to_string(),
+        },
+        cps: effect.cps,
+        fade_seconds: effect.fade_seconds,
+    }
+}
+
+fn dialogue_text_effect_from_snapshot(snapshot: &TextEffectSnapshot) -> DialogueTextEffect {
+    let mut effect = DialogueTextEffect::default();
+    if snapshot.mode == "instant" {
+        effect.mode = DialogueTextEffectMode::Instant;
+    }
+    if snapshot.cps > 0.0 {
+        effect.cps = snapshot.cps;
+    }
+    if snapshot.fade_seconds >= 0.0 {
+        effect.fade_seconds = snapshot.fade_seconds;
+    }
+    effect
 }
 
 fn refresh_dialogue_ui_style(
@@ -3500,6 +4004,8 @@ fn restore_scene_snapshot(
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
     snapshot: SceneSnapshot,
 ) {
+    let text_effect = snapshot.text_effect.clone();
+
     if let Some(background) = stage.background.take() {
         commands.entity(background).try_despawn();
     }
@@ -3512,6 +4018,7 @@ fn restore_scene_snapshot(
     for (_, entity) in stage.sprites.drain() {
         commands.entity(entity).try_despawn();
     }
+    stage.character_positions.clear();
     if let Some(bgm) = stage.bgm.take() {
         commands.entity(bgm).try_despawn();
     }
@@ -3550,6 +4057,12 @@ fn restore_scene_snapshot(
         stage.sprites.insert(sprite.id.clone(), entity);
     }
 
+    stage.character_positions = snapshot
+        .character_positions
+        .iter()
+        .map(|(actor_id, position)| (actor_id.clone(), Vec2::new(position[0], position[1])))
+        .collect();
+
     if let Some(bgm) = snapshot.bgm.as_ref() {
         stage.bgm = Some(
             commands
@@ -3573,6 +4086,7 @@ fn restore_scene_snapshot(
 
     match snapshot.dialogue {
         Some(dialogue) => {
+            clear_dialogue_spans(commands, dialogue_state);
             if let Ok(mut visibility) = dialogue_root.single_mut() {
                 *visibility = Visibility::Visible;
             }
@@ -3584,6 +4098,7 @@ fn restore_scene_snapshot(
             }
         }
         None => {
+            clear_dialogue_spans(commands, dialogue_state);
             if let Ok(mut visibility) = dialogue_root.single_mut() {
                 *visibility = Visibility::Hidden;
             }
@@ -3596,6 +4111,7 @@ fn restore_scene_snapshot(
         }
     }
 
+    dialogue_state.effect = dialogue_text_effect_from_snapshot(&text_effect);
     dialogue_state.waiting = None;
     choice_state.waiting = None;
     choice_state.options.clear();

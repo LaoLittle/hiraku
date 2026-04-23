@@ -12,6 +12,8 @@ use rhai::{
     Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, INT, ImmutableString, Map,
     NativeCallContext, Position, FnPtr,
 };
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
 
 use crate::{
     character::load_character_catalog,
@@ -76,11 +78,19 @@ pub enum ScriptCommand {
         animation_id: Option<String>,
         done: Option<mpsc::Sender<ScriptResponse>>,
     },
+    AwaitDialogueAdvance {
+        done: mpsc::Sender<ScriptResponse>,
+    },
     SetDialogue {
         speaker: String,
         text: String,
+        reveal_from: Option<usize>,
+        animation_id: Option<String>,
+        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     ClearDialogue,
+    SetTextEffect(DialogueTextEffectSpec),
+    ResetTextEffect,
     ApplyUserSettings(UserSettings),
     ApplyUiStyle(UiStylePatch),
     ResetUiStyle,
@@ -116,6 +126,12 @@ pub enum ScriptCommand {
         actor_id: String,
         amplitude: f32,
         duration: Duration,
+        animation_id: Option<String>,
+        done: Option<mpsc::Sender<ScriptResponse>>,
+    },
+    AnimateCharacter {
+        actor_id: String,
+        keyframes: Vec<ResolvedCharacterKeyframe>,
         animation_id: Option<String>,
         done: Option<mpsc::Sender<ScriptResponse>>,
     },
@@ -222,6 +238,50 @@ pub struct BatchSubmissionItem {
     pub command: Box<ScriptCommand>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DialogueTextEffectSpec {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub cps: Option<f32>,
+    #[serde(default)]
+    pub fade_seconds: Option<f32>,
+    #[serde(default)]
+    pub fade_ms: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedCharacterKeyframe {
+    pub time: f32,
+    pub position: Vec2,
+    pub ease: CharacterEase,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CharacterEase {
+    Linear,
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    Bounce,
+}
+
+#[derive(Debug, Deserialize)]
+struct CharacterAnimationKeyframeInput {
+    time: f32,
+    #[serde(default)]
+    x: Option<f32>,
+    #[serde(default)]
+    y: Option<f32>,
+    #[serde(default)]
+    dx: Option<f32>,
+    #[serde(default)]
+    dy: Option<f32>,
+    #[serde(default)]
+    ease: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ScriptResponse {
     Continue,
@@ -230,6 +290,9 @@ pub enum ScriptResponse {
 
 #[derive(Resource)]
 pub struct ScriptInbox(pub Mutex<mpsc::Receiver<ScriptCommand>>);
+
+#[derive(Resource, Clone, Default)]
+pub struct InlineDialogueControlResource(pub Arc<Mutex<InlineDialogueControl>>);
 
 #[derive(Clone, Debug)]
 pub struct ScriptBootstrap {
@@ -266,7 +329,15 @@ struct ScriptHost {
     scene_state: Arc<Mutex<SceneSnapshot>>,
     next_animation_id: Arc<Mutex<u64>>,
     batch_registry: Arc<Mutex<BatchRegistry>>,
+    inline_dialogue_control: Arc<Mutex<InlineDialogueControl>>,
     save_root: PathBuf,
+}
+
+#[derive(Default)]
+pub struct InlineDialogueControl {
+    pub active: bool,
+    pub skip_requested: bool,
+    pub current_handle: Option<String>,
 }
 
 #[derive(Default)]
@@ -338,7 +409,28 @@ impl ScriptHost {
     }
 
     fn set_dialogue(&self, speaker: String, text: String) -> Result<(), Box<EvalAltResult>> {
-        self.send(ScriptCommand::SetDialogue { speaker, text })
+        self.send(ScriptCommand::SetDialogue {
+            speaker,
+            text,
+            reveal_from: None,
+            animation_id: None,
+            done: None,
+        })
+    }
+
+    fn reveal_dialogue_tail(
+        &self,
+        speaker: String,
+        text: String,
+        reveal_from: usize,
+    ) -> Result<(), Box<EvalAltResult>> {
+        self.send_continue(|done| ScriptCommand::SetDialogue {
+            speaker,
+            text,
+            reveal_from: Some(reveal_from),
+            animation_id: None,
+            done: Some(done),
+        })
     }
 
     fn next_animation_id(&self, kind: &str) -> String {
@@ -349,6 +441,33 @@ impl ScriptHost {
 
     fn is_batch_mode(&self) -> bool {
         self.batch_registry.lock().unwrap().active.is_some()
+    }
+
+    fn begin_inline_dialogue(&self) {
+        let mut control = self.inline_dialogue_control.lock().unwrap();
+        control.active = true;
+        control.skip_requested = false;
+        control.current_handle = None;
+    }
+
+    fn end_inline_dialogue(&self) {
+        let mut control = self.inline_dialogue_control.lock().unwrap();
+        control.active = false;
+        control.skip_requested = false;
+        control.current_handle = None;
+    }
+
+    fn is_inline_dialogue_active(&self) -> bool {
+        self.inline_dialogue_control.lock().unwrap().active
+    }
+
+    fn inline_skip_requested(&self) -> bool {
+        let control = self.inline_dialogue_control.lock().unwrap();
+        control.active && control.skip_requested
+    }
+
+    fn set_inline_current_handle(&self, handle: Option<String>) {
+        self.inline_dialogue_control.lock().unwrap().current_handle = handle;
     }
 
     fn begin_batch(&self, mode: BatchMode) -> Result<(), Box<EvalAltResult>> {
@@ -526,6 +645,16 @@ impl ScriptHost {
             .unwrap_or(false)
     }
 
+    fn character_position(&self, actor_id: &str) -> Result<Vec2, Box<EvalAltResult>> {
+        self.scene_state
+            .lock()
+            .unwrap()
+            .character_positions
+            .get(actor_id)
+            .map(|value| Vec2::new(value[0], value[1]))
+            .ok_or_else(|| runtime_error(format!("character actor `{actor_id}` is not shown")))
+    }
+
     fn user_setting(&self, name: &str) -> Result<f32, Box<EvalAltResult>> {
         let settings = read_user_settings()
             .map_err(|err| runtime_error(format!("failed to read user settings: {err}")))?;
@@ -658,8 +787,10 @@ pub fn spawn_script_runtime(
     let script_stack = Arc::new(Mutex::new(bootstrap.script_stack));
     let next_animation_id = Arc::new(Mutex::new(0));
     let batch_registry = Arc::new(Mutex::new(BatchRegistry::default()));
+    let inline_dialogue_control = Arc::new(Mutex::new(InlineDialogueControl::default()));
 
     commands.insert_resource(ScriptInbox(Mutex::new(command_rx)));
+    commands.insert_resource(InlineDialogueControlResource(inline_dialogue_control.clone()));
 
     let host = ScriptHost {
         vfs,
@@ -670,6 +801,7 @@ pub fn spawn_script_runtime(
         scene_state,
         next_animation_id,
         batch_registry,
+        inline_dialogue_control,
         save_root: save_root_path(),
     };
 
@@ -877,21 +1009,6 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
-    let bg_fade_async_host = host.clone();
-    engine.register_fn(
-        "bg_fade_async",
-        move |path: ImmutableString, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            let path = bg_fade_async_host.resolve_path(&path);
-            run_handle_command(&bg_fade_async_host, "bg-fade", |animation_id, done| ScriptCommand::SetBackground {
-                path,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
     let bg_rule_host = host.clone();
     engine.register_fn(
         "bg_rule",
@@ -915,48 +1032,12 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
-    let bg_rule_async_host = host.clone();
-    engine.register_fn(
-        "bg_rule_async",
-        move |
-            path: ImmutableString,
-            rule_path: ImmutableString,
-            ms: i64,
-            vague: FLOAT,
-        | -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            let path = bg_rule_async_host.resolve_path(&path);
-            let rule_path = bg_rule_async_host.resolve_path(&rule_path);
-            run_handle_command(&bg_rule_async_host, "bg-rule", |animation_id, done| ScriptCommand::RuleTransitionBg {
-                path,
-                rule_path,
-                duration,
-                vague: normalize_vague(vague),
-                animation_id,
-                done,
-            })
-        },
-    );
-
     let effect_host = host.clone();
     engine.register_fn(
         "effect",
         move |options: Map| -> Result<Dynamic, Box<EvalAltResult>> {
             let options = parse_custom_effect_options(&effect_host, options)?;
             run_blocking_or_collected(&effect_host, "effect", |animation_id, done| ScriptCommand::PlayCustomEffect {
-                options,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let effect_async_host = host.clone();
-    engine.register_fn(
-        "effect_async",
-        move |options: Map| -> Result<String, Box<EvalAltResult>> {
-            let options = parse_custom_effect_options(&effect_async_host, options)?;
-            run_handle_command(&effect_async_host, "effect", |animation_id, done| ScriptCommand::PlayCustomEffect {
                 options,
                 animation_id,
                 done,
@@ -1228,6 +1309,24 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
+    let animate_character_host = host.clone();
+    engine.register_fn(
+        "animate",
+        move |actor_id: ImmutableString, keyframes: Array| -> Result<Dynamic, Box<EvalAltResult>> {
+            let actor_id = actor_id.to_string();
+            let current = animate_character_host.character_position(&actor_id)?;
+            let keyframes = parse_character_animation_keyframes(keyframes, current)?;
+            run_blocking_or_collected(&animate_character_host, "character-animate", |animation_id, done| {
+                ScriptCommand::AnimateCharacter {
+                    actor_id,
+                    keyframes,
+                    animation_id,
+                    done,
+                }
+            })
+        },
+    );
+
     let jump_character_host = host.clone();
     engine.register_fn(
         "jump_character",
@@ -1243,42 +1342,12 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
-    let jump_character_async_host = host.clone();
-    engine.register_fn(
-        "jump_character_async",
-        move |actor_id: ImmutableString, height: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_handle_command(&jump_character_async_host, "character-jump", |animation_id, done| ScriptCommand::JumpCharacter {
-                actor_id: actor_id.to_string(),
-                height: non_negative_amplitude(height),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
     let shake_character_host = host.clone();
     engine.register_fn(
         "shake_character",
         move |actor_id: ImmutableString, amplitude: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
             let duration = duration_from_millis(ms)?;
             run_blocking_or_collected(&shake_character_host, "character-shake", |animation_id, done| ScriptCommand::ShakeCharacter {
-                actor_id: actor_id.to_string(),
-                amplitude: non_negative_amplitude(amplitude),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let shake_character_async_host = host.clone();
-    engine.register_fn(
-        "shake_character_async",
-        move |actor_id: ImmutableString, amplitude: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_handle_command(&shake_character_async_host, "character-shake", |animation_id, done| ScriptCommand::ShakeCharacter {
                 actor_id: actor_id.to_string(),
                 amplitude: non_negative_amplitude(amplitude),
                 duration,
@@ -1316,41 +1385,12 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
-    let overlay_async_host = host.clone();
-    engine.register_fn(
-        "screen_fade_async",
-        move |alpha: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            run_handle_command(&overlay_async_host, "screen-fade", |animation_id, done| ScriptCommand::SetOverlay {
-                alpha: alpha.clamp(0.0, 1.0) as f32,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
     let move_sprite_host = host.clone();
     engine.register_fn(
         "move_sprite",
         move |id: ImmutableString, x: FLOAT, y: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
             let duration = duration_from_millis(ms)?;
             run_blocking_or_collected(&move_sprite_host, "move", |animation_id, done| ScriptCommand::MoveSprite {
-                id: id.to_string(),
-                position: Vec2::new(x as f32, y as f32),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let move_sprite_async_host = host.clone();
-    engine.register_fn(
-        "move_sprite_async",
-        move |id: ImmutableString, x: FLOAT, y: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_handle_command(&move_sprite_async_host, "move", |animation_id, done| ScriptCommand::MoveSprite {
                 id: id.to_string(),
                 position: Vec2::new(x as f32, y as f32),
                 duration,
@@ -1384,30 +1424,6 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
-    let move_sprite_by_async_host = host.clone();
-    engine.register_fn(
-        "move_sprite_by_async",
-        move |id: ImmutableString, dx: FLOAT, dy: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            let current = move_sprite_by_async_host
-                .scene_state
-                .lock()
-                .unwrap()
-                .sprites
-                .iter()
-                .find(|sprite| sprite.id == id.as_str())
-                .map(|sprite| Vec2::new(sprite.x, sprite.y))
-                .ok_or_else(|| runtime_error(format!("sprite `{}` not found", id)))?;
-            run_handle_command(&move_sprite_by_async_host, "move", |animation_id, done| ScriptCommand::MoveSprite {
-                id: id.to_string(),
-                position: current + Vec2::new(dx as f32, dy as f32),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
     let scale_sprite_host = host.clone();
     engine.register_fn(
         "scale_sprite",
@@ -1415,22 +1431,6 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
             let duration = duration_from_millis(ms)?;
             let scale = positive_scale(scale)?;
             run_blocking_or_collected(&scale_sprite_host, "scale", |animation_id, done| ScriptCommand::ScaleSprite {
-                id: id.to_string(),
-                scale,
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let scale_sprite_async_host = host.clone();
-    engine.register_fn(
-        "scale_sprite_async",
-        move |id: ImmutableString, scale: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            let scale = positive_scale(scale)?;
-            run_handle_command(&scale_sprite_async_host, "scale", |animation_id, done| ScriptCommand::ScaleSprite {
                 id: id.to_string(),
                 scale,
                 duration,
@@ -1455,74 +1455,12 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
-    let fade_sprite_async_host = host.clone();
-    engine.register_fn(
-        "fade_sprite_async",
-        move |id: ImmutableString, alpha: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_handle_command(&fade_sprite_async_host, "fade", |animation_id, done| ScriptCommand::FadeSprite {
-                id: id.to_string(),
-                alpha: alpha.clamp(0.0, 1.0) as f32,
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let wait_host = host.clone();
-    engine.register_fn("wait", move |ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-        let duration = duration_from_millis(ms)?;
-        run_blocking_or_collected(&wait_host, "pause", |animation_id, done| ScriptCommand::Wait {
-            duration,
-            animation_id,
-            done: done.expect("blocking or collected waits always provide a completion sender"),
-        })
-    });
-
-    let wait_anim_host = host.clone();
-    engine.register_fn(
-        "wait_anim",
-        move |animation_id: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            if wait_anim_host.is_batch_mode() {
-                return Err(runtime_error("wait_anim cannot be used inside seq/par; wait after the block returns a handle"));
-            }
-            wait_anim_host.wait_for_handle(animation_id.to_string())
-        },
-    );
-
-    let wait_all_host = host.clone();
-    engine.register_fn(
-        "wait_all",
-        move |ids: Array| -> Result<(), Box<EvalAltResult>> {
-            if wait_all_host.is_batch_mode() {
-                return Err(runtime_error("wait_all cannot be used inside seq/par; wait after the block returns a handle"));
-            }
-            let ids = parse_animation_ids(ids)?;
-            wait_all_host.wait_for_handles(ids)
-        },
-    );
-
     let shake_host = host.clone();
     engine.register_fn(
         "shake",
         move |ms: i64, amplitude: FLOAT| -> Result<Dynamic, Box<EvalAltResult>> {
             let duration = duration_from_millis(ms)?;
             run_blocking_or_collected(&shake_host, "shake", |animation_id, done| ScriptCommand::Shake {
-                duration,
-                amplitude: non_negative_amplitude(amplitude),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let shake_async_host = host.clone();
-    engine.register_fn(
-        "shake_async",
-        move |ms: i64, amplitude: FLOAT| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_handle_command(&shake_async_host, "shake", |animation_id, done| ScriptCommand::Shake {
                 duration,
                 amplitude: non_negative_amplitude(amplitude),
                 animation_id,
@@ -1577,52 +1515,6 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         },
     );
 
-    let bgm_async_host = host.clone();
-    engine.register_fn(
-        "play_bgm_async",
-        move |path: ImmutableString| -> Result<String, Box<EvalAltResult>> {
-            let path = bgm_async_host.resolve_path(&path);
-            run_handle_command(&bgm_async_host, "bgm", |animation_id, done| ScriptCommand::PlayBgm {
-                path,
-                volume: 1.0,
-                fade_in: None,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let bgm_async_volume_host = host.clone();
-    engine.register_fn(
-        "play_bgm_async",
-        move |path: ImmutableString, volume: FLOAT| -> Result<String, Box<EvalAltResult>> {
-            let path = bgm_async_volume_host.resolve_path(&path);
-            run_handle_command(&bgm_async_volume_host, "bgm", |animation_id, done| ScriptCommand::PlayBgm {
-                path,
-                volume: clamp_volume(volume),
-                fade_in: None,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let bgm_async_fade_host = host.clone();
-    engine.register_fn(
-        "play_bgm_async",
-        move |path: ImmutableString, volume: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let fade_in = duration_from_millis(ms)?;
-            let path = bgm_async_fade_host.resolve_path(&path);
-            run_handle_command(&bgm_async_fade_host, "bgm", |animation_id, done| ScriptCommand::PlayBgm {
-                path,
-                volume: clamp_volume(volume),
-                fade_in: Some(fade_in),
-                animation_id,
-                done,
-            })
-        },
-    );
-
     let set_bgm_volume_host = host.clone();
     engine.register_fn(
         "set_bgm_volume",
@@ -1639,20 +1531,6 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         move |volume: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
             let duration = duration_from_millis(ms)?;
             run_blocking_or_collected(&fade_bgm_host, "bgm-fade", |animation_id, done| ScriptCommand::FadeBgm {
-                volume: clamp_volume(volume),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let fade_bgm_async_host = host.clone();
-    engine.register_fn(
-        "fade_bgm_async",
-        move |volume: FLOAT, ms: i64| -> Result<String, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_handle_command(&fade_bgm_async_host, "bgm-fade", |animation_id, done| ScriptCommand::FadeBgm {
                 volume: clamp_volume(volume),
                 duration,
                 animation_id,
@@ -1686,34 +1564,6 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         move |path: ImmutableString, volume: FLOAT| -> Result<Dynamic, Box<EvalAltResult>> {
             let path = voice_volume_host.resolve_path(&path);
             run_blocking_or_collected(&voice_volume_host, "voice", |animation_id, done| ScriptCommand::PlayVoice {
-                path,
-                volume: clamp_volume(volume),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let voice_async_host = host.clone();
-    engine.register_fn(
-        "play_voice_async",
-        move |path: ImmutableString| -> Result<String, Box<EvalAltResult>> {
-            let path = voice_async_host.resolve_path(&path);
-            run_handle_command(&voice_async_host, "voice", |animation_id, done| ScriptCommand::PlayVoice {
-                path,
-                volume: 1.0,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let voice_async_volume_host = host.clone();
-    engine.register_fn(
-        "play_voice_async",
-        move |path: ImmutableString, volume: FLOAT| -> Result<String, Box<EvalAltResult>> {
-            let path = voice_async_volume_host.resolve_path(&path);
-            run_handle_command(&voice_async_volume_host, "voice", |animation_id, done| ScriptCommand::PlayVoice {
                 path,
                 volume: clamp_volume(volume),
                 animation_id,
@@ -1841,6 +1691,17 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     let reset_ui_style_host = host.clone();
     engine.register_fn("reset_ui_style", move || -> Result<(), Box<EvalAltResult>> {
         reset_ui_style_host.send(ScriptCommand::ResetUiStyle)
+    });
+
+    let text_effect_host = host.clone();
+    engine.register_fn("set_text_effect", move |options: Map| -> Result<(), Box<EvalAltResult>> {
+        let effect = parse_text_effect_spec(options)?;
+        text_effect_host.send(ScriptCommand::SetTextEffect(effect))
+    });
+
+    let reset_text_effect_host = host.clone();
+    engine.register_fn("reset_text_effect", move || -> Result<(), Box<EvalAltResult>> {
+        reset_text_effect_host.send(ScriptCommand::ResetTextEffect)
     });
 
     let character_names_host = host.clone();
@@ -2055,18 +1916,25 @@ fn say_with_inline_commands(
         return Err(runtime_error("inline dialogue commands are not supported inside seq/par"));
     }
 
+    host.begin_inline_dialogue();
     let mut rendered = String::new();
     let mut saw_text = false;
 
-    for chunk in chunks {
+    let result = (|| -> Result<(), Box<EvalAltResult>> {
+        for chunk in chunks {
         match chunk {
             InlineDialogueChunk::Text(segment) => {
                 if segment.is_empty() {
                     continue;
                 }
+                let reveal_from = rendered.chars().count();
                 rendered.push_str(&segment);
                 saw_text = true;
-                host.set_dialogue(speaker.clone(), rendered.clone())?;
+                if host.inline_skip_requested() {
+                    host.set_dialogue(speaker.clone(), rendered.clone())?;
+                } else {
+                    host.reveal_dialogue_tail(speaker.clone(), rendered.clone(), reveal_from)?;
+                }
             }
             InlineDialogueChunk::Command(code) => {
                 let _ = ctx.engine().eval_expression::<Dynamic>(&code)?;
@@ -2074,16 +1942,16 @@ fn say_with_inline_commands(
         }
     }
 
-    if saw_text {
-        host.send_continue(|done| ScriptCommand::Say {
-            speaker,
-            text: rendered,
-            animation_id: None,
-            done: Some(done),
-        })
-    } else {
-        Ok(())
-    }
+        if saw_text {
+            host.end_inline_dialogue();
+            host.send_continue(|done| ScriptCommand::AwaitDialogueAdvance { done })
+        } else {
+            Ok(())
+        }
+    })();
+
+    host.end_inline_dialogue();
+    result
 }
 
 fn parse_inline_dialogue_chunks(text: &str) -> Result<Vec<InlineDialogueChunk>, Box<EvalAltResult>> {
@@ -2329,6 +2197,101 @@ fn parse_custom_effect_options(
     })
 }
 
+fn parse_text_effect_spec(options: Map) -> Result<DialogueTextEffectSpec, Box<EvalAltResult>> {
+    let value = dynamic_to_json_value(Dynamic::from(options))?;
+    serde_json::from_value(value)
+        .map_err(|err| runtime_error(format!("invalid text effect options: {err}")))
+}
+
+fn parse_character_animation_keyframes(
+    keyframes: Array,
+    current: Vec2,
+) -> Result<Vec<ResolvedCharacterKeyframe>, Box<EvalAltResult>> {
+    if keyframes.is_empty() {
+        return Err(runtime_error("animate requires at least one keyframe"));
+    }
+
+    let inputs: Vec<CharacterAnimationKeyframeInput> = serde_json::from_value(dynamic_to_json_value(
+        Dynamic::from(keyframes),
+    )?)
+    .map_err(|err| runtime_error(format!("invalid animate keyframes: {err}")))?;
+
+    let mut resolved = Vec::with_capacity(inputs.len());
+    let mut previous_time = 0.0f32;
+    let mut cursor = current;
+
+    for input in inputs {
+        if input.time < 0.0 {
+            return Err(runtime_error("animate keyframe time cannot be negative"));
+        }
+        if input.time < previous_time {
+            return Err(runtime_error("animate keyframes must be sorted by time ascending"));
+        }
+
+        let position = Vec2::new(
+            input.x.unwrap_or(cursor.x + input.dx.unwrap_or(0.0)),
+            input.y.unwrap_or(cursor.y + input.dy.unwrap_or(0.0)),
+        );
+        let ease = parse_character_ease(input.ease.as_deref().unwrap_or("linear"))?;
+
+        resolved.push(ResolvedCharacterKeyframe {
+            time: input.time,
+            position,
+            ease,
+        });
+
+        previous_time = input.time;
+        cursor = position;
+    }
+
+    Ok(resolved)
+}
+
+fn parse_character_ease(name: &str) -> Result<CharacterEase, Box<EvalAltResult>> {
+    match name {
+        "linear" => Ok(CharacterEase::Linear),
+        "ease" => Ok(CharacterEase::Ease),
+        "ease_in" | "easein" => Ok(CharacterEase::EaseIn),
+        "ease_out" | "easeout" => Ok(CharacterEase::EaseOut),
+        "ease_in_out" | "easeinout" => Ok(CharacterEase::EaseInOut),
+        "bounce" => Ok(CharacterEase::Bounce),
+        other => Err(runtime_error(format!("unknown animation ease `{other}`"))),
+    }
+}
+
+fn dynamic_to_json_value(value: Dynamic) -> Result<JsonValue, Box<EvalAltResult>> {
+    if value.is::<bool>() {
+        return Ok(JsonValue::Bool(value.cast::<bool>()));
+    }
+    if value.is::<INT>() {
+        return Ok(JsonValue::Number(value.cast::<INT>().into()));
+    }
+    if value.is::<FLOAT>() {
+        let number = serde_json::Number::from_f64(value.cast::<FLOAT>())
+            .ok_or_else(|| runtime_error("expected a finite numeric value"))?;
+        return Ok(JsonValue::Number(number));
+    }
+    if value.is_string() {
+        return Ok(JsonValue::String(value.cast::<ImmutableString>().to_string()));
+    }
+    if let Some(array) = value.clone().try_cast::<Array>() {
+        return array
+            .into_iter()
+            .map(dynamic_to_json_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonValue::Array);
+    }
+    if let Some(map) = value.try_cast::<Map>() {
+        let mut object = serde_json::Map::new();
+        for (key, nested) in map {
+            object.insert(key.to_string(), dynamic_to_json_value(nested)?);
+        }
+        return Ok(JsonValue::Object(object));
+    }
+
+    Err(runtime_error("only bool, int, float, string, array, and map values are supported here"))
+}
+
 fn take_optional_string(options: &mut Map, key: &str) -> Option<String> {
     options.remove(key).and_then(|value| {
         if value.is_string() {
@@ -2523,27 +2486,27 @@ where
 {
     if host.is_batch_mode() {
         Ok(host.collect_command(kind, build)?.into())
+    } else if host.inline_skip_requested() {
+        let handle = host.next_animation_id(kind);
+        let (done_tx, _done_rx) = mpsc::channel();
+        host.send(build(Some(handle), Some(done_tx)))?;
+        Ok(Dynamic::UNIT)
+    } else if host.is_inline_dialogue_active() {
+        let handle = host.next_animation_id(kind);
+        let (done_tx, done_rx) = mpsc::channel();
+        host.set_inline_current_handle(Some(handle.clone()));
+        host.send(build(Some(handle), Some(done_tx)))?;
+        let response = done_rx
+            .recv()
+            .map_err(|err| runtime_error(format!("engine stopped while waiting for command: {err}")));
+        host.set_inline_current_handle(None);
+        match response? {
+            ScriptResponse::Continue => Ok(Dynamic::UNIT),
+            ScriptResponse::Choice(_) => Err(runtime_error("engine returned unexpected choice response")),
+        }
     } else {
         host.send_continue(|done| build(None, Some(done)))?;
         Ok(Dynamic::UNIT)
-    }
-}
-
-fn run_handle_command<F>(
-    host: &ScriptHost,
-    kind: &str,
-    build: F,
-) -> Result<String, Box<EvalAltResult>>
-where
-    F: FnOnce(Option<String>, Option<mpsc::Sender<ScriptResponse>>) -> ScriptCommand,
-{
-    if host.is_batch_mode() {
-        host.collect_command(kind, build)
-    } else {
-        let handle = host.next_animation_id(kind);
-        let (done_tx, _done_rx) = mpsc::channel();
-        host.send(build(Some(handle.clone()), Some(done_tx)))?;
-        Ok(handle)
     }
 }
 

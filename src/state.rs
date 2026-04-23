@@ -47,13 +47,24 @@ pub struct DialogueSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TextEffectSnapshot {
+    pub mode: String,
+    pub cps: f32,
+    pub fade_seconds: f32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
     pub background: Option<ImageLayerSnapshot>,
     #[serde(default)]
     pub sprites: Vec<SpriteSnapshot>,
+    #[serde(default)]
+    pub character_positions: BTreeMap<String, [f32; 2]>,
     pub overlay_alpha: f32,
     pub bgm: Option<AudioSnapshot>,
     pub dialogue: Option<DialogueSnapshot>,
+    #[serde(default)]
+    pub text_effect: TextEffectSnapshot,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

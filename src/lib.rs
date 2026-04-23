@@ -21,6 +21,7 @@ use bevy::{
 use effect::CustomScreenEffectMaterial;
 use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake,
+    animate_dialogue_text_reveal,
     apply_animation_cancellations,
     animate_character_motion_effects, animate_custom_effects, animate_rule_transitions,
     animate_visual_tweens, handle_choice_buttons,
@@ -104,6 +105,7 @@ pub fn run_app(config: RuntimeLaunchConfig) {
                 handle_screen_buttons,
                 handle_choice_buttons,
                 handle_choice_keyboard,
+                animate_dialogue_text_reveal,
                 advance_dialogue_on_input,
                 tick_pending_waits,
             ),
