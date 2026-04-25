@@ -9,9 +9,11 @@ use std::{
 
 use bevy::{log::error, math::{Vec2, Vec4}, prelude::Resource};
 use rhai::{
-    Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, INT, ImmutableString,
+    Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, INT, ImmutableString, Map,
     NativeCallContext, Position, FnPtr,
 };
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
 
 use crate::{
     character::load_character_catalog,
@@ -100,6 +102,13 @@ pub enum ScriptCommand {
     ShowScreen {
         screen: ScreenSpec,
         done: mpsc::Sender<ScriptResponse>,
+    },
+    ShowOverlay {
+        name: String,
+        screen: ScreenSpec,
+    },
+    HideOverlay {
+        name: String,
     },
     Choose {
         prompt: String,
@@ -241,11 +250,15 @@ pub struct BatchSubmissionItem {
     pub command: Box<ScriptCommand>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DialogueTextEffectSpec {
+    #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
     pub cps: Option<f32>,
+    #[serde(default)]
     pub fade_seconds: Option<f32>,
+    #[serde(default)]
     pub fade_ms: Option<f32>,
 }
 
@@ -266,49 +279,19 @@ pub enum CharacterEase {
     Bounce,
 }
 
-#[derive(Debug, Clone)]
-pub struct CharacterAnimationKeyframeInput {
-    pub time: f32,
-    pub x: Option<f32>,
-    pub y: Option<f32>,
-    pub dx: Option<f32>,
-    pub dy: Option<f32>,
-    pub ease: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ScriptEffectOptions {
-    pub from_path: Option<String>,
-    pub to_path: Option<String>,
-    pub rule_path: Option<String>,
-    pub aux0_path: Option<String>,
-    pub aux1_path: Option<String>,
-    pub duration: Duration,
-    pub mode: f32,
-    pub p0: Vec4,
-    pub p1: Vec4,
-    pub p2: Vec4,
-    pub p3: Vec4,
-    pub commit_to_bg: bool,
-}
-
-impl Default for ScriptEffectOptions {
-    fn default() -> Self {
-        Self {
-            from_path: None,
-            to_path: None,
-            rule_path: None,
-            aux0_path: None,
-            aux1_path: None,
-            duration: Duration::from_millis(0),
-            mode: 0.0,
-            p0: Vec4::ZERO,
-            p1: Vec4::ZERO,
-            p2: Vec4::ZERO,
-            p3: Vec4::ZERO,
-            commit_to_bg: false,
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct CharacterAnimationKeyframeInput {
+    time: f32,
+    #[serde(default)]
+    x: Option<f32>,
+    #[serde(default)]
+    y: Option<f32>,
+    #[serde(default)]
+    dx: Option<f32>,
+    #[serde(default)]
+    dy: Option<f32>,
+    #[serde(default)]
+    ease: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -910,8 +893,6 @@ fn run_script_loop(host: ScriptHost, startup_script: String) {
 }
 
 fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
-    register_typed_data_api(engine);
-
     let log_host = host.clone();
     engine.register_fn("log", move |message: ImmutableString| {
         let _ = log_host.send(ScriptCommand::Log(message.to_string()));
@@ -1082,8 +1063,8 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     let effect_host = host.clone();
     engine.register_fn(
         "effect",
-        move |options: ScriptEffectOptions| -> Result<Dynamic, Box<EvalAltResult>> {
-            let options = resolve_custom_effect_options(&effect_host, options)?;
+        move |options: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+            let options = parse_custom_effect_options(&effect_host, options)?;
             run_blocking_or_collected(&effect_host, "effect", |animation_id, done| ScriptCommand::PlayCustomEffect {
                 options,
                 animation_id,
@@ -1665,14 +1646,49 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     let screen_host = host.clone();
     engine.register_fn(
         "screen",
-        move |mut screen: ScreenSpec| -> Result<Dynamic, Box<EvalAltResult>> {
-            resolve_screen_spec_paths(&screen_host, &mut screen);
+        move |screen: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+            let screen = parse_screen_spec(&screen_host, screen)?;
             match screen_host.send_and_wait(|done| ScriptCommand::ShowScreen { screen, done })? {
                 ScriptResponse::Choice(value) => Ok(stored_value_to_dynamic(value)),
                 ScriptResponse::Continue => Err(runtime_error("engine returned unexpected continue response")),
             }
         },
     );
+
+    let overlay_host = host.clone();
+    engine.register_fn(
+        "show_overlay",
+        move |name: ImmutableString, screen: Map| -> Result<(), Box<EvalAltResult>> {
+            let screen = parse_screen_spec(&overlay_host, screen)?;
+            overlay_host.send(ScriptCommand::ShowOverlay {
+                name: name.to_string(),
+                screen,
+            })
+        },
+    );
+
+    let default_overlay_host = host.clone();
+    engine.register_fn("show_overlay", move |screen: Map| -> Result<(), Box<EvalAltResult>> {
+        let screen = parse_screen_spec(&default_overlay_host, screen)?;
+        default_overlay_host.send(ScriptCommand::ShowOverlay {
+            name: "default".to_string(),
+            screen,
+        })
+    });
+
+    let hide_overlay_host = host.clone();
+    engine.register_fn("hide_overlay", move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+        hide_overlay_host.send(ScriptCommand::HideOverlay {
+            name: name.to_string(),
+        })
+    });
+
+    let hide_default_overlay_host = host.clone();
+    engine.register_fn("hide_overlay", move || -> Result<(), Box<EvalAltResult>> {
+        hide_default_overlay_host.send(ScriptCommand::HideOverlay {
+            name: "default".to_string(),
+        })
+    });
 
     let prompt_choice_host = host.clone();
     engine.register_fn(
@@ -1737,7 +1753,8 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     );
 
     let ui_style_host = host.clone();
-    engine.register_fn("set_ui_style", move |style: UiStylePatch| -> Result<(), Box<EvalAltResult>> {
+    engine.register_fn("set_ui_style", move |options: Map| -> Result<(), Box<EvalAltResult>> {
+        let style = parse_ui_style_patch(options)?;
         ui_style_host.send(ScriptCommand::ApplyUiStyle(style))
     });
 
@@ -1747,7 +1764,8 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     });
 
     let text_effect_host = host.clone();
-    engine.register_fn("set_text_effect", move |effect: DialogueTextEffectSpec| -> Result<(), Box<EvalAltResult>> {
+    engine.register_fn("set_text_effect", move |options: Map| -> Result<(), Box<EvalAltResult>> {
+        let effect = parse_text_effect_spec(options)?;
         text_effect_host.send(ScriptCommand::SetTextEffect(effect))
     });
 
@@ -1864,582 +1882,6 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     engine.register_fn("current_script", move || -> String {
         current_script_host.current_script_path()
     });
-}
-
-fn register_typed_data_api(engine: &mut RhaiEngine) {
-    engine
-        .register_type_with_name::<UiStylePatch>("UiStylePatch")
-        .register_type_with_name::<DialogueTextEffectSpec>("TextEffectSpec")
-        .register_type_with_name::<ChoiceOption>("ChoiceOption")
-        .register_type_with_name::<ScreenSpec>("ScreenSpec")
-        .register_type_with_name::<ScreenNode>("ScreenNode")
-        .register_type_with_name::<CharacterAnimationKeyframeInput>("CharacterKeyframe")
-        .register_type_with_name::<ScriptEffectOptions>("EffectOptions")
-        .register_fn("ui_style", UiStylePatch::default)
-        .register_fn("text_effect", text_effect_spec)
-        .register_fn("choice_option", choice_option_string)
-        .register_fn("choice_option", choice_option_dynamic)
-        .register_fn("screen_spec", screen_spec_from_children)
-        .register_fn("screen_panel", screen_panel_spec)
-        .register_fn("set_panel", |screen: &mut ScreenSpec, value: bool| screen.panel = value)
-        .register_fn("set_title", |screen: &mut ScreenSpec, title: ImmutableString| screen.title = Some(title.to_string()))
-        .register_fn("set_width", |screen: &mut ScreenSpec, width: FLOAT| screen.width = Some(width as f32))
-        .register_fn("set_padding", |screen: &mut ScreenSpec, padding: FLOAT| screen.padding = padding as f32)
-        .register_fn("set_gap", |screen: &mut ScreenSpec, gap: FLOAT| screen.gap = gap as f32)
-        .register_fn("set_background", |screen: &mut ScreenSpec, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            screen.background = Some(array_to_rgba(rgba)?);
-            Ok(())
-        })
-        .register_fn("set_border", |screen: &mut ScreenSpec, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            screen.border = Some(array_to_rgba(rgba)?);
-            Ok(())
-        })
-        .register_fn("set_background_image", |screen: &mut ScreenSpec, path: ImmutableString| {
-            screen.background_image = Some(path.to_string());
-        })
-        .register_fn("set_overlay", |screen: &mut ScreenSpec, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            screen.overlay = Some(array_to_rgba(rgba)?);
-            Ok(())
-        })
-        .register_fn("text_node", text_node)
-        .register_fn("button_node", button_node_string)
-        .register_fn("button_node", button_node_dynamic)
-        .register_fn("image_node", image_node)
-        .register_fn("bar_node", bar_node)
-        .register_fn("spacer_node", spacer_node)
-        .register_fn("vbox_node", vbox_node)
-        .register_fn("hbox_node", hbox_node)
-        .register_fn("frame_node", frame_node)
-        .register_fn("set_text", |node: &mut ScreenNode, text: ImmutableString| set_node_text(node, text.to_string()))
-        .register_fn("set_size", |node: &mut ScreenNode, size: FLOAT| set_node_size(node, size as f32))
-        .register_fn("set_color", |node: &mut ScreenNode, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            set_node_color(node, array_to_rgba(rgba)?);
-            Ok(())
-        })
-        .register_fn("set_background", |node: &mut ScreenNode, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            set_node_background(node, array_to_rgba(rgba)?);
-            Ok(())
-        })
-        .register_fn("set_hovered_background", |node: &mut ScreenNode, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            if let ScreenNode::Button(button) = node {
-                button.hovered_background = Some(array_to_rgba(rgba)?);
-            }
-            Ok(())
-        })
-        .register_fn("set_pressed_background", |node: &mut ScreenNode, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            if let ScreenNode::Button(button) = node {
-                button.pressed_background = Some(array_to_rgba(rgba)?);
-            }
-            Ok(())
-        })
-        .register_fn("set_border", |node: &mut ScreenNode, rgba: Array| -> Result<(), Box<EvalAltResult>> {
-            set_node_border(node, array_to_rgba(rgba)?);
-            Ok(())
-        })
-        .register_fn("set_width", |node: &mut ScreenNode, width: FLOAT| set_node_layout(node, |layout| layout.width = Some(width as f32)))
-        .register_fn("set_height", |node: &mut ScreenNode, height: FLOAT| set_node_layout(node, |layout| layout.height = Some(height as f32)))
-        .register_fn("set_width_percent", |node: &mut ScreenNode, width: FLOAT| set_node_layout(node, |layout| layout.width_percent = Some(width as f32)))
-        .register_fn("set_height_percent", |node: &mut ScreenNode, height: FLOAT| set_node_layout(node, |layout| layout.height_percent = Some(height as f32)))
-        .register_fn("set_left", |node: &mut ScreenNode, left: FLOAT| set_node_layout(node, |layout| layout.left = Some(left as f32)))
-        .register_fn("set_right", |node: &mut ScreenNode, right: FLOAT| set_node_layout(node, |layout| layout.right = Some(right as f32)))
-        .register_fn("set_top", |node: &mut ScreenNode, top: FLOAT| set_node_layout(node, |layout| layout.top = Some(top as f32)))
-        .register_fn("set_bottom", |node: &mut ScreenNode, bottom: FLOAT| set_node_layout(node, |layout| layout.bottom = Some(bottom as f32)))
-        .register_fn("set_align", |node: &mut ScreenNode, align: FLOAT| set_node_align(node, align as f32))
-        .register_fn("set_gap", |node: &mut ScreenNode, gap: FLOAT| set_container_gap(node, gap as f32))
-        .register_fn("set_justify", |node: &mut ScreenNode, justify: ImmutableString| set_container_justify(node, justify.to_string()))
-        .register_fn("set_align_items", |node: &mut ScreenNode, align: ImmutableString| set_container_align_items(node, align.to_string()))
-        .register_fn("set_padding", |node: &mut ScreenNode, padding: FLOAT| set_node_padding(node, padding as f32))
-        .register_fn("set_button_padding", |node: &mut ScreenNode, x: FLOAT, y: FLOAT| set_button_padding(node, x as f32, y as f32))
-        .register_fn("set_button_border_width", |node: &mut ScreenNode, width: FLOAT| set_button_border_width(node, width as f32))
-        .register_fn("set_button_radius", |node: &mut ScreenNode, radius: FLOAT| set_button_radius(node, radius as f32))
-        .register_fn("style_color", style_color)
-        .register_fn("style_number", style_number)
-        .register_fn("style_bool", style_bool)
-        .register_fn("keyframe", keyframe)
-        .register_fn("keyframe_xy", keyframe_xy)
-        .register_fn("keyframe_delta", keyframe_delta)
-        .register_fn("effect_options", effect_options)
-        .register_fn("effect_path", effect_path)
-        .register_fn("effect_number", effect_number)
-        .register_fn("effect_bool", effect_bool)
-        .register_fn("effect_vec4", effect_vec4);
-}
-
-fn text_effect_spec(mode: ImmutableString) -> DialogueTextEffectSpec {
-    DialogueTextEffectSpec {
-        mode: Some(mode.to_string()),
-        ..Default::default()
-    }
-}
-
-fn choice_option_string(text: ImmutableString, value: ImmutableString) -> ChoiceOption {
-    ChoiceOption {
-        text: text.to_string(),
-        value: StoredValue::String(value.to_string()),
-    }
-}
-
-fn choice_option_dynamic(text: ImmutableString, value: Dynamic) -> Result<ChoiceOption, Box<EvalAltResult>> {
-    Ok(ChoiceOption {
-        text: text.to_string(),
-        value: dynamic_to_stored_value(value)?,
-    })
-}
-
-fn screen_spec_from_children(children: Array) -> Result<ScreenSpec, Box<EvalAltResult>> {
-    Ok(ScreenSpec {
-        children: screen_nodes_from_array(children)?,
-        ..default_screen_spec()
-    })
-}
-
-fn screen_panel_spec(width: FLOAT, background_image: ImmutableString, children: Array) -> Result<ScreenSpec, Box<EvalAltResult>> {
-    Ok(ScreenSpec {
-        width: Some(width as f32),
-        background_image: Some(background_image.to_string()),
-        children: screen_nodes_from_array(children)?,
-        ..default_screen_spec()
-    })
-}
-
-fn default_screen_spec() -> ScreenSpec {
-    ScreenSpec {
-        title: None,
-        panel: true,
-        width: None,
-        background_image: None,
-        xalign: 0.5,
-        yalign: 0.5,
-        padding: 24.0,
-        gap: 16.0,
-        overlay: None,
-        background: None,
-        border: None,
-        children: Vec::new(),
-    }
-}
-
-fn screen_nodes_from_array(children: Array) -> Result<Vec<ScreenNode>, Box<EvalAltResult>> {
-    children
-        .into_iter()
-        .map(|value| {
-            value
-                .try_cast::<ScreenNode>()
-                .ok_or_else(|| runtime_error("screen children must be ScreenNode values from *_node(...)"))
-        })
-        .collect()
-}
-
-fn text_node(text: ImmutableString, size: FLOAT) -> ScreenNode {
-    ScreenNode::Text(TextNode {
-        text: text.to_string(),
-        size: size as f32,
-        color: None,
-        align: None,
-        layout: ScreenLayout::default(),
-    })
-}
-
-fn button_node_string(text: ImmutableString, value: ImmutableString) -> ScreenNode {
-    ScreenNode::Button(ButtonNode {
-        text: text.to_string(),
-        value: StoredValue::String(value.to_string()),
-        size: 28.0,
-        color: None,
-        background: None,
-        border: None,
-        hovered_background: None,
-        pressed_background: None,
-        align: None,
-        padding_x: None,
-        padding_y: None,
-        border_width: None,
-        radius: None,
-        layout: ScreenLayout::default(),
-    })
-}
-
-fn button_node_dynamic(text: ImmutableString, value: Dynamic) -> Result<ScreenNode, Box<EvalAltResult>> {
-    let mut node = button_node_string(text, "".into());
-    if let ScreenNode::Button(button) = &mut node {
-        button.value = dynamic_to_stored_value(value)?;
-    }
-    Ok(node)
-}
-
-fn image_node(path: ImmutableString) -> ScreenNode {
-    ScreenNode::Image(ScreenImageNode {
-        path: path.to_string(),
-        layout: ScreenLayout::default(),
-    })
-}
-
-fn bar_node(value: FLOAT, width: FLOAT, height: FLOAT) -> ScreenNode {
-    ScreenNode::Bar(BarNode {
-        value: value as f32,
-        min: 0.0,
-        max: 1.0,
-        width: width as f32,
-        height: height as f32,
-        background: None,
-        fill: None,
-        border: None,
-    })
-}
-
-fn spacer_node(height: FLOAT) -> ScreenNode {
-    ScreenNode::Spacer(SpacerNode {
-        width: 0.0,
-        height: height as f32,
-    })
-}
-
-fn vbox_node(children: Array) -> Result<ScreenNode, Box<EvalAltResult>> {
-    Ok(ScreenNode::Column(container_node(children)?))
-}
-
-fn hbox_node(children: Array) -> Result<ScreenNode, Box<EvalAltResult>> {
-    Ok(ScreenNode::Row(container_node(children)?))
-}
-
-fn frame_node(children: Array) -> Result<ScreenNode, Box<EvalAltResult>> {
-    vbox_node(children)
-}
-
-fn container_node(children: Array) -> Result<ContainerNode, Box<EvalAltResult>> {
-    Ok(ContainerNode {
-        gap: 12.0,
-        padding: 0.0,
-        background: None,
-        border: None,
-        justify: None,
-        align_items: None,
-        layout: ScreenLayout::default(),
-        children: screen_nodes_from_array(children)?,
-    })
-}
-
-fn set_node_text(node: &mut ScreenNode, text: String) {
-    match node {
-        ScreenNode::Text(text_node) => text_node.text = text,
-        ScreenNode::Button(button) => button.text = text,
-        _ => {}
-    }
-}
-
-fn set_node_size(node: &mut ScreenNode, size: f32) {
-    match node {
-        ScreenNode::Text(text) => text.size = size,
-        ScreenNode::Button(button) => button.size = size,
-        _ => {}
-    }
-}
-
-fn set_node_color(node: &mut ScreenNode, color: [f32; 4]) {
-    match node {
-        ScreenNode::Text(text) => text.color = Some(color),
-        ScreenNode::Button(button) => button.color = Some(color),
-        ScreenNode::Bar(bar) => bar.fill = Some(color),
-        _ => {}
-    }
-}
-
-fn set_node_background(node: &mut ScreenNode, color: [f32; 4]) {
-    match node {
-        ScreenNode::Button(button) => button.background = Some(color),
-        ScreenNode::Bar(bar) => bar.background = Some(color),
-        ScreenNode::Row(container) | ScreenNode::Column(container) => container.background = Some(color),
-        _ => {}
-    }
-}
-
-fn set_node_border(node: &mut ScreenNode, color: [f32; 4]) {
-    match node {
-        ScreenNode::Button(button) => button.border = Some(color),
-        ScreenNode::Bar(bar) => bar.border = Some(color),
-        ScreenNode::Row(container) | ScreenNode::Column(container) => container.border = Some(color),
-        _ => {}
-    }
-}
-
-fn set_node_layout<F>(node: &mut ScreenNode, update: F)
-where
-    F: FnOnce(&mut ScreenLayout),
-{
-    match node {
-        ScreenNode::Text(text) => update(&mut text.layout),
-        ScreenNode::Button(button) => update(&mut button.layout),
-        ScreenNode::Image(image) => update(&mut image.layout),
-        ScreenNode::Row(container) | ScreenNode::Column(container) => update(&mut container.layout),
-        _ => {}
-    }
-}
-
-fn set_node_align(node: &mut ScreenNode, align: f32) {
-    match node {
-        ScreenNode::Text(text) => text.align = Some(align),
-        ScreenNode::Button(button) => button.align = Some(align),
-        _ => {}
-    }
-}
-
-fn set_container_gap(node: &mut ScreenNode, gap: f32) {
-    if let ScreenNode::Row(container) | ScreenNode::Column(container) = node {
-        container.gap = gap;
-    }
-}
-
-fn set_container_justify(node: &mut ScreenNode, justify: String) {
-    if let ScreenNode::Row(container) | ScreenNode::Column(container) = node {
-        container.justify = Some(justify);
-    }
-}
-
-fn set_container_align_items(node: &mut ScreenNode, align: String) {
-    if let ScreenNode::Row(container) | ScreenNode::Column(container) = node {
-        container.align_items = Some(align);
-    }
-}
-
-fn set_node_padding(node: &mut ScreenNode, padding: f32) {
-    if let ScreenNode::Row(container) | ScreenNode::Column(container) = node {
-        container.padding = padding;
-    }
-}
-
-fn set_button_padding(node: &mut ScreenNode, x: f32, y: f32) {
-    if let ScreenNode::Button(button) = node {
-        button.padding_x = Some(x);
-        button.padding_y = Some(y);
-    }
-}
-
-fn set_button_border_width(node: &mut ScreenNode, width: f32) {
-    if let ScreenNode::Button(button) = node {
-        button.border_width = Some(width);
-    }
-}
-
-fn set_button_radius(node: &mut ScreenNode, radius: f32) {
-    if let ScreenNode::Button(button) = node {
-        button.radius = Some(radius);
-    }
-}
-
-fn style_color(style: &mut UiStylePatch, key: ImmutableString, rgba: Array) -> Result<(), Box<EvalAltResult>> {
-    let color = array_to_rgba(rgba)?;
-    match key.as_str() {
-        "dialogue_bg" => style.dialogue_bg = Some(color),
-        "dialogue_border" => style.dialogue_border = Some(color),
-        "speaker_color" => style.speaker_color = Some(color),
-        "line_color" => style.line_color = Some(color),
-        "hint_color" => style.hint_color = Some(color),
-        "choice_panel_bg" => style.choice_panel_bg = Some(color),
-        "choice_prompt_color" => style.choice_prompt_color = Some(color),
-        "choice_button_bg" => style.choice_button_bg = Some(color),
-        "choice_button_hovered" => style.choice_button_hovered = Some(color),
-        "choice_button_pressed" => style.choice_button_pressed = Some(color),
-        "choice_button_border" => style.choice_button_border = Some(color),
-        "choice_text_color" => style.choice_text_color = Some(color),
-        "quick_menu_bg" => style.quick_menu_bg = Some(color),
-        "quick_button_bg" => style.quick_button_bg = Some(color),
-        "quick_button_hovered" => style.quick_button_hovered = Some(color),
-        "quick_button_pressed" => style.quick_button_pressed = Some(color),
-        "quick_button_border" => style.quick_button_border = Some(color),
-        "quick_text_color" => style.quick_text_color = Some(color),
-        other => return Err(runtime_error(format!("unknown ui style color `{other}`"))),
-    }
-    Ok(())
-}
-
-fn style_number(style: &mut UiStylePatch, key: ImmutableString, value: FLOAT) -> Result<(), Box<EvalAltResult>> {
-    let value = value as f32;
-    match key.as_str() {
-        "dialogue_left" => style.dialogue_left = Some(value),
-        "dialogue_right" => style.dialogue_right = Some(value),
-        "dialogue_bottom" => style.dialogue_bottom = Some(value),
-        "dialogue_min_height" => style.dialogue_min_height = Some(value),
-        "dialogue_padding_x" => style.dialogue_padding_x = Some(value),
-        "dialogue_padding_y" => style.dialogue_padding_y = Some(value),
-        "dialogue_radius" => style.dialogue_radius = Some(value),
-        "speaker_size" => style.speaker_size = Some(value),
-        "line_size" => style.line_size = Some(value),
-        "hint_size" => style.hint_size = Some(value),
-        "choice_bottom" => style.choice_bottom = Some(value),
-        "choice_panel_width" => style.choice_panel_width = Some(value),
-        "choice_padding" => style.choice_padding = Some(value),
-        "choice_gap" => style.choice_gap = Some(value),
-        "choice_prompt_size" => style.choice_prompt_size = Some(value),
-        "choice_button_size" => style.choice_button_size = Some(value),
-        "quick_menu_bottom" => style.quick_menu_bottom = Some(value),
-        "quick_menu_gap" => style.quick_menu_gap = Some(value),
-        "quick_button_size" => style.quick_button_size = Some(value),
-        other => return Err(runtime_error(format!("unknown ui style number `{other}`"))),
-    }
-    Ok(())
-}
-
-fn style_bool(style: &mut UiStylePatch, key: ImmutableString, value: bool) -> Result<(), Box<EvalAltResult>> {
-    match key.as_str() {
-        "hint_visible" => style.hint_visible = Some(value),
-        "choice_center_text" => style.choice_center_text = Some(value),
-        "choice_show_indices" => style.choice_show_indices = Some(value),
-        other => return Err(runtime_error(format!("unknown ui style bool `{other}`"))),
-    }
-    Ok(())
-}
-
-fn keyframe(time: FLOAT) -> CharacterAnimationKeyframeInput {
-    CharacterAnimationKeyframeInput {
-        time: time as f32,
-        x: None,
-        y: None,
-        dx: None,
-        dy: None,
-        ease: None,
-    }
-}
-
-fn keyframe_xy(time: FLOAT, x: FLOAT, y: FLOAT, ease: ImmutableString) -> CharacterAnimationKeyframeInput {
-    CharacterAnimationKeyframeInput {
-        time: time as f32,
-        x: Some(x as f32),
-        y: Some(y as f32),
-        dx: None,
-        dy: None,
-        ease: Some(ease.to_string()),
-    }
-}
-
-fn keyframe_delta(time: FLOAT, dx: FLOAT, dy: FLOAT, ease: ImmutableString) -> CharacterAnimationKeyframeInput {
-    CharacterAnimationKeyframeInput {
-        time: time as f32,
-        x: None,
-        y: None,
-        dx: Some(dx as f32),
-        dy: Some(dy as f32),
-        ease: Some(ease.to_string()),
-    }
-}
-
-fn effect_options(ms: i64) -> Result<ScriptEffectOptions, Box<EvalAltResult>> {
-    Ok(ScriptEffectOptions {
-        duration: duration_from_millis(ms)?,
-        ..Default::default()
-    })
-}
-
-fn effect_path(options: &mut ScriptEffectOptions, key: ImmutableString, path: ImmutableString) -> Result<(), Box<EvalAltResult>> {
-    match key.as_str() {
-        "from" => options.from_path = Some(path.to_string()),
-        "to" => options.to_path = Some(path.to_string()),
-        "rule" => options.rule_path = Some(path.to_string()),
-        "tex0" => options.aux0_path = Some(path.to_string()),
-        "tex1" => options.aux1_path = Some(path.to_string()),
-        other => return Err(runtime_error(format!("unknown effect path `{other}`"))),
-    }
-    Ok(())
-}
-
-fn effect_number(options: &mut ScriptEffectOptions, key: ImmutableString, value: FLOAT) -> Result<(), Box<EvalAltResult>> {
-    match key.as_str() {
-        "mode" => options.mode = value as f32,
-        other => return Err(runtime_error(format!("unknown effect number `{other}`"))),
-    }
-    Ok(())
-}
-
-fn effect_bool(options: &mut ScriptEffectOptions, key: ImmutableString, value: bool) -> Result<(), Box<EvalAltResult>> {
-    match key.as_str() {
-        "commit_to_bg" => options.commit_to_bg = value,
-        other => return Err(runtime_error(format!("unknown effect bool `{other}`"))),
-    }
-    Ok(())
-}
-
-fn effect_vec4(options: &mut ScriptEffectOptions, key: ImmutableString, value: Array) -> Result<(), Box<EvalAltResult>> {
-    let value = array_to_vec4(value)?;
-    match key.as_str() {
-        "p0" => options.p0 = value,
-        "p1" => options.p1 = value,
-        "p2" => options.p2 = value,
-        "p3" => options.p3 = value,
-        other => return Err(runtime_error(format!("unknown effect vec4 `{other}`"))),
-    }
-    Ok(())
-}
-
-fn array_to_rgba(array: Array) -> Result<[f32; 4], Box<EvalAltResult>> {
-    if array.len() != 3 && array.len() != 4 {
-        return Err(runtime_error("rgba arrays must contain three or four numbers"));
-    }
-    let mut values = [0.0, 0.0, 0.0, 1.0];
-    for (index, value) in array.into_iter().enumerate() {
-        values[index] = dynamic_to_f32(value)?;
-    }
-    Ok(values)
-}
-
-fn array_to_vec4(array: Array) -> Result<Vec4, Box<EvalAltResult>> {
-    if array.len() != 4 {
-        return Err(runtime_error("vec4 arrays must contain four numbers"));
-    }
-    let mut values = [0.0; 4];
-    for (index, value) in array.into_iter().enumerate() {
-        values[index] = dynamic_to_f32(value)?;
-    }
-    Ok(Vec4::new(values[0], values[1], values[2], values[3]))
-}
-
-fn resolve_custom_effect_options(
-    host: &ScriptHost,
-    options: ScriptEffectOptions,
-) -> Result<CustomEffectOptions, Box<EvalAltResult>> {
-    let current_background = host.current_background_path();
-    let from_path = options
-        .from_path
-        .or_else(|| current_background.clone())
-        .ok_or_else(|| runtime_error("effect options require `from` or an existing background"))?;
-    let to_path = options.to_path.unwrap_or_else(|| from_path.clone());
-    let rule_path = options.rule_path.unwrap_or_else(|| from_path.clone());
-    let aux0_path = options.aux0_path.unwrap_or_else(|| from_path.clone());
-    let aux1_path = options.aux1_path.unwrap_or_else(|| from_path.clone());
-
-    Ok(CustomEffectOptions {
-        from_path: host.resolve_path(&from_path),
-        to_path: host.resolve_path(&to_path),
-        rule_path: host.resolve_path(&rule_path),
-        aux0_path: host.resolve_path(&aux0_path),
-        aux1_path: host.resolve_path(&aux1_path),
-        duration: options.duration,
-        mode: options.mode,
-        p0: options.p0,
-        p1: options.p1,
-        p2: options.p2,
-        p3: options.p3,
-        commit_to_bg: options.commit_to_bg,
-    })
-}
-
-fn resolve_screen_spec_paths(host: &ScriptHost, screen: &mut ScreenSpec) {
-    if let Some(path) = screen.background_image.as_mut() {
-        *path = host.resolve_path(path);
-    }
-    for child in &mut screen.children {
-        resolve_screen_node_paths(host, child);
-    }
-}
-
-fn resolve_screen_node_paths(host: &ScriptHost, node: &mut ScreenNode) {
-    match node {
-        ScreenNode::Image(image) => image.path = host.resolve_path(&image.path),
-        ScreenNode::Row(container) | ScreenNode::Column(container) => {
-            for child in &mut container.children {
-                resolve_screen_node_paths(host, child);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn extract_script_flow_action(error: &EvalAltResult) -> Option<ScriptFlowAction> {
@@ -2660,6 +2102,311 @@ fn find_inline_command_end(text: &str, start: usize) -> Result<usize, Box<EvalAl
     Err(runtime_error("unterminated inline dialogue command"))
 }
 
+fn parse_ui_style_patch(mut options: Map) -> Result<UiStylePatch, Box<EvalAltResult>> {
+    let patch = UiStylePatch {
+        dialogue_bg: take_optional_rgba(&mut options, "dialogue_bg")?,
+        dialogue_border: take_optional_rgba(&mut options, "dialogue_border")?,
+        dialogue_left: take_optional_number(&mut options, "dialogue_left")?.map(|value| value as f32),
+        dialogue_right: take_optional_number(&mut options, "dialogue_right")?.map(|value| value as f32),
+        dialogue_bottom: take_optional_number(&mut options, "dialogue_bottom")?.map(|value| value as f32),
+        dialogue_min_height: take_optional_number(&mut options, "dialogue_min_height")?.map(|value| value as f32),
+        dialogue_padding_x: take_optional_number(&mut options, "dialogue_padding_x")?.map(|value| value as f32),
+        dialogue_padding_y: take_optional_number(&mut options, "dialogue_padding_y")?.map(|value| value as f32),
+        dialogue_radius: take_optional_number(&mut options, "dialogue_radius")?.map(|value| value as f32),
+        speaker_size: take_optional_number(&mut options, "speaker_size")?.map(|value| value as f32),
+        line_size: take_optional_number(&mut options, "line_size")?.map(|value| value as f32),
+        hint_size: take_optional_number(&mut options, "hint_size")?.map(|value| value as f32),
+        hint_visible: take_optional_bool(&mut options, "hint_visible")?,
+        speaker_color: take_optional_rgba(&mut options, "speaker_color")?,
+        line_color: take_optional_rgba(&mut options, "line_color")?,
+        hint_color: take_optional_rgba(&mut options, "hint_color")?,
+        choice_panel_bg: take_optional_rgba(&mut options, "choice_panel_bg")?,
+        choice_bottom: take_optional_number(&mut options, "choice_bottom")?.map(|value| value as f32),
+        choice_panel_width: take_optional_number(&mut options, "choice_panel_width")?.map(|value| value as f32),
+        choice_padding: take_optional_number(&mut options, "choice_padding")?.map(|value| value as f32),
+        choice_gap: take_optional_number(&mut options, "choice_gap")?.map(|value| value as f32),
+        choice_prompt_size: take_optional_number(&mut options, "choice_prompt_size")?.map(|value| value as f32),
+        choice_button_size: take_optional_number(&mut options, "choice_button_size")?.map(|value| value as f32),
+        choice_center_text: take_optional_bool(&mut options, "choice_center_text")?,
+        choice_show_indices: take_optional_bool(&mut options, "choice_show_indices")?,
+        choice_prompt_color: take_optional_rgba(&mut options, "choice_prompt_color")?,
+        choice_button_bg: take_optional_rgba(&mut options, "choice_button_bg")?,
+        choice_button_hovered: take_optional_rgba(&mut options, "choice_button_hovered")?,
+        choice_button_pressed: take_optional_rgba(&mut options, "choice_button_pressed")?,
+        choice_button_border: take_optional_rgba(&mut options, "choice_button_border")?,
+        choice_text_color: take_optional_rgba(&mut options, "choice_text_color")?,
+        quick_menu_bottom: take_optional_number(&mut options, "quick_menu_bottom")?.map(|value| value as f32),
+        quick_menu_gap: take_optional_number(&mut options, "quick_menu_gap")?.map(|value| value as f32),
+        quick_button_size: take_optional_number(&mut options, "quick_button_size")?.map(|value| value as f32),
+        quick_menu_bg: take_optional_rgba(&mut options, "quick_menu_bg")?,
+        quick_button_bg: take_optional_rgba(&mut options, "quick_button_bg")?,
+        quick_button_hovered: take_optional_rgba(&mut options, "quick_button_hovered")?,
+        quick_button_pressed: take_optional_rgba(&mut options, "quick_button_pressed")?,
+        quick_button_border: take_optional_rgba(&mut options, "quick_button_border")?,
+        quick_text_color: take_optional_rgba(&mut options, "quick_text_color")?,
+    };
+
+    if !options.is_empty() {
+        let unknown = options.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(runtime_error(format!("unknown ui style option(s): {unknown}")));
+    }
+
+    Ok(patch)
+}
+
+fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, Box<EvalAltResult>> {
+    let title = take_optional_string(&mut screen, "title");
+    let panel = take_optional_bool(&mut screen, "panel")?.unwrap_or(true);
+    let width = take_optional_number(&mut screen, "width")?;
+    let background_image = take_optional_string(&mut screen, "background_image")
+        .map(|path| host.resolve_path(&path));
+    let xalign = take_optional_number(&mut screen, "xalign")?.unwrap_or(0.5);
+    let yalign = take_optional_number(&mut screen, "yalign")?.unwrap_or(0.5);
+    let padding = take_optional_number(&mut screen, "padding")?.unwrap_or(24.0);
+    let gap = take_optional_number(&mut screen, "gap")?.unwrap_or(16.0);
+    let overlay = take_optional_rgba(&mut screen, "overlay")?;
+    let background = take_optional_rgba(&mut screen, "background")?;
+    let border = take_optional_rgba(&mut screen, "border")?;
+    let children = take_required_array(&mut screen, "children")?
+        .into_iter()
+        .map(|node| parse_screen_node(host, node))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !screen.is_empty() {
+        let unknown = screen.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(runtime_error(format!("unknown screen option(s): {unknown}")));
+    }
+
+    Ok(ScreenSpec {
+        title,
+        panel,
+        width: width.map(|value| value as f32),
+        background_image,
+        xalign: xalign as f32,
+        yalign: yalign as f32,
+        padding: padding as f32,
+        gap: gap as f32,
+        overlay,
+        background,
+        border,
+        children,
+    })
+}
+
+fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Box<EvalAltResult>> {
+    let mut node = value
+        .try_cast::<Map>()
+        .ok_or_else(|| runtime_error("screen nodes must be maps"))?;
+    let node_type = take_required_string(&mut node, "type")?;
+
+    match node_type.as_str() {
+        "text" => {
+            let text = take_required_string(&mut node, "text")?;
+            let size = take_optional_number(&mut node, "size")?.unwrap_or(26.0) as f32;
+            let color = take_optional_rgba(&mut node, "color")?;
+            let align = take_optional_number(&mut node, "align")?.map(|value| value as f32);
+            let layout = take_screen_layout(&mut node)?;
+            ensure_no_unknown_options("text", &node)?;
+            Ok(ScreenNode::Text(TextNode {
+                text,
+                size,
+                color,
+                align,
+                layout,
+            }))
+        }
+        "button" => {
+            let text = take_required_string(&mut node, "text")?;
+            let value = node
+                .remove("value")
+                .map(dynamic_to_stored_value)
+                .transpose()?;
+            let action = take_optional_string(&mut node, "action");
+            if value.is_none() && action.is_none() {
+                return Err(runtime_error("screen button requires `value` or `action`"));
+            }
+            let enabled = take_optional_bool(&mut node, "enabled")?.unwrap_or(true);
+            let size = take_optional_number(&mut node, "size")?.unwrap_or(28.0) as f32;
+            let color = take_optional_rgba(&mut node, "color")?;
+            let hovered_color = take_optional_rgba(&mut node, "hovered_color")?;
+            let pressed_color = take_optional_rgba(&mut node, "pressed_color")?;
+            let insensitive_color = take_optional_rgba(&mut node, "insensitive_color")?;
+            let background = take_optional_rgba(&mut node, "background")?;
+            let border = take_optional_rgba(&mut node, "border")?;
+            let hovered_background = take_optional_rgba(&mut node, "hovered_background")?;
+            let pressed_background = take_optional_rgba(&mut node, "pressed_background")?;
+            let align = take_optional_number(&mut node, "align")?.map(|value| value as f32);
+            let padding = take_optional_number(&mut node, "padding")?.map(|value| value as f32);
+            let padding_x = take_optional_number(&mut node, "padding_x")?
+                .map(|value| value as f32)
+                .or(padding);
+            let padding_y = take_optional_number(&mut node, "padding_y")?
+                .map(|value| value as f32)
+                .or(padding);
+            let border_width = take_optional_number(&mut node, "border_width")?.map(|value| value as f32);
+            let radius = take_optional_number(&mut node, "radius")?.map(|value| value as f32);
+            let layout = take_screen_layout(&mut node)?;
+            ensure_no_unknown_options("button", &node)?;
+            Ok(ScreenNode::Button(ButtonNode {
+                text,
+                value,
+                action,
+                enabled,
+                size,
+                color,
+                hovered_color,
+                pressed_color,
+                insensitive_color,
+                background,
+                border,
+                hovered_background,
+                pressed_background,
+                align,
+                padding_x,
+                padding_y,
+                border_width,
+                radius,
+                layout,
+            }))
+        }
+        "image" => {
+            let path = take_required_string(&mut node, "path")?;
+            let layout = take_screen_layout(&mut node)?;
+            ensure_no_unknown_options("image", &node)?;
+            Ok(ScreenNode::Image(ScreenImageNode {
+                path: host.resolve_path(&path),
+                layout,
+            }))
+        }
+        "bar" => {
+            let value = take_optional_number(&mut node, "value")?.unwrap_or(0.0) as f32;
+            let min = take_optional_number(&mut node, "min")?.unwrap_or(0.0) as f32;
+            let max = take_optional_number(&mut node, "max")?.unwrap_or(1.0) as f32;
+            let width = take_optional_number(&mut node, "width")?.unwrap_or(320.0) as f32;
+            let height = take_optional_number(&mut node, "height")?.unwrap_or(18.0) as f32;
+            let background = take_optional_rgba(&mut node, "background")?;
+            let fill = take_optional_rgba(&mut node, "fill")?;
+            let border = take_optional_rgba(&mut node, "border")?;
+            ensure_no_unknown_options("bar", &node)?;
+            Ok(ScreenNode::Bar(BarNode {
+                value,
+                min,
+                max,
+                width,
+                height,
+                background,
+                fill,
+                border,
+            }))
+        }
+        "vbox" | "hbox" | "frame" => {
+            let gap = take_optional_number(&mut node, "gap")?.unwrap_or(12.0) as f32;
+            let padding = take_optional_number(&mut node, "padding")?.unwrap_or(0.0) as f32;
+            let background = take_optional_rgba(&mut node, "background")?;
+            let border = take_optional_rgba(&mut node, "border")?;
+            let justify = take_optional_string(&mut node, "justify");
+            let align_items = take_optional_string(&mut node, "align_items");
+            let layout = take_screen_layout(&mut node)?;
+            let children = take_required_array(&mut node, "children")?
+                .into_iter()
+                .map(|child| parse_screen_node(host, child))
+                .collect::<Result<Vec<_>, _>>()?;
+            ensure_no_unknown_options(&node_type, &node)?;
+            let container = ContainerNode {
+                gap,
+                padding,
+                background,
+                border,
+                justify,
+                align_items,
+                layout,
+                children,
+            };
+            if node_type == "vbox" || node_type == "frame" {
+                Ok(ScreenNode::Column(container))
+            } else {
+                Ok(ScreenNode::Row(container))
+            }
+        }
+        "spacer" => {
+            let width = take_optional_number(&mut node, "width")?.unwrap_or(0.0) as f32;
+            let height = take_optional_number(&mut node, "height")?.unwrap_or(0.0) as f32;
+            ensure_no_unknown_options("spacer", &node)?;
+            Ok(ScreenNode::Spacer(SpacerNode { width, height }))
+        }
+        other => Err(runtime_error(format!("unknown screen node type `{other}`"))),
+    }
+}
+
+fn parse_custom_effect_options(
+    host: &ScriptHost,
+    mut options: Map,
+) -> Result<CustomEffectOptions, Box<EvalAltResult>> {
+    let duration = options
+        .remove("duration")
+        .or_else(|| options.remove("ms"))
+        .ok_or_else(|| runtime_error("effect options require `duration` or `ms`"))?;
+    let duration = duration_from_dynamic(duration)?;
+
+    let current_background = host.current_background_path();
+
+    let from_path = take_optional_string(&mut options, "from")
+        .or_else(|| current_background.clone())
+        .ok_or_else(|| runtime_error("effect options require `from` or an existing background"))?;
+    let to_path = take_optional_string(&mut options, "to").unwrap_or_else(|| from_path.clone());
+    let rule_path = take_optional_string(&mut options, "rule").unwrap_or_else(|| from_path.clone());
+    let aux0_path = take_optional_string(&mut options, "tex0").unwrap_or_else(|| from_path.clone());
+    let aux1_path = take_optional_string(&mut options, "tex1").unwrap_or_else(|| from_path.clone());
+
+    let from_path = host.resolve_path(&from_path);
+    let to_path = host.resolve_path(&to_path);
+    let rule_path = host.resolve_path(&rule_path);
+    let aux0_path = host.resolve_path(&aux0_path);
+    let aux1_path = host.resolve_path(&aux1_path);
+
+    let mode = options
+        .remove("mode")
+        .map(dynamic_to_f32)
+        .transpose()?
+        .unwrap_or(0.0);
+    let commit_to_bg = options
+        .remove("commit_to_bg")
+        .map(dynamic_to_bool)
+        .transpose()?
+        .unwrap_or(false);
+
+    let p0 = take_vec4(&mut options, "p0")?;
+    let p1 = take_vec4(&mut options, "p1")?;
+    let p2 = take_vec4(&mut options, "p2")?;
+    let p3 = take_vec4(&mut options, "p3")?;
+
+    if !options.is_empty() {
+        let unknown = options.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(runtime_error(format!("unknown effect option(s): {unknown}")));
+    }
+
+    Ok(CustomEffectOptions {
+        from_path,
+        to_path,
+        rule_path,
+        aux0_path,
+        aux1_path,
+        duration,
+        mode,
+        p0,
+        p1,
+        p2,
+        p3,
+        commit_to_bg,
+    })
+}
+
+fn parse_text_effect_spec(options: Map) -> Result<DialogueTextEffectSpec, Box<EvalAltResult>> {
+    let value = dynamic_to_json_value(Dynamic::from(options))?;
+    serde_json::from_value(value)
+        .map_err(|err| runtime_error(format!("invalid text effect options: {err}")))
+}
+
 fn parse_character_animation_keyframes(
     keyframes: Array,
     current: Vec2,
@@ -2668,14 +2415,10 @@ fn parse_character_animation_keyframes(
         return Err(runtime_error("animate requires at least one keyframe"));
     }
 
-    let inputs = keyframes
-        .into_iter()
-        .map(|value| {
-            value
-                .try_cast::<CharacterAnimationKeyframeInput>()
-                .ok_or_else(|| runtime_error("animate keyframes must be CharacterKeyframe values from keyframe(...)"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let inputs: Vec<CharacterAnimationKeyframeInput> = serde_json::from_value(dynamic_to_json_value(
+        Dynamic::from(keyframes),
+    )?)
+    .map_err(|err| runtime_error(format!("invalid animate keyframes: {err}")))?;
 
     let mut resolved = Vec::with_capacity(inputs.len());
     let mut previous_time = 0.0f32;
@@ -2720,6 +2463,159 @@ fn parse_character_ease(name: &str) -> Result<CharacterEase, Box<EvalAltResult>>
     }
 }
 
+fn dynamic_to_json_value(value: Dynamic) -> Result<JsonValue, Box<EvalAltResult>> {
+    if value.is::<bool>() {
+        return Ok(JsonValue::Bool(value.cast::<bool>()));
+    }
+    if value.is::<INT>() {
+        return Ok(JsonValue::Number(value.cast::<INT>().into()));
+    }
+    if value.is::<FLOAT>() {
+        let number = serde_json::Number::from_f64(value.cast::<FLOAT>())
+            .ok_or_else(|| runtime_error("expected a finite numeric value"))?;
+        return Ok(JsonValue::Number(number));
+    }
+    if value.is_string() {
+        return Ok(JsonValue::String(value.cast::<ImmutableString>().to_string()));
+    }
+    if let Some(array) = value.clone().try_cast::<Array>() {
+        return array
+            .into_iter()
+            .map(dynamic_to_json_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonValue::Array);
+    }
+    if let Some(map) = value.try_cast::<Map>() {
+        let mut object = serde_json::Map::new();
+        for (key, nested) in map {
+            object.insert(key.to_string(), dynamic_to_json_value(nested)?);
+        }
+        return Ok(JsonValue::Object(object));
+    }
+
+    Err(runtime_error("only bool, int, float, string, array, and map values are supported here"))
+}
+
+fn take_optional_string(options: &mut Map, key: &str) -> Option<String> {
+    options.remove(key).and_then(|value| {
+        if value.is_string() {
+            Some(value.cast::<ImmutableString>().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn take_required_string(options: &mut Map, key: &str) -> Result<String, Box<EvalAltResult>> {
+    take_optional_string(options, key)
+        .ok_or_else(|| runtime_error(format!("missing required string option `{key}`")))
+}
+
+fn take_required_array(options: &mut Map, key: &str) -> Result<Array, Box<EvalAltResult>> {
+    options
+        .remove(key)
+        .and_then(|value| value.try_cast::<Array>())
+        .ok_or_else(|| runtime_error(format!("missing required array option `{key}`")))
+}
+
+fn take_optional_number(options: &mut Map, key: &str) -> Result<Option<f64>, Box<EvalAltResult>> {
+    let Some(value) = options.remove(key) else {
+        return Ok(None);
+    };
+
+    Ok(Some(dynamic_to_f32(value)? as f64))
+}
+
+fn take_optional_bool(options: &mut Map, key: &str) -> Result<Option<bool>, Box<EvalAltResult>> {
+    let Some(value) = options.remove(key) else {
+        return Ok(None);
+    };
+
+    Ok(Some(dynamic_to_bool(value)?))
+}
+
+fn take_screen_layout(options: &mut Map) -> Result<ScreenLayout, Box<EvalAltResult>> {
+    Ok(ScreenLayout {
+        width: take_optional_number(options, "width")?.map(|value| value as f32),
+        height: take_optional_number(options, "height")?.map(|value| value as f32),
+        width_percent: take_optional_number(options, "width_percent")?.map(|value| value as f32),
+        height_percent: take_optional_number(options, "height_percent")?.map(|value| value as f32),
+        min_width: take_optional_number(options, "min_width")?.map(|value| value as f32),
+        left: take_optional_number(options, "left")?.map(|value| value as f32),
+        right: take_optional_number(options, "right")?.map(|value| value as f32),
+        top: take_optional_number(options, "top")?.map(|value| value as f32),
+        bottom: take_optional_number(options, "bottom")?.map(|value| value as f32),
+    })
+}
+
+fn ensure_no_unknown_options(kind: &str, options: &Map) -> Result<(), Box<EvalAltResult>> {
+    if options.is_empty() {
+        return Ok(());
+    }
+
+    let unknown = options.keys().cloned().collect::<Vec<_>>().join(", ");
+    Err(runtime_error(format!("unknown {kind} option(s): {unknown}")))
+}
+
+fn take_optional_rgba(options: &mut Map, key: &str) -> Result<Option<[f32; 4]>, Box<EvalAltResult>> {
+    let Some(value) = options.remove(key) else {
+        return Ok(None);
+    };
+
+    let array = value
+        .try_cast::<Array>()
+        .ok_or_else(|| runtime_error(format!("ui style option `{key}` must be an array")))?;
+    if array.len() != 3 && array.len() != 4 {
+        return Err(runtime_error(format!(
+            "ui style option `{key}` must contain three or four numbers"
+        )));
+    }
+
+    let alpha = if array.len() == 4 {
+        dynamic_to_f32(array[3].clone())?
+    } else {
+        1.0
+    };
+
+    Ok(Some([
+        dynamic_to_f32(array[0].clone())?,
+        dynamic_to_f32(array[1].clone())?,
+        dynamic_to_f32(array[2].clone())?,
+        alpha,
+    ]))
+}
+
+fn take_vec4(options: &mut Map, key: &str) -> Result<Vec4, Box<EvalAltResult>> {
+    let Some(value) = options.remove(key) else {
+        return Ok(Vec4::ZERO);
+    };
+
+    let array = value
+        .try_cast::<Array>()
+        .ok_or_else(|| runtime_error(format!("effect option `{key}` must be an array of four numbers")))?;
+    if array.len() != 4 {
+        return Err(runtime_error(format!("effect option `{key}` must contain exactly four numbers")));
+    }
+
+    Ok(Vec4::new(
+        dynamic_to_f32(array[0].clone())?,
+        dynamic_to_f32(array[1].clone())?,
+        dynamic_to_f32(array[2].clone())?,
+        dynamic_to_f32(array[3].clone())?,
+    ))
+}
+
+fn duration_from_dynamic(value: Dynamic) -> Result<Duration, Box<EvalAltResult>> {
+    if value.is::<INT>() {
+        return duration_from_millis(value.cast::<INT>());
+    }
+    if value.is::<FLOAT>() {
+        return duration_from_millis(value.cast::<FLOAT>() as i64);
+    }
+
+    Err(runtime_error("duration must be a number"))
+}
+
 fn reject_known_unsupported_audio_path(path: &str) -> Result<(), Box<EvalAltResult>> {
     let extension = Path::new(path)
         .extension()
@@ -2746,11 +2642,15 @@ fn dynamic_to_f32(value: Dynamic) -> Result<f32, Box<EvalAltResult>> {
     Err(runtime_error("expected a numeric value"))
 }
 
-fn parse_choice_option(option: Dynamic) -> Result<ChoiceOption, Box<EvalAltResult>> {
-    if option.is::<ChoiceOption>() {
-        return Ok(option.cast::<ChoiceOption>());
+fn dynamic_to_bool(value: Dynamic) -> Result<bool, Box<EvalAltResult>> {
+    if value.is::<bool>() {
+        Ok(value.cast::<bool>())
+    } else {
+        Err(runtime_error("expected a boolean value"))
     }
+}
 
+fn parse_choice_option(option: Dynamic) -> Result<ChoiceOption, Box<EvalAltResult>> {
     if option.is_string() {
         let text = option.cast::<ImmutableString>().to_string();
         return Ok(ChoiceOption {
@@ -2759,8 +2659,29 @@ fn parse_choice_option(option: Dynamic) -> Result<ChoiceOption, Box<EvalAltResul
         });
     }
 
+    if option.is_map() {
+        let option = option.cast::<Map>();
+        let text = option
+            .get("text")
+            .cloned()
+            .ok_or_else(|| runtime_error("choice option map requires a `text` field"))?;
+        let text = if text.is_string() {
+            text.cast::<ImmutableString>().to_string()
+        } else {
+            return Err(runtime_error("choice option `text` must be a string"));
+        };
+        let value = option
+            .get("value")
+            .cloned()
+            .map(dynamic_to_stored_value)
+            .transpose()?
+            .unwrap_or_else(|| StoredValue::String(text.clone()));
+
+        return Ok(ChoiceOption { text, value });
+    }
+
     Err(runtime_error(
-        "choice option must be a string or ChoiceOption from choice_option(...) ",
+        "choice option must be a string or a map like #{ text: ..., value: ... }",
     ))
 }
 
