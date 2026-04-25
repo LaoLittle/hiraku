@@ -22,11 +22,12 @@ use effect::CustomScreenEffectMaterial;
 use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake,
     animate_dialogue_text_reveal,
-    apply_animation_cancellations,
+    apply_animation_cancellations, cleanup_stale_screen_ui,
     animate_character_motion_effects, animate_custom_effects, animate_rule_transitions,
-    animate_visual_tweens, handle_choice_buttons,
-    handle_choice_keyboard, handle_screen_buttons, poll_pending_character_shows, poll_voice_playback,
-    process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
+    animate_visual_tweens, ensure_runtime_quick_menu, handle_choice_buttons,
+    handle_choice_keyboard, handle_runtime_menu_buttons, handle_screen_buttons,
+    poll_pending_character_shows, poll_voice_playback, process_script_commands, setup_frontend,
+    setup_stage, sync_runtime_menu_visibility, sync_scene_snapshot, toggle_pause_menu_on_input,
     tick_animation_waits, tick_pending_waits, tick_script_batches,
 };
 use script::{ScriptBootstrap, spawn_script_runtime};
@@ -98,18 +99,18 @@ pub fn run_app(config: RuntimeLaunchConfig) {
         .init_asset_loader::<RhaiScriptAssetLoader>()
         .init_asset_loader::<BytesAssetLoader>()
         .add_systems(Startup, (setup_frontend, setup_stage, boot_runtime).chain())
-        .add_systems(
-            Update,
-            (
-                process_script_commands,
-                handle_screen_buttons,
-                handle_choice_buttons,
-                handle_choice_keyboard,
-                animate_dialogue_text_reveal,
-                advance_dialogue_on_input,
-                tick_pending_waits,
-            ),
-        )
+        .add_systems(Update, process_script_commands)
+        .add_systems(Update, cleanup_stale_screen_ui)
+        .add_systems(Update, ensure_runtime_quick_menu)
+        .add_systems(Update, sync_runtime_menu_visibility)
+        .add_systems(Update, toggle_pause_menu_on_input)
+        .add_systems(Update, handle_screen_buttons)
+        .add_systems(Update, handle_choice_buttons)
+        .add_systems(Update, handle_runtime_menu_buttons)
+        .add_systems(Update, handle_choice_keyboard)
+        .add_systems(Update, animate_dialogue_text_reveal)
+        .add_systems(Update, advance_dialogue_on_input)
+        .add_systems(Update, tick_pending_waits)
         .add_systems(
             Update,
             (

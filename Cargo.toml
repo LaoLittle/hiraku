@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.18.1", features = ["webp"] }
+bevy = { version = "0.18.1", features = ["webp", "jpeg", "wav", "mp3", "flac"] }
 rhai = "1.24.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

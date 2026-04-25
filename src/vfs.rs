@@ -22,8 +22,10 @@ pub const DEFAULT_SETTINGS_PATH: &str = "main.hdp!settings.toml";
 pub const DEFAULT_STARTUP_SCRIPT: &str = "main.hdp!startup.rhai";
 pub const ASSET_ROOT_PREFIX: &str = "assets:/";
 pub const RESOURCE_ROOT_PREFIX: &str = "res:/";
+pub const WORKSPACE_ROOT_PREFIX: &str = "workspace:/";
 pub const DEFAULT_RESOURCE_ROOT: &str = "main.hdp!";
 const WORKSPACE_ASSET_ALIAS: &str = "__hiraku_workspace_assets__/";
+const WORKSPACE_ROOT_ALIAS: &str = "__hiraku_workspace_root__/";
 
 #[derive(Resource, Clone)]
 pub struct VfsResource(pub Arc<HdpVfs>);
@@ -144,6 +146,10 @@ impl HdpVfs {
             return format!("{WORKSPACE_ASSET_ALIAS}{}", normalize_relative_path(Path::new(stripped)).to_string_lossy().replace('\\', "/"));
         }
 
+        if let Some(stripped) = requested.strip_prefix(WORKSPACE_ROOT_PREFIX) {
+            return format!("{WORKSPACE_ROOT_ALIAS}{}", normalize_relative_path(Path::new(stripped)).to_string_lossy().replace('\\', "/"));
+        }
+
         if let Some(stripped) = requested.strip_prefix(RESOURCE_ROOT_PREFIX) {
             let root = self
                 .load_resource_root_path()
@@ -212,6 +218,12 @@ impl HdpVfs {
     pub fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         if let Some(stripped) = path.strip_prefix(WORKSPACE_ASSET_ALIAS) {
             let full_path = FileAssetReader::get_base_path().join(DEFAULT_ASSET_ROOT).join(stripped);
+            return std::fs::read(&full_path)
+                .map_err(|err| map_fs_not_found(err, full_path.display().to_string()));
+        }
+
+        if let Some(stripped) = path.strip_prefix(WORKSPACE_ROOT_ALIAS) {
+            let full_path = FileAssetReader::get_base_path().join(stripped);
             return std::fs::read(&full_path)
                 .map_err(|err| map_fs_not_found(err, full_path.display().to_string()));
         }
@@ -325,6 +337,13 @@ impl AssetReader for HdpAssetReader {
             return Ok(Box::new(VecReader::new(bytes)) as Box<dyn Reader>);
         }
 
+        if let Some(stripped) = path.to_string_lossy().strip_prefix(WORKSPACE_ROOT_ALIAS) {
+            let full_path = FileAssetReader::get_base_path().join(stripped);
+            let bytes = std::fs::read(&full_path)
+                .map_err(|err| map_reader_fs_error(err, full_path.clone()))?;
+            return Ok(Box::new(VecReader::new(bytes)) as Box<dyn Reader>);
+        }
+
         if split_hdp_asset_path(&path.to_string_lossy()).is_some() {
             let bytes = self.read_virtual_bytes(path)?;
             return Ok(Box::new(VecReader::new(bytes)) as Box<dyn Reader>);
@@ -335,7 +354,9 @@ impl AssetReader for HdpAssetReader {
     }
 
     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
-        if path.to_string_lossy().starts_with(WORKSPACE_ASSET_ALIAS) {
+        if path.to_string_lossy().starts_with(WORKSPACE_ASSET_ALIAS)
+            || path.to_string_lossy().starts_with(WORKSPACE_ROOT_ALIAS)
+        {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         }
 
@@ -351,7 +372,9 @@ impl AssetReader for HdpAssetReader {
         &'a self,
         path: &'a Path,
     ) -> Result<Box<PathStream>, AssetReaderError> {
-        if path.to_string_lossy().starts_with(WORKSPACE_ASSET_ALIAS) {
+        if path.to_string_lossy().starts_with(WORKSPACE_ASSET_ALIAS)
+            || path.to_string_lossy().starts_with(WORKSPACE_ROOT_ALIAS)
+        {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         }
 
@@ -364,7 +387,9 @@ impl AssetReader for HdpAssetReader {
     }
 
     async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
-        if path.to_string_lossy().starts_with(WORKSPACE_ASSET_ALIAS) {
+        if path.to_string_lossy().starts_with(WORKSPACE_ASSET_ALIAS)
+            || path.to_string_lossy().starts_with(WORKSPACE_ROOT_ALIAS)
+        {
             return Ok(false);
         }
 

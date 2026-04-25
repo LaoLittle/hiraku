@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, sync::mpsc};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, sync::mpsc};
 
 use bevy::{
     audio::{AudioSink, AudioSinkPlayback, Volume},
@@ -13,20 +13,22 @@ use crate::{
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
         ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse,
-        spawn_script_runtime,
+        ScriptRuntimeState, spawn_script_runtime,
     },
     storage::{
         SaveSlotSummary, StorageError, UserSettings, list_save_slots, load_save_data,
         read_user_settings, write_user_settings,
     },
     state::{
-        AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
-        SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot, UiStylePatch,
+        AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SaveGameData,
+        SceneSharedState, SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot,
+        UiStylePatch,
     },
     transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
-        ButtonNode, ContainerNode, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiNode,
-        ScreenUiRoot, ScreenUiState, SpacerNode, TextNode,
+        BarNode, ButtonNode, ContainerNode, ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec,
+        ScreenUiButton, ScreenUiNode, ScreenUiRoot, ScreenUiState, SpacerNode, StaleScreenRoot,
+        TextNode,
     },
     vfs::VfsResource,
 };
@@ -34,6 +36,10 @@ use crate::{
 const STAGE_Z_BACKGROUND: f32 = 0.0;
 const STAGE_Z_SPRITE: f32 = 10.0;
 const STAGE_Z_OVERLAY: f32 = 30.0;
+const SCREEN_READY_FRAMES: u8 = 2;
+const SCREEN_PENDING_Z: i32 = 90;
+const SCREEN_ACTIVE_Z: i32 = 100;
+const SCREEN_STALE_Z: i32 = 80;
 
 const BUTTON_NORMAL: Color = Color::srgb(0.13, 0.15, 0.19);
 const BUTTON_HOVERED: Color = Color::srgb(0.22, 0.26, 0.32);
@@ -54,16 +60,44 @@ pub struct UiFonts {
 pub struct UiStyle {
     pub dialogue_bg: Color,
     pub dialogue_border: Color,
+    pub dialogue_left: f32,
+    pub dialogue_right: f32,
+    pub dialogue_bottom: f32,
+    pub dialogue_min_height: f32,
+    pub dialogue_padding_x: f32,
+    pub dialogue_padding_y: f32,
+    pub dialogue_radius: f32,
+    pub speaker_size: f32,
+    pub line_size: f32,
+    pub hint_size: f32,
+    pub hint_visible: bool,
     pub speaker_color: Color,
     pub line_color: Color,
     pub hint_color: Color,
     pub choice_panel_bg: Color,
+    pub choice_bottom: f32,
+    pub choice_panel_width: f32,
+    pub choice_padding: f32,
+    pub choice_gap: f32,
+    pub choice_prompt_size: f32,
+    pub choice_button_size: f32,
+    pub choice_center_text: bool,
+    pub choice_show_indices: bool,
     pub choice_prompt_color: Color,
     pub choice_button_bg: Color,
     pub choice_button_hovered: Color,
     pub choice_button_pressed: Color,
     pub choice_button_border: Color,
     pub choice_text_color: Color,
+    pub quick_menu_bottom: f32,
+    pub quick_menu_gap: f32,
+    pub quick_button_size: f32,
+    pub quick_menu_bg: Color,
+    pub quick_button_bg: Color,
+    pub quick_button_hovered: Color,
+    pub quick_button_pressed: Color,
+    pub quick_button_border: Color,
+    pub quick_text_color: Color,
 }
 
 impl Default for UiStyle {
@@ -71,16 +105,44 @@ impl Default for UiStyle {
         Self {
             dialogue_bg: Color::BLACK.with_alpha(0.82),
             dialogue_border: Color::WHITE.with_alpha(0.14),
+            dialogue_left: 24.0,
+            dialogue_right: 24.0,
+            dialogue_bottom: 24.0,
+            dialogue_min_height: 180.0,
+            dialogue_padding_x: 28.0,
+            dialogue_padding_y: 22.0,
+            dialogue_radius: 18.0,
+            speaker_size: 28.0,
+            line_size: 34.0,
+            hint_size: 18.0,
+            hint_visible: true,
             speaker_color: Color::srgb(1.0, 0.9, 0.72),
             line_color: Color::WHITE,
             hint_color: Color::WHITE.with_alpha(0.55),
             choice_panel_bg: Color::BLACK.with_alpha(0.72),
+            choice_bottom: 230.0,
+            choice_panel_width: 0.0,
+            choice_padding: 18.0,
+            choice_gap: 12.0,
+            choice_prompt_size: 22.0,
+            choice_button_size: 26.0,
+            choice_center_text: false,
+            choice_show_indices: true,
             choice_prompt_color: Color::WHITE.with_alpha(0.82),
             choice_button_bg: BUTTON_NORMAL,
             choice_button_hovered: BUTTON_HOVERED,
             choice_button_pressed: BUTTON_PRESSED,
             choice_button_border: Color::WHITE.with_alpha(0.16),
             choice_text_color: Color::WHITE,
+            quick_menu_bottom: 8.0,
+            quick_menu_gap: 0.0,
+            quick_button_size: 14.0,
+            quick_menu_bg: Color::BLACK.with_alpha(0.0),
+            quick_button_bg: Color::BLACK.with_alpha(0.0),
+            quick_button_hovered: Color::BLACK.with_alpha(0.0),
+            quick_button_pressed: BUTTON_PRESSED,
+            quick_button_border: Color::BLACK.with_alpha(0.0),
+            quick_text_color: Color::WHITE.with_alpha(0.75),
         }
     }
 }
@@ -317,6 +379,33 @@ pub struct ChoiceButton {
 }
 
 #[derive(Component)]
+pub struct QuickMenuRoot;
+
+#[derive(Component)]
+pub struct PauseMenuRoot;
+
+#[derive(Component)]
+pub struct RuntimeMenuButton {
+    pub action: RuntimeMenuButtonAction,
+}
+
+#[derive(Clone, Copy)]
+pub enum RuntimeMenuButtonAction {
+    QuickSave,
+    QuickLoad,
+    OpenPauseMenu,
+    Resume,
+    ReturnToTitle,
+}
+
+#[derive(Resource, Default)]
+pub struct RuntimeMenuState {
+    pub quick_root: Option<Entity>,
+    pub pause_root: Option<Entity>,
+    pub pause_open: bool,
+}
+
+#[derive(Component)]
 pub struct FrontendRoot;
 
 #[derive(Component)]
@@ -389,6 +478,7 @@ pub struct VisualTween {
 pub struct SceneCommandContext<'w, 's> {
     pub commands: Commands<'w, 's>,
     pub asset_server: Res<'w, AssetServer>,
+    pub images: Res<'w, Assets<Image>>,
     pub vfs: Res<'w, VfsResource>,
     pub shared_state: Res<'w, SceneSharedState>,
     pub characters: Res<'w, CharacterCatalog>,
@@ -412,12 +502,17 @@ pub struct SceneCommandContext<'w, 's> {
     pub custom_effect_materials: ResMut<'w, Assets<CustomScreenEffectMaterial>>,
     pub rule_materials: ResMut<'w, Assets<RuleTransitionMaterial>>,
     pub choice_ui_roots: Query<'w, 's, Entity, (With<ChoiceUi>, Without<ChildOf>)>,
-    pub dialogue_root: Query<'w, 's, &'static mut Visibility, With<DialogueRoot>>,
+    pub dialogue_root: Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
+    pub dialogue_root_node: Query<'w, 's, &'static mut Node, With<DialogueRoot>>,
     pub dialogue_background: Query<'w, 's, &'static mut BackgroundColor, With<DialogueRoot>>,
     pub dialogue_border: Query<'w, 's, &'static mut BorderColor, With<DialogueRoot>>,
     pub speaker_text: Query<'w, 's, &'static mut Text, (With<SpeakerText>, Without<LineText>)>,
     pub line_text: Query<'w, 's, &'static mut Text, (With<LineText>, Without<SpeakerText>)>,
     pub line_text_entity: Query<'w, 's, Entity, (With<LineText>, Without<SpeakerText>)>,
+    pub speaker_font: Query<'w, 's, &'static mut TextFont, (With<SpeakerText>, Without<LineText>)>,
+    pub line_font: Query<'w, 's, &'static mut TextFont, (With<LineText>, Without<SpeakerText>)>,
+    pub hint_font: Query<'w, 's, &'static mut TextFont, (With<HintText>, Without<SpeakerText>, Without<LineText>)>,
+    pub hint_visibility: Query<'w, 's, &'static mut Visibility, (With<HintText>, Without<DialogueRoot>)>,
     pub speaker_color: Query<
         'w,
         's,
@@ -435,6 +530,39 @@ pub struct SceneCommandContext<'w, 's> {
         's,
         &'static mut TextColor,
         (With<HintText>, Without<SpeakerText>, Without<LineText>),
+    >,
+}
+
+#[derive(SystemParam)]
+pub struct RuntimeMenuContext<'w, 's> {
+    pub commands: Commands<'w, 's>,
+    pub asset_server: Res<'w, AssetServer>,
+    pub ui_fonts: Res<'w, UiFonts>,
+    pub vfs: Res<'w, VfsResource>,
+    pub shared_state: Res<'w, SceneSharedState>,
+    pub runtime_state: Option<Res<'w, ScriptRuntimeState>>,
+    pub frontend: ResMut<'w, FrontendState>,
+    pub ui_style: Res<'w, UiStyle>,
+    pub runtime_menu: ResMut<'w, RuntimeMenuState>,
+    pub stage: ResMut<'w, StageState>,
+    pub waits: ResMut<'w, PendingWaits>,
+    pub pending_script_commands: ResMut<'w, PendingScriptCommands>,
+    pub active_batches: ResMut<'w, ActiveScriptBatches>,
+    pub dialogue_state: ResMut<'w, DialogueState>,
+    pub choice_state: ResMut<'w, ChoiceState>,
+    pub screen_state: ResMut<'w, ScreenUiState>,
+    pub animations: ResMut<'w, AnimationState>,
+    pub voice_state: ResMut<'w, VoiceState>,
+    pub pending_characters: ResMut<'w, PendingCharacterShows>,
+    pub choice_ui_roots: Query<'w, 's, Entity, (With<ChoiceUi>, Without<ChildOf>)>,
+    pub dialogue_root: Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
+    pub speaker_text: Query<'w, 's, &'static mut Text, (With<SpeakerText>, Without<LineText>)>,
+    pub line_text: Query<'w, 's, &'static mut Text, (With<LineText>, Without<SpeakerText>)>,
+    pub interaction_query: Query<
+        'w,
+        's,
+        (&'static Interaction, &'static mut BackgroundColor, &'static RuntimeMenuButton),
+        Changed<Interaction>,
     >,
 }
 
@@ -477,13 +605,13 @@ pub fn setup_stage(
             DialogueRoot,
             Node {
                 position_type: PositionType::Absolute,
-                left: px(24.0),
-                right: px(24.0),
-                bottom: px(24.0),
-                min_height: px(180.0),
+                left: px(ui_style.dialogue_left),
+                right: px(ui_style.dialogue_right),
+                bottom: px(ui_style.dialogue_bottom),
+                min_height: px(ui_style.dialogue_min_height),
                 border: UiRect::all(px(1.0)),
-                padding: UiRect::axes(px(28.0), px(22.0)),
-                border_radius: BorderRadius::all(px(18.0)),
+                padding: UiRect::axes(px(ui_style.dialogue_padding_x), px(ui_style.dialogue_padding_y)),
+                border_radius: BorderRadius::all(px(ui_style.dialogue_radius)),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(12.0),
                 ..default()
@@ -498,22 +626,29 @@ pub fn setup_stage(
         parent.spawn((
             SpeakerText,
             Text::new(""),
-            ui_text_font(&ui_fonts, 28.0),
+            ui_text_font(&ui_fonts, ui_style.speaker_size),
             TextColor(ui_style.speaker_color),
         ));
         parent.spawn((
             LineText,
             Text::new(""),
-            ui_text_font(&ui_fonts, 34.0),
+            ui_text_font(&ui_fonts, ui_style.line_size),
             TextColor(ui_style.line_color),
         ));
         parent.spawn((
             HintText,
             Text::new("click / enter / space"),
-            ui_text_font(&ui_fonts, 18.0),
+            ui_text_font(&ui_fonts, ui_style.hint_size),
             TextColor(ui_style.hint_color),
+            if ui_style.hint_visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            },
         ));
     });
+
+    commands.insert_resource(RuntimeMenuState::default());
 
     let mut snapshot = SceneSnapshot::default();
     snapshot.text_effect = text_effect_snapshot(&DialogueTextEffect::default());
@@ -1109,7 +1244,7 @@ pub fn handle_frontend_buttons(
         Changed<Interaction>,
     >,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
-    mut dialogue_root: Query<&mut Visibility, With<DialogueRoot>>,
+    mut dialogue_root: Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     mut speaker_text: Query<&mut Text, (With<SpeakerText>, Without<LineText>)>,
     mut line_text: Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
 ) {
@@ -1277,6 +1412,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
 
     let mut commands = ctx.commands;
     let asset_server = ctx.asset_server;
+    let images = ctx.images;
     let vfs = ctx.vfs;
     let shared_state = ctx.shared_state;
     let characters = ctx.characters;
@@ -1300,11 +1436,16 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut rule_materials = ctx.rule_materials;
     let choice_ui_roots = ctx.choice_ui_roots;
     let mut dialogue_root = ctx.dialogue_root;
+    let mut dialogue_root_node = ctx.dialogue_root_node;
     let mut dialogue_background = ctx.dialogue_background;
     let mut dialogue_border = ctx.dialogue_border;
     let mut speaker_text = ctx.speaker_text;
     let mut line_text = ctx.line_text;
     let line_text_entity = ctx.line_text_entity;
+    let mut speaker_font = ctx.speaker_font;
+    let mut line_font = ctx.line_font;
+    let mut hint_font = ctx.hint_font;
+    let mut hint_visibility = ctx.hint_visibility;
     let mut speaker_color = ctx.speaker_color;
     let mut line_color = ctx.line_color;
     let mut hint_color = ctx.hint_color;
@@ -1318,6 +1459,13 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
         .pop_front()
         .or_else(|| receiver.try_recv().ok())
     {
+        if screen_state.active_root.is_some()
+            && screen_state.waiting.is_none()
+            && should_clear_stale_screen_before_command(&command)
+        {
+            clear_screen_ui(&mut commands, &mut screen_state);
+        }
+
         match command {
             ScriptCommand::Log(message) => info!("[rhai] {message}"),
             ScriptCommand::SetBackground {
@@ -1326,6 +1474,23 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 animation_id,
                 done,
             } => {
+                let current_background = shared_state
+                    .0
+                    .lock()
+                    .unwrap()
+                    .background
+                    .as_ref()
+                    .map(|background| background.path.clone());
+                if fade.is_none() && current_background.as_deref() == Some(path.as_str()) {
+                    if let Some(animation_id) = animation_id {
+                        animations.completed.insert(animation_id);
+                    }
+                    if let Some(done) = done {
+                        let _ = done.send(ScriptResponse::Continue);
+                    }
+                    continue;
+                }
+
                 if let Some(effect) = stage.screen_effect.take() {
                     commands.entity(effect).try_despawn();
                 }
@@ -1773,9 +1938,15 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::ApplyUiStyle(style_patch) => {
                 apply_ui_style_patch(&mut ui_style, style_patch);
                 refresh_dialogue_ui_style(
+                    &ui_fonts,
                     &ui_style,
+                    &mut dialogue_root_node,
                     &mut dialogue_background,
                     &mut dialogue_border,
+                    &mut speaker_font,
+                    &mut line_font,
+                    &mut hint_font,
+                    &mut hint_visibility,
                     &mut speaker_color,
                     &mut line_color,
                     &mut hint_color,
@@ -1784,19 +1955,44 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::ResetUiStyle => {
                 *ui_style = UiStyle::default();
                 refresh_dialogue_ui_style(
+                    &ui_fonts,
                     &ui_style,
+                    &mut dialogue_root_node,
                     &mut dialogue_background,
                     &mut dialogue_border,
+                    &mut speaker_font,
+                    &mut line_font,
+                    &mut hint_font,
+                    &mut hint_visibility,
                     &mut speaker_color,
                     &mut line_color,
                     &mut hint_color,
                 );
             }
             ScriptCommand::ShowScreen { screen, done } => {
-                clear_screen_ui(&mut commands, &mut screen_state);
-                let root = spawn_screen_ui(&mut commands, &ui_fonts, &ui_style, &screen);
-                screen_state.active_root = Some(root);
-                screen_state.waiting = Some(done);
+                let spawned = spawn_screen_ui(&mut commands, &asset_server, &ui_fonts, &ui_style, &screen);
+                let root = spawned.root;
+                let previous = screen_state.active_root.take();
+                let images_ready = screen_images_ready(&images, &spawned.image_handles);
+                if previous.is_none() && images_ready {
+                    commands
+                        .entity(root)
+                        .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z)));
+                    screen_state.active_root = Some(root);
+                    screen_state.waiting = Some(done);
+                } else {
+                    commands
+                        .entity(root)
+                        .insert((Visibility::Hidden, GlobalZIndex(SCREEN_PENDING_Z)));
+                    screen_state.pending_root = Some(crate::ui::PendingScreenRoot {
+                        entity: root,
+                        previous,
+                        wait_images: spawned.image_handles,
+                        ready_frames_remaining: SCREEN_READY_FRAMES,
+                        done,
+                    });
+                    screen_state.waiting = None;
+                }
             }
             ScriptCommand::Choose {
                 prompt,
@@ -2290,32 +2486,57 @@ pub fn handle_choice_buttons(
 }
 
 pub fn handle_screen_buttons(
-    mut commands: Commands,
     mut screen_state: ResMut<ScreenUiState>,
-    ui_style: Res<UiStyle>,
     mut interaction_query: Query<
         (&Interaction, &mut BackgroundColor, &ScreenUiButton),
         Changed<Interaction>,
     >,
 ) {
     for (interaction, mut color, button) in &mut interaction_query {
+        if Some(button.root) != screen_state.active_root {
+            continue;
+        }
+
         match *interaction {
             Interaction::Pressed => {
-                *color = ui_style.choice_button_pressed.into();
+                *color = button.pressed_background.into();
                 let Some(done) = screen_state.waiting.take() else {
                     continue;
                 };
-                clear_screen_ui(&mut commands, &mut screen_state);
                 let _ = done.send(ScriptResponse::Choice(button.value.clone()));
             }
             Interaction::Hovered => {
-                *color = ui_style.choice_button_hovered.into();
+                *color = button.hovered_background.into();
             }
             Interaction::None => {
-                *color = ui_style.choice_button_bg.into();
+                *color = button.normal_background.into();
             }
         }
     }
+}
+
+fn should_clear_stale_screen_before_command(command: &ScriptCommand) -> bool {
+    matches!(
+        command,
+        ScriptCommand::Say { .. }
+            | ScriptCommand::AwaitDialogueAdvance { .. }
+            | ScriptCommand::SetDialogue { .. }
+            | ScriptCommand::Choose { .. }
+            | ScriptCommand::ShowSprite { .. }
+            | ScriptCommand::HideSprite { .. }
+            | ScriptCommand::ShowCharacter { .. }
+            | ScriptCommand::HideCharacter { .. }
+            | ScriptCommand::JumpCharacter { .. }
+            | ScriptCommand::ShakeCharacter { .. }
+            | ScriptCommand::AnimateCharacter { .. }
+            | ScriptCommand::MoveSprite { .. }
+            | ScriptCommand::ScaleSprite { .. }
+            | ScriptCommand::FadeSprite { .. }
+            | ScriptCommand::RuleTransitionBg { .. }
+            | ScriptCommand::PlayCustomEffect { .. }
+            | ScriptCommand::RestoreSnapshot { .. }
+            | ScriptCommand::ReturnToTitle
+    )
 }
 
 pub fn handle_choice_keyboard(
@@ -2382,7 +2603,12 @@ pub fn advance_dialogue_on_input(
     mut pending_cancels: ResMut<PendingAnimationCancels>,
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
     choice_state: Res<ChoiceState>,
+    runtime_menu: Res<RuntimeMenuState>,
 ) {
+    if runtime_menu.pause_open {
+        return;
+    }
+
     if choice_state.waiting.is_some() {
         return;
     }
@@ -3453,7 +3679,7 @@ fn start_frontend_session(
     dialogue_state: &mut DialogueState,
     choice_state: &mut ChoiceState,
     choice_ui: &Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
-    dialogue_root: &mut Query<&mut Visibility, With<DialogueRoot>>,
+    dialogue_root: &mut Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     speaker_text: &mut Query<&mut Text, (With<SpeakerText>, Without<LineText>)>,
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
     frontend: &mut FrontendState,
@@ -3509,6 +3735,39 @@ fn apply_ui_style_patch(ui_style: &mut UiStyle, patch: UiStylePatch) {
     if let Some(color) = patch.dialogue_border {
         ui_style.dialogue_border = color_from_rgba(color);
     }
+    if let Some(value) = patch.dialogue_left {
+        ui_style.dialogue_left = value.max(0.0);
+    }
+    if let Some(value) = patch.dialogue_right {
+        ui_style.dialogue_right = value.max(0.0);
+    }
+    if let Some(value) = patch.dialogue_bottom {
+        ui_style.dialogue_bottom = value.max(0.0);
+    }
+    if let Some(value) = patch.dialogue_min_height {
+        ui_style.dialogue_min_height = value.max(0.0);
+    }
+    if let Some(value) = patch.dialogue_padding_x {
+        ui_style.dialogue_padding_x = value.max(0.0);
+    }
+    if let Some(value) = patch.dialogue_padding_y {
+        ui_style.dialogue_padding_y = value.max(0.0);
+    }
+    if let Some(value) = patch.dialogue_radius {
+        ui_style.dialogue_radius = value.max(0.0);
+    }
+    if let Some(value) = patch.speaker_size {
+        ui_style.speaker_size = value.max(1.0);
+    }
+    if let Some(value) = patch.line_size {
+        ui_style.line_size = value.max(1.0);
+    }
+    if let Some(value) = patch.hint_size {
+        ui_style.hint_size = value.max(1.0);
+    }
+    if let Some(value) = patch.hint_visible {
+        ui_style.hint_visible = value;
+    }
     if let Some(color) = patch.speaker_color {
         ui_style.speaker_color = color_from_rgba(color);
     }
@@ -3520,6 +3779,30 @@ fn apply_ui_style_patch(ui_style: &mut UiStyle, patch: UiStylePatch) {
     }
     if let Some(color) = patch.choice_panel_bg {
         ui_style.choice_panel_bg = color_from_rgba(color);
+    }
+    if let Some(value) = patch.choice_bottom {
+        ui_style.choice_bottom = value.max(0.0);
+    }
+    if let Some(value) = patch.choice_panel_width {
+        ui_style.choice_panel_width = value.max(0.0);
+    }
+    if let Some(value) = patch.choice_padding {
+        ui_style.choice_padding = value.max(0.0);
+    }
+    if let Some(value) = patch.choice_gap {
+        ui_style.choice_gap = value.max(0.0);
+    }
+    if let Some(value) = patch.choice_prompt_size {
+        ui_style.choice_prompt_size = value.max(1.0);
+    }
+    if let Some(value) = patch.choice_button_size {
+        ui_style.choice_button_size = value.max(1.0);
+    }
+    if let Some(value) = patch.choice_center_text {
+        ui_style.choice_center_text = value;
+    }
+    if let Some(value) = patch.choice_show_indices {
+        ui_style.choice_show_indices = value;
     }
     if let Some(color) = patch.choice_prompt_color {
         ui_style.choice_prompt_color = color_from_rgba(color);
@@ -3538,6 +3821,33 @@ fn apply_ui_style_patch(ui_style: &mut UiStyle, patch: UiStylePatch) {
     }
     if let Some(color) = patch.choice_text_color {
         ui_style.choice_text_color = color_from_rgba(color);
+    }
+    if let Some(value) = patch.quick_menu_bottom {
+        ui_style.quick_menu_bottom = value.max(0.0);
+    }
+    if let Some(value) = patch.quick_menu_gap {
+        ui_style.quick_menu_gap = value.max(0.0);
+    }
+    if let Some(value) = patch.quick_button_size {
+        ui_style.quick_button_size = value.max(1.0);
+    }
+    if let Some(color) = patch.quick_menu_bg {
+        ui_style.quick_menu_bg = color_from_rgba(color);
+    }
+    if let Some(color) = patch.quick_button_bg {
+        ui_style.quick_button_bg = color_from_rgba(color);
+    }
+    if let Some(color) = patch.quick_button_hovered {
+        ui_style.quick_button_hovered = color_from_rgba(color);
+    }
+    if let Some(color) = patch.quick_button_pressed {
+        ui_style.quick_button_pressed = color_from_rgba(color);
+    }
+    if let Some(color) = patch.quick_button_border {
+        ui_style.quick_button_border = color_from_rgba(color);
+    }
+    if let Some(color) = patch.quick_text_color {
+        ui_style.quick_text_color = color_from_rgba(color);
     }
 }
 
@@ -3684,9 +3994,15 @@ fn dialogue_text_effect_from_snapshot(snapshot: &TextEffectSnapshot) -> Dialogue
 }
 
 fn refresh_dialogue_ui_style(
+    ui_fonts: &UiFonts,
     ui_style: &UiStyle,
+    dialogue_root_node: &mut Query<&mut Node, With<DialogueRoot>>,
     dialogue_background: &mut Query<&mut BackgroundColor, With<DialogueRoot>>,
     dialogue_border: &mut Query<&mut BorderColor, With<DialogueRoot>>,
+    speaker_font: &mut Query<&mut TextFont, (With<SpeakerText>, Without<LineText>)>,
+    line_font: &mut Query<&mut TextFont, (With<LineText>, Without<SpeakerText>)>,
+    hint_font: &mut Query<&mut TextFont, (With<HintText>, Without<SpeakerText>, Without<LineText>)>,
+    hint_visibility: &mut Query<&mut Visibility, (With<HintText>, Without<DialogueRoot>)>,
     speaker_color: &mut Query<
         &mut TextColor,
         (With<SpeakerText>, Without<LineText>, Without<HintText>),
@@ -3700,11 +4016,35 @@ fn refresh_dialogue_ui_style(
         (With<HintText>, Without<SpeakerText>, Without<LineText>),
     >,
 ) {
+    if let Ok(mut node) = dialogue_root_node.single_mut() {
+        node.left = px(ui_style.dialogue_left);
+        node.right = px(ui_style.dialogue_right);
+        node.bottom = px(ui_style.dialogue_bottom);
+        node.min_height = px(ui_style.dialogue_min_height);
+        node.padding = UiRect::axes(px(ui_style.dialogue_padding_x), px(ui_style.dialogue_padding_y));
+        node.border_radius = BorderRadius::all(px(ui_style.dialogue_radius));
+    }
     if let Ok(mut color) = dialogue_background.single_mut() {
         *color = ui_style.dialogue_bg.into();
     }
     if let Ok(mut color) = dialogue_border.single_mut() {
         *color = BorderColor::all(ui_style.dialogue_border);
+    }
+    if let Ok(mut font) = speaker_font.single_mut() {
+        *font = ui_text_font(ui_fonts, ui_style.speaker_size);
+    }
+    if let Ok(mut font) = line_font.single_mut() {
+        *font = ui_text_font(ui_fonts, ui_style.line_size);
+    }
+    if let Ok(mut font) = hint_font.single_mut() {
+        *font = ui_text_font(ui_fonts, ui_style.hint_size);
+    }
+    if let Ok(mut visibility) = hint_visibility.single_mut() {
+        *visibility = if ui_style.hint_visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
     if let Ok(mut color) = speaker_color.single_mut() {
         *color = ui_style.speaker_color.into();
@@ -3725,35 +4065,143 @@ fn clear_screen_ui(commands: &mut Commands, screen_state: &mut ScreenUiState) {
     if let Some(root) = screen_state.active_root.take() {
         commands.entity(root).try_despawn();
     }
+    if let Some(pending) = screen_state.pending_root.take() {
+        commands.entity(pending.entity).try_despawn();
+        if let Some(previous) = pending.previous {
+            commands.entity(previous).try_despawn();
+        }
+    }
+    for stale in screen_state.stale_roots.drain(..) {
+        commands.entity(stale.entity).try_despawn();
+    }
+}
+
+pub fn cleanup_stale_screen_ui(
+    mut commands: Commands,
+    images: Res<Assets<Image>>,
+    mut screen_state: ResMut<ScreenUiState>,
+) {
+    if let Some(mut pending) = screen_state.pending_root.take() {
+        if screen_images_ready(&images, &pending.wait_images) && pending.ready_frames_remaining == 0 {
+            commands
+                .entity(pending.entity)
+                .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z)));
+            if let Some(previous) = pending.previous {
+                commands.entity(previous).insert(GlobalZIndex(SCREEN_STALE_Z));
+                screen_state.stale_roots.push(StaleScreenRoot {
+                    entity: previous,
+                    frames_remaining: 2,
+                    wait_images: Vec::new(),
+                });
+            }
+            screen_state.active_root = Some(pending.entity);
+            screen_state.waiting = Some(pending.done);
+        } else {
+            if screen_images_ready(&images, &pending.wait_images) {
+                commands
+                    .entity(pending.entity)
+                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_PENDING_Z)));
+                pending.ready_frames_remaining = pending.ready_frames_remaining.saturating_sub(1);
+            }
+            screen_state.pending_root = Some(pending);
+        }
+    }
+
+    let mut survivors = Vec::new();
+    for mut stale in screen_state.stale_roots.drain(..) {
+        stale.frames_remaining = stale.frames_remaining.saturating_sub(1);
+        let images_ready = stale.wait_images.iter().all(|handle| images.contains(handle));
+        if stale.frames_remaining == 0 && images_ready {
+            commands.entity(stale.entity).try_despawn();
+        } else {
+            survivors.push(stale);
+        }
+    }
+    screen_state.stale_roots = survivors;
+}
+
+fn screen_images_ready(images: &Assets<Image>, handles: &[Handle<Image>]) -> bool {
+    handles.iter().all(|handle| images.contains(handle))
+}
+
+struct SpawnedScreenUi {
+    root: Entity,
+    image_handles: Vec<Handle<Image>>,
 }
 
 fn spawn_screen_ui(
     commands: &mut Commands,
+    asset_server: &AssetServer,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     screen: &ScreenSpec,
-) -> Entity {
+) -> SpawnedScreenUi {
     let root = commands
         .spawn((
             ScreenUiRoot,
             ScreenUiNode,
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(0.0),
-                right: px(0.0),
-                top: px(0.0),
-                bottom: px(0.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                padding: UiRect::all(px(24.0)),
-                ..default()
-            },
-            BackgroundColor(Color::BLACK.with_alpha(0.35)),
+            GlobalZIndex(SCREEN_ACTIVE_Z),
+            screen_root_node(screen),
+            screen_root_background(screen),
         ))
         .id();
 
-    commands.entity(root).with_children(|parent| {
-        let mut panel = parent.spawn((
+    let mut image_handles = Vec::new();
+    let children = build_screen_ui_children(
+        commands,
+        root,
+        asset_server,
+        ui_fonts,
+        ui_style,
+        screen,
+        &mut image_handles,
+    );
+    commands.entity(root).add_children(&children);
+
+    SpawnedScreenUi { root, image_handles }
+}
+
+fn build_screen_ui_children(
+    commands: &mut Commands,
+    root: Entity,
+    asset_server: &AssetServer,
+    ui_fonts: &UiFonts,
+    ui_style: &UiStyle,
+    screen: &ScreenSpec,
+    image_handles: &mut Vec<Handle<Image>>,
+) -> Vec<Entity> {
+    let mut top_level = Vec::new();
+
+    if let Some(path) = screen.background_image.as_ref() {
+        let image = asset_server.load(path.clone());
+        image_handles.push(image.clone());
+        let background = commands
+            .spawn((
+                ScreenUiNode,
+                ImageNode::new(image),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0.0),
+                    right: px(0.0),
+                    top: px(0.0),
+                    bottom: px(0.0),
+                    ..default()
+                },
+            ))
+            .id();
+        top_level.push(background);
+    }
+
+    if !screen.panel {
+        for child in &screen.children {
+            let child_entity = spawn_screen_node_entity(commands, root, asset_server, ui_fonts, ui_style, child, image_handles);
+            top_level.push(child_entity);
+        }
+        return top_level;
+    }
+
+    let panel = commands
+        .spawn((
             ScreenUiNode,
             Node {
                 width: screen.width.map(px).unwrap_or(percent(72.0)),
@@ -3777,41 +4225,121 @@ fn spawn_screen_ui(
                     .map(color_from_rgba)
                     .unwrap_or(ui_style.choice_button_border),
             ),
-        ));
+        ))
+        .id();
 
-        panel.with_children(|panel| {
-            if let Some(title) = screen.title.as_ref() {
-                panel.spawn((
+    let mut panel_children = Vec::new();
+    if let Some(title) = screen.title.as_ref() {
+        panel_children.push(
+            commands
+                .spawn((
                     ScreenUiNode,
                     Text::new(title.clone()),
                     ui_text_font(ui_fonts, 34.0),
                     TextColor(ui_style.speaker_color),
-                ));
-            }
+                ))
+                .id(),
+        );
+    }
+    for child in &screen.children {
+        panel_children.push(spawn_screen_node_entity(
+            commands,
+            root,
+            asset_server,
+            ui_fonts,
+            ui_style,
+            child,
+            image_handles,
+        ));
+    }
+    commands.entity(panel).add_children(&panel_children);
 
-            for child in &screen.children {
-                spawn_screen_node(panel, ui_fonts, ui_style, child);
-            }
-        });
-    });
-
-    root
+    top_level.push(panel);
+    top_level
 }
 
-fn spawn_screen_node(
-    parent: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
+fn screen_root_node(screen: &ScreenSpec) -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        left: px(0.0),
+        right: px(0.0),
+        top: px(0.0),
+        bottom: px(0.0),
+        justify_content: justify_from_align(screen.yalign),
+        align_items: align_items_from_align(screen.xalign),
+        padding: UiRect::all(px(if screen.panel { 24.0 } else { 0.0 })),
+        ..default()
+    }
+}
+
+fn screen_root_background(screen: &ScreenSpec) -> BackgroundColor {
+    BackgroundColor(
+        screen
+            .overlay
+            .map(color_from_rgba)
+            .unwrap_or(Color::BLACK.with_alpha(0.35)),
+    )
+}
+
+fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
+    if let Some(width) = layout.width {
+        node.width = px(width);
+    }
+    if let Some(width) = layout.width_percent {
+        node.width = percent(width);
+    }
+    if let Some(height) = layout.height {
+        node.height = px(height);
+    }
+    if let Some(height) = layout.height_percent {
+        node.height = percent(height);
+    }
+    if let Some(min_width) = layout.min_width {
+        node.min_width = px(min_width);
+    }
+
+    if layout.left.is_some()
+        || layout.right.is_some()
+        || layout.top.is_some()
+        || layout.bottom.is_some()
+    {
+        node.position_type = PositionType::Absolute;
+    }
+    if let Some(left) = layout.left {
+        node.left = px(left);
+    }
+    if let Some(right) = layout.right {
+        node.right = px(right);
+    }
+    if let Some(top) = layout.top {
+        node.top = px(top);
+    }
+    if let Some(bottom) = layout.bottom {
+        node.bottom = px(bottom);
+    }
+}
+
+fn spawn_screen_node_entity(
+    commands: &mut Commands,
+    root: Entity,
+    asset_server: &AssetServer,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     node: &ScreenNode,
-) {
+    image_handles: &mut Vec<Handle<Image>>,
+) -> Entity {
     match node {
-        ScreenNode::Text(TextNode { text, size, color }) => {
-            parent.spawn((
+        ScreenNode::Text(TextNode { text, size, color, align, layout }) => {
+            let mut node = Node::default();
+            apply_screen_layout(&mut node, layout);
+            commands.spawn((
                 ScreenUiNode,
+                node,
                 Text::new(text.clone()),
                 ui_text_font(ui_fonts, *size),
+                TextLayout::new_with_justify(justify_text_from_align(align.unwrap_or(0.0))),
                 TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
-            ));
+            )).id()
         }
         ScreenNode::Button(ButtonNode {
             text,
@@ -3820,79 +4348,224 @@ fn spawn_screen_node(
             color,
             background,
             border,
-            width,
+            hovered_background,
+            pressed_background,
+            align,
+            padding_x,
+            padding_y,
+            border_width,
+            radius,
+            layout,
         }) => {
-            parent
-                .spawn((
-                    ScreenUiNode,
-                    ScreenUiButton {
-                        value: value.clone(),
-                    },
-                    Button,
-                    Node {
-                        width: width.map(px).unwrap_or(percent(100.0)),
-                        border: UiRect::all(px(1.0)),
-                        padding: UiRect::axes(px(18.0), px(14.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border_radius: BorderRadius::all(px(14.0)),
-                        ..default()
-                    },
-                    BackgroundColor(background.map(color_from_rgba).unwrap_or(ui_style.choice_button_bg)),
-                    BorderColor::all(border.map(color_from_rgba).unwrap_or(ui_style.choice_button_border)),
-                ))
-                .with_children(|button| {
-                    button.spawn((
-                        ScreenUiNode,
-                        Text::new(text.clone()),
-                        ui_text_font(ui_fonts, *size),
-                        TextColor(color.map(color_from_rgba).unwrap_or(ui_style.choice_text_color)),
-                    ));
-                });
+            let normal_background = background.map(color_from_rgba).unwrap_or(ui_style.choice_button_bg);
+            let mut button_node = Node {
+                width: percent(100.0),
+                border: UiRect::all(px(border_width.unwrap_or(1.0).max(0.0))),
+                padding: UiRect::axes(px(padding_x.unwrap_or(18.0).max(0.0)), px(padding_y.unwrap_or(14.0).max(0.0))),
+                justify_content: justify_from_align(align.unwrap_or(0.5)),
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(px(radius.unwrap_or(14.0).max(0.0))),
+                ..default()
+            };
+            apply_screen_layout(&mut button_node, layout);
+            let button = commands.spawn((
+                ScreenUiNode,
+                ScreenUiButton {
+                    root,
+                    value: value.clone(),
+                    normal_background,
+                    hovered_background: hovered_background.map(color_from_rgba).unwrap_or(ui_style.choice_button_hovered),
+                    pressed_background: pressed_background.map(color_from_rgba).unwrap_or(ui_style.choice_button_pressed),
+                },
+                Button,
+                button_node,
+                BackgroundColor(normal_background),
+                BorderColor::all(border.map(color_from_rgba).unwrap_or(ui_style.choice_button_border)),
+            )).id();
+            let text = commands.spawn((
+                ScreenUiNode,
+                Text::new(text.clone()),
+                ui_text_font(ui_fonts, *size),
+                TextColor(color.map(color_from_rgba).unwrap_or(ui_style.choice_text_color)),
+            )).id();
+            commands.entity(button).add_child(text);
+            button
         }
-        ScreenNode::Row(ContainerNode { gap, children }) => {
-            parent
-                .spawn((
-                    ScreenUiNode,
-                    Node {
-                        width: percent(100.0),
-                        column_gap: px(*gap),
-                        ..default()
-                    },
-                ))
-                .with_children(|container| {
-                    for child in children {
-                        spawn_screen_node(container, ui_fonts, ui_style, child);
-                    }
-                });
+        ScreenNode::Image(ScreenImageNode { path, layout }) => {
+            let texture = asset_server.load(path.clone());
+            image_handles.push(texture.clone());
+            let mut node = Node::default();
+            apply_screen_layout(&mut node, layout);
+            commands.spawn((
+                ScreenUiNode,
+                ImageNode::new(texture),
+                node,
+            )).id()
         }
-        ScreenNode::Column(ContainerNode { gap, children }) => {
-            parent
-                .spawn((
-                    ScreenUiNode,
-                    Node {
-                        width: percent(100.0),
-                        flex_direction: FlexDirection::Column,
-                        row_gap: px(*gap),
-                        ..default()
-                    },
-                ))
-                .with_children(|container| {
-                    for child in children {
-                        spawn_screen_node(container, ui_fonts, ui_style, child);
-                    }
-                });
+        ScreenNode::Bar(BarNode {
+            value,
+            min,
+            max,
+            width,
+            height,
+            background,
+            fill,
+            border,
+        }) => {
+            let span = (*max - *min).max(f32::EPSILON);
+            let progress = ((*value - *min) / span).clamp(0.0, 1.0);
+
+            let bar = commands.spawn((
+                ScreenUiNode,
+                Node {
+                    width: px(*width),
+                    height: px(*height),
+                    border: UiRect::all(px(1.0)),
+                    align_items: AlignItems::Stretch,
+                    ..default()
+                },
+                BackgroundColor(background.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.28))),
+                BorderColor::all(border.map(color_from_rgba).unwrap_or(ui_style.choice_button_border)),
+            )).id();
+            let fill = commands.spawn((
+                ScreenUiNode,
+                Node {
+                    width: percent(progress * 100.0),
+                    height: percent(100.0),
+                    ..default()
+                },
+                BackgroundColor(fill.map(color_from_rgba).unwrap_or(ui_style.choice_button_pressed)),
+            )).id();
+            commands.entity(bar).add_child(fill);
+            bar
+        }
+        ScreenNode::Row(ContainerNode {
+            gap,
+            padding,
+            background,
+            border,
+            justify,
+            align_items,
+            layout,
+            children,
+        }) => {
+            let mut node = Node {
+                width: percent(100.0),
+                column_gap: px(*gap),
+                padding: UiRect::all(px((*padding).max(0.0))),
+                border: UiRect::all(px(if border.is_some() { 1.0 } else { 0.0 })),
+                justify_content: justify_content_from_option(justify),
+                align_items: align_items_from_option(align_items),
+                ..default()
+            };
+            apply_screen_layout(&mut node, layout);
+            let container = commands.spawn((
+                ScreenUiNode,
+                node,
+                BackgroundColor(background.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
+                BorderColor::all(border.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
+            )).id();
+            let children = children.iter().map(|child| {
+                spawn_screen_node_entity(commands, root, asset_server, ui_fonts, ui_style, child, image_handles)
+            }).collect::<Vec<_>>();
+            commands.entity(container).add_children(&children);
+            container
+        }
+        ScreenNode::Column(ContainerNode {
+            gap,
+            padding,
+            background,
+            border,
+            justify,
+            align_items,
+            layout,
+            children,
+        }) => {
+            let mut node = Node {
+                width: percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(*gap),
+                padding: UiRect::all(px((*padding).max(0.0))),
+                border: UiRect::all(px(if border.is_some() { 1.0 } else { 0.0 })),
+                justify_content: justify_content_from_option(justify),
+                align_items: align_items_from_option(align_items),
+                ..default()
+            };
+            apply_screen_layout(&mut node, layout);
+            let container = commands.spawn((
+                ScreenUiNode,
+                node,
+                BackgroundColor(background.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
+                BorderColor::all(border.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
+            )).id();
+            let children = children.iter().map(|child| {
+                spawn_screen_node_entity(commands, root, asset_server, ui_fonts, ui_style, child, image_handles)
+            }).collect::<Vec<_>>();
+            commands.entity(container).add_children(&children);
+            container
         }
         ScreenNode::Spacer(SpacerNode { width, height }) => {
-            parent.spawn((
+            commands.spawn((
                 ScreenUiNode,
                 Node {
                     width: px(*width),
                     height: px(*height),
                     ..default()
                 },
-            ));
+            )).id()
         }
+    }
+}
+
+fn justify_from_align(value: f32) -> JustifyContent {
+    if value <= 0.25 {
+        JustifyContent::FlexStart
+    } else if value >= 0.75 {
+        JustifyContent::FlexEnd
+    } else {
+        JustifyContent::Center
+    }
+}
+
+fn justify_text_from_align(value: f32) -> Justify {
+    if value <= 0.25 {
+        Justify::Left
+    } else if value >= 0.75 {
+        Justify::Right
+    } else {
+        Justify::Center
+    }
+}
+
+fn justify_content_from_option(value: &Option<String>) -> JustifyContent {
+    match value.as_deref() {
+        Some("start") | Some("left") | Some("top") => JustifyContent::FlexStart,
+        Some("end") | Some("right") | Some("bottom") => JustifyContent::FlexEnd,
+        Some("center") => JustifyContent::Center,
+        Some("between") => JustifyContent::SpaceBetween,
+        Some("around") => JustifyContent::SpaceAround,
+        Some("evenly") => JustifyContent::SpaceEvenly,
+        _ => JustifyContent::Default,
+    }
+}
+
+fn align_items_from_option(value: &Option<String>) -> AlignItems {
+    match value.as_deref() {
+        Some("start") | Some("left") | Some("top") => AlignItems::FlexStart,
+        Some("end") | Some("right") | Some("bottom") => AlignItems::FlexEnd,
+        Some("center") => AlignItems::Center,
+        Some("stretch") => AlignItems::Stretch,
+        _ => AlignItems::Default,
+    }
+}
+
+fn align_items_from_align(value: f32) -> AlignItems {
+    if value <= 0.25 {
+        AlignItems::FlexStart
+    } else if value >= 0.75 {
+        AlignItems::FlexEnd
+    } else {
+        AlignItems::Center
     }
 }
 
@@ -3912,12 +4585,20 @@ fn spawn_choice_ui(
             ChoiceUi,
             Node {
                 position_type: PositionType::Absolute,
-                left: px(24.0),
-                right: px(24.0),
-                bottom: px(230.0),
-                padding: UiRect::all(px(18.0)),
+                left: if ui_style.choice_panel_width > 0.0 { Val::Auto } else { px(24.0) },
+                right: if ui_style.choice_panel_width > 0.0 { Val::Auto } else { px(24.0) },
+                bottom: px(ui_style.choice_bottom),
+                width: if ui_style.choice_panel_width > 0.0 {
+                    px(ui_style.choice_panel_width)
+                } else {
+                    percent(100.0)
+                },
+                max_width: percent(92.0),
+                padding: UiRect::all(px(ui_style.choice_padding)),
                 flex_direction: FlexDirection::Column,
-                row_gap: px(12.0),
+                row_gap: px(ui_style.choice_gap),
+                justify_self: JustifySelf::Center,
+                align_self: AlignSelf::Center,
                 ..default()
             },
             BackgroundColor(ui_style.choice_panel_bg),
@@ -3929,7 +4610,7 @@ fn spawn_choice_ui(
             parent.spawn((
                 ChoiceUi,
                 Text::new(prompt),
-                ui_text_font(ui_fonts, 22.0),
+                ui_text_font(ui_fonts, ui_style.choice_prompt_size),
                 TextColor(ui_style.choice_prompt_color),
             ));
         }
@@ -3944,7 +4625,11 @@ fn spawn_choice_ui(
                         width: percent(100.0),
                         border: UiRect::all(px(1.0)),
                         padding: UiRect::axes(px(18.0), px(14.0)),
-                        justify_content: JustifyContent::FlexStart,
+                        justify_content: if ui_style.choice_center_text {
+                            JustifyContent::Center
+                        } else {
+                            JustifyContent::FlexStart
+                        },
                         align_items: AlignItems::Center,
                         border_radius: BorderRadius::all(px(12.0)),
                         ..default()
@@ -3953,10 +4638,15 @@ fn spawn_choice_ui(
                     BorderColor::all(ui_style.choice_button_border),
                 ))
                 .with_children(|button| {
+                    let label = if ui_style.choice_show_indices {
+                        format!("{}. {}", index + 1, option.text)
+                    } else {
+                        option.text.clone()
+                    };
                     button.spawn((
                         ChoiceUi,
-                        Text::new(format!("{}. {}", index + 1, option.text)),
-                        ui_text_font(ui_fonts, 26.0),
+                        Text::new(label),
+                        ui_text_font(ui_fonts, ui_style.choice_button_size),
                         TextColor(ui_style.choice_text_color),
                     ));
                 });
@@ -3992,6 +4682,363 @@ fn resolve_choice(
     let _ = done.send(ScriptResponse::Choice(selected.value));
 }
 
+pub fn ensure_runtime_quick_menu(
+    mut commands: Commands,
+    ui_fonts: Res<UiFonts>,
+    ui_style: Res<UiStyle>,
+    mut runtime_menu: ResMut<RuntimeMenuState>,
+) {
+    if runtime_menu.quick_root.is_none() {
+        runtime_menu.quick_root = Some(spawn_runtime_quick_menu(&mut commands, &ui_fonts, &ui_style));
+    }
+}
+
+pub fn sync_runtime_menu_visibility(
+    frontend: Res<FrontendState>,
+    screen_state: Res<ScreenUiState>,
+    runtime_menu: Res<RuntimeMenuState>,
+    mut quick_root: Query<&mut Visibility, (With<QuickMenuRoot>, Without<PauseMenuRoot>)>,
+    mut pause_root: Query<&mut Visibility, (With<PauseMenuRoot>, Without<QuickMenuRoot>)>,
+) {
+    let screen_open = screen_state.active_root.is_some() || screen_state.pending_root.is_some();
+
+    if let Some(entity) = runtime_menu.quick_root
+        && let Ok(mut visibility) = quick_root.get_mut(entity)
+    {
+        *visibility = if frontend.runtime_started && !runtime_menu.pause_open && !screen_open {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+
+    if let Some(entity) = runtime_menu.pause_root
+        && let Ok(mut visibility) = pause_root.get_mut(entity)
+    {
+        *visibility = if runtime_menu.pause_open {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+pub fn toggle_pause_menu_on_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    ui_fonts: Res<UiFonts>,
+    ui_style: Res<UiStyle>,
+    frontend: Res<FrontendState>,
+    screen_state: Res<ScreenUiState>,
+    mut runtime_menu: ResMut<RuntimeMenuState>,
+) {
+    let screen_open = screen_state.active_root.is_some() || screen_state.pending_root.is_some();
+    if !keys.just_pressed(KeyCode::Escape) || !frontend.runtime_started || screen_open {
+        return;
+    }
+
+    if runtime_menu.pause_open {
+        close_pause_menu(&mut commands, &mut runtime_menu);
+        return;
+    }
+
+    if runtime_menu.pause_root.is_none() {
+        runtime_menu.pause_root = Some(spawn_pause_menu(&mut commands, &ui_fonts, &ui_style));
+    }
+    runtime_menu.pause_open = true;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
+    for (interaction, mut color, button) in &mut ctx.interaction_query {
+        match *interaction {
+            Interaction::Pressed => {
+                *color = ctx.ui_style.quick_button_pressed.into();
+                match button.action {
+                    RuntimeMenuButtonAction::QuickSave => {
+                        if let Some(runtime_state) = ctx.runtime_state.as_ref() {
+                            let _ = save_runtime_slot("quick", runtime_state, &ctx.shared_state);
+                        }
+                    }
+                    RuntimeMenuButtonAction::QuickLoad => {
+                        let Ok(save_data) = load_save_data("quick") else {
+                            continue;
+                        };
+                        abort_runtime_waiters(
+                            &mut ctx.commands,
+                            &mut ctx.waits,
+                            &mut ctx.dialogue_state,
+                            &mut ctx.choice_state,
+                            &mut ctx.screen_state,
+                            &mut ctx.pending_script_commands,
+                            &mut ctx.active_batches,
+                            &mut ctx.pending_characters,
+                            &mut ctx.animations,
+                            &mut ctx.voice_state,
+                            &ctx.choice_ui_roots,
+                        );
+                        close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
+                        clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                        start_frontend_session(
+                            &mut ctx.commands,
+                            &ctx.asset_server,
+                            &ctx.vfs,
+                            &ctx.shared_state,
+                            &mut ctx.stage,
+                            &mut ctx.dialogue_state,
+                            &mut ctx.choice_state,
+                            &ctx.choice_ui_roots,
+                            &mut ctx.dialogue_root,
+                            &mut ctx.speaker_text,
+                            &mut ctx.line_text,
+                            &mut ctx.frontend,
+                            ScriptBootstrap::from_save(&save_data),
+                            save_data.scene.clone(),
+                        );
+                    }
+                    RuntimeMenuButtonAction::OpenPauseMenu => {
+                        if ctx.runtime_menu.pause_root.is_none() {
+                            ctx.runtime_menu.pause_root = Some(spawn_pause_menu(&mut ctx.commands, &ctx.ui_fonts, &ctx.ui_style));
+                        }
+                        ctx.runtime_menu.pause_open = true;
+                    }
+                    RuntimeMenuButtonAction::Resume => {
+                        close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
+                    }
+                    RuntimeMenuButtonAction::ReturnToTitle => {
+                        let startup_script = ctx.frontend.startup_script.clone();
+                        abort_runtime_waiters(
+                            &mut ctx.commands,
+                            &mut ctx.waits,
+                            &mut ctx.dialogue_state,
+                            &mut ctx.choice_state,
+                            &mut ctx.screen_state,
+                            &mut ctx.pending_script_commands,
+                            &mut ctx.active_batches,
+                            &mut ctx.pending_characters,
+                            &mut ctx.animations,
+                            &mut ctx.voice_state,
+                            &ctx.choice_ui_roots,
+                        );
+                        close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
+                        clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                        start_frontend_session(
+                            &mut ctx.commands,
+                            &ctx.asset_server,
+                            &ctx.vfs,
+                            &ctx.shared_state,
+                            &mut ctx.stage,
+                            &mut ctx.dialogue_state,
+                            &mut ctx.choice_state,
+                            &ctx.choice_ui_roots,
+                            &mut ctx.dialogue_root,
+                            &mut ctx.speaker_text,
+                            &mut ctx.line_text,
+                            &mut ctx.frontend,
+                            ScriptBootstrap::new(startup_script),
+                            SceneSnapshot::default(),
+                        );
+                    }
+                }
+            }
+            Interaction::Hovered => {
+                *color = ctx.ui_style.quick_button_hovered.into();
+            }
+            Interaction::None => {
+                *color = ctx.ui_style.quick_button_bg.into();
+            }
+        }
+    }
+}
+
+fn spawn_runtime_quick_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiStyle) -> Entity {
+    let root = commands
+        .spawn((
+            QuickMenuRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                right: px(0.0),
+                bottom: px(ui_style.quick_menu_bottom),
+                justify_content: JustifyContent::Center,
+                padding: UiRect::axes(px(12.0), px(4.0)),
+                ..default()
+            },
+            BackgroundColor(ui_style.quick_menu_bg),
+            Visibility::Hidden,
+        ))
+        .id();
+
+    commands.entity(root).with_children(|parent| {
+        parent
+            .spawn((
+                Node {
+                    column_gap: px(ui_style.quick_menu_gap),
+                    ..default()
+                },
+            ))
+            .with_children(|row| {
+                spawn_runtime_menu_button(
+                    row,
+                    ui_fonts,
+                    ui_style,
+                    "Q.Save",
+                    RuntimeMenuButtonAction::QuickSave,
+                );
+                spawn_runtime_menu_button(
+                    row,
+                    ui_fonts,
+                    ui_style,
+                    "Q.Load",
+                    RuntimeMenuButtonAction::QuickLoad,
+                );
+                spawn_runtime_menu_button(
+                    row,
+                    ui_fonts,
+                    ui_style,
+                    "Menu",
+                    RuntimeMenuButtonAction::OpenPauseMenu,
+                );
+            });
+    });
+
+    root
+}
+
+fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiStyle) -> Entity {
+    let root = commands
+        .spawn((
+            PauseMenuRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                right: px(0.0),
+                top: px(0.0),
+                bottom: px(0.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::BLACK.with_alpha(0.35)),
+            Visibility::Hidden,
+        ))
+        .id();
+
+    commands.entity(root).with_children(|parent| {
+        parent
+            .spawn((
+                Node {
+                    width: px(360.0),
+                    padding: UiRect::all(px(20.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(10.0),
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(18.0)),
+                    ..default()
+                },
+                BackgroundColor(ui_style.choice_panel_bg),
+                BorderColor::all(ui_style.choice_button_border),
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("Game Menu"),
+                    ui_text_font(ui_fonts, 30.0),
+                    TextColor(ui_style.speaker_color),
+                ));
+                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Return", RuntimeMenuButtonAction::Resume);
+                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Quick Save", RuntimeMenuButtonAction::QuickSave);
+                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Quick Load", RuntimeMenuButtonAction::QuickLoad);
+                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Main Menu", RuntimeMenuButtonAction::ReturnToTitle);
+            });
+    });
+
+    root
+}
+
+fn spawn_runtime_menu_button(
+    parent: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
+    ui_fonts: &UiFonts,
+    ui_style: &UiStyle,
+    text: &str,
+    action: RuntimeMenuButtonAction,
+) {
+    parent
+        .spawn((
+            RuntimeMenuButton { action },
+            Button,
+            Node {
+                width: Val::Auto,
+                border: UiRect::all(px(1.0)),
+                padding: UiRect::axes(px(10.0), px(4.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(px(8.0)),
+                ..default()
+            },
+            BackgroundColor(ui_style.quick_button_bg),
+            BorderColor::all(ui_style.quick_button_border),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(text),
+                ui_text_font(ui_fonts, ui_style.quick_button_size),
+                TextColor(ui_style.quick_text_color),
+            ));
+        });
+}
+
+fn close_pause_menu(commands: &mut Commands, runtime_menu: &mut RuntimeMenuState) {
+    runtime_menu.pause_open = false;
+    if let Some(root) = runtime_menu.pause_root.take() {
+        commands.entity(root).try_despawn();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn abort_runtime_waiters(
+    commands: &mut Commands,
+    waits: &mut PendingWaits,
+    dialogue_state: &mut DialogueState,
+    choice_state: &mut ChoiceState,
+    screen_state: &mut ScreenUiState,
+    pending_script_commands: &mut PendingScriptCommands,
+    active_batches: &mut ActiveScriptBatches,
+    pending_characters: &mut PendingCharacterShows,
+    animations: &mut AnimationState,
+    voice_state: &mut VoiceState,
+    choice_ui_roots: &Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
+) {
+    clear_choice_ui(commands, choice_ui_roots);
+    choice_state.options.clear();
+    choice_state.waiting.take();
+    screen_state.waiting.take();
+    dialogue_state.waiting.take();
+    waits.items.clear();
+    pending_script_commands.items.clear();
+    active_batches.items.clear();
+    pending_characters.items.clear();
+    animations.waits.clear();
+    finish_active_voice(commands, animations, voice_state);
+}
+
+fn save_runtime_slot(
+    slot: &str,
+    runtime_state: &ScriptRuntimeState,
+    shared_state: &SceneSharedState,
+) -> Result<(), StorageError> {
+    fs::create_dir_all(&runtime_state.save_root)?;
+    let save_path = runtime_state.save_root.join(format!("{slot}.toml"));
+    let data = SaveGameData {
+        resume_script: runtime_state.current_script.lock().unwrap().clone(),
+        script_stack: runtime_state.script_stack.lock().unwrap().clone(),
+        globals: runtime_state.globals.lock().unwrap().clone(),
+        scene: shared_state.0.lock().unwrap().clone(),
+    };
+    let payload = toml::to_string_pretty(&data).map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+    fs::write(save_path, payload)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn restore_scene_snapshot(
     commands: &mut Commands,
@@ -3999,7 +5046,7 @@ fn restore_scene_snapshot(
     stage: &mut StageState,
     dialogue_state: &mut DialogueState,
     choice_state: &mut ChoiceState,
-    dialogue_root: &mut Query<&mut Visibility, With<DialogueRoot>>,
+    dialogue_root: &mut Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     speaker_text: &mut Query<&mut Text, (With<SpeakerText>, Without<LineText>)>,
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
     snapshot: SceneSnapshot,
