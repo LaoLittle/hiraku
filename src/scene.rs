@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, fs, sync::mpsc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::mpsc,
+};
 
 use bevy::{
     audio::{AudioSink, AudioSinkPlayback, Volume},
@@ -15,14 +18,14 @@ use crate::{
         ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse,
         ScriptRuntimeState, spawn_script_runtime,
     },
-    storage::{
-        SaveSlotSummary, StorageError, UserSettings, list_save_slots, load_save_data,
-        read_user_settings, write_user_settings,
-    },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SaveGameData,
         SceneSharedState, SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot,
         UiStylePatch,
+    },
+    storage::{
+        SaveSlotSummary, StorageError, UserSettings, list_save_slots, load_save_data,
+        read_user_settings, write_save_data_to_root, write_user_settings,
     },
     transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
@@ -354,7 +357,6 @@ pub enum CharacterMotionKind {
     Shake { amplitude: f32 },
 }
 
-
 #[derive(Component)]
 pub struct OverlayMarker;
 
@@ -499,7 +501,8 @@ pub struct SceneCommandContext<'w, 's> {
     pub custom_effect_materials: ResMut<'w, Assets<CustomScreenEffectMaterial>>,
     pub rule_materials: ResMut<'w, Assets<RuleTransitionMaterial>>,
     pub choice_ui_roots: Query<'w, 's, Entity, (With<ChoiceUi>, Without<ChildOf>)>,
-    pub dialogue_root: Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
+    pub dialogue_root:
+        Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     pub dialogue_root_node: Query<'w, 's, &'static mut Node, With<DialogueRoot>>,
     pub dialogue_background: Query<'w, 's, &'static mut BackgroundColor, With<DialogueRoot>>,
     pub dialogue_border: Query<'w, 's, &'static mut BorderColor, With<DialogueRoot>>,
@@ -508,8 +511,14 @@ pub struct SceneCommandContext<'w, 's> {
     pub line_text_entity: Query<'w, 's, Entity, (With<LineText>, Without<SpeakerText>)>,
     pub speaker_font: Query<'w, 's, &'static mut TextFont, (With<SpeakerText>, Without<LineText>)>,
     pub line_font: Query<'w, 's, &'static mut TextFont, (With<LineText>, Without<SpeakerText>)>,
-    pub hint_font: Query<'w, 's, &'static mut TextFont, (With<HintText>, Without<SpeakerText>, Without<LineText>)>,
-    pub hint_visibility: Query<'w, 's, &'static mut Visibility, (With<HintText>, Without<DialogueRoot>)>,
+    pub hint_font: Query<
+        'w,
+        's,
+        &'static mut TextFont,
+        (With<HintText>, Without<SpeakerText>, Without<LineText>),
+    >,
+    pub hint_visibility:
+        Query<'w, 's, &'static mut Visibility, (With<HintText>, Without<DialogueRoot>)>,
     pub speaker_color: Query<
         'w,
         's,
@@ -553,13 +562,18 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub voice_state: ResMut<'w, VoiceState>,
     pub pending_characters: ResMut<'w, PendingCharacterShows>,
     pub choice_ui_roots: Query<'w, 's, Entity, (With<ChoiceUi>, Without<ChildOf>)>,
-    pub dialogue_root: Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
+    pub dialogue_root:
+        Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     pub speaker_text: Query<'w, 's, &'static mut Text, (With<SpeakerText>, Without<LineText>)>,
     pub line_text: Query<'w, 's, &'static mut Text, (With<LineText>, Without<SpeakerText>)>,
     pub interaction_query: Query<
         'w,
         's,
-        (&'static Interaction, &'static mut BackgroundColor, &'static RuntimeMenuButton),
+        (
+            &'static Interaction,
+            &'static mut BackgroundColor,
+            &'static RuntimeMenuButton,
+        ),
         Changed<Interaction>,
     >,
 }
@@ -608,7 +622,10 @@ pub fn setup_stage(
                 bottom: px(ui_style.dialogue_bottom),
                 min_height: px(ui_style.dialogue_min_height),
                 border: UiRect::all(px(1.0)),
-                padding: UiRect::axes(px(ui_style.dialogue_padding_x), px(ui_style.dialogue_padding_y)),
+                padding: UiRect::axes(
+                    px(ui_style.dialogue_padding_x),
+                    px(ui_style.dialogue_padding_y),
+                ),
                 border_radius: BorderRadius::all(px(ui_style.dialogue_radius)),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(12.0),
@@ -654,7 +671,11 @@ pub fn setup_stage(
     *shared_state.0.lock().unwrap() = snapshot;
 }
 
-pub fn setup_frontend(mut commands: Commands, asset_server: Res<AssetServer>, vfs: Res<VfsResource>) {
+pub fn setup_frontend(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    vfs: Res<VfsResource>,
+) {
     let startup_script = match vfs.0.load_startup_script_path() {
         Ok(startup_script) => startup_script,
         Err(err) => {
@@ -689,9 +710,10 @@ pub fn setup_frontend(mut commands: Commands, asset_server: Res<AssetServer>, vf
 
     let mut frontend = FrontendState {
         startup_script,
-        gallery_script: vfs
-            .0
-            .resolve_path(Some(vfs.0.settings_path()), "scripts/character_gallery.rhai"),
+        gallery_script: vfs.0.resolve_path(
+            Some(vfs.0.settings_path()),
+            "scripts/character_gallery.rhai",
+        ),
         screen: FrontendScreen::InGame,
         runtime_started: true,
         dirty: false,
@@ -699,7 +721,8 @@ pub fn setup_frontend(mut commands: Commands, asset_server: Res<AssetServer>, vf
     };
 
     if frontend.startup_script.is_empty() {
-        frontend.notice = Some("startup.rhai not found. Fix settings.toml before starting.".to_string());
+        frontend.notice =
+            Some("startup.rhai not found. Fix settings.toml before starting.".to_string());
     }
 
     commands.insert_resource(UiFonts {
@@ -927,7 +950,7 @@ pub fn rebuild_frontend_ui(
                     FrontendScreen::Load => {
                         if frontend.saves.is_empty() {
                             panel.spawn((
-                                Text::new("No save files found in saves/*.toml"),
+                                Text::new("No save files found in saves/*.sav"),
                                 ui_text_font(&ui_fonts, 24.0),
                                 TextColor(Color::WHITE.with_alpha(0.62)),
                             ));
@@ -1328,7 +1351,9 @@ pub fn handle_frontend_buttons(
                         frontend.notice = None;
                         match list_save_slots() {
                             Ok(saves) => frontend.saves = saves,
-                            Err(err) => frontend.notice = Some(format!("Failed to read save list: {err}")),
+                            Err(err) => {
+                                frontend.notice = Some(format!("Failed to read save list: {err}"))
+                            }
                         }
                         frontend.dirty = true;
                     }
@@ -1379,7 +1404,8 @@ pub fn handle_frontend_buttons(
                         frontend.dirty = true;
                     }
                     FrontendAction::AdjustVoice(delta) => {
-                        user_settings.voice_volume = adjusted_volume(user_settings.voice_volume, delta);
+                        user_settings.voice_volume =
+                            adjusted_volume(user_settings.voice_volume, delta);
                         frontend.notice = write_user_settings(user_settings.as_ref())
                             .err()
                             .map(format_storage_error);
@@ -1752,7 +1778,11 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             },
                             sprite,
                             Transform {
-                                translation: Vec3::new(position.x, position.y, STAGE_Z_SPRITE + layer),
+                                translation: Vec3::new(
+                                    position.x,
+                                    position.y,
+                                    STAGE_Z_SPRITE + layer,
+                                ),
                                 scale: Vec3::splat(scale),
                                 ..default()
                             },
@@ -1926,11 +1956,13 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             }
             ScriptCommand::SetTextEffect(effect) => {
                 apply_text_effect_spec(&mut dialogue_state.effect, effect);
-                shared_state.0.lock().unwrap().text_effect = text_effect_snapshot(&dialogue_state.effect);
+                shared_state.0.lock().unwrap().text_effect =
+                    text_effect_snapshot(&dialogue_state.effect);
             }
             ScriptCommand::ResetTextEffect => {
                 dialogue_state.effect = DialogueTextEffect::default();
-                shared_state.0.lock().unwrap().text_effect = text_effect_snapshot(&dialogue_state.effect);
+                shared_state.0.lock().unwrap().text_effect =
+                    text_effect_snapshot(&dialogue_state.effect);
             }
             ScriptCommand::ApplyUserSettings(settings) => {
                 *user_settings = settings;
@@ -1970,7 +2002,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 );
             }
             ScriptCommand::ShowScreen { screen, done } => {
-                let spawned = spawn_screen_ui(&mut commands, &asset_server, &ui_fonts, &ui_style, &screen);
+                let spawned =
+                    spawn_screen_ui(&mut commands, &asset_server, &ui_fonts, &ui_style, &screen);
                 let root = spawned.root;
                 let previous = screen_state.active_root.take();
                 let images_ready = screen_images_ready(&images, &spawned.image_handles);
@@ -1998,7 +2031,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if let Some(root) = overlay_state.roots.remove(&name) {
                     commands.entity(root).try_despawn();
                 }
-                let spawned = spawn_screen_ui(&mut commands, &asset_server, &ui_fonts, &ui_style, &screen);
+                let spawned =
+                    spawn_screen_ui(&mut commands, &asset_server, &ui_fonts, &ui_style, &screen);
                 commands
                     .entity(spawned.root)
                     .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z + 10)));
@@ -2034,7 +2068,12 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     continue;
                 };
 
-                despawn_character_actor(&mut commands, &mut stage, &mut pending_characters, &actor_id);
+                despawn_character_actor(
+                    &mut commands,
+                    &mut stage,
+                    &mut pending_characters,
+                    &actor_id,
+                );
                 stage.character_positions.insert(actor_id.clone(), position);
                 queue_character_show(
                     &mut commands,
@@ -2052,7 +2091,12 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 );
             }
             ScriptCommand::HideCharacter { actor_id } => {
-                despawn_character_actor(&mut commands, &mut stage, &mut pending_characters, &actor_id);
+                despawn_character_actor(
+                    &mut commands,
+                    &mut stage,
+                    &mut pending_characters,
+                    &actor_id,
+                );
                 stage.character_positions.remove(&actor_id);
             }
             ScriptCommand::JumpCharacter {
@@ -2639,6 +2683,14 @@ pub fn advance_dialogue_on_input(
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
     choice_state: Res<ChoiceState>,
     runtime_menu: Res<RuntimeMenuState>,
+    ui_interactions: Query<
+        &Interaction,
+        Or<(
+            With<ScreenUiButton>,
+            With<RuntimeMenuButton>,
+            With<ChoiceButton>,
+        )>,
+    >,
 ) {
     if runtime_menu.pause_open {
         return;
@@ -2653,6 +2705,14 @@ pub fn advance_dialogue_on_input(
         || mouse.just_pressed(MouseButton::Left);
 
     if !advance {
+        return;
+    }
+
+    if mouse.just_pressed(MouseButton::Left)
+        && ui_interactions
+            .iter()
+            .any(|interaction| !matches!(*interaction, Interaction::None))
+    {
         return;
     }
 
@@ -2737,7 +2797,11 @@ pub fn animate_dialogue_text_reveal(
     }
 }
 
-pub fn tick_pending_waits(time: Res<Time>, mut waits: ResMut<PendingWaits>, mut animations: ResMut<AnimationState>) {
+pub fn tick_pending_waits(
+    time: Res<Time>,
+    mut waits: ResMut<PendingWaits>,
+    mut animations: ResMut<AnimationState>,
+) {
     for wait in waits.items.iter_mut() {
         wait.timer.tick(time.delta());
     }
@@ -2775,13 +2839,18 @@ pub fn apply_animation_cancellations(
     mut bgm_fades: Query<(Entity, &mut BgmFade)>,
     mut motion_queries: ParamSet<(
         Query<'_, '_, &'static mut Transform, With<MainCamera>>,
-        Query<'_, '_, (
-            Entity,
-            &'static mut Transform,
-            Option<&'static mut CharacterJumpEffect>,
-            Option<&'static mut CharacterShakeEffect>,
-            Option<&'static mut CharacterTimelineEffect>,
-        ), Without<MainCamera>>,
+        Query<
+            '_,
+            '_,
+            (
+                Entity,
+                &'static mut Transform,
+                Option<&'static mut CharacterJumpEffect>,
+                Option<&'static mut CharacterShakeEffect>,
+                Option<&'static mut CharacterTimelineEffect>,
+            ),
+            Without<MainCamera>,
+        >,
     )>,
     mut transitions: Query<(Entity, &mut RuleTransitionPlayer)>,
     mut effects: Query<(Entity, &mut CustomScreenEffectPlayer)>,
@@ -2829,7 +2898,11 @@ pub fn apply_animation_cancellations(
             camera.translation.x = 0.0;
             camera.translation.y = 0.0;
         }
-        complete_missing_animation(&mut animations, shake.animation_id.take(), shake.done.take());
+        complete_missing_animation(
+            &mut animations,
+            shake.animation_id.take(),
+            shake.done.take(),
+        );
         shake_state.active = None;
     }
 
@@ -2867,10 +2940,16 @@ pub fn apply_animation_cancellations(
             .as_ref()
             .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            if tween.despawn_on_finish && let Some(actor) = actor {
+            if tween.despawn_on_finish
+                && let Some(actor) = actor
+            {
                 stage.sprites.insert(actor.id.clone(), entity);
             }
-            complete_missing_animation(&mut animations, tween.animation_id.take(), tween.done.take());
+            complete_missing_animation(
+                &mut animations,
+                tween.animation_id.take(),
+                tween.done.take(),
+            );
             commands.entity(entity).try_remove::<VisualTween>();
         }
     }
@@ -2900,7 +2979,11 @@ pub fn apply_animation_cancellations(
                 .as_ref()
                 .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+            complete_missing_animation(
+                &mut animations,
+                effect.animation_id.take(),
+                effect.done.take(),
+            );
             commands.entity(entity).try_remove::<CharacterJumpEffect>();
             reset_translation = true;
         }
@@ -2911,7 +2994,11 @@ pub fn apply_animation_cancellations(
                 .as_ref()
                 .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+            complete_missing_animation(
+                &mut animations,
+                effect.animation_id.take(),
+                effect.done.take(),
+            );
             commands.entity(entity).try_remove::<CharacterShakeEffect>();
             reset_translation = true;
         }
@@ -2923,10 +3010,18 @@ pub fn apply_animation_cancellations(
                 .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
             if let Some(final_keyframe) = effect.keyframes.last() {
-                stage.character_positions.insert(effect.actor_id.clone(), final_keyframe.position);
+                stage
+                    .character_positions
+                    .insert(effect.actor_id.clone(), final_keyframe.position);
             }
-            complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
-            commands.entity(entity).try_remove::<CharacterTimelineEffect>();
+            complete_missing_animation(
+                &mut animations,
+                effect.animation_id.take(),
+                effect.done.take(),
+            );
+            commands
+                .entity(entity)
+                .try_remove::<CharacterTimelineEffect>();
             reset_translation = true;
         }
 
@@ -2964,7 +3059,11 @@ pub fn apply_animation_cancellations(
             if stage.screen_effect == Some(entity) {
                 stage.screen_effect = None;
             }
-            complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+            complete_missing_animation(
+                &mut animations,
+                effect.animation_id.take(),
+                effect.done.take(),
+            );
             commands.entity(entity).try_despawn();
         }
     }
@@ -3080,13 +3179,22 @@ pub fn animate_character_motion_effects(
 
         if let Some(mut effect) = timeline {
             effect.elapsed = (effect.elapsed + time.delta_secs()).min(effect.duration);
-            let actor_position = character_timeline_position(effect.actor_origin, &effect.keyframes, effect.elapsed);
+            let actor_position =
+                character_timeline_position(effect.actor_origin, &effect.keyframes, effect.elapsed);
             translation += (actor_position - effect.actor_origin).extend(0.0);
-            stage.character_positions.insert(effect.actor_id.clone(), actor_position);
+            stage
+                .character_positions
+                .insert(effect.actor_id.clone(), actor_position);
 
             if effect.elapsed >= effect.duration {
-                complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
-                commands.entity(entity).try_remove::<CharacterTimelineEffect>();
+                complete_missing_animation(
+                    &mut animations,
+                    effect.animation_id.take(),
+                    effect.done.take(),
+                );
+                commands
+                    .entity(entity)
+                    .try_remove::<CharacterTimelineEffect>();
             }
         }
 
@@ -3095,7 +3203,11 @@ pub fn animate_character_motion_effects(
             let progress = tween_fraction(&effect.timer);
             translation.y += (std::f32::consts::PI * progress).sin().max(0.0) * effect.height;
             if effect.timer.is_finished() {
-                complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+                complete_missing_animation(
+                    &mut animations,
+                    effect.animation_id.take(),
+                    effect.done.take(),
+                );
                 commands.entity(entity).try_remove::<CharacterJumpEffect>();
             }
         }
@@ -3110,7 +3222,11 @@ pub fn animate_character_motion_effects(
                 0.0,
             );
             if effect.timer.is_finished() {
-                complete_missing_animation(&mut animations, effect.animation_id.take(), effect.done.take());
+                complete_missing_animation(
+                    &mut animations,
+                    effect.animation_id.take(),
+                    effect.done.take(),
+                );
                 commands.entity(entity).try_remove::<CharacterShakeEffect>();
             }
         }
@@ -3151,7 +3267,9 @@ pub fn animate_rule_transitions(
                 stage.transition = None;
             }
 
-            commands.entity(transition.previous_background).try_despawn();
+            commands
+                .entity(transition.previous_background)
+                .try_despawn();
             commands.entity(entity).try_despawn();
 
             if let Some(animation_id) = transition.animation_id.take() {
@@ -3290,23 +3408,24 @@ pub fn poll_pending_character_shows(
 ) {
     let mut completed = Vec::new();
     pending.items.retain_mut(|item| {
-        let has_failed = item
-            .handles
-            .iter()
-            .any(|handle| matches!(asset_server.load_state(handle.id()), bevy::asset::LoadState::Failed(_)));
+        let has_failed = item.handles.iter().any(|handle| {
+            matches!(
+                asset_server.load_state(handle.id()),
+                bevy::asset::LoadState::Failed(_)
+            )
+        });
         if has_failed {
-            warn!("failed to load one or more parts for character `{}`", item.actor_id);
+            warn!(
+                "failed to load one or more parts for character `{}`",
+                item.actor_id
+            );
             for entity in item.entities.drain(..) {
                 commands.entity(entity).try_despawn();
             }
             for id in item.entity_ids.drain(..) {
                 stage.sprites.remove(&id);
             }
-            complete_missing_animation(
-                &mut animations,
-                item.animation_id.take(),
-                item.done.take(),
-            );
+            complete_missing_animation(&mut animations, item.animation_id.take(), item.done.take());
             return false;
         }
 
@@ -3465,11 +3584,7 @@ fn queue_character_show(
     }
 
     if entities.is_empty() {
-        complete_missing_animation(
-            animations,
-            animation_id,
-            done,
-        );
+        complete_missing_animation(animations, animation_id, done);
         return;
     }
 
@@ -3559,7 +3674,9 @@ fn apply_character_timeline(
     let duration = keyframes.last().map(|frame| frame.time).unwrap_or(0.0);
     if duration <= f32::EPSILON {
         if let Some(final_position) = keyframes.last().map(|frame| frame.position) {
-            stage.character_positions.insert(actor_id.to_string(), final_position);
+            stage
+                .character_positions
+                .insert(actor_id.to_string(), final_position);
         }
         complete_missing_animation(animations, animation_id, done);
         return;
@@ -3619,12 +3736,20 @@ fn character_timeline_position(
     };
     for keyframe in keyframes {
         if elapsed <= keyframe.time {
-            return interpolate_character_position(previous.position, previous.time, keyframe.clone(), elapsed);
+            return interpolate_character_position(
+                previous.position,
+                previous.time,
+                keyframe.clone(),
+                elapsed,
+            );
         }
         previous = keyframe.clone();
     }
 
-    keyframes.last().map(|frame| frame.position).unwrap_or(actor_origin)
+    keyframes
+        .last()
+        .map(|frame| frame.position)
+        .unwrap_or(actor_origin)
 }
 
 fn interpolate_character_position(
@@ -3985,7 +4110,10 @@ fn reveal_all_dialogue_chars(
     reveal.accumulator = 0.0;
 }
 
-fn apply_text_effect_spec(effect: &mut DialogueTextEffect, spec: crate::script::DialogueTextEffectSpec) {
+fn apply_text_effect_spec(
+    effect: &mut DialogueTextEffect,
+    spec: crate::script::DialogueTextEffectSpec,
+) {
     if let Some(mode) = spec.mode.as_deref() {
         effect.mode = match mode {
             "instant" => DialogueTextEffectMode::Instant,
@@ -4056,7 +4184,10 @@ fn refresh_dialogue_ui_style(
         node.right = px(ui_style.dialogue_right);
         node.bottom = px(ui_style.dialogue_bottom);
         node.min_height = px(ui_style.dialogue_min_height);
-        node.padding = UiRect::axes(px(ui_style.dialogue_padding_x), px(ui_style.dialogue_padding_y));
+        node.padding = UiRect::axes(
+            px(ui_style.dialogue_padding_x),
+            px(ui_style.dialogue_padding_y),
+        );
         node.border_radius = BorderRadius::all(px(ui_style.dialogue_radius));
     }
     if let Ok(mut color) = dialogue_background.single_mut() {
@@ -4123,12 +4254,15 @@ pub fn cleanup_stale_screen_ui(
     mut screen_state: ResMut<ScreenUiState>,
 ) {
     if let Some(mut pending) = screen_state.pending_root.take() {
-        if screen_images_ready(&images, &pending.wait_images) && pending.ready_frames_remaining == 0 {
+        if screen_images_ready(&images, &pending.wait_images) && pending.ready_frames_remaining == 0
+        {
             commands
                 .entity(pending.entity)
                 .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z)));
             if let Some(previous) = pending.previous {
-                commands.entity(previous).insert(GlobalZIndex(SCREEN_STALE_Z));
+                commands
+                    .entity(previous)
+                    .insert(GlobalZIndex(SCREEN_STALE_Z));
                 screen_state.stale_roots.push(StaleScreenRoot {
                     entity: previous,
                     frames_remaining: 2,
@@ -4151,7 +4285,10 @@ pub fn cleanup_stale_screen_ui(
     let mut survivors = Vec::new();
     for mut stale in screen_state.stale_roots.drain(..) {
         stale.frames_remaining = stale.frames_remaining.saturating_sub(1);
-        let images_ready = stale.wait_images.iter().all(|handle| images.contains(handle));
+        let images_ready = stale
+            .wait_images
+            .iter()
+            .all(|handle| images.contains(handle));
         if stale.frames_remaining == 0 && images_ready {
             commands.entity(stale.entity).try_despawn();
         } else {
@@ -4199,7 +4336,10 @@ fn spawn_screen_ui(
     );
     commands.entity(root).add_children(&children);
 
-    SpawnedScreenUi { root, image_handles }
+    SpawnedScreenUi {
+        root,
+        image_handles,
+    }
 }
 
 fn build_screen_ui_children(
@@ -4235,7 +4375,15 @@ fn build_screen_ui_children(
 
     if !screen.panel {
         for child in &screen.children {
-            let child_entity = spawn_screen_node_entity(commands, root, asset_server, ui_fonts, ui_style, child, image_handles);
+            let child_entity = spawn_screen_node_entity(
+                commands,
+                root,
+                asset_server,
+                ui_fonts,
+                ui_style,
+                child,
+                image_handles,
+            );
             top_level.push(child_entity);
         }
         return top_level;
@@ -4370,17 +4518,25 @@ fn spawn_screen_node_entity(
     image_handles: &mut Vec<Handle<Image>>,
 ) -> Entity {
     match node {
-        ScreenNode::Text(TextNode { text, size, color, align, layout }) => {
+        ScreenNode::Text(TextNode {
+            text,
+            size,
+            color,
+            align,
+            layout,
+        }) => {
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
-            commands.spawn((
-                ScreenUiNode,
-                node,
-                Text::new(text.clone()),
-                ui_text_font(ui_fonts, *size),
-                TextLayout::new_with_justify(justify_text_from_align(align.unwrap_or(0.0))),
-                TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
-            )).id()
+            commands
+                .spawn((
+                    ScreenUiNode,
+                    node,
+                    Text::new(text.clone()),
+                    ui_text_font(ui_fonts, *size),
+                    TextLayout::new_with_justify(justify_text_from_align(align.unwrap_or(0.0))),
+                    TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
+                ))
+                .id()
         }
         ScreenNode::Button(ButtonNode {
             text,
@@ -4403,20 +4559,35 @@ fn spawn_screen_node_entity(
             radius,
             layout,
         }) => {
-            let normal_background = background.map(color_from_rgba).unwrap_or(ui_style.choice_button_bg);
-            let hovered_background = hovered_background.map(color_from_rgba).unwrap_or(ui_style.choice_button_hovered);
-            let pressed_background = pressed_background.map(color_from_rgba).unwrap_or(ui_style.choice_button_pressed);
+            let normal_background = background
+                .map(color_from_rgba)
+                .unwrap_or(ui_style.choice_button_bg);
+            let hovered_background = hovered_background
+                .map(color_from_rgba)
+                .unwrap_or(ui_style.choice_button_hovered);
+            let pressed_background = pressed_background
+                .map(color_from_rgba)
+                .unwrap_or(ui_style.choice_button_pressed);
             let insensitive_background = normal_background;
-            let normal_text_color = color.map(color_from_rgba).unwrap_or(ui_style.choice_text_color);
-            let hovered_text_color = hovered_color.map(color_from_rgba).unwrap_or(normal_text_color);
-            let pressed_text_color = pressed_color.map(color_from_rgba).unwrap_or(hovered_text_color);
+            let normal_text_color = color
+                .map(color_from_rgba)
+                .unwrap_or(ui_style.choice_text_color);
+            let hovered_text_color = hovered_color
+                .map(color_from_rgba)
+                .unwrap_or(normal_text_color);
+            let pressed_text_color = pressed_color
+                .map(color_from_rgba)
+                .unwrap_or(hovered_text_color);
             let insensitive_text_color = insensitive_color
                 .map(color_from_rgba)
                 .unwrap_or(normal_text_color.with_alpha(0.45));
             let mut button_node = Node {
                 width: percent(100.0),
                 border: UiRect::all(px(border_width.unwrap_or(1.0).max(0.0))),
-                padding: UiRect::axes(px(padding_x.unwrap_or(18.0).max(0.0)), px(padding_y.unwrap_or(14.0).max(0.0))),
+                padding: UiRect::axes(
+                    px(padding_x.unwrap_or(18.0).max(0.0)),
+                    px(padding_y.unwrap_or(14.0).max(0.0)),
+                ),
                 justify_content: justify_from_align(align.unwrap_or(0.5)),
                 align_items: AlignItems::Center,
                 border_radius: BorderRadius::all(px(radius.unwrap_or(14.0).max(0.0))),
@@ -4433,20 +4604,28 @@ fn spawn_screen_node_entity(
             } else {
                 insensitive_text_color
             };
-            let text = commands.spawn((
-                ScreenUiNode,
-                ScreenUiButtonText,
-                Text::new(text.clone()),
-                ui_text_font(ui_fonts, *size),
-                TextColor(initial_text_color),
-            )).id();
-            let button = commands.spawn((
-                ScreenUiNode,
-                Button,
-                button_node,
-                BackgroundColor(initial_background),
-                BorderColor::all(border.map(color_from_rgba).unwrap_or(ui_style.choice_button_border)),
-            )).id();
+            let text = commands
+                .spawn((
+                    ScreenUiNode,
+                    ScreenUiButtonText,
+                    Text::new(text.clone()),
+                    ui_text_font(ui_fonts, *size),
+                    TextColor(initial_text_color),
+                ))
+                .id();
+            let button = commands
+                .spawn((
+                    ScreenUiNode,
+                    Button,
+                    button_node,
+                    BackgroundColor(initial_background),
+                    BorderColor::all(
+                        border
+                            .map(color_from_rgba)
+                            .unwrap_or(ui_style.choice_button_border),
+                    ),
+                ))
+                .id();
             if let Some(value) = value.as_ref() {
                 commands.entity(button).insert(ScreenUiButton {
                     root,
@@ -4464,7 +4643,9 @@ fn spawn_screen_node_entity(
                 });
             }
             if *enabled
-                && let Some(action) = action.as_ref().and_then(|action| runtime_menu_action_from_str(action))
+                && let Some(action) = action
+                    .as_ref()
+                    .and_then(|action| runtime_menu_action_from_str(action))
             {
                 commands.entity(button).insert(RuntimeMenuButton { action });
             }
@@ -4476,11 +4657,9 @@ fn spawn_screen_node_entity(
             image_handles.push(texture.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
-            commands.spawn((
-                ScreenUiNode,
-                ImageNode::new(texture),
-                node,
-            )).id()
+            commands
+                .spawn((ScreenUiNode, ImageNode::new(texture), node))
+                .id()
         }
         ScreenNode::Bar(BarNode {
             value,
@@ -4495,27 +4674,42 @@ fn spawn_screen_node_entity(
             let span = (*max - *min).max(f32::EPSILON);
             let progress = ((*value - *min) / span).clamp(0.0, 1.0);
 
-            let bar = commands.spawn((
-                ScreenUiNode,
-                Node {
-                    width: px(*width),
-                    height: px(*height),
-                    border: UiRect::all(px(1.0)),
-                    align_items: AlignItems::Stretch,
-                    ..default()
-                },
-                BackgroundColor(background.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.28))),
-                BorderColor::all(border.map(color_from_rgba).unwrap_or(ui_style.choice_button_border)),
-            )).id();
-            let fill = commands.spawn((
-                ScreenUiNode,
-                Node {
-                    width: percent(progress * 100.0),
-                    height: percent(100.0),
-                    ..default()
-                },
-                BackgroundColor(fill.map(color_from_rgba).unwrap_or(ui_style.choice_button_pressed)),
-            )).id();
+            let bar = commands
+                .spawn((
+                    ScreenUiNode,
+                    Node {
+                        width: px(*width),
+                        height: px(*height),
+                        border: UiRect::all(px(1.0)),
+                        align_items: AlignItems::Stretch,
+                        ..default()
+                    },
+                    BackgroundColor(
+                        background
+                            .map(color_from_rgba)
+                            .unwrap_or(Color::BLACK.with_alpha(0.28)),
+                    ),
+                    BorderColor::all(
+                        border
+                            .map(color_from_rgba)
+                            .unwrap_or(ui_style.choice_button_border),
+                    ),
+                ))
+                .id();
+            let fill = commands
+                .spawn((
+                    ScreenUiNode,
+                    Node {
+                        width: percent(progress * 100.0),
+                        height: percent(100.0),
+                        ..default()
+                    },
+                    BackgroundColor(
+                        fill.map(color_from_rgba)
+                            .unwrap_or(ui_style.choice_button_pressed),
+                    ),
+                ))
+                .id();
             commands.entity(bar).add_child(fill);
             bar
         }
@@ -4539,15 +4733,36 @@ fn spawn_screen_node_entity(
                 ..default()
             };
             apply_screen_layout(&mut node, layout);
-            let container = commands.spawn((
-                ScreenUiNode,
-                node,
-                BackgroundColor(background.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
-                BorderColor::all(border.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
-            )).id();
-            let children = children.iter().map(|child| {
-                spawn_screen_node_entity(commands, root, asset_server, ui_fonts, ui_style, child, image_handles)
-            }).collect::<Vec<_>>();
+            let container = commands
+                .spawn((
+                    ScreenUiNode,
+                    node,
+                    BackgroundColor(
+                        background
+                            .map(color_from_rgba)
+                            .unwrap_or(Color::BLACK.with_alpha(0.0)),
+                    ),
+                    BorderColor::all(
+                        border
+                            .map(color_from_rgba)
+                            .unwrap_or(Color::BLACK.with_alpha(0.0)),
+                    ),
+                ))
+                .id();
+            let children = children
+                .iter()
+                .map(|child| {
+                    spawn_screen_node_entity(
+                        commands,
+                        root,
+                        asset_server,
+                        ui_fonts,
+                        ui_style,
+                        child,
+                        image_handles,
+                    )
+                })
+                .collect::<Vec<_>>();
             commands.entity(container).add_children(&children);
             container
         }
@@ -4572,28 +4787,49 @@ fn spawn_screen_node_entity(
                 ..default()
             };
             apply_screen_layout(&mut node, layout);
-            let container = commands.spawn((
-                ScreenUiNode,
-                node,
-                BackgroundColor(background.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
-                BorderColor::all(border.map(color_from_rgba).unwrap_or(Color::BLACK.with_alpha(0.0))),
-            )).id();
-            let children = children.iter().map(|child| {
-                spawn_screen_node_entity(commands, root, asset_server, ui_fonts, ui_style, child, image_handles)
-            }).collect::<Vec<_>>();
+            let container = commands
+                .spawn((
+                    ScreenUiNode,
+                    node,
+                    BackgroundColor(
+                        background
+                            .map(color_from_rgba)
+                            .unwrap_or(Color::BLACK.with_alpha(0.0)),
+                    ),
+                    BorderColor::all(
+                        border
+                            .map(color_from_rgba)
+                            .unwrap_or(Color::BLACK.with_alpha(0.0)),
+                    ),
+                ))
+                .id();
+            let children = children
+                .iter()
+                .map(|child| {
+                    spawn_screen_node_entity(
+                        commands,
+                        root,
+                        asset_server,
+                        ui_fonts,
+                        ui_style,
+                        child,
+                        image_handles,
+                    )
+                })
+                .collect::<Vec<_>>();
             commands.entity(container).add_children(&children);
             container
         }
-        ScreenNode::Spacer(SpacerNode { width, height }) => {
-            commands.spawn((
+        ScreenNode::Spacer(SpacerNode { width, height }) => commands
+            .spawn((
                 ScreenUiNode,
                 Node {
                     width: px(*width),
                     height: px(*height),
                     ..default()
                 },
-            )).id()
-        }
+            ))
+            .id(),
     }
 }
 
@@ -4679,8 +4915,16 @@ fn spawn_choice_ui(
             ChoiceUi,
             Node {
                 position_type: PositionType::Absolute,
-                left: if ui_style.choice_panel_width > 0.0 { Val::Auto } else { px(24.0) },
-                right: if ui_style.choice_panel_width > 0.0 { Val::Auto } else { px(24.0) },
+                left: if ui_style.choice_panel_width > 0.0 {
+                    Val::Auto
+                } else {
+                    px(24.0)
+                },
+                right: if ui_style.choice_panel_width > 0.0 {
+                    Val::Auto
+                } else {
+                    px(24.0)
+                },
                 bottom: px(ui_style.choice_bottom),
                 width: if ui_style.choice_panel_width > 0.0 {
                     px(ui_style.choice_panel_width)
@@ -4807,7 +5051,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                         );
                         close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
                         clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                        clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
                         start_frontend_session(
                             &mut ctx.commands,
                             &ctx.asset_server,
@@ -4827,7 +5070,11 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     }
                     RuntimeMenuButtonAction::OpenPauseMenu => {
                         if ctx.runtime_menu.pause_root.is_none() {
-                            ctx.runtime_menu.pause_root = Some(spawn_pause_menu(&mut ctx.commands, &ctx.ui_fonts, &ctx.ui_style));
+                            ctx.runtime_menu.pause_root = Some(spawn_pause_menu(
+                                &mut ctx.commands,
+                                &ctx.ui_fonts,
+                                &ctx.ui_style,
+                            ));
                         }
                         ctx.runtime_menu.pause_open = true;
                     }
@@ -4896,7 +5143,7 @@ fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiSt
                 ..default()
             },
             BackgroundColor(Color::BLACK.with_alpha(0.35)),
-            Visibility::Hidden,
+            Visibility::Inherited,
         ))
         .id();
 
@@ -4921,10 +5168,34 @@ fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiSt
                     ui_text_font(ui_fonts, 30.0),
                     TextColor(ui_style.speaker_color),
                 ));
-                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Return", RuntimeMenuButtonAction::Resume);
-                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Quick Save", RuntimeMenuButtonAction::QuickSave);
-                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Quick Load", RuntimeMenuButtonAction::QuickLoad);
-                spawn_runtime_menu_button(panel, ui_fonts, ui_style, "Main Menu", RuntimeMenuButtonAction::ReturnToTitle);
+                spawn_runtime_menu_button(
+                    panel,
+                    ui_fonts,
+                    ui_style,
+                    "Return",
+                    RuntimeMenuButtonAction::Resume,
+                );
+                spawn_runtime_menu_button(
+                    panel,
+                    ui_fonts,
+                    ui_style,
+                    "Quick Save",
+                    RuntimeMenuButtonAction::QuickSave,
+                );
+                spawn_runtime_menu_button(
+                    panel,
+                    ui_fonts,
+                    ui_style,
+                    "Quick Load",
+                    RuntimeMenuButtonAction::QuickLoad,
+                );
+                spawn_runtime_menu_button(
+                    panel,
+                    ui_fonts,
+                    ui_style,
+                    "Main Menu",
+                    RuntimeMenuButtonAction::ReturnToTitle,
+                );
             });
     });
 
@@ -5002,17 +5273,19 @@ fn save_runtime_slot(
     runtime_state: &ScriptRuntimeState,
     shared_state: &SceneSharedState,
 ) -> Result<(), StorageError> {
-    fs::create_dir_all(&runtime_state.save_root)?;
-    let save_path = runtime_state.save_root.join(format!("{slot}.toml"));
+    let checkpoint_state = runtime_state.checkpoint.lock().unwrap().clone();
     let data = SaveGameData {
+        version: 2,
         resume_script: runtime_state.current_script.lock().unwrap().clone(),
+        random_seed: *runtime_state.random_seed.lock().unwrap(),
+        checkpoint: checkpoint_state.current,
         script_stack: runtime_state.script_stack.lock().unwrap().clone(),
         globals: runtime_state.globals.lock().unwrap().clone(),
+        scope: std::collections::BTreeMap::new(),
+        input_log: checkpoint_state.input_log,
         scene: shared_state.0.lock().unwrap().clone(),
     };
-    let payload = toml::to_string_pretty(&data).map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
-    fs::write(save_path, payload)?;
-    Ok(())
+    write_save_data_to_root(&runtime_state.save_root, slot, &data)
 }
 
 #[allow(clippy::too_many_arguments)]

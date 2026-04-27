@@ -6,9 +6,19 @@ edition = "2024"
 [dependencies]
 bevy = { version = "0.18.1", features = ["webp", "jpeg", "wav", "mp3", "flac"] }
 rhai = "1.24.0"
+rand = "0.10.0"
+rand_pcg = "0.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0.149"
+prost = "0.14.3"
 toml = "1.1.2"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 futures-lite = "2.6.1"
-zip = "8.5.1"
+zip = "8.6.0"
+
+[profile.app-release]
+inherits = "release"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1

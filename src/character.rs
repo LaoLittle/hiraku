@@ -79,7 +79,10 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
         return Ok(CharacterCatalog::default());
     };
 
-    let catalog_path = vfs.resolve_path(Some(vfs.settings_path()), &format!("{directory}/characters.toml"));
+    let catalog_path = vfs.resolve_path(
+        Some(vfs.settings_path()),
+        &format!("{directory}/characters.toml"),
+    );
     let catalog_text = match vfs.read_text(&catalog_path) {
         Ok(catalog_text) => catalog_text,
         Err(VfsError::NotFound(_)) => {
@@ -106,7 +109,9 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
             Some(&format!("{character_directory}/__dir__")),
             &config_relative,
         );
-        let config_text = vfs.read_text(&config_path).map_err(CharacterCatalogError::Settings)?;
+        let config_text = vfs
+            .read_text(&config_path)
+            .map_err(CharacterCatalogError::Settings)?;
         let config = toml::from_str::<CharacterConfigFile>(&config_text).map_err(|source| {
             CharacterCatalogError::CharacterToml {
                 path: config_path.clone(),

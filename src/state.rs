@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::{Arc, Mutex}};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -9,6 +12,31 @@ pub enum StoredValue {
     Int(i64),
     Float(f64),
     String(String),
+    Array(Vec<StoredValue>),
+    Map(BTreeMap<String, StoredValue>),
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScriptPosition {
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SaveCheckpoint {
+    pub script: String,
+    pub ordinal: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub position: ScriptPosition,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedInput {
+    pub checkpoint: SaveCheckpoint,
+    pub value: StoredValue,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,13 +97,27 @@ pub struct SceneSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SaveGameData {
+    #[serde(default = "default_save_version")]
+    pub version: u32,
     pub resume_script: String,
+    #[serde(default)]
+    pub random_seed: u64,
+    #[serde(default)]
+    pub checkpoint: Option<SaveCheckpoint>,
     #[serde(default)]
     pub script_stack: Vec<String>,
     #[serde(default)]
     pub globals: BTreeMap<String, StoredValue>,
     #[serde(default)]
+    pub scope: BTreeMap<String, StoredValue>,
+    #[serde(default)]
+    pub input_log: Vec<SavedInput>,
+    #[serde(default)]
     pub scene: SceneSnapshot,
+}
+
+fn default_save_version() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Default)]

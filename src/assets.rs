@@ -1,12 +1,15 @@
 use bevy::{
-    asset::{io::Reader, AssetLoader, LoadContext},
+    asset::{AssetLoader, LoadContext, io::Reader},
     prelude::*,
     reflect::TypePath,
 };
 use thiserror::Error;
 
 #[derive(Asset, TypePath, Debug, Clone)]
-#[expect(dead_code, reason = "typed asset is exposed for game-side systems and scripts")]
+#[expect(
+    dead_code,
+    reason = "typed asset is exposed for game-side systems and scripts"
+)]
 pub struct RhaiScriptAsset {
     pub source: String,
 }
@@ -47,7 +50,10 @@ impl AssetLoader for RhaiScriptAssetLoader {
 }
 
 #[derive(Asset, TypePath, Debug, Clone)]
-#[expect(dead_code, reason = "typed asset is exposed for generic binary loading")]
+#[expect(
+    dead_code,
+    reason = "typed asset is exposed for generic binary loading"
+)]
 pub struct BytesAsset {
     pub bytes: Vec<u8>,
 }

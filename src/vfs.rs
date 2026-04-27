@@ -7,15 +7,15 @@ use std::{
 
 use bevy::{
     asset::io::{
-        file::FileAssetReader, AssetReader, AssetReaderError, AssetSourceBuilder, PathStream,
-        Reader, VecReader,
+        AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, Reader, VecReader,
+        file::FileAssetReader,
     },
     prelude::*,
 };
 use futures_lite::stream;
 use serde::Deserialize;
 use thiserror::Error;
-use zip::{result::ZipError, ZipArchive};
+use zip::{ZipArchive, result::ZipError};
 
 pub const DEFAULT_ASSET_ROOT: &str = "assets";
 pub const DEFAULT_SETTINGS_PATH: &str = "main.hdp!settings.toml";
@@ -143,11 +143,21 @@ impl HdpVfs {
 
     pub fn resolve_path(&self, base: Option<&str>, requested: &str) -> String {
         if let Some(stripped) = requested.strip_prefix(ASSET_ROOT_PREFIX) {
-            return format!("{WORKSPACE_ASSET_ALIAS}{}", normalize_relative_path(Path::new(stripped)).to_string_lossy().replace('\\', "/"));
+            return format!(
+                "{WORKSPACE_ASSET_ALIAS}{}",
+                normalize_relative_path(Path::new(stripped))
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
         }
 
         if let Some(stripped) = requested.strip_prefix(WORKSPACE_ROOT_PREFIX) {
-            return format!("{WORKSPACE_ROOT_ALIAS}{}", normalize_relative_path(Path::new(stripped)).to_string_lossy().replace('\\', "/"));
+            return format!(
+                "{WORKSPACE_ROOT_ALIAS}{}",
+                normalize_relative_path(Path::new(stripped))
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
         }
 
         if let Some(stripped) = requested.strip_prefix(RESOURCE_ROOT_PREFIX) {
@@ -217,7 +227,9 @@ impl HdpVfs {
 
     pub fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         if let Some(stripped) = path.strip_prefix(WORKSPACE_ASSET_ALIAS) {
-            let full_path = FileAssetReader::get_base_path().join(DEFAULT_ASSET_ROOT).join(stripped);
+            let full_path = FileAssetReader::get_base_path()
+                .join(DEFAULT_ASSET_ROOT)
+                .join(stripped);
             return std::fs::read(&full_path)
                 .map_err(|err| map_fs_not_found(err, full_path.display().to_string()));
         }
@@ -242,7 +254,8 @@ impl HdpVfs {
         }
 
         let full_path = self.root.join(path);
-        std::fs::read(&full_path).map_err(|err| map_fs_not_found(err, full_path.display().to_string()))
+        std::fs::read(&full_path)
+            .map_err(|err| map_fs_not_found(err, full_path.display().to_string()))
     }
 
     fn list_virtual_directory(&self, path: &Path) -> Result<Vec<PathBuf>, AssetReaderError> {
@@ -251,7 +264,8 @@ impl HdpVfs {
         };
 
         let archive_path = self.root.join(&archive);
-        let file = File::open(&archive_path).map_err(|err| map_reader_fs_error(err, archive_path))?;
+        let file =
+            File::open(&archive_path).map_err(|err| map_reader_fs_error(err, archive_path))?;
         let mut zip = ZipArchive::new(file).map_err(zip_to_reader_error)?;
         let directory_prefix = normalize_entry_prefix(&entry);
         let mut items = Vec::new();
@@ -331,7 +345,9 @@ impl HdpAssetReader {
 impl AssetReader for HdpAssetReader {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
         if let Some(stripped) = path.to_string_lossy().strip_prefix(WORKSPACE_ASSET_ALIAS) {
-            let full_path = FileAssetReader::get_base_path().join(DEFAULT_ASSET_ROOT).join(stripped);
+            let full_path = FileAssetReader::get_base_path()
+                .join(DEFAULT_ASSET_ROOT)
+                .join(stripped);
             let bytes = std::fs::read(&full_path)
                 .map_err(|err| map_reader_fs_error(err, full_path.clone()))?;
             return Ok(Box::new(VecReader::new(bytes)) as Box<dyn Reader>);
@@ -522,13 +538,11 @@ fn vfs_to_reader_error(error: VfsError) -> AssetReaderError {
         VfsError::NotFound(path) => AssetReaderError::NotFound(PathBuf::from(path)),
         VfsError::Io(error) => AssetReaderError::from(error),
         VfsError::Zip(error) => AssetReaderError::from(std::io::Error::other(error.to_string())),
-        VfsError::Utf8(error) => AssetReaderError::from(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            error,
-        )),
-        VfsError::SettingsParse(error) => AssetReaderError::from(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            error,
-        )),
+        VfsError::Utf8(error) => {
+            AssetReaderError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }
+        VfsError::SettingsParse(error) => {
+            AssetReaderError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }
     }
 }

@@ -1,16 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::Duration,
 };
 
-use bevy::{log::error, math::{Vec2, Vec4}, prelude::Resource};
+use bevy::{
+    log::error,
+    math::{Vec2, Vec4},
+    prelude::Resource,
+};
+use rand::{Rng, SeedableRng};
+use rand_pcg::Pcg32;
+use rhai::plugin::*;
 use rhai::{
-    Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, INT, ImmutableString, Map,
-    NativeCallContext, Position, FnPtr,
+    Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, FnPtr, INT, ImmutableString,
+    Map, NativeCallContext, Position,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -18,14 +24,23 @@ use serde_json::Value as JsonValue;
 use crate::{
     character::load_character_catalog,
     effect::CustomEffectOptions,
-    storage::{UserSettings, read_user_settings, save_root_path, write_user_settings},
-    state::{ChoiceOption, SaveGameData, SceneSnapshot, StoredValue, UiStylePatch},
+    state::{
+        ChoiceOption, SaveCheckpoint, SaveGameData, SavedInput, SceneSnapshot, ScriptPosition,
+        StoredValue, UiStylePatch,
+    },
+    storage::{
+        UserSettings, load_save_data_from_root, read_user_settings, save_root_path, slot_path_in,
+        write_save_data_to_root, write_user_settings,
+    },
     ui::{
         BarNode, ButtonNode, ContainerNode, ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec,
         SpacerNode, TextNode,
     },
     vfs::{HdpVfs, VfsError},
 };
+
+mod hiraku_engine;
+mod rng;
 
 const JUMP_SCRIPT_SIGNAL: &str = "__hiraku_jump_script__::";
 const CALL_SCRIPT_SIGNAL: &str = "__hiraku_call_script__::";
@@ -44,6 +59,12 @@ enum ScriptFlowAction {
     Return,
     ReturnToTitle,
     EngineStopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointDecision {
+    Run,
+    ReplaySkip,
 }
 
 #[derive(Debug)]
@@ -311,7 +332,24 @@ pub struct ScriptRuntimeState {
     pub current_script: Arc<Mutex<String>>,
     pub script_stack: Arc<Mutex<Vec<String>>>,
     pub globals: Arc<Mutex<BTreeMap<String, StoredValue>>>,
+    pub checkpoint: Arc<Mutex<CheckpointState>>,
+    pub random_seed: Arc<Mutex<u64>>,
     pub save_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointState {
+    pub current: Option<SaveCheckpoint>,
+    pub ordinal: u64,
+    pub input_log: Vec<SavedInput>,
+    pub replay: Option<ReplayState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplayState {
+    pub target: SaveCheckpoint,
+    pub input_log: Vec<SavedInput>,
+    pub input_cursor: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +357,9 @@ pub struct ScriptBootstrap {
     pub startup_script: String,
     pub script_stack: Vec<String>,
     pub globals: BTreeMap<String, StoredValue>,
+    pub checkpoint: Option<SaveCheckpoint>,
+    pub input_log: Vec<SavedInput>,
+    pub random_seed: Option<u64>,
 }
 
 impl ScriptBootstrap {
@@ -327,14 +368,24 @@ impl ScriptBootstrap {
             startup_script,
             script_stack: Vec::new(),
             globals: BTreeMap::new(),
+            checkpoint: None,
+            input_log: Vec::new(),
+            random_seed: None,
         }
     }
 
     pub fn from_save(data: &SaveGameData) -> Self {
         Self {
-            startup_script: data.resume_script.clone(),
+            startup_script: data
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.script.clone())
+                .unwrap_or_else(|| data.resume_script.clone()),
             script_stack: data.script_stack.clone(),
             globals: data.globals.clone(),
+            checkpoint: data.checkpoint.clone(),
+            input_log: data.input_log.clone(),
+            random_seed: Some(data.random_seed),
         }
     }
 }
@@ -346,6 +397,9 @@ struct ScriptHost {
     current_script: Arc<Mutex<String>>,
     script_stack: Arc<Mutex<Vec<String>>>,
     globals: Arc<Mutex<BTreeMap<String, StoredValue>>>,
+    checkpoint: Arc<Mutex<CheckpointState>>,
+    random_seed: Arc<Mutex<u64>>,
+    rng: Arc<Mutex<Pcg32>>,
     scene_state: Arc<Mutex<SceneSnapshot>>,
     next_animation_id: Arc<Mutex<u64>>,
     batch_registry: Arc<Mutex<BatchRegistry>>,
@@ -396,15 +450,85 @@ impl ScriptHost {
         *self.current_script.lock().unwrap() = path.into();
     }
 
+    fn reset_script_checkpoint_counter(&self) {
+        self.checkpoint.lock().unwrap().ordinal = 0;
+    }
+
+    fn checkpoint(&self, kind: &str, label: Option<String>, pos: Position) -> CheckpointDecision {
+        let mut state = self.checkpoint.lock().unwrap();
+        state.ordinal += 1;
+        let checkpoint = SaveCheckpoint {
+            script: self.current_script_path(),
+            ordinal: state.ordinal,
+            kind: kind.to_string(),
+            label,
+            position: ScriptPosition {
+                line: pos.line(),
+                column: pos.position(),
+            },
+        };
+
+        if let Some(replay) = state.replay.as_ref() {
+            if checkpoint.script == replay.target.script
+                && checkpoint.ordinal < replay.target.ordinal
+            {
+                state.current = Some(checkpoint);
+                return CheckpointDecision::ReplaySkip;
+            }
+            if checkpoint.script == replay.target.script
+                && checkpoint.ordinal == replay.target.ordinal
+            {
+                state.current = Some(checkpoint);
+                state.replay = None;
+                return CheckpointDecision::Run;
+            }
+        }
+
+        state.current = Some(checkpoint);
+        CheckpointDecision::Run
+    }
+
+    fn is_replaying(&self) -> bool {
+        self.checkpoint.lock().unwrap().replay.is_some()
+    }
+
+    fn replay_input(&self) -> Option<StoredValue> {
+        let mut state = self.checkpoint.lock().unwrap();
+        let input = {
+            let replay = state.replay.as_mut()?;
+            let input = replay.input_log.get(replay.input_cursor)?.value.clone();
+            replay.input_cursor += 1;
+            input
+        };
+        if let Some(checkpoint) = state.current.clone() {
+            state.input_log.push(SavedInput {
+                checkpoint,
+                value: input.clone(),
+            });
+        }
+        Some(input)
+    }
+
+    fn record_input(&self, value: StoredValue) {
+        let mut state = self.checkpoint.lock().unwrap();
+        if let Some(checkpoint) = state.current.clone() {
+            state.input_log.push(SavedInput { checkpoint, value });
+        }
+    }
+
     fn resolve_path(&self, requested: &str) -> String {
         self.vfs
             .resolve_path(Some(&self.current_script_path()), requested)
     }
 
     fn send(&self, command: ScriptCommand) -> Result<(), Box<EvalAltResult>> {
+        if self.is_replaying() && command_suppressed_during_replay(&command) {
+            return Ok(());
+        }
+
         self.command_tx
             .send(command)
-            .map_err(|err| runtime_error(format!("failed to send command to engine: {err}")))
+            .map_err(|_| engine_stopped_signal())
     }
 
     fn send_and_wait<F>(&self, builder: F) -> Result<ScriptResponse, Box<EvalAltResult>>
@@ -413,18 +537,25 @@ impl ScriptHost {
     {
         let (done_tx, done_rx) = mpsc::channel();
         self.send(builder(done_tx))?;
-        done_rx
-            .recv()
-            .map_err(|_| engine_stopped_signal())
+        done_rx.recv().map_err(|_| engine_stopped_signal())
     }
 
     fn send_continue<F>(&self, builder: F) -> Result<(), Box<EvalAltResult>>
     where
         F: FnOnce(mpsc::Sender<ScriptResponse>) -> ScriptCommand,
     {
-        match self.send_and_wait(builder)? {
+        let (done_tx, done_rx) = mpsc::channel();
+        let command = builder(done_tx);
+        if self.is_replaying() && command_suppressed_during_replay(&command) {
+            return Ok(());
+        }
+
+        self.send(command)?;
+        match done_rx.recv().map_err(|_| engine_stopped_signal())? {
             ScriptResponse::Continue => Ok(()),
-            ScriptResponse::Choice(_) => Err(runtime_error("engine returned unexpected choice response")),
+            ScriptResponse::Choice(_) => {
+                Err(runtime_error("engine returned unexpected choice response"))
+            }
         }
     }
 
@@ -554,12 +685,9 @@ impl ScriptHost {
             BatchMode::Sequence => format!("seq-{}", registry.next_group_id),
             BatchMode::Parallel => format!("par-{}", registry.next_group_id),
         };
-        registry.groups.insert(
-            group_id.clone(),
-            BatchGroup {
-                handles: deduped,
-            },
-        );
+        registry
+            .groups
+            .insert(group_id.clone(), BatchGroup { handles: deduped });
         drop(registry);
 
         self.send(ScriptCommand::SubmitBatch {
@@ -627,16 +755,28 @@ impl ScriptHost {
 
     fn request_choice(
         &self,
+        pos: Position,
         prompt: String,
         options: Vec<ChoiceOption>,
     ) -> Result<StoredValue, Box<EvalAltResult>> {
+        if self.checkpoint("choice", None, pos) == CheckpointDecision::ReplaySkip {
+            return self.replay_input().ok_or_else(|| {
+                runtime_error("save replay reached a choice without a recorded input")
+            });
+        }
+
         match self.send_and_wait(|done| ScriptCommand::Choose {
             prompt,
             options,
             done,
         })? {
-            ScriptResponse::Choice(value) => Ok(value),
-            ScriptResponse::Continue => Err(runtime_error("engine returned unexpected continue response")),
+            ScriptResponse::Choice(value) => {
+                self.record_input(value.clone());
+                Ok(value)
+            }
+            ScriptResponse::Continue => Err(runtime_error(
+                "engine returned unexpected continue response",
+            )),
         }
     }
 
@@ -712,41 +852,51 @@ impl ScriptHost {
         slot: &str,
         resume_script: Option<String>,
     ) -> Result<(), Box<EvalAltResult>> {
-        fs::create_dir_all(&self.save_root)
-            .map_err(|err| runtime_error(format!("failed to create save directory: {err}")))?;
-
-        let save_path = self.save_file_path(slot)?;
+        let checkpoint_state = self.checkpoint.lock().unwrap().clone();
         let data = SaveGameData {
+            version: 2,
             resume_script: resume_script.unwrap_or_else(|| self.current_script_path()),
+            random_seed: *self.random_seed.lock().unwrap(),
+            checkpoint: checkpoint_state.current.clone(),
             script_stack: self.script_stack.lock().unwrap().clone(),
             globals: self.globals.lock().unwrap().clone(),
+            scope: BTreeMap::new(),
+            input_log: checkpoint_state.input_log.clone(),
             scene: self.scene_state.lock().unwrap().clone(),
         };
 
-        let payload = toml::to_string_pretty(&data)
-            .map_err(|err| runtime_error(format!("failed to serialize save data: {err}")))?;
-        fs::write(&save_path, payload).map_err(|err| {
-            runtime_error(format!("failed to write save file `{}`: {err}", save_path.display()))
-        })
+        write_save_data_to_root(&self.save_root, slot, &data)
+            .map_err(|err| runtime_error(format!("failed to write save slot `{slot}`: {err}")))
     }
 
     fn load_game(&self, slot: &str) -> Result<String, Box<EvalAltResult>> {
-        let save_path = self.save_file_path(slot)?;
-        let payload = fs::read_to_string(&save_path).map_err(|err| {
-            runtime_error(format!("failed to read save file `{}`: {err}", save_path.display()))
-        })?;
-        let data: SaveGameData = toml::from_str(&payload)
-            .map_err(|err| runtime_error(format!("failed to parse save file: {err}")))?;
+        let data = load_save_data_from_root(&self.save_root, slot)
+            .map_err(|err| runtime_error(format!("failed to load save slot `{slot}`: {err}")))?;
 
         *self.script_stack.lock().unwrap() = data.script_stack.clone();
         *self.globals.lock().unwrap() = data.globals.clone();
         *self.scene_state.lock().unwrap() = data.scene.clone();
+        *self.random_seed.lock().unwrap() = data.random_seed;
+        *self.rng.lock().unwrap() = Pcg32::seed_from_u64(data.random_seed);
+        *self.checkpoint.lock().unwrap() = CheckpointState {
+            current: data.checkpoint.clone(),
+            ordinal: 0,
+            input_log: Vec::new(),
+            replay: data.checkpoint.clone().map(|target| ReplayState {
+                target,
+                input_log: data.input_log.clone(),
+                input_cursor: 0,
+            }),
+        };
         self.send_continue(|done| ScriptCommand::RestoreSnapshot {
             snapshot: data.scene.clone(),
             done,
         })?;
 
-        Ok(data.resume_script)
+        Ok(data
+            .checkpoint
+            .map(|checkpoint| checkpoint.script)
+            .unwrap_or(data.resume_script))
     }
 
     fn set_global(&self, name: &str, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
@@ -791,8 +941,8 @@ impl ScriptHost {
     }
 
     fn save_file_path(&self, slot: &str) -> Result<PathBuf, Box<EvalAltResult>> {
-        let slot = sanitize_slot_name(slot)?;
-        Ok(self.save_root.join(format!("{slot}.toml")))
+        slot_path_in(&self.save_root, slot)
+            .map_err(|err| runtime_error(format!("failed to resolve save slot `{slot}`: {err}")))
     }
 }
 
@@ -805,12 +955,27 @@ pub fn spawn_script_runtime(
     let (command_tx, command_rx) = mpsc::channel();
     let current_script = Arc::new(Mutex::new(bootstrap.startup_script.clone()));
     let script_stack = Arc::new(Mutex::new(bootstrap.script_stack));
+    let seed = bootstrap.random_seed.unwrap_or_else(new_random_seed);
+    let random_seed = Arc::new(Mutex::new(seed));
+    let rng = Arc::new(Mutex::new(Pcg32::seed_from_u64(seed)));
+    let checkpoint = Arc::new(Mutex::new(CheckpointState {
+        current: bootstrap.checkpoint.clone(),
+        ordinal: 0,
+        input_log: Vec::new(),
+        replay: bootstrap.checkpoint.clone().map(|target| ReplayState {
+            target,
+            input_log: bootstrap.input_log.clone(),
+            input_cursor: 0,
+        }),
+    }));
     let next_animation_id = Arc::new(Mutex::new(0));
     let batch_registry = Arc::new(Mutex::new(BatchRegistry::default()));
     let inline_dialogue_control = Arc::new(Mutex::new(InlineDialogueControl::default()));
 
     commands.insert_resource(ScriptInbox(Mutex::new(command_rx)));
-    commands.insert_resource(InlineDialogueControlResource(inline_dialogue_control.clone()));
+    commands.insert_resource(InlineDialogueControlResource(
+        inline_dialogue_control.clone(),
+    ));
 
     let host = ScriptHost {
         vfs,
@@ -818,6 +983,9 @@ pub fn spawn_script_runtime(
         current_script: current_script.clone(),
         script_stack: script_stack.clone(),
         globals: Arc::new(Mutex::new(bootstrap.globals)),
+        checkpoint: checkpoint.clone(),
+        random_seed: random_seed.clone(),
+        rng: rng.clone(),
         scene_state,
         next_animation_id,
         batch_registry,
@@ -829,6 +997,8 @@ pub fn spawn_script_runtime(
         current_script,
         script_stack,
         globals: host.globals.clone(),
+        checkpoint,
+        random_seed,
         save_root: host.save_root.clone(),
     });
 
@@ -848,6 +1018,7 @@ fn run_script_loop(host: ScriptHost, startup_script: String) {
 
     loop {
         host.set_current_script_path(next_script.clone());
+        host.reset_script_checkpoint_counter();
 
         let source = match host.vfs.read_text(&next_script) {
             Ok(source) => source,
@@ -874,7 +1045,10 @@ fn run_script_loop(host: ScriptHost, startup_script: String) {
                         }
                         ScriptFlowAction::Return => {
                             let Some(target) = host.script_stack.lock().unwrap().pop() else {
-                                error!("script `{}` tried to return with an empty call stack", next_script);
+                                error!(
+                                    "script `{}` tried to return with an empty call stack",
+                                    next_script
+                                );
                                 return;
                             };
                             next_script = target;
@@ -892,996 +1066,60 @@ fn run_script_loop(host: ScriptHost, startup_script: String) {
     }
 }
 
+fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
+    matches!(
+        command,
+        ScriptCommand::Log(_)
+            | ScriptCommand::SetBackground { .. }
+            | ScriptCommand::ShowSprite { .. }
+            | ScriptCommand::HideSprite { .. }
+            | ScriptCommand::SetOverlay { .. }
+            | ScriptCommand::Say { .. }
+            | ScriptCommand::AwaitDialogueAdvance { .. }
+            | ScriptCommand::SetDialogue { .. }
+            | ScriptCommand::ClearDialogue
+            | ScriptCommand::SetTextEffect(_)
+            | ScriptCommand::ResetTextEffect
+            | ScriptCommand::ApplyUserSettings(_)
+            | ScriptCommand::ApplyUiStyle(_)
+            | ScriptCommand::ResetUiStyle
+            | ScriptCommand::ShowScreen { .. }
+            | ScriptCommand::ShowOverlay { .. }
+            | ScriptCommand::HideOverlay { .. }
+            | ScriptCommand::Choose { .. }
+            | ScriptCommand::ShowCharacter { .. }
+            | ScriptCommand::HideCharacter { .. }
+            | ScriptCommand::JumpCharacter { .. }
+            | ScriptCommand::ShakeCharacter { .. }
+            | ScriptCommand::AnimateCharacter { .. }
+            | ScriptCommand::PlayCustomEffect { .. }
+            | ScriptCommand::RuleTransitionBg { .. }
+            | ScriptCommand::MoveSprite { .. }
+            | ScriptCommand::ScaleSprite { .. }
+            | ScriptCommand::FadeSprite { .. }
+            | ScriptCommand::Wait { .. }
+            | ScriptCommand::WaitAnimations { .. }
+            | ScriptCommand::Shake { .. }
+            | ScriptCommand::PlayBgm { .. }
+            | ScriptCommand::SetBgmVolume { .. }
+            | ScriptCommand::FadeBgm { .. }
+            | ScriptCommand::StopBgm
+            | ScriptCommand::PlayVoice { .. }
+            | ScriptCommand::StopVoice
+            | ScriptCommand::PlaySfx { .. }
+            | ScriptCommand::SubmitBatch { .. }
+            | ScriptCommand::CancelAnimations { .. }
+    )
+}
+
 fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
-    let log_host = host.clone();
-    engine.register_fn("log", move |message: ImmutableString| {
-        let _ = log_host.send(ScriptCommand::Log(message.to_string()));
-    });
-
-    let seq_host = host.clone();
-    engine.register_fn(
-        "seq",
-        move |ctx: NativeCallContext, callback: FnPtr| -> Result<String, Box<EvalAltResult>> {
-            seq_host.begin_batch(BatchMode::Sequence)?;
-            match callback.call_within_context::<Dynamic>(&ctx, ()) {
-                Ok(_) => seq_host.finish_batch(),
-                Err(err) => {
-                    seq_host.cancel_batch();
-                    Err(err)
-                }
-            }
-        },
-    );
-
-    let par_host = host.clone();
-    engine.register_fn(
-        "par",
-        move |ctx: NativeCallContext, callback: FnPtr| -> Result<String, Box<EvalAltResult>> {
-            par_host.begin_batch(BatchMode::Parallel)?;
-            match callback.call_within_context::<Dynamic>(&ctx, ()) {
-                Ok(_) => par_host.finish_batch(),
-                Err(err) => {
-                    par_host.cancel_batch();
-                    Err(err)
-                }
-            }
-        },
-    );
-
-    let pause_seconds_host = host.clone();
-    engine.register_fn("pause", move |seconds: FLOAT| -> Result<Dynamic, Box<EvalAltResult>> {
-        let duration = duration_from_seconds(seconds)?;
-        run_blocking_or_collected(&pause_seconds_host, "pause", |animation_id, done| ScriptCommand::Wait {
-            duration,
-            animation_id,
-            done: done.expect("blocking or collected waits always provide a completion sender"),
-        })
-    });
-
-    let pause_int_host = host.clone();
-    engine.register_fn("pause", move |seconds: INT| -> Result<Dynamic, Box<EvalAltResult>> {
-        let duration = duration_from_seconds(seconds as FLOAT)?;
-        run_blocking_or_collected(&pause_int_host, "pause", |animation_id, done| ScriptCommand::Wait {
-            duration,
-            animation_id,
-            done: done.expect("blocking or collected waits always provide a completion sender"),
-        })
-    });
-
-    let pause_ms_host = host.clone();
-    engine.register_fn("pause_ms", move |ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-        let duration = duration_from_millis(ms)?;
-        run_blocking_or_collected(&pause_ms_host, "pause", |animation_id, done| ScriptCommand::Wait {
-            duration,
-            animation_id,
-            done: done.expect("blocking or collected waits always provide a completion sender"),
-        })
-    });
-
-    let wait_handle_host = host.clone();
-    engine.register_fn("wait", move |handle: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-        if wait_handle_host.is_batch_mode() {
-            return Err(runtime_error("wait cannot be used inside seq/par; wait after the block returns a handle"));
-        }
-        wait_handle_host.wait_for_handle(handle.to_string())
-    });
-
-    let wait_handles_host = host.clone();
-    engine.register_fn("wait", move |handles: Array| -> Result<(), Box<EvalAltResult>> {
-        if wait_handles_host.is_batch_mode() {
-            return Err(runtime_error("wait cannot be used inside seq/par; wait after the block returns a handle"));
-        }
-        let handles = parse_animation_ids(handles)?;
-        wait_handles_host.wait_for_handles(handles)
-    });
-
-    let cancel_host = host.clone();
-    engine.register_fn("cancel", move |handle: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-        if cancel_host.is_batch_mode() {
-            return Err(runtime_error("cancel cannot be used inside seq/par"));
-        }
-        cancel_host.cancel_handle(handle.to_string())
-    });
-
-    let say_host = host.clone();
-    engine.register_fn(
-        "say",
-        move |
-            ctx: NativeCallContext,
-            speaker: ImmutableString,
-            text: ImmutableString,
-        | -> Result<(), Box<EvalAltResult>> {
-            say_with_inline_commands(&ctx, &say_host, speaker.to_string(), text.to_string())
-        },
-    );
-
-    let narrate_host = host.clone();
-    engine.register_fn(
-        "narrate",
-        move |ctx: NativeCallContext, text: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            say_with_inline_commands(&ctx, &narrate_host, String::new(), text.to_string())
-        },
-    );
-
-    let clear_host = host.clone();
-    engine.register_fn("clear_text", move || -> Result<(), Box<EvalAltResult>> {
-        clear_host.send(ScriptCommand::ClearDialogue)
-    });
-
-    let bg_host = host.clone();
-    engine.register_fn(
-        "bg",
-        move |path: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let path = bg_host.resolve_path(&path);
-            bg_host.send(ScriptCommand::SetBackground {
-                path,
-                fade: None,
-                animation_id: None,
-                done: None,
-            })
-        },
-    );
-
-    let bg_fade_host = host.clone();
-    engine.register_fn(
-        "bg_fade",
-        move |path: ImmutableString, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            let path = bg_fade_host.resolve_path(&path);
-            run_blocking_or_collected(&bg_fade_host, "bg-fade", |animation_id, done| ScriptCommand::SetBackground {
-                path,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let bg_rule_host = host.clone();
-    engine.register_fn(
-        "bg_rule",
-        move |
-            path: ImmutableString,
-            rule_path: ImmutableString,
-            ms: i64,
-            vague: FLOAT,
-        | -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            let path = bg_rule_host.resolve_path(&path);
-            let rule_path = bg_rule_host.resolve_path(&rule_path);
-            run_blocking_or_collected(&bg_rule_host, "bg-rule", |animation_id, done| ScriptCommand::RuleTransitionBg {
-                path,
-                rule_path,
-                duration,
-                vague: normalize_vague(vague),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let effect_host = host.clone();
-    engine.register_fn(
-        "effect",
-        move |options: Map| -> Result<Dynamic, Box<EvalAltResult>> {
-            let options = parse_custom_effect_options(&effect_host, options)?;
-            run_blocking_or_collected(&effect_host, "effect", |animation_id, done| ScriptCommand::PlayCustomEffect {
-                options,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let show_host = host.clone();
-    engine.register_fn(
-        "show",
-        move |id: ImmutableString, path: ImmutableString, x: FLOAT, y: FLOAT| -> Result<(), Box<EvalAltResult>> {
-            let path = show_host.resolve_path(&path);
-            show_host.send(ScriptCommand::ShowSprite {
-                id: id.to_string(),
-                path,
-                position: Vec2::new(x as f32, y as f32),
-                layer: 0.0,
-                scale: 1.0,
-                fade: None,
-                animation_id: None,
-                done: None,
-            })
-        },
-    );
-
-    let show_scaled_host = host.clone();
-    engine.register_fn(
-        "show",
-        move |
-            id: ImmutableString,
-            path: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-        | -> Result<(), Box<EvalAltResult>> {
-            let path = show_scaled_host.resolve_path(&path);
-            let scale = positive_scale(scale)?;
-            show_scaled_host.send(ScriptCommand::ShowSprite {
-                id: id.to_string(),
-                path,
-                position: Vec2::new(x as f32, y as f32),
-                layer: 0.0,
-                scale,
-                fade: None,
-                animation_id: None,
-                done: None,
-            })
-        },
-    );
-
-    let show_layered_host = host.clone();
-    engine.register_fn(
-        "show",
-        move |
-            id: ImmutableString,
-            path: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-            layer: FLOAT,
-        | -> Result<(), Box<EvalAltResult>> {
-            let path = show_layered_host.resolve_path(&path);
-            let scale = positive_scale(scale)?;
-            show_layered_host.send(ScriptCommand::ShowSprite {
-                id: id.to_string(),
-                path,
-                position: Vec2::new(x as f32, y as f32),
-                layer: layer as f32,
-                scale,
-                fade: None,
-                animation_id: None,
-                done: None,
-            })
-        },
-    );
-
-    let show_fade_host = host.clone();
-    engine.register_fn(
-        "show_fade",
-        move |id: ImmutableString, path: ImmutableString, x: FLOAT, y: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            let path = show_fade_host.resolve_path(&path);
-            run_blocking_or_collected(&show_fade_host, "show", |animation_id, done| ScriptCommand::ShowSprite {
-                id: id.to_string(),
-                path,
-                position: Vec2::new(x as f32, y as f32),
-                layer: 0.0,
-                scale: 1.0,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let show_fade_scaled_host = host.clone();
-    engine.register_fn(
-        "show_fade",
-        move |
-            id: ImmutableString,
-            path: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-            ms: i64,
-        | -> Result<Dynamic, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            let path = show_fade_scaled_host.resolve_path(&path);
-            let scale = positive_scale(scale)?;
-            run_blocking_or_collected(&show_fade_scaled_host, "show", |animation_id, done| ScriptCommand::ShowSprite {
-                id: id.to_string(),
-                path,
-                position: Vec2::new(x as f32, y as f32),
-                layer: 0.0,
-                scale,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let show_fade_layered_host = host.clone();
-    engine.register_fn(
-        "show_fade",
-        move |
-            id: ImmutableString,
-            path: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-            layer: FLOAT,
-            ms: i64,
-        | -> Result<Dynamic, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            let path = show_fade_layered_host.resolve_path(&path);
-            let scale = positive_scale(scale)?;
-            run_blocking_or_collected(&show_fade_layered_host, "show", |animation_id, done| ScriptCommand::ShowSprite {
-                id: id.to_string(),
-                path,
-                position: Vec2::new(x as f32, y as f32),
-                layer: layer as f32,
-                scale,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let hide_host = host.clone();
-    engine.register_fn(
-        "hide",
-        move |id: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            hide_host.send(ScriptCommand::HideSprite {
-                id: id.to_string(),
-                fade: None,
-                animation_id: None,
-                done: None,
-            })
-        },
-    );
-
-    let show_character_host = host.clone();
-    engine.register_fn(
-        "show_character",
-        move |
-            name: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-        | -> Result<Dynamic, Box<EvalAltResult>> {
-            let scale = positive_scale(scale)?;
-            let actor_id = name.to_string();
-            let character_name = actor_id.clone();
-            run_blocking_or_collected(&show_character_host, "character-show", |animation_id, done| ScriptCommand::ShowCharacter {
-                actor_id,
-                character_name,
-                position: Vec2::new(x as f32, y as f32),
-                scale,
-                fade: None,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let show_character_fade_host = host.clone();
-    engine.register_fn(
-        "show_character",
-        move |
-            name: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-            ms: i64,
-        | -> Result<Dynamic, Box<EvalAltResult>> {
-            let scale = positive_scale(scale)?;
-            let fade = duration_from_millis(ms)?;
-            let actor_id = name.to_string();
-            let character_name = actor_id.clone();
-            run_blocking_or_collected(&show_character_fade_host, "character-show", |animation_id, done| ScriptCommand::ShowCharacter {
-                actor_id,
-                character_name,
-                position: Vec2::new(x as f32, y as f32),
-                scale,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let show_character_as_host = host.clone();
-    engine.register_fn(
-        "show_character",
-        move |
-            actor_id: ImmutableString,
-            name: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-        | -> Result<Dynamic, Box<EvalAltResult>> {
-            let scale = positive_scale(scale)?;
-            run_blocking_or_collected(&show_character_as_host, "character-show", |animation_id, done| ScriptCommand::ShowCharacter {
-                actor_id: actor_id.to_string(),
-                character_name: name.to_string(),
-                position: Vec2::new(x as f32, y as f32),
-                scale,
-                fade: None,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let show_character_as_fade_host = host.clone();
-    engine.register_fn(
-        "show_character",
-        move |
-            actor_id: ImmutableString,
-            name: ImmutableString,
-            x: FLOAT,
-            y: FLOAT,
-            scale: FLOAT,
-            ms: i64,
-        | -> Result<Dynamic, Box<EvalAltResult>> {
-            let scale = positive_scale(scale)?;
-            let fade = duration_from_millis(ms)?;
-            run_blocking_or_collected(&show_character_as_fade_host, "character-show", |animation_id, done| ScriptCommand::ShowCharacter {
-                actor_id: actor_id.to_string(),
-                character_name: name.to_string(),
-                position: Vec2::new(x as f32, y as f32),
-                scale,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let hide_character_host = host.clone();
-    engine.register_fn(
-        "hide_character",
-        move |actor_id: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            hide_character_host.send(ScriptCommand::HideCharacter {
-                actor_id: actor_id.to_string(),
-            })
-        },
-    );
-
-    let animate_character_host = host.clone();
-    engine.register_fn(
-        "animate",
-        move |actor_id: ImmutableString, keyframes: Array| -> Result<Dynamic, Box<EvalAltResult>> {
-            let actor_id = actor_id.to_string();
-            let current = animate_character_host.character_position(&actor_id)?;
-            let keyframes = parse_character_animation_keyframes(keyframes, current)?;
-            run_blocking_or_collected(&animate_character_host, "character-animate", |animation_id, done| {
-                ScriptCommand::AnimateCharacter {
-                    actor_id,
-                    keyframes,
-                    animation_id,
-                    done,
-                }
-            })
-        },
-    );
-
-    let jump_character_host = host.clone();
-    engine.register_fn(
-        "jump_character",
-        move |actor_id: ImmutableString, height: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_blocking_or_collected(&jump_character_host, "character-jump", |animation_id, done| ScriptCommand::JumpCharacter {
-                actor_id: actor_id.to_string(),
-                height: non_negative_amplitude(height),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let shake_character_host = host.clone();
-    engine.register_fn(
-        "shake_character",
-        move |actor_id: ImmutableString, amplitude: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_blocking_or_collected(&shake_character_host, "character-shake", |animation_id, done| ScriptCommand::ShakeCharacter {
-                actor_id: actor_id.to_string(),
-                amplitude: non_negative_amplitude(amplitude),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let hide_fade_host = host.clone();
-    engine.register_fn(
-        "hide_fade",
-        move |id: ImmutableString, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            run_blocking_or_collected(&hide_fade_host, "hide", |animation_id, done| ScriptCommand::HideSprite {
-                id: id.to_string(),
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let overlay_host = host.clone();
-    engine.register_fn(
-        "screen_fade",
-        move |alpha: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let fade = duration_from_millis(ms)?;
-            run_blocking_or_collected(&overlay_host, "screen-fade", |animation_id, done| ScriptCommand::SetOverlay {
-                alpha: alpha.clamp(0.0, 1.0) as f32,
-                fade: Some(fade),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let move_sprite_host = host.clone();
-    engine.register_fn(
-        "move_sprite",
-        move |id: ImmutableString, x: FLOAT, y: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_blocking_or_collected(&move_sprite_host, "move", |animation_id, done| ScriptCommand::MoveSprite {
-                id: id.to_string(),
-                position: Vec2::new(x as f32, y as f32),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let move_sprite_by_host = host.clone();
-    engine.register_fn(
-        "move_sprite_by",
-        move |id: ImmutableString, dx: FLOAT, dy: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            let current = move_sprite_by_host
-                .scene_state
-                .lock()
-                .unwrap()
-                .sprites
-                .iter()
-                .find(|sprite| sprite.id == id.as_str())
-                .map(|sprite| Vec2::new(sprite.x, sprite.y))
-                .ok_or_else(|| runtime_error(format!("sprite `{}` not found", id)))?;
-            run_blocking_or_collected(&move_sprite_by_host, "move", |animation_id, done| ScriptCommand::MoveSprite {
-                id: id.to_string(),
-                position: current + Vec2::new(dx as f32, dy as f32),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let scale_sprite_host = host.clone();
-    engine.register_fn(
-        "scale_sprite",
-        move |id: ImmutableString, scale: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            let scale = positive_scale(scale)?;
-            run_blocking_or_collected(&scale_sprite_host, "scale", |animation_id, done| ScriptCommand::ScaleSprite {
-                id: id.to_string(),
-                scale,
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let fade_sprite_host = host.clone();
-    engine.register_fn(
-        "fade_sprite",
-        move |id: ImmutableString, alpha: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_blocking_or_collected(&fade_sprite_host, "fade", |animation_id, done| ScriptCommand::FadeSprite {
-                id: id.to_string(),
-                alpha: alpha.clamp(0.0, 1.0) as f32,
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let shake_host = host.clone();
-    engine.register_fn(
-        "shake",
-        move |ms: i64, amplitude: FLOAT| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_blocking_or_collected(&shake_host, "shake", |animation_id, done| ScriptCommand::Shake {
-                duration,
-                amplitude: non_negative_amplitude(amplitude),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let bgm_host = host.clone();
-    engine.register_fn(
-        "play_bgm",
-        move |path: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            reject_known_unsupported_audio_path(&path)?;
-            let path = bgm_host.resolve_path(&path);
-            bgm_host.send(ScriptCommand::PlayBgm {
-                path,
-                volume: 1.0,
-                fade_in: None,
-                animation_id: None,
-                done: None,
-            })
-        },
-    );
-
-    let bgm_volume_host = host.clone();
-    engine.register_fn(
-        "play_bgm",
-        move |path: ImmutableString, volume: FLOAT| -> Result<(), Box<EvalAltResult>> {
-            reject_known_unsupported_audio_path(&path)?;
-            let path = bgm_volume_host.resolve_path(&path);
-            bgm_volume_host.send(ScriptCommand::PlayBgm {
-                path,
-                volume: clamp_volume(volume),
-                fade_in: None,
-                animation_id: None,
-                done: None,
-            })
-        },
-    );
-
-    let bgm_fadein_host = host.clone();
-    engine.register_fn(
-        "play_bgm",
-        move |path: ImmutableString, volume: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            reject_known_unsupported_audio_path(&path)?;
-            let fade_in = duration_from_millis(ms)?;
-            let path = bgm_fadein_host.resolve_path(&path);
-            run_blocking_or_collected(&bgm_fadein_host, "bgm", |animation_id, done| ScriptCommand::PlayBgm {
-                path,
-                volume: clamp_volume(volume),
-                fade_in: Some(fade_in),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let set_bgm_volume_host = host.clone();
-    engine.register_fn(
-        "set_bgm_volume",
-        move |volume: FLOAT| -> Result<(), Box<EvalAltResult>> {
-            set_bgm_volume_host.send(ScriptCommand::SetBgmVolume {
-                volume: clamp_volume(volume),
-            })
-        },
-    );
-
-    let fade_bgm_host = host.clone();
-    engine.register_fn(
-        "fade_bgm",
-        move |volume: FLOAT, ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
-            let duration = duration_from_millis(ms)?;
-            run_blocking_or_collected(&fade_bgm_host, "bgm-fade", |animation_id, done| ScriptCommand::FadeBgm {
-                volume: clamp_volume(volume),
-                duration,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let stop_bgm_host = host.clone();
-    engine.register_fn("stop_bgm", move || -> Result<(), Box<EvalAltResult>> {
-        stop_bgm_host.send(ScriptCommand::StopBgm)
-    });
-
-    let voice_host = host.clone();
-    engine.register_fn(
-        "play_voice",
-        move |path: ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
-            reject_known_unsupported_audio_path(&path)?;
-            let path = voice_host.resolve_path(&path);
-            run_blocking_or_collected(&voice_host, "voice", |animation_id, done| ScriptCommand::PlayVoice {
-                path,
-                volume: 1.0,
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let voice_volume_host = host.clone();
-    engine.register_fn(
-        "play_voice",
-        move |path: ImmutableString, volume: FLOAT| -> Result<Dynamic, Box<EvalAltResult>> {
-            reject_known_unsupported_audio_path(&path)?;
-            let path = voice_volume_host.resolve_path(&path);
-            run_blocking_or_collected(&voice_volume_host, "voice", |animation_id, done| ScriptCommand::PlayVoice {
-                path,
-                volume: clamp_volume(volume),
-                animation_id,
-                done,
-            })
-        },
-    );
-
-    let stop_voice_host = host.clone();
-    engine.register_fn("stop_voice", move || -> Result<(), Box<EvalAltResult>> {
-        stop_voice_host.send(ScriptCommand::StopVoice)
-    });
-
-    let sfx_host = host.clone();
-    engine.register_fn(
-        "play_sfx",
-        move |path: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            reject_known_unsupported_audio_path(&path)?;
-            let path = sfx_host.resolve_path(&path);
-            sfx_host.send(ScriptCommand::PlaySfx { path, volume: 1.0 })
-        },
-    );
-
-    let sfx_volume_host = host.clone();
-    engine.register_fn(
-        "play_sfx",
-        move |path: ImmutableString, volume: FLOAT| -> Result<(), Box<EvalAltResult>> {
-            reject_known_unsupported_audio_path(&path)?;
-            let path = sfx_volume_host.resolve_path(&path);
-            sfx_volume_host.send(ScriptCommand::PlaySfx {
-                path,
-                volume: clamp_volume(volume),
-            })
-        },
-    );
-
-    let choice_host = host.clone();
-    engine.register_fn(
-        "choice",
-        move |options: Array| -> Result<Dynamic, Box<EvalAltResult>> {
-            let options = parse_choice_options(options)?;
-            let selection = choice_host.request_choice(String::new(), options)?;
-            Ok(stored_value_to_dynamic(selection))
-        },
-    );
-
-    let screen_host = host.clone();
-    engine.register_fn(
-        "screen",
-        move |screen: Map| -> Result<Dynamic, Box<EvalAltResult>> {
-            let screen = parse_screen_spec(&screen_host, screen)?;
-            match screen_host.send_and_wait(|done| ScriptCommand::ShowScreen { screen, done })? {
-                ScriptResponse::Choice(value) => Ok(stored_value_to_dynamic(value)),
-                ScriptResponse::Continue => Err(runtime_error("engine returned unexpected continue response")),
-            }
-        },
-    );
-
-    let overlay_host = host.clone();
-    engine.register_fn(
-        "show_overlay",
-        move |name: ImmutableString, screen: Map| -> Result<(), Box<EvalAltResult>> {
-            let screen = parse_screen_spec(&overlay_host, screen)?;
-            overlay_host.send(ScriptCommand::ShowOverlay {
-                name: name.to_string(),
-                screen,
-            })
-        },
-    );
-
-    let default_overlay_host = host.clone();
-    engine.register_fn("show_overlay", move |screen: Map| -> Result<(), Box<EvalAltResult>> {
-        let screen = parse_screen_spec(&default_overlay_host, screen)?;
-        default_overlay_host.send(ScriptCommand::ShowOverlay {
-            name: "default".to_string(),
-            screen,
-        })
-    });
-
-    let hide_overlay_host = host.clone();
-    engine.register_fn("hide_overlay", move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-        hide_overlay_host.send(ScriptCommand::HideOverlay {
-            name: name.to_string(),
-        })
-    });
-
-    let hide_default_overlay_host = host.clone();
-    engine.register_fn("hide_overlay", move || -> Result<(), Box<EvalAltResult>> {
-        hide_default_overlay_host.send(ScriptCommand::HideOverlay {
-            name: "default".to_string(),
-        })
-    });
-
-    let prompt_choice_host = host.clone();
-    engine.register_fn(
-        "choice",
-        move |prompt: ImmutableString, options: Array| -> Result<Dynamic, Box<EvalAltResult>> {
-            let options = parse_choice_options(options)?;
-            let selection = prompt_choice_host.request_choice(prompt.to_string(), options)?;
-            Ok(stored_value_to_dynamic(selection))
-        },
-    );
-
-    let set_global_host = host.clone();
-    engine.register_fn(
-        "set_global",
-        move |name: ImmutableString, value: Dynamic| -> Result<(), Box<EvalAltResult>> {
-            set_global_host.set_global(&name, value)
-        },
-    );
-
-    let get_global_host = host.clone();
-    engine.register_fn("get_global", move |name: ImmutableString| -> Dynamic {
-        get_global_host.get_global(&name)
-    });
-
-    let get_global_or_host = host.clone();
-    engine.register_fn(
-        "get_global_or",
-        move |name: ImmutableString, fallback: Dynamic| -> Dynamic {
-            get_global_or_host.get_global_or(&name, fallback)
-        },
-    );
-
-    let has_global_host = host.clone();
-    engine.register_fn("has_global", move |name: ImmutableString| -> bool {
-        has_global_host.has_global(&name)
-    });
-
-    let remove_global_host = host.clone();
-    engine.register_fn("remove_global", move |name: ImmutableString| -> bool {
-        remove_global_host.remove_global(&name)
-    });
-
-    let clear_globals_host = host.clone();
-    engine.register_fn("clear_globals", move || {
-        clear_globals_host.clear_globals();
-    });
-
-    let setting_host = host.clone();
-    engine.register_fn(
-        "get_setting",
-        move |name: ImmutableString| -> Result<FLOAT, Box<EvalAltResult>> {
-            Ok(setting_host.user_setting(&name)? as FLOAT)
-        },
-    );
-
-    let set_setting_host = host.clone();
-    engine.register_fn(
-        "set_setting",
-        move |name: ImmutableString, value: FLOAT| -> Result<(), Box<EvalAltResult>> {
-            set_setting_host.set_user_setting(&name, value as f32)
-        },
-    );
-
-    let ui_style_host = host.clone();
-    engine.register_fn("set_ui_style", move |options: Map| -> Result<(), Box<EvalAltResult>> {
-        let style = parse_ui_style_patch(options)?;
-        ui_style_host.send(ScriptCommand::ApplyUiStyle(style))
-    });
-
-    let reset_ui_style_host = host.clone();
-    engine.register_fn("reset_ui_style", move || -> Result<(), Box<EvalAltResult>> {
-        reset_ui_style_host.send(ScriptCommand::ResetUiStyle)
-    });
-
-    let text_effect_host = host.clone();
-    engine.register_fn("set_text_effect", move |options: Map| -> Result<(), Box<EvalAltResult>> {
-        let effect = parse_text_effect_spec(options)?;
-        text_effect_host.send(ScriptCommand::SetTextEffect(effect))
-    });
-
-    let reset_text_effect_host = host.clone();
-    engine.register_fn("reset_text_effect", move || -> Result<(), Box<EvalAltResult>> {
-        reset_text_effect_host.send(ScriptCommand::ResetTextEffect)
-    });
-
-    let character_names_host = host.clone();
-    engine.register_fn("character_names", move || -> Array {
-        character_names_host
-            .character_names()
-            .into_iter()
-            .map(Dynamic::from)
-            .collect()
-    });
-
-    let character_exists_host = host.clone();
-    engine.register_fn("character_exists", move |name: ImmutableString| -> bool {
-        character_exists_host.character_exists(&name)
-    });
-
-    let load_text_host = host.clone();
-    engine.register_fn(
-        "load_text",
-        move |path: ImmutableString| -> Result<String, Box<EvalAltResult>> {
-            load_text_host.read_text(&path)
-        },
-    );
-
-    let load_bytes_host = host.clone();
-    engine.register_fn(
-        "load_bytes",
-        move |path: ImmutableString| -> Result<Blob, Box<EvalAltResult>> {
-            load_bytes_host.read_bytes(&path)
-        },
-    );
-
-    let exists_host = host.clone();
-    engine.register_fn("exists", move |path: ImmutableString| -> bool {
-        let path = exists_host.resolve_path(&path);
-        exists_host.vfs.exists(&path)
-    });
-
-    let save_exists_host = host.clone();
-    engine.register_fn("save_exists", move |slot: ImmutableString| -> bool {
-        save_exists_host.save_exists(&slot).unwrap_or(false)
-    });
-
-    let save_host = host.clone();
-    engine.register_fn(
-        "save",
-        move |slot: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            save_host.save_game(&slot, None)
-        },
-    );
-
-    let save_resume_host = host.clone();
-    engine.register_fn(
-        "save",
-        move |slot: ImmutableString, resume_script: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let resume_script = save_resume_host.resolve_path(&resume_script);
-            save_resume_host.save_game(&slot, Some(resume_script))
-        },
-    );
-
-    let load_save_host = host.clone();
-    engine.register_fn(
-        "load",
-        move |slot: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let resume_script = load_save_host.load_game(&slot)?;
-            Err(jump_script_signal(resume_script))
-        },
-    );
-
-    let load_script_host = host.clone();
-    engine.register_fn(
-        "load_script",
-        move |path: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let resolved = load_script_host.resolve_path(&path);
-            Err(jump_script_signal(resolved))
-        },
-    );
-
-    let jump_script_host = host.clone();
-    engine.register_fn(
-        "jump_script",
-        move |path: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let resolved = jump_script_host.resolve_path(&path);
-            Err(jump_script_signal(resolved))
-        },
-    );
-
-    let call_script_host = host.clone();
-    engine.register_fn(
-        "call_script",
-        move |path: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let resolved = call_script_host.resolve_path(&path);
-            Err(call_script_signal(resolved))
-        },
-    );
-
-    engine.register_fn("return_script", move || -> Result<(), Box<EvalAltResult>> {
-        Err(return_script_signal())
-    });
-
-    let return_to_title_host = host.clone();
-    engine.register_fn("return_to_title", move || -> Result<(), Box<EvalAltResult>> {
-        return_to_title_host.send(ScriptCommand::ReturnToTitle)?;
-        Err(return_to_title_signal())
-    });
-
-    let current_script_host = host.clone();
-    engine.register_fn("current_script", move || -> String {
-        current_script_host.current_script_path()
-    });
+    engine.set_default_tag(Dynamic::from(host.clone()));
+    engine.register_global_module(exported_module!(hiraku_engine::HirakuEngine).into());
+    engine.register_global_module(exported_module!(rng::RNG).into());
+}
+
+fn new_random_seed() -> u64 {
+    rand::rng().next_u64()
 }
 
 fn extract_script_flow_action(error: &EvalAltResult) -> Option<ScriptFlowAction> {
@@ -1972,15 +1210,24 @@ fn say_with_inline_commands(
     speaker: String,
     text: String,
 ) -> Result<(), Box<EvalAltResult>> {
+    let kind = if speaker.is_empty() { "narrate" } else { "say" };
+    if host.checkpoint(kind, None, ctx.call_position()) == CheckpointDecision::ReplaySkip {
+        return Ok(());
+    }
+
     let chunks = parse_inline_dialogue_chunks(&text)?;
-    if chunks.iter().all(|chunk| matches!(chunk, InlineDialogueChunk::Text(_))) {
+    if chunks
+        .iter()
+        .all(|chunk| matches!(chunk, InlineDialogueChunk::Text(_)))
+    {
         if host.is_batch_mode() {
-            let _ = run_blocking_or_collected(host, "say", |animation_id, done| ScriptCommand::Say {
-                speaker,
-                text,
-                animation_id,
-                done,
-            })?;
+            let _ =
+                run_blocking_or_collected(host, "say", |animation_id, done| ScriptCommand::Say {
+                    speaker,
+                    text,
+                    animation_id,
+                    done,
+                })?;
             return Ok(());
         }
 
@@ -1993,7 +1240,9 @@ fn say_with_inline_commands(
     }
 
     if host.is_batch_mode() {
-        return Err(runtime_error("inline dialogue commands are not supported inside seq/par"));
+        return Err(runtime_error(
+            "inline dialogue commands are not supported inside seq/par",
+        ));
     }
 
     host.begin_inline_dialogue();
@@ -2002,25 +1251,25 @@ fn say_with_inline_commands(
 
     let result = (|| -> Result<(), Box<EvalAltResult>> {
         for chunk in chunks {
-        match chunk {
-            InlineDialogueChunk::Text(segment) => {
-                if segment.is_empty() {
-                    continue;
+            match chunk {
+                InlineDialogueChunk::Text(segment) => {
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    let reveal_from = rendered.chars().count();
+                    rendered.push_str(&segment);
+                    saw_text = true;
+                    if host.inline_skip_requested() {
+                        host.set_dialogue(speaker.clone(), rendered.clone())?;
+                    } else {
+                        host.reveal_dialogue_tail(speaker.clone(), rendered.clone(), reveal_from)?;
+                    }
                 }
-                let reveal_from = rendered.chars().count();
-                rendered.push_str(&segment);
-                saw_text = true;
-                if host.inline_skip_requested() {
-                    host.set_dialogue(speaker.clone(), rendered.clone())?;
-                } else {
-                    host.reveal_dialogue_tail(speaker.clone(), rendered.clone(), reveal_from)?;
+                InlineDialogueChunk::Command(code) => {
+                    let _ = ctx.engine().eval_expression::<Dynamic>(&code)?;
                 }
-            }
-            InlineDialogueChunk::Command(code) => {
-                let _ = ctx.engine().eval_expression::<Dynamic>(&code)?;
             }
         }
-    }
 
         if saw_text {
             host.end_inline_dialogue();
@@ -2034,7 +1283,9 @@ fn say_with_inline_commands(
     result
 }
 
-fn parse_inline_dialogue_chunks(text: &str) -> Result<Vec<InlineDialogueChunk>, Box<EvalAltResult>> {
+fn parse_inline_dialogue_chunks(
+    text: &str,
+) -> Result<Vec<InlineDialogueChunk>, Box<EvalAltResult>> {
     let mut chunks = Vec::new();
     let mut cursor = 0;
 
@@ -2106,13 +1357,20 @@ fn parse_ui_style_patch(mut options: Map) -> Result<UiStylePatch, Box<EvalAltRes
     let patch = UiStylePatch {
         dialogue_bg: take_optional_rgba(&mut options, "dialogue_bg")?,
         dialogue_border: take_optional_rgba(&mut options, "dialogue_border")?,
-        dialogue_left: take_optional_number(&mut options, "dialogue_left")?.map(|value| value as f32),
-        dialogue_right: take_optional_number(&mut options, "dialogue_right")?.map(|value| value as f32),
-        dialogue_bottom: take_optional_number(&mut options, "dialogue_bottom")?.map(|value| value as f32),
-        dialogue_min_height: take_optional_number(&mut options, "dialogue_min_height")?.map(|value| value as f32),
-        dialogue_padding_x: take_optional_number(&mut options, "dialogue_padding_x")?.map(|value| value as f32),
-        dialogue_padding_y: take_optional_number(&mut options, "dialogue_padding_y")?.map(|value| value as f32),
-        dialogue_radius: take_optional_number(&mut options, "dialogue_radius")?.map(|value| value as f32),
+        dialogue_left: take_optional_number(&mut options, "dialogue_left")?
+            .map(|value| value as f32),
+        dialogue_right: take_optional_number(&mut options, "dialogue_right")?
+            .map(|value| value as f32),
+        dialogue_bottom: take_optional_number(&mut options, "dialogue_bottom")?
+            .map(|value| value as f32),
+        dialogue_min_height: take_optional_number(&mut options, "dialogue_min_height")?
+            .map(|value| value as f32),
+        dialogue_padding_x: take_optional_number(&mut options, "dialogue_padding_x")?
+            .map(|value| value as f32),
+        dialogue_padding_y: take_optional_number(&mut options, "dialogue_padding_y")?
+            .map(|value| value as f32),
+        dialogue_radius: take_optional_number(&mut options, "dialogue_radius")?
+            .map(|value| value as f32),
         speaker_size: take_optional_number(&mut options, "speaker_size")?.map(|value| value as f32),
         line_size: take_optional_number(&mut options, "line_size")?.map(|value| value as f32),
         hint_size: take_optional_number(&mut options, "hint_size")?.map(|value| value as f32),
@@ -2121,12 +1379,17 @@ fn parse_ui_style_patch(mut options: Map) -> Result<UiStylePatch, Box<EvalAltRes
         line_color: take_optional_rgba(&mut options, "line_color")?,
         hint_color: take_optional_rgba(&mut options, "hint_color")?,
         choice_panel_bg: take_optional_rgba(&mut options, "choice_panel_bg")?,
-        choice_bottom: take_optional_number(&mut options, "choice_bottom")?.map(|value| value as f32),
-        choice_panel_width: take_optional_number(&mut options, "choice_panel_width")?.map(|value| value as f32),
-        choice_padding: take_optional_number(&mut options, "choice_padding")?.map(|value| value as f32),
+        choice_bottom: take_optional_number(&mut options, "choice_bottom")?
+            .map(|value| value as f32),
+        choice_panel_width: take_optional_number(&mut options, "choice_panel_width")?
+            .map(|value| value as f32),
+        choice_padding: take_optional_number(&mut options, "choice_padding")?
+            .map(|value| value as f32),
         choice_gap: take_optional_number(&mut options, "choice_gap")?.map(|value| value as f32),
-        choice_prompt_size: take_optional_number(&mut options, "choice_prompt_size")?.map(|value| value as f32),
-        choice_button_size: take_optional_number(&mut options, "choice_button_size")?.map(|value| value as f32),
+        choice_prompt_size: take_optional_number(&mut options, "choice_prompt_size")?
+            .map(|value| value as f32),
+        choice_button_size: take_optional_number(&mut options, "choice_button_size")?
+            .map(|value| value as f32),
         choice_center_text: take_optional_bool(&mut options, "choice_center_text")?,
         choice_show_indices: take_optional_bool(&mut options, "choice_show_indices")?,
         choice_prompt_color: take_optional_rgba(&mut options, "choice_prompt_color")?,
@@ -2135,9 +1398,12 @@ fn parse_ui_style_patch(mut options: Map) -> Result<UiStylePatch, Box<EvalAltRes
         choice_button_pressed: take_optional_rgba(&mut options, "choice_button_pressed")?,
         choice_button_border: take_optional_rgba(&mut options, "choice_button_border")?,
         choice_text_color: take_optional_rgba(&mut options, "choice_text_color")?,
-        quick_menu_bottom: take_optional_number(&mut options, "quick_menu_bottom")?.map(|value| value as f32),
-        quick_menu_gap: take_optional_number(&mut options, "quick_menu_gap")?.map(|value| value as f32),
-        quick_button_size: take_optional_number(&mut options, "quick_button_size")?.map(|value| value as f32),
+        quick_menu_bottom: take_optional_number(&mut options, "quick_menu_bottom")?
+            .map(|value| value as f32),
+        quick_menu_gap: take_optional_number(&mut options, "quick_menu_gap")?
+            .map(|value| value as f32),
+        quick_button_size: take_optional_number(&mut options, "quick_button_size")?
+            .map(|value| value as f32),
         quick_menu_bg: take_optional_rgba(&mut options, "quick_menu_bg")?,
         quick_button_bg: take_optional_rgba(&mut options, "quick_button_bg")?,
         quick_button_hovered: take_optional_rgba(&mut options, "quick_button_hovered")?,
@@ -2148,7 +1414,9 @@ fn parse_ui_style_patch(mut options: Map) -> Result<UiStylePatch, Box<EvalAltRes
 
     if !options.is_empty() {
         let unknown = options.keys().cloned().collect::<Vec<_>>().join(", ");
-        return Err(runtime_error(format!("unknown ui style option(s): {unknown}")));
+        return Err(runtime_error(format!(
+            "unknown ui style option(s): {unknown}"
+        )));
     }
 
     Ok(patch)
@@ -2158,8 +1426,8 @@ fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, B
     let title = take_optional_string(&mut screen, "title");
     let panel = take_optional_bool(&mut screen, "panel")?.unwrap_or(true);
     let width = take_optional_number(&mut screen, "width")?;
-    let background_image = take_optional_string(&mut screen, "background_image")
-        .map(|path| host.resolve_path(&path));
+    let background_image =
+        take_optional_string(&mut screen, "background_image").map(|path| host.resolve_path(&path));
     let xalign = take_optional_number(&mut screen, "xalign")?.unwrap_or(0.5);
     let yalign = take_optional_number(&mut screen, "yalign")?.unwrap_or(0.5);
     let padding = take_optional_number(&mut screen, "padding")?.unwrap_or(24.0);
@@ -2174,7 +1442,9 @@ fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, B
 
     if !screen.is_empty() {
         let unknown = screen.keys().cloned().collect::<Vec<_>>().join(", ");
-        return Err(runtime_error(format!("unknown screen option(s): {unknown}")));
+        return Err(runtime_error(format!(
+            "unknown screen option(s): {unknown}"
+        )));
     }
 
     Ok(ScreenSpec {
@@ -2243,7 +1513,8 @@ fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Bo
             let padding_y = take_optional_number(&mut node, "padding_y")?
                 .map(|value| value as f32)
                 .or(padding);
-            let border_width = take_optional_number(&mut node, "border_width")?.map(|value| value as f32);
+            let border_width =
+                take_optional_number(&mut node, "border_width")?.map(|value| value as f32);
             let radius = take_optional_number(&mut node, "radius")?.map(|value| value as f32);
             let layout = take_screen_layout(&mut node)?;
             ensure_no_unknown_options("button", &node)?;
@@ -2382,7 +1653,9 @@ fn parse_custom_effect_options(
 
     if !options.is_empty() {
         let unknown = options.keys().cloned().collect::<Vec<_>>().join(", ");
-        return Err(runtime_error(format!("unknown effect option(s): {unknown}")));
+        return Err(runtime_error(format!(
+            "unknown effect option(s): {unknown}"
+        )));
     }
 
     Ok(CustomEffectOptions {
@@ -2415,10 +1688,9 @@ fn parse_character_animation_keyframes(
         return Err(runtime_error("animate requires at least one keyframe"));
     }
 
-    let inputs: Vec<CharacterAnimationKeyframeInput> = serde_json::from_value(dynamic_to_json_value(
-        Dynamic::from(keyframes),
-    )?)
-    .map_err(|err| runtime_error(format!("invalid animate keyframes: {err}")))?;
+    let inputs: Vec<CharacterAnimationKeyframeInput> =
+        serde_json::from_value(dynamic_to_json_value(Dynamic::from(keyframes))?)
+            .map_err(|err| runtime_error(format!("invalid animate keyframes: {err}")))?;
 
     let mut resolved = Vec::with_capacity(inputs.len());
     let mut previous_time = 0.0f32;
@@ -2429,7 +1701,9 @@ fn parse_character_animation_keyframes(
             return Err(runtime_error("animate keyframe time cannot be negative"));
         }
         if input.time < previous_time {
-            return Err(runtime_error("animate keyframes must be sorted by time ascending"));
+            return Err(runtime_error(
+                "animate keyframes must be sorted by time ascending",
+            ));
         }
 
         let position = Vec2::new(
@@ -2476,7 +1750,9 @@ fn dynamic_to_json_value(value: Dynamic) -> Result<JsonValue, Box<EvalAltResult>
         return Ok(JsonValue::Number(number));
     }
     if value.is_string() {
-        return Ok(JsonValue::String(value.cast::<ImmutableString>().to_string()));
+        return Ok(JsonValue::String(
+            value.cast::<ImmutableString>().to_string(),
+        ));
     }
     if let Some(array) = value.clone().try_cast::<Array>() {
         return array
@@ -2493,7 +1769,9 @@ fn dynamic_to_json_value(value: Dynamic) -> Result<JsonValue, Box<EvalAltResult>
         return Ok(JsonValue::Object(object));
     }
 
-    Err(runtime_error("only bool, int, float, string, array, and map values are supported here"))
+    Err(runtime_error(
+        "only bool, int, float, string, array, and map values are supported here",
+    ))
 }
 
 fn take_optional_string(options: &mut Map, key: &str) -> Option<String> {
@@ -2554,10 +1832,15 @@ fn ensure_no_unknown_options(kind: &str, options: &Map) -> Result<(), Box<EvalAl
     }
 
     let unknown = options.keys().cloned().collect::<Vec<_>>().join(", ");
-    Err(runtime_error(format!("unknown {kind} option(s): {unknown}")))
+    Err(runtime_error(format!(
+        "unknown {kind} option(s): {unknown}"
+    )))
 }
 
-fn take_optional_rgba(options: &mut Map, key: &str) -> Result<Option<[f32; 4]>, Box<EvalAltResult>> {
+fn take_optional_rgba(
+    options: &mut Map,
+    key: &str,
+) -> Result<Option<[f32; 4]>, Box<EvalAltResult>> {
     let Some(value) = options.remove(key) else {
         return Ok(None);
     };
@@ -2590,11 +1873,15 @@ fn take_vec4(options: &mut Map, key: &str) -> Result<Vec4, Box<EvalAltResult>> {
         return Ok(Vec4::ZERO);
     };
 
-    let array = value
-        .try_cast::<Array>()
-        .ok_or_else(|| runtime_error(format!("effect option `{key}` must be an array of four numbers")))?;
+    let array = value.try_cast::<Array>().ok_or_else(|| {
+        runtime_error(format!(
+            "effect option `{key}` must be an array of four numbers"
+        ))
+    })?;
     if array.len() != 4 {
-        return Err(runtime_error(format!("effect option `{key}` must contain exactly four numbers")));
+        return Err(runtime_error(format!(
+            "effect option `{key}` must contain exactly four numbers"
+        )));
     }
 
     Ok(Vec4::new(
@@ -2691,7 +1978,9 @@ fn parse_animation_ids(ids: Array) -> Result<Vec<String>, Box<EvalAltResult>> {
             if value.is_string() {
                 Ok(value.cast::<ImmutableString>().to_string())
             } else {
-                Err(runtime_error("animation handle array must contain only strings"))
+                Err(runtime_error(
+                    "animation handle array must contain only strings",
+                ))
             }
         })
         .collect()
@@ -2737,13 +2026,15 @@ where
         let (done_tx, done_rx) = mpsc::channel();
         host.set_inline_current_handle(Some(handle.clone()));
         host.send(build(Some(handle), Some(done_tx)))?;
-        let response = done_rx
-            .recv()
-            .map_err(|err| runtime_error(format!("engine stopped while waiting for command: {err}")));
+        let response = done_rx.recv().map_err(|err| {
+            runtime_error(format!("engine stopped while waiting for command: {err}"))
+        });
         host.set_inline_current_handle(None);
         match response? {
             ScriptResponse::Continue => Ok(Dynamic::UNIT),
-            ScriptResponse::Choice(_) => Err(runtime_error("engine returned unexpected choice response")),
+            ScriptResponse::Choice(_) => {
+                Err(runtime_error("engine returned unexpected choice response"))
+            }
         }
     } else {
         host.send_continue(|done| build(None, Some(done)))?;
@@ -2762,11 +2053,28 @@ fn dynamic_to_stored_value(value: Dynamic) -> Result<StoredValue, Box<EvalAltRes
         return Ok(StoredValue::Float(value.cast::<FLOAT>()));
     }
     if value.is_string() {
-        return Ok(StoredValue::String(value.cast::<ImmutableString>().to_string()));
+        return Ok(StoredValue::String(
+            value.cast::<ImmutableString>().to_string(),
+        ));
+    }
+    if value.is_array() {
+        return value
+            .cast::<Array>()
+            .into_iter()
+            .map(dynamic_to_stored_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(StoredValue::Array);
+    }
+    if value.is_map() {
+        let mut stored = BTreeMap::new();
+        for (key, value) in value.cast::<Map>() {
+            stored.insert(key.to_string(), dynamic_to_stored_value(value)?);
+        }
+        return Ok(StoredValue::Map(stored));
     }
 
     Err(runtime_error(
-        "only bool, int, float and string values are supported here",
+        "only bool, int, float, string, array and map values are supported here",
     ))
 }
 
@@ -2776,27 +2084,16 @@ fn stored_value_to_dynamic(value: StoredValue) -> Dynamic {
         StoredValue::Int(value) => value.into(),
         StoredValue::Float(value) => value.into(),
         StoredValue::String(value) => value.into(),
-    }
-}
-
-fn sanitize_slot_name(slot: &str) -> Result<String, Box<EvalAltResult>> {
-    let sanitized = slot
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_string();
-
-    if sanitized.is_empty() {
-        Err(runtime_error("save slot must contain at least one valid character"))
-    } else {
-        Ok(sanitized)
+        StoredValue::Array(values) => values
+            .into_iter()
+            .map(stored_value_to_dynamic)
+            .collect::<Array>()
+            .into(),
+        StoredValue::Map(values) => values
+            .into_iter()
+            .map(|(key, value)| (key.into(), stored_value_to_dynamic(value)))
+            .collect::<Map>()
+            .into(),
     }
 }
 
