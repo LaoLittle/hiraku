@@ -120,7 +120,8 @@ fn default_save_version() -> u32 {
     1
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UiStylePatch {
     pub dialogue_bg: Option<[f32; 4]>,
     pub dialogue_border: Option<[f32; 4]>,

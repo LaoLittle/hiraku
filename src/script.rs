@@ -18,8 +18,7 @@ use rhai::{
     Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, FnPtr, INT, ImmutableString,
     Map, NativeCallContext, Position,
 };
-use serde::Deserialize;
-use serde_json::Value as JsonValue;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{
     character::load_character_catalog,
@@ -283,6 +282,30 @@ pub struct DialogueTextEffectSpec {
     pub fade_ms: Option<f32>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DialogueTextEffectInput {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    cps: Option<f64>,
+    #[serde(default)]
+    fade_seconds: Option<f64>,
+    #[serde(default)]
+    fade_ms: Option<f64>,
+}
+
+impl From<DialogueTextEffectInput> for DialogueTextEffectSpec {
+    fn from(input: DialogueTextEffectInput) -> Self {
+        Self {
+            mode: input.mode,
+            cps: input.cps.map(|value| value as f32),
+            fade_seconds: input.fade_seconds.map(|value| value as f32),
+            fade_ms: input.fade_ms.map(|value| value as f32),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedCharacterKeyframe {
     pub time: f32,
@@ -302,17 +325,164 @@ pub enum CharacterEase {
 
 #[derive(Debug, Deserialize)]
 struct CharacterAnimationKeyframeInput {
-    time: f32,
+    time: f64,
     #[serde(default)]
-    x: Option<f32>,
+    x: Option<f64>,
     #[serde(default)]
-    y: Option<f32>,
+    y: Option<f64>,
     #[serde(default)]
-    dx: Option<f32>,
+    dx: Option<f64>,
     #[serde(default)]
-    dy: Option<f32>,
+    dy: Option<f64>,
     #[serde(default)]
     ease: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ChoiceOptionInput {
+    Text(String),
+    Map(ChoiceOptionMapInput),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChoiceOptionMapInput {
+    text: String,
+    #[serde(default)]
+    value: Option<Dynamic>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UiStylePatchInput {
+    #[serde(default)]
+    dialogue_bg: Option<[f64; 4]>,
+    #[serde(default)]
+    dialogue_border: Option<[f64; 4]>,
+    #[serde(default)]
+    dialogue_left: Option<f64>,
+    #[serde(default)]
+    dialogue_right: Option<f64>,
+    #[serde(default)]
+    dialogue_bottom: Option<f64>,
+    #[serde(default)]
+    dialogue_min_height: Option<f64>,
+    #[serde(default)]
+    dialogue_padding_x: Option<f64>,
+    #[serde(default)]
+    dialogue_padding_y: Option<f64>,
+    #[serde(default)]
+    dialogue_radius: Option<f64>,
+    #[serde(default)]
+    speaker_size: Option<f64>,
+    #[serde(default)]
+    line_size: Option<f64>,
+    #[serde(default)]
+    hint_size: Option<f64>,
+    #[serde(default)]
+    hint_visible: Option<bool>,
+    #[serde(default)]
+    speaker_color: Option<[f64; 4]>,
+    #[serde(default)]
+    line_color: Option<[f64; 4]>,
+    #[serde(default)]
+    hint_color: Option<[f64; 4]>,
+    #[serde(default)]
+    choice_panel_bg: Option<[f64; 4]>,
+    #[serde(default)]
+    choice_bottom: Option<f64>,
+    #[serde(default)]
+    choice_panel_width: Option<f64>,
+    #[serde(default)]
+    choice_padding: Option<f64>,
+    #[serde(default)]
+    choice_gap: Option<f64>,
+    #[serde(default)]
+    choice_prompt_size: Option<f64>,
+    #[serde(default)]
+    choice_button_size: Option<f64>,
+    #[serde(default)]
+    choice_center_text: Option<bool>,
+    #[serde(default)]
+    choice_show_indices: Option<bool>,
+    #[serde(default)]
+    choice_prompt_color: Option<[f64; 4]>,
+    #[serde(default)]
+    choice_button_bg: Option<[f64; 4]>,
+    #[serde(default)]
+    choice_button_hovered: Option<[f64; 4]>,
+    #[serde(default)]
+    choice_button_pressed: Option<[f64; 4]>,
+    #[serde(default)]
+    choice_button_border: Option<[f64; 4]>,
+    #[serde(default)]
+    choice_text_color: Option<[f64; 4]>,
+    #[serde(default)]
+    quick_menu_bottom: Option<f64>,
+    #[serde(default)]
+    quick_menu_gap: Option<f64>,
+    #[serde(default)]
+    quick_button_size: Option<f64>,
+    #[serde(default)]
+    quick_menu_bg: Option<[f64; 4]>,
+    #[serde(default)]
+    quick_button_bg: Option<[f64; 4]>,
+    #[serde(default)]
+    quick_button_hovered: Option<[f64; 4]>,
+    #[serde(default)]
+    quick_button_pressed: Option<[f64; 4]>,
+    #[serde(default)]
+    quick_button_border: Option<[f64; 4]>,
+    #[serde(default)]
+    quick_text_color: Option<[f64; 4]>,
+}
+
+impl From<UiStylePatchInput> for UiStylePatch {
+    fn from(input: UiStylePatchInput) -> Self {
+        Self {
+            dialogue_bg: input.dialogue_bg.map(rgba_to_f32),
+            dialogue_border: input.dialogue_border.map(rgba_to_f32),
+            dialogue_left: input.dialogue_left.map(f64_to_f32),
+            dialogue_right: input.dialogue_right.map(f64_to_f32),
+            dialogue_bottom: input.dialogue_bottom.map(f64_to_f32),
+            dialogue_min_height: input.dialogue_min_height.map(f64_to_f32),
+            dialogue_padding_x: input.dialogue_padding_x.map(f64_to_f32),
+            dialogue_padding_y: input.dialogue_padding_y.map(f64_to_f32),
+            dialogue_radius: input.dialogue_radius.map(f64_to_f32),
+            speaker_size: input.speaker_size.map(f64_to_f32),
+            line_size: input.line_size.map(f64_to_f32),
+            hint_size: input.hint_size.map(f64_to_f32),
+            hint_visible: input.hint_visible,
+            speaker_color: input.speaker_color.map(rgba_to_f32),
+            line_color: input.line_color.map(rgba_to_f32),
+            hint_color: input.hint_color.map(rgba_to_f32),
+            choice_panel_bg: input.choice_panel_bg.map(rgba_to_f32),
+            choice_bottom: input.choice_bottom.map(f64_to_f32),
+            choice_panel_width: input.choice_panel_width.map(f64_to_f32),
+            choice_padding: input.choice_padding.map(f64_to_f32),
+            choice_gap: input.choice_gap.map(f64_to_f32),
+            choice_prompt_size: input.choice_prompt_size.map(f64_to_f32),
+            choice_button_size: input.choice_button_size.map(f64_to_f32),
+            choice_center_text: input.choice_center_text,
+            choice_show_indices: input.choice_show_indices,
+            choice_prompt_color: input.choice_prompt_color.map(rgba_to_f32),
+            choice_button_bg: input.choice_button_bg.map(rgba_to_f32),
+            choice_button_hovered: input.choice_button_hovered.map(rgba_to_f32),
+            choice_button_pressed: input.choice_button_pressed.map(rgba_to_f32),
+            choice_button_border: input.choice_button_border.map(rgba_to_f32),
+            choice_text_color: input.choice_text_color.map(rgba_to_f32),
+            quick_menu_bottom: input.quick_menu_bottom.map(f64_to_f32),
+            quick_menu_gap: input.quick_menu_gap.map(f64_to_f32),
+            quick_button_size: input.quick_button_size.map(f64_to_f32),
+            quick_menu_bg: input.quick_menu_bg.map(rgba_to_f32),
+            quick_button_bg: input.quick_button_bg.map(rgba_to_f32),
+            quick_button_hovered: input.quick_button_hovered.map(rgba_to_f32),
+            quick_button_pressed: input.quick_button_pressed.map(rgba_to_f32),
+            quick_button_border: input.quick_button_border.map(rgba_to_f32),
+            quick_text_color: input.quick_text_color.map(rgba_to_f32),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1353,73 +1523,9 @@ fn find_inline_command_end(text: &str, start: usize) -> Result<usize, Box<EvalAl
     Err(runtime_error("unterminated inline dialogue command"))
 }
 
-fn parse_ui_style_patch(mut options: Map) -> Result<UiStylePatch, Box<EvalAltResult>> {
-    let patch = UiStylePatch {
-        dialogue_bg: take_optional_rgba(&mut options, "dialogue_bg")?,
-        dialogue_border: take_optional_rgba(&mut options, "dialogue_border")?,
-        dialogue_left: take_optional_number(&mut options, "dialogue_left")?
-            .map(|value| value as f32),
-        dialogue_right: take_optional_number(&mut options, "dialogue_right")?
-            .map(|value| value as f32),
-        dialogue_bottom: take_optional_number(&mut options, "dialogue_bottom")?
-            .map(|value| value as f32),
-        dialogue_min_height: take_optional_number(&mut options, "dialogue_min_height")?
-            .map(|value| value as f32),
-        dialogue_padding_x: take_optional_number(&mut options, "dialogue_padding_x")?
-            .map(|value| value as f32),
-        dialogue_padding_y: take_optional_number(&mut options, "dialogue_padding_y")?
-            .map(|value| value as f32),
-        dialogue_radius: take_optional_number(&mut options, "dialogue_radius")?
-            .map(|value| value as f32),
-        speaker_size: take_optional_number(&mut options, "speaker_size")?.map(|value| value as f32),
-        line_size: take_optional_number(&mut options, "line_size")?.map(|value| value as f32),
-        hint_size: take_optional_number(&mut options, "hint_size")?.map(|value| value as f32),
-        hint_visible: take_optional_bool(&mut options, "hint_visible")?,
-        speaker_color: take_optional_rgba(&mut options, "speaker_color")?,
-        line_color: take_optional_rgba(&mut options, "line_color")?,
-        hint_color: take_optional_rgba(&mut options, "hint_color")?,
-        choice_panel_bg: take_optional_rgba(&mut options, "choice_panel_bg")?,
-        choice_bottom: take_optional_number(&mut options, "choice_bottom")?
-            .map(|value| value as f32),
-        choice_panel_width: take_optional_number(&mut options, "choice_panel_width")?
-            .map(|value| value as f32),
-        choice_padding: take_optional_number(&mut options, "choice_padding")?
-            .map(|value| value as f32),
-        choice_gap: take_optional_number(&mut options, "choice_gap")?.map(|value| value as f32),
-        choice_prompt_size: take_optional_number(&mut options, "choice_prompt_size")?
-            .map(|value| value as f32),
-        choice_button_size: take_optional_number(&mut options, "choice_button_size")?
-            .map(|value| value as f32),
-        choice_center_text: take_optional_bool(&mut options, "choice_center_text")?,
-        choice_show_indices: take_optional_bool(&mut options, "choice_show_indices")?,
-        choice_prompt_color: take_optional_rgba(&mut options, "choice_prompt_color")?,
-        choice_button_bg: take_optional_rgba(&mut options, "choice_button_bg")?,
-        choice_button_hovered: take_optional_rgba(&mut options, "choice_button_hovered")?,
-        choice_button_pressed: take_optional_rgba(&mut options, "choice_button_pressed")?,
-        choice_button_border: take_optional_rgba(&mut options, "choice_button_border")?,
-        choice_text_color: take_optional_rgba(&mut options, "choice_text_color")?,
-        quick_menu_bottom: take_optional_number(&mut options, "quick_menu_bottom")?
-            .map(|value| value as f32),
-        quick_menu_gap: take_optional_number(&mut options, "quick_menu_gap")?
-            .map(|value| value as f32),
-        quick_button_size: take_optional_number(&mut options, "quick_button_size")?
-            .map(|value| value as f32),
-        quick_menu_bg: take_optional_rgba(&mut options, "quick_menu_bg")?,
-        quick_button_bg: take_optional_rgba(&mut options, "quick_button_bg")?,
-        quick_button_hovered: take_optional_rgba(&mut options, "quick_button_hovered")?,
-        quick_button_pressed: take_optional_rgba(&mut options, "quick_button_pressed")?,
-        quick_button_border: take_optional_rgba(&mut options, "quick_button_border")?,
-        quick_text_color: take_optional_rgba(&mut options, "quick_text_color")?,
-    };
-
-    if !options.is_empty() {
-        let unknown = options.keys().cloned().collect::<Vec<_>>().join(", ");
-        return Err(runtime_error(format!(
-            "unknown ui style option(s): {unknown}"
-        )));
-    }
-
-    Ok(patch)
+fn parse_ui_style_patch(options: Map) -> Result<UiStylePatch, Box<EvalAltResult>> {
+    let input: UiStylePatchInput = from_dynamic(Dynamic::from_map(options), "ui style options")?;
+    Ok(input.into())
 }
 
 fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, Box<EvalAltResult>> {
@@ -1635,16 +1741,8 @@ fn parse_custom_effect_options(
     let aux0_path = host.resolve_path(&aux0_path);
     let aux1_path = host.resolve_path(&aux1_path);
 
-    let mode = options
-        .remove("mode")
-        .map(dynamic_to_f32)
-        .transpose()?
-        .unwrap_or(0.0);
-    let commit_to_bg = options
-        .remove("commit_to_bg")
-        .map(dynamic_to_bool)
-        .transpose()?
-        .unwrap_or(false);
+    let mode = take_optional::<f32>(&mut options, "mode")?.unwrap_or(0.0);
+    let commit_to_bg = take_optional::<bool>(&mut options, "commit_to_bg")?.unwrap_or(false);
 
     let p0 = take_vec4(&mut options, "p0")?;
     let p1 = take_vec4(&mut options, "p1")?;
@@ -1675,9 +1773,9 @@ fn parse_custom_effect_options(
 }
 
 fn parse_text_effect_spec(options: Map) -> Result<DialogueTextEffectSpec, Box<EvalAltResult>> {
-    let value = dynamic_to_json_value(Dynamic::from(options))?;
-    serde_json::from_value(value)
-        .map_err(|err| runtime_error(format!("invalid text effect options: {err}")))
+    let input: DialogueTextEffectInput =
+        from_dynamic(Dynamic::from_map(options), "text effect options")?;
+    Ok(input.into())
 }
 
 fn parse_character_animation_keyframes(
@@ -1687,13 +1785,11 @@ fn parse_character_animation_keyframes(
     if keyframes.is_empty() {
         return Err(runtime_error("animate requires at least one keyframe"));
     }
-
     let inputs: Vec<CharacterAnimationKeyframeInput> =
-        serde_json::from_value(dynamic_to_json_value(Dynamic::from(keyframes))?)
-            .map_err(|err| runtime_error(format!("invalid animate keyframes: {err}")))?;
+        from_dynamic(Dynamic::from_array(keyframes), "animate keyframes")?;
 
     let mut resolved = Vec::with_capacity(inputs.len());
-    let mut previous_time = 0.0f32;
+    let mut previous_time = 0.0f64;
     let mut cursor = current;
 
     for input in inputs {
@@ -1706,14 +1802,18 @@ fn parse_character_animation_keyframes(
             ));
         }
 
+        let x = input.x.map(f64_to_f32);
+        let y = input.y.map(f64_to_f32);
+        let dx = input.dx.map(f64_to_f32);
+        let dy = input.dy.map(f64_to_f32);
         let position = Vec2::new(
-            input.x.unwrap_or(cursor.x + input.dx.unwrap_or(0.0)),
-            input.y.unwrap_or(cursor.y + input.dy.unwrap_or(0.0)),
+            x.unwrap_or(cursor.x + dx.unwrap_or(0.0)),
+            y.unwrap_or(cursor.y + dy.unwrap_or(0.0)),
         );
         let ease = parse_character_ease(input.ease.as_deref().unwrap_or("linear"))?;
 
         resolved.push(ResolvedCharacterKeyframe {
-            time: input.time,
+            time: input.time as f32,
             position,
             ease,
         });
@@ -1737,51 +1837,39 @@ fn parse_character_ease(name: &str) -> Result<CharacterEase, Box<EvalAltResult>>
     }
 }
 
-fn dynamic_to_json_value(value: Dynamic) -> Result<JsonValue, Box<EvalAltResult>> {
-    if value.is::<bool>() {
-        return Ok(JsonValue::Bool(value.cast::<bool>()));
-    }
-    if value.is::<INT>() {
-        return Ok(JsonValue::Number(value.cast::<INT>().into()));
-    }
-    if value.is::<FLOAT>() {
-        let number = serde_json::Number::from_f64(value.cast::<FLOAT>())
-            .ok_or_else(|| runtime_error("expected a finite numeric value"))?;
-        return Ok(JsonValue::Number(number));
-    }
-    if value.is_string() {
-        return Ok(JsonValue::String(
-            value.cast::<ImmutableString>().to_string(),
-        ));
-    }
-    if let Some(array) = value.clone().try_cast::<Array>() {
-        return array
-            .into_iter()
-            .map(dynamic_to_json_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Array);
-    }
-    if let Some(map) = value.try_cast::<Map>() {
-        let mut object = serde_json::Map::new();
-        for (key, nested) in map {
-            object.insert(key.to_string(), dynamic_to_json_value(nested)?);
-        }
-        return Ok(JsonValue::Object(object));
-    }
+fn from_dynamic<T>(value: Dynamic, context: &str) -> Result<T, Box<EvalAltResult>>
+where
+    T: DeserializeOwned,
+{
+    rhai::serde::from_dynamic(&value)
+        .map_err(|err| runtime_error(format!("invalid {context}: {err}")))
+}
 
-    Err(runtime_error(
-        "only bool, int, float, string, array, and map values are supported here",
-    ))
+fn f64_to_f32(value: f64) -> f32 {
+    value as f32
+}
+
+fn rgba_to_f32(value: [f64; 4]) -> [f32; 4] {
+    [
+        value[0] as f32,
+        value[1] as f32,
+        value[2] as f32,
+        value[3] as f32,
+    ]
+}
+
+fn take_optional<T>(options: &mut Map, key: &str) -> Result<Option<T>, Box<EvalAltResult>>
+where
+    T: DeserializeOwned,
+{
+    options
+        .remove(key)
+        .map(|value| from_dynamic(value, key))
+        .transpose()
 }
 
 fn take_optional_string(options: &mut Map, key: &str) -> Option<String> {
-    options.remove(key).and_then(|value| {
-        if value.is_string() {
-            Some(value.cast::<ImmutableString>().to_string())
-        } else {
-            None
-        }
-    })
+    take_optional::<String>(options, key).ok().flatten()
 }
 
 fn take_required_string(options: &mut Map, key: &str) -> Result<String, Box<EvalAltResult>> {
@@ -1797,19 +1885,11 @@ fn take_required_array(options: &mut Map, key: &str) -> Result<Array, Box<EvalAl
 }
 
 fn take_optional_number(options: &mut Map, key: &str) -> Result<Option<f64>, Box<EvalAltResult>> {
-    let Some(value) = options.remove(key) else {
-        return Ok(None);
-    };
-
-    Ok(Some(dynamic_to_f32(value)? as f64))
+    take_optional::<f64>(options, key)
 }
 
 fn take_optional_bool(options: &mut Map, key: &str) -> Result<Option<bool>, Box<EvalAltResult>> {
-    let Some(value) = options.remove(key) else {
-        return Ok(None);
-    };
-
-    Ok(Some(dynamic_to_bool(value)?))
+    take_optional::<bool>(options, key)
 }
 
 fn take_screen_layout(options: &mut Map) -> Result<ScreenLayout, Box<EvalAltResult>> {
@@ -1845,9 +1925,7 @@ fn take_optional_rgba(
         return Ok(None);
     };
 
-    let array = value
-        .try_cast::<Array>()
-        .ok_or_else(|| runtime_error(format!("ui style option `{key}` must be an array")))?;
+    let array: Vec<f64> = from_dynamic(value, key)?;
     if array.len() != 3 && array.len() != 4 {
         return Err(runtime_error(format!(
             "ui style option `{key}` must contain three or four numbers"
@@ -1855,15 +1933,15 @@ fn take_optional_rgba(
     }
 
     let alpha = if array.len() == 4 {
-        dynamic_to_f32(array[3].clone())?
+        array[3] as f32
     } else {
         1.0
     };
 
     Ok(Some([
-        dynamic_to_f32(array[0].clone())?,
-        dynamic_to_f32(array[1].clone())?,
-        dynamic_to_f32(array[2].clone())?,
+        array[0] as f32,
+        array[1] as f32,
+        array[2] as f32,
         alpha,
     ]))
 }
@@ -1873,11 +1951,7 @@ fn take_vec4(options: &mut Map, key: &str) -> Result<Vec4, Box<EvalAltResult>> {
         return Ok(Vec4::ZERO);
     };
 
-    let array = value.try_cast::<Array>().ok_or_else(|| {
-        runtime_error(format!(
-            "effect option `{key}` must be an array of four numbers"
-        ))
-    })?;
+    let array: Vec<f64> = from_dynamic(value, key)?;
     if array.len() != 4 {
         return Err(runtime_error(format!(
             "effect option `{key}` must contain exactly four numbers"
@@ -1885,10 +1959,10 @@ fn take_vec4(options: &mut Map, key: &str) -> Result<Vec4, Box<EvalAltResult>> {
     }
 
     Ok(Vec4::new(
-        dynamic_to_f32(array[0].clone())?,
-        dynamic_to_f32(array[1].clone())?,
-        dynamic_to_f32(array[2].clone())?,
-        dynamic_to_f32(array[3].clone())?,
+        array[0] as f32,
+        array[1] as f32,
+        array[2] as f32,
+        array[3] as f32,
     ))
 }
 
@@ -1918,72 +1992,31 @@ fn reject_known_unsupported_audio_path(path: &str) -> Result<(), Box<EvalAltResu
     Ok(())
 }
 
-fn dynamic_to_f32(value: Dynamic) -> Result<f32, Box<EvalAltResult>> {
-    if value.is::<FLOAT>() {
-        return Ok(value.cast::<FLOAT>() as f32);
-    }
-    if value.is::<INT>() {
-        return Ok(value.cast::<INT>() as f32);
-    }
-
-    Err(runtime_error("expected a numeric value"))
-}
-
-fn dynamic_to_bool(value: Dynamic) -> Result<bool, Box<EvalAltResult>> {
-    if value.is::<bool>() {
-        Ok(value.cast::<bool>())
-    } else {
-        Err(runtime_error("expected a boolean value"))
-    }
-}
-
 fn parse_choice_option(option: Dynamic) -> Result<ChoiceOption, Box<EvalAltResult>> {
-    if option.is_string() {
-        let text = option.cast::<ImmutableString>().to_string();
-        return Ok(ChoiceOption {
+    match from_dynamic::<ChoiceOptionInput>(
+        option,
+        "choice option; expected a string or #{ text: ..., value: ... }",
+    )? {
+        ChoiceOptionInput::Text(text) => Ok(ChoiceOption {
             value: StoredValue::String(text.clone()),
             text,
-        });
+        }),
+        ChoiceOptionInput::Map(option) => {
+            let value = option
+                .value
+                .map(dynamic_to_stored_value)
+                .transpose()?
+                .unwrap_or_else(|| StoredValue::String(option.text.clone()));
+            Ok(ChoiceOption {
+                text: option.text,
+                value,
+            })
+        }
     }
-
-    if option.is_map() {
-        let option = option.cast::<Map>();
-        let text = option
-            .get("text")
-            .cloned()
-            .ok_or_else(|| runtime_error("choice option map requires a `text` field"))?;
-        let text = if text.is_string() {
-            text.cast::<ImmutableString>().to_string()
-        } else {
-            return Err(runtime_error("choice option `text` must be a string"));
-        };
-        let value = option
-            .get("value")
-            .cloned()
-            .map(dynamic_to_stored_value)
-            .transpose()?
-            .unwrap_or_else(|| StoredValue::String(text.clone()));
-
-        return Ok(ChoiceOption { text, value });
-    }
-
-    Err(runtime_error(
-        "choice option must be a string or a map like #{ text: ..., value: ... }",
-    ))
 }
 
 fn parse_animation_ids(ids: Array) -> Result<Vec<String>, Box<EvalAltResult>> {
-    ids.into_iter()
-        .map(|value| {
-            if value.is_string() {
-                Ok(value.cast::<ImmutableString>().to_string())
-            } else {
-                Err(runtime_error(
-                    "animation handle array must contain only strings",
-                ))
-            }
-        })
-        .collect()
+    from_dynamic(Dynamic::from_array(ids), "animation handle array")
 }
 
 fn expand_wait_handle(
