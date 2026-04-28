@@ -9,9 +9,12 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::state::{
-    AudioSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint, SaveGameData, SavedInput,
-    SceneSnapshot, ScriptPosition, SpriteSnapshot, StoredValue, TextEffectSnapshot,
+use crate::{
+    proto,
+    state::{
+        AudioSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint, SaveGameData,
+        SavedInput, SceneSnapshot, ScriptPosition, SpriteSnapshot, StoredValue, TextEffectSnapshot,
+    },
 };
 
 const SAVE_ROOT: &str = "saves";
@@ -108,11 +111,11 @@ pub fn write_save_data_to_root(
 }
 
 fn encode_save_data(data: &SaveGameData) -> Vec<u8> {
-    proto::ProtoSaveGameData::from(data).encode_to_vec()
+    proto::SaveGameData::from(data).encode_to_vec()
 }
 
 fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
-    proto::ProtoSaveGameData::decode(payload)?.try_into()
+    proto::SaveGameData::decode(payload)?.try_into()
 }
 
 pub fn list_save_slots() -> Result<Vec<SaveSlotSummary>, StorageError> {
@@ -159,201 +162,7 @@ pub fn slot_path_in(root: &Path, slot: &str) -> Result<PathBuf, StorageError> {
     Ok(root.join(format!("{slot}.{SAVE_EXTENSION}")))
 }
 
-mod proto {
-    use prost::Message;
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoSaveGameData {
-        #[prost(uint32, tag = "1")]
-        pub version: u32,
-        #[prost(string, tag = "2")]
-        pub resume_script: String,
-        #[prost(uint64, tag = "3")]
-        pub random_seed: u64,
-        #[prost(int64, tag = "4")]
-        pub time_seed: i64,
-        #[prost(message, optional, tag = "5")]
-        pub checkpoint: Option<ProtoSaveCheckpoint>,
-        #[prost(string, repeated, tag = "6")]
-        pub script_stack: Vec<String>,
-        #[prost(message, repeated, tag = "7")]
-        pub globals: Vec<ProtoStoredEntry>,
-        #[prost(message, repeated, tag = "8")]
-        pub scope: Vec<ProtoStoredEntry>,
-        #[prost(message, repeated, tag = "9")]
-        pub input_log: Vec<ProtoSavedInput>,
-        #[prost(message, optional, tag = "10")]
-        pub scene: Option<ProtoSceneSnapshot>,
-        #[prost(message, optional, tag = "11")]
-        pub rng_state: Option<ProtoRngState>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoRngState {
-        #[prost(uint64, tag = "1")]
-        pub state: u64,
-        #[prost(uint64, tag = "2")]
-        pub stream: u64,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoSaveCheckpoint {
-        #[prost(string, tag = "1")]
-        pub script: String,
-        #[prost(uint64, tag = "2")]
-        pub ordinal: u64,
-        #[prost(string, tag = "3")]
-        pub kind: String,
-        #[prost(string, optional, tag = "4")]
-        pub label: Option<String>,
-        #[prost(message, optional, tag = "5")]
-        pub position: Option<ProtoScriptPosition>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoScriptPosition {
-        #[prost(uint64, optional, tag = "1")]
-        pub line: Option<u64>,
-        #[prost(uint64, optional, tag = "2")]
-        pub column: Option<u64>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoSavedInput {
-        #[prost(message, optional, tag = "1")]
-        pub checkpoint: Option<ProtoSaveCheckpoint>,
-        #[prost(message, optional, tag = "2")]
-        pub value: Option<ProtoStoredValue>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoStoredEntry {
-        #[prost(string, tag = "1")]
-        pub key: String,
-        #[prost(message, optional, tag = "2")]
-        pub value: Option<ProtoStoredValue>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoStoredArray {
-        #[prost(message, repeated, tag = "1")]
-        pub values: Vec<ProtoStoredValue>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoStoredMap {
-        #[prost(message, repeated, tag = "1")]
-        pub entries: Vec<ProtoStoredEntry>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoStoredValue {
-        #[prost(oneof = "proto_stored_value::Kind", tags = "1, 2, 3, 4, 5, 6")]
-        pub kind: Option<proto_stored_value::Kind>,
-    }
-
-    pub mod proto_stored_value {
-        use prost::Oneof;
-
-        use super::{ProtoStoredArray, ProtoStoredMap};
-
-        #[derive(Clone, PartialEq, Oneof)]
-        pub enum Kind {
-            #[prost(bool, tag = "1")]
-            Bool(bool),
-            #[prost(int64, tag = "2")]
-            Int(i64),
-            #[prost(double, tag = "3")]
-            Float(f64),
-            #[prost(string, tag = "4")]
-            String(String),
-            #[prost(message, tag = "5")]
-            Array(ProtoStoredArray),
-            #[prost(message, tag = "6")]
-            Map(ProtoStoredMap),
-        }
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoSceneSnapshot {
-        #[prost(message, optional, tag = "1")]
-        pub background: Option<ProtoImageLayerSnapshot>,
-        #[prost(message, repeated, tag = "2")]
-        pub sprites: Vec<ProtoSpriteSnapshot>,
-        #[prost(message, repeated, tag = "3")]
-        pub character_positions: Vec<ProtoCharacterPosition>,
-        #[prost(float, tag = "4")]
-        pub overlay_alpha: f32,
-        #[prost(message, optional, tag = "5")]
-        pub bgm: Option<ProtoAudioSnapshot>,
-        #[prost(message, optional, tag = "6")]
-        pub dialogue: Option<ProtoDialogueSnapshot>,
-        #[prost(message, optional, tag = "7")]
-        pub text_effect: Option<ProtoTextEffectSnapshot>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoImageLayerSnapshot {
-        #[prost(string, tag = "1")]
-        pub path: String,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoSpriteSnapshot {
-        #[prost(string, tag = "1")]
-        pub id: String,
-        #[prost(string, tag = "2")]
-        pub path: String,
-        #[prost(float, tag = "3")]
-        pub x: f32,
-        #[prost(float, tag = "4")]
-        pub y: f32,
-        #[prost(float, tag = "5")]
-        pub layer: f32,
-        #[prost(float, tag = "6")]
-        pub scale: f32,
-        #[prost(float, tag = "7")]
-        pub alpha: f32,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoCharacterPosition {
-        #[prost(string, tag = "1")]
-        pub actor_id: String,
-        #[prost(float, tag = "2")]
-        pub x: f32,
-        #[prost(float, tag = "3")]
-        pub y: f32,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoAudioSnapshot {
-        #[prost(string, tag = "1")]
-        pub path: String,
-        #[prost(float, tag = "2")]
-        pub volume: f32,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoDialogueSnapshot {
-        #[prost(string, tag = "1")]
-        pub speaker: String,
-        #[prost(string, tag = "2")]
-        pub text: String,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    pub struct ProtoTextEffectSnapshot {
-        #[prost(string, tag = "1")]
-        pub mode: String,
-        #[prost(float, tag = "2")]
-        pub cps: f32,
-        #[prost(float, tag = "3")]
-        pub fade_seconds: f32,
-    }
-}
-
-impl From<&SaveGameData> for proto::ProtoSaveGameData {
+impl From<&SaveGameData> for proto::SaveGameData {
     fn from(data: &SaveGameData) -> Self {
         Self {
             version: data.version,
@@ -371,10 +180,10 @@ impl From<&SaveGameData> for proto::ProtoSaveGameData {
     }
 }
 
-impl TryFrom<proto::ProtoSaveGameData> for SaveGameData {
+impl TryFrom<proto::SaveGameData> for SaveGameData {
     type Error = StorageError;
 
-    fn try_from(data: proto::ProtoSaveGameData) -> Result<Self, Self::Error> {
+    fn try_from(data: proto::SaveGameData) -> Result<Self, Self::Error> {
         Ok(Self {
             version: data.version,
             resume_script: data.resume_script,
@@ -399,7 +208,7 @@ impl TryFrom<proto::ProtoSaveGameData> for SaveGameData {
     }
 }
 
-impl From<&crate::state::RngState> for proto::ProtoRngState {
+impl From<&crate::state::RngState> for proto::RngState {
     fn from(state: &crate::state::RngState) -> Self {
         Self {
             state: state.state,
@@ -408,8 +217,8 @@ impl From<&crate::state::RngState> for proto::ProtoRngState {
     }
 }
 
-impl From<proto::ProtoRngState> for crate::state::RngState {
-    fn from(state: proto::ProtoRngState) -> Self {
+impl From<proto::RngState> for crate::state::RngState {
+    fn from(state: proto::RngState) -> Self {
         Self {
             state: state.state,
             stream: state.stream,
@@ -417,7 +226,7 @@ impl From<proto::ProtoRngState> for crate::state::RngState {
     }
 }
 
-impl From<&SaveCheckpoint> for proto::ProtoSaveCheckpoint {
+impl From<&SaveCheckpoint> for proto::SaveCheckpoint {
     fn from(checkpoint: &SaveCheckpoint) -> Self {
         Self {
             script: checkpoint.script.clone(),
@@ -429,10 +238,10 @@ impl From<&SaveCheckpoint> for proto::ProtoSaveCheckpoint {
     }
 }
 
-impl TryFrom<proto::ProtoSaveCheckpoint> for SaveCheckpoint {
+impl TryFrom<proto::SaveCheckpoint> for SaveCheckpoint {
     type Error = StorageError;
 
-    fn try_from(checkpoint: proto::ProtoSaveCheckpoint) -> Result<Self, Self::Error> {
+    fn try_from(checkpoint: proto::SaveCheckpoint) -> Result<Self, Self::Error> {
         Ok(Self {
             script: checkpoint.script,
             ordinal: checkpoint.ordinal,
@@ -443,7 +252,7 @@ impl TryFrom<proto::ProtoSaveCheckpoint> for SaveCheckpoint {
     }
 }
 
-impl From<&ScriptPosition> for proto::ProtoScriptPosition {
+impl From<&ScriptPosition> for proto::ScriptPosition {
     fn from(position: &ScriptPosition) -> Self {
         Self {
             line: position.line.map(|value| value as u64),
@@ -452,8 +261,8 @@ impl From<&ScriptPosition> for proto::ProtoScriptPosition {
     }
 }
 
-impl From<proto::ProtoScriptPosition> for ScriptPosition {
-    fn from(position: proto::ProtoScriptPosition) -> Self {
+impl From<proto::ScriptPosition> for ScriptPosition {
+    fn from(position: proto::ScriptPosition) -> Self {
         Self {
             line: position.line.map(|value| value as usize),
             column: position.column.map(|value| value as usize),
@@ -461,7 +270,7 @@ impl From<proto::ProtoScriptPosition> for ScriptPosition {
     }
 }
 
-impl From<&SavedInput> for proto::ProtoSavedInput {
+impl From<&SavedInput> for proto::SavedInput {
     fn from(input: &SavedInput) -> Self {
         Self {
             checkpoint: Some((&input.checkpoint).into()),
@@ -470,10 +279,10 @@ impl From<&SavedInput> for proto::ProtoSavedInput {
     }
 }
 
-impl TryFrom<proto::ProtoSavedInput> for SavedInput {
+impl TryFrom<proto::SavedInput> for SavedInput {
     type Error = StorageError;
 
-    fn try_from(input: proto::ProtoSavedInput) -> Result<Self, Self::Error> {
+    fn try_from(input: proto::SavedInput) -> Result<Self, Self::Error> {
         Ok(Self {
             checkpoint: input
                 .checkpoint
@@ -489,19 +298,19 @@ impl TryFrom<proto::ProtoSavedInput> for SavedInput {
     }
 }
 
-impl From<&StoredValue> for proto::ProtoStoredValue {
+impl From<&StoredValue> for proto::StoredValue {
     fn from(value: &StoredValue) -> Self {
-        use proto::proto_stored_value::Kind;
+        use proto::stored_value::Kind;
 
         let kind = match value {
             StoredValue::Bool(value) => Kind::Bool(*value),
             StoredValue::Int(value) => Kind::Int(*value),
             StoredValue::Float(value) => Kind::Float(*value),
             StoredValue::String(value) => Kind::String(value.clone()),
-            StoredValue::Array(values) => Kind::Array(proto::ProtoStoredArray {
+            StoredValue::Array(values) => Kind::Array(proto::StoredArray {
                 values: values.iter().map(Into::into).collect(),
             }),
-            StoredValue::Map(values) => Kind::Map(proto::ProtoStoredMap {
+            StoredValue::Map(values) => Kind::Map(proto::StoredMap {
                 entries: stored_entries_from_map(values),
             }),
         };
@@ -509,11 +318,11 @@ impl From<&StoredValue> for proto::ProtoStoredValue {
     }
 }
 
-impl TryFrom<proto::ProtoStoredValue> for StoredValue {
+impl TryFrom<proto::StoredValue> for StoredValue {
     type Error = StorageError;
 
-    fn try_from(value: proto::ProtoStoredValue) -> Result<Self, Self::Error> {
-        use proto::proto_stored_value::Kind;
+    fn try_from(value: proto::StoredValue) -> Result<Self, Self::Error> {
+        use proto::stored_value::Kind;
 
         match value
             .kind
@@ -534,7 +343,7 @@ impl TryFrom<proto::ProtoStoredValue> for StoredValue {
     }
 }
 
-impl From<&SceneSnapshot> for proto::ProtoSceneSnapshot {
+impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
             background: scene.background.as_ref().map(Into::into),
@@ -542,7 +351,7 @@ impl From<&SceneSnapshot> for proto::ProtoSceneSnapshot {
             character_positions: scene
                 .character_positions
                 .iter()
-                .map(|(actor_id, position)| proto::ProtoCharacterPosition {
+                .map(|(actor_id, position)| proto::CharacterPosition {
                     actor_id: actor_id.clone(),
                     x: position[0],
                     y: position[1],
@@ -556,10 +365,10 @@ impl From<&SceneSnapshot> for proto::ProtoSceneSnapshot {
     }
 }
 
-impl TryFrom<proto::ProtoSceneSnapshot> for SceneSnapshot {
+impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
     type Error = StorageError;
 
-    fn try_from(scene: proto::ProtoSceneSnapshot) -> Result<Self, Self::Error> {
+    fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
             background: scene.background.map(Into::into),
             sprites: scene.sprites.into_iter().map(Into::into).collect(),
@@ -576,7 +385,7 @@ impl TryFrom<proto::ProtoSceneSnapshot> for SceneSnapshot {
     }
 }
 
-impl From<&ImageLayerSnapshot> for proto::ProtoImageLayerSnapshot {
+impl From<&ImageLayerSnapshot> for proto::ImageLayerSnapshot {
     fn from(snapshot: &ImageLayerSnapshot) -> Self {
         Self {
             path: snapshot.path.clone(),
@@ -584,15 +393,15 @@ impl From<&ImageLayerSnapshot> for proto::ProtoImageLayerSnapshot {
     }
 }
 
-impl From<proto::ProtoImageLayerSnapshot> for ImageLayerSnapshot {
-    fn from(snapshot: proto::ProtoImageLayerSnapshot) -> Self {
+impl From<proto::ImageLayerSnapshot> for ImageLayerSnapshot {
+    fn from(snapshot: proto::ImageLayerSnapshot) -> Self {
         Self {
             path: snapshot.path,
         }
     }
 }
 
-impl From<&SpriteSnapshot> for proto::ProtoSpriteSnapshot {
+impl From<&SpriteSnapshot> for proto::SpriteSnapshot {
     fn from(snapshot: &SpriteSnapshot) -> Self {
         Self {
             id: snapshot.id.clone(),
@@ -606,8 +415,8 @@ impl From<&SpriteSnapshot> for proto::ProtoSpriteSnapshot {
     }
 }
 
-impl From<proto::ProtoSpriteSnapshot> for SpriteSnapshot {
-    fn from(snapshot: proto::ProtoSpriteSnapshot) -> Self {
+impl From<proto::SpriteSnapshot> for SpriteSnapshot {
+    fn from(snapshot: proto::SpriteSnapshot) -> Self {
         Self {
             id: snapshot.id,
             path: snapshot.path,
@@ -620,7 +429,7 @@ impl From<proto::ProtoSpriteSnapshot> for SpriteSnapshot {
     }
 }
 
-impl From<&AudioSnapshot> for proto::ProtoAudioSnapshot {
+impl From<&AudioSnapshot> for proto::AudioSnapshot {
     fn from(snapshot: &AudioSnapshot) -> Self {
         Self {
             path: snapshot.path.clone(),
@@ -629,8 +438,8 @@ impl From<&AudioSnapshot> for proto::ProtoAudioSnapshot {
     }
 }
 
-impl From<proto::ProtoAudioSnapshot> for AudioSnapshot {
-    fn from(snapshot: proto::ProtoAudioSnapshot) -> Self {
+impl From<proto::AudioSnapshot> for AudioSnapshot {
+    fn from(snapshot: proto::AudioSnapshot) -> Self {
         Self {
             path: snapshot.path,
             volume: snapshot.volume,
@@ -638,7 +447,7 @@ impl From<proto::ProtoAudioSnapshot> for AudioSnapshot {
     }
 }
 
-impl From<&DialogueSnapshot> for proto::ProtoDialogueSnapshot {
+impl From<&DialogueSnapshot> for proto::DialogueSnapshot {
     fn from(snapshot: &DialogueSnapshot) -> Self {
         Self {
             speaker: snapshot.speaker.clone(),
@@ -647,8 +456,8 @@ impl From<&DialogueSnapshot> for proto::ProtoDialogueSnapshot {
     }
 }
 
-impl From<proto::ProtoDialogueSnapshot> for DialogueSnapshot {
-    fn from(snapshot: proto::ProtoDialogueSnapshot) -> Self {
+impl From<proto::DialogueSnapshot> for DialogueSnapshot {
+    fn from(snapshot: proto::DialogueSnapshot) -> Self {
         Self {
             speaker: snapshot.speaker,
             text: snapshot.text,
@@ -656,7 +465,7 @@ impl From<proto::ProtoDialogueSnapshot> for DialogueSnapshot {
     }
 }
 
-impl From<&TextEffectSnapshot> for proto::ProtoTextEffectSnapshot {
+impl From<&TextEffectSnapshot> for proto::TextEffectSnapshot {
     fn from(snapshot: &TextEffectSnapshot) -> Self {
         Self {
             mode: snapshot.mode.clone(),
@@ -666,8 +475,8 @@ impl From<&TextEffectSnapshot> for proto::ProtoTextEffectSnapshot {
     }
 }
 
-impl From<proto::ProtoTextEffectSnapshot> for TextEffectSnapshot {
-    fn from(snapshot: proto::ProtoTextEffectSnapshot) -> Self {
+impl From<proto::TextEffectSnapshot> for TextEffectSnapshot {
+    fn from(snapshot: proto::TextEffectSnapshot) -> Self {
         Self {
             mode: snapshot.mode,
             cps: snapshot.cps,
@@ -676,10 +485,10 @@ impl From<proto::ProtoTextEffectSnapshot> for TextEffectSnapshot {
     }
 }
 
-fn stored_entries_from_map(values: &BTreeMap<String, StoredValue>) -> Vec<proto::ProtoStoredEntry> {
+fn stored_entries_from_map(values: &BTreeMap<String, StoredValue>) -> Vec<proto::StoredEntry> {
     values
         .iter()
-        .map(|(key, value)| proto::ProtoStoredEntry {
+        .map(|(key, value)| proto::StoredEntry {
             key: key.clone(),
             value: Some(value.into()),
         })
@@ -687,7 +496,7 @@ fn stored_entries_from_map(values: &BTreeMap<String, StoredValue>) -> Vec<proto:
 }
 
 fn stored_map_from_entries(
-    entries: Vec<proto::ProtoStoredEntry>,
+    entries: Vec<proto::StoredEntry>,
 ) -> Result<BTreeMap<String, StoredValue>, StorageError> {
     let mut values = BTreeMap::new();
     for entry in entries {

@@ -2164,7 +2164,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::RestoreSnapshot { snapshot, done } => {
                 clear_choice_ui(&mut commands, &choice_ui_roots);
                 clear_screen_ui(&mut commands, &mut screen_state);
-                clear_overlay_ui(&mut commands, &mut overlay_state);
+                // clear_overlay_ui(&mut commands, &mut overlay_state);
                 commands.insert_resource(CameraShakeState::default());
                 commands.insert_resource(AnimationState::default());
                 pending_characters.items.clear();

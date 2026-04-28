@@ -1,6 +1,7 @@
 mod assets;
 mod character;
 mod effect;
+mod proto;
 mod scene;
 mod script;
 mod state;
