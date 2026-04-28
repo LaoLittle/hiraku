@@ -441,6 +441,7 @@ pub struct BackgroundLayer {
 #[derive(Component, Clone)]
 pub struct BgmChannel {
     pub path: String,
+    pub volume: f32,
 }
 
 #[derive(Component)]
@@ -548,6 +549,7 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub shared_state: Res<'w, SceneSharedState>,
     pub runtime_state: Option<Res<'w, ScriptRuntimeState>>,
     pub frontend: ResMut<'w, FrontendState>,
+    pub user_settings: Res<'w, UserSettings>,
     pub ui_style: Res<'w, UiStyle>,
     pub runtime_menu: ResMut<'w, RuntimeMenuState>,
     pub stage: ResMut<'w, StageState>,
@@ -1307,6 +1309,7 @@ pub fn handle_frontend_buttons(
                             &mut dialogue_root,
                             &mut speaker_text,
                             &mut line_text,
+                            &user_settings,
                             &mut frontend,
                             bootstrap,
                             SceneSnapshot::default(),
@@ -1341,6 +1344,7 @@ pub fn handle_frontend_buttons(
                             &mut dialogue_root,
                             &mut speaker_text,
                             &mut line_text,
+                            &user_settings,
                             &mut frontend,
                             bootstrap,
                             SceneSnapshot::default(),
@@ -1386,6 +1390,7 @@ pub fn handle_frontend_buttons(
                                 &mut dialogue_root,
                                 &mut speaker_text,
                                 &mut line_text,
+                                &user_settings,
                                 &mut frontend,
                                 bootstrap,
                                 snapshot,
@@ -2170,6 +2175,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut dialogue_root,
                     &mut speaker_text,
                     &mut line_text,
+                    &user_settings,
                     snapshot.clone(),
                 );
                 *shared_state.0.lock().unwrap() = snapshot;
@@ -2314,14 +2320,21 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 animation_id,
                 done,
             } => {
-                let volume = apply_volume_setting(volume, user_settings.bgm_volume);
+                let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
                 if let Some(previous) = stage.bgm.take() {
                     commands.entity(previous).try_despawn();
                 }
-                let start_volume = if fade_in.is_some() { 0.0 } else { volume };
+                let start_volume = if fade_in.is_some() {
+                    0.0
+                } else {
+                    playback_volume
+                };
                 let bgm = commands
                     .spawn((
-                        BgmChannel { path: path.clone() },
+                        BgmChannel {
+                            path: path.clone(),
+                            volume,
+                        },
                         AudioPlayer::new(asset_server.load(path.clone())),
                         PlaybackSettings::LOOP.with_volume(Volume::Linear(start_volume)),
                     ))
@@ -2329,7 +2342,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if let Some(fade_in) = fade_in {
                     commands.entity(bgm).insert(BgmFade {
                         from: start_volume,
-                        to: volume,
+                        to: playback_volume,
                         timer: Timer::new(fade_in, TimerMode::Once),
                         animation_id,
                         done,
@@ -2346,11 +2359,17 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 shared_state.0.lock().unwrap().bgm = Some(AudioSnapshot { path, volume });
             }
             ScriptCommand::SetBgmVolume { volume } => {
-                let volume = apply_volume_setting(volume, user_settings.bgm_volume);
+                let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
                 if let Some(bgm) = stage.bgm {
+                    if let Some(snapshot) = shared_state.0.lock().unwrap().bgm.as_ref() {
+                        commands.entity(bgm).insert(BgmChannel {
+                            path: snapshot.path.clone(),
+                            volume,
+                        });
+                    }
                     commands.entity(bgm).insert(BgmFade {
-                        from: volume,
-                        to: volume,
+                        from: playback_volume,
+                        to: playback_volume,
                         timer: Timer::new(std::time::Duration::ZERO, TimerMode::Once),
                         animation_id: None,
                         done: None,
@@ -2366,7 +2385,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 animation_id,
                 done,
             } => {
-                let volume = apply_volume_setting(volume, user_settings.bgm_volume);
+                let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
                 let from = shared_state
                     .0
                     .lock()
@@ -2374,11 +2393,18 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     .bgm
                     .as_ref()
                     .map(|bgm| bgm.volume)
-                    .unwrap_or(volume);
+                    .map(|volume| apply_volume_setting(volume, user_settings.bgm_volume))
+                    .unwrap_or(playback_volume);
                 if let Some(bgm) = stage.bgm {
+                    if let Some(snapshot) = shared_state.0.lock().unwrap().bgm.as_ref() {
+                        commands.entity(bgm).insert(BgmChannel {
+                            path: snapshot.path.clone(),
+                            volume,
+                        });
+                    }
                     commands.entity(bgm).insert(BgmFade {
                         from,
-                        to: volume,
+                        to: playback_volume,
                         timer: Timer::new(duration, TimerMode::Once),
                         animation_id,
                         done,
@@ -2470,6 +2496,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut dialogue_root,
                     &mut speaker_text,
                     &mut line_text,
+                    &user_settings,
                     SceneSnapshot::default(),
                 );
                 frontend.runtime_started = true;
@@ -2493,7 +2520,6 @@ pub fn animate_bgm_fades(
     mut commands: Commands,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
-    shared_state: ResMut<SceneSharedState>,
     mut bgms: Query<(Entity, Option<&mut AudioSink>, &mut BgmFade)>,
 ) {
     for (entity, sink, mut fade) in &mut bgms {
@@ -2503,9 +2529,6 @@ pub fn animate_bgm_fades(
 
         if let Some(mut sink) = sink {
             sink.set_volume(Volume::Linear(volume));
-        }
-        if let Some(snapshot) = shared_state.0.lock().unwrap().bgm.as_mut() {
-            snapshot.volume = volume;
         }
 
         if fade.timer.is_finished() {
@@ -3489,7 +3512,7 @@ pub fn sync_scene_snapshot(
     stage: Res<StageState>,
     dialogue_state: Res<DialogueState>,
     background_layers: Query<&BackgroundLayer>,
-    bgms: Query<(&BgmChannel, Option<&AudioSink>)>,
+    bgms: Query<&BgmChannel>,
     overlay: Query<&Sprite, With<OverlayMarker>>,
     sprites: Query<(&SpriteActor, &Sprite, &Transform)>,
 ) {
@@ -3523,9 +3546,9 @@ pub fn sync_scene_snapshot(
         .collect();
 
     snapshot.bgm = stage.bgm.and_then(|entity| {
-        bgms.get(entity).ok().map(|(bgm, sink)| AudioSnapshot {
+        bgms.get(entity).ok().map(|bgm| AudioSnapshot {
             path: bgm.path.clone(),
-            volume: sink.map(|sink| sink.volume().to_linear()).unwrap_or(1.0),
+            volume: bgm.volume,
         })
     });
 
@@ -3842,6 +3865,7 @@ fn start_frontend_session(
     dialogue_root: &mut Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     speaker_text: &mut Query<&mut Text, (With<SpeakerText>, Without<LineText>)>,
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
+    user_settings: &UserSettings,
     frontend: &mut FrontendState,
     bootstrap: ScriptBootstrap,
     snapshot: SceneSnapshot,
@@ -3861,6 +3885,7 @@ fn start_frontend_session(
         dialogue_root,
         speaker_text,
         line_text,
+        user_settings,
         snapshot,
     );
 
@@ -5063,6 +5088,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.dialogue_root,
                             &mut ctx.speaker_text,
                             &mut ctx.line_text,
+                            &ctx.user_settings,
                             &mut ctx.frontend,
                             ScriptBootstrap::from_save(&save_data),
                             save_data.scene.clone(),
@@ -5111,6 +5137,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.dialogue_root,
                             &mut ctx.speaker_text,
                             &mut ctx.line_text,
+                            &ctx.user_settings,
                             &mut ctx.frontend,
                             ScriptBootstrap::new(startup_script),
                             SceneSnapshot::default(),
@@ -5298,6 +5325,7 @@ fn restore_scene_snapshot(
     dialogue_root: &mut Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     speaker_text: &mut Query<&mut Text, (With<SpeakerText>, Without<LineText>)>,
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
+    user_settings: &UserSettings,
     snapshot: SceneSnapshot,
 ) {
     let text_effect = snapshot.text_effect.clone();
@@ -5360,14 +5388,16 @@ fn restore_scene_snapshot(
         .collect();
 
     if let Some(bgm) = snapshot.bgm.as_ref() {
+        let playback_volume = apply_volume_setting(bgm.volume, user_settings.bgm_volume);
         stage.bgm = Some(
             commands
                 .spawn((
                     BgmChannel {
                         path: bgm.path.clone(),
+                        volume: bgm.volume,
                     },
                     AudioPlayer::new(asset_server.load(bgm.path.clone())),
-                    PlaybackSettings::LOOP.with_volume(Volume::Linear(bgm.volume)),
+                    PlaybackSettings::LOOP.with_volume(Volume::Linear(playback_volume)),
                 ))
                 .id(),
         );
