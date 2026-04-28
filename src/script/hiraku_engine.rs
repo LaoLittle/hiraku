@@ -854,12 +854,7 @@ pub mod HirakuEngine {
     pub fn screen(ctx: NativeCallContext, screen: Map) -> Result<Dynamic, Box<EvalAltResult>> {
         let host = host(&ctx)?;
         if host.checkpoint("screen", None, ctx.call_position()) == CheckpointDecision::ReplaySkip {
-            return host
-                .replay_input()
-                .map(stored_value_to_dynamic)
-                .ok_or_else(|| {
-                    runtime_error("save replay reached a screen without a recorded input")
-                });
+            return host.replay_input("screen").map(stored_value_to_dynamic);
         }
         let screen = parse_screen_spec(&host, screen)?;
         match host.send_and_wait(|done| ScriptCommand::ShowScreen { screen, done })? {
@@ -1046,7 +1041,10 @@ pub mod HirakuEngine {
 
     #[rhai_fn(name = "save", return_raw)]
     pub fn save(ctx: NativeCallContext, slot: ImmutableString) -> Result<(), Box<EvalAltResult>> {
-        host(&ctx)?.save_game(&slot, None)
+        if host(&ctx)?.is_replaying() {
+            return Ok(());
+        }
+        Err(save_script_signal(slot.to_string(), None))
     }
 
     #[rhai_fn(name = "save", return_raw)]
@@ -1056,8 +1054,11 @@ pub mod HirakuEngine {
         resume_script: ImmutableString,
     ) -> Result<(), Box<EvalAltResult>> {
         let host = host(&ctx)?;
+        if host.is_replaying() {
+            return Ok(());
+        }
         let resume_script = host.resolve_path(&resume_script);
-        host.save_game(&slot, Some(resume_script))
+        Err(save_script_signal(slot.to_string(), Some(resume_script)))
     }
 
     #[rhai_fn(return_raw)]
@@ -1102,6 +1103,11 @@ pub mod HirakuEngine {
     pub fn return_to_title(ctx: NativeCallContext) -> Result<(), Box<EvalAltResult>> {
         host(&ctx)?.send(ScriptCommand::ReturnToTitle)?;
         Err(return_to_title_signal())
+    }
+
+    #[rhai_fn(return_raw)]
+    pub fn quit(ctx: NativeCallContext) -> Result<(), Box<EvalAltResult>> {
+        host(&ctx)?.send(ScriptCommand::Exit)
     }
 
     pub fn current_script(ctx: NativeCallContext) -> String {

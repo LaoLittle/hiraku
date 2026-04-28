@@ -39,6 +39,12 @@ pub struct SavedInput {
     pub value: StoredValue,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RngState {
+    pub state: u64,
+    pub stream: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChoiceOption {
     pub text: String,
@@ -102,6 +108,10 @@ pub struct SaveGameData {
     pub resume_script: String,
     #[serde(default)]
     pub random_seed: u64,
+    #[serde(default)]
+    pub rng_state: Option<RngState>,
+    #[serde(default)]
+    pub time_seed: i64,
     #[serde(default)]
     pub checkpoint: Option<SaveCheckpoint>,
     #[serde(default)]

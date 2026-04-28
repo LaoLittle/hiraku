@@ -35,6 +35,24 @@ pub mod RNG {
         if min > max {
             return Err(runtime_error("rand(min, max) requires min <= max"));
         }
-        Ok(host(&ctx)?.rng.lock().unwrap().random_range(min..=max))
+        let host = host(&ctx)?;
+        let generated = host.rng.lock().unwrap().random_range(min..=max);
+        if host.checkpoint("rand", None, ctx.call_position()) == CheckpointDecision::ReplaySkip {
+            let replayed = host.replay_input("rand")?;
+            let StoredValue::Int(value) = replayed else {
+                return Err(runtime_error(
+                    "save replay recorded a non-integer rand value",
+                ));
+            };
+            if value != generated {
+                return Err(runtime_error(format!(
+                    "save replay rand mismatch: recorded {value}, generated {generated}"
+                )));
+            }
+            return Ok(value);
+        }
+
+        host.record_input(StoredValue::Int(generated));
+        Ok(generated)
     }
 }

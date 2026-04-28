@@ -4,6 +4,7 @@ use std::{
 };
 
 use bevy::{
+    app::AppExit,
     audio::{AudioSink, AudioSinkPlayback, Volume},
     ecs::system::SystemParam,
     log::warn,
@@ -16,16 +17,15 @@ use crate::{
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
         ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse,
-        ScriptRuntimeState, spawn_script_runtime,
+        ScriptRuntimeState, save_runtime_slot, spawn_script_runtime,
     },
     state::{
-        AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SaveGameData,
-        SceneSharedState, SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot,
-        UiStylePatch,
+        AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
+        SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot, UiStylePatch,
     },
     storage::{
         SaveSlotSummary, StorageError, UserSettings, list_save_slots, load_save_data,
-        read_user_settings, write_save_data_to_root, write_user_settings,
+        read_user_settings, write_user_settings,
     },
     transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
@@ -476,6 +476,7 @@ pub struct VisualTween {
 #[derive(SystemParam)]
 pub struct SceneCommandContext<'w, 's> {
     pub commands: Commands<'w, 's>,
+    pub app_exit: MessageWriter<'w, AppExit>,
     pub asset_server: Res<'w, AssetServer>,
     pub images: Res<'w, Assets<Image>>,
     pub vfs: Res<'w, VfsResource>,
@@ -1441,6 +1442,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     };
 
     let mut commands = ctx.commands;
+    let mut app_exit = ctx.app_exit;
     let asset_server = ctx.asset_server;
     let images = ctx.images;
     let vfs = ctx.vfs;
@@ -2480,6 +2482,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::CancelAnimations { ids } => {
                 pending_cancels.ids.extend(ids);
             }
+            ScriptCommand::Exit => {
+                app_exit.write(AppExit::Success);
+            }
             ScriptCommand::ReturnToTitle => {
                 finish_active_voice(&mut commands, &mut animations, &mut voice_state);
                 clear_choice_ui(&mut commands, &choice_ui_roots);
@@ -2637,6 +2642,7 @@ fn should_clear_stale_screen_before_command(command: &ScriptCommand) -> bool {
             | ScriptCommand::RuleTransitionBg { .. }
             | ScriptCommand::PlayCustomEffect { .. }
             | ScriptCommand::RestoreSnapshot { .. }
+            | ScriptCommand::Exit
             | ScriptCommand::ReturnToTitle
     )
 }
@@ -5293,26 +5299,6 @@ fn abort_runtime_waiters(
     pending_characters.items.clear();
     animations.waits.clear();
     finish_active_voice(commands, animations, voice_state);
-}
-
-fn save_runtime_slot(
-    slot: &str,
-    runtime_state: &ScriptRuntimeState,
-    shared_state: &SceneSharedState,
-) -> Result<(), StorageError> {
-    let checkpoint_state = runtime_state.checkpoint.lock().unwrap().clone();
-    let data = SaveGameData {
-        version: 2,
-        resume_script: runtime_state.current_script.lock().unwrap().clone(),
-        random_seed: *runtime_state.random_seed.lock().unwrap(),
-        checkpoint: checkpoint_state.current,
-        script_stack: runtime_state.script_stack.lock().unwrap().clone(),
-        globals: runtime_state.globals.lock().unwrap().clone(),
-        scope: std::collections::BTreeMap::new(),
-        input_log: checkpoint_state.input_log,
-        scene: shared_state.0.lock().unwrap().clone(),
-    };
-    write_save_data_to_root(&runtime_state.save_root, slot, &data)
 }
 
 #[allow(clippy::too_many_arguments)]

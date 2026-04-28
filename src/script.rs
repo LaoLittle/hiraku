@@ -16,7 +16,7 @@ use rand_pcg::Pcg32;
 use rhai::plugin::*;
 use rhai::{
     Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, FnPtr, INT, ImmutableString,
-    Map, NativeCallContext, Position,
+    Map, NativeCallContext, Position, Scope,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -24,12 +24,12 @@ use crate::{
     character::load_character_catalog,
     effect::CustomEffectOptions,
     state::{
-        ChoiceOption, SaveCheckpoint, SaveGameData, SavedInput, SceneSnapshot, ScriptPosition,
-        StoredValue, UiStylePatch,
+        ChoiceOption, RngState, SaveCheckpoint, SaveGameData, SavedInput, SceneSharedState,
+        SceneSnapshot, ScriptPosition, StoredValue, UiStylePatch,
     },
     storage::{
-        UserSettings, load_save_data_from_root, read_user_settings, save_root_path, slot_path_in,
-        write_save_data_to_root, write_user_settings,
+        StorageError, UserSettings, load_save_data_from_root, read_user_settings, save_root_path,
+        slot_path_in, write_save_data_to_root, write_user_settings,
     },
     ui::{
         BarNode, ButtonNode, ContainerNode, ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec,
@@ -40,9 +40,11 @@ use crate::{
 
 mod hiraku_engine;
 mod rng;
+mod time;
 
 const JUMP_SCRIPT_SIGNAL: &str = "__hiraku_jump_script__::";
 const CALL_SCRIPT_SIGNAL: &str = "__hiraku_call_script__::";
+const SAVE_SCRIPT_SIGNAL: &str = "__hiraku_save_script__::";
 const RETURN_SCRIPT_SIGNAL: &str = "__hiraku_return_script__";
 const RETURN_TO_TITLE_SIGNAL: &str = "__hiraku_return_to_title__";
 const ENGINE_STOPPED_SIGNAL: &str = "__hiraku_engine_stopped__";
@@ -55,6 +57,10 @@ enum InlineDialogueChunk {
 enum ScriptFlowAction {
     Jump(String),
     Call(String),
+    Save {
+        slot: String,
+        resume_script: Option<String>,
+    },
     Return,
     ReturnToTitle,
     EngineStopped,
@@ -256,6 +262,7 @@ pub enum ScriptCommand {
         ids: Vec<String>,
     },
     ReturnToTitle,
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -504,6 +511,8 @@ pub struct ScriptRuntimeState {
     pub globals: Arc<Mutex<BTreeMap<String, StoredValue>>>,
     pub checkpoint: Arc<Mutex<CheckpointState>>,
     pub random_seed: Arc<Mutex<u64>>,
+    pub rng: Arc<Mutex<Pcg32>>,
+    pub time_seed: Arc<Mutex<i64>>,
     pub save_root: PathBuf,
 }
 
@@ -527,9 +536,12 @@ pub struct ScriptBootstrap {
     pub startup_script: String,
     pub script_stack: Vec<String>,
     pub globals: BTreeMap<String, StoredValue>,
+    pub scope: BTreeMap<String, StoredValue>,
     pub checkpoint: Option<SaveCheckpoint>,
     pub input_log: Vec<SavedInput>,
     pub random_seed: Option<u64>,
+    pub rng_state: Option<RngState>,
+    pub time_seed: Option<i64>,
 }
 
 impl ScriptBootstrap {
@@ -538,9 +550,12 @@ impl ScriptBootstrap {
             startup_script,
             script_stack: Vec::new(),
             globals: BTreeMap::new(),
+            scope: BTreeMap::new(),
             checkpoint: None,
             input_log: Vec::new(),
             random_seed: None,
+            rng_state: None,
+            time_seed: None,
         }
     }
 
@@ -553,9 +568,12 @@ impl ScriptBootstrap {
                 .unwrap_or_else(|| data.resume_script.clone()),
             script_stack: data.script_stack.clone(),
             globals: data.globals.clone(),
+            scope: data.scope.clone(),
             checkpoint: data.checkpoint.clone(),
             input_log: data.input_log.clone(),
             random_seed: Some(data.random_seed),
+            rng_state: data.rng_state.clone(),
+            time_seed: Some(data.time_seed),
         }
     }
 }
@@ -568,7 +586,9 @@ struct ScriptHost {
     script_stack: Arc<Mutex<Vec<String>>>,
     globals: Arc<Mutex<BTreeMap<String, StoredValue>>>,
     checkpoint: Arc<Mutex<CheckpointState>>,
+    pending_scope_restore: Arc<Mutex<Option<BTreeMap<String, StoredValue>>>>,
     random_seed: Arc<Mutex<u64>>,
+    time_seed: Arc<Mutex<i64>>,
     rng: Arc<Mutex<Pcg32>>,
     scene_state: Arc<Mutex<SceneSnapshot>>,
     next_animation_id: Arc<Mutex<u64>>,
@@ -662,21 +682,42 @@ impl ScriptHost {
         self.checkpoint.lock().unwrap().replay.is_some()
     }
 
-    fn replay_input(&self) -> Option<StoredValue> {
+    fn replay_input(&self, expected_kind: &str) -> Result<StoredValue, Box<EvalAltResult>> {
         let mut state = self.checkpoint.lock().unwrap();
-        let input = {
-            let replay = state.replay.as_mut()?;
-            let input = replay.input_log.get(replay.input_cursor)?.value.clone();
-            replay.input_cursor += 1;
-            input
-        };
-        if let Some(checkpoint) = state.current.clone() {
-            state.input_log.push(SavedInput {
-                checkpoint,
-                value: input.clone(),
-            });
+        let current = state
+            .current
+            .clone()
+            .ok_or_else(|| runtime_error("save replay reached an event without a checkpoint"))?;
+        if current.kind != expected_kind {
+            return Err(runtime_error(format!(
+                "save replay expected `{expected_kind}` but reached `{}`",
+                current.kind
+            )));
         }
-        Some(input)
+        let input = {
+            let replay = state
+                .replay
+                .as_mut()
+                .ok_or_else(|| runtime_error("save replay is not active"))?;
+            let input_index = replay.input_log[replay.input_cursor..]
+                .iter()
+                .position(|input| checkpoint_matches(&input.checkpoint, &current))
+                .map(|index| replay.input_cursor + index)
+                .ok_or_else(|| {
+                    runtime_error(format!(
+                        "save replay reached `{expected_kind}` without a matching recorded value"
+                    ))
+                })?;
+            let input = &replay.input_log[input_index];
+            let value = input.value.clone();
+            replay.input_cursor = input_index + 1;
+            value
+        };
+        state.input_log.push(SavedInput {
+            checkpoint: current,
+            value: input.clone(),
+        });
+        Ok(input)
     }
 
     fn record_input(&self, value: StoredValue) {
@@ -684,6 +725,10 @@ impl ScriptHost {
         if let Some(checkpoint) = state.current.clone() {
             state.input_log.push(SavedInput { checkpoint, value });
         }
+    }
+
+    fn rng_state(&self) -> RngState {
+        rng_state_snapshot(&self.rng.lock().unwrap())
     }
 
     fn resolve_path(&self, requested: &str) -> String {
@@ -930,9 +975,7 @@ impl ScriptHost {
         options: Vec<ChoiceOption>,
     ) -> Result<StoredValue, Box<EvalAltResult>> {
         if self.checkpoint("choice", None, pos) == CheckpointDecision::ReplaySkip {
-            return self.replay_input().ok_or_else(|| {
-                runtime_error("save replay reached a choice without a recorded input")
-            });
+            return self.replay_input("choice");
         }
 
         match self.send_and_wait(|done| ScriptCommand::Choose {
@@ -1017,20 +1060,23 @@ impl ScriptHost {
         Ok(self.save_file_path(slot)?.exists())
     }
 
-    fn save_game(
+    fn save_game_with_scope(
         &self,
         slot: &str,
         resume_script: Option<String>,
+        scope: BTreeMap<String, StoredValue>,
     ) -> Result<(), Box<EvalAltResult>> {
         let checkpoint_state = self.checkpoint.lock().unwrap().clone();
         let data = SaveGameData {
-            version: 2,
+            version: 3,
             resume_script: resume_script.unwrap_or_else(|| self.current_script_path()),
             random_seed: *self.random_seed.lock().unwrap(),
+            rng_state: Some(self.rng_state()),
+            time_seed: *self.time_seed.lock().unwrap(),
             checkpoint: checkpoint_state.current.clone(),
             script_stack: self.script_stack.lock().unwrap().clone(),
             globals: self.globals.lock().unwrap().clone(),
-            scope: BTreeMap::new(),
+            scope,
             input_log: checkpoint_state.input_log.clone(),
             scene: self.scene_state.lock().unwrap().clone(),
         };
@@ -1046,8 +1092,16 @@ impl ScriptHost {
         *self.script_stack.lock().unwrap() = data.script_stack.clone();
         *self.globals.lock().unwrap() = data.globals.clone();
         *self.scene_state.lock().unwrap() = data.scene.clone();
+        *self.pending_scope_restore.lock().unwrap() = Some(data.scope.clone());
         *self.random_seed.lock().unwrap() = data.random_seed;
-        *self.rng.lock().unwrap() = Pcg32::seed_from_u64(data.random_seed);
+        *self.time_seed.lock().unwrap() = data.time_seed;
+        let restored_rng = if data.checkpoint.is_none() {
+            data.rng_state.as_ref().map(rng_from_state_snapshot)
+        } else {
+            None
+        };
+        *self.rng.lock().unwrap() =
+            restored_rng.unwrap_or_else(|| Pcg32::seed_from_u64(data.random_seed));
         *self.checkpoint.lock().unwrap() = CheckpointState {
             current: data.checkpoint.clone(),
             ordinal: 0,
@@ -1127,7 +1181,17 @@ pub fn spawn_script_runtime(
     let script_stack = Arc::new(Mutex::new(bootstrap.script_stack));
     let seed = bootstrap.random_seed.unwrap_or_else(new_random_seed);
     let random_seed = Arc::new(Mutex::new(seed));
-    let rng = Arc::new(Mutex::new(Pcg32::seed_from_u64(seed)));
+    let time_seed = Arc::new(Mutex::new(
+        bootstrap.time_seed.unwrap_or_else(new_time_seed),
+    ));
+    let restored_rng = if bootstrap.checkpoint.is_none() {
+        bootstrap.rng_state.as_ref().map(rng_from_state_snapshot)
+    } else {
+        None
+    };
+    let rng = Arc::new(Mutex::new(
+        restored_rng.unwrap_or_else(|| Pcg32::seed_from_u64(seed)),
+    ));
     let checkpoint = Arc::new(Mutex::new(CheckpointState {
         current: bootstrap.checkpoint.clone(),
         ordinal: 0,
@@ -1138,9 +1202,11 @@ pub fn spawn_script_runtime(
             input_cursor: 0,
         }),
     }));
+    let pending_scope_restore = Arc::new(Mutex::new(None));
     let next_animation_id = Arc::new(Mutex::new(0));
     let batch_registry = Arc::new(Mutex::new(BatchRegistry::default()));
     let inline_dialogue_control = Arc::new(Mutex::new(InlineDialogueControl::default()));
+    let startup_scope = bootstrap.scope.clone();
 
     commands.insert_resource(ScriptInbox(Mutex::new(command_rx)));
     commands.insert_resource(InlineDialogueControlResource(
@@ -1154,7 +1220,9 @@ pub fn spawn_script_runtime(
         script_stack: script_stack.clone(),
         globals: Arc::new(Mutex::new(bootstrap.globals)),
         checkpoint: checkpoint.clone(),
+        pending_scope_restore,
         random_seed: random_seed.clone(),
+        time_seed: time_seed.clone(),
         rng: rng.clone(),
         scene_state,
         next_animation_id,
@@ -1169,6 +1237,8 @@ pub fn spawn_script_runtime(
         globals: host.globals.clone(),
         checkpoint,
         random_seed,
+        rng,
+        time_seed,
         save_root: host.save_root.clone(),
     });
 
@@ -1176,15 +1246,51 @@ pub fn spawn_script_runtime(
 
     thread::Builder::new()
         .name("hiraku-rhai".to_string())
-        .spawn(move || run_script_loop(host, startup_script))
+        .spawn(move || run_script_loop(host, startup_script, startup_scope))
         .expect("failed to spawn script runtime thread");
 }
 
-fn run_script_loop(host: ScriptHost, startup_script: String) {
+pub fn save_runtime_slot(
+    slot: &str,
+    runtime_state: &ScriptRuntimeState,
+    shared_state: &SceneSharedState,
+) -> Result<(), StorageError> {
+    save_runtime_slot_with_scope(slot, runtime_state, shared_state, BTreeMap::new())
+}
+
+pub fn save_runtime_slot_with_scope(
+    slot: &str,
+    runtime_state: &ScriptRuntimeState,
+    shared_state: &SceneSharedState,
+    scope: BTreeMap<String, StoredValue>,
+) -> Result<(), StorageError> {
+    let checkpoint_state = runtime_state.checkpoint.lock().unwrap().clone();
+    let data = SaveGameData {
+        version: 3,
+        resume_script: runtime_state.current_script.lock().unwrap().clone(),
+        random_seed: *runtime_state.random_seed.lock().unwrap(),
+        rng_state: Some(rng_state_snapshot(&runtime_state.rng.lock().unwrap())),
+        time_seed: *runtime_state.time_seed.lock().unwrap(),
+        checkpoint: checkpoint_state.current,
+        script_stack: runtime_state.script_stack.lock().unwrap().clone(),
+        globals: runtime_state.globals.lock().unwrap().clone(),
+        scope,
+        input_log: checkpoint_state.input_log,
+        scene: shared_state.0.lock().unwrap().clone(),
+    };
+    write_save_data_to_root(&runtime_state.save_root, slot, &data)
+}
+
+fn run_script_loop(
+    host: ScriptHost,
+    startup_script: String,
+    startup_scope: BTreeMap<String, StoredValue>,
+) {
     let mut engine = RhaiEngine::new();
     register_api(&mut engine, &host);
 
     let mut next_script = startup_script;
+    let mut scope = scope_from_stored_values(startup_scope);
 
     loop {
         host.set_current_script_path(next_script.clone());
@@ -1198,13 +1304,17 @@ fn run_script_loop(host: ScriptHost, startup_script: String) {
             }
         };
 
-        let mut scope = rhai::Scope::new();
         match engine.eval_with_scope::<Dynamic>(&mut scope, &source) {
             Ok(_) => return,
             Err(err) => {
                 if let Some(action) = extract_script_flow_action(err.as_ref()) {
                     match action {
                         ScriptFlowAction::Jump(target) => {
+                            if let Some(restored_scope) =
+                                host.pending_scope_restore.lock().unwrap().take()
+                            {
+                                scope = scope_from_stored_values(restored_scope);
+                            }
                             next_script = target;
                             continue;
                         }
@@ -1212,6 +1322,20 @@ fn run_script_loop(host: ScriptHost, startup_script: String) {
                             host.script_stack.lock().unwrap().push(next_script.clone());
                             next_script = target;
                             continue;
+                        }
+                        ScriptFlowAction::Save {
+                            slot,
+                            resume_script,
+                        } => {
+                            match scope_to_stored_values(&scope).and_then(|scope| {
+                                host.save_game_with_scope(&slot, resume_script, scope)
+                            }) {
+                                Ok(()) => return,
+                                Err(err) => {
+                                    error!("script `{}` failed to save: {err}", next_script);
+                                    return;
+                                }
+                            }
                         }
                         ScriptFlowAction::Return => {
                             let Some(target) = host.script_stack.lock().unwrap().pop() else {
@@ -1279,6 +1403,7 @@ fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
             | ScriptCommand::PlaySfx { .. }
             | ScriptCommand::SubmitBatch { .. }
             | ScriptCommand::CancelAnimations { .. }
+            | ScriptCommand::Exit
     )
 }
 
@@ -1286,10 +1411,67 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     engine.set_default_tag(Dynamic::from(host.clone()));
     engine.register_global_module(exported_module!(hiraku_engine::HirakuEngine).into());
     engine.register_global_module(exported_module!(rng::RNG).into());
+    engine.register_global_module(exported_module!(time::Time).into());
 }
 
 fn new_random_seed() -> u64 {
     rand::rng().next_u64()
+}
+
+fn new_time_seed() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn rng_state_snapshot(rng: &Pcg32) -> RngState {
+    RngState {
+        state: rng.state(),
+        stream: rng.stream(),
+    }
+}
+
+fn rng_from_state_snapshot(state: &RngState) -> Pcg32 {
+    Pcg32::from_state(state.state, state.stream)
+}
+
+fn checkpoint_matches(left: &SaveCheckpoint, right: &SaveCheckpoint) -> bool {
+    left.script == right.script && left.ordinal == right.ordinal && left.kind == right.kind
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::RngExt;
+
+    #[test]
+    fn rng_state_round_trips() {
+        let mut rng = Pcg32::seed_from_u64(42);
+        let _ = rng.random::<u64>();
+        let state = rng_state_snapshot(&rng);
+        let mut restored = rng_from_state_snapshot(&state);
+
+        assert_eq!(rng.random::<u64>(), restored.random::<u64>());
+    }
+}
+
+fn scope_from_stored_values(values: BTreeMap<String, StoredValue>) -> Scope<'static> {
+    let mut scope = Scope::new();
+    for (name, value) in values {
+        scope.push_dynamic(name, stored_value_to_dynamic(value));
+    }
+    scope
+}
+
+fn scope_to_stored_values(
+    scope: &Scope,
+) -> Result<BTreeMap<String, StoredValue>, Box<EvalAltResult>> {
+    let mut values = BTreeMap::new();
+    for (name, _, value) in scope.iter() {
+        values.insert(name.to_string(), dynamic_to_stored_value(value)?);
+    }
+    Ok(values)
 }
 
 fn extract_script_flow_action(error: &EvalAltResult) -> Option<ScriptFlowAction> {
@@ -1314,6 +1496,16 @@ fn extract_signal_string(value: &Dynamic) -> Option<ScriptFlowAction> {
     }
     if let Some(target) = payload.strip_prefix(CALL_SCRIPT_SIGNAL) {
         return Some(ScriptFlowAction::Call(target.to_string()));
+    }
+    if let Some(payload) = payload.strip_prefix(SAVE_SCRIPT_SIGNAL) {
+        let (slot, resume_script) = payload
+            .split_once('\n')
+            .map(|(slot, resume_script)| (slot, Some(resume_script.to_string())))
+            .unwrap_or((payload, None));
+        return Some(ScriptFlowAction::Save {
+            slot: slot.to_string(),
+            resume_script,
+        });
     }
     if payload == RETURN_SCRIPT_SIGNAL {
         return Some(ScriptFlowAction::Return);
@@ -1340,6 +1532,14 @@ fn call_script_signal(target: String) -> Box<EvalAltResult> {
         format!("{CALL_SCRIPT_SIGNAL}{target}").into(),
         Position::NONE,
     ))
+}
+
+fn save_script_signal(slot: String, resume_script: Option<String>) -> Box<EvalAltResult> {
+    let payload = match resume_script {
+        Some(resume_script) => format!("{SAVE_SCRIPT_SIGNAL}{slot}\n{resume_script}"),
+        None => format!("{SAVE_SCRIPT_SIGNAL}{slot}"),
+    };
+    Box::new(EvalAltResult::ErrorRuntime(payload.into(), Position::NONE))
 }
 
 fn return_script_signal() -> Box<EvalAltResult> {

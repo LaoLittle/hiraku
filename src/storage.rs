@@ -170,18 +170,30 @@ mod proto {
         pub resume_script: String,
         #[prost(uint64, tag = "3")]
         pub random_seed: u64,
-        #[prost(message, optional, tag = "4")]
+        #[prost(int64, tag = "4")]
+        pub time_seed: i64,
+        #[prost(message, optional, tag = "5")]
         pub checkpoint: Option<ProtoSaveCheckpoint>,
-        #[prost(string, repeated, tag = "5")]
+        #[prost(string, repeated, tag = "6")]
         pub script_stack: Vec<String>,
-        #[prost(message, repeated, tag = "6")]
-        pub globals: Vec<ProtoStoredEntry>,
         #[prost(message, repeated, tag = "7")]
-        pub scope: Vec<ProtoStoredEntry>,
+        pub globals: Vec<ProtoStoredEntry>,
         #[prost(message, repeated, tag = "8")]
+        pub scope: Vec<ProtoStoredEntry>,
+        #[prost(message, repeated, tag = "9")]
         pub input_log: Vec<ProtoSavedInput>,
-        #[prost(message, optional, tag = "9")]
+        #[prost(message, optional, tag = "10")]
         pub scene: Option<ProtoSceneSnapshot>,
+        #[prost(message, optional, tag = "11")]
+        pub rng_state: Option<ProtoRngState>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ProtoRngState {
+        #[prost(uint64, tag = "1")]
+        pub state: u64,
+        #[prost(uint64, tag = "2")]
+        pub stream: u64,
     }
 
     #[derive(Clone, PartialEq, Message)]
@@ -347,6 +359,8 @@ impl From<&SaveGameData> for proto::ProtoSaveGameData {
             version: data.version,
             resume_script: data.resume_script.clone(),
             random_seed: data.random_seed,
+            time_seed: data.time_seed,
+            rng_state: data.rng_state.as_ref().map(Into::into),
             checkpoint: data.checkpoint.as_ref().map(Into::into),
             script_stack: data.script_stack.clone(),
             globals: stored_entries_from_map(&data.globals),
@@ -365,6 +379,8 @@ impl TryFrom<proto::ProtoSaveGameData> for SaveGameData {
             version: data.version,
             resume_script: data.resume_script,
             random_seed: data.random_seed,
+            rng_state: data.rng_state.map(Into::into),
+            time_seed: data.time_seed,
             checkpoint: data.checkpoint.map(TryInto::try_into).transpose()?,
             script_stack: data.script_stack,
             globals: stored_map_from_entries(data.globals)?,
@@ -380,6 +396,24 @@ impl TryFrom<proto::ProtoSaveGameData> for SaveGameData {
                 .transpose()?
                 .unwrap_or_default(),
         })
+    }
+}
+
+impl From<&crate::state::RngState> for proto::ProtoRngState {
+    fn from(state: &crate::state::RngState) -> Self {
+        Self {
+            state: state.state,
+            stream: state.stream,
+        }
+    }
+}
+
+impl From<proto::ProtoRngState> for crate::state::RngState {
+    fn from(state: proto::ProtoRngState) -> Self {
+        Self {
+            state: state.state,
+            stream: state.stream,
+        }
     }
 }
 
