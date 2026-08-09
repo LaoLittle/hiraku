@@ -3276,7 +3276,7 @@ pub fn animate_rule_transitions(
         transition.timer.tick(time.delta());
         let progress = tween_fraction(&transition.timer);
 
-        if let Some(material) = rule_materials.get_mut(&transition.material) {
+        if let Some(mut material) = rule_materials.get_mut(&transition.material) {
             material.progress = progress;
         }
 
@@ -3323,7 +3323,7 @@ pub fn animate_custom_effects(
         effect.timer.tick(time.delta());
         let progress = tween_fraction(&effect.timer);
 
-        if let Some(material) = materials.get_mut(&effect.material) {
+        if let Some(mut material) = materials.get_mut(&effect.material) {
             material.progress = progress;
             material.time = effect.timer.elapsed_secs();
         }
@@ -4564,7 +4564,7 @@ fn spawn_screen_node_entity(
                     node,
                     Text::new(text.clone()),
                     ui_text_font(ui_fonts, *size),
-                    TextLayout::new_with_justify(justify_text_from_align(align.unwrap_or(0.0))),
+                    TextLayout::new(justify_text_from_align(align.unwrap_or(0.0)), LineBreak::AnyCharacter),
                     TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
                 ))
                 .id()

@@ -5,6 +5,6 @@ Cargo.lock
 /assets
 /.vscode
 /config
-/exmaples
+/examples
 /saves
-/docs/book
+/docs
