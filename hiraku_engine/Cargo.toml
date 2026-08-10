@@ -1,0 +1,17 @@
+[package]
+name = "hiraku_engine"
+version.workspace = true
+edition.workspace = true
+description = "Embeddable visual-novel runtime and HDP resource engine"
+
+[dependencies]
+bevy.workspace = true
+futures-lite.workspace = true
+prost.workspace = true
+rand.workspace = true
+rand_pcg.workspace = true
+rhai.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+zip.workspace = true
