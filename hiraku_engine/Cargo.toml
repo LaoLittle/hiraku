@@ -13,5 +13,4 @@ rand_pcg.workspace = true
 rhai.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 zip.workspace = true

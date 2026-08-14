@@ -1,5 +1,7 @@
 use std::{env, fs, process};
 
+use bevy::{camera::RenderTarget, window::WindowRef};
+
 fn main() {
     let mut args = env::args().skip(1);
     let Some(example_name) = args.next() else {
@@ -23,11 +25,14 @@ fn main() {
         process::exit(1);
     }
 
-    hiraku::run_app(hiraku::RuntimeLaunchConfig {
+    hiraku_app::run_app(hiraku_engine::RuntimeLaunchConfig {
         asset_root: example_root,
-        settings_path: "settings.toml".to_string(),
+        settings_path: "settings.rhai".to_string(),
         default_startup_script: "startup.rhai".to_string(),
         window_title: format!("hiraku example: {example_name}"),
+        render_target: RenderTarget::Window(WindowRef::Primary),
+        camera_order: 0,
+        camera_clear_color: bevy::camera::ClearColorConfig::Default,
     });
 }
 

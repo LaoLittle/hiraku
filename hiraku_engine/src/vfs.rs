@@ -13,12 +13,14 @@ use bevy::{
     prelude::*,
 };
 use futures_lite::stream;
-use serde::Deserialize;
+use rhai::Map;
 use thiserror::Error;
 use zip::{ZipArchive, result::ZipError};
 
+use crate::data::evaluate_rhai_map;
+
 pub const DEFAULT_ASSET_ROOT: &str = "assets";
-pub const DEFAULT_SETTINGS_PATH: &str = "hdp://main.hdp/settings.toml";
+pub const DEFAULT_SETTINGS_PATH: &str = "hdp://main.hdp/settings.rhai";
 pub const DEFAULT_STARTUP_SCRIPT: &str = "hdp://main.hdp/startup.rhai";
 pub const ASSET_ROOT_PREFIX: &str = "assets:/";
 pub const RESOURCE_ROOT_PREFIX: &str = "res:/";
@@ -58,34 +60,109 @@ pub enum VfsError {
     Zip(#[from] ZipError),
     #[error("file is not valid UTF-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
-    #[error("failed to parse settings.toml: {0}")]
-    SettingsParse(#[from] toml::de::Error),
+    #[error("failed to load settings data `{path}`: {message}")]
+    SettingsData { path: String, message: String },
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct BootSection {
     startup: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct SettingsFile {
     startup: Option<String>,
-    #[serde(default)]
     fonts: FontsSettings,
     backgrounds_dir: Option<String>,
-    #[serde(alias = "sound_effects_dir", alias = "sfx_dir")]
     soundeffects_dir: Option<String>,
     bgm_dir: Option<String>,
     voice_dir: Option<String>,
     characters_dir: Option<String>,
     res_root: Option<String>,
-    #[serde(default)]
     boot: BootSection,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct FontsSettings {
     path: Option<String>,
+}
+
+fn settings_from_data(mut data: Map, path: &str) -> Result<SettingsFile, VfsError> {
+    let startup = take_data_string(&mut data, "startup", path)?;
+    let backgrounds_dir = take_data_string(&mut data, "backgrounds_dir", path)?;
+    let soundeffects_dir = take_data_string(&mut data, "soundeffects_dir", path)?;
+    let bgm_dir = take_data_string(&mut data, "bgm_dir", path)?;
+    let voice_dir = take_data_string(&mut data, "voice_dir", path)?;
+    let characters_dir = take_data_string(&mut data, "characters_dir", path)?;
+    let res_root = take_data_string(&mut data, "res_root", path)?;
+
+    let fonts = if let Some(mut fonts) = take_data_map(&mut data, "fonts", path)? {
+        let path_value = take_data_string(&mut fonts, "path", path)?;
+        ensure_empty_data_map(fonts, path, "fonts")?;
+        FontsSettings { path: path_value }
+    } else {
+        FontsSettings::default()
+    };
+
+    let boot = if let Some(mut boot) = take_data_map(&mut data, "boot", path)? {
+        let startup = take_data_string(&mut boot, "startup", path)?;
+        ensure_empty_data_map(boot, path, "boot")?;
+        BootSection { startup }
+    } else {
+        BootSection::default()
+    };
+
+    ensure_empty_data_map(data, path, "settings")?;
+    Ok(SettingsFile {
+        startup,
+        fonts,
+        backgrounds_dir,
+        soundeffects_dir,
+        bgm_dir,
+        voice_dir,
+        characters_dir,
+        res_root,
+        boot,
+    })
+}
+
+fn take_data_string(data: &mut Map, key: &str, path: &str) -> Result<Option<String>, VfsError> {
+    data.remove(key)
+        .map(|value| {
+            value
+                .try_cast::<String>()
+                .ok_or_else(|| invalid_settings_data(path, format!("`{key}` must be a string")))
+        })
+        .transpose()
+}
+
+fn take_data_map(data: &mut Map, key: &str, path: &str) -> Result<Option<Map>, VfsError> {
+    data.remove(key)
+        .map(|value| {
+            value
+                .try_cast::<Map>()
+                .ok_or_else(|| invalid_settings_data(path, format!("`{key}` must be a map")))
+        })
+        .transpose()
+}
+
+fn ensure_empty_data_map(data: Map, path: &str, section: &str) -> Result<(), VfsError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let keys = data.keys().cloned().collect::<Vec<_>>().join(", ");
+    Err(invalid_settings_data(
+        path,
+        format!("unknown {section} setting(s): {keys}"),
+    ))
+}
+
+fn invalid_settings_data(path: &str, message: String) -> VfsError {
+    VfsError::SettingsData {
+        path: path.to_string(),
+        message,
+    }
 }
 
 impl HdpVfs {
@@ -264,17 +341,30 @@ impl HdpVfs {
     fn load_settings_file_at(&self, base: Option<&str>) -> Result<SettingsFile, VfsError> {
         let settings_path = self.settings_path_for_base(base);
         let settings_text = self.read_text(&settings_path)?;
-        Ok(toml::from_str(&settings_text)?)
+        let data = evaluate_rhai_map(&settings_path, &settings_text).map_err(|error| {
+            VfsError::SettingsData {
+                path: settings_path.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        settings_from_data(data, &settings_path)
     }
 
     fn settings_path_for_base(&self, base: Option<&str>) -> String {
         if let Some(base) = base
             && let Some((archive, _)) = split_hdp_asset_path(base)
         {
-            return format!("hdp://{archive}/settings.toml");
+            return format!("hdp://{archive}/{}", self.settings_file_name());
         }
 
         self.settings_path.clone()
+    }
+
+    fn settings_file_name(&self) -> &str {
+        Path::new(&self.settings_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("settings.rhai")
     }
 
     fn load_directory_path(
@@ -772,9 +862,10 @@ fn vfs_to_reader_error(error: VfsError) -> AssetReaderError {
         VfsError::Utf8(error) => {
             AssetReaderError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         }
-        VfsError::SettingsParse(error) => {
-            AssetReaderError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        }
+        VfsError::SettingsData { path, message } => AssetReaderError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to load settings data `{path}`: {message}"),
+        )),
     }
 }
 
@@ -815,15 +906,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hiraku-vfs-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&root);
         std::fs::write(
-            root.join("settings.toml"),
-            "backgrounds_dir = \"art/backgrounds\"\nsound_effects_dir = \"audio/sfx\"\n[fonts]\npath = \"font-pack\"\n",
+            root.join("settings.rhai"),
+            "#{ backgrounds_dir: \"art/backgrounds\", soundeffects_dir: \"audio/sfx\", fonts: #{ path: \"font-pack\" } }",
         )
         .unwrap();
         std::fs::create_dir_all(root.join("font-pack")).unwrap();
         std::fs::write(root.join("font-pack/Regular.otf"), b"font").unwrap();
         std::fs::write(root.join("font-pack/readme.txt"), b"ignored").unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.toml", "startup.rhai");
+        let vfs = HdpVfs::new_with_config(&root, "settings.rhai", "startup.rhai");
         assert_eq!(
             vfs.resolve_background_path(Some("scripts/chapter.rhai"), "forest.png")
                 .unwrap(),
@@ -839,7 +930,7 @@ mod tests {
             vec!["font-pack/Regular.otf".to_string()]
         );
 
-        let _ = std::fs::remove_file(root.join("settings.toml"));
+        let _ = std::fs::remove_file(root.join("settings.rhai"));
         let _ = std::fs::remove_file(root.join("font-pack/Regular.otf"));
         let _ = std::fs::remove_file(root.join("font-pack/readme.txt"));
         let _ = std::fs::remove_dir(root.join("font-pack"));

@@ -61,6 +61,10 @@ pub enum ScreenNode {
     Button(ButtonNode),
     /// A UI image.
     Image(ScreenImageNode),
+    /// A rectangular region rendered from a UI texture atlas.
+    AtlasImage(ScreenAtlasImageNode),
+    /// A clickable rectangular region rendered from a UI texture atlas.
+    AtlasButton(ScreenAtlasButtonNode),
     /// A non-interactive horizontal progress bar.
     Bar(BarNode),
     /// A horizontal flex container.
@@ -95,15 +99,27 @@ pub struct ScreenLayout {
     /// Absolute left inset in logical pixels.
     #[serde(default)]
     pub left: Option<f32>,
+    /// Absolute left inset as a percent of the parent width.
+    #[serde(default)]
+    pub left_percent: Option<f32>,
     /// Absolute right inset in logical pixels.
     #[serde(default)]
     pub right: Option<f32>,
+    /// Absolute right inset as a percent of the parent width.
+    #[serde(default)]
+    pub right_percent: Option<f32>,
     /// Absolute top inset in logical pixels.
     #[serde(default)]
     pub top: Option<f32>,
+    /// Absolute top inset as a percent of the parent height.
+    #[serde(default)]
+    pub top_percent: Option<f32>,
     /// Absolute bottom inset in logical pixels.
     #[serde(default)]
     pub bottom: Option<f32>,
+    /// Absolute bottom inset as a percent of the parent height.
+    #[serde(default)]
+    pub bottom_percent: Option<f32>,
 }
 
 /// Static text in a Rhai screen.
@@ -205,6 +221,41 @@ pub struct ButtonNode {
 pub struct ScreenImageNode {
     /// Resolved asset path.
     pub path: String,
+    /// Size and absolute positioning.
+    #[serde(default)]
+    pub layout: ScreenLayout,
+}
+
+/// A rectangular region from a UI texture atlas.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScreenAtlasImageNode {
+    /// Resolved texture asset path.
+    pub path: String,
+    /// Source rectangle `[left, top, width, height]` in texture pixels.
+    pub rect: [f32; 4],
+    /// Size and absolute positioning.
+    #[serde(default)]
+    pub layout: ScreenLayout,
+}
+
+/// An atlas-backed button with optional hover artwork.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScreenAtlasButtonNode {
+    /// Resolved texture asset path.
+    pub path: String,
+    /// Idle source rectangle `[left, top, width, height]` in texture pixels.
+    pub rect: [f32; 4],
+    /// Hover source rectangle `[left, top, width, height]` in texture pixels.
+    #[serde(default)]
+    pub hovered_rect: Option<[f32; 4]>,
+    /// Size and absolute positioning while the pointer hovers the button.
+    #[serde(default)]
+    pub hovered_layout: Option<ScreenLayout>,
+    /// Value returned from `screen(...)` when the button is pressed.
+    pub value: StoredValue,
+    /// Whether the button can be pressed.
+    #[serde(default = "default_button_enabled")]
+    pub enabled: bool,
     /// Size and absolute positioning.
     #[serde(default)]
     pub layout: ScreenLayout,
@@ -366,6 +417,25 @@ pub struct ScreenUiButton {
 /// Marker component for the text child of a screen button.
 #[derive(Component)]
 pub struct ScreenUiButtonText;
+
+/// Runtime interaction state for an atlas-backed screen button.
+#[derive(Component, Clone)]
+pub struct ScreenUiImageButton {
+    /// Root this button belongs to; stale and pending roots are ignored.
+    pub root: Entity,
+    /// Value returned to Rhai when pressed.
+    pub value: StoredValue,
+    /// Whether press interactions should produce a value.
+    pub enabled: bool,
+    /// Idle source rectangle.
+    pub normal_rect: Rect,
+    /// Hover source rectangle, when supplied by the script.
+    pub hovered_rect: Option<Rect>,
+    /// Layout restored while the hovered artwork is displayed.
+    pub hovered_node: Option<Node>,
+    /// Layout restored while the idle artwork is displayed.
+    pub normal_node: Node,
+}
 
 fn default_screen_panel() -> bool {
     true

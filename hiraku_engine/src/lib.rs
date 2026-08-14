@@ -1,5 +1,6 @@
 mod assets;
 mod character;
+mod data;
 mod effect;
 mod proto;
 mod scene;
@@ -25,9 +26,10 @@ use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake,
     animate_character_motion_effects, animate_custom_effects, animate_dialogue_text_reveal,
     animate_rule_transitions, animate_visual_tweens, apply_animation_cancellations,
-    cleanup_stale_screen_ui, handle_choice_buttons, handle_choice_keyboard,
-    handle_runtime_menu_buttons, handle_screen_buttons, poll_pending_character_shows,
-    poll_voice_playback, process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
+    apply_live_audio_settings, cleanup_stale_screen_ui, handle_choice_buttons,
+    handle_choice_keyboard, handle_runtime_menu_buttons, handle_screen_buttons,
+    handle_screen_image_buttons, poll_pending_character_shows, poll_voice_playback,
+    process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
     tick_animation_waits, tick_pending_waits, tick_script_batches,
 };
 use script::{ScriptBootstrap, spawn_script_runtime};
@@ -108,8 +110,13 @@ impl Plugin for HirakuPlugin {
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(Startup, (setup_frontend, setup_stage, boot_runtime).chain())
             .add_systems(Update, process_script_commands)
+            .add_systems(
+                Update,
+                apply_live_audio_settings.after(process_script_commands),
+            )
             .add_systems(Update, cleanup_stale_screen_ui)
             .add_systems(Update, handle_screen_buttons)
+            .add_systems(Update, handle_screen_image_buttons)
             .add_systems(Update, handle_choice_buttons)
             .add_systems(Update, handle_runtime_menu_buttons)
             .add_systems(Update, handle_choice_keyboard)

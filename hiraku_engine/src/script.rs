@@ -32,8 +32,8 @@ use crate::{
         slot_path_in, write_save_data_to_root, write_user_settings,
     },
     ui::{
-        BarNode, ButtonNode, ContainerNode, ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec,
-        SpacerNode, TextNode,
+        BarNode, ButtonNode, ContainerNode, ScreenAtlasButtonNode, ScreenAtlasImageNode,
+        ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec, SpacerNode, TextNode,
     },
     vfs::{HdpVfs, VfsError},
 };
@@ -144,6 +144,7 @@ pub enum ScriptCommand {
     ShowCharacter {
         actor_id: String,
         character_name: String,
+        expression: Option<String>,
         position: Vec2,
         scale: f32,
         fade: Option<Duration>,
@@ -1875,6 +1876,43 @@ fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Bo
                 layout,
             }))
         }
+        "atlas_image" => {
+            let path = take_required_string(&mut node, "path")?;
+            let rect = take_screen_rect(&mut node, "rect")?;
+            let layout = take_screen_layout(&mut node)?;
+            ensure_no_unknown_options("atlas_image", &node)?;
+            Ok(ScreenNode::AtlasImage(ScreenAtlasImageNode {
+                path: host.resolve_path(&path),
+                rect,
+                layout,
+            }))
+        }
+        "atlas_button" => {
+            let path = take_required_string(&mut node, "path")?;
+            let rect = take_screen_rect(&mut node, "rect")?;
+            let hovered_rect = node
+                .remove("hovered_rect")
+                .map(|value| parse_screen_rect(value, "hovered_rect"))
+                .transpose()?;
+            let hovered_layout = take_optional_screen_layout(&mut node, "hovered_layout")?;
+            let value = node
+                .remove("value")
+                .map(dynamic_to_stored_value)
+                .transpose()?
+                .ok_or_else(|| runtime_error("atlas_button requires `value`"))?;
+            let enabled = take_optional_bool(&mut node, "enabled")?.unwrap_or(true);
+            let layout = take_screen_layout(&mut node)?;
+            ensure_no_unknown_options("atlas_button", &node)?;
+            Ok(ScreenNode::AtlasButton(ScreenAtlasButtonNode {
+                path: host.resolve_path(&path),
+                rect,
+                hovered_rect,
+                hovered_layout,
+                value,
+                enabled,
+                layout,
+            }))
+        }
         "bar" => {
             let value = take_optional_number(&mut node, "value")?.unwrap_or(0.0) as f32;
             let min = take_optional_number(&mut node, "min")?.unwrap_or(0.0) as f32;
@@ -2120,10 +2158,51 @@ fn take_screen_layout(options: &mut Map) -> Result<ScreenLayout, Box<EvalAltResu
         height_percent: take_optional_number(options, "height_percent")?.map(|value| value as f32),
         min_width: take_optional_number(options, "min_width")?.map(|value| value as f32),
         left: take_optional_number(options, "left")?.map(|value| value as f32),
+        left_percent: take_optional_number(options, "left_percent")?.map(|value| value as f32),
         right: take_optional_number(options, "right")?.map(|value| value as f32),
+        right_percent: take_optional_number(options, "right_percent")?.map(|value| value as f32),
         top: take_optional_number(options, "top")?.map(|value| value as f32),
+        top_percent: take_optional_number(options, "top_percent")?.map(|value| value as f32),
         bottom: take_optional_number(options, "bottom")?.map(|value| value as f32),
+        bottom_percent: take_optional_number(options, "bottom_percent")?.map(|value| value as f32),
     })
+}
+
+fn take_optional_screen_layout(
+    options: &mut Map,
+    key: &str,
+) -> Result<Option<ScreenLayout>, Box<EvalAltResult>> {
+    let Some(value) = options.remove(key) else {
+        return Ok(None);
+    };
+    let mut layout = value
+        .try_cast::<Map>()
+        .ok_or_else(|| runtime_error(format!("`{key}` must be a map")))?;
+    let result = take_screen_layout(&mut layout)?;
+    ensure_no_unknown_options(key, &layout)?;
+    Ok(Some(result))
+}
+
+fn take_screen_rect(options: &mut Map, key: &str) -> Result<[f32; 4], Box<EvalAltResult>> {
+    let value = options
+        .remove(key)
+        .ok_or_else(|| runtime_error(format!("missing required `{key}` rectangle")))?;
+    parse_screen_rect(value, key)
+}
+
+fn parse_screen_rect(value: Dynamic, key: &str) -> Result<[f32; 4], Box<EvalAltResult>> {
+    let values: Vec<f64> = from_dynamic(value, key)?;
+    if values.len() != 4 || values[2] <= 0.0 || values[3] <= 0.0 {
+        return Err(runtime_error(format!(
+            "`{key}` must contain [left, top, width, height] with positive dimensions"
+        )));
+    }
+    Ok([
+        values[0] as f32,
+        values[1] as f32,
+        values[2] as f32,
+        values[3] as f32,
+    ])
 }
 
 fn ensure_no_unknown_options(kind: &str, options: &Map) -> Result<(), Box<EvalAltResult>> {

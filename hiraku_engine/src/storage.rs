@@ -6,10 +6,12 @@ use std::{
 
 use bevy::prelude::Resource;
 use prost::Message;
+use rhai::Dynamic;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    data::evaluate_rhai_map,
     proto,
     state::{
         AudioSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint, SaveGameData,
@@ -20,7 +22,7 @@ use crate::{
 
 const SAVE_ROOT: &str = "saves";
 const SAVE_EXTENSION: &str = "sav";
-const USER_SETTINGS_PATH: &str = "config/hiraku.toml";
+const USER_SETTINGS_PATH: &str = "config/hiraku.rhai";
 
 #[derive(Clone, Debug, Resource, Serialize, Deserialize)]
 pub struct UserSettings {
@@ -30,6 +32,16 @@ pub struct UserSettings {
     pub voice_volume: f32,
     #[serde(default = "default_volume")]
     pub sfx_volume: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserSettingsFile {
+    #[serde(default = "default_volume_f64")]
+    bgm_volume: f64,
+    #[serde(default = "default_volume_f64")]
+    voice_volume: f64,
+    #[serde(default = "default_volume_f64")]
+    sfx_volume: f64,
 }
 
 impl Default for UserSettings {
@@ -54,10 +66,8 @@ pub struct SaveSlotSummary {
 pub enum StorageError {
     #[error("failed to access storage: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to parse toml: {0}")]
-    TomlDe(#[from] toml::de::Error),
-    #[error("failed to serialize toml: {0}")]
-    TomlSer(#[from] toml::ser::Error),
+    #[error("failed to load Rhai data: {0}")]
+    RhaiData(String),
     #[error("failed to decode save protobuf: {0}")]
     ProstDecode(#[from] prost::DecodeError),
     #[error("invalid save data: {0}")]
@@ -73,7 +83,17 @@ pub fn save_root_path() -> PathBuf {
 pub fn read_user_settings() -> Result<UserSettings, StorageError> {
     let path = workspace_base_path().join(USER_SETTINGS_PATH);
     match fs::read_to_string(path) {
-        Ok(payload) => Ok(toml::from_str(&payload)?),
+        Ok(payload) => {
+            let data = evaluate_rhai_map(USER_SETTINGS_PATH, &payload)
+                .map_err(|error| StorageError::RhaiData(error.to_string()))?;
+            let settings = rhai::serde::from_dynamic::<UserSettingsFile>(&Dynamic::from_map(data))
+                .map_err(|error| StorageError::RhaiData(error.to_string()))?;
+            Ok(UserSettings {
+                bgm_volume: settings.bgm_volume as f32,
+                voice_volume: settings.voice_volume as f32,
+                sfx_volume: settings.sfx_volume as f32,
+            })
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(UserSettings::default()),
         Err(err) => Err(StorageError::Io(err)),
     }
@@ -85,7 +105,10 @@ pub fn write_user_settings(settings: &UserSettings) -> Result<(), StorageError> 
         fs::create_dir_all(parent)?;
     }
 
-    let payload = toml::to_string_pretty(settings)?;
+    let payload = format!(
+        "#{{\n    bgm_volume: {:?},\n    voice_volume: {:?},\n    sfx_volume: {:?},\n}}\n",
+        settings.bgm_volume, settings.voice_volume, settings.sfx_volume
+    );
     fs::write(path, payload)?;
     Ok(())
 }
@@ -535,5 +558,9 @@ fn global_string(globals: &BTreeMap<String, StoredValue>, key: &str) -> Option<S
 }
 
 fn default_volume() -> f32 {
+    1.0
+}
+
+fn default_volume_f64() -> f64 {
     1.0
 }

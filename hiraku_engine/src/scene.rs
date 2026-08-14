@@ -12,7 +12,7 @@ use bevy::{
 };
 
 use crate::{
-    character::{CharacterCatalog, CharacterDefinition, load_character_catalog},
+    character::{CharacterCatalog, CharacterPartDefinition, load_character_catalog},
     effect::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
@@ -29,8 +29,9 @@ use crate::{
     },
     transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
-        BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageNode, ScreenLayout,
-        ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText, ScreenUiNode, ScreenUiRoot,
+        BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenAtlasButtonNode,
+        ScreenAtlasImageNode, ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec,
+        ScreenUiButton, ScreenUiButtonText, ScreenUiImageButton, ScreenUiNode, ScreenUiRoot,
         ScreenUiState, SpacerNode, StaleScreenRoot, TextNode,
     },
     vfs::VfsResource,
@@ -458,6 +459,12 @@ pub struct BgmFade {
 #[expect(dead_code, reason = "voice metadata is kept for future UI/debug hooks")]
 pub struct VoiceChannel {
     pub path: String,
+    pub volume: f32,
+}
+
+#[derive(Component)]
+pub struct SfxChannel {
+    pub volume: f32,
 }
 
 #[derive(Component)]
@@ -737,7 +744,7 @@ pub fn setup_frontend(
 
     if frontend.startup_script.is_empty() {
         frontend.notice =
-            Some("startup.rhai not found. Fix settings.toml before starting.".to_string());
+            Some("startup.rhai not found. Fix settings.rhai before starting.".to_string());
     }
 
     commands.insert_resource(UiFonts {
@@ -1305,7 +1312,7 @@ pub fn handle_frontend_buttons(
                         }
                         if frontend.startup_script.is_empty() {
                             frontend.notice = Some(
-                                "No startup script is configured. Check hdp://main.hdp/settings.toml."
+                                "No startup script is configured. Check hdp://main.hdp/settings.rhai."
                                     .to_string(),
                             );
                             frontend.dirty = true;
@@ -2081,6 +2088,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::ShowCharacter {
                 actor_id,
                 character_name,
+                expression,
                 position,
                 scale,
                 fade,
@@ -2091,6 +2099,14 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     warn!("character `{character_name}` not found in catalog");
                     complete_missing_animation(&mut animations, animation_id, done);
                     continue;
+                };
+                let parts = match character.parts_for_expression(expression.as_deref()) {
+                    Ok(parts) => parts,
+                    Err(message) => {
+                        warn!("{message}");
+                        complete_missing_animation(&mut animations, animation_id, done);
+                        continue;
+                    }
                 };
 
                 despawn_character_actor(
@@ -2107,7 +2123,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut pending_characters,
                     &mut animations,
                     actor_id,
-                    character,
+                    parts,
                     position,
                     scale,
                     fade,
@@ -2453,13 +2469,16 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 animation_id,
                 done,
             } => {
-                let volume = apply_volume_setting(volume, user_settings.voice_volume);
+                let playback_volume = apply_volume_setting(volume, user_settings.voice_volume);
                 finish_active_voice(&mut commands, &mut animations, &mut voice_state);
                 let voice = commands
                     .spawn((
-                        VoiceChannel { path: path.clone() },
+                        VoiceChannel {
+                            path: path.clone(),
+                            volume,
+                        },
                         AudioPlayer::new(asset_server.load(path.clone())),
-                        PlaybackSettings::ONCE.with_volume(Volume::Linear(volume)),
+                        PlaybackSettings::ONCE.with_volume(Volume::Linear(playback_volume)),
                     ))
                     .id();
                 voice_state.active = Some(ActiveVoice {
@@ -2472,10 +2491,11 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 finish_active_voice(&mut commands, &mut animations, &mut voice_state);
             }
             ScriptCommand::PlaySfx { path, volume } => {
-                let volume = apply_volume_setting(volume, user_settings.sfx_volume);
+                let playback_volume = apply_volume_setting(volume, user_settings.sfx_volume);
                 commands.spawn((
+                    SfxChannel { volume },
                     AudioPlayer::new(asset_server.load(path)),
-                    PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume)),
+                    PlaybackSettings::DESPAWN.with_volume(Volume::Linear(playback_volume)),
                 ));
             }
             ScriptCommand::SubmitBatch { mode, items } => match mode {
@@ -2566,6 +2586,36 @@ pub fn animate_bgm_fades(
     }
 }
 
+pub fn apply_live_audio_settings(
+    user_settings: Res<UserSettings>,
+    bgms: Query<(&AudioSink, &BgmChannel)>,
+    voices: Query<(&AudioSink, &VoiceChannel)>,
+    sfx: Query<(&AudioSink, &SfxChannel)>,
+) {
+    if !user_settings.is_changed() {
+        return;
+    }
+
+    for (sink, channel) in &bgms {
+        sink.set_volume(Volume::Linear(apply_volume_setting(
+            channel.volume,
+            user_settings.bgm_volume,
+        )));
+    }
+    for (sink, channel) in &voices {
+        sink.set_volume(Volume::Linear(apply_volume_setting(
+            channel.volume,
+            user_settings.voice_volume,
+        )));
+    }
+    for (sink, channel) in &sfx {
+        sink.set_volume(Volume::Linear(apply_volume_setting(
+            channel.volume,
+            user_settings.sfx_volume,
+        )));
+    }
+}
+
 pub fn handle_choice_buttons(
     mut commands: Commands,
     mut choice_state: ResMut<ChoiceState>,
@@ -2635,6 +2685,56 @@ pub fn handle_screen_buttons(
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.normal_text_color.into();
                 }
+            }
+        }
+    }
+}
+
+pub fn handle_screen_image_buttons(
+    mut screen_state: ResMut<ScreenUiState>,
+    mut interaction_query: Query<
+        (
+            &Interaction,
+            &mut ImageNode,
+            &mut Node,
+            &ScreenUiImageButton,
+        ),
+        Changed<Interaction>,
+    >,
+) {
+    for (interaction, mut image, mut node, button) in &mut interaction_query {
+        if Some(button.root) != screen_state.active_root {
+            continue;
+        }
+
+        if !button.enabled {
+            image.rect = Some(button.normal_rect);
+            *node = button.normal_node.clone();
+            continue;
+        }
+
+        match *interaction {
+            Interaction::Pressed => {
+                image.rect = button.hovered_rect.or(Some(button.normal_rect));
+                *node = button
+                    .hovered_node
+                    .clone()
+                    .unwrap_or_else(|| button.normal_node.clone());
+                let Some(done) = screen_state.waiting.take() else {
+                    continue;
+                };
+                let _ = done.send(ScriptResponse::Choice(button.value.clone()));
+            }
+            Interaction::Hovered => {
+                image.rect = button.hovered_rect.or(Some(button.normal_rect));
+                *node = button
+                    .hovered_node
+                    .clone()
+                    .unwrap_or_else(|| button.normal_node.clone());
+            }
+            Interaction::None => {
+                image.rect = Some(button.normal_rect);
+                *node = button.normal_node.clone();
             }
         }
     }
@@ -2734,6 +2834,7 @@ pub fn advance_dialogue_on_input(
         &Interaction,
         Or<(
             With<ScreenUiButton>,
+            With<ScreenUiImageButton>,
             With<RuntimeMenuButton>,
             With<ChoiceButton>,
         )>,
@@ -3590,7 +3691,7 @@ fn queue_character_show(
     pending: &mut PendingCharacterShows,
     animations: &mut AnimationState,
     actor_id: String,
-    character: CharacterDefinition,
+    parts: Vec<CharacterPartDefinition>,
     position: Vec2,
     scale: f32,
     fade: Option<std::time::Duration>,
@@ -3601,7 +3702,7 @@ fn queue_character_show(
     let mut entity_ids = Vec::new();
     let mut handles = Vec::new();
 
-    for part in &character.parts {
+    for part in &parts {
         let sprite_id = character_part_id(&actor_id, &part.id);
         let handle: Handle<Image> = asset_server.load(part.path.clone());
         let entity = commands
@@ -4539,23 +4640,39 @@ fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
     }
 
     if layout.left.is_some()
+        || layout.left_percent.is_some()
         || layout.right.is_some()
+        || layout.right_percent.is_some()
         || layout.top.is_some()
+        || layout.top_percent.is_some()
         || layout.bottom.is_some()
+        || layout.bottom_percent.is_some()
     {
         node.position_type = PositionType::Absolute;
     }
     if let Some(left) = layout.left {
         node.left = px(left);
     }
+    if let Some(left) = layout.left_percent {
+        node.left = percent(left);
+    }
     if let Some(right) = layout.right {
         node.right = px(right);
+    }
+    if let Some(right) = layout.right_percent {
+        node.right = percent(right);
     }
     if let Some(top) = layout.top {
         node.top = px(top);
     }
+    if let Some(top) = layout.top_percent {
+        node.top = percent(top);
+    }
     if let Some(bottom) = layout.bottom {
         node.bottom = px(bottom);
+    }
+    if let Some(bottom) = layout.bottom_percent {
+        node.bottom = percent(bottom);
     }
 }
 
@@ -4713,6 +4830,57 @@ fn spawn_screen_node_entity(
             apply_screen_layout(&mut node, layout);
             commands
                 .spawn((ScreenUiNode, ImageNode::new(texture), node))
+                .id()
+        }
+        ScreenNode::AtlasImage(ScreenAtlasImageNode { path, rect, layout }) => {
+            let texture = asset_server.load(path.clone());
+            image_handles.push(texture.clone());
+            let mut node = Node::default();
+            apply_screen_layout(&mut node, layout);
+            commands
+                .spawn((
+                    ScreenUiNode,
+                    ImageNode::new(texture).with_rect(screen_rect(*rect)),
+                    node,
+                ))
+                .id()
+        }
+        ScreenNode::AtlasButton(ScreenAtlasButtonNode {
+            path,
+            rect,
+            hovered_rect,
+            hovered_layout,
+            value,
+            enabled,
+            layout,
+        }) => {
+            let texture = asset_server.load(path.clone());
+            image_handles.push(texture.clone());
+            let mut node = Node::default();
+            apply_screen_layout(&mut node, layout);
+            let normal_node = node.clone();
+            let hovered_node = hovered_layout.as_ref().map(|layout| {
+                let mut node = Node::default();
+                apply_screen_layout(&mut node, layout);
+                node
+            });
+            let normal_rect = screen_rect(*rect);
+            commands
+                .spawn((
+                    ScreenUiNode,
+                    Button,
+                    ImageNode::new(texture).with_rect(normal_rect),
+                    node,
+                    ScreenUiImageButton {
+                        root,
+                        value: value.clone(),
+                        enabled: *enabled,
+                        normal_rect,
+                        hovered_rect: hovered_rect.map(|rect| screen_rect(rect)),
+                        hovered_node,
+                        normal_node,
+                    },
+                ))
                 .id()
         }
         ScreenNode::Bar(BarNode {
@@ -4885,6 +5053,13 @@ fn spawn_screen_node_entity(
             ))
             .id(),
     }
+}
+
+fn screen_rect(rect: [f32; 4]) -> Rect {
+    Rect::from_corners(
+        Vec2::new(rect[0], rect[1]),
+        Vec2::new(rect[0] + rect[2], rect[1] + rect[3]),
+    )
 }
 
 fn justify_from_align(value: f32) -> JustifyContent {

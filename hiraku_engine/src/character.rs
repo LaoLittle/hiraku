@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
 
 use bevy::{math::Vec2, prelude::Resource};
-use serde::Deserialize;
+use rhai::Dynamic;
+use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::vfs::{HdpVfs, VfsError};
+use crate::{
+    data::evaluate_rhai_map,
+    vfs::{HdpVfs, VfsError},
+};
 
 #[derive(Clone, Debug, Default, Resource)]
 pub struct CharacterCatalog {
@@ -18,6 +22,8 @@ pub struct CharacterDefinition {
     pub directory: String,
     pub config_path: String,
     pub parts: Vec<CharacterPartDefinition>,
+    pub expressions: BTreeMap<String, Vec<String>>,
+    pub default_expression: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -28,34 +34,50 @@ pub struct CharacterPartDefinition {
     pub layer: f32,
 }
 
+impl CharacterDefinition {
+    pub fn parts_for_expression(
+        &self,
+        expression: Option<&str>,
+    ) -> Result<Vec<CharacterPartDefinition>, String> {
+        let expression = expression.or(self.default_expression.as_deref());
+        let Some(expression) = expression else {
+            return Ok(self.parts.clone());
+        };
+        let part_ids = self.expressions.get(expression).ok_or_else(|| {
+            format!(
+                "character `{}` has no expression named `{expression}`",
+                self.name
+            )
+        })?;
+
+        Ok(self
+            .parts
+            .iter()
+            .filter(|part| part_ids.contains(&part.id))
+            .cloned()
+            .collect())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CharacterCatalogError {
-    #[error("failed to read character catalog setting: {0}")]
-    Settings(#[from] VfsError),
-    #[error("failed to parse character catalog `{path}`: {source}")]
-    CatalogToml {
-        path: String,
-        source: toml::de::Error,
-    },
-    #[error("failed to parse character config `{path}`: {source}")]
-    CharacterToml {
-        path: String,
-        source: toml::de::Error,
-    },
+    #[error("failed to read character data: {0}")]
+    Read(#[from] VfsError),
+    #[error("failed to load character data `{path}`: {message}")]
+    Data { path: String, message: String },
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct CharacterCatalogFile {
-    #[serde(default, alias = "characters")]
-    character: Vec<CharacterCatalogEntryFile>,
+    #[serde(default)]
+    characters: Vec<CharacterCatalogEntryFile>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CharacterCatalogEntryFile {
     name: String,
-    #[serde(alias = "directory", alias = "dir")]
     dir: String,
-    #[serde(default, alias = "config_path", alias = "path")]
+    #[serde(default)]
     config: Option<String>,
 }
 
@@ -63,15 +85,19 @@ struct CharacterCatalogEntryFile {
 struct CharacterConfigFile {
     #[serde(default)]
     parts: BTreeMap<String, CharacterPartFile>,
+    #[serde(default)]
+    expressions: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    default_expression: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CharacterPartFile {
     path: String,
     #[serde(default)]
-    offset: Option<[f32; 2]>,
+    offset: Option<[f64; 2]>,
     #[serde(default)]
-    layer: Option<f32>,
+    layer: Option<f64>,
 }
 
 pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, CharacterCatalogError> {
@@ -81,7 +107,7 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
 
     let catalog_path = vfs.resolve_path(
         Some(vfs.settings_path()),
-        &format!("{directory}/characters.toml"),
+        &format!("{directory}/characters.rhai"),
     );
     let catalog_text = match vfs.read_text(&catalog_path) {
         Ok(catalog_text) => catalog_text,
@@ -91,33 +117,20 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
                 characters: BTreeMap::new(),
             });
         }
-        Err(err) => return Err(CharacterCatalogError::Settings(err)),
+        Err(error) => return Err(error.into()),
     };
-
-    let file = toml::from_str::<CharacterCatalogFile>(&catalog_text).map_err(|source| {
-        CharacterCatalogError::CatalogToml {
-            path: catalog_path.clone(),
-            source,
-        }
-    })?;
+    let file: CharacterCatalogFile = parse_rhai_data(&catalog_path, &catalog_text)?;
 
     let mut characters = BTreeMap::new();
-    for entry in file.character {
+    for entry in file.characters {
         let character_directory = vfs.resolve_path(Some(&catalog_path), &entry.dir);
-        let config_relative = entry.config.unwrap_or_else(|| "character.toml".to_string());
+        let config_relative = entry.config.unwrap_or_else(|| "character.rhai".to_string());
         let config_path = vfs.resolve_path(
             Some(&format!("{character_directory}/__dir__")),
             &config_relative,
         );
-        let config_text = vfs
-            .read_text(&config_path)
-            .map_err(CharacterCatalogError::Settings)?;
-        let config = toml::from_str::<CharacterConfigFile>(&config_text).map_err(|source| {
-            CharacterCatalogError::CharacterToml {
-                path: config_path.clone(),
-                source,
-            }
-        })?;
+        let config_text = vfs.read_text(&config_path)?;
+        let config: CharacterConfigFile = parse_rhai_data(&config_path, &config_text)?;
 
         let mut parts = config
             .parts
@@ -127,9 +140,9 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
                 path: vfs.resolve_path(Some(&config_path), &part.path),
                 offset: part
                     .offset
-                    .map(|offset| Vec2::new(offset[0], offset[1]))
+                    .map(|offset| Vec2::new(offset[0] as f32, offset[1] as f32))
                     .unwrap_or(Vec2::ZERO),
-                layer: part.layer.unwrap_or(0.0),
+                layer: part.layer.unwrap_or(0.0) as f32,
             })
             .collect::<Vec<_>>();
         parts.sort_by(|left, right| {
@@ -138,6 +151,12 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        validate_expressions(
+            &config.expressions,
+            config.default_expression.as_deref(),
+            &parts,
+            &config_path,
+        )?;
 
         characters.insert(
             entry.name.clone(),
@@ -146,6 +165,8 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
                 directory: character_directory,
                 config_path,
                 parts,
+                expressions: config.expressions,
+                default_expression: config.default_expression,
             },
         );
     }
@@ -154,4 +175,91 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
         directory: Some(directory),
         characters,
     })
+}
+
+fn validate_expressions(
+    expressions: &BTreeMap<String, Vec<String>>,
+    default_expression: Option<&str>,
+    parts: &[CharacterPartDefinition],
+    path: &str,
+) -> Result<(), CharacterCatalogError> {
+    if let Some(default_expression) = default_expression
+        && !expressions.contains_key(default_expression)
+    {
+        return Err(CharacterCatalogError::Data {
+            path: path.to_string(),
+            message: format!("default_expression `{default_expression}` is not defined"),
+        });
+    }
+
+    for (expression, part_ids) in expressions {
+        for part_id in part_ids {
+            if !parts.iter().any(|part| &part.id == part_id) {
+                return Err(CharacterCatalogError::Data {
+                    path: path.to_string(),
+                    message: format!(
+                        "expression `{expression}` references missing part `{part_id}`"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_rhai_data<T>(path: &str, source: &str) -> Result<T, CharacterCatalogError>
+where
+    T: DeserializeOwned,
+{
+    let data = evaluate_rhai_map(path, source).map_err(|error| CharacterCatalogError::Data {
+        path: path.to_string(),
+        message: error.to_string(),
+    })?;
+    rhai::serde::from_dynamic(&Dynamic::from_map(data)).map_err(|error| {
+        CharacterCatalogError::Data {
+            path: path.to_string(),
+            message: error.to_string(),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_rhai_character_catalog_and_parts() {
+        let root =
+            std::env::temp_dir().join(format!("hiraku-character-test-{}", std::process::id()));
+        let characters = root.join("characters/alice");
+        std::fs::create_dir_all(&characters).unwrap();
+        std::fs::write(
+            root.join("settings.rhai"),
+            "#{ characters_dir: \"characters\" }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("characters/characters.rhai"),
+            "#{ characters: [#{ name: \"alice\", dir: \"alice\" }] }",
+        )
+        .unwrap();
+        std::fs::write(
+            characters.join("character.rhai"),
+            "#{ parts: #{ body: #{ path: \"body.png\", offset: [12.5, -3.0], layer: -1.0 }, face: #{ path: \"face.png\", layer: 2.0 } }, expressions: #{ happy: [\"body\", \"face\"] }, default_expression: \"happy\" }",
+        )
+        .unwrap();
+
+        let vfs = HdpVfs::new_with_config(&root, "settings.rhai", "startup.rhai");
+        let catalog = load_character_catalog(&vfs).unwrap();
+        let alice = &catalog.characters["alice"];
+
+        assert_eq!(alice.parts.len(), 2);
+        assert_eq!(alice.parts[0].id, "body");
+        assert_eq!(alice.parts[0].offset, Vec2::new(12.5, -3.0));
+        assert_eq!(alice.parts[1].id, "face");
+        assert_eq!(alice.parts_for_expression(Some("happy")).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

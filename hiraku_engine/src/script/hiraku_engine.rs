@@ -382,6 +382,7 @@ pub mod HirakuEngine {
             y,
             scale,
             None,
+            None,
         )
     }
 
@@ -402,11 +403,12 @@ pub mod HirakuEngine {
             x,
             y,
             scale,
+            None,
             Some(ms),
         )
     }
 
-    #[rhai_fn(name = "show_character", return_raw)]
+    #[rhai_fn(name = "show_character_as", return_raw)]
     pub fn show_character_as(
         ctx: NativeCallContext,
         actor_id: ImmutableString,
@@ -415,10 +417,10 @@ pub mod HirakuEngine {
         y: FLOAT,
         scale: FLOAT,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
-        show_character_impl(ctx, actor_id, name, x, y, scale, None)
+        show_character_impl(ctx, actor_id, name, x, y, scale, None, None)
     }
 
-    #[rhai_fn(name = "show_character", return_raw)]
+    #[rhai_fn(name = "show_character_as", return_raw)]
     pub fn show_character_as_fade(
         ctx: NativeCallContext,
         actor_id: ImmutableString,
@@ -428,7 +430,79 @@ pub mod HirakuEngine {
         scale: FLOAT,
         ms: i64,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
-        show_character_impl(ctx, actor_id, name, x, y, scale, Some(ms))
+        show_character_impl(ctx, actor_id, name, x, y, scale, None, Some(ms))
+    }
+
+    #[rhai_fn(name = "show_character", return_raw)]
+    pub fn show_character_expression(
+        ctx: NativeCallContext,
+        name: ImmutableString,
+        expression: ImmutableString,
+        x: FLOAT,
+        y: FLOAT,
+        scale: FLOAT,
+    ) -> Result<Dynamic, Box<EvalAltResult>> {
+        let actor_id = name.to_string();
+        show_character_impl(
+            ctx,
+            actor_id.into(),
+            name,
+            x,
+            y,
+            scale,
+            Some(expression),
+            None,
+        )
+    }
+
+    #[rhai_fn(name = "show_character", return_raw)]
+    pub fn show_character_expression_fade(
+        ctx: NativeCallContext,
+        name: ImmutableString,
+        expression: ImmutableString,
+        x: FLOAT,
+        y: FLOAT,
+        scale: FLOAT,
+        ms: i64,
+    ) -> Result<Dynamic, Box<EvalAltResult>> {
+        let actor_id = name.to_string();
+        show_character_impl(
+            ctx,
+            actor_id.into(),
+            name,
+            x,
+            y,
+            scale,
+            Some(expression),
+            Some(ms),
+        )
+    }
+
+    #[rhai_fn(name = "show_character_as", return_raw)]
+    pub fn show_character_as_expression(
+        ctx: NativeCallContext,
+        actor_id: ImmutableString,
+        name: ImmutableString,
+        expression: ImmutableString,
+        x: FLOAT,
+        y: FLOAT,
+        scale: FLOAT,
+    ) -> Result<Dynamic, Box<EvalAltResult>> {
+        show_character_impl(ctx, actor_id, name, x, y, scale, Some(expression), None)
+    }
+
+    #[rhai_fn(name = "show_character_as", return_raw)]
+    pub fn show_character_as_expression_fade(
+        ctx: NativeCallContext,
+        actor_id: ImmutableString,
+        name: ImmutableString,
+        expression: ImmutableString,
+        x: FLOAT,
+        y: FLOAT,
+        scale: FLOAT,
+        ms: i64,
+    ) -> Result<Dynamic, Box<EvalAltResult>> {
+        show_character_impl(ctx, actor_id, name, x, y, scale, Some(expression), Some(ms))
     }
 
     fn show_character_impl(
@@ -438,6 +512,7 @@ pub mod HirakuEngine {
         x: FLOAT,
         y: FLOAT,
         scale: FLOAT,
+        expression: Option<ImmutableString>,
         ms: Option<i64>,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let host = host(&ctx)?;
@@ -447,6 +522,7 @@ pub mod HirakuEngine {
             ScriptCommand::ShowCharacter {
                 actor_id: actor_id.to_string(),
                 character_name: character_name.to_string(),
+                expression: expression.map(Into::into),
                 position: Vec2::new(x as f32, y as f32),
                 scale,
                 fade,

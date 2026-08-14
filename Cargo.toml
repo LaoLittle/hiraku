@@ -1,28 +1,26 @@
-[package]
-name = "hiraku"
+[workspace]
+resolver = "2"
+members = ["hiraku_engine", "hiraku_app"]
+exclude = ["hiraku_app/examples/atri_3d_overlay_staticlib"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+futures-lite = "2.6.1"
+prost = "0.14.4"
 rand = "0.10.2"
 rand_pcg = "0.10.2"
-prost = "0.14.4"
-toml = "1.1.4"
+rhai = { version = "1.25.1", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
-futures-lite = "2.6.1"
+toml = "1.1.4"
 zip = "8.6.0"
 
-[dependencies.bevy]
+[workspace.dependencies.bevy]
 version = "0.19"
-features = ["webp", "jpeg", "wav", "mp3", "flac"]
-
-[dependencies.rhai]
-version = "1.25.1"
-features = ["serde"]
-
-[dependencies.serde]
-version = "1.0.229"
-features = ["derive"]
+features = ["webp", "jpeg", "audio-all-formats"]
 
 [profile.app-release]
 inherits = "release"
