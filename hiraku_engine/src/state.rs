@@ -66,6 +66,8 @@ pub struct SpriteSnapshot {
     pub layer: f32,
     pub scale: f32,
     pub alpha: f32,
+    #[serde(default)]
+    pub rect: Option<[f32; 4]>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -8,6 +8,7 @@ use bevy::{
     audio::{AudioSink, AudioSinkPlayback, Volume},
     ecs::system::SystemParam,
     log::warn,
+    math::Rect,
     prelude::*,
 };
 
@@ -655,7 +656,7 @@ pub fn setup_stage(
             },
             BackgroundColor(ui_style.dialogue_bg),
             BorderColor::all(ui_style.dialogue_border),
-            Visibility::Inherited,
+            Visibility::Hidden,
         ))
         .id();
 
@@ -1996,9 +1997,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 shared_state.0.lock().unwrap().text_effect =
                     text_effect_snapshot(&dialogue_state.effect);
             }
-            ScriptCommand::ApplyUserSettings(settings) => {
-                *user_settings = settings;
-            }
+            ScriptCommand::ApplyUserSettings(settings) => *user_settings = settings,
             ScriptCommand::ApplyUiStyle(style_patch) => {
                 apply_ui_style_patch(&mut ui_style, style_patch);
                 refresh_dialogue_ui_style(
@@ -2088,7 +2087,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::ShowCharacter {
                 actor_id,
                 character_name,
-                expression,
+                expressions,
                 position,
                 scale,
                 fade,
@@ -2100,7 +2099,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     complete_missing_animation(&mut animations, animation_id, done);
                     continue;
                 };
-                let parts = match character.parts_for_expression(expression.as_deref()) {
+                let parts = match character.parts_for_expressions(&expressions) {
                     Ok(parts) => parts,
                     Err(message) => {
                         warn!("{message}");
@@ -2588,27 +2587,27 @@ pub fn animate_bgm_fades(
 
 pub fn apply_live_audio_settings(
     user_settings: Res<UserSettings>,
-    bgms: Query<(&AudioSink, &BgmChannel)>,
-    voices: Query<(&AudioSink, &VoiceChannel)>,
-    sfx: Query<(&AudioSink, &SfxChannel)>,
+    mut bgms: Query<(&mut AudioSink, &BgmChannel)>,
+    mut voices: Query<(&mut AudioSink, &VoiceChannel)>,
+    mut sfx: Query<(&mut AudioSink, &SfxChannel)>,
 ) {
     if !user_settings.is_changed() {
         return;
     }
 
-    for (sink, channel) in &bgms {
+    for (mut sink, channel) in &mut bgms {
         sink.set_volume(Volume::Linear(apply_volume_setting(
             channel.volume,
             user_settings.bgm_volume,
         )));
     }
-    for (sink, channel) in &voices {
+    for (mut sink, channel) in &mut voices {
         sink.set_volume(Volume::Linear(apply_volume_setting(
             channel.volume,
             user_settings.voice_volume,
         )));
     }
-    for (sink, channel) in &sfx {
+    for (mut sink, channel) in &mut sfx {
         sink.set_volume(Volume::Linear(apply_volume_setting(
             channel.volume,
             user_settings.sfx_volume,
@@ -3660,6 +3659,7 @@ pub fn sync_scene_snapshot(
             layer: transform.translation.z - STAGE_Z_SPRITE,
             scale: transform.scale.x,
             alpha: sprite.color.alpha(),
+            rect: sprite.rect.map(rect_to_array),
         })
         .collect::<Vec<_>>();
     sprite_snapshots.sort_by(|left, right| left.id.cmp(&right.id));
@@ -3711,7 +3711,7 @@ fn queue_character_show(
                     id: sprite_id.clone(),
                     path: part.path.clone(),
                 },
-                Sprite::from_image(handle.clone()),
+                character_part_sprite(handle.clone(), part),
                 Visibility::Hidden,
                 Transform {
                     translation: Vec3::new(
@@ -3975,6 +3975,20 @@ fn character_part_prefix(actor_id: &str) -> String {
 
 fn character_part_id(actor_id: &str, part_id: &str) -> String {
     format!("{}{}", character_part_prefix(actor_id), part_id)
+}
+
+fn character_part_sprite(image: Handle<Image>, part: &CharacterPartDefinition) -> Sprite {
+    let mut sprite = Sprite::from_image(image);
+    sprite.rect = part.rect.map(array_to_rect);
+    sprite
+}
+
+fn array_to_rect(rect: [f32; 4]) -> Rect {
+    Rect::from_corners(Vec2::new(rect[0], rect[1]), Vec2::new(rect[2], rect[3]))
+}
+
+fn rect_to_array(rect: Rect) -> [f32; 4] {
+    [rect.min.x, rect.min.y, rect.max.x, rect.max.y]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5548,6 +5562,7 @@ fn restore_scene_snapshot(
     for sprite in &snapshot.sprites {
         let mut entity_sprite = Sprite::from_image(asset_server.load(sprite.path.clone()));
         entity_sprite.color.set_alpha(sprite.alpha);
+        entity_sprite.rect = sprite.rect.map(array_to_rect);
         let entity = commands
             .spawn((
                 SpriteActor {

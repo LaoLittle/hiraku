@@ -435,6 +435,7 @@ impl From<&SpriteSnapshot> for proto::SpriteSnapshot {
             layer: snapshot.layer,
             scale: snapshot.scale,
             alpha: snapshot.alpha,
+            rect: snapshot.rect.map(Vec::from).unwrap_or_default(),
         }
     }
 }
@@ -449,6 +450,14 @@ impl From<proto::SpriteSnapshot> for SpriteSnapshot {
             layer: snapshot.layer,
             scale: snapshot.scale,
             alpha: snapshot.alpha,
+            rect: (snapshot.rect.len() == 4).then(|| {
+                [
+                    snapshot.rect[0],
+                    snapshot.rect[1],
+                    snapshot.rect[2],
+                    snapshot.rect[3],
+                ]
+            }),
         }
     }
 }

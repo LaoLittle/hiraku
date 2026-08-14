@@ -152,6 +152,8 @@ pub struct SpriteSnapshot {
     pub scale: f32,
     #[prost(float, tag = "7")]
     pub alpha: f32,
+    #[prost(float, repeated, tag = "8")]
+    pub rect: Vec<f32>,
 }
 
 #[derive(Clone, PartialEq, Message)]

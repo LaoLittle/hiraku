@@ -42,6 +42,8 @@ mod hiraku_engine;
 mod rng;
 mod time;
 
+const PRELUDE_SOURCE: &str = include_str!("script/prelude.rhai");
+
 const JUMP_SCRIPT_SIGNAL: &str = "__hiraku_jump_script__::";
 const CALL_SCRIPT_SIGNAL: &str = "__hiraku_call_script__::";
 const SAVE_SCRIPT_SIGNAL: &str = "__hiraku_save_script__::";
@@ -144,7 +146,7 @@ pub enum ScriptCommand {
     ShowCharacter {
         actor_id: String,
         character_name: String,
-        expression: Option<String>,
+        expressions: Vec<String>,
         position: Vec2,
         scale: f32,
         fade: Option<Duration>,
@@ -594,6 +596,7 @@ struct ScriptHost {
     scene_state: Arc<Mutex<SceneSnapshot>>,
     next_animation_id: Arc<Mutex<u64>>,
     batch_registry: Arc<Mutex<BatchRegistry>>,
+    character_expressions: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     inline_dialogue_control: Arc<Mutex<InlineDialogueControl>>,
     save_root: PathBuf,
 }
@@ -828,6 +831,22 @@ impl ScriptHost {
 
     fn is_batch_mode(&self) -> bool {
         self.batch_registry.lock().unwrap().active.is_some()
+    }
+
+    fn character_expressions(&self, actor_id: &str) -> Vec<String> {
+        self.character_expressions
+            .lock()
+            .unwrap()
+            .get(actor_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set_character_expressions(&self, actor_id: String, expressions: Vec<String>) {
+        self.character_expressions
+            .lock()
+            .unwrap()
+            .insert(actor_id, expressions);
     }
 
     fn begin_inline_dialogue(&self) {
@@ -1226,6 +1245,7 @@ pub fn spawn_script_runtime(
     let pending_scope_restore = Arc::new(Mutex::new(None));
     let next_animation_id = Arc::new(Mutex::new(0));
     let batch_registry = Arc::new(Mutex::new(BatchRegistry::default()));
+    let character_expressions = Arc::new(Mutex::new(BTreeMap::new()));
     let inline_dialogue_control = Arc::new(Mutex::new(InlineDialogueControl::default()));
     let startup_scope = bootstrap.scope.clone();
 
@@ -1248,6 +1268,7 @@ pub fn spawn_script_runtime(
         scene_state,
         next_animation_id,
         batch_registry,
+        character_expressions,
         inline_dialogue_control,
         save_root: save_root_path(),
     };
@@ -1325,6 +1346,7 @@ fn run_script_loop(
             }
         };
 
+        let source = format!("{PRELUDE_SOURCE}\n{source}");
         match engine.eval_with_scope::<Dynamic>(&mut scope, &source) {
             Ok(_) => return,
             Err(err) => {
@@ -1430,6 +1452,16 @@ fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
 
 fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
     engine.set_default_tag(Dynamic::from(host.clone()));
+    engine
+        .register_custom_operator("@", 160)
+        .expect("@ must remain available for the character dialogue operator");
+    engine.register_type_with_name::<hiraku_engine::CharacterFlow>("CharacterFlow");
+    engine.register_fn("char", hiraku_engine::char);
+    engine.register_fn("e", hiraku_engine::e);
+    engine.register_fn("at", hiraku_engine::at);
+    engine.register_fn("reset", hiraku_engine::reset);
+    engine.register_fn("say", hiraku_engine::say);
+    engine.register_fn("@", hiraku_engine::say);
     engine.register_global_module(exported_module!(hiraku_engine::HirakuEngine).into());
     engine.register_global_module(exported_module!(rng::RNG).into());
     engine.register_global_module(exported_module!(time::Time).into());
@@ -1474,6 +1506,34 @@ mod tests {
         let mut restored = rng_from_state_snapshot(&state);
 
         assert_eq!(rng.random::<u64>(), restored.random::<u64>());
+    }
+
+    #[test]
+    fn embedded_prelude_compiles() {
+        let mut engine = RhaiEngine::new();
+        engine.register_custom_operator("@", 160).unwrap();
+        engine.register_fn("@", |left: INT, right: INT| left + right);
+        engine.compile(PRELUDE_SOURCE).unwrap();
+        assert_eq!(engine.eval_expression::<INT>("2 @ 3").unwrap(), 5);
+    }
+
+    #[test]
+    fn fluent_character_syntax_compiles() {
+        let mut engine = RhaiEngine::new();
+        engine.register_custom_operator("@", 160).unwrap();
+        engine.register_type_with_name::<hiraku_engine::CharacterFlow>("CharacterFlow");
+        engine.register_fn("char", hiraku_engine::char);
+        engine.register_fn("e", hiraku_engine::e);
+        engine.register_fn("at", hiraku_engine::at);
+        engine.register_fn("reset", hiraku_engine::reset);
+        engine.register_fn("say", hiraku_engine::say);
+        engine.register_fn("@", hiraku_engine::say);
+
+        engine
+            .compile(
+                "char(\"alice\").e(\"open_mouth\").e(\"happy_face\").at(\"left\") @ \"Hello\";",
+            )
+            .unwrap();
     }
 }
 

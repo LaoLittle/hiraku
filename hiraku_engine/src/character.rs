@@ -22,7 +22,8 @@ pub struct CharacterDefinition {
     pub directory: String,
     pub config_path: String,
     pub parts: Vec<CharacterPartDefinition>,
-    pub expressions: BTreeMap<String, Vec<String>>,
+    pub expressions: BTreeMap<String, CharacterExpressionDefinition>,
+    pub basis: Vec<String>,
     pub default_expression: Option<String>,
 }
 
@@ -32,30 +33,77 @@ pub struct CharacterPartDefinition {
     pub path: String,
     pub offset: Vec2,
     pub layer: f32,
+    pub rect: Option<[f32; 4]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CharacterExpressionDefinition {
+    pub slot: Option<String>,
+    pub parts: Vec<String>,
+    pub expressions: Vec<String>,
 }
 
 impl CharacterDefinition {
-    pub fn parts_for_expression(
+    pub fn parts_for_expressions(
         &self,
-        expression: Option<&str>,
+        expressions: &[String],
     ) -> Result<Vec<CharacterPartDefinition>, String> {
-        let expression = expression.or(self.default_expression.as_deref());
-        let Some(expression) = expression else {
-            return Ok(self.parts.clone());
+        let mut selected = BTreeMap::<String, Vec<String>>::new();
+        let basis = if self.basis.is_empty() {
+            self.default_expression.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.basis.clone()
         };
-        let part_ids = self.expressions.get(expression).ok_or_else(|| {
-            format!(
-                "character `{}` has no expression named `{expression}`",
-                self.name
-            )
-        })?;
+        if basis.is_empty() && expressions.is_empty() {
+            return Ok(self.parts.clone());
+        }
 
+        for expression in basis.iter().chain(expressions) {
+            self.apply_expression(expression, &mut selected, &mut Vec::new())?;
+        }
+
+        let selected_ids = selected
+            .into_values()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
         Ok(self
             .parts
             .iter()
-            .filter(|part| part_ids.contains(&part.id))
+            .filter(|part| selected_ids.contains(&part.id))
             .cloned()
             .collect())
+    }
+
+    fn apply_expression(
+        &self,
+        name: &str,
+        selected: &mut BTreeMap<String, Vec<String>>,
+        resolving: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if resolving.iter().any(|expression| expression == name) {
+            return Err(format!(
+                "character `{}` has a circular expression reference at `{name}`",
+                self.name
+            ));
+        }
+        let expression = self
+            .expressions
+            .get(name)
+            .ok_or_else(|| format!("character `{}` has no expression named `{name}`", self.name))?;
+        resolving.push(name.to_string());
+        for nested in &expression.expressions {
+            self.apply_expression(nested, selected, resolving)?;
+        }
+        resolving.pop();
+
+        if !expression.parts.is_empty() {
+            let key = expression
+                .slot
+                .clone()
+                .unwrap_or_else(|| format!("expression:{name}"));
+            selected.insert(key, expression.parts.clone());
+        }
+        Ok(())
     }
 }
 
@@ -86,7 +134,9 @@ struct CharacterConfigFile {
     #[serde(default)]
     parts: BTreeMap<String, CharacterPartFile>,
     #[serde(default)]
-    expressions: BTreeMap<String, Vec<String>>,
+    expressions: BTreeMap<String, CharacterExpressionFile>,
+    #[serde(default)]
+    basis: Vec<String>,
     #[serde(default)]
     default_expression: Option<String>,
 }
@@ -98,6 +148,22 @@ struct CharacterPartFile {
     offset: Option<[f64; 2]>,
     #[serde(default)]
     layer: Option<f64>,
+    #[serde(default)]
+    rect: Option<[f64; 4]>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CharacterExpressionFile {
+    Parts(Vec<String>),
+    Definition {
+        #[serde(default)]
+        slot: Option<String>,
+        #[serde(default)]
+        parts: Vec<String>,
+        #[serde(default)]
+        expressions: Vec<String>,
+    },
 }
 
 pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, CharacterCatalogError> {
@@ -143,6 +209,11 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
                     .map(|offset| Vec2::new(offset[0] as f32, offset[1] as f32))
                     .unwrap_or(Vec2::ZERO),
                 layer: part.layer.unwrap_or(0.0) as f32,
+                rect: part.rect.map(|rect| {
+                    let left = rect[0] as f32;
+                    let top = rect[1] as f32;
+                    [left, top, left + rect[2] as f32, top + rect[3] as f32]
+                }),
             })
             .collect::<Vec<_>>();
         parts.sort_by(|left, right| {
@@ -151,8 +222,32 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        let expressions = config
+            .expressions
+            .into_iter()
+            .map(|(name, expression)| {
+                let expression = match expression {
+                    CharacterExpressionFile::Parts(parts) => CharacterExpressionDefinition {
+                        slot: None,
+                        parts,
+                        expressions: Vec::new(),
+                    },
+                    CharacterExpressionFile::Definition {
+                        slot,
+                        parts,
+                        expressions,
+                    } => CharacterExpressionDefinition {
+                        slot,
+                        parts,
+                        expressions,
+                    },
+                };
+                (name, expression)
+            })
+            .collect::<BTreeMap<_, _>>();
         validate_expressions(
-            &config.expressions,
+            &expressions,
+            &config.basis,
             config.default_expression.as_deref(),
             &parts,
             &config_path,
@@ -165,7 +260,8 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
                 directory: character_directory,
                 config_path,
                 parts,
-                expressions: config.expressions,
+                expressions,
+                basis: config.basis,
                 default_expression: config.default_expression,
             },
         );
@@ -178,7 +274,8 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
 }
 
 fn validate_expressions(
-    expressions: &BTreeMap<String, Vec<String>>,
+    expressions: &BTreeMap<String, CharacterExpressionDefinition>,
+    basis: &[String],
     default_expression: Option<&str>,
     parts: &[CharacterPartDefinition],
     path: &str,
@@ -192,13 +289,32 @@ fn validate_expressions(
         });
     }
 
-    for (expression, part_ids) in expressions {
-        for part_id in part_ids {
+    for expression in basis {
+        if !expressions.contains_key(expression) {
+            return Err(CharacterCatalogError::Data {
+                path: path.to_string(),
+                message: format!("basis references undefined expression `{expression}`"),
+            });
+        }
+    }
+
+    for (expression, definition) in expressions {
+        for part_id in &definition.parts {
             if !parts.iter().any(|part| &part.id == part_id) {
                 return Err(CharacterCatalogError::Data {
                     path: path.to_string(),
                     message: format!(
                         "expression `{expression}` references missing part `{part_id}`"
+                    ),
+                });
+            }
+        }
+        for nested in &definition.expressions {
+            if !expressions.contains_key(nested) {
+                return Err(CharacterCatalogError::Data {
+                    path: path.to_string(),
+                    message: format!(
+                        "expression `{expression}` references undefined expression `{nested}`"
                     ),
                 });
             }
@@ -258,8 +374,89 @@ mod tests {
         assert_eq!(alice.parts[0].id, "body");
         assert_eq!(alice.parts[0].offset, Vec2::new(12.5, -3.0));
         assert_eq!(alice.parts[1].id, "face");
-        assert_eq!(alice.parts_for_expression(Some("happy")).unwrap().len(), 2);
+        assert_eq!(
+            alice
+                .parts_for_expressions(&["happy".to_string()])
+                .unwrap()
+                .len(),
+            2
+        );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn slot_expressions_preserve_the_other_basis_slots() {
+        let definition = CharacterDefinition {
+            name: "alice".to_string(),
+            directory: String::new(),
+            config_path: String::new(),
+            parts: [
+                "body",
+                "mouth_closed",
+                "mouth_open",
+                "face_neutral",
+                "face_happy",
+            ]
+            .into_iter()
+            .map(|id| CharacterPartDefinition {
+                id: id.to_string(),
+                path: format!("{id}.png"),
+                offset: Vec2::ZERO,
+                layer: 0.0,
+                rect: None,
+            })
+            .collect(),
+            expressions: BTreeMap::from([
+                (
+                    "basis".to_string(),
+                    CharacterExpressionDefinition {
+                        slot: None,
+                        parts: vec!["body".to_string()],
+                        expressions: vec!["mouth_closed".to_string(), "face_neutral".to_string()],
+                    },
+                ),
+                (
+                    "mouth_closed".to_string(),
+                    CharacterExpressionDefinition {
+                        slot: Some("mouth".to_string()),
+                        parts: vec!["mouth_closed".to_string()],
+                        expressions: Vec::new(),
+                    },
+                ),
+                (
+                    "mouth_open".to_string(),
+                    CharacterExpressionDefinition {
+                        slot: Some("mouth".to_string()),
+                        parts: vec!["mouth_open".to_string()],
+                        expressions: Vec::new(),
+                    },
+                ),
+                (
+                    "face_neutral".to_string(),
+                    CharacterExpressionDefinition {
+                        slot: Some("face".to_string()),
+                        parts: vec!["face_neutral".to_string()],
+                        expressions: Vec::new(),
+                    },
+                ),
+                (
+                    "face_happy".to_string(),
+                    CharacterExpressionDefinition {
+                        slot: Some("face".to_string()),
+                        parts: vec!["face_happy".to_string()],
+                        expressions: Vec::new(),
+                    },
+                ),
+            ]),
+            basis: vec!["basis".to_string()],
+            default_expression: None,
+        };
+
+        let parts = definition
+            .parts_for_expressions(&["mouth_open".to_string(), "face_happy".to_string()])
+            .unwrap();
+        let ids = parts.into_iter().map(|part| part.id).collect::<Vec<_>>();
+        assert_eq!(ids, ["body", "mouth_open", "face_happy"]);
     }
 }

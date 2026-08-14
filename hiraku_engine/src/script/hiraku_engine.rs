@@ -1,5 +1,146 @@
 use super::*;
 
+#[derive(Clone)]
+pub struct CharacterFlow(Arc<CharacterFlowState>);
+
+struct CharacterFlowState {
+    host: ScriptHost,
+    actor_id: String,
+    character_name: String,
+    state: Mutex<CharacterFlowData>,
+}
+
+struct CharacterFlowData {
+    expressions: Vec<String>,
+    position: Vec2,
+    scale: f32,
+    committed: bool,
+}
+
+impl Drop for CharacterFlowState {
+    fn drop(&mut self) {
+        let Ok(data) = self.state.lock() else {
+            return;
+        };
+        if data.committed {
+            return;
+        }
+
+        self.host
+            .set_character_expressions(self.actor_id.clone(), data.expressions.clone());
+        let _ = self.host.send(ScriptCommand::ShowCharacter {
+            actor_id: self.actor_id.clone(),
+            character_name: self.character_name.clone(),
+            expressions: data.expressions.clone(),
+            position: data.position,
+            scale: data.scale,
+            fade: None,
+            animation_id: None,
+            done: None,
+        });
+    }
+}
+
+pub fn char(
+    ctx: NativeCallContext,
+    name: ImmutableString,
+) -> Result<CharacterFlow, Box<EvalAltResult>> {
+    let host = host(&ctx)?;
+    let actor_id = name.to_string();
+    Ok(CharacterFlow(Arc::new(CharacterFlowState {
+        state: Mutex::new(CharacterFlowData {
+            expressions: host.character_expressions(&actor_id),
+            position: Vec2::ZERO,
+            scale: 1.0,
+            committed: false,
+        }),
+        host,
+        actor_id,
+        character_name: name.to_string(),
+    })))
+}
+
+pub fn e(flow: CharacterFlow, expression: ImmutableString) -> CharacterFlow {
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.expressions.push(expression.to_string());
+    }
+    flow
+}
+
+pub fn at(
+    flow: CharacterFlow,
+    position: ImmutableString,
+) -> Result<CharacterFlow, Box<EvalAltResult>> {
+    let position = match position.as_str() {
+        "left" => Vec2::new(-600.0, 0.0),
+        "center" => Vec2::ZERO,
+        "right" => Vec2::new(600.0, 0.0),
+        _ => {
+            return Err(runtime_error(
+                "character position must be left, center, or right",
+            ));
+        }
+    };
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.position = position;
+    }
+    Ok(flow)
+}
+
+pub fn reset(flow: CharacterFlow) -> CharacterFlow {
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.expressions.clear();
+    }
+    flow
+}
+
+pub fn say(
+    ctx: NativeCallContext,
+    flow: CharacterFlow,
+    text: ImmutableString,
+) -> Result<(), Box<EvalAltResult>> {
+    let state = &flow.0;
+    let (expressions, position, scale) = {
+        let mut data = state.state.lock().unwrap();
+        data.committed = true;
+        (data.expressions.clone(), data.position, data.scale)
+    };
+    state
+        .host
+        .set_character_expressions(state.actor_id.clone(), expressions.clone());
+    if state.host.is_batch_mode() {
+        return Err(runtime_error("character.say cannot be used inside seq/par"));
+    }
+
+    state.host.begin_batch(BatchMode::Parallel)?;
+    let result = (|| {
+        let _ = run_blocking_or_collected(&state.host, "character-show", |animation_id, done| {
+            ScriptCommand::ShowCharacter {
+                actor_id: state.actor_id.clone(),
+                character_name: state.character_name.clone(),
+                expressions,
+                position,
+                scale,
+                fade: None,
+                animation_id,
+                done,
+            }
+        })?;
+        say_with_inline_commands(
+            &ctx,
+            &state.host,
+            state.character_name.clone(),
+            text.to_string(),
+        )?;
+        let batch = state.host.finish_batch()?;
+        state.host.wait_for_handle(batch)
+    })();
+    if result.is_err() {
+        state.host.cancel_batch();
+    }
+    result
+}
+
 fn host(ctx: &NativeCallContext) -> Result<ScriptHost, Box<EvalAltResult>> {
     ctx.tag()
         .and_then(|tag| tag.clone().try_cast::<ScriptHost>())
@@ -522,7 +663,7 @@ pub mod HirakuEngine {
             ScriptCommand::ShowCharacter {
                 actor_id: actor_id.to_string(),
                 character_name: character_name.to_string(),
-                expression: expression.map(Into::into),
+                expressions: expression.into_iter().map(Into::into).collect(),
                 position: Vec2::new(x as f32, y as f32),
                 scale,
                 fade,
