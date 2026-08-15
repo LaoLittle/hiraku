@@ -426,10 +426,14 @@ pub struct ScreenUiImageButton {
     pub normal_rect: Option<Rect>,
     /// Idle image handle.
     pub normal_texture: Handle<Image>,
+    /// Idle atlas section, when the texture came from the catalog.
+    pub normal_atlas: Option<TextureAtlas>,
     /// Hover source rectangle, when supplied by the script.
     pub hovered_rect: Option<Rect>,
     /// Hover image handle, when supplied by the script.
     pub hovered_texture: Option<Handle<Image>>,
+    /// Hover atlas section, when supplied by the script.
+    pub hovered_atlas: Option<TextureAtlas>,
     /// Layout restored while the hovered artwork is displayed.
     pub hovered_node: Option<Node>,
     /// Layout restored while the idle artwork is displayed.

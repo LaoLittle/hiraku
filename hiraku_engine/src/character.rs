@@ -32,6 +32,9 @@ pub struct CharacterDefinition {
 pub struct CharacterPartDefinition {
     pub id: String,
     pub path: String,
+    /// Catalog rectangle in `[left, top, width, height]` form, retained so
+    /// rendering can select the generated/declared atlas section.
+    pub atlas_rect: Option<[f32; 4]>,
     pub offset: Vec2,
     pub layer: f32,
     pub rect: Option<[f32; 4]>,
@@ -321,6 +324,7 @@ fn character_definition_from_config(
             Ok(CharacterPartDefinition {
                 id,
                 path,
+                atlas_rect: texture_rect,
                 offset: part
                     .offset
                     .map(|offset| Vec2::new(offset[0] as f32, offset[1] as f32))
@@ -507,6 +511,7 @@ mod tests {
             .map(|id| CharacterPartDefinition {
                 id: id.to_string(),
                 path: format!("{id}.png"),
+                atlas_rect: None,
                 offset: Vec2::ZERO,
                 layer: 0.0,
                 rect: None,

@@ -35,6 +35,7 @@ use scene::{
 };
 use script::{ScriptBootstrap, spawn_script_runtime};
 use state::SceneSharedState;
+use texture::{build_texture_atlases, texture_atlases_ready};
 use transition::RuleTransitionMaterial;
 use vfs::{
     ASSET_SOURCE_ID, HDP_SOURCE_ID, VfsResource, WORKSPACE_SOURCE_ID, file_asset_source_builder,
@@ -107,9 +108,19 @@ impl Plugin for HirakuPlugin {
 
         app.init_asset::<RhaiScriptAsset>()
             .init_asset::<BytesAsset>()
+            .init_asset::<TextureAtlasLayout>()
+            .init_resource::<texture::TextureAtlasCatalog>()
+            .init_resource::<script::InlineDialogueControlResource>()
             .init_asset_loader::<RhaiScriptAssetLoader>()
             .init_asset_loader::<BytesAssetLoader>()
-            .add_systems(Startup, (setup_frontend, setup_stage, boot_runtime).chain())
+            .add_systems(Startup, (setup_frontend, setup_stage).chain())
+            .add_systems(Update, build_texture_atlases)
+            .add_systems(
+                Update,
+                boot_runtime
+                    .after(build_texture_atlases)
+                    .run_if(texture_atlases_ready),
+            )
             .add_systems(Update, process_script_commands)
             .add_systems(
                 Update,
@@ -165,7 +176,15 @@ pub fn configure_runtime_app(app: &mut App, config: RuntimeLaunchConfig) {
     app.add_plugins(HirakuAssetSourcePlugin);
 }
 
-fn boot_runtime(mut commands: Commands, vfs: Res<VfsResource>, scene_state: Res<SceneSharedState>) {
+fn boot_runtime(
+    mut commands: Commands,
+    vfs: Res<VfsResource>,
+    scene_state: Res<SceneSharedState>,
+    mut booted: Local<bool>,
+) {
+    if *booted {
+        return;
+    }
     match vfs.0.load_startup_script_path() {
         Ok(startup_script) => {
             info!("startup script: {startup_script}");
@@ -175,6 +194,7 @@ fn boot_runtime(mut commands: Commands, vfs: Res<VfsResource>, scene_state: Res<
                 scene_state.0.clone(),
                 ScriptBootstrap::new(startup_script),
             );
+            *booted = true;
         }
         Err(err) => {
             error!("failed to resolve startup script: {err}");

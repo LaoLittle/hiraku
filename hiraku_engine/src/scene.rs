@@ -28,6 +28,7 @@ use crate::{
         SaveSlotSummary, StorageError, UserSettings, list_save_slots, load_save_data,
         read_user_settings, write_user_settings,
     },
+    texture::{TextureAtlasCatalog, prepare_texture_atlases},
     transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
@@ -488,6 +489,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub app_exit: MessageWriter<'w, AppExit>,
     pub asset_server: Res<'w, AssetServer>,
     pub images: Res<'w, Assets<Image>>,
+    pub texture_atlases: Res<'w, TextureAtlasCatalog>,
     pub vfs: Res<'w, VfsResource>,
     pub shared_state: Res<'w, SceneSharedState>,
     pub characters: Res<'w, CharacterCatalog>,
@@ -699,6 +701,7 @@ pub fn setup_frontend(
     asset_server: Res<AssetServer>,
     vfs: Res<VfsResource>,
 ) {
+    prepare_texture_atlases(&mut commands, &asset_server, &vfs.0);
     let startup_script = match vfs.0.load_startup_script_path() {
         Ok(startup_script) => startup_script,
         Err(err) => {
@@ -1469,6 +1472,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut app_exit = ctx.app_exit;
     let asset_server = ctx.asset_server;
     let images = ctx.images;
+    let texture_atlases = ctx.texture_atlases;
     let vfs = ctx.vfs;
     let shared_state = ctx.shared_state;
     let characters = ctx.characters;
@@ -2033,8 +2037,14 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 );
             }
             ScriptCommand::ShowScreen { screen, done } => {
-                let spawned =
-                    spawn_screen_ui(&mut commands, &asset_server, &ui_fonts, &ui_style, &screen);
+                let spawned = spawn_screen_ui(
+                    &mut commands,
+                    &asset_server,
+                    &texture_atlases,
+                    &ui_fonts,
+                    &ui_style,
+                    &screen,
+                );
                 let root = spawned.root;
                 let previous = screen_state.active_root.take();
                 let images_ready = screen_images_ready(&images, &spawned.image_handles);
@@ -2062,8 +2072,14 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if let Some(root) = overlay_state.roots.remove(&name) {
                     commands.entity(root).try_despawn();
                 }
-                let spawned =
-                    spawn_screen_ui(&mut commands, &asset_server, &ui_fonts, &ui_style, &screen);
+                let spawned = spawn_screen_ui(
+                    &mut commands,
+                    &asset_server,
+                    &texture_atlases,
+                    &ui_fonts,
+                    &ui_style,
+                    &screen,
+                );
                 commands
                     .entity(spawned.root)
                     .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z + 10)));
@@ -2118,6 +2134,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 queue_character_show(
                     &mut commands,
                     &asset_server,
+                    &texture_atlases,
                     &mut stage,
                     &mut pending_characters,
                     &mut animations,
@@ -2709,6 +2726,10 @@ pub fn handle_screen_image_buttons(
                     .hovered_texture
                     .clone()
                     .unwrap_or_else(|| button.normal_texture.clone());
+                image.texture_atlas = button
+                    .hovered_atlas
+                    .clone()
+                    .or_else(|| button.normal_atlas.clone());
                 image.rect = button.hovered_rect.or(button.normal_rect);
                 *node = button
                     .hovered_node
@@ -2724,6 +2745,10 @@ pub fn handle_screen_image_buttons(
                     .hovered_texture
                     .clone()
                     .unwrap_or_else(|| button.normal_texture.clone());
+                image.texture_atlas = button
+                    .hovered_atlas
+                    .clone()
+                    .or_else(|| button.normal_atlas.clone());
                 image.rect = button.hovered_rect.or(button.normal_rect);
                 *node = button
                     .hovered_node
@@ -2732,11 +2757,13 @@ pub fn handle_screen_image_buttons(
             }
             Interaction::None => {
                 image.image = button.normal_texture.clone();
+                image.texture_atlas = button.normal_atlas.clone();
                 image.rect = button.normal_rect;
                 *node = button.normal_node.clone();
             }
             _ => {
                 image.image = button.normal_texture.clone();
+                image.texture_atlas = button.normal_atlas.clone();
                 image.rect = button.normal_rect;
                 *node = button.normal_node.clone();
             }
@@ -3692,6 +3719,7 @@ pub fn sync_scene_snapshot(
 fn queue_character_show(
     commands: &mut Commands,
     asset_server: &AssetServer,
+    texture_atlases: &TextureAtlasCatalog,
     stage: &mut StageState,
     pending: &mut PendingCharacterShows,
     animations: &mut AnimationState,
@@ -3709,14 +3737,17 @@ fn queue_character_show(
 
     for part in &parts {
         let sprite_id = character_part_id(&actor_id, &part.id);
-        let handle: Handle<Image> = asset_server.load(part.path.clone());
+        let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
+        let handle = atlas
+            .map(|texture| texture.image.clone())
+            .unwrap_or_else(|| asset_server.load(part.path.clone()));
         let entity = commands
             .spawn((
                 SpriteActor {
                     id: sprite_id.clone(),
                     path: part.path.clone(),
                 },
-                character_part_sprite(handle.clone(), part),
+                character_part_sprite(handle.clone(), part, atlas),
                 Visibility::Hidden,
                 Transform {
                     translation: Vec3::new(
@@ -3982,9 +4013,17 @@ fn character_part_id(actor_id: &str, part_id: &str) -> String {
     format!("{}{}", character_part_prefix(actor_id), part_id)
 }
 
-fn character_part_sprite(image: Handle<Image>, part: &CharacterPartDefinition) -> Sprite {
-    let mut sprite = Sprite::from_image(image);
-    sprite.rect = part.rect.map(array_to_rect);
+fn character_part_sprite(
+    image: Handle<Image>,
+    part: &CharacterPartDefinition,
+    atlas: Option<&crate::texture::AtlasTexture>,
+) -> Sprite {
+    let mut sprite = atlas
+        .map(|atlas| Sprite::from_atlas_image(image.clone(), atlas.atlas.clone()))
+        .unwrap_or_else(|| Sprite::from_image(image));
+    if atlas.is_none() {
+        sprite.rect = part.rect.map(array_to_rect);
+    }
     sprite
 }
 
@@ -4481,6 +4520,7 @@ struct SpawnedScreenUi {
 fn spawn_screen_ui(
     commands: &mut Commands,
     asset_server: &AssetServer,
+    texture_atlases: &TextureAtlasCatalog,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     screen: &ScreenSpec,
@@ -4500,6 +4540,7 @@ fn spawn_screen_ui(
         commands,
         root,
         asset_server,
+        texture_atlases,
         ui_fonts,
         ui_style,
         screen,
@@ -4517,6 +4558,7 @@ fn build_screen_ui_children(
     commands: &mut Commands,
     root: Entity,
     asset_server: &AssetServer,
+    texture_atlases: &TextureAtlasCatalog,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     screen: &ScreenSpec,
@@ -4525,12 +4567,15 @@ fn build_screen_ui_children(
     let mut top_level = Vec::new();
 
     if let Some(texture) = screen.background_texture.as_ref() {
-        let image = asset_server.load(texture.path.clone());
+        let image = texture_atlases
+            .resolve(&texture.path, texture.rect)
+            .map(|texture| texture.image.clone())
+            .unwrap_or_else(|| asset_server.load(texture.path.clone()));
         image_handles.push(image.clone());
         let background = commands
             .spawn((
                 ScreenUiNode,
-                image_node(image, texture.rect),
+                image_node(image, texture_atlases.resolve(&texture.path, texture.rect)),
                 Node {
                     position_type: PositionType::Absolute,
                     left: px(0.0),
@@ -4550,6 +4595,7 @@ fn build_screen_ui_children(
                 commands,
                 root,
                 asset_server,
+                texture_atlases,
                 ui_fonts,
                 ui_style,
                 child,
@@ -4606,6 +4652,7 @@ fn build_screen_ui_children(
             commands,
             root,
             asset_server,
+            texture_atlases,
             ui_fonts,
             ui_style,
             child,
@@ -4699,6 +4746,7 @@ fn spawn_screen_node_entity(
     commands: &mut Commands,
     root: Entity,
     asset_server: &AssetServer,
+    texture_atlases: &TextureAtlasCatalog,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     node: &ScreenNode,
@@ -4843,12 +4891,15 @@ fn spawn_screen_node_entity(
             button
         }
         ScreenNode::Image(ScreenImageNode { texture, layout }) => {
-            let image = asset_server.load(texture.path.clone());
+            let resolved = texture_atlases.resolve(&texture.path, texture.rect);
+            let image = resolved
+                .map(|texture| texture.image.clone())
+                .unwrap_or_else(|| asset_server.load(texture.path.clone()));
             image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
             commands
-                .spawn((ScreenUiNode, image_node(image, texture.rect), node))
+                .spawn((ScreenUiNode, image_node(image, resolved), node))
                 .id()
         }
         ScreenNode::ImageButton(ScreenImageButtonNode {
@@ -4860,10 +4911,18 @@ fn spawn_screen_node_entity(
             hovered_when_disabled,
             layout,
         }) => {
-            let image = asset_server.load(texture.path.clone());
+            let resolved = texture_atlases.resolve(&texture.path, texture.rect);
+            let image = resolved
+                .map(|texture| texture.image.clone())
+                .unwrap_or_else(|| asset_server.load(texture.path.clone()));
             image_handles.push(image.clone());
+            let hovered_resolved = hovered_texture
+                .as_ref()
+                .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
             let hovered_image = hovered_texture.as_ref().map(|texture| {
-                let image = asset_server.load(texture.path.clone());
+                let image = hovered_resolved
+                    .map(|texture| texture.image.clone())
+                    .unwrap_or_else(|| asset_server.load(texture.path.clone()));
                 image_handles.push(image.clone());
                 image
             });
@@ -4875,12 +4934,15 @@ fn spawn_screen_node_entity(
                 apply_screen_layout(&mut node, layout);
                 node
             });
-            let normal_rect = texture.rect.map(texture_rect);
+            let normal_rect = resolved
+                .is_none()
+                .then(|| texture.rect.map(texture_rect))
+                .flatten();
             commands
                 .spawn((
                     ScreenUiNode,
                     Button,
-                    image_node(image.clone(), texture.rect),
+                    image_node(image.clone(), resolved),
                     node,
                     ScreenUiImageButton {
                         root,
@@ -4889,11 +4951,18 @@ fn spawn_screen_node_entity(
                         hovered_when_disabled: *hovered_when_disabled,
                         normal_rect,
                         normal_texture: image,
-                        hovered_rect: hovered_texture
-                            .as_ref()
-                            .and_then(|texture| texture.rect)
-                            .map(texture_rect),
+                        normal_atlas: resolved.map(|texture| texture.atlas.clone()),
+                        hovered_rect: hovered_resolved
+                            .is_none()
+                            .then(|| {
+                                hovered_texture
+                                    .as_ref()
+                                    .and_then(|texture| texture.rect)
+                                    .map(texture_rect)
+                            })
+                            .flatten(),
                         hovered_texture: hovered_image,
+                        hovered_atlas: hovered_resolved.map(|texture| texture.atlas.clone()),
                         hovered_node,
                         normal_node,
                     },
@@ -4995,6 +5064,7 @@ fn spawn_screen_node_entity(
                         commands,
                         root,
                         asset_server,
+                        texture_atlases,
                         ui_fonts,
                         ui_style,
                         child,
@@ -5049,6 +5119,7 @@ fn spawn_screen_node_entity(
                         commands,
                         root,
                         asset_server,
+                        texture_atlases,
                         ui_fonts,
                         ui_style,
                         child,
@@ -5072,9 +5143,9 @@ fn spawn_screen_node_entity(
     }
 }
 
-fn image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
-    if let Some(rect) = rect {
-        ImageNode::new(image).with_rect(texture_rect(rect))
+fn image_node(image: Handle<Image>, atlas: Option<&crate::texture::AtlasTexture>) -> ImageNode {
+    if let Some(atlas) = atlas {
+        ImageNode::from_atlas_image(image, atlas.atlas.clone())
     } else {
         ImageNode::new(image)
     }
