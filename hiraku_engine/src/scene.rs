@@ -30,10 +30,10 @@ use crate::{
     },
     transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
-        BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenAtlasButtonNode,
-        ScreenAtlasImageNode, ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec,
-        ScreenUiButton, ScreenUiButtonText, ScreenUiImageButton, ScreenUiNode, ScreenUiRoot,
-        ScreenUiState, SpacerNode, StaleScreenRoot, TextNode,
+        BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
+        ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
+        ScreenUiImageButton, ScreenUiNode, ScreenUiRoot, ScreenUiState, SpacerNode,
+        StaleScreenRoot, TextNode,
     },
     vfs::VfsResource,
 };
@@ -2587,9 +2587,9 @@ pub fn animate_bgm_fades(
 
 pub fn apply_live_audio_settings(
     user_settings: Res<UserSettings>,
-    mut bgms: Query<(&mut AudioSink, &BgmChannel)>,
-    mut voices: Query<(&mut AudioSink, &VoiceChannel)>,
-    mut sfx: Query<(&mut AudioSink, &SfxChannel)>,
+    mut bgms: Query<(&mut AudioSink, &BgmChannel), (Without<VoiceChannel>, Without<SfxChannel>)>,
+    mut voices: Query<(&mut AudioSink, &VoiceChannel), (Without<BgmChannel>, Without<SfxChannel>)>,
+    mut sfx: Query<(&mut AudioSink, &SfxChannel), (Without<BgmChannel>, Without<VoiceChannel>)>,
 ) {
     if !user_settings.is_changed() {
         return;
@@ -2691,30 +2691,25 @@ pub fn handle_screen_buttons(
 
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
-    mut interaction_query: Query<
-        (
-            &Interaction,
-            &mut ImageNode,
-            &mut Node,
-            &ScreenUiImageButton,
-        ),
-        Changed<Interaction>,
-    >,
+    mut interaction_query: Query<(
+        &Interaction,
+        &mut ImageNode,
+        &mut Node,
+        &ScreenUiImageButton,
+    )>,
 ) {
     for (interaction, mut image, mut node, button) in &mut interaction_query {
         if Some(button.root) != screen_state.active_root {
             continue;
         }
 
-        if !button.enabled {
-            image.rect = Some(button.normal_rect);
-            *node = button.normal_node.clone();
-            continue;
-        }
-
         match *interaction {
-            Interaction::Pressed => {
-                image.rect = button.hovered_rect.or(Some(button.normal_rect));
+            Interaction::Pressed if button.enabled => {
+                image.image = button
+                    .hovered_texture
+                    .clone()
+                    .unwrap_or_else(|| button.normal_texture.clone());
+                image.rect = button.hovered_rect.or(button.normal_rect);
                 *node = button
                     .hovered_node
                     .clone()
@@ -2724,15 +2719,25 @@ pub fn handle_screen_image_buttons(
                 };
                 let _ = done.send(ScriptResponse::Choice(button.value.clone()));
             }
-            Interaction::Hovered => {
-                image.rect = button.hovered_rect.or(Some(button.normal_rect));
+            Interaction::Hovered if button.enabled || button.hovered_when_disabled => {
+                image.image = button
+                    .hovered_texture
+                    .clone()
+                    .unwrap_or_else(|| button.normal_texture.clone());
+                image.rect = button.hovered_rect.or(button.normal_rect);
                 *node = button
                     .hovered_node
                     .clone()
                     .unwrap_or_else(|| button.normal_node.clone());
             }
             Interaction::None => {
-                image.rect = Some(button.normal_rect);
+                image.image = button.normal_texture.clone();
+                image.rect = button.normal_rect;
+                *node = button.normal_node.clone();
+            }
+            _ => {
+                image.image = button.normal_texture.clone();
+                image.rect = button.normal_rect;
                 *node = button.normal_node.clone();
             }
         }
@@ -4519,13 +4524,13 @@ fn build_screen_ui_children(
 ) -> Vec<Entity> {
     let mut top_level = Vec::new();
 
-    if let Some(path) = screen.background_image.as_ref() {
-        let image = asset_server.load(path.clone());
+    if let Some(texture) = screen.background_texture.as_ref() {
+        let image = asset_server.load(texture.path.clone());
         image_handles.push(image.clone());
         let background = commands
             .spawn((
                 ScreenUiNode,
-                ImageNode::new(image),
+                image_node(image, texture.rect),
                 Node {
                     position_type: PositionType::Absolute,
                     left: px(0.0),
@@ -4837,39 +4842,31 @@ fn spawn_screen_node_entity(
             commands.entity(button).add_child(text);
             button
         }
-        ScreenNode::Image(ScreenImageNode { path, layout }) => {
-            let texture = asset_server.load(path.clone());
-            image_handles.push(texture.clone());
+        ScreenNode::Image(ScreenImageNode { texture, layout }) => {
+            let image = asset_server.load(texture.path.clone());
+            image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
             commands
-                .spawn((ScreenUiNode, ImageNode::new(texture), node))
+                .spawn((ScreenUiNode, image_node(image, texture.rect), node))
                 .id()
         }
-        ScreenNode::AtlasImage(ScreenAtlasImageNode { path, rect, layout }) => {
-            let texture = asset_server.load(path.clone());
-            image_handles.push(texture.clone());
-            let mut node = Node::default();
-            apply_screen_layout(&mut node, layout);
-            commands
-                .spawn((
-                    ScreenUiNode,
-                    ImageNode::new(texture).with_rect(screen_rect(*rect)),
-                    node,
-                ))
-                .id()
-        }
-        ScreenNode::AtlasButton(ScreenAtlasButtonNode {
-            path,
-            rect,
-            hovered_rect,
+        ScreenNode::ImageButton(ScreenImageButtonNode {
+            texture,
+            hovered_texture,
             hovered_layout,
             value,
             enabled,
+            hovered_when_disabled,
             layout,
         }) => {
-            let texture = asset_server.load(path.clone());
-            image_handles.push(texture.clone());
+            let image = asset_server.load(texture.path.clone());
+            image_handles.push(image.clone());
+            let hovered_image = hovered_texture.as_ref().map(|texture| {
+                let image = asset_server.load(texture.path.clone());
+                image_handles.push(image.clone());
+                image
+            });
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
             let normal_node = node.clone();
@@ -4878,19 +4875,25 @@ fn spawn_screen_node_entity(
                 apply_screen_layout(&mut node, layout);
                 node
             });
-            let normal_rect = screen_rect(*rect);
+            let normal_rect = texture.rect.map(texture_rect);
             commands
                 .spawn((
                     ScreenUiNode,
                     Button,
-                    ImageNode::new(texture).with_rect(normal_rect),
+                    image_node(image.clone(), texture.rect),
                     node,
                     ScreenUiImageButton {
                         root,
                         value: value.clone(),
                         enabled: *enabled,
+                        hovered_when_disabled: *hovered_when_disabled,
                         normal_rect,
-                        hovered_rect: hovered_rect.map(|rect| screen_rect(rect)),
+                        normal_texture: image,
+                        hovered_rect: hovered_texture
+                            .as_ref()
+                            .and_then(|texture| texture.rect)
+                            .map(texture_rect),
+                        hovered_texture: hovered_image,
                         hovered_node,
                         normal_node,
                     },
@@ -5069,7 +5072,15 @@ fn spawn_screen_node_entity(
     }
 }
 
-fn screen_rect(rect: [f32; 4]) -> Rect {
+fn image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
+    if let Some(rect) = rect {
+        ImageNode::new(image).with_rect(texture_rect(rect))
+    } else {
+        ImageNode::new(image)
+    }
+}
+
+fn texture_rect(rect: [f32; 4]) -> Rect {
     Rect::from_corners(
         Vec2::new(rect[0], rect[1]),
         Vec2::new(rect[0] + rect[2], rect[1] + rect[3]),

@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["hiraku_engine", "hiraku_app"]
-exclude = ["hiraku_app/examples/atri_3d_overlay_staticlib"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +16,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 toml = "1.1.4"
 zip = "8.6.0"
+time = "0.3.55"
 
 [workspace.dependencies.bevy]
 version = "0.19"

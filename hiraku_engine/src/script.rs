@@ -31,9 +31,10 @@ use crate::{
         StorageError, UserSettings, load_save_data_from_root, read_user_settings, save_root_path,
         slot_path_in, write_save_data_to_root, write_user_settings,
     },
+    texture::{TextureCatalog, load_texture_catalog},
     ui::{
-        BarNode, ButtonNode, ContainerNode, ScreenAtlasButtonNode, ScreenAtlasImageNode,
-        ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec, SpacerNode, TextNode,
+        BarNode, ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
+        ScreenNode, ScreenSpec, ScreenTexture, SpacerNode, TextNode,
     },
     vfs::{HdpVfs, VfsError},
 };
@@ -41,6 +42,7 @@ use crate::{
 mod hiraku_engine;
 mod rng;
 mod time;
+mod ui;
 
 const PRELUDE_SOURCE: &str = include_str!("script/prelude.rhai");
 
@@ -584,6 +586,7 @@ impl ScriptBootstrap {
 #[derive(Clone)]
 struct ScriptHost {
     vfs: Arc<HdpVfs>,
+    textures: Arc<TextureCatalog>,
     command_tx: mpsc::Sender<ScriptCommand>,
     current_script: Arc<Mutex<String>>,
     script_stack: Arc<Mutex<Vec<String>>>,
@@ -1208,6 +1211,17 @@ impl ScriptHost {
         slot_path_in(&self.save_root, slot)
             .map_err(|err| runtime_error(format!("failed to resolve save slot `{slot}`: {err}")))
     }
+
+    fn resolve_texture(&self, name: &str) -> Result<ScreenTexture, Box<EvalAltResult>> {
+        let texture = self
+            .textures
+            .resolve(name)
+            .ok_or_else(|| runtime_error(format!("texture `{name}` is not defined")))?;
+        Ok(ScreenTexture {
+            path: texture.path.clone(),
+            rect: texture.rect,
+        })
+    }
 }
 
 pub fn spawn_script_runtime(
@@ -1216,6 +1230,13 @@ pub fn spawn_script_runtime(
     scene_state: Arc<Mutex<SceneSnapshot>>,
     bootstrap: ScriptBootstrap,
 ) {
+    let textures = match load_texture_catalog(&vfs) {
+        Ok(catalog) => Arc::new(catalog),
+        Err(err) => {
+            error!("failed to load texture catalog: {err}");
+            Arc::new(TextureCatalog::default())
+        }
+    };
     let (command_tx, command_rx) = mpsc::channel();
     let current_script = Arc::new(Mutex::new(bootstrap.startup_script.clone()));
     let script_stack = Arc::new(Mutex::new(bootstrap.script_stack));
@@ -1256,6 +1277,7 @@ pub fn spawn_script_runtime(
 
     let host = ScriptHost {
         vfs,
+        textures,
         command_tx,
         current_script: current_script.clone(),
         script_stack: script_stack.clone(),
@@ -1456,15 +1478,11 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         .register_custom_operator("@", 160)
         .expect("@ must remain available for the character dialogue operator");
     engine.register_type_with_name::<hiraku_engine::CharacterFlow>("CharacterFlow");
-    engine.register_fn("char", hiraku_engine::char);
-    engine.register_fn("e", hiraku_engine::e);
-    engine.register_fn("at", hiraku_engine::at);
-    engine.register_fn("reset", hiraku_engine::reset);
-    engine.register_fn("say", hiraku_engine::say);
-    engine.register_fn("@", hiraku_engine::say);
     engine.register_global_module(exported_module!(hiraku_engine::HirakuEngine).into());
+    engine.register_fn("@", hiraku_engine::character_say);
     engine.register_global_module(exported_module!(rng::RNG).into());
     engine.register_global_module(exported_module!(time::Time).into());
+    engine.register_static_module("ui", exported_module!(ui::Ui).into());
 }
 
 fn new_random_seed() -> u64 {
@@ -1522,12 +1540,8 @@ mod tests {
         let mut engine = RhaiEngine::new();
         engine.register_custom_operator("@", 160).unwrap();
         engine.register_type_with_name::<hiraku_engine::CharacterFlow>("CharacterFlow");
-        engine.register_fn("char", hiraku_engine::char);
-        engine.register_fn("e", hiraku_engine::e);
-        engine.register_fn("at", hiraku_engine::at);
-        engine.register_fn("reset", hiraku_engine::reset);
-        engine.register_fn("say", hiraku_engine::say);
-        engine.register_fn("@", hiraku_engine::say);
+        engine.register_global_module(exported_module!(hiraku_engine::HirakuEngine).into());
+        engine.register_fn("@", hiraku_engine::character_say);
 
         engine
             .compile(
@@ -1813,8 +1827,9 @@ fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, B
     let title = take_optional_string(&mut screen, "title");
     let panel = take_optional_bool(&mut screen, "panel")?.unwrap_or(true);
     let width = take_optional_number(&mut screen, "width")?;
-    let background_image =
-        take_optional_string(&mut screen, "background_image").map(|path| host.resolve_path(&path));
+    let background_texture = take_optional_string(&mut screen, "background_texture")
+        .map(|name| host.resolve_texture(&name))
+        .transpose()?;
     let xalign = take_optional_number(&mut screen, "xalign")?.unwrap_or(0.5);
     let yalign = take_optional_number(&mut screen, "yalign")?.unwrap_or(0.5);
     let padding = take_optional_number(&mut screen, "padding")?.unwrap_or(24.0);
@@ -1838,7 +1853,7 @@ fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, B
         title,
         panel,
         width: width.map(|value| value as f32),
-        background_image,
+        background_texture,
         xalign: xalign as f32,
         yalign: yalign as f32,
         padding: padding as f32,
@@ -1928,48 +1943,37 @@ fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Bo
             }))
         }
         "image" => {
-            let path = take_required_string(&mut node, "path")?;
+            let texture = take_required_string(&mut node, "texture")?;
             let layout = take_screen_layout(&mut node)?;
             ensure_no_unknown_options("image", &node)?;
             Ok(ScreenNode::Image(ScreenImageNode {
-                path: host.resolve_path(&path),
+                texture: host.resolve_texture(&texture)?,
                 layout,
             }))
         }
-        "atlas_image" => {
-            let path = take_required_string(&mut node, "path")?;
-            let rect = take_screen_rect(&mut node, "rect")?;
-            let layout = take_screen_layout(&mut node)?;
-            ensure_no_unknown_options("atlas_image", &node)?;
-            Ok(ScreenNode::AtlasImage(ScreenAtlasImageNode {
-                path: host.resolve_path(&path),
-                rect,
-                layout,
-            }))
-        }
-        "atlas_button" => {
-            let path = take_required_string(&mut node, "path")?;
-            let rect = take_screen_rect(&mut node, "rect")?;
-            let hovered_rect = node
-                .remove("hovered_rect")
-                .map(|value| parse_screen_rect(value, "hovered_rect"))
+        "image_button" => {
+            let texture = take_required_string(&mut node, "texture")?;
+            let hovered_texture = take_optional_string(&mut node, "hovered_texture")
+                .map(|name| host.resolve_texture(&name))
                 .transpose()?;
             let hovered_layout = take_optional_screen_layout(&mut node, "hovered_layout")?;
             let value = node
                 .remove("value")
                 .map(dynamic_to_stored_value)
                 .transpose()?
-                .ok_or_else(|| runtime_error("atlas_button requires `value`"))?;
+                .ok_or_else(|| runtime_error("image_button requires `value`"))?;
             let enabled = take_optional_bool(&mut node, "enabled")?.unwrap_or(true);
+            let hovered_when_disabled =
+                take_optional_bool(&mut node, "hovered_when_disabled")?.unwrap_or(false);
             let layout = take_screen_layout(&mut node)?;
-            ensure_no_unknown_options("atlas_button", &node)?;
-            Ok(ScreenNode::AtlasButton(ScreenAtlasButtonNode {
-                path: host.resolve_path(&path),
-                rect,
-                hovered_rect,
+            ensure_no_unknown_options("image_button", &node)?;
+            Ok(ScreenNode::ImageButton(ScreenImageButtonNode {
+                texture: host.resolve_texture(&texture)?,
+                hovered_texture,
                 hovered_layout,
                 value,
                 enabled,
+                hovered_when_disabled,
                 layout,
             }))
         }
@@ -2241,28 +2245,6 @@ fn take_optional_screen_layout(
     let result = take_screen_layout(&mut layout)?;
     ensure_no_unknown_options(key, &layout)?;
     Ok(Some(result))
-}
-
-fn take_screen_rect(options: &mut Map, key: &str) -> Result<[f32; 4], Box<EvalAltResult>> {
-    let value = options
-        .remove(key)
-        .ok_or_else(|| runtime_error(format!("missing required `{key}` rectangle")))?;
-    parse_screen_rect(value, key)
-}
-
-fn parse_screen_rect(value: Dynamic, key: &str) -> Result<[f32; 4], Box<EvalAltResult>> {
-    let values: Vec<f64> = from_dynamic(value, key)?;
-    if values.len() != 4 || values[2] <= 0.0 || values[3] <= 0.0 {
-        return Err(runtime_error(format!(
-            "`{key}` must contain [left, top, width, height] with positive dimensions"
-        )));
-    }
-    Ok([
-        values[0] as f32,
-        values[1] as f32,
-        values[2] as f32,
-        values[3] as f32,
-    ])
 }
 
 fn ensure_no_unknown_options(kind: &str, options: &Map) -> Result<(), Box<EvalAltResult>> {

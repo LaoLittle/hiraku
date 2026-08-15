@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use bevy::{math::Vec2, prelude::Resource};
 use rhai::Dynamic;
@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::{
     data::evaluate_rhai_map,
+    texture::{TextureCatalog, TextureCatalogError, load_texture_catalog},
     vfs::{HdpVfs, VfsError},
 };
 
@@ -111,6 +112,8 @@ impl CharacterDefinition {
 pub enum CharacterCatalogError {
     #[error("failed to read character data: {0}")]
     Read(#[from] VfsError),
+    #[error("failed to load texture data: {0}")]
+    Texture(#[from] TextureCatalogError),
     #[error("failed to load character data `{path}`: {message}")]
     Data { path: String, message: String },
 }
@@ -142,8 +145,18 @@ struct CharacterConfigFile {
 }
 
 #[derive(Debug, Deserialize)]
+struct CharacterDataFile {
+    name: String,
+    #[serde(flatten)]
+    config: CharacterConfigFile,
+}
+
+#[derive(Debug, Deserialize)]
 struct CharacterPartFile {
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    texture: Option<String>,
     #[serde(default)]
     offset: Option<[f64; 2]>,
     #[serde(default)]
@@ -171,6 +184,7 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
         return Ok(CharacterCatalog::default());
     };
 
+    let textures = load_texture_catalog(vfs)?;
     let catalog_path = vfs.resolve_path(
         Some(vfs.settings_path()),
         &format!("{directory}/characters.rhai"),
@@ -178,10 +192,7 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
     let catalog_text = match vfs.read_text(&catalog_path) {
         Ok(catalog_text) => catalog_text,
         Err(VfsError::NotFound(_)) => {
-            return Ok(CharacterCatalog {
-                directory: Some(directory),
-                characters: BTreeMap::new(),
-            });
+            return load_character_data_files(vfs, &textures, directory);
         }
         Err(error) => return Err(error.into()),
     };
@@ -198,78 +209,172 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
         let config_text = vfs.read_text(&config_path)?;
         let config: CharacterConfigFile = parse_rhai_data(&config_path, &config_text)?;
 
-        let mut parts = config
-            .parts
-            .into_iter()
-            .map(|(id, part)| CharacterPartDefinition {
-                id,
-                path: vfs.resolve_path(Some(&config_path), &part.path),
-                offset: part
-                    .offset
-                    .map(|offset| Vec2::new(offset[0] as f32, offset[1] as f32))
-                    .unwrap_or(Vec2::ZERO),
-                layer: part.layer.unwrap_or(0.0) as f32,
-                rect: part.rect.map(|rect| {
-                    let left = rect[0] as f32;
-                    let top = rect[1] as f32;
-                    [left, top, left + rect[2] as f32, top + rect[3] as f32]
-                }),
-            })
-            .collect::<Vec<_>>();
-        parts.sort_by(|left, right| {
-            left.layer
-                .partial_cmp(&right.layer)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let expressions = config
-            .expressions
-            .into_iter()
-            .map(|(name, expression)| {
-                let expression = match expression {
-                    CharacterExpressionFile::Parts(parts) => CharacterExpressionDefinition {
-                        slot: None,
-                        parts,
-                        expressions: Vec::new(),
-                    },
-                    CharacterExpressionFile::Definition {
-                        slot,
-                        parts,
-                        expressions,
-                    } => CharacterExpressionDefinition {
-                        slot,
-                        parts,
-                        expressions,
-                    },
-                };
-                (name, expression)
-            })
-            .collect::<BTreeMap<_, _>>();
-        validate_expressions(
-            &expressions,
-            &config.basis,
-            config.default_expression.as_deref(),
-            &parts,
-            &config_path,
-        )?;
-
-        characters.insert(
+        let definition = character_definition_from_config(
+            vfs,
+            &textures,
             entry.name.clone(),
-            CharacterDefinition {
-                name: entry.name,
-                directory: character_directory,
-                config_path,
-                parts,
-                expressions,
-                basis: config.basis,
-                default_expression: config.default_expression,
-            },
-        );
+            character_directory,
+            config_path,
+            config,
+        )?;
+        characters.insert(entry.name, definition);
     }
 
     Ok(CharacterCatalog {
         directory: Some(directory),
         characters,
+    })
+}
+
+fn load_character_data_files(
+    vfs: &HdpVfs,
+    textures: &TextureCatalog,
+    directory: String,
+) -> Result<CharacterCatalog, CharacterCatalogError> {
+    let mut paths = match vfs.list_files_recursive(&directory) {
+        Ok(paths) => paths,
+        Err(VfsError::NotFound(_)) => {
+            return Ok(CharacterCatalog {
+                directory: Some(directory),
+                characters: BTreeMap::new(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    paths.retain(|path| path.ends_with(".char.rhai"));
+    paths.sort();
+
+    let mut characters = BTreeMap::new();
+    for path in paths {
+        let source = vfs.read_text(&path)?;
+        let data: CharacterDataFile = parse_rhai_data(&path, &source)?;
+        let directory_path = Path::new(&path)
+            .parent()
+            .and_then(|path| path.to_str())
+            .unwrap_or_default();
+        let definition = character_definition_from_config(
+            vfs,
+            textures,
+            data.name.clone(),
+            directory_path.to_string(),
+            path,
+            data.config,
+        )?;
+        if characters.insert(data.name.clone(), definition).is_some() {
+            return Err(CharacterCatalogError::Data {
+                path: data.name,
+                message: "character is defined more than once".to_string(),
+            });
+        }
+    }
+
+    Ok(CharacterCatalog {
+        directory: Some(directory),
+        characters,
+    })
+}
+
+fn character_definition_from_config(
+    vfs: &HdpVfs,
+    textures: &TextureCatalog,
+    name: String,
+    directory: String,
+    config_path: String,
+    config: CharacterConfigFile,
+) -> Result<CharacterDefinition, CharacterCatalogError> {
+    let mut parts = config
+        .parts
+        .into_iter()
+        .map(|(id, part)| {
+            let (path, texture_rect) = if let Some(texture_name) = part.texture.as_deref() {
+                let texture =
+                    textures
+                        .resolve(texture_name)
+                        .ok_or_else(|| CharacterCatalogError::Data {
+                            path: config_path.clone(),
+                            message: format!(
+                                "part `{id}` references undefined texture `{texture_name}`"
+                            ),
+                        })?;
+                (texture.path.clone(), texture.rect)
+            } else {
+                let path = part
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| CharacterCatalogError::Data {
+                        path: config_path.clone(),
+                        message: format!("part `{id}` requires `texture` or `path`"),
+                    })?;
+                (vfs.resolve_path(Some(&config_path), path), None)
+            };
+            let rect = part
+                .rect
+                .map(|rect| {
+                    let left = rect[0] as f32;
+                    let top = rect[1] as f32;
+                    [left, top, left + rect[2] as f32, top + rect[3] as f32]
+                })
+                .or_else(|| {
+                    texture_rect
+                        .map(|rect| [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]])
+                });
+            Ok(CharacterPartDefinition {
+                id,
+                path,
+                offset: part
+                    .offset
+                    .map(|offset| Vec2::new(offset[0] as f32, offset[1] as f32))
+                    .unwrap_or(Vec2::ZERO),
+                layer: part.layer.unwrap_or(0.0) as f32,
+                rect,
+            })
+        })
+        .collect::<Result<Vec<_>, CharacterCatalogError>>()?;
+    parts.sort_by(|left, right| {
+        left.layer
+            .partial_cmp(&right.layer)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let expressions = config
+        .expressions
+        .into_iter()
+        .map(|(name, expression)| {
+            let expression = match expression {
+                CharacterExpressionFile::Parts(parts) => CharacterExpressionDefinition {
+                    slot: None,
+                    parts,
+                    expressions: Vec::new(),
+                },
+                CharacterExpressionFile::Definition {
+                    slot,
+                    parts,
+                    expressions,
+                } => CharacterExpressionDefinition {
+                    slot,
+                    parts,
+                    expressions,
+                },
+            };
+            (name, expression)
+        })
+        .collect::<BTreeMap<_, _>>();
+    validate_expressions(
+        &expressions,
+        &config.basis,
+        config.default_expression.as_deref(),
+        &parts,
+        &config_path,
+    )?;
+
+    Ok(CharacterDefinition {
+        name,
+        directory,
+        config_path,
+        parts,
+        expressions,
+        basis: config.basis,
+        default_expression: config.default_expression,
     })
 }
 

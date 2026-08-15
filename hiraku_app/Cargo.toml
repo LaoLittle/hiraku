@@ -12,15 +12,3 @@ hiraku_engine = { path = "../hiraku_engine" }
 [[bin]]
 name = "hiraku_app"
 path = "src/main.rs"
-
-[[bin]]
-name = "hiraku-example"
-path = "src/bin/hiraku-example.rs"
-
-[[bin]]
-name = "atri_3d_overlay"
-path = "src/bin/atri_3d_overlay.rs"
-
-[[bin]]
-name = "atri_image_target"
-path = "src/bin/atri_image_target.rs"

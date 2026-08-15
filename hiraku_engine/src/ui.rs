@@ -23,9 +23,9 @@ pub struct ScreenSpec {
     /// Width of the default panel, in logical pixels.
     #[serde(default)]
     pub width: Option<f32>,
-    /// Full-screen image drawn behind all screen children.
+    /// Full-screen catalog texture drawn behind all screen children.
     #[serde(default)]
-    pub background_image: Option<String>,
+    pub background_texture: Option<ScreenTexture>,
     /// Horizontal alignment for the default panel: `0.0` left, `0.5` center, `1.0` right.
     #[serde(default)]
     pub xalign: f32,
@@ -59,12 +59,10 @@ pub enum ScreenNode {
     Text(TextNode),
     /// A clickable text button that returns `value` from `screen(...)`.
     Button(ButtonNode),
-    /// A UI image.
+    /// A UI image resolved from the texture catalog.
     Image(ScreenImageNode),
-    /// A rectangular region rendered from a UI texture atlas.
-    AtlasImage(ScreenAtlasImageNode),
-    /// A clickable rectangular region rendered from a UI texture atlas.
-    AtlasButton(ScreenAtlasButtonNode),
+    /// A clickable texture with optional hover artwork.
+    ImageButton(ScreenImageButtonNode),
     /// A non-interactive horizontal progress bar.
     Bar(BarNode),
     /// A horizontal flex container.
@@ -219,35 +217,27 @@ pub struct ButtonNode {
 /// An image displayable in a Rhai screen.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenImageNode {
-    /// Resolved asset path.
-    pub path: String,
+    pub texture: ScreenTexture,
     /// Size and absolute positioning.
     #[serde(default)]
     pub layout: ScreenLayout,
 }
 
-/// A rectangular region from a UI texture atlas.
+/// A texture path and optional source rectangle resolved during script evaluation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScreenAtlasImageNode {
-    /// Resolved texture asset path.
+pub struct ScreenTexture {
     pub path: String,
     /// Source rectangle `[left, top, width, height]` in texture pixels.
-    pub rect: [f32; 4],
-    /// Size and absolute positioning.
     #[serde(default)]
-    pub layout: ScreenLayout,
+    pub rect: Option<[f32; 4]>,
 }
 
-/// An atlas-backed button with optional hover artwork.
+/// A catalog-backed image button with optional hover artwork.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScreenAtlasButtonNode {
-    /// Resolved texture asset path.
-    pub path: String,
-    /// Idle source rectangle `[left, top, width, height]` in texture pixels.
-    pub rect: [f32; 4],
-    /// Hover source rectangle `[left, top, width, height]` in texture pixels.
+pub struct ScreenImageButtonNode {
+    pub texture: ScreenTexture,
     #[serde(default)]
-    pub hovered_rect: Option<[f32; 4]>,
+    pub hovered_texture: Option<ScreenTexture>,
     /// Size and absolute positioning while the pointer hovers the button.
     #[serde(default)]
     pub hovered_layout: Option<ScreenLayout>,
@@ -256,6 +246,9 @@ pub struct ScreenAtlasButtonNode {
     /// Whether the button can be pressed.
     #[serde(default = "default_button_enabled")]
     pub enabled: bool,
+    /// Whether a disabled button still displays its hover artwork.
+    #[serde(default)]
+    pub hovered_when_disabled: bool,
     /// Size and absolute positioning.
     #[serde(default)]
     pub layout: ScreenLayout,
@@ -418,7 +411,7 @@ pub struct ScreenUiButton {
 #[derive(Component)]
 pub struct ScreenUiButtonText;
 
-/// Runtime interaction state for an atlas-backed screen button.
+/// Runtime interaction state for a texture-backed screen button.
 #[derive(Component, Clone)]
 pub struct ScreenUiImageButton {
     /// Root this button belongs to; stale and pending roots are ignored.
@@ -427,10 +420,16 @@ pub struct ScreenUiImageButton {
     pub value: StoredValue,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
+    /// Whether a disabled button still displays its hover artwork.
+    pub hovered_when_disabled: bool,
     /// Idle source rectangle.
-    pub normal_rect: Rect,
+    pub normal_rect: Option<Rect>,
+    /// Idle image handle.
+    pub normal_texture: Handle<Image>,
     /// Hover source rectangle, when supplied by the script.
     pub hovered_rect: Option<Rect>,
+    /// Hover image handle, when supplied by the script.
+    pub hovered_texture: Option<Handle<Image>>,
     /// Layout restored while the hovered artwork is displayed.
     pub hovered_node: Option<Node>,
     /// Layout restored while the idle artwork is displayed.

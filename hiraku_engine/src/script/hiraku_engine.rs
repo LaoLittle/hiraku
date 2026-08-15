@@ -41,7 +41,7 @@ impl Drop for CharacterFlowState {
     }
 }
 
-pub fn char(
+fn char(
     ctx: NativeCallContext,
     name: ImmutableString,
 ) -> Result<CharacterFlow, Box<EvalAltResult>> {
@@ -60,17 +60,14 @@ pub fn char(
     })))
 }
 
-pub fn e(flow: CharacterFlow, expression: ImmutableString) -> CharacterFlow {
+fn e(flow: CharacterFlow, expression: ImmutableString) -> CharacterFlow {
     if let Ok(mut data) = flow.0.state.lock() {
         data.expressions.push(expression.to_string());
     }
     flow
 }
 
-pub fn at(
-    flow: CharacterFlow,
-    position: ImmutableString,
-) -> Result<CharacterFlow, Box<EvalAltResult>> {
+fn at(flow: CharacterFlow, position: ImmutableString) -> Result<CharacterFlow, Box<EvalAltResult>> {
     let position = match position.as_str() {
         "left" => Vec2::new(-600.0, 0.0),
         "center" => Vec2::ZERO,
@@ -87,14 +84,14 @@ pub fn at(
     Ok(flow)
 }
 
-pub fn reset(flow: CharacterFlow) -> CharacterFlow {
+fn reset(flow: CharacterFlow) -> CharacterFlow {
     if let Ok(mut data) = flow.0.state.lock() {
         data.expressions.clear();
     }
     flow
 }
 
-pub fn say(
+pub fn character_say(
     ctx: NativeCallContext,
     flow: CharacterFlow,
     text: ImmutableString,
@@ -151,6 +148,39 @@ fn host(ctx: &NativeCallContext) -> Result<ScriptHost, Box<EvalAltResult>> {
 #[export_module]
 pub mod HirakuEngine {
     use super::*;
+
+    #[rhai_fn(return_raw)]
+    pub fn char(
+        ctx: NativeCallContext,
+        name: ImmutableString,
+    ) -> Result<CharacterFlow, Box<EvalAltResult>> {
+        super::char(ctx, name)
+    }
+
+    pub fn e(flow: CharacterFlow, expression: ImmutableString) -> CharacterFlow {
+        super::e(flow, expression)
+    }
+
+    #[rhai_fn(return_raw)]
+    pub fn at(
+        flow: CharacterFlow,
+        position: ImmutableString,
+    ) -> Result<CharacterFlow, Box<EvalAltResult>> {
+        super::at(flow, position)
+    }
+
+    pub fn reset(flow: CharacterFlow) -> CharacterFlow {
+        super::reset(flow)
+    }
+
+    #[rhai_fn(name = "say", return_raw)]
+    pub fn character_say(
+        ctx: NativeCallContext,
+        flow: CharacterFlow,
+        text: ImmutableString,
+    ) -> Result<(), Box<EvalAltResult>> {
+        super::character_say(ctx, flow, text)
+    }
 
     #[rhai_fn(return_raw)]
     pub fn log(ctx: NativeCallContext, message: ImmutableString) -> Result<(), Box<EvalAltResult>> {

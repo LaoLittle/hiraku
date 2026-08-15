@@ -7,6 +7,7 @@ mod scene;
 mod script;
 mod state;
 mod storage;
+mod texture;
 mod transition;
 mod ui;
 mod vfs;

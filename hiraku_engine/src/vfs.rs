@@ -35,6 +35,7 @@ pub const DEFAULT_SOUNDEFFECTS_DIR: &str = "soundeffects";
 pub const DEFAULT_VOICE_DIR: &str = "voice";
 pub const DEFAULT_CHARACTERS_DIR: &str = "characters";
 pub const DEFAULT_FONTS_DIR: &str = "fonts";
+pub const DEFAULT_TEXTURES_DIR: &str = "textures";
 
 pub fn workspace_base_path() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| FileAssetReader::get_base_path())
@@ -78,6 +79,7 @@ struct SettingsFile {
     bgm_dir: Option<String>,
     voice_dir: Option<String>,
     characters_dir: Option<String>,
+    textures_dir: Option<String>,
     res_root: Option<String>,
     boot: BootSection,
 }
@@ -94,6 +96,7 @@ fn settings_from_data(mut data: Map, path: &str) -> Result<SettingsFile, VfsErro
     let bgm_dir = take_data_string(&mut data, "bgm_dir", path)?;
     let voice_dir = take_data_string(&mut data, "voice_dir", path)?;
     let characters_dir = take_data_string(&mut data, "characters_dir", path)?;
+    let textures_dir = take_data_string(&mut data, "textures_dir", path)?;
     let res_root = take_data_string(&mut data, "res_root", path)?;
 
     let fonts = if let Some(mut fonts) = take_data_map(&mut data, "fonts", path)? {
@@ -121,6 +124,7 @@ fn settings_from_data(mut data: Map, path: &str) -> Result<SettingsFile, VfsErro
         bgm_dir,
         voice_dir,
         characters_dir,
+        textures_dir,
         res_root,
         boot,
     })
@@ -258,6 +262,14 @@ impl HdpVfs {
             |settings| settings.characters_dir.clone(),
             DEFAULT_CHARACTERS_DIR,
         )?))
+    }
+
+    pub fn load_textures_dir_path(&self) -> Result<String, VfsError> {
+        self.load_directory_path(
+            None,
+            |settings| settings.textures_dir.clone(),
+            DEFAULT_TEXTURES_DIR,
+        )
     }
 
     pub fn load_backgrounds_dir_path(&self, base: Option<&str>) -> Result<String, VfsError> {
@@ -573,6 +585,30 @@ impl HdpVfs {
         Ok(paths)
     }
 
+    pub fn list_files_recursive(&self, path: &str) -> Result<Vec<String>, VfsError> {
+        if let Some((archive, entry)) = split_hdp_asset_path(path) {
+            let archive_path = self.root.join(&archive);
+            let file = File::open(&archive_path)
+                .map_err(|err| map_fs_not_found(err, archive_path.display().to_string()))?;
+            let mut zip = ZipArchive::new(file)?;
+            let prefix = normalize_entry_prefix(&entry);
+            let mut paths = Vec::new();
+            for index in 0..zip.len() {
+                let zip_file = zip.by_index(index)?;
+                let name = zip_file.name();
+                if !name.ends_with('/') && name.starts_with(&prefix) {
+                    paths.push(format!("hdp://{archive}/{name}"));
+                }
+            }
+            return Ok(paths);
+        }
+
+        let full_path = self.root.join(path);
+        let mut paths = Vec::new();
+        collect_files_recursive(&full_path, &self.root, &mut paths)?;
+        Ok(paths)
+    }
+
     fn list_virtual_directory(&self, path: &Path) -> Result<Vec<PathBuf>, AssetReaderError> {
         let Some((archive, entry)) = split_hdp_asset_path(&path.to_string_lossy()) else {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
@@ -629,6 +665,30 @@ impl HdpVfs {
             Err(err) => Err(err),
         }
     }
+}
+
+fn collect_files_recursive(
+    directory: &Path,
+    root: &Path,
+    paths: &mut Vec<String>,
+) -> Result<(), VfsError> {
+    for entry in std::fs::read_dir(directory)
+        .map_err(|err| map_fs_not_found(err, directory.display().to_string()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_files_recursive(&path, root, paths)?;
+        } else if entry.file_type()?.is_file() {
+            paths.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn hdp_asset_source_builder(root: impl Into<String>) -> AssetSourceBuilder {
