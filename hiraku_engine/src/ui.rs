@@ -356,7 +356,8 @@ pub struct PendingScreenRoot {
     /// Extra update frames after image readiness, allowing layout and texture preparation to settle.
     pub ready_frames_remaining: u8,
     /// Response channel for the blocked script call.
-    pub done: std::sync::mpsc::Sender<crate::script::ScriptResponse>,
+    pub shown: Option<std::sync::mpsc::Sender<crate::script::ScriptResponse>>,
+    pub done: Option<std::sync::mpsc::Sender<crate::script::ScriptResponse>>,
 }
 
 /// An old screen root kept briefly under a replacement screen.

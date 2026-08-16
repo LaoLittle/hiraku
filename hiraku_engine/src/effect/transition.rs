@@ -1,5 +1,10 @@
 use bevy::{
-    asset::{AssetPath, Handle}, prelude::*, reflect::TypePath, render::render_resource::{AsBindGroup, ShaderType}, shader::{Shader, ShaderRef}, sprite_render::{AlphaMode2d, Material2d},
+    asset::{AssetPath, Handle},
+    prelude::*,
+    reflect::TypePath,
+    render::render_resource::{AsBindGroup, ShaderType},
+    shader::{Shader, ShaderRef},
+    sprite_render::{AlphaMode2d, Material2d},
 };
 
 pub fn load_internal_shaders(app: &mut App) {

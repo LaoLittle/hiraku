@@ -8,10 +8,13 @@ use std::{
 use bevy::{
     asset::io::{
         AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, VecReader,
-        file::FileAssetReader,
     },
     prelude::*,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::asset::io::file::FileAssetReader;
+#[cfg(target_arch = "wasm32")]
+use bevy::asset::io::wasm::HttpWasmAssetReader;
 use futures_lite::stream;
 use rhai::Map;
 use thiserror::Error;
@@ -38,6 +41,12 @@ pub const DEFAULT_FONTS_DIR: &str = "fonts";
 pub const DEFAULT_TEXTURES_DIR: &str = "textures";
 
 pub fn workspace_base_path() -> PathBuf {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return PathBuf::from(".");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     std::env::current_dir().unwrap_or_else(|_| FileAssetReader::get_base_path())
 }
 
@@ -698,6 +707,11 @@ pub fn hdp_asset_source_builder(root: impl Into<String>) -> AssetSourceBuilder {
 
 pub fn file_asset_source_builder(root: impl Into<PathBuf>) -> AssetSourceBuilder {
     let root = root.into();
+
+    #[cfg(target_arch = "wasm32")]
+    return AssetSourceBuilder::new(move || Box::new(HttpWasmAssetReader::new(root.clone())));
+
+    #[cfg(not(target_arch = "wasm32"))]
     AssetSourceBuilder::new(move || Box::new(FileAssetReader::new(root.clone())))
 }
 

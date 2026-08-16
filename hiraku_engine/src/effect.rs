@@ -1,3 +1,3 @@
-pub mod blur_effect;
+pub mod blur;
 pub mod custom;
 pub mod transition;

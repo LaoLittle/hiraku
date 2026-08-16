@@ -1,5 +1,5 @@
 use bevy::{
-    core_pipeline::{Core2dSystems, FullscreenShader, schedule::Core2d},
+    core_pipeline::{FullscreenShader, schedule::Core2d, upscaling::upscaling},
     prelude::*,
     render::{
         RenderApp, RenderStartup,
@@ -31,13 +31,16 @@ impl Plugin for BlurEffectPlugin {
         };
 
         render_app.add_systems(RenderStartup, init_blur_pipeline);
-        render_app.add_systems(Core2d, blur_pass.in_set(Core2dSystems::PostProcess));
+        render_app.add_systems(
+            Core2d,
+            blur_pass.after(bevy_ui_render::ui_pass).before(upscaling),
+        );
     }
 }
 
 #[derive(Component, Clone, Copy, ExtractComponent, ShaderType)]
 pub struct BlurSettings {
-    radius: Vec4,
+    intensity: f32,
 }
 
 impl BlurSettings {
@@ -48,13 +51,13 @@ impl BlurSettings {
     }
 
     pub fn set_radius(&mut self, radius: f32) {
-        self.radius.x = radius.max(0.0);
+        self.intensity = radius.max(0.0);
     }
 }
 
 impl Default for BlurSettings {
     fn default() -> Self {
-        Self { radius: Vec4::ZERO }
+        Self { intensity: 0.0 }
     }
 }
 

@@ -1,6 +1,176 @@
 use super::*;
 
 #[derive(Clone)]
+pub struct CameraFlow(Arc<CameraFlowState>);
+
+#[derive(Clone)]
+pub struct CameraHandle(ScriptHost);
+
+struct CameraFlowState {
+    host: ScriptHost,
+    state: Mutex<CameraFlowData>,
+}
+
+struct CameraFlowData {
+    blur_intensity: Option<f32>,
+    zoom: Option<f32>,
+    center: Option<Vec2>,
+    duration: Duration,
+    ease: CharacterEase,
+    committed: bool,
+}
+
+impl Drop for CameraFlowState {
+    fn drop(&mut self) {
+        let Ok(data) = self.state.lock() else {
+            return;
+        };
+        if data.committed
+            || (data.blur_intensity.is_none() && data.zoom.is_none() && data.center.is_none())
+        {
+            return;
+        }
+
+        let blur_intensity = data.blur_intensity;
+        let zoom = data.zoom;
+        let center = data.center;
+        let duration = data.duration;
+        let ease = data.ease;
+        drop(data);
+        let _ = run_blocking_or_collected(&self.host, "camera", |animation_id, done| {
+            ScriptCommand::SetCamera {
+                blur_intensity,
+                zoom,
+                center,
+                duration,
+                ease,
+                animation_id,
+                done,
+            }
+        });
+    }
+}
+
+pub fn camera(host: ScriptHost) -> CameraHandle {
+    CameraHandle(host)
+}
+
+fn new_camera_flow(host: ScriptHost) -> CameraFlow {
+    CameraFlow(Arc::new(CameraFlowState {
+        host,
+        state: Mutex::new(CameraFlowData {
+            blur_intensity: None,
+            zoom: None,
+            center: None,
+            duration: Duration::ZERO,
+            ease: CharacterEase::Linear,
+            committed: false,
+        }),
+    }))
+}
+
+fn camera_blur(flow: CameraFlow) -> CameraFlow {
+    camera_blur_intensity(flow, 24.0)
+}
+
+fn camera_blur_intensity(flow: CameraFlow, intensity: FLOAT) -> CameraFlow {
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.blur_intensity = Some((intensity as f32).max(0.0));
+    }
+    flow
+}
+
+fn camera_zoom(flow: CameraFlow, zoom: FLOAT) -> CameraFlow {
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.zoom = Some((zoom as f32).max(0.01));
+    }
+    flow
+}
+
+fn camera_duration(flow: CameraFlow, seconds: FLOAT) -> Result<CameraFlow, Box<EvalAltResult>> {
+    let duration = duration_from_seconds(seconds)?;
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.duration = duration;
+    }
+    Ok(flow)
+}
+
+fn camera_ease(flow: CameraFlow, name: ImmutableString) -> Result<CameraFlow, Box<EvalAltResult>> {
+    let ease = super::parse_character_ease(name.as_str())?;
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.ease = ease;
+    }
+    Ok(flow)
+}
+
+fn camera_duration_int(flow: CameraFlow, seconds: INT) -> Result<CameraFlow, Box<EvalAltResult>> {
+    camera_duration(flow, seconds as FLOAT)
+}
+
+fn camera_zoom_at(flow: CameraFlow, x: FLOAT, y: FLOAT) -> CameraFlow {
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.center = Some(Vec2::new(x as f32, y as f32));
+    }
+    flow
+}
+
+fn camera_zoom_at_int(flow: CameraFlow, x: INT, y: INT) -> CameraFlow {
+    camera_zoom_at(flow, x as FLOAT, y as FLOAT)
+}
+
+fn finish_camera(flow: CameraFlow) -> Result<(), Box<EvalAltResult>> {
+    let state = &flow.0;
+    let (blur_intensity, zoom, center, duration, ease) = {
+        let data = state
+            .state
+            .lock()
+            .map_err(|_| runtime_error("camera flow is unavailable"))?;
+        (
+            data.blur_intensity,
+            data.zoom,
+            data.center,
+            data.duration,
+            data.ease,
+        )
+    };
+    let _ = run_blocking_or_collected(&state.host, "camera", |animation_id, done| {
+        ScriptCommand::SetCamera {
+            blur_intensity,
+            zoom,
+            center,
+            duration,
+            ease,
+            animation_id,
+            done,
+        }
+    })?;
+    if let Ok(mut data) = state.state.lock() {
+        data.committed = true;
+    }
+    Ok(())
+}
+
+fn camera_handle_blur(handle: CameraHandle) -> CameraFlow {
+    camera_blur(new_camera_flow(handle.0))
+}
+
+fn camera_handle_blur_intensity(handle: CameraHandle, intensity: FLOAT) -> CameraFlow {
+    camera_blur_intensity(new_camera_flow(handle.0), intensity)
+}
+
+fn camera_handle_blur_int(handle: CameraHandle, intensity: INT) -> CameraFlow {
+    camera_handle_blur_intensity(handle, intensity as FLOAT)
+}
+
+fn camera_handle_zoom(handle: CameraHandle, zoom: FLOAT) -> CameraFlow {
+    camera_zoom(new_camera_flow(handle.0), zoom)
+}
+
+fn camera_handle_zoom_int(handle: CameraHandle, zoom: INT) -> CameraFlow {
+    camera_handle_zoom(handle, zoom as FLOAT)
+}
+
+#[derive(Clone)]
 pub struct CharacterFlow(Arc<CharacterFlowState>);
 
 struct CharacterFlowState {
@@ -91,6 +261,34 @@ fn reset(flow: CharacterFlow) -> CharacterFlow {
     flow
 }
 
+fn finish_character(flow: CharacterFlow) -> Result<(), Box<EvalAltResult>> {
+    let state = &flow.0;
+    if state.host.is_batch_mode() {
+        return Err(runtime_error(
+            "character.finish cannot be used inside seq/par",
+        ));
+    }
+    let (expressions, position, scale) = {
+        let mut data = state.state.lock().unwrap();
+        data.committed = true;
+        (data.expressions.clone(), data.position, data.scale)
+    };
+    state
+        .host
+        .set_character_expressions(state.actor_id.clone(), expressions.clone());
+    state.host.send(ScriptCommand::ShowCharacter {
+        actor_id: state.actor_id.clone(),
+        character_name: state.character_name.clone(),
+        expressions,
+        position,
+        scale,
+        fade: None,
+        animation_id: None,
+        done: None,
+    })?;
+    Ok(())
+}
+
 pub fn character_say(
     ctx: NativeCallContext,
     flow: CharacterFlow,
@@ -149,6 +347,58 @@ fn host(ctx: &NativeCallContext) -> Result<ScriptHost, Box<EvalAltResult>> {
 pub mod HirakuEngine {
     use super::*;
 
+    pub fn blur(handle: CameraHandle) -> CameraFlow {
+        super::camera_handle_blur(handle)
+    }
+
+    #[rhai_fn(name = "blur")]
+    pub fn blur_float(handle: CameraHandle, intensity: FLOAT) -> CameraFlow {
+        super::camera_handle_blur_intensity(handle, intensity)
+    }
+
+    #[rhai_fn(name = "blur")]
+    pub fn blur_int(handle: CameraHandle, intensity: INT) -> CameraFlow {
+        super::camera_handle_blur_int(handle, intensity)
+    }
+
+    pub fn zoom(handle: CameraHandle, zoom: FLOAT) -> CameraFlow {
+        super::camera_handle_zoom(handle, zoom)
+    }
+
+    #[rhai_fn(name = "zoom")]
+    pub fn zoom_int(handle: CameraHandle, zoom: INT) -> CameraFlow {
+        super::camera_handle_zoom_int(handle, zoom)
+    }
+
+    #[rhai_fn(return_raw)]
+    pub fn duration(flow: CameraFlow, seconds: FLOAT) -> Result<CameraFlow, Box<EvalAltResult>> {
+        super::camera_duration(flow, seconds)
+    }
+
+    #[rhai_fn(name = "duration", return_raw)]
+    pub fn duration_int(flow: CameraFlow, seconds: INT) -> Result<CameraFlow, Box<EvalAltResult>> {
+        super::camera_duration_int(flow, seconds)
+    }
+
+    #[rhai_fn(return_raw)]
+    pub fn ease(flow: CameraFlow, name: ImmutableString) -> Result<CameraFlow, Box<EvalAltResult>> {
+        super::camera_ease(flow, name)
+    }
+
+    pub fn zoom_at(flow: CameraFlow, x: FLOAT, y: FLOAT) -> CameraFlow {
+        super::camera_zoom_at(flow, x, y)
+    }
+
+    #[rhai_fn(name = "zoom_at")]
+    pub fn zoom_at_int(flow: CameraFlow, x: INT, y: INT) -> CameraFlow {
+        super::camera_zoom_at_int(flow, x, y)
+    }
+
+    #[rhai_fn(name = "finish", return_raw)]
+    pub fn finish_camera(flow: CameraFlow) -> Result<(), Box<EvalAltResult>> {
+        super::finish_camera(flow)
+    }
+
     #[rhai_fn(return_raw)]
     pub fn char(
         ctx: NativeCallContext,
@@ -171,6 +421,11 @@ pub mod HirakuEngine {
 
     pub fn reset(flow: CharacterFlow) -> CharacterFlow {
         super::reset(flow)
+    }
+
+    #[rhai_fn(name = "finish", return_raw)]
+    pub fn finish_character(flow: CharacterFlow) -> Result<(), Box<EvalAltResult>> {
+        super::finish_character(flow)
     }
 
     #[rhai_fn(name = "say", return_raw)]
@@ -1112,13 +1367,44 @@ pub mod HirakuEngine {
             return host.replay_input("screen").map(stored_value_to_dynamic);
         }
         let screen = parse_screen_spec(&host, screen)?;
-        match host.send_and_wait(|done| ScriptCommand::ShowScreen { screen, done })? {
+        match host.send_and_wait(|done| ScriptCommand::ShowScreen {
+            screen,
+            shown: None,
+            done: Some(done),
+        })? {
             ScriptResponse::Choice(value) => {
                 host.record_input(value.clone());
                 Ok(stored_value_to_dynamic(value))
             }
             ScriptResponse::Continue => Err(runtime_error(
                 "engine returned unexpected continue response",
+            )),
+        }
+    }
+
+    #[rhai_fn(name = "show_screen", return_raw)]
+    pub fn show_screen(ctx: NativeCallContext, screen: Map) -> Result<(), Box<EvalAltResult>> {
+        let host = host(&ctx)?;
+        let screen = parse_screen_spec(&host, screen)?;
+        match host.send_and_wait(|shown| ScriptCommand::ShowScreen {
+            screen,
+            shown: Some(shown),
+            done: None,
+        })? {
+            ScriptResponse::Continue => Ok(()),
+            ScriptResponse::Choice(_) => Err(runtime_error(
+                "engine returned unexpected choice response while showing screen",
+            )),
+        }
+    }
+
+    #[rhai_fn(name = "wait_screen", return_raw)]
+    pub fn wait_screen(ctx: NativeCallContext) -> Result<Dynamic, Box<EvalAltResult>> {
+        let host = host(&ctx)?;
+        match host.send_and_wait(|done| ScriptCommand::WaitForScreenChoice { done })? {
+            ScriptResponse::Choice(value) => Ok(stored_value_to_dynamic(value)),
+            ScriptResponse::Continue => Err(runtime_error(
+                "engine returned unexpected continue response while waiting for screen choice",
             )),
         }
     }

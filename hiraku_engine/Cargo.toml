@@ -6,6 +6,7 @@ description = "Embeddable visual-novel runtime and HDP resource engine"
 
 [dependencies]
 bevy.workspace = true
+bevy_ui_render = "0.19"
 futures-lite.workspace = true
 prost.workspace = true
 rand.workspace = true

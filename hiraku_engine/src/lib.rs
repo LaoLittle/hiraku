@@ -21,9 +21,10 @@ use bevy::{
     prelude::*,
     sprite_render::Material2dPlugin,
 };
-use effect::custom::CustomScreenEffectMaterial;
+use effect::transition::RuleTransitionMaterial;
+use effect::{blur::BlurEffectPlugin, custom::CustomScreenEffectMaterial};
 use scene::{
-    advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake,
+    advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake, animate_camera_transition,
     animate_character_motion_effects, animate_custom_effects, animate_dialogue_text_reveal,
     animate_rule_transitions, animate_visual_tweens, apply_animation_cancellations,
     apply_live_audio_settings, cleanup_stale_screen_ui, handle_choice_buttons,
@@ -35,7 +36,6 @@ use scene::{
 use script::{ScriptBootstrap, spawn_script_runtime};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
-use effect::transition::RuleTransitionMaterial;
 use vfs::{
     ASSET_SOURCE_ID, HDP_SOURCE_ID, VfsResource, WORKSPACE_SOURCE_ID, file_asset_source_builder,
     hdp_asset_source_builder, workspace_base_path,
@@ -101,6 +101,7 @@ impl Plugin for HirakuPlugin {
         app.add_plugins((
             Material2dPlugin::<CustomScreenEffectMaterial>::default(),
             Material2dPlugin::<RuleTransitionMaterial>::default(),
+            BlurEffectPlugin,
         ));
         effect::custom::load_internal_shaders(app);
         effect::transition::load_internal_shaders(app);
@@ -121,6 +122,12 @@ impl Plugin for HirakuPlugin {
                     .run_if(texture_atlases_ready),
             )
             .add_systems(Update, process_script_commands)
+            .add_systems(
+                Update,
+                animate_camera_transition
+                    .after(process_script_commands)
+                    .before(animate_camera_shake),
+            )
             .add_systems(
                 Update,
                 apply_live_audio_settings.after(process_script_commands),

@@ -14,7 +14,11 @@ use bevy::{
 
 use crate::{
     character::{CharacterCatalog, CharacterPartDefinition, load_character_catalog},
-    effect::custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
+    effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
+    effect::{
+        blur::BlurSettings,
+        custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
+    },
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
         ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse,
@@ -29,7 +33,6 @@ use crate::{
         read_user_settings, write_user_settings,
     },
     texture::{TextureAtlasCatalog, prepare_texture_atlases},
-    effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
@@ -253,6 +256,57 @@ pub struct PendingWaits {
 #[derive(Resource, Default)]
 pub struct CameraShakeState {
     pub active: Option<CameraShake>,
+}
+
+#[derive(Resource)]
+pub struct CameraState {
+    pub blur_intensity: f32,
+    pub zoom: f32,
+    pub center: Vec2,
+}
+
+impl Default for CameraState {
+    fn default() -> Self {
+        Self {
+            blur_intensity: 0.0,
+            zoom: 1.0,
+            center: Vec2::ZERO,
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct CameraTweenState {
+    pub active: Option<CameraTween>,
+}
+
+pub struct CameraTween {
+    pub blur: Option<CameraScalarTween>,
+    pub zoom: Option<CameraScalarTween>,
+    pub center: Option<CameraPositionTween>,
+    pub completions: Vec<CameraTweenCompletion>,
+}
+
+pub struct CameraTweenCompletion {
+    pub blur: bool,
+    pub zoom: bool,
+    pub center: bool,
+    pub animation_id: Option<String>,
+    pub done: Option<mpsc::Sender<ScriptResponse>>,
+}
+
+pub struct CameraScalarTween {
+    pub from: f32,
+    pub to: f32,
+    pub timer: Timer,
+    pub ease: CharacterEase,
+}
+
+pub struct CameraPositionTween {
+    pub from: Vec2,
+    pub to: Vec2,
+    pub timer: Timer,
+    pub ease: CharacterEase,
 }
 
 #[derive(Resource, Default)]
@@ -501,6 +555,8 @@ pub struct SceneCommandContext<'w, 's> {
     pub stage: ResMut<'w, StageState>,
     pub waits: ResMut<'w, PendingWaits>,
     pub pending_cancels: ResMut<'w, PendingAnimationCancels>,
+    pub camera_state: ResMut<'w, CameraState>,
+    pub camera_tweens: ResMut<'w, CameraTweenState>,
     pub pending_script_commands: ResMut<'w, PendingScriptCommands>,
     pub active_batches: ResMut<'w, ActiveScriptBatches>,
     pub dialogue_state: ResMut<'w, DialogueState>,
@@ -603,6 +659,8 @@ pub fn setup_stage(
     commands.spawn((
         Camera2d,
         IsDefaultUiCamera,
+        Projection::Orthographic(OrthographicProjection::default_2d()),
+        BlurSettings::default(),
         Camera {
             order: config.camera_order,
             clear_color: config.camera_clear_color.clone(),
@@ -629,6 +687,8 @@ pub fn setup_stage(
     commands.insert_resource(ChoiceState::default());
     commands.insert_resource(PendingWaits::default());
     commands.insert_resource(CameraShakeState::default());
+    commands.insert_resource(CameraState::default());
+    commands.insert_resource(CameraTweenState::default());
     commands.insert_resource(AnimationState::default());
     commands.insert_resource(PendingAnimationCancels::default());
     commands.insert_resource(PendingScriptCommands::default());
@@ -1483,6 +1543,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut stage = ctx.stage;
     let mut waits = ctx.waits;
     let mut pending_cancels = ctx.pending_cancels;
+    let mut camera_state = ctx.camera_state;
+    let mut camera_tweens = ctx.camera_tweens;
     let mut pending_script_commands = ctx.pending_script_commands;
     let mut active_batches = ctx.active_batches;
     let mut dialogue_state = ctx.dialogue_state;
@@ -2001,6 +2063,26 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 shared_state.0.lock().unwrap().text_effect =
                     text_effect_snapshot(&dialogue_state.effect);
             }
+            ScriptCommand::SetCamera {
+                blur_intensity,
+                zoom,
+                center,
+                duration,
+                ease,
+                animation_id,
+                done,
+            } => start_camera_tween(
+                &mut camera_state,
+                &mut camera_tweens,
+                blur_intensity,
+                zoom,
+                center,
+                duration,
+                ease,
+                animation_id,
+                done,
+                &mut animations,
+            ),
             ScriptCommand::ApplyUserSettings(settings) => *user_settings = settings,
             ScriptCommand::ApplyUiStyle(style_patch) => {
                 apply_ui_style_patch(&mut ui_style, style_patch);
@@ -2036,7 +2118,11 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut hint_color,
                 );
             }
-            ScriptCommand::ShowScreen { screen, done } => {
+            ScriptCommand::ShowScreen {
+                screen,
+                shown,
+                done,
+            } => {
                 let spawned = spawn_screen_ui(
                     &mut commands,
                     &asset_server,
@@ -2053,7 +2139,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         .entity(root)
                         .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z)));
                     screen_state.active_root = Some(root);
-                    screen_state.waiting = Some(done);
+                    screen_state.waiting = done;
+                    if let Some(shown) = shown {
+                        let _ = shown.send(ScriptResponse::Continue);
+                    }
                 } else {
                     commands
                         .entity(root)
@@ -2063,9 +2152,17 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         previous,
                         wait_images: spawned.image_handles,
                         ready_frames_remaining: SCREEN_READY_FRAMES,
+                        shown,
                         done,
                     });
                     screen_state.waiting = None;
+                }
+            }
+            ScriptCommand::WaitForScreenChoice { done } => {
+                if screen_state.active_root.is_some() && screen_state.pending_root.is_none() {
+                    screen_state.waiting = Some(done);
+                } else {
+                    let _ = done.send(ScriptResponse::Continue);
                 }
             }
             ScriptCommand::ShowOverlay { name, screen } => {
@@ -3297,6 +3394,7 @@ pub fn animate_camera_shake(
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
     mut shake_state: ResMut<CameraShakeState>,
+    camera_state: Res<CameraState>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
 ) {
     let Ok(mut camera) = camera.single_mut() else {
@@ -3304,8 +3402,8 @@ pub fn animate_camera_shake(
     };
 
     let Some(shake) = shake_state.active.as_mut() else {
-        camera.translation.x = 0.0;
-        camera.translation.y = 0.0;
+        camera.translation.x = camera_state.center.x;
+        camera.translation.y = camera_state.center.y;
         return;
     };
 
@@ -3314,12 +3412,12 @@ pub fn animate_camera_shake(
     let elapsed = shake.timer.elapsed_secs();
     let amplitude = shake.amplitude * decay;
 
-    camera.translation.x = (elapsed * 43.0).sin() * amplitude;
-    camera.translation.y = (elapsed * 31.0).cos() * amplitude;
+    camera.translation.x = camera_state.center.x + (elapsed * 43.0).sin() * amplitude;
+    camera.translation.y = camera_state.center.y + (elapsed * 31.0).cos() * amplitude;
 
     if shake.timer.is_finished() {
-        camera.translation.x = 0.0;
-        camera.translation.y = 0.0;
+        camera.translation.x = camera_state.center.x;
+        camera.translation.y = camera_state.center.y;
         if let Some(animation_id) = shake.animation_id.take() {
             animations.completed.insert(animation_id);
         }
@@ -3327,6 +3425,197 @@ pub fn animate_camera_shake(
             let _ = done.send(ScriptResponse::Continue);
         }
         shake_state.active = None;
+    }
+}
+
+fn start_camera_tween(
+    camera: &mut CameraState,
+    tweens: &mut CameraTweenState,
+    blur_intensity: Option<f32>,
+    zoom: Option<f32>,
+    center: Option<Vec2>,
+    duration: std::time::Duration,
+    ease: CharacterEase,
+    animation_id: Option<String>,
+    done: Option<mpsc::Sender<ScriptResponse>>,
+    animations: &mut AnimationState,
+) {
+    if duration.is_zero() {
+        if let Some(tween) = tweens.active.as_mut() {
+            cancel_camera_completions(
+                tween,
+                blur_intensity.is_some(),
+                zoom.is_some(),
+                center.is_some(),
+                animations,
+            );
+            if blur_intensity.is_some() {
+                tween.blur = None;
+            }
+            if zoom.is_some() {
+                tween.zoom = None;
+            }
+            if center.is_some() {
+                tween.center = None;
+            }
+        }
+        if let Some(blur_intensity) = blur_intensity {
+            camera.blur_intensity = blur_intensity;
+        }
+        if let Some(zoom) = zoom {
+            camera.zoom = zoom;
+        }
+        if let Some(center) = center {
+            camera.center = center;
+        }
+        complete_missing_animation(animations, animation_id, done);
+        return;
+    }
+
+    let tween = tweens.active.get_or_insert_with(|| CameraTween {
+        blur: None,
+        zoom: None,
+        center: None,
+        completions: Vec::new(),
+    });
+    cancel_camera_completions(
+        tween,
+        blur_intensity.is_some(),
+        zoom.is_some(),
+        center.is_some(),
+        animations,
+    );
+    if let Some(to) = blur_intensity {
+        tween.blur = Some(CameraScalarTween {
+            from: camera.blur_intensity,
+            to,
+            timer: Timer::new(duration, TimerMode::Once),
+            ease,
+        });
+    }
+    if let Some(to) = zoom {
+        tween.zoom = Some(CameraScalarTween {
+            from: camera.zoom,
+            to,
+            timer: Timer::new(duration, TimerMode::Once),
+            ease,
+        });
+    }
+    if let Some(to) = center {
+        tween.center = Some(CameraPositionTween {
+            from: camera.center,
+            to,
+            timer: Timer::new(duration, TimerMode::Once),
+            ease,
+        });
+    }
+    tween.completions.push(CameraTweenCompletion {
+        blur: blur_intensity.is_some(),
+        zoom: zoom.is_some(),
+        center: center.is_some(),
+        animation_id,
+        done,
+    });
+}
+
+fn cancel_camera_completions(
+    tween: &mut CameraTween,
+    blur: bool,
+    zoom: bool,
+    center: bool,
+    animations: &mut AnimationState,
+) {
+    let mut retained = Vec::new();
+    for completion in tween.completions.drain(..) {
+        if (blur && completion.blur) || (zoom && completion.zoom) || (center && completion.center) {
+            complete_missing_animation(animations, completion.animation_id, completion.done);
+        } else {
+            retained.push(completion);
+        }
+    }
+    tween.completions = retained;
+}
+
+pub fn animate_camera_transition(
+    time: Res<Time>,
+    mut animations: ResMut<AnimationState>,
+    mut camera_state: ResMut<CameraState>,
+    mut tweens: ResMut<CameraTweenState>,
+    mut camera: Query<(&mut Projection, &mut BlurSettings, &mut Transform), With<MainCamera>>,
+    mut screen_roots: Query<&mut UiTransform, With<ScreenUiRoot>>,
+) {
+    let Ok((mut projection, mut blur, mut transform)) = camera.single_mut() else {
+        return;
+    };
+
+    let mut completed = Vec::new();
+    if let Some(tween) = tweens.active.as_mut() {
+        if let Some(blur_tween) = tween.blur.as_mut() {
+            blur_tween.timer.tick(time.delta());
+            camera_state.blur_intensity = blur_tween.from.lerp(
+                blur_tween.to,
+                apply_character_ease(blur_tween.ease, tween_fraction(&blur_tween.timer)),
+            );
+        }
+        if let Some(zoom_tween) = tween.zoom.as_mut() {
+            zoom_tween.timer.tick(time.delta());
+            camera_state.zoom = zoom_tween.from.lerp(
+                zoom_tween.to,
+                apply_character_ease(zoom_tween.ease, tween_fraction(&zoom_tween.timer)),
+            );
+        }
+        if let Some(center_tween) = tween.center.as_mut() {
+            center_tween.timer.tick(time.delta());
+            camera_state.center = center_tween.from.lerp(
+                center_tween.to,
+                apply_character_ease(center_tween.ease, tween_fraction(&center_tween.timer)),
+            );
+        }
+
+        let blur_finished = tween
+            .blur
+            .as_ref()
+            .is_none_or(|tween| tween.timer.is_finished());
+        let zoom_finished = tween
+            .zoom
+            .as_ref()
+            .is_none_or(|tween| tween.timer.is_finished());
+        let center_finished = tween
+            .center
+            .as_ref()
+            .is_none_or(|tween| tween.timer.is_finished());
+        let mut pending = Vec::new();
+        for completion in tween.completions.drain(..) {
+            if (!completion.blur || blur_finished)
+                && (!completion.zoom || zoom_finished)
+                && (!completion.center || center_finished)
+            {
+                completed.push(completion);
+            } else {
+                pending.push(completion);
+            }
+        }
+        tween.completions = pending;
+    }
+    for completion in completed {
+        complete_missing_animation(&mut animations, completion.animation_id, completion.done);
+    }
+    if tweens
+        .active
+        .as_ref()
+        .is_some_and(|tween| tween.completions.is_empty())
+    {
+        tweens.active = None;
+    }
+
+    blur.set_radius(camera_state.blur_intensity);
+    if let Projection::Orthographic(projection) = projection.as_mut() {
+        projection.scale = 1.0 / camera_state.zoom.max(0.01);
+    }
+    transform.translation.x = camera_state.center.x;
+    transform.translation.y = camera_state.center.y;
+    for mut transform in &mut screen_roots {
+        transform.scale = Vec2::splat(camera_state.zoom);
     }
 }
 
@@ -4480,7 +4769,10 @@ pub fn cleanup_stale_screen_ui(
                 });
             }
             screen_state.active_root = Some(pending.entity);
-            screen_state.waiting = Some(pending.done);
+            screen_state.waiting = pending.done;
+            if let Some(shown) = pending.shown {
+                let _ = shown.send(ScriptResponse::Continue);
+            }
         } else {
             if screen_images_ready(&images, &pending.wait_images) {
                 commands
@@ -4529,6 +4821,7 @@ fn spawn_screen_ui(
         .spawn((
             ScreenUiRoot,
             ScreenUiNode,
+            UiTransform::IDENTITY,
             GlobalZIndex(SCREEN_ACTIVE_Z),
             screen_root_node(screen),
             screen_root_background(screen),

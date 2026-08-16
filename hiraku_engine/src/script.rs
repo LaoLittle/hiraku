@@ -16,7 +16,7 @@ use rand_pcg::Pcg32;
 use rhai::plugin::*;
 use rhai::{
     Array, Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, FLOAT, FnPtr, INT, ImmutableString,
-    Map, NativeCallContext, Position, Scope,
+    Map, Module, NativeCallContext, Position, Scope,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -126,11 +126,24 @@ pub enum ScriptCommand {
     ClearDialogue,
     SetTextEffect(DialogueTextEffectSpec),
     ResetTextEffect,
+    SetCamera {
+        blur_intensity: Option<f32>,
+        zoom: Option<f32>,
+        center: Option<Vec2>,
+        duration: Duration,
+        ease: CharacterEase,
+        animation_id: Option<String>,
+        done: Option<mpsc::Sender<ScriptResponse>>,
+    },
     ApplyUserSettings(UserSettings),
     ApplyUiStyle(UiStylePatch),
     ResetUiStyle,
     ShowScreen {
         screen: ScreenSpec,
+        shown: Option<mpsc::Sender<ScriptResponse>>,
+        done: Option<mpsc::Sender<ScriptResponse>>,
+    },
+    WaitForScreenChoice {
         done: mpsc::Sender<ScriptResponse>,
     },
     ShowOverlay {
@@ -1439,6 +1452,7 @@ fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
             | ScriptCommand::ClearDialogue
             | ScriptCommand::SetTextEffect(_)
             | ScriptCommand::ResetTextEffect
+            | ScriptCommand::SetCamera { .. }
             | ScriptCommand::ApplyUserSettings(_)
             | ScriptCommand::ApplyUiStyle(_)
             | ScriptCommand::ResetUiStyle
@@ -1478,11 +1492,16 @@ fn register_api(engine: &mut RhaiEngine, host: &ScriptHost) {
         .register_custom_operator("@", 160)
         .expect("@ must remain available for the character dialogue operator");
     engine.register_type_with_name::<hiraku_engine::CharacterFlow>("CharacterFlow");
+    engine.register_type_with_name::<hiraku_engine::CameraFlow>("CameraFlow");
+    engine.register_type_with_name::<hiraku_engine::CameraHandle>("CameraHandle");
     engine.register_global_module(exported_module!(hiraku_engine::HirakuEngine).into());
     engine.register_fn("@", hiraku_engine::character_say);
     engine.register_global_module(exported_module!(rng::RNG).into());
     engine.register_global_module(exported_module!(time::Time).into());
     engine.register_static_module("ui", exported_module!(ui::Ui).into());
+    let mut camera_module = Module::new();
+    camera_module.set_var("camera", hiraku_engine::camera(host.clone()));
+    engine.register_global_module(camera_module.into());
 }
 
 fn new_random_seed() -> u64 {
@@ -1540,12 +1559,14 @@ mod tests {
         let mut engine = RhaiEngine::new();
         engine.register_custom_operator("@", 160).unwrap();
         engine.register_type_with_name::<hiraku_engine::CharacterFlow>("CharacterFlow");
+        engine.register_type_with_name::<hiraku_engine::CameraFlow>("CameraFlow");
+        engine.register_type_with_name::<hiraku_engine::CameraHandle>("CameraHandle");
         engine.register_global_module(exported_module!(hiraku_engine::HirakuEngine).into());
         engine.register_fn("@", hiraku_engine::character_say);
 
         engine
             .compile(
-                "char(\"alice\").e(\"open_mouth\").e(\"happy_face\").at(\"left\") @ \"Hello\";",
+                "char(\"alice\").e(\"open_mouth\").e(\"happy_face\").at(\"left\") @ \"Hello\";\nchar(\"alice\").e(\"neutral\").finish();\ncamera.blur().duration(2).ease(\"ease_out\").finish();\ncamera.zoom(1.5).duration(1).zoom_at(1, 2);\npar(|| { camera.blur(0).duration(2).ease(\"ease_in\"); camera.zoom(1).duration(1).ease(\"bounce\"); });",
             )
             .unwrap();
     }
@@ -1564,6 +1585,9 @@ fn scope_to_stored_values(
 ) -> Result<BTreeMap<String, StoredValue>, Box<EvalAltResult>> {
     let mut values = BTreeMap::new();
     for (name, _, value) in scope.iter() {
+        if name == "camera" {
+            continue;
+        }
         values.insert(name.to_string(), dynamic_to_stored_value(value)?);
     }
     Ok(values)
