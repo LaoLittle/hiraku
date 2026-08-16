@@ -14,7 +14,7 @@ use bevy::{
 
 use crate::{
     character::{CharacterCatalog, CharacterPartDefinition, load_character_catalog},
-    effect::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
+    effect::custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
         ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse,
@@ -29,7 +29,7 @@ use crate::{
         read_user_settings, write_user_settings,
     },
     texture::{TextureAtlasCatalog, prepare_texture_atlases},
-    transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
+    effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     ui::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,

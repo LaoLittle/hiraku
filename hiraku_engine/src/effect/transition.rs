@@ -1,22 +1,9 @@
 use bevy::{
-    asset::{Handle, load_internal_asset, uuid_handle},
-    prelude::*,
-    reflect::TypePath,
-    render::render_resource::{AsBindGroup, ShaderType},
-    shader::{Shader, ShaderRef},
-    sprite_render::{AlphaMode2d, Material2d},
+    asset::{AssetPath, Handle}, prelude::*, reflect::TypePath, render::render_resource::{AsBindGroup, ShaderType}, shader::{Shader, ShaderRef}, sprite_render::{AlphaMode2d, Material2d},
 };
 
-pub const RULE_TRANSITION_SHADER_HANDLE: Handle<Shader> =
-    uuid_handle!("f0f375d4-0833-4924-bd99-0186ce8b2a10");
-
 pub fn load_internal_shaders(app: &mut App) {
-    load_internal_asset!(
-        app,
-        RULE_TRANSITION_SHADER_HANDLE,
-        "shaders/rule_transition_2d.wgsl",
-        Shader::from_wgsl
-    );
+    bevy::asset::embedded_asset!(app, "shaders/rule_transition_2d.wgsl");
 }
 
 #[derive(Resource, Clone)]
@@ -57,7 +44,7 @@ impl From<&RuleTransitionMaterial> for RuleTransitionUniform {
 
 impl Material2d for RuleTransitionMaterial {
     fn fragment_shader() -> ShaderRef {
-        RULE_TRANSITION_SHADER_HANDLE.into()
+        "embedded://hiraku_engine/effect/shaders/rule_transition_2d.wgsl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode2d {

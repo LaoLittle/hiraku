@@ -22,7 +22,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{
     character::load_character_catalog,
-    effect::CustomEffectOptions,
+    effect::custom::CustomEffectOptions,
     state::{
         ChoiceOption, RngState, SaveCheckpoint, SaveGameData, SavedInput, SceneSharedState,
         SceneSnapshot, ScriptPosition, StoredValue, UiStylePatch,

@@ -8,7 +8,6 @@ mod script;
 mod state;
 mod storage;
 mod texture;
-mod transition;
 mod ui;
 mod vfs;
 
@@ -22,7 +21,7 @@ use bevy::{
     prelude::*,
     sprite_render::Material2dPlugin,
 };
-use effect::CustomScreenEffectMaterial;
+use effect::custom::CustomScreenEffectMaterial;
 use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake,
     animate_character_motion_effects, animate_custom_effects, animate_dialogue_text_reveal,
@@ -36,7 +35,7 @@ use scene::{
 use script::{ScriptBootstrap, spawn_script_runtime};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
-use transition::RuleTransitionMaterial;
+use effect::transition::RuleTransitionMaterial;
 use vfs::{
     ASSET_SOURCE_ID, HDP_SOURCE_ID, VfsResource, WORKSPACE_SOURCE_ID, file_asset_source_builder,
     hdp_asset_source_builder, workspace_base_path,
@@ -103,8 +102,8 @@ impl Plugin for HirakuPlugin {
             Material2dPlugin::<CustomScreenEffectMaterial>::default(),
             Material2dPlugin::<RuleTransitionMaterial>::default(),
         ));
-        effect::load_internal_shaders(app);
-        transition::load_internal_shaders(app);
+        effect::custom::load_internal_shaders(app);
+        effect::transition::load_internal_shaders(app);
 
         app.init_asset::<RhaiScriptAsset>()
             .init_asset::<BytesAsset>()
