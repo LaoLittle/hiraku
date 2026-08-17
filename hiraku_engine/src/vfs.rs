@@ -1,14 +1,9 @@
 use std::{
-    fs::File,
     io::{Cursor, Read, Seek},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-use bevy::asset::io::file::FileAssetReader;
-#[cfg(target_arch = "wasm32")]
-use bevy::asset::io::wasm::HttpWasmAssetReader;
 use bevy::{
     asset::io::{AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, VecReader},
     prelude::*,
@@ -23,13 +18,9 @@ use crate::data::evaluate_rhai_map;
 pub const DEFAULT_ASSET_ROOT: &str = "assets";
 pub const DEFAULT_SETTINGS_PATH: &str = "hdp://main.hdp/settings.rhai";
 pub const DEFAULT_STARTUP_SCRIPT: &str = "hdp://main.hdp/startup.rhai";
-pub const ASSET_ROOT_PREFIX: &str = "assets:/";
 pub const RESOURCE_ROOT_PREFIX: &str = "res:/";
-pub const WORKSPACE_ROOT_PREFIX: &str = "workspace:/";
 pub const DEFAULT_RESOURCE_ROOT: &str = "hdp://main.hdp/";
 pub const HDP_SOURCE_ID: &str = "hdp";
-pub const ASSET_SOURCE_ID: &str = "assets";
-pub const WORKSPACE_SOURCE_ID: &str = "workspace";
 pub const DEFAULT_BACKGROUNDS_DIR: &str = "backgrounds";
 pub const DEFAULT_BGM_DIR: &str = "bgm";
 pub const DEFAULT_SOUNDEFFECTS_DIR: &str = "soundeffects";
@@ -39,24 +30,36 @@ pub const DEFAULT_FONTS_DIR: &str = "fonts";
 pub const DEFAULT_TEXTURES_DIR: &str = "textures";
 
 pub fn workspace_base_path() -> PathBuf {
-    #[cfg(target_arch = "wasm32")]
-    {
-        return PathBuf::from(".");
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    std::env::current_dir().unwrap_or_else(|_| FileAssetReader::get_base_path())
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 #[derive(Resource, Clone)]
 pub struct VfsResource(pub Arc<HdpVfs>);
+
+/// Archive bytes published by Bevy's asynchronous `HdpArchiveLoader`.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct HdpArchiveStore(Arc<RwLock<Option<Arc<[u8]>>>>);
+
+impl HdpArchiveStore {
+    pub fn replace(&self, bytes: Arc<[u8]>) {
+        *self.0.write().unwrap() = Some(bytes);
+    }
+
+    fn bytes(&self) -> Option<Arc<[u8]>> {
+        self.0.read().unwrap().clone()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.bytes().is_some()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HdpVfs {
     root: PathBuf,
     settings_path: String,
     default_startup_script: String,
-    embedded_archive: Option<Arc<[u8]>>,
+    archive_store: HdpArchiveStore,
 }
 
 #[derive(Debug, Error)]
@@ -191,21 +194,21 @@ impl HdpVfs {
             root: root.into(),
             settings_path: settings_path.into(),
             default_startup_script: default_startup_script.into(),
-            embedded_archive: None,
+            archive_store: HdpArchiveStore::default(),
         }
     }
 
-    pub fn new_with_config_and_archive(
+    pub fn new_with_config_and_store(
         root: impl Into<PathBuf>,
         settings_path: impl Into<String>,
         default_startup_script: impl Into<String>,
-        embedded_archive: Option<&'static [u8]>,
+        archive_store: HdpArchiveStore,
     ) -> Self {
         Self {
             root: root.into(),
             settings_path: settings_path.into(),
             default_startup_script: default_startup_script.into(),
-            embedded_archive: embedded_archive.map(Arc::from),
+            archive_store,
         }
     }
 
@@ -433,28 +436,7 @@ impl HdpVfs {
     }
 
     pub fn resolve_path(&self, base: Option<&str>, requested: &str) -> String {
-        if let Some(stripped) = requested.strip_prefix(ASSET_ROOT_PREFIX) {
-            return format!(
-                "{ASSET_SOURCE_ID}://{}",
-                normalize_relative_path(Path::new(stripped))
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            );
-        }
-
-        if let Some(stripped) = requested.strip_prefix(WORKSPACE_ROOT_PREFIX) {
-            return format!(
-                "{WORKSPACE_SOURCE_ID}://{}",
-                normalize_relative_path(Path::new(stripped))
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            );
-        }
-
-        if requested.starts_with("hdp://")
-            || requested.starts_with("assets://")
-            || requested.starts_with("workspace://")
-        {
+        if requested.starts_with("hdp://") {
             return normalize_virtual_asset_path(requested);
         }
 
@@ -524,35 +506,12 @@ impl HdpVfs {
     }
 
     pub fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
-        if let Some(stripped) = path.strip_prefix("assets://") {
-            let full_path = workspace_base_path()
-                .join(DEFAULT_ASSET_ROOT)
-                .join(stripped);
-            return std::fs::read(&full_path)
-                .map_err(|err| map_fs_not_found(err, full_path.display().to_string()));
-        }
-
-        if let Some(stripped) = path.strip_prefix("workspace://") {
-            let full_path = workspace_base_path().join(stripped);
-            return std::fs::read(&full_path)
-                .map_err(|err| map_fs_not_found(err, full_path.display().to_string()));
-        }
-
         if let Some((archive, entry)) = split_hdp_asset_path(path) {
-            if let Some(bytes) = &self.embedded_archive {
+            if let Some(bytes) = self.archive_store.bytes() {
                 return read_zip_entry(Cursor::new(bytes.as_ref()), &archive, &entry)
                     .map_err(|error| map_zip_not_found(error, format!("{archive}!{entry}")));
             }
-            let archive_path = self.root.join(&archive);
-            let file = File::open(&archive_path)
-                .map_err(|err| map_fs_not_found(err, archive_path.display().to_string()))?;
-            let mut zip_archive = ZipArchive::new(file)?;
-            let mut zip_file = zip_archive
-                .by_name(&entry)
-                .map_err(|err| map_zip_not_found(err, format!("{archive}!{entry}")))?;
-            let mut bytes = Vec::new();
-            zip_file.read_to_end(&mut bytes)?;
-            return Ok(bytes);
+            return Err(VfsError::NotFound(archive));
         }
 
         let full_path = self.root.join(path);
@@ -573,16 +532,8 @@ impl HdpVfs {
                 .map_err(reader_to_vfs_error);
         }
 
-        let (source, directory) = split_asset_source_uri(path)
-            .map(|(source, directory)| (Some(source), PathBuf::from(directory)))
-            .unwrap_or((None, PathBuf::from(path)));
-        let full_path = match source {
-            Some(ASSET_SOURCE_ID) => workspace_base_path()
-                .join(DEFAULT_ASSET_ROOT)
-                .join(&directory),
-            Some(WORKSPACE_SOURCE_ID) => workspace_base_path().join(&directory),
-            _ => self.root.join(&directory),
-        };
+        let directory = PathBuf::from(path);
+        let full_path = self.root.join(&directory);
         let mut paths = Vec::new();
         for entry in std::fs::read_dir(&full_path)
             .map_err(|err| map_fs_not_found(err, full_path.display().to_string()))?
@@ -596,17 +547,14 @@ impl HdpVfs {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| VfsError::NotFound(child.display().to_string()))?;
-            let path = match source {
-                Some(source) => format!("{source}://{}/{}", directory.to_string_lossy(), name),
-                None => self
-                    .root
-                    .join(&directory)
-                    .join(name)
-                    .strip_prefix(&self.root)
-                    .unwrap_or(child.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            };
+            let path = self
+                .root
+                .join(&directory)
+                .join(name)
+                .strip_prefix(&self.root)
+                .unwrap_or(child.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
             paths.push(path);
         }
         Ok(paths)
@@ -614,23 +562,10 @@ impl HdpVfs {
 
     pub fn list_files_recursive(&self, path: &str) -> Result<Vec<String>, VfsError> {
         if let Some((archive, entry)) = split_hdp_asset_path(path) {
-            if let Some(bytes) = &self.embedded_archive {
+            if let Some(bytes) = self.archive_store.bytes() {
                 return list_zip_files(Cursor::new(bytes.as_ref()), &archive, &entry);
             }
-            let archive_path = self.root.join(&archive);
-            let file = File::open(&archive_path)
-                .map_err(|err| map_fs_not_found(err, archive_path.display().to_string()))?;
-            let mut zip = ZipArchive::new(file)?;
-            let prefix = normalize_entry_prefix(&entry);
-            let mut paths = Vec::new();
-            for index in 0..zip.len() {
-                let zip_file = zip.by_index(index)?;
-                let name = zip_file.name();
-                if !name.ends_with('/') && name.starts_with(&prefix) {
-                    paths.push(format!("hdp://{archive}/{name}"));
-                }
-            }
-            return Ok(paths);
+            return Err(VfsError::NotFound(archive));
         }
 
         let full_path = self.root.join(path);
@@ -644,14 +579,11 @@ impl HdpVfs {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         };
 
-        let archive_path = self.root.join(&archive);
-        let items = if let Some(bytes) = &self.embedded_archive {
+        let items = if let Some(bytes) = self.archive_store.bytes() {
             list_zip_directory(Cursor::new(bytes.as_ref()), &archive, &entry)
                 .map_err(zip_to_reader_error)?
         } else {
-            let file =
-                File::open(&archive_path).map_err(|err| map_reader_fs_error(err, archive_path))?;
-            list_zip_directory(file, &archive, &entry).map_err(zip_to_reader_error)?
+            return Err(AssetReaderError::NotFound(PathBuf::from(archive)));
         };
         if items.is_empty() {
             Err(AssetReaderError::NotFound(path.to_path_buf()))
@@ -765,20 +697,12 @@ fn list_zip_directory<R: Read + Seek>(
 
 pub fn hdp_asset_source_builder(
     root: impl Into<String>,
-    embedded_archive: Option<&'static [u8]>,
+    archive_store: HdpArchiveStore,
 ) -> AssetSourceBuilder {
     let root = root.into();
-    AssetSourceBuilder::new(move || Box::new(HdpAssetReader::new(root.clone(), embedded_archive)))
-}
-
-pub fn file_asset_source_builder(root: impl Into<PathBuf>) -> AssetSourceBuilder {
-    let root = root.into();
-
-    #[cfg(target_arch = "wasm32")]
-    return AssetSourceBuilder::new(move || Box::new(HttpWasmAssetReader::new(root.clone())));
-
-    #[cfg(not(target_arch = "wasm32"))]
-    AssetSourceBuilder::new(move || Box::new(FileAssetReader::new(root.clone())))
+    AssetSourceBuilder::new(move || {
+        Box::new(HdpAssetReader::new(root.clone(), archive_store.clone()))
+    })
 }
 
 pub struct HdpAssetReader {
@@ -786,14 +710,14 @@ pub struct HdpAssetReader {
 }
 
 impl HdpAssetReader {
-    pub fn new(root: impl Into<String>, embedded_archive: Option<&'static [u8]>) -> Self {
+    pub fn new(root: impl Into<String>, archive_store: HdpArchiveStore) -> Self {
         let root = root.into();
         Self {
-            vfs: HdpVfs::new_with_config_and_archive(
-                workspace_base_path().join(&root),
+            vfs: HdpVfs::new_with_config_and_store(
+                PathBuf::from(root),
                 DEFAULT_SETTINGS_PATH,
                 DEFAULT_STARTUP_SCRIPT,
-                embedded_archive,
+                archive_store,
             ),
         }
     }
@@ -870,11 +794,6 @@ fn normalize_virtual_asset_path(path: &str) -> String {
         } else {
             format!("hdp://{archive}/{entry}")
         }
-    } else if let Some((source, path)) = split_asset_source_uri(path) {
-        let path = normalize_relative_path(Path::new(path))
-            .to_string_lossy()
-            .replace('\\', "/");
-        format!("{source}://{path}")
     } else {
         normalize_relative_path(Path::new(path))
             .to_string_lossy()
@@ -895,13 +814,6 @@ fn join_virtual_root(root: &str, requested: &str) -> String {
         } else {
             format!("hdp://{archive}/{entry}")
         }
-    } else if let Some((source, entry)) = split_asset_source_uri(root) {
-        let mut combined = PathBuf::from(entry);
-        combined.push(requested_path);
-        let path = normalize_relative_path(&combined)
-            .to_string_lossy()
-            .replace('\\', "/");
-        format!("{source}://{path}")
     } else {
         let mut combined = PathBuf::from(root);
         combined.push(requested_path);
@@ -923,18 +835,8 @@ fn normalize_resource_root_path(path: &str) -> String {
     }
 }
 
-fn split_asset_source_uri(raw: &str) -> Option<(&str, &str)> {
-    let (source, path) = raw.split_once("://")?;
-    (!source.is_empty() && !path.is_empty()).then_some((source, path))
-}
-
 fn is_explicit_asset_uri(path: &str) -> bool {
-    path.starts_with("hdp://")
-        || path.starts_with("assets://")
-        || path.starts_with("workspace://")
-        || path.starts_with(ASSET_ROOT_PREFIX)
-        || path.starts_with(WORKSPACE_ROOT_PREFIX)
-        || path.starts_with(RESOURCE_ROOT_PREFIX)
+    path.starts_with("hdp://") || path.starts_with(RESOURCE_ROOT_PREFIX)
 }
 
 fn normalize_reader_path(path: &str) -> String {
@@ -984,14 +886,6 @@ fn map_zip_not_found(error: ZipError, path: String) -> VfsError {
     }
 }
 
-fn map_reader_fs_error(error: std::io::Error, path: PathBuf) -> AssetReaderError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        AssetReaderError::NotFound(path)
-    } else {
-        AssetReaderError::from(error)
-    }
-}
-
 fn zip_to_reader_error(error: ZipError) -> AssetReaderError {
     match error {
         ZipError::FileNotFound => AssetReaderError::NotFound(PathBuf::new()),
@@ -1029,20 +923,12 @@ mod tests {
     use zip::{ZipWriter, write::SimpleFileOptions};
 
     #[test]
-    fn normalizes_bevy_asset_source_uris() {
+    fn normalizes_hdp_asset_source_uris() {
         let vfs = HdpVfs::new("assets");
 
         assert_eq!(
             vfs.resolve_path(None, "hdp://main.hdp/path/../bg.png"),
             "hdp://main.hdp/bg.png"
-        );
-        assert_eq!(
-            vfs.resolve_path(None, "assets:/images/bg.png"),
-            "assets://images/bg.png"
-        );
-        assert_eq!(
-            vfs.resolve_path(None, "workspace:/examples/demo.rhai"),
-            "workspace://examples/demo.rhai"
         );
     }
 
@@ -1107,7 +993,14 @@ mod tests {
         zip.write_all(b"hdp-test").unwrap();
         zip.finish().unwrap();
 
-        let vfs = HdpVfs::new(&root);
+        let store = HdpArchiveStore::default();
+        store.replace(Arc::from(std::fs::read(root.join("main.hdp")).unwrap()));
+        let vfs = HdpVfs::new_with_config_and_store(
+            &root,
+            DEFAULT_SETTINGS_PATH,
+            DEFAULT_STARTUP_SCRIPT,
+            store,
+        );
         assert_eq!(
             vfs.read_bytes("hdp://main.hdp/backgrounds/forest.png")
                 .unwrap(),

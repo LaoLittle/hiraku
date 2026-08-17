@@ -1,9 +1,59 @@
+use std::{io::Cursor, sync::Arc};
+
 use bevy::{
     asset::{AssetLoader, LoadContext, io::Reader},
     prelude::*,
     reflect::TypePath,
 };
 use thiserror::Error;
+use zip::{ZipArchive, result::ZipError};
+
+use crate::vfs::HdpArchiveStore;
+
+#[derive(Asset, TypePath, Debug, Clone)]
+pub struct HdpArchive;
+
+#[derive(TypePath)]
+pub struct HdpArchiveLoader {
+    store: HdpArchiveStore,
+}
+
+impl HdpArchiveLoader {
+    pub fn new(store: HdpArchiveStore) -> Self {
+        Self { store }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HdpArchiveLoaderError {
+    #[error("failed to read HDP archive: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid HDP archive: {0}")]
+    Zip(#[from] ZipError),
+}
+
+impl AssetLoader for HdpArchiveLoader {
+    type Asset = HdpArchive;
+    type Settings = ();
+    type Error = HdpArchiveLoaderError;
+
+    async fn load(
+        &self,
+        reader: &mut dyn Reader,
+        _settings: &Self::Settings,
+        _load_context: &mut LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        ZipArchive::new(Cursor::new(&bytes))?;
+        self.store.replace(Arc::from(bytes));
+        Ok(HdpArchive)
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["hdp"]
+    }
+}
 
 #[derive(Asset, TypePath, Debug, Clone)]
 #[expect(

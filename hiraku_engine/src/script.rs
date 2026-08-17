@@ -1604,6 +1604,7 @@ fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
             | ScriptCommand::ShowScreen { .. }
             | ScriptCommand::ShowOverlay { .. }
             | ScriptCommand::HideOverlay { .. }
+            | ScriptCommand::WaitForScreenChoice { .. }
             | ScriptCommand::Choose { .. }
             | ScriptCommand::ShowCharacter { .. }
             | ScriptCommand::HideCharacter { .. }
@@ -1685,6 +1686,14 @@ mod tests {
         let mut restored = rng_from_state_snapshot(&state);
 
         assert_eq!(rng.random::<u64>(), restored.random::<u64>());
+    }
+
+    #[test]
+    fn replay_suppresses_screen_choice_waits() {
+        let (done, _response) = mpsc::channel();
+        assert!(command_suppressed_during_replay(
+            &ScriptCommand::WaitForScreenChoice { done }
+        ));
     }
 
     #[test]
