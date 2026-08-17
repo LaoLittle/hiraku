@@ -33,6 +33,8 @@ use scene::{
     process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
     tick_animation_waits, tick_pending_waits, tick_script_batches,
 };
+#[cfg(target_arch = "wasm32")]
+use script::drive_web_script_runtime;
 use script::{ScriptBootstrap, spawn_script_runtime};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
@@ -50,6 +52,7 @@ pub struct RuntimeLaunchConfig {
     pub render_target: RenderTarget,
     pub camera_order: isize,
     pub camera_clear_color: ClearColorConfig,
+    pub embedded_asset_archive: Option<&'static [u8]>,
 }
 
 impl Default for RuntimeLaunchConfig {
@@ -62,6 +65,7 @@ impl Default for RuntimeLaunchConfig {
             render_target: RenderTarget::Window(bevy::window::WindowRef::Primary),
             camera_order: 0,
             camera_clear_color: ClearColorConfig::Default,
+            embedded_asset_archive: None,
         }
     }
 }
@@ -81,7 +85,7 @@ impl Plugin for HirakuAssetSourcePlugin {
         let config = app.world().resource::<RuntimeLaunchConfig>().clone();
         app.register_asset_source(
             AssetSourceId::Name(HDP_SOURCE_ID.into()),
-            hdp_asset_source_builder(config.asset_root),
+            hdp_asset_source_builder(config.asset_root, config.embedded_asset_archive),
         );
         app.register_asset_source(
             AssetSourceId::Name(ASSET_SOURCE_ID.into()),
@@ -158,6 +162,12 @@ impl Plugin for HirakuPlugin {
                     sync_scene_snapshot,
                 ),
             );
+
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(
+            Update,
+            drive_web_script_runtime.before(process_script_commands),
+        );
     }
 }
 
@@ -169,10 +179,11 @@ impl Plugin for HirakuPlugin {
 pub fn configure_runtime_app(app: &mut App, config: RuntimeLaunchConfig) {
     let base_path = workspace_base_path();
     let asset_root_path = base_path.join(&config.asset_root);
-    let vfs = Arc::new(vfs::HdpVfs::new_with_config(
+    let vfs = Arc::new(vfs::HdpVfs::new_with_config_and_archive(
         asset_root_path,
         config.settings_path.clone(),
         config.default_startup_script.clone(),
+        config.embedded_asset_archive,
     ));
 
     app.insert_resource(config);

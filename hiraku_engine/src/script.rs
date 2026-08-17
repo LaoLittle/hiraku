@@ -2,9 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
-    thread,
     time::Duration,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
 
 use bevy::{
     log::error,
@@ -52,6 +54,7 @@ const SAVE_SCRIPT_SIGNAL: &str = "__hiraku_save_script__::";
 const RETURN_SCRIPT_SIGNAL: &str = "__hiraku_return_script__";
 const RETURN_TO_TITLE_SIGNAL: &str = "__hiraku_return_to_title__";
 const ENGINE_STOPPED_SIGNAL: &str = "__hiraku_engine_stopped__";
+const WEB_RUNTIME_YIELD_SIGNAL: &str = "__hiraku_web_runtime_yield__";
 
 enum InlineDialogueChunk {
     Text(String),
@@ -534,6 +537,24 @@ pub struct ScriptRuntimeState {
     pub save_root: PathBuf,
 }
 
+/// WebAssembly cannot block while Bevy processes a pending script command.
+/// The next evaluation replays already completed responses before continuing.
+struct WebScriptExecution {
+    responses: Vec<ScriptResponse>,
+    cursor: usize,
+    pending: Option<mpsc::Receiver<ScriptResponse>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource)]
+pub struct WebScriptRuntime {
+    host: ScriptHost,
+    startup_scope: BTreeMap<String, StoredValue>,
+    execution: Arc<Mutex<WebScriptExecution>>,
+    started: bool,
+    finished: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CheckpointState {
     pub current: Option<SaveCheckpoint>,
@@ -615,6 +636,7 @@ struct ScriptHost {
     character_expressions: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     inline_dialogue_control: Arc<Mutex<InlineDialogueControl>>,
     save_root: PathBuf,
+    web_execution: Option<Arc<Mutex<WebScriptExecution>>>,
 }
 
 #[derive(Default)]
@@ -657,7 +679,22 @@ impl ScriptHost {
     }
 
     fn set_current_script_path(&self, path: impl Into<String>) {
-        *self.current_script.lock().unwrap() = path.into();
+        let path = path.into();
+        let changed = {
+            let mut current = self.current_script.lock().unwrap();
+            if *current == path {
+                false
+            } else {
+                *current = path;
+                true
+            }
+        };
+
+        if changed && let Some(execution) = &self.web_execution {
+            let mut execution = execution.lock().unwrap();
+            execution.responses.clear();
+            execution.cursor = 0;
+        }
     }
 
     fn reset_script_checkpoint_counter(&self) {
@@ -700,6 +737,10 @@ impl ScriptHost {
 
     fn is_replaying(&self) -> bool {
         self.checkpoint.lock().unwrap().replay.is_some()
+            || self.web_execution.as_ref().is_some_and(|execution| {
+                let execution = execution.lock().unwrap();
+                execution.cursor < execution.responses.len()
+            })
     }
 
     fn replay_input(&self, expected_kind: &str) -> Result<StoredValue, Box<EvalAltResult>> {
@@ -792,7 +833,7 @@ impl ScriptHost {
     {
         let (done_tx, done_rx) = mpsc::channel();
         self.send(builder(done_tx))?;
-        done_rx.recv().map_err(|_| engine_stopped_signal())
+        self.wait_for_response(done_rx)
     }
 
     fn send_continue<F>(&self, builder: F) -> Result<(), Box<EvalAltResult>>
@@ -801,17 +842,39 @@ impl ScriptHost {
     {
         let (done_tx, done_rx) = mpsc::channel();
         let command = builder(done_tx);
-        if self.is_replaying() && command_suppressed_during_replay(&command) {
+        if self.web_execution.is_none()
+            && self.is_replaying()
+            && command_suppressed_during_replay(&command)
+        {
             return Ok(());
         }
 
         self.send(command)?;
-        match done_rx.recv().map_err(|_| engine_stopped_signal())? {
+        match self.wait_for_response(done_rx)? {
             ScriptResponse::Continue => Ok(()),
             ScriptResponse::Choice(_) => {
                 Err(runtime_error("engine returned unexpected choice response"))
             }
         }
+    }
+
+    fn wait_for_response(
+        &self,
+        done_rx: mpsc::Receiver<ScriptResponse>,
+    ) -> Result<ScriptResponse, Box<EvalAltResult>> {
+        let Some(execution) = &self.web_execution else {
+            return done_rx.recv().map_err(|_| engine_stopped_signal());
+        };
+
+        let mut execution = execution.lock().unwrap();
+        if execution.cursor < execution.responses.len() {
+            let response = execution.responses[execution.cursor].clone();
+            execution.cursor += 1;
+            return Ok(response);
+        }
+
+        execution.pending = Some(done_rx);
+        Err(web_runtime_yield_signal())
     }
 
     fn set_dialogue(&self, speaker: String, text: String) -> Result<(), Box<EvalAltResult>> {
@@ -1306,6 +1369,7 @@ pub fn spawn_script_runtime(
         character_expressions,
         inline_dialogue_control,
         save_root: save_root_path(),
+        web_execution: None,
     };
 
     commands.insert_resource(ScriptRuntimeState {
@@ -1319,12 +1383,84 @@ pub fn spawn_script_runtime(
         save_root: host.save_root.clone(),
     });
 
+    #[cfg(not(target_arch = "wasm32"))]
     let startup_script = bootstrap.startup_script;
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        let execution = Arc::new(Mutex::new(WebScriptExecution {
+            responses: Vec::new(),
+            cursor: 0,
+            pending: None,
+        }));
+        let mut host = host;
+        host.web_execution = Some(execution.clone());
+        commands.insert_resource(WebScriptRuntime {
+            host,
+            startup_scope,
+            execution,
+            started: false,
+            finished: false,
+        });
+        return;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     thread::Builder::new()
         .name("hiraku-rhai".to_string())
         .spawn(move || run_script_loop(host, startup_script, startup_scope))
         .expect("failed to spawn script runtime thread");
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn drive_web_script_runtime(runtime: Option<bevy::prelude::ResMut<WebScriptRuntime>>) {
+    let Some(mut runtime) = runtime else {
+        return;
+    };
+    if runtime.finished {
+        return;
+    }
+
+    let execution_handle = runtime.execution.clone();
+    let should_run = {
+        let mut execution = execution_handle.lock().unwrap();
+        if !runtime.started {
+            runtime.started = true;
+            true
+        } else {
+            let Some(pending) = execution.pending.as_ref() else {
+                return;
+            };
+            match pending.try_recv() {
+                Ok(response) => {
+                    execution.responses.push(response);
+                    execution.pending = None;
+                    true
+                }
+                Err(mpsc::TryRecvError::Empty) => false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    error!("script runtime stopped while waiting for an ECS response");
+                    runtime.finished = true;
+                    false
+                }
+            }
+        }
+    };
+
+    if !should_run {
+        return;
+    }
+
+    runtime.execution.lock().unwrap().cursor = 0;
+    let startup_script = runtime.host.current_script_path();
+    if run_script_loop(
+        runtime.host.clone(),
+        startup_script,
+        runtime.startup_scope.clone(),
+    ) == ScriptLoopOutcome::Finished
+    {
+        runtime.finished = true;
+    }
 }
 
 pub fn save_runtime_slot(
@@ -1358,11 +1494,17 @@ pub fn save_runtime_slot_with_scope(
     write_save_data_to_root(&runtime_state.save_root, slot, &data)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptLoopOutcome {
+    Finished,
+    Yielded,
+}
+
 fn run_script_loop(
     host: ScriptHost,
     startup_script: String,
     startup_scope: BTreeMap<String, StoredValue>,
-) {
+) -> ScriptLoopOutcome {
     let mut engine = RhaiEngine::new();
     register_api(&mut engine, &host);
 
@@ -1377,14 +1519,17 @@ fn run_script_loop(
             Ok(source) => source,
             Err(err) => {
                 error!("failed to read script `{}`: {err}", next_script);
-                return;
+                return ScriptLoopOutcome::Finished;
             }
         };
 
         let source = format!("{PRELUDE_SOURCE}\n{source}");
         match engine.eval_with_scope::<Dynamic>(&mut scope, &source) {
-            Ok(_) => return,
+            Ok(_) => return ScriptLoopOutcome::Finished,
             Err(err) => {
+                if is_web_runtime_yield(err.as_ref()) {
+                    return ScriptLoopOutcome::Yielded;
+                }
                 if let Some(action) = extract_script_flow_action(err.as_ref()) {
                     match action {
                         ScriptFlowAction::Jump(target) => {
@@ -1408,10 +1553,10 @@ fn run_script_loop(
                             match scope_to_stored_values(&scope).and_then(|scope| {
                                 host.save_game_with_scope(&slot, resume_script, scope)
                             }) {
-                                Ok(()) => return,
+                                Ok(()) => return ScriptLoopOutcome::Finished,
                                 Err(err) => {
                                     error!("script `{}` failed to save: {err}", next_script);
-                                    return;
+                                    return ScriptLoopOutcome::Finished;
                                 }
                             }
                         }
@@ -1421,18 +1566,18 @@ fn run_script_loop(
                                     "script `{}` tried to return with an empty call stack",
                                     next_script
                                 );
-                                return;
+                                return ScriptLoopOutcome::Finished;
                             };
                             next_script = target;
                             continue;
                         }
-                        ScriptFlowAction::ReturnToTitle => return,
-                        ScriptFlowAction::EngineStopped => return,
+                        ScriptFlowAction::ReturnToTitle => return ScriptLoopOutcome::Finished,
+                        ScriptFlowAction::EngineStopped => return ScriptLoopOutcome::Finished,
                     }
                 }
 
                 error!("script `{}` failed: {err}", next_script);
-                return;
+                return ScriptLoopOutcome::Finished;
             }
         }
     }
@@ -1509,10 +1654,7 @@ fn new_random_seed() -> u64 {
 }
 
 fn new_time_seed() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    ::time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
 fn rng_state_snapshot(rng: &Pcg32) -> RngState {
@@ -1602,6 +1744,18 @@ fn extract_script_flow_action(error: &EvalAltResult) -> Option<ScriptFlowAction>
     }
 }
 
+fn is_web_runtime_yield(error: &EvalAltResult) -> bool {
+    match error {
+        EvalAltResult::ErrorRuntime(value, _) => value
+            .clone()
+            .try_cast::<ImmutableString>()
+            .is_some_and(|value| value == WEB_RUNTIME_YIELD_SIGNAL),
+        EvalAltResult::ErrorInFunctionCall(_, _, inner, _)
+        | EvalAltResult::ErrorInModule(_, inner, _) => is_web_runtime_yield(inner),
+        _ => false,
+    }
+}
+
 fn extract_signal_string(value: &Dynamic) -> Option<ScriptFlowAction> {
     if !value.is_string() {
         return None;
@@ -1678,6 +1832,13 @@ fn return_to_title_signal() -> Box<EvalAltResult> {
 fn engine_stopped_signal() -> Box<EvalAltResult> {
     Box::new(EvalAltResult::ErrorRuntime(
         ENGINE_STOPPED_SIGNAL.into(),
+        Position::NONE,
+    ))
+}
+
+fn web_runtime_yield_signal() -> Box<EvalAltResult> {
+    Box::new(EvalAltResult::ErrorRuntime(
+        WEB_RUNTIME_YIELD_SIGNAL.into(),
         Position::NONE,
     ))
 }
@@ -2424,9 +2585,7 @@ where
         let (done_tx, done_rx) = mpsc::channel();
         host.set_inline_current_handle(Some(handle.clone()));
         host.send(build(Some(handle), Some(done_tx)))?;
-        let response = done_rx.recv().map_err(|err| {
-            runtime_error(format!("engine stopped while waiting for command: {err}"))
-        });
+        let response = host.wait_for_response(done_rx);
         host.set_inline_current_handle(None);
         match response? {
             ScriptResponse::Continue => Ok(Dynamic::UNIT),

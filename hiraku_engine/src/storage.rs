@@ -81,36 +81,52 @@ pub fn save_root_path() -> PathBuf {
 }
 
 pub fn read_user_settings() -> Result<UserSettings, StorageError> {
-    let path = workspace_base_path().join(USER_SETTINGS_PATH);
-    match fs::read_to_string(path) {
-        Ok(payload) => {
-            let data = evaluate_rhai_map(USER_SETTINGS_PATH, &payload)
-                .map_err(|error| StorageError::RhaiData(error.to_string()))?;
-            let settings = rhai::serde::from_dynamic::<UserSettingsFile>(&Dynamic::from_map(data))
-                .map_err(|error| StorageError::RhaiData(error.to_string()))?;
-            Ok(UserSettings {
-                bgm_volume: settings.bgm_volume as f32,
-                voice_volume: settings.voice_volume as f32,
-                sfx_volume: settings.sfx_volume as f32,
-            })
+    #[cfg(target_arch = "wasm32")]
+    return Ok(UserSettings::default());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let path = workspace_base_path().join(USER_SETTINGS_PATH);
+        match fs::read_to_string(path) {
+            Ok(payload) => {
+                let data = evaluate_rhai_map(USER_SETTINGS_PATH, &payload)
+                    .map_err(|error| StorageError::RhaiData(error.to_string()))?;
+                let settings =
+                    rhai::serde::from_dynamic::<UserSettingsFile>(&Dynamic::from_map(data))
+                        .map_err(|error| StorageError::RhaiData(error.to_string()))?;
+                Ok(UserSettings {
+                    bgm_volume: settings.bgm_volume as f32,
+                    voice_volume: settings.voice_volume as f32,
+                    sfx_volume: settings.sfx_volume as f32,
+                })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(UserSettings::default()),
+            Err(err) => Err(StorageError::Io(err)),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(UserSettings::default()),
-        Err(err) => Err(StorageError::Io(err)),
     }
 }
 
 pub fn write_user_settings(settings: &UserSettings) -> Result<(), StorageError> {
-    let path = workspace_base_path().join(USER_SETTINGS_PATH);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = settings;
+        return Ok(());
     }
 
-    let payload = format!(
-        "#{{\n    bgm_volume: {:?},\n    voice_volume: {:?},\n    sfx_volume: {:?},\n}}\n",
-        settings.bgm_volume, settings.voice_volume, settings.sfx_volume
-    );
-    fs::write(path, payload)?;
-    Ok(())
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let path = workspace_base_path().join(USER_SETTINGS_PATH);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let payload = format!(
+            "#{{\n    bgm_volume: {:?},\n    voice_volume: {:?},\n    sfx_volume: {:?},\n}}\n",
+            settings.bgm_volume, settings.voice_volume, settings.sfx_volume
+        );
+        fs::write(path, payload)?;
+        Ok(())
+    }
 }
 
 pub fn load_save_data(slot: &str) -> Result<SaveGameData, StorageError> {
@@ -143,42 +159,48 @@ fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
 }
 
 pub fn list_save_slots() -> Result<Vec<SaveSlotSummary>, StorageError> {
-    let root = save_root_path();
-    let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(StorageError::Io(err)),
-    };
+    #[cfg(target_arch = "wasm32")]
+    return Ok(Vec::new());
 
-    let mut slots = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some(SAVE_EXTENSION) {
-            continue;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let root = save_root_path();
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(StorageError::Io(err)),
+        };
+
+        let mut slots = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some(SAVE_EXTENSION) {
+                continue;
+            }
+
+            let Some(slot) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+
+            let Ok(payload) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(data) = decode_save_data(&payload) else {
+                continue;
+            };
+
+            slots.push(SaveSlotSummary {
+                slot: slot.to_string(),
+                resume_script: data.resume_script,
+                route: global_string(&data.globals, "route"),
+                background: data.scene.background.map(|background| background.path),
+            });
         }
 
-        let Some(slot) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
-        };
-
-        let Ok(payload) = fs::read(&path) else {
-            continue;
-        };
-        let Ok(data) = decode_save_data(&payload) else {
-            continue;
-        };
-
-        slots.push(SaveSlotSummary {
-            slot: slot.to_string(),
-            resume_script: data.resume_script,
-            route: global_string(&data.globals, "route"),
-            background: data.scene.background.map(|background| background.path),
-        });
+        slots.sort_by(|left, right| right.slot.cmp(&left.slot));
+        Ok(slots)
     }
-
-    slots.sort_by(|left, right| right.slot.cmp(&left.slot));
-    Ok(slots)
 }
 
 pub fn slot_path_in(root: &Path, slot: &str) -> Result<PathBuf, StorageError> {

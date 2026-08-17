@@ -1,20 +1,18 @@
 use std::{
     fs::File,
-    io::Read,
+    io::{Cursor, Read, Seek},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
-use bevy::{
-    asset::io::{
-        AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, VecReader,
-    },
-    prelude::*,
-};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::asset::io::file::FileAssetReader;
 #[cfg(target_arch = "wasm32")]
 use bevy::asset::io::wasm::HttpWasmAssetReader;
+use bevy::{
+    asset::io::{AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, VecReader},
+    prelude::*,
+};
 use futures_lite::stream;
 use rhai::Map;
 use thiserror::Error;
@@ -58,6 +56,7 @@ pub struct HdpVfs {
     root: PathBuf,
     settings_path: String,
     default_startup_script: String,
+    embedded_archive: Option<Arc<[u8]>>,
 }
 
 #[derive(Debug, Error)]
@@ -192,6 +191,21 @@ impl HdpVfs {
             root: root.into(),
             settings_path: settings_path.into(),
             default_startup_script: default_startup_script.into(),
+            embedded_archive: None,
+        }
+    }
+
+    pub fn new_with_config_and_archive(
+        root: impl Into<PathBuf>,
+        settings_path: impl Into<String>,
+        default_startup_script: impl Into<String>,
+        embedded_archive: Option<&'static [u8]>,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            settings_path: settings_path.into(),
+            default_startup_script: default_startup_script.into(),
+            embedded_archive: embedded_archive.map(Arc::from),
         }
     }
 
@@ -525,6 +539,10 @@ impl HdpVfs {
         }
 
         if let Some((archive, entry)) = split_hdp_asset_path(path) {
+            if let Some(bytes) = &self.embedded_archive {
+                return read_zip_entry(Cursor::new(bytes.as_ref()), &archive, &entry)
+                    .map_err(|error| map_zip_not_found(error, format!("{archive}!{entry}")));
+            }
             let archive_path = self.root.join(&archive);
             let file = File::open(&archive_path)
                 .map_err(|err| map_fs_not_found(err, archive_path.display().to_string()))?;
@@ -596,6 +614,9 @@ impl HdpVfs {
 
     pub fn list_files_recursive(&self, path: &str) -> Result<Vec<String>, VfsError> {
         if let Some((archive, entry)) = split_hdp_asset_path(path) {
+            if let Some(bytes) = &self.embedded_archive {
+                return list_zip_files(Cursor::new(bytes.as_ref()), &archive, &entry);
+            }
             let archive_path = self.root.join(&archive);
             let file = File::open(&archive_path)
                 .map_err(|err| map_fs_not_found(err, archive_path.display().to_string()))?;
@@ -624,47 +645,19 @@ impl HdpVfs {
         };
 
         let archive_path = self.root.join(&archive);
-        let file =
-            File::open(&archive_path).map_err(|err| map_reader_fs_error(err, archive_path))?;
-        let mut zip = ZipArchive::new(file).map_err(zip_to_reader_error)?;
-        let directory_prefix = normalize_entry_prefix(&entry);
-        let mut items = Vec::new();
-
-        for index in 0..zip.len() {
-            let zip_file = zip.by_index(index).map_err(zip_to_reader_error)?;
-            let name = zip_file.name();
-
-            if !name.starts_with(&directory_prefix) {
-                continue;
-            }
-
-            let remainder = &name[directory_prefix.len()..];
-            if remainder.is_empty() {
-                continue;
-            }
-
-            let child_name = remainder.split('/').next().unwrap_or_default();
-            if child_name.is_empty() {
-                continue;
-            }
-
-            let child_path = if entry.is_empty() {
-                format!("{archive}/{child_name}")
-            } else {
-                format!("{archive}/{entry}/{child_name}")
-            };
-
-            let child_path = PathBuf::from(normalize_reader_path(&child_path));
-            if !items.contains(&child_path) {
-                items.push(child_path);
-            }
-        }
-
+        let items = if let Some(bytes) = &self.embedded_archive {
+            list_zip_directory(Cursor::new(bytes.as_ref()), &archive, &entry)
+                .map_err(zip_to_reader_error)?
+        } else {
+            let file =
+                File::open(&archive_path).map_err(|err| map_reader_fs_error(err, archive_path))?;
+            list_zip_directory(file, &archive, &entry).map_err(zip_to_reader_error)?
+        };
         if items.is_empty() {
-            return Err(AssetReaderError::NotFound(path.to_path_buf()));
+            Err(AssetReaderError::NotFound(path.to_path_buf()))
+        } else {
+            Ok(items)
         }
-
-        Ok(items)
     }
 
     fn is_virtual_directory(&self, path: &Path) -> Result<bool, AssetReaderError> {
@@ -700,9 +693,82 @@ fn collect_files_recursive(
     Ok(())
 }
 
-pub fn hdp_asset_source_builder(root: impl Into<String>) -> AssetSourceBuilder {
+fn read_zip_entry<R: Read + Seek>(
+    reader: R,
+    _archive: &str,
+    entry: &str,
+) -> Result<Vec<u8>, ZipError> {
+    let mut zip = ZipArchive::new(reader)?;
+    let mut file = zip.by_name(entry)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn list_zip_files<R: Read + Seek>(
+    reader: R,
+    archive: &str,
+    entry: &str,
+) -> Result<Vec<String>, VfsError> {
+    let mut zip = ZipArchive::new(reader)?;
+    let prefix = normalize_entry_prefix(entry);
+    let mut paths = Vec::new();
+    for index in 0..zip.len() {
+        let zip_file = zip.by_index(index)?;
+        let name = zip_file.name();
+        if !name.ends_with('/') && name.starts_with(&prefix) {
+            paths.push(format!("hdp://{archive}/{name}"));
+        }
+    }
+    Ok(paths)
+}
+
+fn list_zip_directory<R: Read + Seek>(
+    reader: R,
+    archive: &str,
+    entry: &str,
+) -> Result<Vec<PathBuf>, ZipError> {
+    let mut zip = ZipArchive::new(reader)?;
+    let directory_prefix = normalize_entry_prefix(entry);
+    let mut items = Vec::new();
+
+    for index in 0..zip.len() {
+        let zip_file = zip.by_index(index)?;
+        let name = zip_file.name();
+        if !name.starts_with(&directory_prefix) {
+            continue;
+        }
+
+        let remainder = &name[directory_prefix.len()..];
+        if remainder.is_empty() {
+            continue;
+        }
+
+        let child_name = remainder.split('/').next().unwrap_or_default();
+        if child_name.is_empty() {
+            continue;
+        }
+
+        let child_path = if entry.is_empty() {
+            format!("{archive}/{child_name}")
+        } else {
+            format!("{archive}/{entry}/{child_name}")
+        };
+        let child_path = PathBuf::from(normalize_reader_path(&child_path));
+        if !items.contains(&child_path) {
+            items.push(child_path);
+        }
+    }
+
+    Ok(items)
+}
+
+pub fn hdp_asset_source_builder(
+    root: impl Into<String>,
+    embedded_archive: Option<&'static [u8]>,
+) -> AssetSourceBuilder {
     let root = root.into();
-    AssetSourceBuilder::new(move || Box::new(HdpAssetReader::new(root.clone())))
+    AssetSourceBuilder::new(move || Box::new(HdpAssetReader::new(root.clone(), embedded_archive)))
 }
 
 pub fn file_asset_source_builder(root: impl Into<PathBuf>) -> AssetSourceBuilder {
@@ -720,10 +786,15 @@ pub struct HdpAssetReader {
 }
 
 impl HdpAssetReader {
-    pub fn new(root: impl Into<String>) -> Self {
+    pub fn new(root: impl Into<String>, embedded_archive: Option<&'static [u8]>) -> Self {
         let root = root.into();
         Self {
-            vfs: HdpVfs::new(workspace_base_path().join(&root)),
+            vfs: HdpVfs::new_with_config_and_archive(
+                workspace_base_path().join(&root),
+                DEFAULT_SETTINGS_PATH,
+                DEFAULT_STARTUP_SCRIPT,
+                embedded_archive,
+            ),
         }
     }
 
