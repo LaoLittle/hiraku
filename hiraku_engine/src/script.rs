@@ -42,10 +42,18 @@ use crate::{
     vfs::{HdpVfs, VfsError},
 };
 
+mod compiler;
 mod hiraku_engine;
+mod ir;
 mod rng;
 mod time;
 mod ui;
+
+pub use compiler::{IrCompileError, compile_to_ir};
+pub use ir::{
+    IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram, IrRuntime, IrValidationError,
+    IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
+};
 
 const PRELUDE_SOURCE: &str = include_str!("script/prelude.rhai");
 

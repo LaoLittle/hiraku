@@ -39,7 +39,11 @@ use scene::{
 };
 #[cfg(target_arch = "wasm32")]
 use script::drive_web_script_runtime;
-use script::{ScriptBootstrap, spawn_script_runtime};
+pub use script::{
+    IrCommand, IrCompileError, IrEvent, IrExpressionId, IrInstruction, IrProgram,
+    IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, compile_to_ir,
+};
+use script::{IrRuntime, ScriptBootstrap, spawn_script_runtime, tick_ir_runtime};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
@@ -120,6 +124,7 @@ impl Plugin for HirakuPlugin {
             .init_asset::<BytesAsset>()
             .init_asset::<TextureAtlasLayout>()
             .init_resource::<texture::TextureAtlasCatalog>()
+            .init_resource::<IrRuntime>()
             .init_resource::<script::InlineDialogueControlResource>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<RhaiScriptAssetLoader>()
@@ -140,6 +145,7 @@ impl Plugin for HirakuPlugin {
                     .run_if(texture_atlases_ready),
             )
             .add_systems(Update, process_script_commands.in_set(HirakuRuntimeSystems))
+            .add_systems(Update, tick_ir_runtime.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
                 animate_camera_transition

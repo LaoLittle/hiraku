@@ -11,7 +11,7 @@ futures-lite.workspace = true
 prost.workspace = true
 rand.workspace = true
 rand_pcg.workspace = true
-rhai.workspace = true
+rhai = { workspace = true, features = ["internals"] }
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
