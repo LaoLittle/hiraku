@@ -23,6 +23,7 @@ use rhai::{
 use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{
+    audio::{AudioCatalog, load_audio_catalog},
     character::load_character_catalog,
     effect::custom::CustomEffectOptions,
     state::{
@@ -91,6 +92,7 @@ pub enum ScriptCommand {
     ShowSprite {
         id: String,
         path: String,
+        rect: Option<[f32; 4]>,
         position: Vec2,
         layer: f32,
         scale: f32,
@@ -621,6 +623,7 @@ impl ScriptBootstrap {
 struct ScriptHost {
     vfs: Arc<HdpVfs>,
     textures: Arc<TextureCatalog>,
+    audio: Arc<AudioCatalog>,
     command_tx: mpsc::Sender<ScriptCommand>,
     current_script: Arc<Mutex<String>>,
     script_stack: Arc<Mutex<Vec<String>>>,
@@ -795,26 +798,6 @@ impl ScriptHost {
     fn resolve_path(&self, requested: &str) -> String {
         self.vfs
             .resolve_path(Some(&self.current_script_path()), requested)
-    }
-
-    fn resolve_background_path(&self, requested: &str) -> Result<String, VfsError> {
-        self.vfs
-            .resolve_background_path(Some(&self.current_script_path()), requested)
-    }
-
-    fn resolve_bgm_path(&self, requested: &str) -> Result<String, VfsError> {
-        self.vfs
-            .resolve_bgm_path(Some(&self.current_script_path()), requested)
-    }
-
-    fn resolve_soundeffect_path(&self, requested: &str) -> Result<String, VfsError> {
-        self.vfs
-            .resolve_soundeffect_path(Some(&self.current_script_path()), requested)
-    }
-
-    fn resolve_voice_path(&self, requested: &str) -> Result<String, VfsError> {
-        self.vfs
-            .resolve_voice_path(Some(&self.current_script_path()), requested)
     }
 
     fn send(&self, command: ScriptCommand) -> Result<(), Box<EvalAltResult>> {
@@ -1298,6 +1281,37 @@ impl ScriptHost {
             rect: texture.rect,
         })
     }
+
+    fn resolve_image_path(&self, name: &str) -> Result<String, Box<EvalAltResult>> {
+        let texture = self.resolve_texture(name)?;
+        if texture.rect.is_some() {
+            return Err(runtime_error(format!(
+                "texture `{name}` is an atlas region and cannot be used where a full image is required"
+            )));
+        }
+        Ok(texture.path)
+    }
+
+    fn resolve_music(&self, name: &str) -> Result<String, Box<EvalAltResult>> {
+        self.audio
+            .resolve_music(name)
+            .map(|audio| audio.path.clone())
+            .ok_or_else(|| runtime_error(format!("music `{name}` is not defined")))
+    }
+
+    fn resolve_voice(&self, name: &str) -> Result<String, Box<EvalAltResult>> {
+        self.audio
+            .resolve_voice(name)
+            .map(|audio| audio.path.clone())
+            .ok_or_else(|| runtime_error(format!("voice `{name}` is not defined")))
+    }
+
+    fn resolve_sfx(&self, name: &str) -> Result<String, Box<EvalAltResult>> {
+        self.audio
+            .resolve_sfx(name)
+            .map(|audio| audio.path.clone())
+            .ok_or_else(|| runtime_error(format!("sfx `{name}` is not defined")))
+    }
 }
 
 pub fn spawn_script_runtime(
@@ -1311,6 +1325,13 @@ pub fn spawn_script_runtime(
         Err(err) => {
             error!("failed to load texture catalog: {err}");
             Arc::new(TextureCatalog::default())
+        }
+    };
+    let audio = match load_audio_catalog(&vfs) {
+        Ok(catalog) => Arc::new(catalog),
+        Err(err) => {
+            error!("failed to load audio catalog: {err}");
+            Arc::new(AudioCatalog::default())
         }
     };
     let (command_tx, command_rx) = mpsc::channel();
@@ -1354,6 +1375,7 @@ pub fn spawn_script_runtime(
     let host = ScriptHost {
         vfs,
         textures,
+        audio,
         command_tx,
         current_script: current_script.clone(),
         script_stack: script_stack.clone(),
@@ -1717,7 +1739,7 @@ mod tests {
 
         engine
             .compile(
-                "char(\"alice\").e(\"open_mouth\").e(\"happy_face\").at(\"left\") @ \"Hello\";\nchar(\"alice\").e(\"neutral\").finish();\ncamera.blur().duration(2).ease(\"ease_out\").finish();\ncamera.zoom(1.5).duration(1).zoom_at(1, 2);\npar(|| { camera.blur(0).duration(2).ease(\"ease_in\"); camera.zoom(1).duration(1).ease(\"bounce\"); });",
+                "char(\"alice\").e(\"open_mouth\").e(\"happy_face\").at(\"left\").scale(0.5) @ \"Hello\";\nchar(\"alice\").e(\"neutral\").finish();\ncamera.blur().duration(2).ease(\"ease_out\").finish();\ncamera.zoom(1.5).duration(1).zoom_at(1, 2);\npar(|| { camera.blur(0).duration(2).ease(\"ease_in\"); camera.zoom(1).duration(1).ease(\"bounce\"); });",
             )
             .unwrap();
     }
@@ -2243,19 +2265,28 @@ fn parse_custom_effect_options(
 
     let current_background = host.current_background_path();
 
-    let from_path = take_optional_string(&mut options, "from")
-        .or_else(|| current_background.clone())
-        .ok_or_else(|| runtime_error("effect options require `from` or an existing background"))?;
-    let to_path = take_optional_string(&mut options, "to").unwrap_or_else(|| from_path.clone());
-    let rule_path = take_optional_string(&mut options, "rule").unwrap_or_else(|| from_path.clone());
-    let aux0_path = take_optional_string(&mut options, "tex0").unwrap_or_else(|| from_path.clone());
-    let aux1_path = take_optional_string(&mut options, "tex1").unwrap_or_else(|| from_path.clone());
-
-    let from_path = host.resolve_path(&from_path);
-    let to_path = host.resolve_path(&to_path);
-    let rule_path = host.resolve_path(&rule_path);
-    let aux0_path = host.resolve_path(&aux0_path);
-    let aux1_path = host.resolve_path(&aux1_path);
+    let from_path = match take_optional_string(&mut options, "from") {
+        Some(texture) => host.resolve_image_path(&texture)?,
+        None => current_background.clone().ok_or_else(|| {
+            runtime_error("effect options require `from` or an existing background")
+        })?,
+    };
+    let to_path = match take_optional_string(&mut options, "to") {
+        Some(texture) => host.resolve_image_path(&texture)?,
+        None => from_path.clone(),
+    };
+    let rule_path = match take_optional_string(&mut options, "rule") {
+        Some(texture) => host.resolve_image_path(&texture)?,
+        None => from_path.clone(),
+    };
+    let aux0_path = match take_optional_string(&mut options, "tex0") {
+        Some(texture) => host.resolve_image_path(&texture)?,
+        None => from_path.clone(),
+    };
+    let aux1_path = match take_optional_string(&mut options, "tex1") {
+        Some(texture) => host.resolve_image_path(&texture)?,
+        None => from_path.clone(),
+    };
 
     let mode = take_optional::<f32>(&mut options, "mode")?.unwrap_or(0.0);
     let commit_to_bg = take_optional::<bool>(&mut options, "commit_to_bg")?.unwrap_or(false);

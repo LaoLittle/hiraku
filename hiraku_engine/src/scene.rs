@@ -45,7 +45,7 @@ use crate::{
 const STAGE_Z_BACKGROUND: f32 = 0.0;
 const STAGE_Z_SPRITE: f32 = 10.0;
 const STAGE_Z_OVERLAY: f32 = 30.0;
-const SCREEN_READY_FRAMES: u8 = 2;
+const SCREEN_READY_FRAMES: u8 = 0;
 const SCREEN_PENDING_Z: i32 = 90;
 const SCREEN_ACTIVE_Z: i32 = 100;
 const SCREEN_STALE_Z: i32 = 80;
@@ -1836,6 +1836,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::ShowSprite {
                 id,
                 path,
+                rect,
                 position,
                 layer,
                 scale,
@@ -1846,6 +1847,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 let handle = asset_server.load(path.clone());
                 let entity = if let Some(entity) = stage.sprites.get(&id).copied() {
                     let mut sprite = Sprite::from_image(handle);
+                    sprite.rect = rect.map(array_to_rect);
                     if fade.is_some() {
                         sprite.color = sprite.color.with_alpha(0.0);
                     }
@@ -1864,6 +1866,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     entity
                 } else {
                     let mut sprite = Sprite::from_image(handle);
+                    sprite.rect = rect.map(array_to_rect);
                     if fade.is_some() {
                         sprite.color = sprite.color.with_alpha(0.0);
                     }
@@ -4025,7 +4028,7 @@ fn queue_character_show(
     let mut handles = Vec::new();
 
     for part in &parts {
-        let sprite_id = character_part_id(&actor_id, &part.id);
+        let sprite_id = character_part_id(&actor_id, part);
         let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
         let handle = atlas
             .map(|texture| texture.image.clone())
@@ -4298,8 +4301,15 @@ fn character_part_prefix(actor_id: &str) -> String {
     format!("character::{actor_id}::")
 }
 
-fn character_part_id(actor_id: &str, part_id: &str) -> String {
-    format!("{}{}", character_part_prefix(actor_id), part_id)
+fn character_part_id(actor_id: &str, part: &CharacterPartDefinition) -> String {
+    match part.slot {
+        Some(slot) => format!(
+            "{}slot-{slot:03}-{}",
+            character_part_prefix(actor_id),
+            part.id
+        ),
+        None => format!("{}{}", character_part_prefix(actor_id), part.id),
+    }
 }
 
 fn character_part_sprite(

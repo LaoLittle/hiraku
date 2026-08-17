@@ -254,6 +254,14 @@ fn at(flow: CharacterFlow, position: ImmutableString) -> Result<CharacterFlow, B
     Ok(flow)
 }
 
+fn character_scale(flow: CharacterFlow, scale: FLOAT) -> Result<CharacterFlow, Box<EvalAltResult>> {
+    let scale = positive_scale(scale)?;
+    if let Ok(mut data) = flow.0.state.lock() {
+        data.scale = scale;
+    }
+    Ok(flow)
+}
+
 fn reset(flow: CharacterFlow) -> CharacterFlow {
     if let Ok(mut data) = flow.0.state.lock() {
         data.expressions.clear();
@@ -419,6 +427,11 @@ pub mod HirakuEngine {
         super::at(flow, position)
     }
 
+    #[rhai_fn(return_raw)]
+    pub fn scale(flow: CharacterFlow, scale: FLOAT) -> Result<CharacterFlow, Box<EvalAltResult>> {
+        super::character_scale(flow, scale)
+    }
+
     pub fn reset(flow: CharacterFlow) -> CharacterFlow {
         super::reset(flow)
     }
@@ -581,9 +594,7 @@ pub mod HirakuEngine {
     #[rhai_fn(return_raw)]
     pub fn bg(ctx: NativeCallContext, path: ImmutableString) -> Result<(), Box<EvalAltResult>> {
         let host = host(&ctx)?;
-        let path = host
-            .resolve_background_path(&path)
-            .map_err(vfs_to_rhai_error)?;
+        let path = host.resolve_image_path(&path)?;
         host.send(ScriptCommand::SetBackground {
             path,
             fade: None,
@@ -600,9 +611,7 @@ pub mod HirakuEngine {
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let host = host(&ctx)?;
         let fade = duration_from_millis(ms)?;
-        let path = host
-            .resolve_background_path(&path)
-            .map_err(vfs_to_rhai_error)?;
+        let path = host.resolve_image_path(&path)?;
         run_blocking_or_collected(&host, "bg-fade", |animation_id, done| {
             ScriptCommand::SetBackground {
                 path,
@@ -623,10 +632,8 @@ pub mod HirakuEngine {
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let host = host(&ctx)?;
         let duration = duration_from_millis(ms)?;
-        let path = host
-            .resolve_background_path(&path)
-            .map_err(vfs_to_rhai_error)?;
-        let rule_path = host.resolve_path(&rule_path);
+        let path = host.resolve_image_path(&path)?;
+        let rule_path = host.resolve_image_path(&rule_path)?;
         run_blocking_or_collected(&host, "bg-rule", |animation_id, done| {
             ScriptCommand::RuleTransitionBg {
                 path,
@@ -699,11 +706,12 @@ pub mod HirakuEngine {
         layer: FLOAT,
     ) -> Result<(), Box<EvalAltResult>> {
         let host = host(&ctx)?;
-        let path = host.resolve_path(&path);
+        let texture = host.resolve_texture(&path)?;
         let scale = positive_scale(scale)?;
         host.send(ScriptCommand::ShowSprite {
             id: id.to_string(),
-            path,
+            path: texture.path,
+            rect: texture.rect,
             position: Vec2::new(x as f32, y as f32),
             layer: layer as f32,
             scale,
@@ -765,12 +773,13 @@ pub mod HirakuEngine {
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let host = host(&ctx)?;
         let fade = duration_from_millis(ms)?;
-        let path = host.resolve_path(&path);
+        let texture = host.resolve_texture(&path)?;
         let scale = positive_scale(scale)?;
         run_blocking_or_collected(&host, "show", |animation_id, done| {
             ScriptCommand::ShowSprite {
                 id: id.to_string(),
-                path,
+                path: texture.path,
+                rect: texture.rect,
                 position: Vec2::new(x as f32, y as f32),
                 layer: layer as f32,
                 scale,
@@ -1206,8 +1215,8 @@ pub mod HirakuEngine {
         ms: Option<i64>,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let host = host(&ctx)?;
+        let path = host.resolve_music(&path)?;
         reject_known_unsupported_audio_path(&path)?;
-        let path = host.resolve_bgm_path(&path).map_err(vfs_to_rhai_error)?;
         let fade_in = ms.map(duration_from_millis).transpose()?;
         match fade_in {
             Some(fade_in) => run_blocking_or_collected(&host, "bgm", |animation_id, done| {
@@ -1285,8 +1294,8 @@ pub mod HirakuEngine {
         volume: FLOAT,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
         let host = host(&ctx)?;
+        let path = host.resolve_voice(&path)?;
         reject_known_unsupported_audio_path(&path)?;
-        let path = host.resolve_voice_path(&path).map_err(vfs_to_rhai_error)?;
         run_blocking_or_collected(&host, "voice", |animation_id, done| {
             ScriptCommand::PlayVoice {
                 path,
@@ -1325,10 +1334,8 @@ pub mod HirakuEngine {
         volume: FLOAT,
     ) -> Result<(), Box<EvalAltResult>> {
         let host = host(&ctx)?;
+        let path = host.resolve_sfx(&path)?;
         reject_known_unsupported_audio_path(&path)?;
-        let path = host
-            .resolve_soundeffect_path(&path)
-            .map_err(vfs_to_rhai_error)?;
         host.send(ScriptCommand::PlaySfx {
             path,
             volume: clamp_volume(volume),

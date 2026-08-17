@@ -1,4 +1,5 @@
 mod assets;
+mod audio;
 mod character;
 mod data;
 mod effect;

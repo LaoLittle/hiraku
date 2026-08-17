@@ -22,6 +22,9 @@ pub struct CharacterDefinition {
     pub name: String,
     pub directory: String,
     pub config_path: String,
+    /// Named slots are assigned in declaration order so authored state changes
+    /// have stable internal identities instead of relying on part names.
+    pub slots: BTreeMap<String, usize>,
     pub parts: Vec<CharacterPartDefinition>,
     pub expressions: BTreeMap<String, CharacterExpressionDefinition>,
     pub basis: Vec<String>,
@@ -31,6 +34,7 @@ pub struct CharacterDefinition {
 #[derive(Clone, Debug)]
 pub struct CharacterPartDefinition {
     pub id: String,
+    pub slot: Option<usize>,
     pub path: String,
     /// Catalog rectangle in `[left, top, width, height]` form, retained so
     /// rendering can select the generated/declared atlas section.
@@ -42,7 +46,7 @@ pub struct CharacterPartDefinition {
 
 #[derive(Clone, Debug)]
 pub struct CharacterExpressionDefinition {
-    pub slot: Option<String>,
+    pub slot: Option<usize>,
     pub parts: Vec<String>,
     pub expressions: Vec<String>,
 }
@@ -52,7 +56,7 @@ impl CharacterDefinition {
         &self,
         expressions: &[String],
     ) -> Result<Vec<CharacterPartDefinition>, String> {
-        let mut selected = BTreeMap::<String, Vec<String>>::new();
+        let mut selected = BTreeMap::<SelectionKey, Vec<String>>::new();
         let basis = if self.basis.is_empty() {
             self.default_expression.iter().cloned().collect::<Vec<_>>()
         } else {
@@ -67,21 +71,29 @@ impl CharacterDefinition {
         }
 
         let selected_ids = selected
-            .into_values()
-            .flatten()
-            .collect::<std::collections::BTreeSet<_>>();
+            .into_iter()
+            .flat_map(|(slot, ids)| ids.into_iter().map(move |id| (slot.clone(), id)))
+            .collect::<Vec<_>>();
         Ok(self
             .parts
             .iter()
-            .filter(|part| selected_ids.contains(&part.id))
-            .cloned()
+            .filter_map(|part| {
+                let slot = selected_ids
+                    .iter()
+                    .find_map(|(slot, id)| (id == &part.id).then_some(slot))?;
+                let mut part = part.clone();
+                if let SelectionKey::Slot(index) = slot {
+                    part.slot = Some(*index);
+                }
+                Some(part)
+            })
             .collect())
     }
 
     fn apply_expression(
         &self,
         name: &str,
-        selected: &mut BTreeMap<String, Vec<String>>,
+        selected: &mut BTreeMap<SelectionKey, Vec<String>>,
         resolving: &mut Vec<String>,
     ) -> Result<(), String> {
         if resolving.iter().any(|expression| expression == name) {
@@ -103,12 +115,18 @@ impl CharacterDefinition {
         if !expression.parts.is_empty() {
             let key = expression
                 .slot
-                .clone()
-                .unwrap_or_else(|| format!("expression:{name}"));
+                .map(SelectionKey::Slot)
+                .unwrap_or_else(|| SelectionKey::Expression(name.to_string()));
             selected.insert(key, expression.parts.clone());
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SelectionKey {
+    Slot(usize),
+    Expression(String),
 }
 
 #[derive(Debug, Error)]
@@ -138,6 +156,8 @@ struct CharacterCatalogEntryFile {
 #[derive(Debug, Deserialize, Default)]
 struct CharacterConfigFile {
     #[serde(default)]
+    slots: Vec<String>,
+    #[serde(default)]
     parts: BTreeMap<String, CharacterPartFile>,
     #[serde(default)]
     expressions: BTreeMap<String, CharacterExpressionFile>,
@@ -156,6 +176,8 @@ struct CharacterDataFile {
 
 #[derive(Debug, Deserialize)]
 struct CharacterPartFile {
+    #[serde(default)]
+    slot: Option<String>,
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
@@ -285,6 +307,7 @@ fn character_definition_from_config(
     config_path: String,
     config: CharacterConfigFile,
 ) -> Result<CharacterDefinition, CharacterCatalogError> {
+    let slots = build_slot_indices(&config, &config_path)?;
     let mut parts = config
         .parts
         .into_iter()
@@ -323,6 +346,10 @@ fn character_definition_from_config(
                 });
             Ok(CharacterPartDefinition {
                 id,
+                slot: part
+                    .slot
+                    .as_deref()
+                    .and_then(|name| slots.get(name).copied()),
                 path,
                 atlas_rect: texture_rect,
                 offset: part
@@ -355,7 +382,7 @@ fn character_definition_from_config(
                     parts,
                     expressions,
                 } => CharacterExpressionDefinition {
-                    slot,
+                    slot: slot.as_deref().and_then(|name| slots.get(name).copied()),
                     parts,
                     expressions,
                 },
@@ -375,11 +402,54 @@ fn character_definition_from_config(
         name,
         directory,
         config_path,
+        slots,
         parts,
         expressions,
         basis: config.basis,
         default_expression: config.default_expression,
     })
+}
+
+fn build_slot_indices(
+    config: &CharacterConfigFile,
+    path: &str,
+) -> Result<BTreeMap<String, usize>, CharacterCatalogError> {
+    let mut slots = BTreeMap::new();
+    for name in &config.slots {
+        let index = slots.len();
+        if slots.insert(name.clone(), index).is_some() {
+            return Err(CharacterCatalogError::Data {
+                path: path.to_string(),
+                message: format!("slot `{name}` is declared more than once"),
+            });
+        }
+    }
+
+    // Older files only name slots inside parts/expressions. Keep accepting
+    // those files while assigning their extra slots deterministically.
+    let mut implicit = config
+        .parts
+        .values()
+        .filter_map(|part| part.slot.clone())
+        .chain(
+            config
+                .expressions
+                .values()
+                .filter_map(|expression| match expression {
+                    CharacterExpressionFile::Parts(_) => None,
+                    CharacterExpressionFile::Definition { slot, .. } => slot.clone(),
+                }),
+        )
+        .collect::<Vec<_>>();
+    implicit.sort();
+    implicit.dedup();
+    for name in implicit {
+        if !slots.contains_key(&name) {
+            let index = slots.len();
+            slots.insert(name, index);
+        }
+    }
+    Ok(slots)
 }
 
 fn validate_expressions(
@@ -471,7 +541,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             characters.join("character.rhai"),
-            "#{ parts: #{ body: #{ path: \"body.png\", offset: [12.5, -3.0], layer: -1.0 }, face: #{ path: \"face.png\", layer: 2.0 } }, expressions: #{ happy: [\"body\", \"face\"] }, default_expression: \"happy\" }",
+            "#{ slots: [\"body\", \"face\"], parts: #{ body: #{ path: \"body.png\", slot: \"body\", offset: [12.5, -3.0], layer: -1.0 }, face: #{ path: \"face.png\", slot: \"face\", layer: 2.0 } }, expressions: #{ happy: [\"body\", \"face\"] }, default_expression: \"happy\" }",
         )
         .unwrap();
 
@@ -483,6 +553,8 @@ mod tests {
         assert_eq!(alice.parts[0].id, "body");
         assert_eq!(alice.parts[0].offset, Vec2::new(12.5, -3.0));
         assert_eq!(alice.parts[1].id, "face");
+        assert_eq!(alice.slots["body"], 0);
+        assert_eq!(alice.slots["face"], 1);
         assert_eq!(
             alice
                 .parts_for_expressions(&["happy".to_string()])
@@ -500,6 +572,7 @@ mod tests {
             name: "alice".to_string(),
             directory: String::new(),
             config_path: String::new(),
+            slots: BTreeMap::from([("mouth".to_string(), 0), ("face".to_string(), 1)]),
             parts: [
                 "body",
                 "mouth_closed",
@@ -510,6 +583,7 @@ mod tests {
             .into_iter()
             .map(|id| CharacterPartDefinition {
                 id: id.to_string(),
+                slot: None,
                 path: format!("{id}.png"),
                 atlas_rect: None,
                 offset: Vec2::ZERO,
@@ -529,7 +603,7 @@ mod tests {
                 (
                     "mouth_closed".to_string(),
                     CharacterExpressionDefinition {
-                        slot: Some("mouth".to_string()),
+                        slot: Some(0),
                         parts: vec!["mouth_closed".to_string()],
                         expressions: Vec::new(),
                     },
@@ -537,7 +611,7 @@ mod tests {
                 (
                     "mouth_open".to_string(),
                     CharacterExpressionDefinition {
-                        slot: Some("mouth".to_string()),
+                        slot: Some(0),
                         parts: vec!["mouth_open".to_string()],
                         expressions: Vec::new(),
                     },
@@ -545,7 +619,7 @@ mod tests {
                 (
                     "face_neutral".to_string(),
                     CharacterExpressionDefinition {
-                        slot: Some("face".to_string()),
+                        slot: Some(1),
                         parts: vec!["face_neutral".to_string()],
                         expressions: Vec::new(),
                     },
@@ -553,7 +627,7 @@ mod tests {
                 (
                     "face_happy".to_string(),
                     CharacterExpressionDefinition {
-                        slot: Some("face".to_string()),
+                        slot: Some(1),
                         parts: vec!["face_happy".to_string()],
                         expressions: Vec::new(),
                     },

@@ -251,19 +251,24 @@ impl HdpVfs {
     pub fn load_font_paths(&self) -> Result<Vec<String>, VfsError> {
         let directory = self.load_fonts_dir_path()?;
         let mut paths = self
-            .list_directory(&directory)?
+            .list_files_recursive(&directory)?
             .into_iter()
-            .filter(|path| {
-                matches!(
-                    Path::new(path)
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(|extension| extension.to_ascii_lowercase())
-                        .as_deref(),
-                    Some("otf") | Some("ttf")
-                )
+            .filter(|path| path.ends_with(".font.rhai"))
+            .map(|descriptor_path| {
+                let source = self.read_text(&descriptor_path)?;
+                let mut data = evaluate_rhai_map(&descriptor_path, &source)
+                    .map_err(|error| invalid_settings_data(&descriptor_path, error.to_string()))?;
+                let font =
+                    take_data_string(&mut data, "font", &descriptor_path)?.ok_or_else(|| {
+                        invalid_settings_data(
+                            &descriptor_path,
+                            "font descriptor requires `font`".to_string(),
+                        )
+                    })?;
+                ensure_empty_data_map(data, &descriptor_path, "font descriptor")?;
+                Ok(self.resolve_path(Some(&descriptor_path), &font))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, VfsError>>()?;
         paths.sort_by_key(|path| {
             let lower = path.to_ascii_lowercase();
             let priority = if lower.contains("sourcehanserifsc") {
@@ -943,6 +948,11 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(root.join("font-pack")).unwrap();
         std::fs::write(root.join("font-pack/Regular.otf"), b"font").unwrap();
+        std::fs::write(
+            root.join("font-pack/regular.font.rhai"),
+            "#{ font: \"Regular.otf\" }",
+        )
+        .unwrap();
         std::fs::write(root.join("font-pack/readme.txt"), b"ignored").unwrap();
 
         let vfs = HdpVfs::new_with_config(&root, "settings.rhai", "startup.rhai");
@@ -963,6 +973,7 @@ mod tests {
 
         let _ = std::fs::remove_file(root.join("settings.rhai"));
         let _ = std::fs::remove_file(root.join("font-pack/Regular.otf"));
+        let _ = std::fs::remove_file(root.join("font-pack/regular.font.rhai"));
         let _ = std::fs::remove_file(root.join("font-pack/readme.txt"));
         let _ = std::fs::remove_dir(root.join("font-pack"));
         let _ = std::fs::remove_dir(&root);
