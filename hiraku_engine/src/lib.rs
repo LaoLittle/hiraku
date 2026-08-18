@@ -265,6 +265,7 @@ fn boot_runtime(
     mut commands: Commands,
     vfs: Res<VfsResource>,
     scene_state: Res<SceneSharedState>,
+    mut ir_runtime: ResMut<IrRuntime>,
     mut booted: Local<bool>,
 ) {
     if *booted {
@@ -273,12 +274,24 @@ fn boot_runtime(
     match vfs.0.load_startup_script_path() {
         Ok(startup_script) => {
             info!("startup script: {startup_script}");
-            spawn_script_runtime(
-                &mut commands,
-                vfs.0.clone(),
-                scene_state.0.clone(),
-                ScriptBootstrap::new(startup_script),
-            );
+            let ir_program = vfs
+                .0
+                .read_text(&startup_script)
+                .ok()
+                .and_then(|source| compile_to_ir(&startup_script, &source).ok())
+                .and_then(|program| IrVm::new(program).ok());
+            if let Some(vm) = ir_program {
+                info!("starting startup script in IR runtime");
+                ir_runtime.vm = Some(vm);
+                ir_runtime.current_script = Some(startup_script);
+            } else {
+                spawn_script_runtime(
+                    &mut commands,
+                    vfs.0.clone(),
+                    scene_state.0.clone(),
+                    ScriptBootstrap::new(startup_script),
+                );
+            }
             *booted = true;
         }
         Err(err) => {

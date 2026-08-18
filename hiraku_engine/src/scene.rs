@@ -7,7 +7,7 @@ use bevy::{
     app::AppExit,
     audio::{AudioSink, AudioSinkPlayback, Volume},
     ecs::system::SystemParam,
-    log::warn,
+    log::{info, warn},
     math::Rect,
     prelude::*,
 };
@@ -21,9 +21,9 @@ use crate::{
     },
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
-        IrEvent, IrRuntime, IrVm, IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap,
-        ScriptCommand, ScriptInbox, ScriptResponse, ScriptRuntimeState, save_runtime_slot,
-        script_command_from_ir, spawn_script_runtime,
+        IrCommand, IrEvent, IrRuntime, IrVm, IrWaitKind, ResolvedCharacterKeyframe,
+        ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse, ScriptRuntimeState,
+        compile_to_ir, save_runtime_slot, script_command_from_ir, spawn_script_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -340,6 +340,7 @@ pub fn bridge_ir_events(
     mut runtime: ResMut<IrRuntime>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
     textures: Option<Res<TextureCatalog>>,
+    vfs: Res<VfsResource>,
 ) {
     if let Some(receiver) = runtime.wait_response.as_ref() {
         let response = receiver.lock().unwrap().try_recv();
@@ -359,6 +360,29 @@ pub fn bridge_ir_events(
     };
 
     match event {
+        IrEvent::Command(IrCommand::LoadScript { path }) => {
+            let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
+            let program = vfs
+                .0
+                .read_text(&target)
+                .ok()
+                .and_then(|source| compile_to_ir(&target, &source).ok());
+            match program.and_then(|program| IrVm::new(program).ok()) {
+                Some(vm) => {
+                    runtime.vm = Some(vm);
+                    runtime.current_script = Some(target);
+                    runtime.events.clear();
+                }
+                None => {
+                    info!("starting legacy runtime for unsupported IR script `{target}`");
+                    runtime.vm = None;
+                    runtime.current_script = None;
+                    pending_script_commands
+                        .items
+                        .push_back(ScriptCommand::StartLegacy { path: target });
+                }
+            }
+        }
         IrEvent::Command(command) => match script_command_from_ir(command, textures.as_deref()) {
             Ok(command) => pending_script_commands.items.push_back(command),
             Err(error) => warn!("IR command rejected: {error}"),
@@ -1575,10 +1599,6 @@ pub fn handle_frontend_buttons(
 }
 
 pub fn process_script_commands(ctx: SceneCommandContext) {
-    let Some(inbox) = ctx.inbox else {
-        return;
-    };
-
     let mut commands = ctx.commands;
     let mut app_exit = ctx.app_exit;
     let asset_server = ctx.asset_server;
@@ -1625,15 +1645,17 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut line_color = ctx.line_color;
     let mut hint_color = ctx.hint_color;
 
-    let Ok(receiver) = inbox.0.lock() else {
-        return;
-    };
+    let inbox = ctx.inbox;
 
-    while let Some(command) = pending_script_commands
-        .items
-        .pop_front()
-        .or_else(|| receiver.try_recv().ok())
-    {
+    while let Some(command) = pending_script_commands.items.pop_front().or_else(|| {
+        inbox.as_ref().and_then(|inbox| {
+            inbox
+                .0
+                .lock()
+                .ok()
+                .and_then(|receiver| receiver.try_recv().ok())
+        })
+    }) {
         if screen_state.active_root.is_some()
             && screen_state.waiting.is_none()
             && should_clear_stale_screen_before_command(&command)
@@ -1642,14 +1664,26 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
         }
 
         match command {
-            ScriptCommand::StartIr { program } => match IrVm::new(program) {
+            ScriptCommand::StartIr { path, program } => match IrVm::new(program) {
                 Ok(vm) => {
                     ir_runtime.vm = Some(vm);
+                    ir_runtime.current_script = Some(path);
                     ir_runtime.events.clear();
                     ir_runtime.wait_response = None;
                 }
                 Err(error) => warn!("failed to start IR program: {error}"),
             },
+            ScriptCommand::StartLegacy { path } => {
+                ir_runtime.vm = None;
+                ir_runtime.current_script = None;
+                ir_runtime.events.clear();
+                spawn_script_runtime(
+                    &mut commands,
+                    vfs.0.clone(),
+                    shared_state.0.clone(),
+                    ScriptBootstrap::new(path),
+                );
+            }
             ScriptCommand::Log(message) => info!("[rhai] {message}"),
             ScriptCommand::SetBackground {
                 path,

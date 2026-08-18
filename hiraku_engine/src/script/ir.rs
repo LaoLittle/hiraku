@@ -105,6 +105,21 @@ pub enum IrCommand {
         text: String,
     },
     StopBgm,
+    PlayBgm {
+        path: String,
+        volume: f32,
+        fade_in_ms: Option<u64>,
+    },
+    SetCamera {
+        blur: Option<f32>,
+        zoom: Option<f32>,
+        duration_ms: u64,
+        ease: String,
+    },
+    Exit,
+    LoadScript {
+        path: String,
+    },
     ReturnToTitle,
     SetBackground {
         texture: String,
@@ -308,6 +323,7 @@ pub struct IrRuntime {
     pub events: Vec<IrEvent>,
     pub wait_response:
         Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
+    pub current_script: Option<String>,
 }
 
 pub fn tick_ir_runtime(mut runtime: bevy::prelude::ResMut<IrRuntime>) {

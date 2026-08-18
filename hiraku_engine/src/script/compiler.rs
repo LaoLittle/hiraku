@@ -56,6 +56,9 @@ impl Default for IrApiRegistry {
             commands: &[
                 ("log", api::log),
                 ("stop_bgm", api::stop_bgm),
+                ("play_bgm", api::play_bgm),
+                ("quit", api::quit),
+                ("load_script", api::load_script),
                 ("return_to_title", api::return_to_title),
                 ("clear_text", api::clear_text),
                 ("narrate", api::narrate),
@@ -110,6 +113,9 @@ impl Lowerer<'_> {
             Stmt::FnCall(call, position) => self.lower_command_call(call, *position),
             Stmt::Expr(expression) => match expression.as_ref() {
                 Expr::FnCall(call, position) => self.lower_command_call(call, *position),
+                Expr::Dot(_, _, _) if self.is_camera_chain(expression) => {
+                    self.lower_camera_chain(expression)
+                }
                 Expr::Dot(_, _, _) => self.lower_fluent_character(expression),
                 expression => Err(self.unsupported_expression(expression)),
             },
@@ -256,6 +262,81 @@ impl Lowerer<'_> {
         Ok(())
     }
 
+    fn is_camera_chain(&self, expression: &Expr) -> bool {
+        match expression {
+            Expr::Dot(binary, _, _) => match &binary.lhs {
+                Expr::Variable(value, _, _) => value.1 == "camera",
+                Expr::Dot(_, _, _) => self.is_camera_chain(&binary.lhs),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn lower_camera_chain(&mut self, expression: &Expr) -> Result<(), IrCompileError> {
+        let mut flow = CameraFlowLowering::default();
+        self.read_camera_chain(expression, &mut flow)?;
+        self.instructions
+            .push(IrInstruction::Emit(IrCommand::SetCamera {
+                blur: flow.blur,
+                zoom: flow.zoom,
+                duration_ms: flow.duration_ms,
+                ease: flow.ease,
+            }));
+        Ok(())
+    }
+
+    fn read_camera_chain(
+        &self,
+        expression: &Expr,
+        flow: &mut CameraFlowLowering,
+    ) -> Result<(), IrCompileError> {
+        match expression {
+            Expr::Dot(binary, _, _) => {
+                if let Expr::Variable(value, _, _) = &binary.lhs {
+                    if value.1 != "camera" {
+                        return Err(self.unsupported_expression(expression));
+                    }
+                } else {
+                    self.read_camera_chain(&binary.lhs, flow)?;
+                }
+                self.read_camera_method(&binary.rhs, flow)
+            }
+            _ => Err(self.unsupported_expression(expression)),
+        }
+    }
+
+    fn read_camera_method(
+        &self,
+        expression: &Expr,
+        flow: &mut CameraFlowLowering,
+    ) -> Result<(), IrCompileError> {
+        match expression {
+            Expr::MethodCall(call, position) => {
+                let call = RhaiCall::new(call, *position, self.path);
+                match call.name() {
+                    "blur" => flow.blur = Some(call.one_float()?),
+                    "zoom" => flow.zoom = Some(call.one_float()?),
+                    "duration" => {
+                        let seconds = call.one_float()?;
+                        if seconds < 0.0 {
+                            return Err(call.invalid("duration must not be negative"));
+                        }
+                        flow.duration_ms = (seconds * 1000.0).round() as u64;
+                    }
+                    "ease" => flow.ease = call.one_string()?,
+                    _ => return Err(call.unsupported_call()),
+                }
+                Ok(())
+            }
+            Expr::Dot(binary, _, _) => {
+                self.read_camera_method(&binary.lhs, flow)?;
+                self.read_camera_method(&binary.rhs, flow)
+            }
+            _ => Err(self.unsupported_expression(expression)),
+        }
+    }
+
     fn lower_fluent_character(&mut self, expression: &Expr) -> Result<(), IrCompileError> {
         let mut flow = CharacterFlowLowering {
             scale: 1.0,
@@ -376,13 +457,33 @@ impl<'a> RhaiCall<'a> {
     }
 
     fn one_float(&self) -> Result<f32, IrCompileError> {
-        let Some(Expr::FloatConstant(value, _)) = self.call.args.first() else {
-            return Err(self.invalid("requires one float literal argument"));
-        };
         if self.call.args.len() != 1 {
             return Err(self.invalid("requires exactly one argument"));
         }
-        Ok(**value as f32)
+        self.float_at(0)
+    }
+
+    fn args(&self, count: usize) -> Result<(), IrCompileError> {
+        if self.call.args.len() == count {
+            Ok(())
+        } else {
+            Err(self.invalid(format!("requires exactly {count} arguments")))
+        }
+    }
+
+    fn string_at(&self, index: usize) -> Result<String, IrCompileError> {
+        let Some(Expr::StringConstant(value, _)) = self.call.args.get(index) else {
+            return Err(self.invalid("requires a string literal"));
+        };
+        Ok(value.to_string())
+    }
+
+    fn float_at(&self, index: usize) -> Result<f32, IrCompileError> {
+        match self.call.args.get(index) {
+            Some(Expr::FloatConstant(value, _)) => Ok(**value as f32),
+            Some(Expr::IntegerConstant(value, _)) => Ok(*value as f32),
+            _ => Err(self.invalid("requires a numeric literal")),
+        }
     }
 
     fn invalid(&self, message: impl Into<String>) -> IrCompileError {
@@ -423,6 +524,30 @@ mod api {
         })
     }
 
+    pub(super) fn play_bgm(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        call.args(3)?;
+        let fade_in_ms = call.float_at(2)?;
+        if fade_in_ms < 0.0 {
+            return Err(call.invalid("fade duration must not be negative"));
+        }
+        Ok(IrEmission {
+            command: IrCommand::PlayBgm {
+                path: call.string_at(0)?,
+                volume: call.float_at(1)?,
+                fade_in_ms: Some(fade_in_ms.round() as u64),
+            },
+            wait: None,
+        })
+    }
+
+    pub(super) fn quit(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        call.no_args()?;
+        Ok(IrEmission {
+            command: IrCommand::Exit,
+            wait: None,
+        })
+    }
+
     pub(super) fn clear_text(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
         call.no_args()?;
         Ok(IrEmission {
@@ -435,6 +560,15 @@ mod api {
         call.no_args()?;
         Ok(IrEmission {
             command: IrCommand::ReturnToTitle,
+            wait: None,
+        })
+    }
+
+    pub(super) fn load_script(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        Ok(IrEmission {
+            command: IrCommand::LoadScript {
+                path: call.one_string()?,
+            },
             wait: None,
         })
     }
@@ -509,6 +643,14 @@ struct CharacterFlowLowering {
     expressions: Vec<String>,
     position: [f32; 2],
     scale: f32,
+}
+
+#[derive(Default)]
+struct CameraFlowLowering {
+    blur: Option<f32>,
+    zoom: Option<f32>,
+    duration_ms: u64,
+    ease: String,
 }
 
 fn source_hash(source: &str) -> u64 {
@@ -628,6 +770,43 @@ mod tests {
     }
 
     #[test]
+    fn compiles_title_runtime_audio_and_camera_commands() {
+        let program = compile_to_ir(
+            "test.rhai",
+            r#"
+                camera.blur(12);
+                camera.zoom(1.05);
+                camera.zoom(1).duration(1.5).ease("ease_out");
+                play_bgm("title", 0.8, 800);
+                quit();
+            "#,
+        )
+        .unwrap();
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::SetCamera {
+                    blur: Some(12.0),
+                    ..
+                })
+            )
+        }));
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::PlayBgm { path, volume, fade_in_ms: Some(800) })
+                    if path == "title" && (*volume - 0.8).abs() < f32::EPSILON
+            )
+        }));
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, IrInstruction::Emit(IrCommand::Exit)))
+        );
+    }
+
+    #[test]
     fn rejects_dynamic_conditions_without_executing_them() {
         let error =
             compile_to_ir("test.rhai", "if is_unlocked() { narrate(\"yes\"); }").unwrap_err();
@@ -701,6 +880,18 @@ mod tests {
         let program = compile_to_ir("scripts/gallery.rhai", source).unwrap();
         assert!(program.instructions.iter().any(|instruction| {
             matches!(instruction, IrInstruction::Emit(IrCommand::ReturnToTitle))
+        }));
+    }
+
+    #[test]
+    fn current_startup_script_is_ready_for_ir_boot() {
+        let source = include_str!("../../../../manosabars/assets/main_hdp_contents/startup.rhai");
+        let program = compile_to_ir("startup.rhai", source).unwrap();
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::LoadScript { path }) if path == "system.rhai"
+            )
         }));
     }
 

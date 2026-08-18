@@ -92,7 +92,11 @@ enum CheckpointDecision {
 pub enum ScriptCommand {
     Log(String),
     StartIr {
+        path: String,
         program: IrProgram,
+    },
+    StartLegacy {
+        path: String,
     },
     SetBackground {
         path: String,
@@ -313,6 +317,35 @@ pub(crate) fn script_command_from_ir(
             done: None,
         },
         IrCommand::StopBgm => ScriptCommand::StopBgm,
+        IrCommand::PlayBgm {
+            path,
+            volume,
+            fade_in_ms,
+        } => ScriptCommand::PlayBgm {
+            path,
+            volume,
+            fade_in: fade_in_ms.map(Duration::from_millis),
+            animation_id: None,
+            done: None,
+        },
+        IrCommand::SetCamera {
+            blur,
+            zoom,
+            duration_ms,
+            ease,
+        } => ScriptCommand::SetCamera {
+            blur_intensity: blur,
+            zoom,
+            center: None,
+            duration: Duration::from_millis(duration_ms),
+            ease: parse_ir_camera_ease(&ease)?,
+            animation_id: None,
+            done: None,
+        },
+        IrCommand::Exit => ScriptCommand::Exit,
+        IrCommand::LoadScript { .. } => {
+            return Err("load_script is handled by the IR runtime".to_string());
+        }
         IrCommand::ReturnToTitle => ScriptCommand::ReturnToTitle,
         IrCommand::SetBackground { texture } => {
             let Some(definition) = textures.and_then(|catalog| catalog.resolve(&texture)) else {
@@ -343,6 +376,18 @@ pub(crate) fn script_command_from_ir(
         },
     };
     Ok(command)
+}
+
+fn parse_ir_camera_ease(name: &str) -> Result<CharacterEase, String> {
+    match name {
+        "" | "linear" => Ok(CharacterEase::Linear),
+        "ease" => Ok(CharacterEase::Ease),
+        "ease_in" => Ok(CharacterEase::EaseIn),
+        "ease_out" => Ok(CharacterEase::EaseOut),
+        "ease_in_out" => Ok(CharacterEase::EaseInOut),
+        "bounce" => Ok(CharacterEase::Bounce),
+        _ => Err(format!("unsupported camera easing `{name}`")),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1620,7 +1665,10 @@ fn run_script_loop(
                             if let Some(program) = compile_ir_script(&host, &target) {
                                 host.set_current_script_path(target.clone());
                                 host.reset_script_checkpoint_counter();
-                                if let Err(err) = host.send(ScriptCommand::StartIr { program }) {
+                                if let Err(err) = host.send(ScriptCommand::StartIr {
+                                    path: target.clone(),
+                                    program,
+                                }) {
                                     error!("failed to hand off `{target}` to IR runtime: {err}");
                                 }
                                 return ScriptLoopOutcome::Finished;
@@ -1692,6 +1740,7 @@ fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
         command,
         ScriptCommand::Log(_)
             | ScriptCommand::StartIr { .. }
+            | ScriptCommand::StartLegacy { .. }
             | ScriptCommand::SetBackground { .. }
             | ScriptCommand::ShowSprite { .. }
             | ScriptCommand::HideSprite { .. }
