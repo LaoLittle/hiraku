@@ -48,12 +48,14 @@ mod ir;
 mod rng;
 mod time;
 mod ui;
+pub mod ui_runtime;
 
 pub use compiler::{IrCompileError, compile_to_ir};
 pub use ir::{
-    IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram, IrRuntime, IrValidationError,
-    IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
+    IrChoiceOption, IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram, IrRuntime,
+    IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
 };
+pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
 
 const PRELUDE_SOURCE: &str = include_str!("script/prelude.rhai");
 
@@ -343,6 +345,9 @@ pub(crate) fn script_command_from_ir(
             done: None,
         },
         IrCommand::Exit => ScriptCommand::Exit,
+        IrCommand::Choose { .. } | IrCommand::OpenUi { .. } => {
+            return Err("interactive UI commands are handled by the IR runtime".to_string());
+        }
         IrCommand::LoadScript { .. } => {
             return Err("load_script is handled by the IR runtime".to_string());
         }
@@ -2204,12 +2209,37 @@ fn parse_ui_style_patch(options: Map) -> Result<UiStylePatch, Box<EvalAltResult>
     Ok(input.into())
 }
 
-fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, Box<EvalAltResult>> {
+pub(crate) trait ScreenTextureResolver {
+    fn resolve_screen_texture(&self, name: &str) -> Result<ScreenTexture, Box<EvalAltResult>>;
+}
+
+impl ScreenTextureResolver for ScriptHost {
+    fn resolve_screen_texture(&self, name: &str) -> Result<ScreenTexture, Box<EvalAltResult>> {
+        self.resolve_texture(name)
+    }
+}
+
+impl ScreenTextureResolver for TextureCatalog {
+    fn resolve_screen_texture(&self, name: &str) -> Result<ScreenTexture, Box<EvalAltResult>> {
+        let definition = self.resolve(name).ok_or_else(|| {
+            runtime_error(format!("texture `{name}` was not found in the catalog"))
+        })?;
+        Ok(ScreenTexture {
+            path: definition.path.clone(),
+            rect: definition.rect,
+        })
+    }
+}
+
+pub(crate) fn parse_screen_spec(
+    resolver: &impl ScreenTextureResolver,
+    mut screen: Map,
+) -> Result<ScreenSpec, Box<EvalAltResult>> {
     let title = take_optional_string(&mut screen, "title");
     let panel = take_optional_bool(&mut screen, "panel")?.unwrap_or(true);
     let width = take_optional_number(&mut screen, "width")?;
     let background_texture = take_optional_string(&mut screen, "background_texture")
-        .map(|name| host.resolve_texture(&name))
+        .map(|name| resolver.resolve_screen_texture(&name))
         .transpose()?;
     let xalign = take_optional_number(&mut screen, "xalign")?.unwrap_or(0.5);
     let yalign = take_optional_number(&mut screen, "yalign")?.unwrap_or(0.5);
@@ -2220,7 +2250,7 @@ fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, B
     let border = take_optional_rgba(&mut screen, "border")?;
     let children = take_required_array(&mut screen, "children")?
         .into_iter()
-        .map(|node| parse_screen_node(host, node))
+        .map(|node| parse_screen_node(resolver, node))
         .collect::<Result<Vec<_>, _>>()?;
 
     if !screen.is_empty() {
@@ -2246,7 +2276,10 @@ fn parse_screen_spec(host: &ScriptHost, mut screen: Map) -> Result<ScreenSpec, B
     })
 }
 
-fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Box<EvalAltResult>> {
+fn parse_screen_node(
+    resolver: &impl ScreenTextureResolver,
+    value: Dynamic,
+) -> Result<ScreenNode, Box<EvalAltResult>> {
     let mut node = value
         .try_cast::<Map>()
         .ok_or_else(|| runtime_error("screen nodes must be maps"))?;
@@ -2328,14 +2361,14 @@ fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Bo
             let layout = take_screen_layout(&mut node)?;
             ensure_no_unknown_options("image", &node)?;
             Ok(ScreenNode::Image(ScreenImageNode {
-                texture: host.resolve_texture(&texture)?,
+                texture: resolver.resolve_screen_texture(&texture)?,
                 layout,
             }))
         }
         "image_button" => {
             let texture = take_required_string(&mut node, "texture")?;
             let hovered_texture = take_optional_string(&mut node, "hovered_texture")
-                .map(|name| host.resolve_texture(&name))
+                .map(|name| resolver.resolve_screen_texture(&name))
                 .transpose()?;
             let hovered_layout = take_optional_screen_layout(&mut node, "hovered_layout")?;
             let value = node
@@ -2349,7 +2382,7 @@ fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Bo
             let layout = take_screen_layout(&mut node)?;
             ensure_no_unknown_options("image_button", &node)?;
             Ok(ScreenNode::ImageButton(ScreenImageButtonNode {
-                texture: host.resolve_texture(&texture)?,
+                texture: resolver.resolve_screen_texture(&texture)?,
                 hovered_texture,
                 hovered_layout,
                 value,
@@ -2389,7 +2422,7 @@ fn parse_screen_node(host: &ScriptHost, value: Dynamic) -> Result<ScreenNode, Bo
             let layout = take_screen_layout(&mut node)?;
             let children = take_required_array(&mut node, "children")?
                 .into_iter()
-                .map(|child| parse_screen_node(host, child))
+                .map(|child| parse_screen_node(resolver, child))
                 .collect::<Result<Vec<_>, _>>()?;
             ensure_no_unknown_options(&node_type, &node)?;
             let container = ContainerNode {

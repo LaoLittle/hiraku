@@ -4,6 +4,8 @@ use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::state::StoredValue;
+
 pub type IrPc = u32;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -94,6 +96,7 @@ pub enum IrInstruction {
 pub enum IrExpression {
     BoolLiteral(bool),
     BoolVariable(String),
+    StringEquals { variable: String, value: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -117,6 +120,15 @@ pub enum IrCommand {
         ease: String,
     },
     Exit,
+    Choose {
+        prompt: String,
+        options: Vec<IrChoiceOption>,
+        result: String,
+    },
+    OpenUi {
+        path: String,
+        result: String,
+    },
     LoadScript {
         path: String,
     },
@@ -134,9 +146,16 @@ pub enum IrCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IrChoiceOption {
+    pub text: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IrWaitKind {
     DialogueAdvance,
     ScreenChoice,
+    UiIntent,
     DurationMs(u64),
 }
 
@@ -150,13 +169,17 @@ pub enum IrVmStatus {
     Halted,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct IrVmSnapshot {
     pub source_hash: u64,
     pub pc: IrPc,
     pub status: IrVmStatus,
     pub expressions: BTreeMap<IrExpressionId, bool>,
     pub variables: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub string_variables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub story_values: BTreeMap<String, StoredValue>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -173,6 +196,8 @@ pub struct IrVm {
     status: IrVmStatus,
     expressions: BTreeMap<IrExpressionId, bool>,
     variables: BTreeMap<String, bool>,
+    string_variables: BTreeMap<String, String>,
+    story_values: BTreeMap<String, StoredValue>,
 }
 
 impl IrVm {
@@ -184,6 +209,8 @@ impl IrVm {
             status: IrVmStatus::Ready,
             expressions: BTreeMap::new(),
             variables: BTreeMap::new(),
+            string_variables: BTreeMap::new(),
+            story_values: BTreeMap::new(),
         })
     }
 
@@ -192,7 +219,38 @@ impl IrVm {
     }
 
     pub fn set_bool_variable(&mut self, name: impl Into<String>, value: bool) {
-        self.variables.insert(name.into(), value);
+        let name = name.into();
+        self.variables.insert(name.clone(), value);
+        self.story_values.insert(name, StoredValue::Bool(value));
+    }
+
+    pub fn set_stored_value(&mut self, name: impl Into<String>, value: StoredValue) {
+        let name = name.into();
+        match &value {
+            StoredValue::Bool(value) => {
+                self.variables.insert(name.clone(), *value);
+            }
+            StoredValue::String(value) => {
+                self.string_variables.insert(name.clone(), value.clone());
+            }
+            _ => {}
+        }
+        self.story_values.insert(name, value);
+    }
+
+    pub fn story_values(&self) -> BTreeMap<String, StoredValue> {
+        let mut values = self.story_values.clone();
+        values.extend(
+            self.variables
+                .iter()
+                .map(|(name, value)| (name.clone(), StoredValue::Bool(*value))),
+        );
+        values.extend(
+            self.string_variables
+                .iter()
+                .map(|(name, value)| (name.clone(), StoredValue::String(value.clone()))),
+        );
+        values
     }
 
     pub fn pc(&self) -> IrPc {
@@ -256,6 +314,8 @@ impl IrVm {
             status: self.status.clone(),
             expressions: self.expressions.clone(),
             variables: self.variables.clone(),
+            string_variables: self.string_variables.clone(),
+            story_values: self.story_values.clone(),
         }
     }
 
@@ -276,6 +336,8 @@ impl IrVm {
             status: snapshot.status,
             expressions: snapshot.expressions,
             variables: snapshot.variables,
+            string_variables: snapshot.string_variables,
+            story_values: snapshot.story_values,
         })
     }
 
@@ -288,6 +350,11 @@ impl IrVm {
             Some(IrExpression::BoolVariable(name)) => {
                 self.variables.get(name).copied().unwrap_or(false)
             }
+            Some(IrExpression::StringEquals { variable, value }) => self
+                .string_variables
+                .get(variable)
+                .map(|actual| actual == value)
+                .unwrap_or(false),
             None => false,
         }
     }
@@ -324,6 +391,10 @@ pub struct IrRuntime {
     pub wait_response:
         Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
     pub current_script: Option<String>,
+    pub pending_input_variable: Option<String>,
+    pub pending_ui_screen: Option<String>,
+    pub pending_response:
+        Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
 }
 
 pub fn tick_ir_runtime(mut runtime: bevy::prelude::ResMut<IrRuntime>) {
@@ -369,6 +440,23 @@ mod tests {
             Some(IrEvent::Command(IrCommand::Log("after".to_string())))
         );
         assert_eq!(vm.step(), Some(IrEvent::Completed));
+    }
+
+    #[test]
+    fn story_values_preserve_all_ui_visible_types() {
+        let mut vm = IrVm::new(IrProgram::new(42, vec![IrInstruction::Halt])).unwrap();
+        vm.set_stored_value("unlocked", StoredValue::Bool(true));
+        vm.set_stored_value("route", StoredValue::String("ema".to_string()));
+        vm.set_stored_value("affection", StoredValue::Int(7));
+
+        assert_eq!(
+            vm.story_values(),
+            BTreeMap::from([
+                ("affection".to_string(), StoredValue::Int(7)),
+                ("route".to_string(), StoredValue::String("ema".to_string())),
+                ("unlocked".to_string(), StoredValue::Bool(true)),
+            ])
+        );
     }
 
     #[test]

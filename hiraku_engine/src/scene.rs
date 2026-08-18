@@ -22,8 +22,9 @@ use crate::{
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
         IrCommand, IrEvent, IrRuntime, IrVm, IrWaitKind, ResolvedCharacterKeyframe,
-        ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse, ScriptRuntimeState,
-        compile_to_ir, save_runtime_slot, script_command_from_ir, spawn_script_runtime,
+        ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse, ScriptRuntimeState, UiContext,
+        UiIntent, compile_to_ir, evaluate_ui_script, save_runtime_slot, script_command_from_ir,
+        spawn_script_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -345,8 +346,26 @@ pub fn bridge_ir_events(
     if let Some(receiver) = runtime.wait_response.as_ref() {
         let response = receiver.lock().unwrap().try_recv();
         match response {
+            Ok(ScriptResponse::Choice(value)) => {
+                let value = if let Some(screen) = runtime.pending_ui_screen.take() {
+                    UiIntent { screen, value }.value
+                } else {
+                    value
+                };
+                if let Some(variable) = runtime.pending_input_variable.take()
+                    && let Some(vm) = runtime.vm.as_mut()
+                {
+                    vm.set_stored_value(variable, value);
+                }
+                runtime.wait_response = None;
+                if let Some(vm) = runtime.vm.as_mut() {
+                    vm.resume();
+                }
+            }
             Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
                 runtime.wait_response = None;
+                runtime.pending_input_variable = None;
+                runtime.pending_ui_screen = None;
                 if let Some(vm) = runtime.vm.as_mut() {
                     vm.resume();
                 }
@@ -372,14 +391,83 @@ pub fn bridge_ir_events(
                     runtime.vm = Some(vm);
                     runtime.current_script = Some(target);
                     runtime.events.clear();
+                    runtime.wait_response = None;
+                    runtime.pending_input_variable = None;
+                    runtime.pending_ui_screen = None;
+                    runtime.pending_response = None;
                 }
                 None => {
                     info!("starting legacy runtime for unsupported IR script `{target}`");
                     runtime.vm = None;
                     runtime.current_script = None;
+                    runtime.wait_response = None;
+                    runtime.pending_input_variable = None;
+                    runtime.pending_ui_screen = None;
+                    runtime.pending_response = None;
                     pending_script_commands
                         .items
                         .push_back(ScriptCommand::StartLegacy { path: target });
+                }
+            }
+        }
+        IrEvent::Command(IrCommand::Choose {
+            prompt,
+            options,
+            result,
+        }) => {
+            let (response_tx, response_rx) = mpsc::channel();
+            runtime.pending_input_variable = Some(result);
+            runtime.pending_ui_screen = None;
+            runtime.pending_response =
+                Some(std::sync::Arc::new(std::sync::Mutex::new(response_rx)));
+            pending_script_commands
+                .items
+                .push_back(ScriptCommand::Choose {
+                    prompt,
+                    options: options
+                        .into_iter()
+                        .map(|option| ChoiceOption {
+                            text: option.text,
+                            value: StoredValue::String(option.value),
+                        })
+                        .collect(),
+                    done: response_tx,
+                });
+        }
+        IrEvent::Command(IrCommand::OpenUi { path, result }) => {
+            let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
+            let story = runtime
+                .vm
+                .as_ref()
+                .map(IrVm::story_values)
+                .unwrap_or_default();
+            let screen = vfs
+                .0
+                .read_text(&target)
+                .map_err(|error| error.to_string())
+                .and_then(|source| {
+                    let textures = textures
+                        .as_deref()
+                        .ok_or_else(|| "texture catalog is unavailable".to_string())?;
+                    evaluate_ui_script(&source, &UiContext::new(story), textures)
+                        .map_err(|error| error.to_string())
+                });
+            let (response_tx, response_rx) = mpsc::channel();
+            runtime.pending_input_variable = Some(result);
+            runtime.pending_ui_screen = Some(target.clone());
+            runtime.pending_response =
+                Some(std::sync::Arc::new(std::sync::Mutex::new(response_rx)));
+            match screen {
+                Ok(screen) => pending_script_commands
+                    .items
+                    .push_back(ScriptCommand::ShowScreen {
+                        screen,
+                        shown: None,
+                        done: Some(response_tx),
+                    }),
+                Err(error) => {
+                    warn!("failed to render UI script `{target}`: {error}");
+                    let _ = response_tx.send(ScriptResponse::Continue);
                 }
             }
         }
@@ -388,6 +476,12 @@ pub fn bridge_ir_events(
             Err(error) => warn!("IR command rejected: {error}"),
         },
         IrEvent::Waiting(wait_kind) => {
+            if matches!(wait_kind, IrWaitKind::ScreenChoice | IrWaitKind::UiIntent)
+                && let Some(receiver) = runtime.pending_response.take()
+            {
+                runtime.wait_response = Some(receiver);
+                return;
+            }
             let (response_tx, response_rx) = mpsc::channel();
             let command = match wait_kind {
                 IrWaitKind::DialogueAdvance => {
@@ -396,6 +490,7 @@ pub fn bridge_ir_events(
                 IrWaitKind::ScreenChoice => {
                     ScriptCommand::WaitForScreenChoice { done: response_tx }
                 }
+                IrWaitKind::UiIntent => ScriptCommand::WaitForScreenChoice { done: response_tx },
                 IrWaitKind::DurationMs(milliseconds) => ScriptCommand::Wait {
                     duration: std::time::Duration::from_millis(milliseconds),
                     animation_id: None,
@@ -1670,6 +1765,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     ir_runtime.current_script = Some(path);
                     ir_runtime.events.clear();
                     ir_runtime.wait_response = None;
+                    ir_runtime.pending_input_variable = None;
+                    ir_runtime.pending_ui_screen = None;
+                    ir_runtime.pending_response = None;
                 }
                 Err(error) => warn!("failed to start IR program: {error}"),
             },
@@ -1677,6 +1775,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 ir_runtime.vm = None;
                 ir_runtime.current_script = None;
                 ir_runtime.events.clear();
+                ir_runtime.wait_response = None;
+                ir_runtime.pending_input_variable = None;
+                ir_runtime.pending_ui_screen = None;
+                ir_runtime.pending_response = None;
                 spawn_script_runtime(
                     &mut commands,
                     vfs.0.clone(),

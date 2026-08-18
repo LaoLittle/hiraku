@@ -1,7 +1,9 @@
 use rhai::{ASTFlags, Engine, Expr, FnCallExpr, OptimizationLevel, Position, Stmt, StmtBlock};
 use thiserror::Error;
 
-use super::ir::{IrCommand, IrExpression, IrExpressionId, IrInstruction, IrProgram, IrWaitKind};
+use super::ir::{
+    IrChoiceOption, IrCommand, IrExpression, IrExpressionId, IrInstruction, IrProgram, IrWaitKind,
+};
 
 /// Compiles the deterministic command-only Rhai subset into Hiraku IR.
 ///
@@ -111,6 +113,36 @@ impl Lowerer<'_> {
             Stmt::Noop(_) => Ok(()),
             Stmt::Block(block) => self.lower_block(block),
             Stmt::FnCall(call, position) => self.lower_command_call(call, *position),
+            Stmt::Var(variable, _, position) => {
+                let result = variable.0.as_str().to_string();
+                let Expr::FnCall(call, call_position) = &variable.1 else {
+                    return Err(IrCompileError::UnsupportedStatement {
+                        path: self.path.to_string(),
+                        kind: "variable declaration".to_string(),
+                        line: position.line(),
+                        column: position.position(),
+                    });
+                };
+                let call = RhaiCall::new(call, *call_position, self.path);
+                let emission = match call.name() {
+                    "choice" => api::choice(call, result)?,
+                    "open_ui" => api::open_ui(call, result)?,
+                    _ => {
+                        return Err(IrCompileError::UnsupportedStatement {
+                            path: self.path.to_string(),
+                            kind: "variable declaration".to_string(),
+                            line: position.line(),
+                            column: position.position(),
+                        });
+                    }
+                };
+                self.instructions
+                    .push(IrInstruction::Emit(emission.command));
+                if let Some(wait) = emission.wait {
+                    self.instructions.push(IrInstruction::Wait(wait));
+                }
+                Ok(())
+            }
             Stmt::Expr(expression) => match expression.as_ref() {
                 Expr::FnCall(call, position) => self.lower_command_call(call, *position),
                 Expr::Dot(_, _, _) if self.is_camera_chain(expression) => {
@@ -184,6 +216,18 @@ impl Lowerer<'_> {
         let expression = match expression {
             Expr::BoolConstant(value, _) => IrExpression::BoolLiteral(*value),
             Expr::Variable(value, _, _) => IrExpression::BoolVariable(value.1.to_string()),
+            Expr::FnCall(call, _) if call.name == "==" && call.args.len() == 2 => {
+                let (variable, value) = match (&call.args[0], &call.args[1]) {
+                    (Expr::Variable(variable, _, _), Expr::StringConstant(value, _)) => {
+                        (variable.1.to_string(), value.to_string())
+                    }
+                    (Expr::StringConstant(value, _), Expr::Variable(variable, _, _)) => {
+                        (variable.1.to_string(), value.to_string())
+                    }
+                    _ => return Err(self.unsupported_expression(expression)),
+                };
+                IrExpression::StringEquals { variable, value }
+            }
             expression => return Err(self.unsupported_expression(expression)),
         };
         let id = IrExpressionId(self.expressions.len() as u32);
@@ -486,6 +530,33 @@ impl<'a> RhaiCall<'a> {
         }
     }
 
+    fn choice_options(&self, index: usize) -> Result<Vec<IrChoiceOption>, IrCompileError> {
+        let Some(Expr::Array(items, _)) = self.call.args.get(index) else {
+            return Err(self.invalid("choice options must be an array literal"));
+        };
+        items
+            .iter()
+            .map(|item| {
+                let Expr::Map(entries, _) = item else {
+                    return Err(self.invalid("choice options must be map literals"));
+                };
+                let text = entries
+                    .0
+                    .iter()
+                    .find(|(key, _)| key.as_str() == "text")
+                    .and_then(|(_, value)| literal_string(value))
+                    .ok_or_else(|| self.invalid("choice option requires string `text`"))?;
+                let value = entries
+                    .0
+                    .iter()
+                    .find(|(key, _)| key.as_str() == "value")
+                    .and_then(|(_, value)| literal_string(value))
+                    .ok_or_else(|| self.invalid("choice option requires string `value`"))?;
+                Ok(IrChoiceOption { text, value })
+            })
+            .collect()
+    }
+
     fn invalid(&self, message: impl Into<String>) -> IrCompileError {
         IrCompileError::InvalidCall {
             path: self.path.to_string(),
@@ -503,6 +574,13 @@ impl<'a> RhaiCall<'a> {
             line: self.position.line(),
             column: self.position.position(),
         }
+    }
+}
+
+fn literal_string(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::StringConstant(value, _) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -545,6 +623,35 @@ mod api {
         Ok(IrEmission {
             command: IrCommand::Exit,
             wait: None,
+        })
+    }
+
+    pub(super) fn choice(call: RhaiCall<'_>, result: String) -> Result<IrEmission, IrCompileError> {
+        call.args(2)?;
+        let options = call.choice_options(1)?;
+        if options.is_empty() {
+            return Err(call.invalid("choice requires at least one option"));
+        }
+        Ok(IrEmission {
+            command: IrCommand::Choose {
+                prompt: call.string_at(0)?,
+                options,
+                result,
+            },
+            wait: Some(IrWaitKind::ScreenChoice),
+        })
+    }
+
+    pub(super) fn open_ui(
+        call: RhaiCall<'_>,
+        result: String,
+    ) -> Result<IrEmission, IrCompileError> {
+        Ok(IrEmission {
+            command: IrCommand::OpenUi {
+                path: call.one_string()?,
+                result,
+            },
+            wait: Some(IrWaitKind::UiIntent),
         })
     }
 
@@ -803,6 +910,42 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|instruction| matches!(instruction, IrInstruction::Emit(IrCommand::Exit)))
+        );
+    }
+
+    #[test]
+    fn compiles_choice_and_ui_results_into_string_branches() {
+        let program = compile_to_ir(
+            "test.rhai",
+            r#"
+                let action = choice("Menu", [#{ text: "Back", value: "back" }]);
+                if action == "back" { quit(); }
+                let settings = open_ui("ui/settings.ui.rhai");
+                if settings == "close" { return_to_title(); }
+            "#,
+        )
+        .unwrap();
+
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::Choose { result, .. }) if result == "action"
+            )
+        }));
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::OpenUi { path, result })
+                    if path == "ui/settings.ui.rhai" && result == "settings"
+            )
+        }));
+        assert_eq!(
+            program
+                .expressions
+                .iter()
+                .filter(|expression| matches!(expression, IrExpression::StringEquals { .. }))
+                .count(),
+            2
         );
     }
 

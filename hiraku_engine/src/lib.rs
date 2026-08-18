@@ -40,7 +40,7 @@ use scene::{
 #[cfg(target_arch = "wasm32")]
 use script::drive_web_script_runtime;
 pub use script::{
-    IrCommand, IrCompileError, IrEvent, IrExpressionId, IrInstruction, IrProgram,
+    IrChoiceOption, IrCommand, IrCompileError, IrEvent, IrExpressionId, IrInstruction, IrProgram,
     IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, compile_to_ir,
 };
 use script::{IrRuntime, ScriptBootstrap, spawn_script_runtime, tick_ir_runtime};
