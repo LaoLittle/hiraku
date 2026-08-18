@@ -158,6 +158,10 @@ pub enum ScriptCommand {
         done: Option<mpsc::Sender<ScriptResponse>>,
     },
     ApplyUserSettings(UserSettings),
+    AdjustUserSetting {
+        name: String,
+        delta: f32,
+    },
     ApplyUiStyle(UiStylePatch),
     ResetUiStyle,
     ShowScreen {
@@ -344,6 +348,9 @@ pub(crate) fn script_command_from_ir(
             animation_id: None,
             done: None,
         },
+        IrCommand::AdjustSetting { name, delta } => {
+            ScriptCommand::AdjustUserSetting { name, delta }
+        }
         IrCommand::Exit => ScriptCommand::Exit,
         IrCommand::Choose { .. } | IrCommand::OpenUi { .. } => {
             return Err("interactive UI commands are handled by the IR runtime".to_string());

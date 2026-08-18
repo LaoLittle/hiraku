@@ -3,6 +3,7 @@ mod audio;
 mod character;
 mod data;
 mod effect;
+pub mod hks_prelude;
 mod proto;
 mod scene;
 mod script;

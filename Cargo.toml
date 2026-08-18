@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hiraku_engine", "hiraku_app"]
+members = ["hiraku_engine", "hiraku_app", "hiraku_script"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,9 @@ thiserror = "2.0.20"
 toml = "1.1.4"
 zip = "8.6.0"
 time = "0.3.55"
+
+hiraku-engine = { path = "hiraku_engine" }
+hiraku-script = { path = "hiraku_script" }
 
 [workspace.dependencies.bevy]
 version = "0.19"

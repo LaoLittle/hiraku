@@ -1,5 +1,5 @@
 [package]
-name = "hiraku_engine"
+name = "hiraku-engine"
 version.workspace = true
 edition.workspace = true
 description = "Embeddable visual-novel runtime and HDP resource engine"
@@ -8,6 +8,7 @@ description = "Embeddable visual-novel runtime and HDP resource engine"
 bevy.workspace = true
 bevy_ui_render = "0.19"
 futures-lite.workspace = true
+hiraku-script.workspace = true
 prost.workspace = true
 rand.workspace = true
 rand_pcg.workspace = true

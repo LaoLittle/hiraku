@@ -154,4 +154,16 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, UiScriptError::Evaluation(_)));
     }
+
+    #[test]
+    fn current_settings_ui_reads_the_runtime_volume() {
+        let context = UiContext::new(BTreeMap::from([(
+            "bgm_volume".to_string(),
+            StoredValue::Float(0.8),
+        )]));
+        let source =
+            include_str!("../../../../manosabars/assets/main_hdp_contents/ui/settings.ui.rhai");
+        let screen = evaluate_ui_script(source, &context, &TextureCatalog::default()).unwrap();
+        assert_eq!(screen.title.as_deref(), Some("Settings (BGM: 0.8)"));
+    }
 }

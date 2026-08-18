@@ -1,0 +1,11 @@
+[package]
+name = "hiraku-script"
+version.workspace = true
+edition.workspace = true
+description = "Embeddable visual-novel runtime and HDP resource engine"
+
+[dependencies]
+unicode-xid = "0.2.6"
+unic-emoji-char = "0.9.0"
+indexmap = "2.14.0"
+serde = { workspace = true, features = ["derive"] }

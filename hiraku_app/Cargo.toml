@@ -1,14 +1,14 @@
 [package]
-name = "hiraku_app"
+name = "hiraku-app"
 version.workspace = true
 edition.workspace = true
 description = "Standalone Hiraku HDP player application"
-default-run = "hiraku_app"
+default-run = "hiraku-app"
 
 [dependencies]
 bevy.workspace = true
-hiraku_engine = { path = "../hiraku_engine" }
+hiraku-engine.workspace = true
 
 [[bin]]
-name = "hiraku_app"
+name = "hiraku-app"
 path = "src/main.rs"

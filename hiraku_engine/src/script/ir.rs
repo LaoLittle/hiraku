@@ -119,6 +119,10 @@ pub enum IrCommand {
         duration_ms: u64,
         ease: String,
     },
+    AdjustSetting {
+        name: String,
+        delta: f32,
+    },
     Exit,
     Choose {
         prompt: String,

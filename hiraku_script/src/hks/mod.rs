@@ -1,0 +1,791 @@
+//! The deliberately small HKS language frontend.
+//!
+//! This is separate from the older Kotlin experiment under `ast`/`parse`.
+//! It models only the syntax that the recoverable Hiraku VM needs.
+
+pub mod vm;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Span {
+    fn join(left: &Self, right: &Self) -> Self {
+        Self {
+            start: left.start,
+            end: right.end,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Program {
+    pub statements: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stmt {
+    Let {
+        mutable: bool,
+        name: String,
+        value: Expr,
+        span: Span,
+    },
+    Expr(Expr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    pub statements: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExprKind {
+    Ident(String),
+    Symbol(String),
+    Bool(bool),
+    Number {
+        value: f64,
+        unit: NumberUnit,
+    },
+    String(String),
+    UnaryMinus(Box<Expr>),
+    Member {
+        object: Box<Expr>,
+        name: String,
+    },
+    Call {
+        callee: Box<Expr>,
+        arguments: Vec<Argument>,
+        trailing_block: Option<Block>,
+    },
+    Tuple(Vec<Expr>),
+    Map(Vec<MapField>),
+    Block(Block),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumberUnit {
+    Scalar,
+    Percent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Argument {
+    pub label: Option<String>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapField {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseError {
+    pub message: String,
+    pub span: Span,
+}
+
+pub fn parse_program(source: &str) -> Result<Program, Vec<ParseError>> {
+    let tokens = Lexer::new(source).tokenize()?;
+    Parser::new(tokens).parse_program()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Token {
+    kind: TokenKind,
+    span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TokenKind {
+    Ident(String),
+    Number(f64, NumberUnit),
+    String(String),
+    Newline,
+    Semi,
+    Dot,
+    Comma,
+    Colon,
+    Equal,
+    Minus,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    Eof,
+}
+
+struct Lexer<'a> {
+    source: &'a str,
+    offset: usize,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(source: &'a str) -> Self {
+        Self { source, offset: 0 }
+    }
+
+    fn tokenize(mut self) -> Result<Vec<Token>, Vec<ParseError>> {
+        let mut tokens = Vec::new();
+        let mut errors = Vec::new();
+
+        while let Some(character) = self.current() {
+            let start = self.offset;
+            match character {
+                ' ' | '\t' | '\r' => self.bump(),
+                '\n' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::Newline, start));
+                }
+                '/' if self.peek() == Some('/') => {
+                    while !matches!(self.current(), Some('\n') | None) {
+                        self.bump();
+                    }
+                }
+                ';' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::Semi, start));
+                }
+                '.' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::Dot, start));
+                }
+                ',' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::Comma, start));
+                }
+                ':' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::Colon, start));
+                }
+                '=' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::Equal, start));
+                }
+                '-' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::Minus, start));
+                }
+                '(' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::LParen, start));
+                }
+                ')' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::RParen, start));
+                }
+                '{' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::LBrace, start));
+                }
+                '}' => {
+                    self.bump();
+                    tokens.push(self.token(TokenKind::RBrace, start));
+                }
+                '"' => match self.string() {
+                    Ok(value) => tokens.push(self.token(TokenKind::String(value), start)),
+                    Err(message) => errors.push(ParseError {
+                        message,
+                        span: Span {
+                            start,
+                            end: self.offset,
+                        },
+                    }),
+                },
+                digit if digit.is_ascii_digit() => match self.number() {
+                    Ok((value, unit)) => {
+                        tokens.push(self.token(TokenKind::Number(value, unit), start))
+                    }
+                    Err(message) => errors.push(ParseError {
+                        message,
+                        span: Span {
+                            start,
+                            end: self.offset,
+                        },
+                    }),
+                },
+                identifier if is_identifier_start(identifier) => {
+                    let name = self.identifier();
+                    tokens.push(self.token(TokenKind::Ident(name), start));
+                }
+                _ => {
+                    self.bump();
+                    errors.push(ParseError {
+                        message: format!("unexpected character `{character}`"),
+                        span: Span {
+                            start,
+                            end: self.offset,
+                        },
+                    });
+                }
+            }
+        }
+
+        tokens.push(Token {
+            kind: TokenKind::Eof,
+            span: Span {
+                start: self.offset,
+                end: self.offset,
+            },
+        });
+        if errors.is_empty() {
+            Ok(tokens)
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn current(&self) -> Option<char> {
+        self.source[self.offset..].chars().next()
+    }
+
+    fn peek(&self) -> Option<char> {
+        let mut characters = self.source[self.offset..].chars();
+        characters.next()?;
+        characters.next()
+    }
+
+    fn bump(&mut self) {
+        if let Some(character) = self.current() {
+            self.offset += character.len_utf8();
+        }
+    }
+
+    fn token(&self, kind: TokenKind, start: usize) -> Token {
+        Token {
+            kind,
+            span: Span {
+                start,
+                end: self.offset,
+            },
+        }
+    }
+
+    fn identifier(&mut self) -> String {
+        let start = self.offset;
+        self.bump();
+        while self.current().is_some_and(is_identifier_continue) {
+            self.bump();
+        }
+        self.source[start..self.offset].to_string()
+    }
+
+    fn number(&mut self) -> Result<(f64, NumberUnit), String> {
+        let start = self.offset;
+        while self
+            .current()
+            .is_some_and(|character| character.is_ascii_digit())
+        {
+            self.bump();
+        }
+        if self.current() == Some('.')
+            && self
+                .peek()
+                .is_some_and(|character| character.is_ascii_digit())
+        {
+            self.bump();
+            while self
+                .current()
+                .is_some_and(|character| character.is_ascii_digit())
+            {
+                self.bump();
+            }
+        }
+        let value = self.source[start..self.offset]
+            .parse::<f64>()
+            .map_err(|_| "invalid numeric literal".to_string())?;
+        let unit = if self.current() == Some('%') {
+            self.bump();
+            NumberUnit::Percent
+        } else {
+            NumberUnit::Scalar
+        };
+        Ok((value, unit))
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        self.bump();
+        let mut value = String::new();
+        while let Some(character) = self.current() {
+            self.bump();
+            match character {
+                '"' => return Ok(value),
+                '\\' => match self.current() {
+                    Some('n') => {
+                        self.bump();
+                        value.push('\n');
+                    }
+                    Some('"') => {
+                        self.bump();
+                        value.push('"');
+                    }
+                    Some('\\') => {
+                        self.bump();
+                        value.push('\\');
+                    }
+                    Some(other) => return Err(format!("unsupported escape `\\{other}`")),
+                    None => return Err("unterminated string literal".to_string()),
+                },
+                '\n' => return Err("unterminated string literal".to_string()),
+                _ => value.push(character),
+            }
+        }
+        Err("unterminated string literal".to_string())
+    }
+}
+
+fn is_identifier_start(character: char) -> bool {
+    character == '_' || character.is_alphabetic()
+}
+
+fn is_identifier_continue(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    index: usize,
+    errors: Vec<ParseError>,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            tokens,
+            index: 0,
+            errors: Vec::new(),
+        }
+    }
+
+    fn parse_program(mut self) -> Result<Program, Vec<ParseError>> {
+        let mut statements = Vec::new();
+        self.skip_separators();
+        while !self.at(TokenKind::Eof) {
+            statements.push(self.parse_statement());
+            self.skip_separators();
+        }
+        if self.errors.is_empty() {
+            Ok(Program { statements })
+        } else {
+            Err(self.errors)
+        }
+    }
+
+    fn parse_statement(&mut self) -> Stmt {
+        if matches!(self.current().kind, TokenKind::Ident(ref name) if name == "let" || name == "var")
+        {
+            return self.parse_let();
+        }
+        Stmt::Expr(self.parse_expression())
+    }
+
+    fn parse_let(&mut self) -> Stmt {
+        let start = self.advance();
+        let mutable = matches!(start.kind, TokenKind::Ident(ref name) if name == "var");
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected variable name");
+                "<error>".to_string()
+            }
+        };
+        self.expect(TokenKind::Equal, "expected `=` after variable name");
+        let value = self.parse_expression();
+        let span = Span::join(&start.span, &value.span);
+        Stmt::Let {
+            mutable,
+            name,
+            value,
+            span,
+        }
+    }
+
+    fn parse_expression(&mut self) -> Expr {
+        let mut expression = self.parse_primary();
+        loop {
+            if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::Ident(_)) {
+                self.advance();
+                let name = match self.advance().kind {
+                    TokenKind::Ident(name) => name,
+                    _ => unreachable!(),
+                };
+                let span = Span::join(&expression.span, &self.previous().span);
+                expression = Expr {
+                    kind: ExprKind::Member {
+                        object: Box::new(expression),
+                        name,
+                    },
+                    span,
+                };
+                continue;
+            }
+            if self.at(TokenKind::LParen) {
+                let arguments = self.parse_arguments();
+                let trailing_block = self.parse_optional_trailing_block();
+                let end = trailing_block
+                    .as_ref()
+                    .map(|block| block.span.clone())
+                    .unwrap_or_else(|| self.previous().span.clone());
+                expression = Expr {
+                    span: Span::join(&expression.span, &end),
+                    kind: ExprKind::Call {
+                        callee: Box::new(expression),
+                        arguments,
+                        trailing_block,
+                    },
+                };
+                continue;
+            }
+            if self.at(TokenKind::LBrace) {
+                let block = self.parse_block();
+                let span = Span::join(&expression.span, &block.span);
+                expression = Expr {
+                    span,
+                    kind: ExprKind::Call {
+                        callee: Box::new(expression),
+                        arguments: Vec::new(),
+                        trailing_block: Some(block),
+                    },
+                };
+                continue;
+            }
+            break;
+        }
+        expression
+    }
+
+    fn parse_primary(&mut self) -> Expr {
+        let token = self.advance();
+        match token.kind {
+            TokenKind::Ident(name) if name == "true" || name == "false" => Expr {
+                kind: ExprKind::Bool(name == "true"),
+                span: token.span,
+            },
+            TokenKind::Ident(name) => Expr {
+                kind: ExprKind::Ident(name),
+                span: token.span,
+            },
+            TokenKind::Number(value, unit) => Expr {
+                kind: ExprKind::Number { value, unit },
+                span: token.span,
+            },
+            TokenKind::String(value) => Expr {
+                kind: ExprKind::String(value),
+                span: token.span,
+            },
+            TokenKind::Minus => {
+                let value = self.parse_primary();
+                let span = Span::join(&token.span, &value.span);
+                Expr {
+                    kind: ExprKind::UnaryMinus(Box::new(value)),
+                    span,
+                }
+            }
+            TokenKind::Dot if self.at(TokenKind::LBrace) => self.parse_map(token.span.start),
+            TokenKind::Dot => match self.advance().kind {
+                TokenKind::Ident(name) => Expr {
+                    span: Span::join(&token.span, &self.previous().span),
+                    kind: ExprKind::Symbol(name),
+                },
+                _ => self.bad_expression(token.span, "expected symbol name or `{` after `.`"),
+            },
+            TokenKind::LParen => self.parse_tuple(token.span.start),
+            TokenKind::LBrace => {
+                self.index -= 1;
+                let block = self.parse_block();
+                Expr {
+                    span: block.span.clone(),
+                    kind: ExprKind::Block(block),
+                }
+            }
+            _ => self.bad_expression(token.span, "expected expression"),
+        }
+    }
+
+    fn parse_arguments(&mut self) -> Vec<Argument> {
+        self.expect(TokenKind::LParen, "expected `(`");
+        let mut arguments = Vec::new();
+        self.skip_newlines();
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            let start = self.current().span.clone();
+            let label = if let TokenKind::Ident(name) = self.current().kind.clone()
+                && matches!(self.peek().kind, TokenKind::Colon)
+            {
+                self.advance();
+                self.advance();
+                Some(name)
+            } else {
+                None
+            };
+            let value = self.parse_expression();
+            let span = Span::join(&start, &value.span);
+            arguments.push(Argument { label, value, span });
+            self.skip_newlines();
+            if self.at(TokenKind::Comma) {
+                self.advance();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "expected `)` after arguments");
+        arguments
+    }
+
+    fn parse_tuple(&mut self, start: usize) -> Expr {
+        let mut values = Vec::new();
+        self.skip_newlines();
+        if self.at(TokenKind::RParen) {
+            let end = self.advance().span.end;
+            return Expr {
+                kind: ExprKind::Tuple(values),
+                span: Span { start, end },
+            };
+        }
+        loop {
+            values.push(self.parse_expression());
+            self.skip_newlines();
+            if self.at(TokenKind::Comma) {
+                self.advance();
+                self.skip_newlines();
+                continue;
+            }
+            break;
+        }
+        let end = self
+            .expect(TokenKind::RParen, "expected `)` after tuple")
+            .span
+            .end;
+        Expr {
+            kind: ExprKind::Tuple(values),
+            span: Span { start, end },
+        }
+    }
+
+    fn parse_map(&mut self, start: usize) -> Expr {
+        self.expect(TokenKind::LBrace, "expected `{` after `.`");
+        let mut fields = Vec::new();
+        self.skip_separators();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let field_start = self.current().span.clone();
+            let name = match self.advance().kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.error_here("expected map field name");
+                    "<error>".to_string()
+                }
+            };
+            self.expect(TokenKind::Colon, "expected `:` after map field name");
+            let value = self.parse_expression();
+            let span = Span::join(&field_start, &value.span);
+            fields.push(MapField { name, value, span });
+            self.skip_newlines();
+            if self.at(TokenKind::Comma) {
+                self.advance();
+            }
+            self.skip_separators();
+        }
+        let end = self
+            .expect(TokenKind::RBrace, "expected `}` after map")
+            .span
+            .end;
+        Expr {
+            kind: ExprKind::Map(fields),
+            span: Span { start, end },
+        }
+    }
+
+    fn parse_optional_trailing_block(&mut self) -> Option<Block> {
+        self.at(TokenKind::LBrace).then(|| self.parse_block())
+    }
+
+    fn parse_block(&mut self) -> Block {
+        let start = self.expect(TokenKind::LBrace, "expected `{`").span.start;
+        let mut statements = Vec::new();
+        self.skip_separators();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            statements.push(self.parse_statement());
+            self.skip_separators();
+        }
+        let end = self
+            .expect(TokenKind::RBrace, "expected `}` after block")
+            .span
+            .end;
+        Block {
+            statements,
+            span: Span { start, end },
+        }
+    }
+
+    fn skip_separators(&mut self) {
+        while matches!(self.current().kind, TokenKind::Newline | TokenKind::Semi) {
+            self.advance();
+        }
+    }
+
+    fn skip_newlines(&mut self) {
+        while self.at(TokenKind::Newline) {
+            self.advance();
+        }
+    }
+
+    fn at(&self, kind: TokenKind) -> bool {
+        std::mem::discriminant(&self.current().kind) == std::mem::discriminant(&kind)
+    }
+
+    fn current(&self) -> &Token {
+        &self.tokens[self.index]
+    }
+
+    fn peek(&self) -> &Token {
+        &self.tokens[(self.index + 1).min(self.tokens.len() - 1)]
+    }
+
+    fn previous(&self) -> &Token {
+        &self.tokens[self.index.saturating_sub(1)]
+    }
+
+    fn advance(&mut self) -> Token {
+        let token = self.current().clone();
+        if !matches!(token.kind, TokenKind::Eof) {
+            self.index += 1;
+        }
+        token
+    }
+
+    fn expect(&mut self, kind: TokenKind, message: &str) -> Token {
+        if self.at(kind) {
+            self.advance()
+        } else {
+            self.error_here(message);
+            self.advance()
+        }
+    }
+
+    fn bad_expression(&mut self, span: Span, message: &str) -> Expr {
+        self.errors.push(ParseError {
+            message: message.to_string(),
+            span: span.clone(),
+        });
+        Expr {
+            kind: ExprKind::Ident("<error>".to_string()),
+            span,
+        }
+    }
+
+    fn error_here(&mut self, message: &str) {
+        self.errors.push(ParseError {
+            message: message.to_string(),
+            span: self.current().span.clone(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expression(source: &str) -> Expr {
+        let program = parse_program(source).unwrap();
+        let [Stmt::Expr(expression)] = program.statements.as_slice() else {
+            panic!("expected one expression");
+        };
+        expression.clone()
+    }
+
+    #[test]
+    fn parses_camera_named_arguments_and_symbol_positions() {
+        let expression = expression("camera.zoom(1.2, at: .center, duration: 0.5, ease: .easeOut)");
+        let ExprKind::Call { arguments, .. } = expression.kind else {
+            panic!("expected call");
+        };
+        assert_eq!(arguments.len(), 4);
+        assert_eq!(arguments[1].label.as_deref(), Some("at"));
+        assert_eq!(
+            arguments[1].value.kind,
+            ExprKind::Symbol("center".to_string())
+        );
+        assert_eq!(
+            arguments[3].value.kind,
+            ExprKind::Symbol("easeOut".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_tuple_and_percent_positions() {
+        let expression = expression("camera.zoom(1.2, at: (20%, 30%))");
+        let ExprKind::Call { arguments, .. } = expression.kind else {
+            panic!("expected call");
+        };
+        let ExprKind::Tuple(values) = &arguments[1].value.kind else {
+            panic!("expected position tuple");
+        };
+        assert!(matches!(
+            values[0].kind,
+            ExprKind::Number {
+                value: 20.0,
+                unit: NumberUnit::Percent
+            }
+        ));
+        assert!(matches!(
+            values[1].kind,
+            ExprKind::Number {
+                value: 30.0,
+                unit: NumberUnit::Percent
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_seq_and_par_trailing_blocks() {
+        let program = parse_program(
+            r#"
+                let handle = seq {
+                    char("ema").e("shock").fade(0.5)
+                    char("ema").e("happy").fade(0.5).ease(.easeInOut)
+                }
+                par {
+                    camera.zoom(1.2)
+                }
+                wait(handle)
+            "#,
+        )
+        .unwrap();
+        let Stmt::Let { value, .. } = &program.statements[0] else {
+            panic!("expected let");
+        };
+        assert!(matches!(
+            value.kind,
+            ExprKind::Call {
+                trailing_block: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(program.statements.len(), 3);
+    }
+
+    #[test]
+    fn parses_nested_map_literals() {
+        let expression =
+            expression(".{ field1: \"string\", field2: 0.2, field3: .{ nested: true } }");
+        let ExprKind::Map(fields) = expression.kind else {
+            panic!("expected map");
+        };
+        assert_eq!(fields.len(), 3);
+        assert!(matches!(fields[2].value.kind, ExprKind::Map(_)));
+    }
+}

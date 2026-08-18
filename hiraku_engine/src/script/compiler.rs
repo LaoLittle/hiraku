@@ -59,6 +59,7 @@ impl Default for IrApiRegistry {
                 ("log", api::log),
                 ("stop_bgm", api::stop_bgm),
                 ("play_bgm", api::play_bgm),
+                ("adjust_setting", api::adjust_setting),
                 ("quit", api::quit),
                 ("load_script", api::load_script),
                 ("return_to_title", api::return_to_title),
@@ -618,6 +619,17 @@ mod api {
         })
     }
 
+    pub(super) fn adjust_setting(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        call.args(2)?;
+        Ok(IrEmission {
+            command: IrCommand::AdjustSetting {
+                name: call.string_at(0)?,
+                delta: call.float_at(1)?,
+            },
+            wait: None,
+        })
+    }
+
     pub(super) fn quit(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
         call.no_args()?;
         Ok(IrEmission {
@@ -1023,6 +1035,28 @@ mod tests {
         let program = compile_to_ir("scripts/gallery.rhai", source).unwrap();
         assert!(program.instructions.iter().any(|instruction| {
             matches!(instruction, IrInstruction::Emit(IrCommand::ReturnToTitle))
+        }));
+    }
+
+    #[test]
+    fn current_settings_story_is_ready_for_ir_handoff() {
+        let source = include_str!(
+            "../../../../manosabars/assets/main_hdp_contents/scripts/settings.story.rhai"
+        );
+        let program = compile_to_ir("scripts/settings.story.rhai", source).unwrap();
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::OpenUi { path, result })
+                    if path == "../ui/settings.ui.rhai" && result == "action"
+            )
+        }));
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::AdjustSetting { name, delta })
+                    if name == "bgm_volume" && (*delta - 0.1).abs() < f32::EPSILON
+            )
         }));
     }
 

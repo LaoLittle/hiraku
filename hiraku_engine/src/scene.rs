@@ -342,6 +342,7 @@ pub fn bridge_ir_events(
     mut pending_script_commands: ResMut<PendingScriptCommands>,
     textures: Option<Res<TextureCatalog>>,
     vfs: Res<VfsResource>,
+    user_settings: Res<UserSettings>,
 ) {
     if let Some(receiver) = runtime.wait_response.as_ref() {
         let response = receiver.lock().unwrap().try_recv();
@@ -436,11 +437,23 @@ pub fn bridge_ir_events(
         }
         IrEvent::Command(IrCommand::OpenUi { path, result }) => {
             let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
-            let story = runtime
+            let mut story = runtime
                 .vm
                 .as_ref()
                 .map(IrVm::story_values)
                 .unwrap_or_default();
+            story.insert(
+                "bgm_volume".to_string(),
+                StoredValue::Float(user_settings.bgm_volume as f64),
+            );
+            story.insert(
+                "voice_volume".to_string(),
+                StoredValue::Float(user_settings.voice_volume as f64),
+            );
+            story.insert(
+                "sfx_volume".to_string(),
+                StoredValue::Float(user_settings.sfx_volume as f64),
+            );
             let screen = vfs
                 .0
                 .read_text(&target)
@@ -2283,6 +2296,21 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 &mut animations,
             ),
             ScriptCommand::ApplyUserSettings(settings) => *user_settings = settings,
+            ScriptCommand::AdjustUserSetting { name, delta } => {
+                let volume = match name.as_str() {
+                    "bgm_volume" => &mut user_settings.bgm_volume,
+                    "voice_volume" => &mut user_settings.voice_volume,
+                    "sfx_volume" => &mut user_settings.sfx_volume,
+                    _ => {
+                        warn!("unsupported user setting `{name}`");
+                        continue;
+                    }
+                };
+                *volume = adjusted_volume(*volume, delta);
+                if let Err(error) = write_user_settings(user_settings.as_ref()) {
+                    warn!("failed to write user settings: {error}");
+                }
+            }
             ScriptCommand::ApplyUiStyle(style_patch) => {
                 apply_ui_style_patch(&mut ui_style, style_patch);
                 refresh_dialogue_ui_style(
