@@ -21,8 +21,9 @@ use crate::{
     },
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
-        ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse,
-        ScriptRuntimeState, save_runtime_slot, spawn_script_runtime,
+        IrEvent, IrRuntime, IrVm, IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap,
+        ScriptCommand, ScriptInbox, ScriptResponse, ScriptRuntimeState, save_runtime_slot,
+        script_command_from_ir, spawn_script_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -32,7 +33,7 @@ use crate::{
         SaveSlotSummary, StorageError, UserSettings, list_save_slots, load_save_data,
         read_user_settings, write_user_settings,
     },
-    texture::{TextureAtlasCatalog, prepare_texture_atlases},
+    texture::{TextureAtlasCatalog, TextureCatalog, prepare_texture_atlases},
     ui::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
@@ -335,6 +336,55 @@ pub struct PendingScriptCommands {
     pub items: VecDeque<ScriptCommand>,
 }
 
+pub fn bridge_ir_events(
+    mut runtime: ResMut<IrRuntime>,
+    mut pending_script_commands: ResMut<PendingScriptCommands>,
+    textures: Option<Res<TextureCatalog>>,
+) {
+    if let Some(receiver) = runtime.wait_response.as_ref() {
+        let response = receiver.lock().unwrap().try_recv();
+        match response {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                runtime.wait_response = None;
+                if let Some(vm) = runtime.vm.as_mut() {
+                    vm.resume();
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => return,
+        }
+    }
+
+    let Some(event) = runtime.events.pop() else {
+        return;
+    };
+
+    match event {
+        IrEvent::Command(command) => match script_command_from_ir(command, textures.as_deref()) {
+            Ok(command) => pending_script_commands.items.push_back(command),
+            Err(error) => warn!("IR command rejected: {error}"),
+        },
+        IrEvent::Waiting(wait_kind) => {
+            let (response_tx, response_rx) = mpsc::channel();
+            let command = match wait_kind {
+                IrWaitKind::DialogueAdvance => {
+                    ScriptCommand::AwaitDialogueAdvance { done: response_tx }
+                }
+                IrWaitKind::ScreenChoice => {
+                    ScriptCommand::WaitForScreenChoice { done: response_tx }
+                }
+                IrWaitKind::DurationMs(milliseconds) => ScriptCommand::Wait {
+                    duration: std::time::Duration::from_millis(milliseconds),
+                    animation_id: None,
+                    done: response_tx,
+                },
+            };
+            runtime.wait_response = Some(std::sync::Arc::new(std::sync::Mutex::new(response_rx)));
+            pending_script_commands.items.push_back(command);
+        }
+        IrEvent::Completed => {}
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct ActiveScriptBatches {
     pub items: Vec<ActiveScriptBatch>,
@@ -558,6 +608,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub camera_state: ResMut<'w, CameraState>,
     pub camera_tweens: ResMut<'w, CameraTweenState>,
     pub pending_script_commands: ResMut<'w, PendingScriptCommands>,
+    pub ir_runtime: ResMut<'w, IrRuntime>,
     pub active_batches: ResMut<'w, ActiveScriptBatches>,
     pub dialogue_state: ResMut<'w, DialogueState>,
     pub choice_state: ResMut<'w, ChoiceState>,
@@ -1546,6 +1597,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut camera_state = ctx.camera_state;
     let mut camera_tweens = ctx.camera_tweens;
     let mut pending_script_commands = ctx.pending_script_commands;
+    let mut ir_runtime = ctx.ir_runtime;
     let mut active_batches = ctx.active_batches;
     let mut dialogue_state = ctx.dialogue_state;
     let mut choice_state = ctx.choice_state;
@@ -1590,6 +1642,14 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
         }
 
         match command {
+            ScriptCommand::StartIr { program } => match IrVm::new(program) {
+                Ok(vm) => {
+                    ir_runtime.vm = Some(vm);
+                    ir_runtime.events.clear();
+                    ir_runtime.wait_response = None;
+                }
+                Err(error) => warn!("failed to start IR program: {error}"),
+            },
             ScriptCommand::Log(message) => info!("[rhai] {message}"),
             ScriptCommand::SetBackground {
                 path,

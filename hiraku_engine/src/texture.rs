@@ -80,6 +80,7 @@ pub fn prepare_texture_atlases(commands: &mut Commands, asset_server: &AssetServ
         })
         .collect();
     commands.insert_resource(TextureAtlasCatalog::default());
+    commands.insert_resource(catalog.clone());
     commands.insert_resource(TextureAtlasBuildState {
         catalog,
         images,
@@ -403,5 +404,31 @@ mod tests {
         assert!(catalog.ready);
         assert_eq!(first.image, second.image);
         assert_ne!(first.atlas.index, second.atlas.index);
+    }
+
+    #[test]
+    fn ir_background_commands_resolve_catalog_names() {
+        let catalog = TextureCatalog {
+            textures: BTreeMap::from([(
+                "bg/016/001".to_string(),
+                TextureDefinition {
+                    path: "hdp://main.hdp/textures/backgrounds/Background_016_001.png".to_string(),
+                    rect: None,
+                },
+            )]),
+        };
+
+        let command = crate::script::script_command_from_ir(
+            crate::script::IrCommand::SetBackground {
+                texture: "bg/016/001".to_string(),
+            },
+            Some(&catalog),
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            crate::script::ScriptCommand::SetBackground { path, .. }
+                if path == "hdp://main.hdp/textures/backgrounds/Background_016_001.png"
+        ));
     }
 }

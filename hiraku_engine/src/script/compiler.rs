@@ -1,11 +1,11 @@
-use rhai::{Engine, Expr, FnCallExpr, OptimizationLevel, Position, Stmt, StmtBlock};
+use rhai::{ASTFlags, Engine, Expr, FnCallExpr, OptimizationLevel, Position, Stmt, StmtBlock};
 use thiserror::Error;
 
-use super::ir::{IrCommand, IrExpression, IrExpressionId, IrInstruction, IrProgram};
+use super::ir::{IrCommand, IrExpression, IrExpressionId, IrInstruction, IrProgram, IrWaitKind};
 
 /// Compiles the deterministic command-only Rhai subset into Hiraku IR.
 ///
-/// This intentionally rejects variables, closures, loops, and arbitrary calls
+/// This intentionally rejects closures and arbitrary calls
 /// until their execution semantics are represented by the IR VM.
 pub fn compile_to_ir(path: &str, source: &str) -> Result<IrProgram, IrCompileError> {
     let mut engine = Engine::new_raw();
@@ -20,6 +20,8 @@ pub fn compile_to_ir(path: &str, source: &str) -> Result<IrProgram, IrCompileErr
         path,
         expressions: Vec::new(),
         instructions: Vec::new(),
+        loops: Vec::new(),
+        apis: IrApiRegistry::default(),
     };
     lowerer.lower_statements(ast.statements())?;
     lowerer.instructions.push(IrInstruction::Halt);
@@ -34,6 +36,63 @@ struct Lowerer<'a> {
     path: &'a str,
     expressions: Vec<IrExpression>,
     instructions: Vec<IrInstruction>,
+    loops: Vec<LoopContext>,
+    apis: IrApiRegistry,
+}
+
+#[derive(Clone, Copy)]
+struct IrApiRegistry {
+    commands: &'static [(&'static str, CommandApi)],
+    character: &'static [(&'static str, CharacterApi)],
+}
+
+type CommandApi = for<'a> fn(RhaiCall<'a>) -> Result<IrEmission, IrCompileError>;
+type CharacterApi =
+    for<'a> fn(&mut CharacterFlowLowering, RhaiCall<'a>) -> Result<(), IrCompileError>;
+
+impl Default for IrApiRegistry {
+    fn default() -> Self {
+        Self {
+            commands: &[
+                ("log", api::log),
+                ("stop_bgm", api::stop_bgm),
+                ("return_to_title", api::return_to_title),
+                ("clear_text", api::clear_text),
+                ("narrate", api::narrate),
+                ("bg", api::bg),
+            ],
+            character: &[
+                ("char", api::char),
+                ("at", api::at),
+                ("scale", api::scale),
+                ("e", api::expression),
+            ],
+        }
+    }
+}
+
+impl IrApiRegistry {
+    fn command(&self, name: &str) -> Option<CommandApi> {
+        self.commands
+            .iter()
+            .find_map(|(registered, handler)| (*registered == name).then_some(*handler))
+    }
+
+    fn character(&self, name: &str) -> Option<CharacterApi> {
+        self.character
+            .iter()
+            .find_map(|(registered, handler)| (*registered == name).then_some(*handler))
+    }
+}
+
+struct LoopContext {
+    continue_pc: u32,
+    break_patches: Vec<usize>,
+}
+
+struct IrEmission {
+    command: IrCommand,
+    wait: Option<IrWaitKind>,
 }
 
 impl Lowerer<'_> {
@@ -51,9 +110,37 @@ impl Lowerer<'_> {
             Stmt::FnCall(call, position) => self.lower_command_call(call, *position),
             Stmt::Expr(expression) => match expression.as_ref() {
                 Expr::FnCall(call, position) => self.lower_command_call(call, *position),
+                Expr::Dot(_, _, _) => self.lower_fluent_character(expression),
                 expression => Err(self.unsupported_expression(expression)),
             },
             Stmt::If(flow, _) => self.lower_if(flow),
+            Stmt::While(flow, _) => self.lower_while(flow),
+            Stmt::BreakLoop(expression, flags, position) => {
+                if expression.is_some() {
+                    return Err(IrCompileError::UnsupportedStatement {
+                        path: self.path.to_string(),
+                        kind: "break/continue with expression".to_string(),
+                        line: position.line(),
+                        column: position.position(),
+                    });
+                }
+                let Some(loop_context) = self.loops.last_mut() else {
+                    return Err(IrCompileError::UnsupportedStatement {
+                        path: self.path.to_string(),
+                        kind: "break/continue outside loop".to_string(),
+                        line: position.line(),
+                        column: position.position(),
+                    });
+                };
+                if flags.contains(ASTFlags::BREAK) {
+                    loop_context.break_patches.push(self.instructions.len());
+                    self.instructions.push(IrInstruction::Jump(0));
+                } else {
+                    self.instructions
+                        .push(IrInstruction::Jump(loop_context.continue_pc));
+                }
+                Ok(())
+            }
             other => Err(self.unsupported_statement(other)),
         }
     }
@@ -98,35 +185,134 @@ impl Lowerer<'_> {
         Ok(id)
     }
 
+    fn lower_while(&mut self, flow: &rhai::FlowControl) -> Result<(), IrCompileError> {
+        let is_loop = matches!(&flow.expr, Expr::Unit(_));
+        if is_loop {
+            let body_pc = self.instructions.len() as u32;
+            self.loops.push(LoopContext {
+                continue_pc: body_pc,
+                break_patches: Vec::new(),
+            });
+            self.lower_block(&flow.body)?;
+            self.instructions.push(IrInstruction::Jump(body_pc));
+            let end_pc = self.instructions.len() as u32;
+            self.patch_loop_breaks(end_pc);
+            self.loops.pop();
+            return Ok(());
+        }
+
+        let condition_pc = self.instructions.len() as u32;
+        let expression = self.lower_condition(&flow.expr)?;
+        let branch_pc = self.instructions.len();
+        self.instructions.push(IrInstruction::Branch {
+            expression,
+            then_pc: 0,
+            else_pc: 0,
+        });
+        let body_pc = self.instructions.len() as u32;
+        self.loops.push(LoopContext {
+            continue_pc: condition_pc,
+            break_patches: Vec::new(),
+        });
+        self.lower_block(&flow.body)?;
+        self.instructions.push(IrInstruction::Jump(condition_pc));
+        let end_pc = self.instructions.len() as u32;
+        self.patch_loop_breaks(end_pc);
+        self.loops.pop();
+        self.instructions[branch_pc] = IrInstruction::Branch {
+            expression,
+            then_pc: body_pc,
+            else_pc: end_pc,
+        };
+        Ok(())
+    }
+
+    fn patch_loop_breaks(&mut self, end_pc: u32) {
+        let break_patches = self
+            .loops
+            .last_mut()
+            .map(|context| std::mem::take(&mut context.break_patches))
+            .unwrap_or_default();
+        for pc in break_patches {
+            self.instructions[pc] = IrInstruction::Jump(end_pc);
+        }
+    }
+
     fn lower_command_call(
         &mut self,
         call: &FnCallExpr,
         position: Position,
     ) -> Result<(), IrCompileError> {
-        let command = match call.name.as_str() {
-            "log" => IrCommand::Log(one_string_argument(call, self.path, position)?),
-            "clear_text" => {
-                no_arguments(call, self.path, position)?;
-                IrCommand::ClearDialogue
-            }
-            "narrate" => IrCommand::Say {
-                speaker: String::new(),
-                text: one_string_argument(call, self.path, position)?,
-            },
-            "bg" => IrCommand::SetBackground {
-                path: one_string_argument(call, self.path, position)?,
-            },
-            _ => {
-                return Err(IrCompileError::UnsupportedCall {
-                    path: self.path.to_string(),
-                    name: call.name.to_string(),
-                    line: position.line(),
-                    column: position.position(),
-                });
-            }
+        let call = RhaiCall::new(call, position, self.path);
+        let Some(handler) = self.apis.command(call.name()) else {
+            return Err(call.unsupported_call());
         };
-        self.instructions.push(IrInstruction::Emit(command));
+        let emission = handler(call)?;
+        self.instructions
+            .push(IrInstruction::Emit(emission.command));
+        if let Some(wait) = emission.wait {
+            self.instructions.push(IrInstruction::Wait(wait));
+        }
         Ok(())
+    }
+
+    fn lower_fluent_character(&mut self, expression: &Expr) -> Result<(), IrCompileError> {
+        let mut flow = CharacterFlowLowering {
+            scale: 1.0,
+            ..Default::default()
+        };
+        self.read_character_chain(expression, &mut flow)?;
+        self.instructions
+            .push(IrInstruction::Emit(IrCommand::ShowCharacter {
+                actor_id: flow.actor_id.clone(),
+                character_name: flow.character_name,
+                expressions: flow.expressions,
+                position: flow.position,
+                scale: flow.scale,
+            }));
+        Ok(())
+    }
+
+    fn read_character_chain(
+        &self,
+        expression: &Expr,
+        flow: &mut CharacterFlowLowering,
+    ) -> Result<(), IrCompileError> {
+        match expression {
+            Expr::FnCall(call, position) => {
+                let call = RhaiCall::new(call, *position, self.path);
+                let Some(handler) = self.apis.character(call.name()) else {
+                    return Err(self.unsupported_expression(expression));
+                };
+                handler(flow, call)
+            }
+            Expr::Dot(binary, _, _) => {
+                self.read_character_chain(&binary.lhs, flow)?;
+                self.read_character_suffix(&binary.rhs, flow)
+            }
+            _ => Err(self.unsupported_expression(expression)),
+        }
+    }
+
+    fn read_character_suffix(
+        &self,
+        expression: &Expr,
+        flow: &mut CharacterFlowLowering,
+    ) -> Result<(), IrCompileError> {
+        match expression {
+            Expr::MethodCall(call, position) => {
+                let call = RhaiCall::new(call, *position, self.path);
+                let Some(handler) = self.apis.character(call.name()) else {
+                    return Err(call.unsupported_call());
+                };
+                handler(flow, call)
+            }
+            Expr::Dot(binary, _, _) => {
+                self.read_character_suffix(&binary.lhs, flow)?;
+                self.read_character_suffix(&binary.rhs, flow)
+            }
+            _ => Err(self.unsupported_expression(expression)),
+        }
     }
 
     fn unsupported_statement(&self, statement: &Stmt) -> IrCompileError {
@@ -150,44 +336,179 @@ impl Lowerer<'_> {
     }
 }
 
-fn no_arguments(call: &FnCallExpr, path: &str, position: Position) -> Result<(), IrCompileError> {
-    if call.args.is_empty() {
-        Ok(())
-    } else {
-        Err(IrCompileError::InvalidCall {
-            path: path.to_string(),
-            name: call.name.to_string(),
-            message: "does not accept arguments".to_string(),
-            line: position.line(),
-            column: position.position(),
-        })
+/// Typed, Rust-like access to a Rhai call. This is the only layer that
+/// understands Rhai's raw `FnCallExpr` argument representation.
+struct RhaiCall<'a> {
+    call: &'a FnCallExpr,
+    position: Position,
+    path: &'a str,
+}
+
+impl<'a> RhaiCall<'a> {
+    fn new(call: &'a FnCallExpr, position: Position, path: &'a str) -> Self {
+        Self {
+            call,
+            position,
+            path,
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.call.name.as_str()
+    }
+
+    fn no_args(&self) -> Result<(), IrCompileError> {
+        if self.call.args.is_empty() {
+            Ok(())
+        } else {
+            Err(self.invalid("does not accept arguments"))
+        }
+    }
+
+    fn one_string(&self) -> Result<String, IrCompileError> {
+        let Some(Expr::StringConstant(value, _)) = self.call.args.first() else {
+            return Err(self.invalid("requires one string literal argument"));
+        };
+        if self.call.args.len() != 1 {
+            return Err(self.invalid("requires exactly one argument"));
+        }
+        Ok(value.to_string())
+    }
+
+    fn one_float(&self) -> Result<f32, IrCompileError> {
+        let Some(Expr::FloatConstant(value, _)) = self.call.args.first() else {
+            return Err(self.invalid("requires one float literal argument"));
+        };
+        if self.call.args.len() != 1 {
+            return Err(self.invalid("requires exactly one argument"));
+        }
+        Ok(**value as f32)
+    }
+
+    fn invalid(&self, message: impl Into<String>) -> IrCompileError {
+        IrCompileError::InvalidCall {
+            path: self.path.to_string(),
+            name: self.call.name.to_string(),
+            message: message.into(),
+            line: self.position.line(),
+            column: self.position.position(),
+        }
+    }
+
+    fn unsupported_call(&self) -> IrCompileError {
+        IrCompileError::UnsupportedCall {
+            path: self.path.to_string(),
+            name: self.call.name.to_string(),
+            line: self.position.line(),
+            column: self.position.position(),
+        }
     }
 }
 
-fn one_string_argument(
-    call: &FnCallExpr,
-    path: &str,
-    position: Position,
-) -> Result<String, IrCompileError> {
-    let Some(Expr::StringConstant(value, _)) = call.args.first() else {
-        return Err(IrCompileError::InvalidCall {
-            path: path.to_string(),
-            name: call.name.to_string(),
-            message: "requires one string literal argument".to_string(),
-            line: position.line(),
-            column: position.position(),
-        });
-    };
-    if call.args.len() != 1 {
-        return Err(IrCompileError::InvalidCall {
-            path: path.to_string(),
-            name: call.name.to_string(),
-            message: "requires exactly one argument".to_string(),
-            line: position.line(),
-            column: position.position(),
-        });
+mod api {
+    use super::*;
+
+    pub(super) fn log(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        Ok(IrEmission {
+            command: IrCommand::Log(call.one_string()?),
+            wait: None,
+        })
     }
-    Ok(value.to_string())
+
+    pub(super) fn stop_bgm(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        call.no_args()?;
+        Ok(IrEmission {
+            command: IrCommand::StopBgm,
+            wait: None,
+        })
+    }
+
+    pub(super) fn clear_text(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        call.no_args()?;
+        Ok(IrEmission {
+            command: IrCommand::ClearDialogue,
+            wait: None,
+        })
+    }
+
+    pub(super) fn return_to_title(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        call.no_args()?;
+        Ok(IrEmission {
+            command: IrCommand::ReturnToTitle,
+            wait: None,
+        })
+    }
+
+    pub(super) fn narrate(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        Ok(IrEmission {
+            command: IrCommand::Say {
+                speaker: String::new(),
+                text: call.one_string()?,
+            },
+            wait: Some(IrWaitKind::DialogueAdvance),
+        })
+    }
+
+    pub(super) fn bg(call: RhaiCall<'_>) -> Result<IrEmission, IrCompileError> {
+        Ok(IrEmission {
+            command: IrCommand::SetBackground {
+                texture: call.one_string()?,
+            },
+            wait: None,
+        })
+    }
+
+    pub(super) fn char(
+        flow: &mut CharacterFlowLowering,
+        call: RhaiCall<'_>,
+    ) -> Result<(), IrCompileError> {
+        let actor_id = call.one_string()?;
+        flow.actor_id = actor_id.clone();
+        flow.character_name = actor_id;
+        Ok(())
+    }
+
+    pub(super) fn at(
+        flow: &mut CharacterFlowLowering,
+        call: RhaiCall<'_>,
+    ) -> Result<(), IrCompileError> {
+        flow.position = match call.one_string()?.as_str() {
+            "left" => [-600.0, 0.0],
+            "center" => [0.0, 0.0],
+            "right" => [600.0, 0.0],
+            _ => return Err(call.invalid("position must be left, center, or right")),
+        };
+        Ok(())
+    }
+
+    pub(super) fn scale(
+        flow: &mut CharacterFlowLowering,
+        call: RhaiCall<'_>,
+    ) -> Result<(), IrCompileError> {
+        let scale = call.one_float()?;
+        if scale <= 0.0 {
+            return Err(call.invalid("scale must be positive"));
+        }
+        flow.scale = scale;
+        Ok(())
+    }
+
+    pub(super) fn expression(
+        flow: &mut CharacterFlowLowering,
+        call: RhaiCall<'_>,
+    ) -> Result<(), IrCompileError> {
+        flow.expressions.push(call.one_string()?);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CharacterFlowLowering {
+    actor_id: String,
+    character_name: String,
+    expressions: Vec<String>,
+    position: [f32; 2],
+    scale: f32,
 }
 
 fn source_hash(source: &str) -> u64 {
@@ -267,6 +588,7 @@ pub enum IrCompileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::ir::{IrEvent, IrVm};
 
     #[test]
     fn compiles_supported_commands_and_literal_if() {
@@ -283,20 +605,22 @@ mod tests {
                 IrInstruction::Branch {
                     expression: IrExpressionId(0),
                     then_pc: 2,
-                    else_pc: 4,
+                    else_pc: 5,
                 },
                 IrInstruction::Emit(IrCommand::Say {
                     speaker: String::new(),
                     text: "yes".to_string(),
                 }),
-                IrInstruction::Jump(5),
+                IrInstruction::Wait(IrWaitKind::DialogueAdvance),
+                IrInstruction::Jump(7),
                 IrInstruction::Emit(IrCommand::Say {
                     speaker: String::new(),
                     text: "no".to_string(),
                 }),
+                IrInstruction::Wait(IrWaitKind::DialogueAdvance),
                 IrInstruction::Emit(IrCommand::ClearDialogue),
                 IrInstruction::Emit(IrCommand::SetBackground {
-                    path: "bg/opening".to_string(),
+                    texture: "bg/opening".to_string(),
                 }),
                 IrInstruction::Halt,
             ]
@@ -310,6 +634,82 @@ mod tests {
         assert!(matches!(
             error,
             IrCompileError::UnsupportedExpression { .. }
+        ));
+    }
+
+    #[test]
+    fn lowers_while_loop_break_and_continue_to_valid_jumps() {
+        let while_program =
+            compile_to_ir("test.rhai", "while ready { if false { continue; } break; }").unwrap();
+        assert!(while_program.validate().is_ok());
+
+        let loop_program = compile_to_ir("test.rhai", "loop { break; }").unwrap();
+        assert!(loop_program.validate().is_ok());
+    }
+
+    #[test]
+    fn evaluates_a_boolean_variable_when_the_vm_reaches_a_branch() {
+        let program = compile_to_ir("test.rhai", "if ready { log(\"yes\"); }").unwrap();
+        let mut vm = IrVm::new(program).unwrap();
+        vm.set_bool_variable("ready", true);
+        assert_eq!(
+            vm.step(),
+            Some(IrEvent::Command(IrCommand::Log("yes".to_string())))
+        );
+    }
+
+    #[test]
+    fn current_new_game_script_is_ready_for_ir_handoff() {
+        let source =
+            include_str!("../../../../manosabars/assets/main_hdp_contents/scripts/new_game.rhai");
+        let program = compile_to_ir("scripts/new_game.rhai", source).unwrap();
+        assert!(program.validate().is_ok());
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::ShowCharacter { .. })
+            )
+        }));
+    }
+
+    #[test]
+    fn each_character_statement_commits_without_finish() {
+        let program = compile_to_ir(
+            "test.rhai",
+            r#"char("alice").e("hand"); char("bob").e("hand");"#,
+        )
+        .unwrap();
+        assert_eq!(
+            program
+                .instructions
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        instruction,
+                        IrInstruction::Emit(IrCommand::ShowCharacter { .. })
+                    )
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn current_gallery_script_is_ready_for_ir_handoff() {
+        let source =
+            include_str!("../../../../manosabars/assets/main_hdp_contents/scripts/gallery.rhai");
+        let program = compile_to_ir("scripts/gallery.rhai", source).unwrap();
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(instruction, IrInstruction::Emit(IrCommand::ReturnToTitle))
+        }));
+    }
+
+    #[test]
+    fn finish_is_not_an_ir_api() {
+        let error = compile_to_ir("test.rhai", r#"char("alice").finish();"#).unwrap_err();
+        assert!(matches!(
+            error,
+            IrCompileError::UnsupportedCall { name, .. } if name == "finish"
         ));
     }
 }

@@ -31,7 +31,7 @@ use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake, animate_camera_transition,
     animate_character_motion_effects, animate_custom_effects, animate_dialogue_text_reveal,
     animate_rule_transitions, animate_visual_tweens, apply_animation_cancellations,
-    apply_live_audio_settings, cleanup_stale_screen_ui, handle_choice_buttons,
+    apply_live_audio_settings, bridge_ir_events, cleanup_stale_screen_ui, handle_choice_buttons,
     handle_choice_keyboard, handle_runtime_menu_buttons, handle_screen_buttons,
     handle_screen_image_buttons, poll_pending_character_shows, poll_voice_playback,
     process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
@@ -144,8 +144,19 @@ impl Plugin for HirakuPlugin {
                     .after(build_texture_atlases)
                     .run_if(texture_atlases_ready),
             )
-            .add_systems(Update, process_script_commands.in_set(HirakuRuntimeSystems))
             .add_systems(Update, tick_ir_runtime.in_set(HirakuRuntimeSystems))
+            .add_systems(
+                Update,
+                bridge_ir_events
+                    .after(tick_ir_runtime)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                process_script_commands
+                    .after(bridge_ir_events)
+                    .in_set(HirakuRuntimeSystems),
+            )
             .add_systems(
                 Update,
                 animate_camera_transition

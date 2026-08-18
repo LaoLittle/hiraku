@@ -9,7 +9,7 @@ use std::{
 use std::thread;
 
 use bevy::{
-    log::error,
+    log::{error, info},
     math::{Vec2, Vec4},
     prelude::Resource,
 };
@@ -91,6 +91,9 @@ enum CheckpointDecision {
 #[derive(Debug)]
 pub enum ScriptCommand {
     Log(String),
+    StartIr {
+        program: IrProgram,
+    },
     SetBackground {
         path: String,
         fade: Option<Duration>,
@@ -294,6 +297,52 @@ pub enum ScriptCommand {
     },
     ReturnToTitle,
     Exit,
+}
+
+pub(crate) fn script_command_from_ir(
+    command: IrCommand,
+    textures: Option<&TextureCatalog>,
+) -> Result<ScriptCommand, String> {
+    let command = match command {
+        IrCommand::Log(message) => ScriptCommand::Log(message),
+        IrCommand::ClearDialogue => ScriptCommand::ClearDialogue,
+        IrCommand::Say { speaker, text } => ScriptCommand::Say {
+            speaker,
+            text,
+            animation_id: None,
+            done: None,
+        },
+        IrCommand::StopBgm => ScriptCommand::StopBgm,
+        IrCommand::ReturnToTitle => ScriptCommand::ReturnToTitle,
+        IrCommand::SetBackground { texture } => {
+            let Some(definition) = textures.and_then(|catalog| catalog.resolve(&texture)) else {
+                return Err(format!("texture `{texture}` is not defined"));
+            };
+            ScriptCommand::SetBackground {
+                path: definition.path.clone(),
+                fade: None,
+                animation_id: None,
+                done: None,
+            }
+        }
+        IrCommand::ShowCharacter {
+            actor_id,
+            character_name,
+            expressions,
+            position,
+            scale,
+        } => ScriptCommand::ShowCharacter {
+            actor_id,
+            character_name,
+            expressions,
+            position: Vec2::new(position[0], position[1]),
+            scale,
+            fade: None,
+            animation_id: None,
+            done: None,
+        },
+    };
+    Ok(command)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1568,6 +1617,14 @@ fn run_script_loop(
                             {
                                 scope = scope_from_stored_values(restored_scope);
                             }
+                            if let Some(program) = compile_ir_script(&host, &target) {
+                                host.set_current_script_path(target.clone());
+                                host.reset_script_checkpoint_counter();
+                                if let Err(err) = host.send(ScriptCommand::StartIr { program }) {
+                                    error!("failed to hand off `{target}` to IR runtime: {err}");
+                                }
+                                return ScriptLoopOutcome::Finished;
+                            }
                             next_script = target;
                             continue;
                         }
@@ -1613,10 +1670,28 @@ fn run_script_loop(
     }
 }
 
+fn compile_ir_script(host: &ScriptHost, path: &str) -> Option<IrProgram> {
+    let source = match host.vfs.read_text(path) {
+        Ok(source) => source,
+        Err(err) => {
+            error!("failed to read candidate IR script `{path}`: {err}");
+            return None;
+        }
+    };
+    match compile_to_ir(path, &source) {
+        Ok(program) => Some(program),
+        Err(err) => {
+            info!("keeping legacy runtime for `{path}`: {err}");
+            None
+        }
+    }
+}
+
 fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
     matches!(
         command,
         ScriptCommand::Log(_)
+            | ScriptCommand::StartIr { .. }
             | ScriptCommand::SetBackground { .. }
             | ScriptCommand::ShowSprite { .. }
             | ScriptCommand::HideSprite { .. }
@@ -1723,6 +1798,39 @@ mod tests {
         let (done, _response) = mpsc::channel();
         assert!(command_suppressed_during_replay(
             &ScriptCommand::WaitForScreenChoice { done }
+        ));
+    }
+
+    #[test]
+    fn ir_commands_map_to_scene_commands_without_callbacks() {
+        let command = script_command_from_ir(
+            IrCommand::ShowCharacter {
+                actor_id: "ema".to_string(),
+                character_name: "Ema".to_string(),
+                expressions: vec!["smile".to_string()],
+                position: [12.0, -4.0],
+                scale: 0.5,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            ScriptCommand::ShowCharacter {
+                actor_id,
+                character_name,
+                expressions,
+                position,
+                scale,
+                fade: None,
+                animation_id: None,
+                done: None,
+            } if actor_id == "ema"
+                && character_name == "Ema"
+                && expressions == vec!["smile".to_string()]
+                && position == Vec2::new(12.0, -4.0)
+                && scale == 0.5
         ));
     }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::mpsc};
 
 use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
@@ -104,8 +104,10 @@ pub enum IrCommand {
         speaker: String,
         text: String,
     },
+    StopBgm,
+    ReturnToTitle,
     SetBackground {
-        path: String,
+        texture: String,
     },
     ShowCharacter {
         actor_id: String,
@@ -304,6 +306,8 @@ pub enum IrValidationError {
 pub struct IrRuntime {
     pub vm: Option<IrVm>,
     pub events: Vec<IrEvent>,
+    pub wait_response:
+        Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
 }
 
 pub fn tick_ir_runtime(mut runtime: bevy::prelude::ResMut<IrRuntime>) {
