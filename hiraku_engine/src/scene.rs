@@ -23,8 +23,8 @@ use crate::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
         IrCommand, IrEvent, IrRuntime, IrVm, IrWaitKind, ResolvedCharacterKeyframe,
         ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse, ScriptRuntimeState, UiContext,
-        UiIntent, compile_to_ir, evaluate_ui_script, save_runtime_slot, script_command_from_ir,
-        spawn_script_runtime,
+        UiIntent, compile_story_program, evaluate_ui_script, save_runtime_slot,
+        script_command_from_ir, spawn_script_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -386,7 +386,7 @@ pub fn bridge_ir_events(
                 .0
                 .read_text(&target)
                 .ok()
-                .and_then(|source| compile_to_ir(&target, &source).ok());
+                .and_then(|source| compile_story_program(&target, &source).ok());
             match program.and_then(|program| IrVm::new(program).ok()) {
                 Some(vm) => {
                     runtime.vm = Some(vm);

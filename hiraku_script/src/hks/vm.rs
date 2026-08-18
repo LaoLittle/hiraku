@@ -445,6 +445,350 @@ impl Vm {
     }
 }
 
+/// Deterministic executor for task templates emitted by `seq` and `par`.
+///
+/// The scheduler has no knowledge of builtins. It yields calls to its host and
+/// accepts a value when that host completes the operation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskScheduler {
+    bytecode: Bytecode,
+    next_task_id: u64,
+    tasks: BTreeMap<u64, ScheduledTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ScheduledTask {
+    template: u32,
+    pc: usize,
+    stack: Vec<Value>,
+    locals: BTreeMap<String, Value>,
+    status: TaskStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum TaskStatus {
+    Ready,
+    WaitingForHost,
+    WaitingForChildren(Vec<u64>),
+    Completed(Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskSchedulerSnapshot {
+    pub source_hash: u64,
+    pub next_task_id: u64,
+    pub tasks: BTreeMap<u64, TaskSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskSnapshot {
+    pub template: u32,
+    pub pc: usize,
+    pub stack: Vec<Value>,
+    pub locals: BTreeMap<String, Value>,
+    pub status: TaskStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TaskEvent {
+    Call { task: u64, call: BuiltinCall },
+    Completed { task: u64, value: Value },
+}
+
+impl TaskScheduler {
+    pub fn new(bytecode: Bytecode) -> Result<Self, TaskSchedulerError> {
+        if bytecode.version != BYTECODE_VERSION {
+            return Err(TaskSchedulerError::UnsupportedBytecode(bytecode.version));
+        }
+        Ok(Self {
+            bytecode,
+            next_task_id: 1,
+            tasks: BTreeMap::new(),
+        })
+    }
+
+    /// Starts a task template and returns its deterministic handle.
+    pub fn spawn(&mut self, template: u32) -> Result<u64, TaskSchedulerError> {
+        self.template(template)?;
+        let task = self.next_task_id;
+        self.next_task_id += 1;
+        self.tasks.insert(
+            task,
+            ScheduledTask {
+                template,
+                pc: 0,
+                stack: Vec::new(),
+                locals: BTreeMap::new(),
+                status: TaskStatus::Ready,
+            },
+        );
+        Ok(task)
+    }
+
+    /// Drives one task until it needs a host result or completes.
+    pub fn step(&mut self) -> Result<Option<TaskEvent>, TaskSchedulerError> {
+        loop {
+            if let Some(event) = self.settle_completed_children()? {
+                return Ok(Some(event));
+            }
+            let Some(task) = self.tasks.iter().find_map(|(task, state)| {
+                matches!(state.status, TaskStatus::Ready).then_some(*task)
+            }) else {
+                return Ok(None);
+            };
+            if let Some(event) = self.step_task(task)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    pub fn resume(&mut self, task: u64, value: Value) -> Result<(), TaskSchedulerError> {
+        let task = self
+            .tasks
+            .get_mut(&task)
+            .ok_or(TaskSchedulerError::UnknownTask(task))?;
+        if !matches!(task.status, TaskStatus::WaitingForHost) {
+            return Err(TaskSchedulerError::NotWaitingForHost);
+        }
+        task.stack.push(value);
+        task.status = TaskStatus::Ready;
+        Ok(())
+    }
+
+    pub fn status(&self, task: u64) -> Option<&TaskStatus> {
+        self.tasks.get(&task).map(|task| &task.status)
+    }
+
+    pub fn snapshot(&self) -> TaskSchedulerSnapshot {
+        TaskSchedulerSnapshot {
+            source_hash: self.bytecode.source_hash,
+            next_task_id: self.next_task_id,
+            tasks: self
+                .tasks
+                .iter()
+                .map(|(id, task)| {
+                    (
+                        *id,
+                        TaskSnapshot {
+                            template: task.template,
+                            pc: task.pc,
+                            stack: task.stack.clone(),
+                            locals: task.locals.clone(),
+                            status: task.status.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub fn restore(
+        bytecode: Bytecode,
+        snapshot: TaskSchedulerSnapshot,
+    ) -> Result<Self, TaskSchedulerError> {
+        if bytecode.source_hash != snapshot.source_hash {
+            return Err(TaskSchedulerError::SourceHashMismatch);
+        }
+        let mut scheduler = Self::new(bytecode)?;
+        scheduler.next_task_id = snapshot.next_task_id;
+        for (id, task) in snapshot.tasks {
+            let template = scheduler.template(task.template)?;
+            if task.pc > template.instructions.len() {
+                return Err(TaskSchedulerError::InvalidProgramCounter(task.pc));
+            }
+            scheduler.tasks.insert(
+                id,
+                ScheduledTask {
+                    template: task.template,
+                    pc: task.pc,
+                    stack: task.stack,
+                    locals: task.locals,
+                    status: task.status,
+                },
+            );
+        }
+        Ok(scheduler)
+    }
+
+    fn step_task(&mut self, task_id: u64) -> Result<Option<TaskEvent>, TaskSchedulerError> {
+        let template_id = self
+            .tasks
+            .get(&task_id)
+            .ok_or(TaskSchedulerError::UnknownTask(task_id))?
+            .template;
+        let template = self.template(template_id)?.clone();
+        if template.mode == TaskMode::Parallel {
+            let children = template
+                .children
+                .iter()
+                .map(|template| self.spawn(*template))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.tasks
+                .get_mut(&task_id)
+                .ok_or(TaskSchedulerError::UnknownTask(task_id))?
+                .status = TaskStatus::WaitingForChildren(children);
+            return Ok(None);
+        }
+
+        let instruction = {
+            let task = self
+                .tasks
+                .get_mut(&task_id)
+                .ok_or(TaskSchedulerError::UnknownTask(task_id))?;
+            let instruction = template
+                .instructions
+                .get(task.pc)
+                .cloned()
+                .ok_or(TaskSchedulerError::InvalidProgramCounter(task.pc))?;
+            task.pc += 1;
+            instruction
+        };
+        match instruction {
+            Instruction::Constant(value) => self.task_mut(task_id)?.stack.push(value),
+            Instruction::LoadLocal(name) => {
+                let value = self
+                    .task_mut(task_id)?
+                    .locals
+                    .get(&name)
+                    .cloned()
+                    .ok_or(TaskSchedulerError::UnknownLocal(name))?;
+                self.task_mut(task_id)?.stack.push(value);
+            }
+            Instruction::StoreLocal(name) => {
+                let value = self.pop_task(task_id)?;
+                self.task_mut(task_id)?.locals.insert(name, value);
+            }
+            Instruction::MakeTuple(count) => {
+                let values = self.pop_task_count(task_id, count)?;
+                self.task_mut(task_id)?.stack.push(Value::Tuple(values));
+            }
+            Instruction::MakeMap(keys) => {
+                let values = self.pop_task_count(task_id, keys.len())?;
+                self.task_mut(task_id)?
+                    .stack
+                    .push(Value::Map(keys.into_iter().zip(values).collect()));
+            }
+            Instruction::Negate => {
+                let Value::Number(value) = self.pop_task(task_id)? else {
+                    return Err(TaskSchedulerError::TypeMismatch(
+                        "cannot negate a non-number",
+                    ));
+                };
+                self.task_mut(task_id)?.stack.push(Value::Number(-value));
+            }
+            Instruction::Call { callee, labels } => {
+                let values = self.pop_task_count(task_id, labels.len())?;
+                self.task_mut(task_id)?.status = TaskStatus::WaitingForHost;
+                return Ok(Some(TaskEvent::Call {
+                    task: task_id,
+                    call: BuiltinCall {
+                        callee,
+                        arguments: labels
+                            .into_iter()
+                            .zip(values)
+                            .map(|(label, value)| CallArgument { label, value })
+                            .collect(),
+                    },
+                }));
+            }
+            Instruction::SpawnTask { task } => {
+                let child = self.spawn(task)?;
+                self.task_mut(task_id)?.stack.push(Value::Task(child));
+            }
+            Instruction::Pop => {
+                self.pop_task(task_id)?;
+            }
+            Instruction::Halt => {
+                let value = self.task_mut(task_id)?.stack.pop().unwrap_or(Value::Null);
+                self.task_mut(task_id)?.status = TaskStatus::Completed(value.clone());
+                return Ok(Some(TaskEvent::Completed {
+                    task: task_id,
+                    value,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn settle_completed_children(&mut self) -> Result<Option<TaskEvent>, TaskSchedulerError> {
+        let waiting = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| match &task.status {
+                TaskStatus::WaitingForChildren(children) => Some((*id, children.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (task_id, children) in waiting {
+            let mut values = Vec::with_capacity(children.len());
+            for child in children {
+                let child = self
+                    .tasks
+                    .get(&child)
+                    .ok_or(TaskSchedulerError::UnknownTask(child))?;
+                let TaskStatus::Completed(value) = &child.status else {
+                    values.clear();
+                    break;
+                };
+                values.push(value.clone());
+            }
+            if !values.is_empty()
+                || matches!(self.status(task_id), Some(TaskStatus::WaitingForChildren(children)) if children.is_empty())
+            {
+                let value = Value::Tuple(values);
+                self.task_mut(task_id)?.status = TaskStatus::Completed(value.clone());
+                return Ok(Some(TaskEvent::Completed {
+                    task: task_id,
+                    value,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn template(&self, id: u32) -> Result<&TaskTemplate, TaskSchedulerError> {
+        self.bytecode
+            .tasks
+            .get(id as usize)
+            .ok_or(TaskSchedulerError::UnknownTemplate(id))
+    }
+
+    fn task_mut(&mut self, id: u64) -> Result<&mut ScheduledTask, TaskSchedulerError> {
+        self.tasks
+            .get_mut(&id)
+            .ok_or(TaskSchedulerError::UnknownTask(id))
+    }
+
+    fn pop_task(&mut self, id: u64) -> Result<Value, TaskSchedulerError> {
+        self.task_mut(id)?
+            .stack
+            .pop()
+            .ok_or(TaskSchedulerError::StackUnderflow)
+    }
+
+    fn pop_task_count(&mut self, id: u64, count: usize) -> Result<Vec<Value>, TaskSchedulerError> {
+        let task = self.task_mut(id)?;
+        if task.stack.len() < count {
+            return Err(TaskSchedulerError::StackUnderflow);
+        }
+        let start = task.stack.len() - count;
+        Ok(task.stack.split_off(start))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskSchedulerError {
+    UnsupportedBytecode(u16),
+    SourceHashMismatch,
+    InvalidProgramCounter(usize),
+    StackUnderflow,
+    UnknownLocal(String),
+    UnknownTask(u64),
+    UnknownTemplate(u32),
+    NotWaitingForHost,
+    TypeMismatch(&'static str),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmError {
     UnsupportedBytecode(u16),
@@ -529,5 +873,85 @@ mod tests {
         assert_eq!(bytecode.tasks.len(), 3);
         assert_eq!(bytecode.tasks[2].mode, TaskMode::Parallel);
         assert_eq!(bytecode.tasks[2].children, vec![0, 1]);
+    }
+
+    #[test]
+    fn scheduler_runs_sequence_tasks_and_restores_waiting_state() {
+        let program = parse_program("let handle = seq { first(); second() }").unwrap();
+        let bytecode = compile(&program, 42).unwrap();
+        let mut scheduler = TaskScheduler::new(bytecode.clone()).unwrap();
+        let task = scheduler.spawn(0).unwrap();
+
+        let Some(TaskEvent::Call {
+            task: yielded,
+            call,
+        }) = scheduler.step().unwrap()
+        else {
+            panic!("expected first call");
+        };
+        assert_eq!(yielded, task);
+        assert_eq!(call.callee, "first");
+
+        let snapshot = scheduler.snapshot();
+        let mut restored = TaskScheduler::restore(bytecode, snapshot).unwrap();
+        restored.resume(task, Value::Null).unwrap();
+        let Some(TaskEvent::Call {
+            task: yielded,
+            call,
+        }) = restored.step().unwrap()
+        else {
+            panic!("expected second call");
+        };
+        assert_eq!(yielded, task);
+        assert_eq!(call.callee, "second");
+        restored.resume(task, Value::Null).unwrap();
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(TaskEvent::Completed {
+                task,
+                value: Value::Null,
+            })
+        );
+    }
+
+    #[test]
+    fn scheduler_starts_parallel_children_in_task_id_order() {
+        let program = parse_program("let handles = par { first(); second() }").unwrap();
+        let bytecode = compile(&program, 42).unwrap();
+        let mut scheduler = TaskScheduler::new(bytecode).unwrap();
+        let parent = scheduler.spawn(2).unwrap();
+
+        let Some(TaskEvent::Call { task: first, call }) = scheduler.step().unwrap() else {
+            panic!("expected first child call");
+        };
+        assert_eq!(call.callee, "first");
+        scheduler.resume(first, Value::Null).unwrap();
+        assert_eq!(
+            scheduler.step().unwrap(),
+            Some(TaskEvent::Completed {
+                task: first,
+                value: Value::Null,
+            })
+        );
+
+        let Some(TaskEvent::Call { task: second, call }) = scheduler.step().unwrap() else {
+            panic!("expected second child call");
+        };
+        assert_eq!(call.callee, "second");
+        scheduler.resume(second, Value::Null).unwrap();
+        assert_eq!(
+            scheduler.step().unwrap(),
+            Some(TaskEvent::Completed {
+                task: second,
+                value: Value::Null,
+            })
+        );
+        assert_eq!(
+            scheduler.step().unwrap(),
+            Some(TaskEvent::Completed {
+                task: parent,
+                value: Value::Tuple(vec![Value::Null, Value::Null]),
+            })
+        );
     }
 }

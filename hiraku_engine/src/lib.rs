@@ -44,7 +44,9 @@ pub use script::{
     IrChoiceOption, IrCommand, IrCompileError, IrEvent, IrExpressionId, IrInstruction, IrProgram,
     IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, compile_to_ir,
 };
-use script::{IrRuntime, ScriptBootstrap, spawn_script_runtime, tick_ir_runtime};
+use script::{
+    IrRuntime, ScriptBootstrap, compile_story_program, spawn_script_runtime, tick_ir_runtime,
+};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
@@ -279,7 +281,7 @@ fn boot_runtime(
                 .0
                 .read_text(&startup_script)
                 .ok()
-                .and_then(|source| compile_to_ir(&startup_script, &source).ok())
+                .and_then(|source| compile_story_program(&startup_script, &source).ok())
                 .and_then(|program| IrVm::new(program).ok());
             if let Some(vm) = ir_program {
                 info!("starting startup script in IR runtime");

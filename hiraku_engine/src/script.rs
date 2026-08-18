@@ -57,6 +57,14 @@ pub use ir::{
 };
 pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
 
+pub(crate) fn compile_story_program(path: &str, source: &str) -> Result<IrProgram, String> {
+    if path.ends_with(".hks") {
+        crate::hks_prelude::compile_story_to_ir(path, source).map_err(|error| error.to_string())
+    } else {
+        compile_to_ir(path, source).map_err(|error| error.to_string())
+    }
+}
+
 const PRELUDE_SOURCE: &str = include_str!("script/prelude.rhai");
 
 const JUMP_SCRIPT_SIGNAL: &str = "__hiraku_jump_script__::";
@@ -1738,7 +1746,7 @@ fn compile_ir_script(host: &ScriptHost, path: &str) -> Option<IrProgram> {
             return None;
         }
     };
-    match compile_to_ir(path, &source) {
+    match compile_story_program(path, &source) {
         Ok(program) => Some(program),
         Err(err) => {
             info!("keeping legacy runtime for `{path}`: {err}");
