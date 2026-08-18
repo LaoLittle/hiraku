@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 
-use rhai::Dynamic;
+use bevy::prelude::Resource;
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    data::evaluate_rhai_map,
+    data::evaluate_hks_map,
     vfs::{HdpVfs, VfsError},
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Resource)]
 pub struct AudioCatalog {
     music: BTreeMap<String, AudioDefinition>,
     voices: BTreeMap<String, AudioDefinition>,
@@ -51,9 +52,9 @@ struct AudioFile {
 
 pub fn load_audio_catalog(vfs: &HdpVfs) -> Result<AudioCatalog, AudioCatalogError> {
     Ok(AudioCatalog {
-        music: load_channel(vfs, &vfs.load_bgm_dir_path(None)?, ".music.rhai")?,
-        voices: load_channel(vfs, &vfs.load_voice_dir_path(None)?, ".voice.rhai")?,
-        sfx: load_channel(vfs, &vfs.load_soundeffects_dir_path(None)?, ".sfx.rhai")?,
+        music: load_channel(vfs, &vfs.load_bgm_dir_path(None)?, ".music.data.hks")?,
+        voices: load_channel(vfs, &vfs.load_voice_dir_path(None)?, ".voice.data.hks")?,
+        sfx: load_channel(vfs, &vfs.load_soundeffects_dir_path(None)?, ".sfx.data.hks")?,
     })
 }
 
@@ -73,19 +74,18 @@ fn load_channel(
     let mut definitions = BTreeMap::new();
     for descriptor_path in paths {
         let source = vfs.read_text(&descriptor_path)?;
-        let data = evaluate_rhai_map(&descriptor_path, &source).map_err(|error| {
+        let data = evaluate_hks_map(&descriptor_path, &source).map_err(|error| {
             AudioCatalogError::Data {
                 path: descriptor_path.clone(),
                 message: error.to_string(),
             }
         })?;
-        let file: AudioFile =
-            rhai::serde::from_dynamic(&Dynamic::from_map(data)).map_err(|error| {
-                AudioCatalogError::Data {
-                    path: descriptor_path.clone(),
-                    message: error.to_string(),
-                }
-            })?;
+        let file: AudioFile = serde_json::from_value(Value::Object(data)).map_err(|error| {
+            AudioCatalogError::Data {
+                path: descriptor_path.clone(),
+                message: error.to_string(),
+            }
+        })?;
         let definition = AudioDefinition {
             path: vfs.resolve_path(Some(&descriptor_path), &file.audio),
         };
@@ -104,29 +104,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_audio_aliases_from_rhai_descriptors() {
+    fn loads_audio_aliases_from_hks_descriptors() {
         let root = std::env::temp_dir().join(format!("hiraku-audio-test-{}", std::process::id()));
         std::fs::create_dir_all(root.join("bgm")).unwrap();
         std::fs::create_dir_all(root.join("voice")).unwrap();
         std::fs::create_dir_all(root.join("soundeffects")).unwrap();
-        std::fs::write(root.join("settings.rhai"), "#{}").unwrap();
+        std::fs::write(root.join("settings.data.hks"), ".{}").unwrap();
         std::fs::write(
-            root.join("bgm/title.music.rhai"),
-            "#{ name: \"title\", audio: \"Title.ogg\" }",
+            root.join("bgm/title.music.data.hks"),
+            ".{ name: \"title\", audio: \"Title.ogg\" }",
         )
         .unwrap();
         std::fs::write(
-            root.join("voice/ema_001.voice.rhai"),
-            "#{ name: \"ema/001\", audio: \"Ema_001.ogg\" }",
+            root.join("voice/ema_001.voice.data.hks"),
+            ".{ name: \"ema/001\", audio: \"Ema_001.ogg\" }",
         )
         .unwrap();
         std::fs::write(
-            root.join("soundeffects/click.sfx.rhai"),
-            "#{ name: \"ui/click\", audio: \"click.wav\" }",
+            root.join("soundeffects/click.sfx.data.hks"),
+            ".{ name: \"ui/click\", audio: \"click.wav\" }",
         )
         .unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.rhai", "startup.rhai");
+        let vfs = HdpVfs::new_with_config(&root, "settings.data.hks", "startup.story.hks");
         let catalog = load_audio_catalog(&vfs).unwrap();
         assert_eq!(
             catalog.resolve_music("title").unwrap().path,

@@ -42,7 +42,6 @@ use crate::{
     vfs::{HdpVfs, VfsError},
 };
 
-mod compiler;
 mod hiraku_engine;
 mod ir;
 mod rng;
@@ -50,19 +49,19 @@ mod time;
 mod ui;
 pub mod ui_runtime;
 
-pub use compiler::{IrCompileError, compile_to_ir};
 pub use ir::{
-    IrChoiceOption, IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram, IrRuntime,
-    IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
+    IrChoiceOption, IrCommand, IrEvent, IrExpression, IrExpressionId, IrInstruction, IrProgram,
+    IrRuntime, IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
 };
 pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
 
 pub(crate) fn compile_story_program(path: &str, source: &str) -> Result<IrProgram, String> {
-    if path.ends_with(".hks") {
-        crate::hks_prelude::compile_story_to_ir(path, source).map_err(|error| error.to_string())
-    } else {
-        compile_to_ir(path, source).map_err(|error| error.to_string())
+    if !path.ends_with(".hks") {
+        return Err(format!(
+            "executable scripts must use the `.hks` extension: `{path}`"
+        ));
     }
+    crate::hks_prelude::compile_story_to_ir(path, source).map_err(|error| error.to_string())
 }
 
 const PRELUDE_SOURCE: &str = include_str!("script/prelude.rhai");
@@ -104,9 +103,6 @@ pub enum ScriptCommand {
     StartIr {
         path: String,
         program: IrProgram,
-    },
-    StartLegacy {
-        path: String,
     },
     SetBackground {
         path: String,
@@ -394,6 +390,9 @@ pub(crate) fn script_command_from_ir(
             animation_id: None,
             done: None,
         },
+        IrCommand::HksStatement { .. } => {
+            return Err("HKS native statements are handled by the IR runtime".to_string());
+        }
     };
     Ok(command)
 }
@@ -1760,7 +1759,6 @@ fn command_suppressed_during_replay(command: &ScriptCommand) -> bool {
         command,
         ScriptCommand::Log(_)
             | ScriptCommand::StartIr { .. }
-            | ScriptCommand::StartLegacy { .. }
             | ScriptCommand::SetBackground { .. }
             | ScriptCommand::ShowSprite { .. }
             | ScriptCommand::HideSprite { .. }

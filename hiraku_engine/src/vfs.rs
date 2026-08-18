@@ -9,15 +9,15 @@ use bevy::{
     prelude::*,
 };
 use futures_lite::stream;
-use rhai::Map;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use zip::{ZipArchive, result::ZipError};
 
-use crate::data::evaluate_rhai_map;
+use crate::data::evaluate_hks_map;
 
 pub const DEFAULT_ASSET_ROOT: &str = "assets";
-pub const DEFAULT_SETTINGS_PATH: &str = "hdp://main.hdp/settings.rhai";
-pub const DEFAULT_STARTUP_SCRIPT: &str = "hdp://main.hdp/startup.rhai";
+pub const DEFAULT_SETTINGS_PATH: &str = "hdp://main.hdp/settings.data.hks";
+pub const DEFAULT_STARTUP_SCRIPT: &str = "hdp://main.hdp/startup.story.hks";
 pub const RESOURCE_ROOT_PREFIX: &str = "res:/";
 pub const DEFAULT_RESOURCE_ROOT: &str = "hdp://main.hdp/";
 pub const HDP_SOURCE_ID: &str = "hdp";
@@ -100,15 +100,15 @@ struct FontsSettings {
     path: Option<String>,
 }
 
-fn settings_from_data(mut data: Map, path: &str) -> Result<SettingsFile, VfsError> {
+fn settings_from_data(mut data: Map<String, Value>, path: &str) -> Result<SettingsFile, VfsError> {
     let startup = take_data_string(&mut data, "startup", path)?;
-    let backgrounds_dir = take_data_string(&mut data, "backgrounds_dir", path)?;
-    let soundeffects_dir = take_data_string(&mut data, "soundeffects_dir", path)?;
-    let bgm_dir = take_data_string(&mut data, "bgm_dir", path)?;
-    let voice_dir = take_data_string(&mut data, "voice_dir", path)?;
-    let characters_dir = take_data_string(&mut data, "characters_dir", path)?;
-    let textures_dir = take_data_string(&mut data, "textures_dir", path)?;
-    let res_root = take_data_string(&mut data, "res_root", path)?;
+    let backgrounds_dir = take_data_string(&mut data, "backgroundsDir", path)?;
+    let soundeffects_dir = take_data_string(&mut data, "soundeffectsDir", path)?;
+    let bgm_dir = take_data_string(&mut data, "bgmDir", path)?;
+    let voice_dir = take_data_string(&mut data, "voiceDir", path)?;
+    let characters_dir = take_data_string(&mut data, "charactersDir", path)?;
+    let textures_dir = take_data_string(&mut data, "texturesDir", path)?;
+    let res_root = take_data_string(&mut data, "resRoot", path)?;
 
     let fonts = if let Some(mut fonts) = take_data_map(&mut data, "fonts", path)? {
         let path_value = take_data_string(&mut fonts, "path", path)?;
@@ -141,27 +141,41 @@ fn settings_from_data(mut data: Map, path: &str) -> Result<SettingsFile, VfsErro
     })
 }
 
-fn take_data_string(data: &mut Map, key: &str, path: &str) -> Result<Option<String>, VfsError> {
+fn take_data_string(
+    data: &mut Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<Option<String>, VfsError> {
     data.remove(key)
         .map(|value| {
             value
-                .try_cast::<String>()
+                .as_str()
+                .map(ToOwned::to_owned)
                 .ok_or_else(|| invalid_settings_data(path, format!("`{key}` must be a string")))
         })
         .transpose()
 }
 
-fn take_data_map(data: &mut Map, key: &str, path: &str) -> Result<Option<Map>, VfsError> {
+fn take_data_map(
+    data: &mut Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<Option<Map<String, Value>>, VfsError> {
     data.remove(key)
         .map(|value| {
             value
-                .try_cast::<Map>()
+                .as_object()
+                .cloned()
                 .ok_or_else(|| invalid_settings_data(path, format!("`{key}` must be a map")))
         })
         .transpose()
 }
 
-fn ensure_empty_data_map(data: Map, path: &str, section: &str) -> Result<(), VfsError> {
+fn ensure_empty_data_map(
+    data: Map<String, Value>,
+    path: &str,
+    section: &str,
+) -> Result<(), VfsError> {
     if data.is_empty() {
         return Ok(());
     }
@@ -253,10 +267,10 @@ impl HdpVfs {
         let mut paths = self
             .list_files_recursive(&directory)?
             .into_iter()
-            .filter(|path| path.ends_with(".font.rhai"))
+            .filter(|path| path.ends_with(".font.data.hks"))
             .map(|descriptor_path| {
                 let source = self.read_text(&descriptor_path)?;
-                let mut data = evaluate_rhai_map(&descriptor_path, &source)
+                let mut data = evaluate_hks_map(&descriptor_path, &source)
                     .map_err(|error| invalid_settings_data(&descriptor_path, error.to_string()))?;
                 let font =
                     take_data_string(&mut data, "font", &descriptor_path)?.ok_or_else(|| {
@@ -384,7 +398,7 @@ impl HdpVfs {
     fn load_settings_file_at(&self, base: Option<&str>) -> Result<SettingsFile, VfsError> {
         let settings_path = self.settings_path_for_base(base);
         let settings_text = self.read_text(&settings_path)?;
-        let data = evaluate_rhai_map(&settings_path, &settings_text).map_err(|error| {
+        let data = evaluate_hks_map(&settings_path, &settings_text).map_err(|error| {
             VfsError::SettingsData {
                 path: settings_path.clone(),
                 message: error.to_string(),
@@ -407,7 +421,7 @@ impl HdpVfs {
         Path::new(&self.settings_path)
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("settings.rhai")
+            .unwrap_or("settings.data.hks")
     }
 
     fn load_directory_path(
@@ -942,20 +956,20 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hiraku-vfs-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&root);
         std::fs::write(
-            root.join("settings.rhai"),
-            "#{ backgrounds_dir: \"art/backgrounds\", soundeffects_dir: \"audio/sfx\", fonts: #{ path: \"font-pack\" } }",
+            root.join("settings.data.hks"),
+            ".{ backgroundsDir: \"art/backgrounds\", soundeffectsDir: \"audio/sfx\", fonts: .{ path: \"font-pack\" } }",
         )
         .unwrap();
         std::fs::create_dir_all(root.join("font-pack")).unwrap();
         std::fs::write(root.join("font-pack/Regular.otf"), b"font").unwrap();
         std::fs::write(
-            root.join("font-pack/regular.font.rhai"),
-            "#{ font: \"Regular.otf\" }",
+            root.join("font-pack/regular.font.data.hks"),
+            ".{ font: \"Regular.otf\" }",
         )
         .unwrap();
         std::fs::write(root.join("font-pack/readme.txt"), b"ignored").unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.rhai", "startup.rhai");
+        let vfs = HdpVfs::new_with_config(&root, "settings.data.hks", "startup.story.hks");
         assert_eq!(
             vfs.resolve_background_path(Some("scripts/chapter.rhai"), "forest.png")
                 .unwrap(),
@@ -971,9 +985,9 @@ mod tests {
             vec!["font-pack/Regular.otf".to_string()]
         );
 
-        let _ = std::fs::remove_file(root.join("settings.rhai"));
+        let _ = std::fs::remove_file(root.join("settings.data.hks"));
         let _ = std::fs::remove_file(root.join("font-pack/Regular.otf"));
-        let _ = std::fs::remove_file(root.join("font-pack/regular.font.rhai"));
+        let _ = std::fs::remove_file(root.join("font-pack/regular.font.data.hks"));
         let _ = std::fs::remove_file(root.join("font-pack/readme.txt"));
         let _ = std::fs::remove_dir(root.join("font-pack"));
         let _ = std::fs::remove_dir(&root);

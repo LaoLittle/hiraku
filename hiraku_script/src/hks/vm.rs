@@ -9,7 +9,43 @@ use serde::{Deserialize, Serialize};
 
 use super::{Expr, ExprKind, Program, Span, Stmt};
 
-pub const BYTECODE_VERSION: u16 = 1;
+pub const BYTECODE_VERSION: u16 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BuiltinId(pub u32);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltinManifest {
+    hash: u64,
+    names: BTreeMap<String, BuiltinId>,
+}
+
+impl BuiltinManifest {
+    pub fn new(entries: impl IntoIterator<Item = (impl Into<String>, BuiltinId)>) -> Self {
+        let names = entries
+            .into_iter()
+            .map(|(name, id)| (name.into(), id))
+            .collect::<BTreeMap<_, _>>();
+        let hash = names
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325, |hash, (name, id)| {
+                name.bytes()
+                    .chain(id.0.to_le_bytes())
+                    .fold(hash, |hash, byte| {
+                        (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
+                    })
+            });
+        Self { hash, names }
+    }
+
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    pub fn resolve(&self, name: &str) -> Option<BuiltinId> {
+        self.names.get(name).copied()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -19,6 +55,7 @@ pub enum Value {
     Percent(f64),
     String(String),
     Symbol(String),
+    Handle { type_id: u32, id: u64 },
     Task(u64),
     Tuple(Vec<Value>),
     Map(BTreeMap<String, Value>),
@@ -28,6 +65,8 @@ pub enum Value {
 pub struct Bytecode {
     pub version: u16,
     pub source_hash: u64,
+    #[serde(default)]
+    pub builtin_manifest_hash: u64,
     pub instructions: Vec<Instruction>,
     pub tasks: Vec<TaskTemplate>,
 }
@@ -54,10 +93,12 @@ pub enum Instruction {
     MakeTuple(usize),
     MakeMap(Vec<String>),
     Negate,
-    Call {
-        callee: String,
+    CallBuiltin {
+        builtin: BuiltinId,
         labels: Vec<Option<String>>,
+        has_receiver: bool,
     },
+    StatementCommit,
     SpawnTask {
         task: u32,
     },
@@ -72,10 +113,27 @@ pub struct CompileError {
 }
 
 pub fn compile(program: &Program, source_hash: u64) -> Result<Bytecode, Vec<CompileError>> {
+    compile_inner(program, source_hash, None)
+}
+
+pub fn compile_with_manifest(
+    program: &Program,
+    source_hash: u64,
+    manifest: &BuiltinManifest,
+) -> Result<Bytecode, Vec<CompileError>> {
+    compile_inner(program, source_hash, Some(manifest))
+}
+
+fn compile_inner(
+    program: &Program,
+    source_hash: u64,
+    manifest: Option<&BuiltinManifest>,
+) -> Result<Bytecode, Vec<CompileError>> {
     let mut compiler = Compiler {
         instructions: Vec::new(),
         tasks: Vec::new(),
         errors: Vec::new(),
+        manifest,
     };
     for statement in &program.statements {
         compiler.statement(statement);
@@ -85,6 +143,7 @@ pub fn compile(program: &Program, source_hash: u64) -> Result<Bytecode, Vec<Comp
         Ok(Bytecode {
             version: BYTECODE_VERSION,
             source_hash,
+            builtin_manifest_hash: manifest.map(BuiltinManifest::hash).unwrap_or_default(),
             instructions: compiler.instructions,
             tasks: compiler.tasks,
         })
@@ -93,23 +152,36 @@ pub fn compile(program: &Program, source_hash: u64) -> Result<Bytecode, Vec<Comp
     }
 }
 
-struct Compiler {
+struct Compiler<'a> {
     instructions: Vec<Instruction>,
     tasks: Vec<TaskTemplate>,
     errors: Vec<CompileError>,
+    manifest: Option<&'a BuiltinManifest>,
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn statement(&mut self, statement: &Stmt) {
         match statement {
             Stmt::Let { name, value, .. } => {
                 self.expression(value);
                 self.instructions
                     .push(Instruction::StoreLocal(name.clone()));
+                if self.manifest.is_some() {
+                    self.instructions.push(Instruction::StatementCommit);
+                }
             }
             Stmt::Expr(expression) => {
                 self.expression(expression);
                 self.instructions.push(Instruction::Pop);
+                if self.manifest.is_some() {
+                    self.instructions.push(Instruction::StatementCommit);
+                }
+            }
+            Stmt::If { span, .. } | Stmt::While { span, .. } => {
+                self.errors.push(CompileError {
+                    message: "control flow requires an embedding prelude compiler".to_string(),
+                    span: span.clone(),
+                });
             }
         }
     }
@@ -155,14 +227,14 @@ impl Compiler {
                 arguments,
                 trailing_block,
             } => {
-                let Some(callee) = flatten_callee(callee) else {
-                    self.errors.push(CompileError {
-                        message: "call target must be an identifier or member path".to_string(),
-                        span: callee.span.clone(),
-                    });
-                    return;
-                };
                 if let Some(block) = trailing_block {
+                    let Some(callee) = flatten_callee(callee) else {
+                        self.errors.push(CompileError {
+                            message: "task call target must be an identifier".to_string(),
+                            span: callee.span.clone(),
+                        });
+                        return;
+                    };
                     if !arguments.is_empty() || !matches!(callee.as_str(), "seq" | "par") {
                         self.errors.push(CompileError {
                             message: "trailing blocks are only supported by seq and par"
@@ -180,19 +252,57 @@ impl Compiler {
                     self.instructions.push(Instruction::SpawnTask { task });
                     return;
                 }
-                for argument in arguments {
-                    self.expression(&argument.value);
+                if let Some(manifest) = self.manifest {
+                    if let Some(name) = flatten_callee(callee)
+                        && let Some(builtin) = manifest.resolve(&name)
+                    {
+                        for argument in arguments {
+                            self.expression(&argument.value);
+                        }
+                        self.instructions.push(Instruction::CallBuiltin {
+                            builtin,
+                            labels: arguments
+                                .iter()
+                                .map(|argument| argument.label.clone())
+                                .collect(),
+                            has_receiver: false,
+                        });
+                        return;
+                    }
+                    if let ExprKind::Member { object, name } = &callee.kind
+                        && let Some(builtin) = manifest.resolve(name)
+                    {
+                        self.expression(object);
+                        for argument in arguments {
+                            self.expression(&argument.value);
+                        }
+                        self.instructions.push(Instruction::CallBuiltin {
+                            builtin,
+                            labels: arguments
+                                .iter()
+                                .map(|argument| argument.label.clone())
+                                .collect(),
+                            has_receiver: true,
+                        });
+                        return;
+                    }
+                    self.errors.push(CompileError {
+                        message: "call is not registered in the builtin manifest".to_string(),
+                        span: callee.span.clone(),
+                    });
+                    return;
                 }
-                self.instructions.push(Instruction::Call {
-                    callee,
-                    labels: arguments
-                        .iter()
-                        .map(|argument| argument.label.clone())
-                        .collect(),
+                self.errors.push(CompileError {
+                    message: "builtin calls require a BuiltinManifest".to_string(),
+                    span: callee.span.clone(),
                 });
             }
             ExprKind::Member { .. } | ExprKind::Block(_) => self.errors.push(CompileError {
                 message: "expression is not a value".to_string(),
+                span: expression.span.clone(),
+            }),
+            ExprKind::Binary { .. } => self.errors.push(CompileError {
+                message: "binary expressions require an embedding prelude compiler".to_string(),
                 span: expression.span.clone(),
             }),
         }
@@ -253,7 +363,7 @@ fn flatten_callee(expression: &Expr) -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuiltinCall {
-    pub callee: String,
+    pub builtin: BuiltinId,
     pub arguments: Vec<CallArgument>,
 }
 
@@ -272,6 +382,7 @@ pub struct TaskRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmEvent {
     Call(BuiltinCall),
+    StatementCommit,
     SpawnTask(TaskRequest),
     Completed(Value),
 }
@@ -286,6 +397,7 @@ pub enum VmStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmSnapshot {
     pub source_hash: u64,
+    pub builtin_manifest_hash: u64,
     pub pc: usize,
     pub stack: Vec<Value>,
     pub locals: BTreeMap<String, Value>,
@@ -354,11 +466,20 @@ impl Vm {
                     };
                     self.stack.push(Value::Number(-value));
                 }
-                Instruction::Call { callee, labels } => {
-                    let values = self.pop_count(labels.len())?;
+                Instruction::CallBuiltin {
+                    builtin,
+                    labels,
+                    has_receiver,
+                } => {
+                    let values = self.pop_count(labels.len() + usize::from(has_receiver))?;
+                    let labels = if has_receiver {
+                        std::iter::once(None).chain(labels).collect()
+                    } else {
+                        labels
+                    };
                     self.status = VmStatus::WaitingForHost;
                     return Ok(Some(VmEvent::Call(BuiltinCall {
-                        callee,
+                        builtin,
                         arguments: labels
                             .into_iter()
                             .zip(values)
@@ -366,6 +487,7 @@ impl Vm {
                             .collect(),
                     })));
                 }
+                Instruction::StatementCommit => return Ok(Some(VmEvent::StatementCommit)),
                 Instruction::SpawnTask { task } => {
                     let template = self
                         .bytecode
@@ -406,6 +528,7 @@ impl Vm {
     pub fn snapshot(&self) -> VmSnapshot {
         VmSnapshot {
             source_hash: self.bytecode.source_hash,
+            builtin_manifest_hash: self.bytecode.builtin_manifest_hash,
             pc: self.pc,
             stack: self.stack.clone(),
             locals: self.locals.clone(),
@@ -416,6 +539,9 @@ impl Vm {
     pub fn restore(bytecode: Bytecode, snapshot: VmSnapshot) -> Result<Self, VmError> {
         if bytecode.source_hash != snapshot.source_hash {
             return Err(VmError::SourceHashMismatch);
+        }
+        if bytecode.builtin_manifest_hash != snapshot.builtin_manifest_hash {
+            return Err(VmError::BuiltinManifestMismatch);
         }
         if bytecode.version != BYTECODE_VERSION {
             return Err(VmError::UnsupportedBytecode(bytecode.version));
@@ -476,6 +602,7 @@ pub enum TaskStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskSchedulerSnapshot {
     pub source_hash: u64,
+    pub builtin_manifest_hash: u64,
     pub next_task_id: u64,
     pub tasks: BTreeMap<u64, TaskSnapshot>,
 }
@@ -492,6 +619,7 @@ pub struct TaskSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TaskEvent {
     Call { task: u64, call: BuiltinCall },
+    StatementCommit { task: u64 },
     Completed { task: u64, value: Value },
 }
 
@@ -562,6 +690,7 @@ impl TaskScheduler {
     pub fn snapshot(&self) -> TaskSchedulerSnapshot {
         TaskSchedulerSnapshot {
             source_hash: self.bytecode.source_hash,
+            builtin_manifest_hash: self.bytecode.builtin_manifest_hash,
             next_task_id: self.next_task_id,
             tasks: self
                 .tasks
@@ -588,6 +717,9 @@ impl TaskScheduler {
     ) -> Result<Self, TaskSchedulerError> {
         if bytecode.source_hash != snapshot.source_hash {
             return Err(TaskSchedulerError::SourceHashMismatch);
+        }
+        if bytecode.builtin_manifest_hash != snapshot.builtin_manifest_hash {
+            return Err(TaskSchedulerError::BuiltinManifestMismatch);
         }
         let mut scheduler = Self::new(bytecode)?;
         scheduler.next_task_id = snapshot.next_task_id;
@@ -676,13 +808,23 @@ impl TaskScheduler {
                 };
                 self.task_mut(task_id)?.stack.push(Value::Number(-value));
             }
-            Instruction::Call { callee, labels } => {
-                let values = self.pop_task_count(task_id, labels.len())?;
+            Instruction::CallBuiltin {
+                builtin,
+                labels,
+                has_receiver,
+            } => {
+                let values =
+                    self.pop_task_count(task_id, labels.len() + usize::from(has_receiver))?;
+                let labels = if has_receiver {
+                    std::iter::once(None).chain(labels).collect()
+                } else {
+                    labels
+                };
                 self.task_mut(task_id)?.status = TaskStatus::WaitingForHost;
                 return Ok(Some(TaskEvent::Call {
                     task: task_id,
                     call: BuiltinCall {
-                        callee,
+                        builtin,
                         arguments: labels
                             .into_iter()
                             .zip(values)
@@ -690,6 +832,9 @@ impl TaskScheduler {
                             .collect(),
                     },
                 }));
+            }
+            Instruction::StatementCommit => {
+                return Ok(Some(TaskEvent::StatementCommit { task: task_id }));
             }
             Instruction::SpawnTask { task } => {
                 let child = self.spawn(task)?;
@@ -780,6 +925,7 @@ impl TaskScheduler {
 pub enum TaskSchedulerError {
     UnsupportedBytecode(u16),
     SourceHashMismatch,
+    BuiltinManifestMismatch,
     InvalidProgramCounter(usize),
     StackUnderflow,
     UnknownLocal(String),
@@ -794,6 +940,7 @@ pub enum VmError {
     UnsupportedBytecode(u16),
     InvalidProgramCounter(usize),
     SourceHashMismatch,
+    BuiltinManifestMismatch,
     StackUnderflow,
     UnknownLocal(String),
     UnknownTask(u32),
@@ -807,22 +954,63 @@ mod tests {
     use crate::hks::parse_program;
 
     #[test]
+    fn registered_fluent_calls_use_handles_and_commit_after_the_statement() {
+        let program = parse_program(r#"char("Alice").e("eyes").e("face")"#).unwrap();
+        let manifest = BuiltinManifest::new([("char", BuiltinId(1)), ("e", BuiltinId(2))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
+        assert_eq!(bytecode.builtin_manifest_hash, manifest.hash());
+
+        let mut vm = Vm::new(bytecode.clone()).unwrap();
+        let Some(VmEvent::Call(call)) = vm.step().unwrap() else {
+            panic!()
+        };
+        assert_eq!(call.builtin, BuiltinId(1));
+        vm.resume_builtin(Value::Handle { type_id: 7, id: 9 })
+            .unwrap();
+
+        let Some(VmEvent::Call(call)) = vm.step().unwrap() else {
+            panic!()
+        };
+        assert_eq!(call.builtin, BuiltinId(2));
+        assert_eq!(call.arguments[0].value, Value::Handle { type_id: 7, id: 9 });
+        vm.resume_builtin(Value::Handle { type_id: 7, id: 9 })
+            .unwrap();
+
+        let snapshot = vm.snapshot();
+        let mut restored = Vm::restore(bytecode, snapshot).unwrap();
+        let Some(VmEvent::Call(call)) = restored.step().unwrap() else {
+            panic!()
+        };
+        assert_eq!(call.builtin, BuiltinId(2));
+        restored
+            .resume_builtin(Value::Handle { type_id: 7, id: 9 })
+            .unwrap();
+        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(VmEvent::Completed(Value::Null))
+        );
+    }
+
+    #[test]
     fn yields_named_builtin_calls_and_restores_waiting_state() {
         let program =
             parse_program("let result = camera.zoom(1.2, at: .center, duration: 1)").unwrap();
-        let bytecode = compile(&program, 42).unwrap();
+        let manifest = BuiltinManifest::new([("camera.zoom", BuiltinId(10))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         let mut vm = Vm::new(bytecode.clone()).unwrap();
 
         let Some(VmEvent::Call(call)) = vm.step().unwrap() else {
             panic!("expected camera call");
         };
-        assert_eq!(call.callee, "camera.zoom");
+        assert_eq!(call.builtin, BuiltinId(10));
         assert_eq!(call.arguments[1].label.as_deref(), Some("at"));
         assert_eq!(call.arguments[1].value, Value::Symbol("center".to_string()));
 
         let snapshot = vm.snapshot();
         let mut restored = Vm::restore(bytecode, snapshot).unwrap();
         restored.resume_builtin(Value::Null).unwrap();
+        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
         assert_eq!(
             restored.step().unwrap(),
             Some(VmEvent::Completed(Value::Null))
@@ -832,7 +1020,8 @@ mod tests {
     #[test]
     fn preserves_percent_tuple_arguments_for_typed_builtins() {
         let program = parse_program("camera.zoom(1.2, at: (20%, 30%))").unwrap();
-        let bytecode = compile(&program, 42).unwrap();
+        let manifest = BuiltinManifest::new([("camera.zoom", BuiltinId(10))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         let mut vm = Vm::new(bytecode).unwrap();
         let Some(VmEvent::Call(call)) = vm.step().unwrap() else {
             panic!("expected camera call");
@@ -846,7 +1035,8 @@ mod tests {
     #[test]
     fn compiles_seq_as_a_host_spawned_task_template() {
         let program = parse_program("let handle = seq { camera.zoom(1.2) }").unwrap();
-        let bytecode = compile(&program, 42).unwrap();
+        let manifest = BuiltinManifest::new([("camera.zoom", BuiltinId(10))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         assert_eq!(bytecode.tasks.len(), 1);
         assert_eq!(bytecode.tasks[0].mode, TaskMode::Sequence);
 
@@ -860,6 +1050,7 @@ mod tests {
         let snapshot = vm.snapshot();
         let mut restored = Vm::restore(bytecode, snapshot).unwrap();
         restored.resume(Value::Task(7)).unwrap();
+        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
         assert_eq!(
             restored.step().unwrap(),
             Some(VmEvent::Completed(Value::Null))
@@ -869,7 +1060,8 @@ mod tests {
     #[test]
     fn compiles_par_with_one_child_task_per_statement() {
         let program = parse_program("let handles = par { first(); second() }").unwrap();
-        let bytecode = compile(&program, 42).unwrap();
+        let manifest = BuiltinManifest::new([("first", BuiltinId(1)), ("second", BuiltinId(2))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         assert_eq!(bytecode.tasks.len(), 3);
         assert_eq!(bytecode.tasks[2].mode, TaskMode::Parallel);
         assert_eq!(bytecode.tasks[2].children, vec![0, 1]);
@@ -878,7 +1070,8 @@ mod tests {
     #[test]
     fn scheduler_runs_sequence_tasks_and_restores_waiting_state() {
         let program = parse_program("let handle = seq { first(); second() }").unwrap();
-        let bytecode = compile(&program, 42).unwrap();
+        let manifest = BuiltinManifest::new([("first", BuiltinId(1)), ("second", BuiltinId(2))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         let mut scheduler = TaskScheduler::new(bytecode.clone()).unwrap();
         let task = scheduler.spawn(0).unwrap();
 
@@ -890,11 +1083,15 @@ mod tests {
             panic!("expected first call");
         };
         assert_eq!(yielded, task);
-        assert_eq!(call.callee, "first");
+        assert_eq!(call.builtin, BuiltinId(1));
 
         let snapshot = scheduler.snapshot();
         let mut restored = TaskScheduler::restore(bytecode, snapshot).unwrap();
         restored.resume(task, Value::Null).unwrap();
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(TaskEvent::StatementCommit { task })
+        );
         let Some(TaskEvent::Call {
             task: yielded,
             call,
@@ -903,8 +1100,12 @@ mod tests {
             panic!("expected second call");
         };
         assert_eq!(yielded, task);
-        assert_eq!(call.callee, "second");
+        assert_eq!(call.builtin, BuiltinId(2));
         restored.resume(task, Value::Null).unwrap();
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(TaskEvent::StatementCommit { task })
+        );
         assert_eq!(
             restored.step().unwrap(),
             Some(TaskEvent::Completed {
@@ -917,15 +1118,20 @@ mod tests {
     #[test]
     fn scheduler_starts_parallel_children_in_task_id_order() {
         let program = parse_program("let handles = par { first(); second() }").unwrap();
-        let bytecode = compile(&program, 42).unwrap();
+        let manifest = BuiltinManifest::new([("first", BuiltinId(1)), ("second", BuiltinId(2))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         let mut scheduler = TaskScheduler::new(bytecode).unwrap();
         let parent = scheduler.spawn(2).unwrap();
 
         let Some(TaskEvent::Call { task: first, call }) = scheduler.step().unwrap() else {
             panic!("expected first child call");
         };
-        assert_eq!(call.callee, "first");
+        assert_eq!(call.builtin, BuiltinId(1));
         scheduler.resume(first, Value::Null).unwrap();
+        assert_eq!(
+            scheduler.step().unwrap(),
+            Some(TaskEvent::StatementCommit { task: first })
+        );
         assert_eq!(
             scheduler.step().unwrap(),
             Some(TaskEvent::Completed {
@@ -937,8 +1143,12 @@ mod tests {
         let Some(TaskEvent::Call { task: second, call }) = scheduler.step().unwrap() else {
             panic!("expected second child call");
         };
-        assert_eq!(call.callee, "second");
+        assert_eq!(call.builtin, BuiltinId(2));
         scheduler.resume(second, Value::Null).unwrap();
+        assert_eq!(
+            scheduler.step().unwrap(),
+            Some(TaskEvent::StatementCommit { task: second })
+        );
         assert_eq!(
             scheduler.step().unwrap(),
             Some(TaskEvent::Completed {

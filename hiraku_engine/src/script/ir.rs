@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::state::StoredValue;
+use hiraku_script::hks::vm::Bytecode;
 
 pub type IrPc = u32;
 
@@ -146,6 +147,9 @@ pub enum IrCommand {
         expressions: Vec<String>,
         position: [f32; 2],
         scale: f32,
+    },
+    HksStatement {
+        bytecode: Bytecode,
     },
 }
 

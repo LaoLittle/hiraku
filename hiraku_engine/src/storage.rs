@@ -6,12 +6,11 @@ use std::{
 
 use bevy::prelude::Resource;
 use prost::Message;
-use rhai::Dynamic;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    data::evaluate_rhai_map,
+    data::evaluate_hks_map,
     proto,
     state::{
         AudioSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint, SaveGameData,
@@ -22,7 +21,7 @@ use crate::{
 
 const SAVE_ROOT: &str = "saves";
 const SAVE_EXTENSION: &str = "sav";
-const USER_SETTINGS_PATH: &str = "config/hiraku.rhai";
+const USER_SETTINGS_PATH: &str = "config/hiraku.data.hks";
 
 #[derive(Clone, Debug, Resource, Serialize, Deserialize)]
 pub struct UserSettings {
@@ -36,10 +35,13 @@ pub struct UserSettings {
 
 #[derive(Debug, Deserialize)]
 struct UserSettingsFile {
+    #[serde(rename = "bgmVolume")]
     #[serde(default = "default_volume_f64")]
     bgm_volume: f64,
+    #[serde(rename = "voiceVolume")]
     #[serde(default = "default_volume_f64")]
     voice_volume: f64,
+    #[serde(rename = "sfxVolume")]
     #[serde(default = "default_volume_f64")]
     sfx_volume: f64,
 }
@@ -66,8 +68,8 @@ pub struct SaveSlotSummary {
 pub enum StorageError {
     #[error("failed to access storage: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to load Rhai data: {0}")]
-    RhaiData(String),
+    #[error("failed to load HKS data: {0}")]
+    HksData(String),
     #[error("failed to decode save protobuf: {0}")]
     ProstDecode(#[from] prost::DecodeError),
     #[error("invalid save data: {0}")]
@@ -89,11 +91,11 @@ pub fn read_user_settings() -> Result<UserSettings, StorageError> {
         let path = workspace_base_path().join(USER_SETTINGS_PATH);
         match fs::read_to_string(path) {
             Ok(payload) => {
-                let data = evaluate_rhai_map(USER_SETTINGS_PATH, &payload)
-                    .map_err(|error| StorageError::RhaiData(error.to_string()))?;
+                let data = evaluate_hks_map(USER_SETTINGS_PATH, &payload)
+                    .map_err(|error| StorageError::HksData(error.to_string()))?;
                 let settings =
-                    rhai::serde::from_dynamic::<UserSettingsFile>(&Dynamic::from_map(data))
-                        .map_err(|error| StorageError::RhaiData(error.to_string()))?;
+                    serde_json::from_value::<UserSettingsFile>(serde_json::Value::Object(data))
+                        .map_err(|error| StorageError::HksData(error.to_string()))?;
                 Ok(UserSettings {
                     bgm_volume: settings.bgm_volume as f32,
                     voice_volume: settings.voice_volume as f32,
@@ -121,7 +123,7 @@ pub fn write_user_settings(settings: &UserSettings) -> Result<(), StorageError> 
         }
 
         let payload = format!(
-            "#{{\n    bgm_volume: {:?},\n    voice_volume: {:?},\n    sfx_volume: {:?},\n}}\n",
+            ".{{\n    bgmVolume: {:?},\n    voiceVolume: {:?},\n    sfxVolume: {:?},\n}}\n",
             settings.bgm_volume, settings.voice_volume, settings.sfx_volume
         );
         fs::write(path, payload)?;

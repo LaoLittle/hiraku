@@ -322,7 +322,7 @@ pub struct SpacerNode {
     pub height: f32,
 }
 
-/// Runtime state for modal Rhai screens.
+/// Runtime state for modal declarative HKS screens.
 ///
 /// The renderer keeps old and pending roots alive during transitions so a screen
 /// replacement never exposes an empty frame while images are loading.
@@ -375,7 +375,7 @@ pub struct StaleScreenRoot {
 #[derive(Component)]
 pub struct ScreenUiRoot;
 
-/// Marker component for entities that belong to a Rhai screen.
+/// Marker component for entities that belong to a declarative HKS screen.
 #[derive(Component)]
 pub struct ScreenUiNode;
 
@@ -384,7 +384,7 @@ pub struct ScreenUiNode;
 pub struct ScreenUiButton {
     /// Root this button belongs to; stale/pending roots are ignored.
     pub root: Entity,
-    /// Value returned to Rhai when the button is pressed.
+    /// Intent value returned to the story runtime when the button is pressed.
     pub value: StoredValue,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
@@ -417,7 +417,7 @@ pub struct ScreenUiButtonText;
 pub struct ScreenUiImageButton {
     /// Root this button belongs to; stale and pending roots are ignored.
     pub root: Entity,
-    /// Value returned to Rhai when pressed.
+    /// Intent value returned to the story runtime when pressed.
     pub value: StoredValue,
     /// Whether press interactions should produce a value.
     pub enabled: bool,

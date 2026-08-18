@@ -34,6 +34,17 @@ pub enum Stmt {
         span: Span,
     },
     Expr(Expr),
+    If {
+        condition: Expr,
+        then_block: Block,
+        else_block: Option<Block>,
+        span: Span,
+    },
+    While {
+        condition: Expr,
+        body: Block,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +82,16 @@ pub enum ExprKind {
     Tuple(Vec<Expr>),
     Map(Vec<MapField>),
     Block(Block),
+    Binary {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    Equal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +142,7 @@ enum TokenKind {
     Comma,
     Colon,
     Equal,
+    EqualEqual,
     Minus,
     LParen,
     RParen,
@@ -174,7 +196,12 @@ impl<'a> Lexer<'a> {
                 }
                 '=' => {
                     self.bump();
-                    tokens.push(self.token(TokenKind::Equal, start));
+                    if self.current() == Some('=') {
+                        self.bump();
+                        tokens.push(self.token(TokenKind::EqualEqual, start));
+                    } else {
+                        tokens.push(self.token(TokenKind::Equal, start));
+                    }
                 }
                 '-' => {
                     self.bump();
@@ -386,11 +413,51 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Stmt {
-        if matches!(self.current().kind, TokenKind::Ident(ref name) if name == "let" || name == "var")
-        {
-            return self.parse_let();
+        if let TokenKind::Ident(name) = &self.current().kind {
+            match name.as_str() {
+                "let" | "var" => return self.parse_let(),
+                "if" => return self.parse_if(),
+                "while" => return self.parse_while(),
+                _ => {}
+            }
         }
         Stmt::Expr(self.parse_expression())
+    }
+
+    fn parse_if(&mut self) -> Stmt {
+        let start = self.advance();
+        let condition = self.parse_condition_expression();
+        let then_block = self.parse_block();
+        self.skip_separators();
+        let else_block = if matches!(self.current().kind, TokenKind::Ident(ref name) if name == "else")
+        {
+            self.advance();
+            Some(self.parse_block())
+        } else {
+            None
+        };
+        let end = else_block
+            .as_ref()
+            .map(|block| block.span.clone())
+            .unwrap_or_else(|| then_block.span.clone());
+        Stmt::If {
+            condition,
+            then_block,
+            else_block,
+            span: Span::join(&start.span, &end),
+        }
+    }
+
+    fn parse_while(&mut self) -> Stmt {
+        let start = self.advance();
+        let condition = self.parse_condition_expression();
+        let body = self.parse_block();
+        let span = Span::join(&start.span, &body.span);
+        Stmt::While {
+            condition,
+            body,
+            span,
+        }
     }
 
     fn parse_let(&mut self) -> Stmt {
@@ -415,6 +482,14 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Expr {
+        self.parse_expression_mode(true)
+    }
+
+    fn parse_condition_expression(&mut self) -> Expr {
+        self.parse_expression_mode(false)
+    }
+
+    fn parse_expression_mode(&mut self, allow_trailing_block: bool) -> Expr {
         let mut expression = self.parse_primary();
         loop {
             if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::Ident(_)) {
@@ -450,7 +525,7 @@ impl Parser {
                 };
                 continue;
             }
-            if self.at(TokenKind::LBrace) {
+            if allow_trailing_block && self.at(TokenKind::LBrace) {
                 let block = self.parse_block();
                 let span = Span::join(&expression.span, &block.span);
                 expression = Expr {
@@ -464,6 +539,19 @@ impl Parser {
                 continue;
             }
             break;
+        }
+        if self.at(TokenKind::EqualEqual) {
+            self.advance();
+            let right = self.parse_expression_mode(false);
+            let span = Span::join(&expression.span, &right.span);
+            expression = Expr {
+                kind: ExprKind::Binary {
+                    left: Box::new(expression),
+                    op: BinaryOp::Equal,
+                    right: Box::new(right),
+                },
+                span,
+            };
         }
         expression
     }
@@ -583,7 +671,7 @@ impl Parser {
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let field_start = self.current().span.clone();
             let name = match self.advance().kind {
-                TokenKind::Ident(name) => name,
+                TokenKind::Ident(name) | TokenKind::String(name) => name,
                 _ => {
                     self.error_here("expected map field name");
                     "<error>".to_string()
@@ -787,5 +875,17 @@ mod tests {
         };
         assert_eq!(fields.len(), 3);
         assert!(matches!(fields[2].value.kind, ExprKind::Map(_)));
+    }
+
+    #[test]
+    fn parses_quoted_map_field_names() {
+        let expression = expression(r#".{ regions: .{ "ema/body": (1, 2, 3, 4) } }"#);
+        let ExprKind::Map(fields) = expression.kind else {
+            panic!("expected map");
+        };
+        let ExprKind::Map(regions) = &fields[0].value.kind else {
+            panic!("expected nested map");
+        };
+        assert_eq!(regions[0].name, "ema/body");
     }
 }

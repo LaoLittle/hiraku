@@ -13,6 +13,7 @@ use bevy::{
 };
 
 use crate::{
+    audio::{AudioCatalog, load_audio_catalog},
     character::{CharacterCatalog, CharacterPartDefinition, load_character_catalog},
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     effect::{
@@ -341,6 +342,7 @@ pub fn bridge_ir_events(
     mut runtime: ResMut<IrRuntime>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
     textures: Option<Res<TextureCatalog>>,
+    audio: Option<Res<AudioCatalog>>,
     vfs: Res<VfsResource>,
     user_settings: Res<UserSettings>,
 ) {
@@ -385,10 +387,11 @@ pub fn bridge_ir_events(
             let program = vfs
                 .0
                 .read_text(&target)
-                .ok()
-                .and_then(|source| compile_story_program(&target, &source).ok());
-            match program.and_then(|program| IrVm::new(program).ok()) {
-                Some(vm) => {
+                .map_err(|error| error.to_string())
+                .and_then(|source| compile_story_program(&target, &source))
+                .and_then(|program| IrVm::new(program).map_err(|error| error.to_string()));
+            match program {
+                Ok(vm) => {
                     runtime.vm = Some(vm);
                     runtime.current_script = Some(target);
                     runtime.events.clear();
@@ -397,18 +400,7 @@ pub fn bridge_ir_events(
                     runtime.pending_ui_screen = None;
                     runtime.pending_response = None;
                 }
-                None => {
-                    info!("starting legacy runtime for unsupported IR script `{target}`");
-                    runtime.vm = None;
-                    runtime.current_script = None;
-                    runtime.wait_response = None;
-                    runtime.pending_input_variable = None;
-                    runtime.pending_ui_screen = None;
-                    runtime.pending_response = None;
-                    pending_script_commands
-                        .items
-                        .push_back(ScriptCommand::StartLegacy { path: target });
-                }
+                Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
             }
         }
         IrEvent::Command(IrCommand::Choose {
@@ -443,15 +435,15 @@ pub fn bridge_ir_events(
                 .map(IrVm::story_values)
                 .unwrap_or_default();
             story.insert(
-                "bgm_volume".to_string(),
+                "bgmVolume".to_string(),
                 StoredValue::Float(user_settings.bgm_volume as f64),
             );
             story.insert(
-                "voice_volume".to_string(),
+                "voiceVolume".to_string(),
                 StoredValue::Float(user_settings.voice_volume as f64),
             );
             story.insert(
-                "sfx_volume".to_string(),
+                "sfxVolume".to_string(),
                 StoredValue::Float(user_settings.sfx_volume as f64),
             );
             let screen = vfs
@@ -480,8 +472,47 @@ pub fn bridge_ir_events(
                     }),
                 Err(error) => {
                     warn!("failed to render UI script `{target}`: {error}");
-                    let _ = response_tx.send(ScriptResponse::Continue);
+                    runtime.vm = None;
+                    runtime.pending_input_variable = None;
+                    runtime.pending_ui_screen = None;
+                    runtime.pending_response = None;
                 }
+            }
+        }
+        IrEvent::Command(IrCommand::PlayBgm {
+            path,
+            volume,
+            fade_in_ms,
+        }) => {
+            match audio
+                .as_deref()
+                .and_then(|catalog| catalog.resolve_music(&path))
+            {
+                Some(definition) => {
+                    pending_script_commands
+                        .items
+                        .push_back(ScriptCommand::PlayBgm {
+                            path: definition.path.clone(),
+                            volume,
+                            fade_in: fade_in_ms.map(std::time::Duration::from_millis),
+                            animation_id: None,
+                            done: None,
+                        })
+                }
+                None => warn!("music `{path}` is not defined"),
+            }
+        }
+        IrEvent::Command(IrCommand::HksStatement { bytecode }) => {
+            match crate::hks_character::execute(bytecode) {
+                Ok(commands) => {
+                    for command in commands {
+                        match script_command_from_ir(command, textures.as_deref()) {
+                            Ok(command) => pending_script_commands.items.push_back(command),
+                            Err(error) => warn!("HKS native command rejected: {error}"),
+                        }
+                    }
+                }
+                Err(error) => warn!("HKS native statement failed: {error}"),
             }
         }
         IrEvent::Command(command) => match script_command_from_ir(command, textures.as_deref()) {
@@ -945,6 +976,13 @@ pub fn setup_frontend(
     vfs: Res<VfsResource>,
 ) {
     prepare_texture_atlases(&mut commands, &asset_server, &vfs.0);
+    match load_audio_catalog(&vfs.0) {
+        Ok(catalog) => commands.insert_resource(catalog),
+        Err(error) => {
+            warn!("failed to load audio catalog: {error}");
+            commands.insert_resource(AudioCatalog::default());
+        }
+    }
     let startup_script = match vfs.0.load_startup_script_path() {
         Ok(startup_script) => startup_script,
         Err(err) => {
@@ -991,7 +1029,7 @@ pub fn setup_frontend(
 
     if frontend.startup_script.is_empty() {
         frontend.notice =
-            Some("startup.rhai not found. Fix settings.rhai before starting.".to_string());
+            Some("startup.story.hks not found. Fix settings.data.hks before starting.".to_string());
     }
 
     commands.insert_resource(UiFonts {
@@ -1559,7 +1597,7 @@ pub fn handle_frontend_buttons(
                         }
                         if frontend.startup_script.is_empty() {
                             frontend.notice = Some(
-                                "No startup script is configured. Check hdp://main.hdp/settings.rhai."
+                                "No startup script is configured. Check hdp://main.hdp/settings.data.hks."
                                     .to_string(),
                             );
                             frontend.dirty = true;
@@ -1784,22 +1822,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 }
                 Err(error) => warn!("failed to start IR program: {error}"),
             },
-            ScriptCommand::StartLegacy { path } => {
-                ir_runtime.vm = None;
-                ir_runtime.current_script = None;
-                ir_runtime.events.clear();
-                ir_runtime.wait_response = None;
-                ir_runtime.pending_input_variable = None;
-                ir_runtime.pending_ui_screen = None;
-                ir_runtime.pending_response = None;
-                spawn_script_runtime(
-                    &mut commands,
-                    vfs.0.clone(),
-                    shared_state.0.clone(),
-                    ScriptBootstrap::new(path),
-                );
-            }
-            ScriptCommand::Log(message) => info!("[rhai] {message}"),
+            ScriptCommand::Log(message) => info!("[hks] {message}"),
             ScriptCommand::SetBackground {
                 path,
                 fade,
@@ -2298,9 +2321,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::ApplyUserSettings(settings) => *user_settings = settings,
             ScriptCommand::AdjustUserSetting { name, delta } => {
                 let volume = match name.as_str() {
-                    "bgm_volume" => &mut user_settings.bgm_volume,
-                    "voice_volume" => &mut user_settings.voice_volume,
-                    "sfx_volume" => &mut user_settings.sfx_volume,
+                    "bgmVolume" => &mut user_settings.bgm_volume,
+                    "voiceVolume" => &mut user_settings.voice_volume,
+                    "sfxVolume" => &mut user_settings.sfx_volume,
                     _ => {
                         warn!("unsupported user setting `{name}`");
                         continue;
@@ -2887,12 +2910,25 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 frontend.notice = None;
                 frontend.dirty = false;
                 if !frontend.startup_script.is_empty() {
-                    spawn_script_runtime(
-                        &mut commands,
-                        vfs.0.clone(),
-                        shared_state.0.clone(),
-                        ScriptBootstrap::new(frontend.startup_script.clone()),
-                    );
+                    let startup = frontend.startup_script.clone();
+                    let program = vfs
+                        .0
+                        .read_text(&startup)
+                        .map_err(|error| error.to_string())
+                        .and_then(|source| compile_story_program(&startup, &source))
+                        .and_then(|program| IrVm::new(program).map_err(|error| error.to_string()));
+                    match program {
+                        Ok(vm) => {
+                            ir_runtime.vm = Some(vm);
+                            ir_runtime.current_script = Some(startup);
+                            ir_runtime.events.clear();
+                            ir_runtime.wait_response = None;
+                            ir_runtime.pending_input_variable = None;
+                            ir_runtime.pending_ui_screen = None;
+                            ir_runtime.pending_response = None;
+                        }
+                        Err(error) => warn!("failed to return to HKS title: {error}"),
+                    }
                 }
             }
         }
@@ -3032,12 +3068,15 @@ pub fn handle_screen_buttons(
 
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
-    mut interaction_query: Query<(
-        &Interaction,
-        &mut ImageNode,
-        &mut Node,
-        &ScreenUiImageButton,
-    )>,
+    mut interaction_query: Query<
+        (
+            &Interaction,
+            &mut ImageNode,
+            &mut Node,
+            &ScreenUiImageButton,
+        ),
+        Changed<Interaction>,
+    >,
 ) {
     for (interaction, mut image, mut node, button) in &mut interaction_query {
         if Some(button.root) != screen_state.active_root {
@@ -5055,6 +5094,7 @@ fn spawn_screen_ui(
         .spawn((
             ScreenUiRoot,
             ScreenUiNode,
+            Pickable::IGNORE,
             UiTransform::IDENTITY,
             GlobalZIndex(SCREEN_ACTIVE_Z),
             screen_root_node(screen),
@@ -5102,6 +5142,7 @@ fn build_screen_ui_children(
         let background = commands
             .spawn((
                 ScreenUiNode,
+                Pickable::IGNORE,
                 image_node(image, texture_atlases.resolve(&texture.path, texture.rect)),
                 Node {
                     position_type: PositionType::Absolute,
@@ -5136,6 +5177,7 @@ fn build_screen_ui_children(
     let panel = commands
         .spawn((
             ScreenUiNode,
+            Pickable::IGNORE,
             Node {
                 width: screen.width.map(px).unwrap_or(percent(72.0)),
                 max_width: percent(92.0),
@@ -5167,6 +5209,7 @@ fn build_screen_ui_children(
             commands
                 .spawn((
                     ScreenUiNode,
+                    Pickable::IGNORE,
                     Text::new(title.clone()),
                     ui_text_font(ui_fonts, 34.0),
                     TextColor(ui_style.speaker_color),
@@ -5195,6 +5238,8 @@ fn build_screen_ui_children(
 fn screen_root_node(screen: &ScreenSpec) -> Node {
     Node {
         position_type: PositionType::Absolute,
+        width: percent(100.0),
+        height: percent(100.0),
         left: px(0.0),
         right: px(0.0),
         top: px(0.0),
@@ -5220,13 +5265,13 @@ fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
         node.width = px(width);
     }
     if let Some(width) = layout.width_percent {
-        node.width = percent(width);
+        node.width = vw(width);
     }
     if let Some(height) = layout.height {
         node.height = px(height);
     }
     if let Some(height) = layout.height_percent {
-        node.height = percent(height);
+        node.height = vh(height);
     }
     if let Some(min_width) = layout.min_width {
         node.min_width = px(min_width);
@@ -5247,25 +5292,25 @@ fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
         node.left = px(left);
     }
     if let Some(left) = layout.left_percent {
-        node.left = percent(left);
+        node.left = vw(left);
     }
     if let Some(right) = layout.right {
         node.right = px(right);
     }
     if let Some(right) = layout.right_percent {
-        node.right = percent(right);
+        node.right = vw(right);
     }
     if let Some(top) = layout.top {
         node.top = px(top);
     }
     if let Some(top) = layout.top_percent {
-        node.top = percent(top);
+        node.top = vh(top);
     }
     if let Some(bottom) = layout.bottom {
         node.bottom = px(bottom);
     }
     if let Some(bottom) = layout.bottom_percent {
-        node.bottom = percent(bottom);
+        node.bottom = vh(bottom);
     }
 }
 
@@ -5292,6 +5337,7 @@ fn spawn_screen_node_entity(
             commands
                 .spawn((
                     ScreenUiNode,
+                    Pickable::IGNORE,
                     node,
                     Text::new(text.clone()),
                     ui_text_font(ui_fonts, *size),
@@ -5373,6 +5419,7 @@ fn spawn_screen_node_entity(
                 .spawn((
                     ScreenUiNode,
                     ScreenUiButtonText,
+                    Pickable::IGNORE,
                     Text::new(text.clone()),
                     ui_text_font(ui_fonts, *size),
                     TextColor(initial_text_color),
@@ -5426,7 +5473,12 @@ fn spawn_screen_node_entity(
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
             commands
-                .spawn((ScreenUiNode, image_node(image, resolved), node))
+                .spawn((
+                    ScreenUiNode,
+                    Pickable::IGNORE,
+                    image_node(image, resolved),
+                    node,
+                ))
                 .id()
         }
         ScreenNode::ImageButton(ScreenImageButtonNode {
@@ -5512,6 +5564,7 @@ fn spawn_screen_node_entity(
             let bar = commands
                 .spawn((
                     ScreenUiNode,
+                    Pickable::IGNORE,
                     Node {
                         width: px(*width),
                         height: px(*height),
@@ -5534,6 +5587,7 @@ fn spawn_screen_node_entity(
             let fill = commands
                 .spawn((
                     ScreenUiNode,
+                    Pickable::IGNORE,
                     Node {
                         width: percent(progress * 100.0),
                         height: percent(100.0),
@@ -5571,6 +5625,7 @@ fn spawn_screen_node_entity(
             let container = commands
                 .spawn((
                     ScreenUiNode,
+                    Pickable::IGNORE,
                     node,
                     BackgroundColor(
                         background
@@ -5626,6 +5681,7 @@ fn spawn_screen_node_entity(
             let container = commands
                 .spawn((
                     ScreenUiNode,
+                    Pickable::IGNORE,
                     node,
                     BackgroundColor(
                         background
@@ -5660,6 +5716,7 @@ fn spawn_screen_node_entity(
         ScreenNode::Spacer(SpacerNode { width, height }) => commands
             .spawn((
                 ScreenUiNode,
+                Pickable::IGNORE,
                 Node {
                     width: px(*width),
                     height: px(*height),

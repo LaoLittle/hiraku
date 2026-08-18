@@ -5,7 +5,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    data::evaluate_rhai_map,
+    data::evaluate_hks_map,
     vfs::{HdpVfs, VfsError},
 };
 
@@ -268,21 +268,20 @@ pub fn load_texture_catalog(vfs: &HdpVfs) -> Result<TextureCatalog, TextureCatal
         Err(VfsError::NotFound(_)) => return Ok(TextureCatalog::default()),
         Err(error) => return Err(error.into()),
     };
-    descriptor_paths.retain(|path| path.ends_with(".texture.rhai"));
+    descriptor_paths.retain(|path| path.ends_with(".texture.data.hks"));
     descriptor_paths.sort();
 
     let mut textures = BTreeMap::new();
     for descriptor_path in descriptor_paths {
         let source = vfs.read_text(&descriptor_path)?;
-        let data = evaluate_rhai_map(&descriptor_path, &source).map_err(|error| {
+        let data = evaluate_hks_map(&descriptor_path, &source).map_err(|error| {
             TextureCatalogError::Data {
                 path: descriptor_path.clone(),
                 message: error.to_string(),
             }
         })?;
-        let value = rhai::Dynamic::from_map(data);
-        let texture: TextureFile =
-            rhai::serde::from_dynamic(&value).map_err(|error| TextureCatalogError::Data {
+        let texture: TextureFile = serde_json::from_value(serde_json::Value::Object(data))
+            .map_err(|error| TextureCatalogError::Data {
                 path: descriptor_path.clone(),
                 message: error.to_string(),
             })?;

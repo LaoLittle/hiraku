@@ -4,10 +4,14 @@
 //! concepts. This module validates engine capabilities before they become ECS
 //! effects.
 
-use hiraku_script::hks::{Argument, Expr, ExprKind, NumberUnit, Span, Stmt, parse_program};
+use hiraku_script::hks::{
+    Argument, BinaryOp, Expr, ExprKind, NumberUnit, Span, Stmt, parse_program,
+};
 use thiserror::Error;
 
-use crate::script::{IrCommand, IrInstruction, IrProgram, IrWaitKind};
+use crate::script::{
+    IrCommand, IrExpression, IrExpressionId, IrInstruction, IrProgram, IrWaitKind,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PositionSpec {
@@ -224,13 +228,19 @@ pub fn compile_story_to_ir(path: &str, source: &str) -> Result<IrProgram, HksSto
     })?;
     let mut lowerer = HksStoryLowerer {
         path,
+        source_hash: source_hash(source),
+        expressions: Vec::new(),
         instructions: Vec::new(),
     };
     for statement in &program.statements {
         lowerer.statement(statement)?;
     }
     lowerer.instructions.push(IrInstruction::Halt);
-    Ok(IrProgram::new(source_hash(source), lowerer.instructions))
+    Ok(IrProgram::with_expressions(
+        source_hash(source),
+        lowerer.expressions,
+        lowerer.instructions,
+    ))
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -256,17 +266,89 @@ pub enum HksStoryCompileError {
 
 struct HksStoryLowerer<'a> {
     path: &'a str,
+    source_hash: u64,
+    expressions: Vec<IrExpression>,
     instructions: Vec<IrInstruction>,
 }
 
 impl HksStoryLowerer<'_> {
     fn statement(&mut self, statement: &Stmt) -> Result<(), HksStoryCompileError> {
-        let Stmt::Expr(expression) = statement else {
+        match statement {
+            Stmt::Let {
+                name, value, span, ..
+            } => self.let_statement(name, value, span),
+            Stmt::If {
+                condition,
+                then_block,
+                else_block,
+                span,
+            } => self.if_statement(condition, then_block, else_block.as_ref(), span),
+            Stmt::While {
+                condition,
+                body,
+                span,
+            } => self.while_statement(condition, body, span),
+            Stmt::Expr(expression) => self.expression_statement(expression),
+        }
+    }
+
+    fn let_statement(
+        &mut self,
+        variable: &str,
+        value: &Expr,
+        span: &Span,
+    ) -> Result<(), HksStoryCompileError> {
+        let ExprKind::Call {
+            callee,
+            arguments,
+            trailing_block,
+        } = &value.kind
+        else {
             return Err(HksStoryCompileError::UnsupportedStatement {
                 path: self.path.to_string(),
-                offset: statement_span(statement).start,
+                offset: span.start,
             });
         };
+        if trailing_block.is_some() {
+            return Err(HksStoryCompileError::UnsupportedStatement {
+                path: self.path.to_string(),
+                offset: span.start,
+            });
+        }
+        let name =
+            flatten_callee(callee).ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
+                path: self.path.to_string(),
+                offset: value.span.start,
+            })?;
+        if name != "openUi" || arguments.len() != 1 || arguments[0].label.is_some() {
+            return Err(HksStoryCompileError::UnsupportedCall {
+                path: self.path.to_string(),
+                name,
+                offset: value.span.start,
+            });
+        }
+        let ExprKind::String(path) = &arguments[0].value.kind else {
+            return Err(self.invalid_call("openUi", value, "expected one string path"));
+        };
+        self.instructions
+            .push(IrInstruction::Emit(IrCommand::OpenUi {
+                path: path.clone(),
+                result: variable.to_string(),
+            }));
+        self.instructions
+            .push(IrInstruction::Wait(IrWaitKind::UiIntent));
+        Ok(())
+    }
+
+    fn expression_statement(&mut self, expression: &Expr) -> Result<(), HksStoryCompileError> {
+        if let Some(bytecode) = crate::hks_character::compile_expression(
+            expression,
+            self.source_hash ^ expression.span.start as u64,
+        ) {
+            self.instructions
+                .push(IrInstruction::Emit(IrCommand::HksStatement { bytecode }));
+            return Ok(());
+        }
         let ExprKind::Call {
             callee,
             arguments,
@@ -278,10 +360,6 @@ impl HksStoryLowerer<'_> {
                 offset: expression.span.start,
             });
         };
-        if let Some(command) = self.character_call(expression)? {
-            self.instructions.push(IrInstruction::Emit(command));
-            return Ok(());
-        }
         if trailing_block.is_some() {
             return Err(HksStoryCompileError::UnsupportedStatement {
                 path: self.path.to_string(),
@@ -293,6 +371,11 @@ impl HksStoryLowerer<'_> {
                 path: self.path.to_string(),
                 offset: callee.span.start,
             })?;
+        match name.as_str() {
+            "camera.blur" => return self.camera_blur(expression, arguments),
+            "camera.zoom" => return self.camera_zoom(expression),
+            _ => {}
+        }
         if arguments.iter().any(|argument| argument.label.is_some()) {
             return Err(self.invalid_call(
                 &name,
@@ -301,11 +384,12 @@ impl HksStoryLowerer<'_> {
             ));
         }
         match name.as_str() {
-            "clear_text" => {
+            "clearText" => {
                 self.no_arguments(&name, expression, arguments, IrCommand::ClearDialogue)
             }
-            "stop_bgm" => self.no_arguments(&name, expression, arguments, IrCommand::StopBgm),
-            "return_to_title" => {
+            "stopBgm" => self.no_arguments(&name, expression, arguments, IrCommand::StopBgm),
+            "exit" => self.no_arguments(&name, expression, arguments, IrCommand::Exit),
+            "returnToTitle" => {
                 self.no_arguments(&name, expression, arguments, IrCommand::ReturnToTitle)
             }
             "log" => self.one_string(
@@ -322,13 +406,15 @@ impl HksStoryLowerer<'_> {
                 |texture| IrCommand::SetBackground { texture },
                 None,
             ),
-            "load_script" => self.one_string(
+            "loadScript" => self.one_string(
                 &name,
                 expression,
                 arguments,
                 |path| IrCommand::LoadScript { path },
                 None,
             ),
+            "adjustSetting" => self.adjust_setting(expression, arguments),
+            "playBgm" => self.play_bgm(expression, arguments),
             "narrate" => self.one_string(
                 &name,
                 expression,
@@ -347,84 +433,104 @@ impl HksStoryLowerer<'_> {
         }
     }
 
-    fn character_call(&self, expression: &Expr) -> Result<Option<IrCommand>, HksStoryCompileError> {
-        let mut methods = Vec::new();
-        let Some(arguments) = collect_character_chain(expression, &mut methods) else {
-            return Ok(None);
-        };
-        let actor_id = one_string_literal(arguments).ok_or_else(|| {
-            self.invalid_call("char", expression, "expected exactly one string argument")
-        })?;
-        let mut position = [0.0, 0.0];
-        let mut scale = 1.0;
-        let mut expressions = Vec::new();
-        for (method, arguments) in methods {
-            match method {
-                "at" => {
-                    let position_name = one_string_literal(arguments).ok_or_else(|| {
-                        self.invalid_call(
-                            "char.at",
-                            expression,
-                            "expected exactly one string argument",
-                        )
-                    })?;
-                    position = match position_name {
-                        "left" => [-600.0, 0.0],
-                        "center" => [0.0, 0.0],
-                        "right" => [600.0, 0.0],
-                        _ => {
-                            return Err(self.invalid_call(
-                                "char.at",
-                                expression,
-                                "position must be left, center, or right",
-                            ));
-                        }
-                    };
-                }
-                "scale" => {
-                    let value = one_scalar_number(arguments).ok_or_else(|| {
-                        self.invalid_call(
-                            "char.scale",
-                            expression,
-                            "expected exactly one numeric argument",
-                        )
-                    })?;
-                    if value <= 0.0 {
-                        return Err(self.invalid_call(
-                            "char.scale",
-                            expression,
-                            "scale must be positive",
-                        ));
-                    }
-                    scale = value as f32;
-                }
-                "e" => expressions.push(
-                    one_string_literal(arguments)
-                        .ok_or_else(|| {
-                            self.invalid_call(
-                                "char.e",
-                                expression,
-                                "expected exactly one string argument",
-                            )
-                        })?
-                        .to_string(),
-                ),
-                _ => {
-                    return Err(HksStoryCompileError::UnsupportedCall {
-                        path: self.path.to_string(),
-                        name: format!("char.{method}"),
-                        offset: expression.span.start,
-                    });
-                }
+    fn if_statement(
+        &mut self,
+        condition: &Expr,
+        then_block: &hiraku_script::hks::Block,
+        else_block: Option<&hiraku_script::hks::Block>,
+        span: &Span,
+    ) -> Result<(), HksStoryCompileError> {
+        let expression = self.condition(condition, span)?;
+        let branch_pc = self.instructions.len();
+        self.instructions.push(IrInstruction::Branch {
+            expression,
+            then_pc: 0,
+            else_pc: 0,
+        });
+        for statement in &then_block.statements {
+            self.statement(statement)?;
+        }
+        let end_jump_pc = self.instructions.len();
+        self.instructions.push(IrInstruction::Jump(0));
+        let else_pc = self.instructions.len() as u32;
+        if let Some(else_block) = else_block {
+            for statement in &else_block.statements {
+                self.statement(statement)?;
             }
         }
-        Ok(Some(IrCommand::ShowCharacter {
-            actor_id: actor_id.to_string(),
-            character_name: actor_id.to_string(),
-            expressions,
-            position,
-            scale,
-        }))
+        let end_pc = self.instructions.len() as u32;
+        self.instructions[branch_pc] = IrInstruction::Branch {
+            expression,
+            then_pc: (branch_pc + 1) as u32,
+            else_pc,
+        };
+        self.instructions[end_jump_pc] = IrInstruction::Jump(end_pc);
+        Ok(())
+    }
+
+    fn while_statement(
+        &mut self,
+        condition: &Expr,
+        body: &hiraku_script::hks::Block,
+        span: &Span,
+    ) -> Result<(), HksStoryCompileError> {
+        let condition_pc = self.instructions.len() as u32;
+        let expression = self.condition(condition, span)?;
+        let branch_pc = self.instructions.len();
+        self.instructions.push(IrInstruction::Branch {
+            expression,
+            then_pc: 0,
+            else_pc: 0,
+        });
+        for statement in &body.statements {
+            self.statement(statement)?;
+        }
+        self.instructions.push(IrInstruction::Jump(condition_pc));
+        let end_pc = self.instructions.len() as u32;
+        self.instructions[branch_pc] = IrInstruction::Branch {
+            expression,
+            then_pc: (branch_pc + 1) as u32,
+            else_pc: end_pc,
+        };
+        Ok(())
+    }
+
+    fn condition(
+        &mut self,
+        expression: &Expr,
+        span: &Span,
+    ) -> Result<IrExpressionId, HksStoryCompileError> {
+        let value = match &expression.kind {
+            ExprKind::Bool(value) => IrExpression::BoolLiteral(*value),
+            ExprKind::Ident(name) => IrExpression::BoolVariable(name.clone()),
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::Equal,
+                right,
+            } => match (&left.kind, &right.kind) {
+                (ExprKind::Ident(variable), ExprKind::String(value)) => {
+                    IrExpression::StringEquals {
+                        variable: variable.clone(),
+                        value: value.clone(),
+                    }
+                }
+                _ => {
+                    return Err(HksStoryCompileError::UnsupportedStatement {
+                        path: self.path.to_string(),
+                        offset: span.start,
+                    });
+                }
+            },
+            _ => {
+                return Err(HksStoryCompileError::UnsupportedStatement {
+                    path: self.path.to_string(),
+                    offset: span.start,
+                });
+            }
+        };
+        let id = IrExpressionId(self.expressions.len() as u32);
+        self.expressions.push(value);
+        Ok(id)
     }
 
     fn no_arguments(
@@ -438,6 +544,146 @@ impl HksStoryLowerer<'_> {
             return Err(self.invalid_call(name, expression, "expected no arguments"));
         }
         self.instructions.push(IrInstruction::Emit(command));
+        Ok(())
+    }
+
+    fn adjust_setting(
+        &mut self,
+        expression: &Expr,
+        arguments: &[Argument],
+    ) -> Result<(), HksStoryCompileError> {
+        let [name, delta] = arguments else {
+            return Err(self.invalid_call(
+                "adjustSetting",
+                expression,
+                "expected a string name and numeric delta",
+            ));
+        };
+        let Some(name) = one_string_literal(std::slice::from_ref(name)) else {
+            return Err(self.invalid_call(
+                "adjustSetting",
+                expression,
+                "expected a string setting name",
+            ));
+        };
+        let Some(delta) = one_scalar_number(std::slice::from_ref(delta)) else {
+            return Err(self.invalid_call("adjustSetting", expression, "expected a numeric delta"));
+        };
+        self.instructions
+            .push(IrInstruction::Emit(IrCommand::AdjustSetting {
+                name: name.to_string(),
+                delta: delta as f32,
+            }));
+        Ok(())
+    }
+
+    fn play_bgm(
+        &mut self,
+        expression: &Expr,
+        arguments: &[Argument],
+    ) -> Result<(), HksStoryCompileError> {
+        let [name, volume, fade] = arguments else {
+            return Err(self.invalid_call(
+                "playBgm",
+                expression,
+                "expected a music name, volume, and fade duration in milliseconds",
+            ));
+        };
+        let Some(name) = one_string_literal(std::slice::from_ref(name)) else {
+            return Err(self.invalid_call("playBgm", expression, "music name must be a string"));
+        };
+        let Some(volume) = one_scalar_number(std::slice::from_ref(volume)) else {
+            return Err(self.invalid_call("playBgm", expression, "volume must be numeric"));
+        };
+        let Some(fade) = one_scalar_number(std::slice::from_ref(fade)) else {
+            return Err(self.invalid_call("playBgm", expression, "fade duration must be numeric"));
+        };
+        if !(0.0..=1.0).contains(&volume) || fade < 0.0 {
+            return Err(self.invalid_call(
+                "playBgm",
+                expression,
+                "volume must be between 0 and 1 and fade duration must not be negative",
+            ));
+        }
+        self.instructions
+            .push(IrInstruction::Emit(IrCommand::PlayBgm {
+                path: name.to_string(),
+                volume: volume as f32,
+                fade_in_ms: Some(fade.round() as u64),
+            }));
+        Ok(())
+    }
+
+    fn camera_blur(
+        &mut self,
+        expression: &Expr,
+        arguments: &[Argument],
+    ) -> Result<(), HksStoryCompileError> {
+        let mut intensity = None;
+        let mut duration = 0.0;
+        let mut ease = Ease::Linear;
+        for argument in arguments {
+            match argument.label.as_deref() {
+                None if intensity.is_none() => {
+                    intensity = Some(number(argument, "intensity").map_err(|error| {
+                        self.invalid_call("camera.blur", expression, &error.message)
+                    })?)
+                }
+                Some("duration") => {
+                    duration = number(argument, "duration").map_err(|error| {
+                        self.invalid_call("camera.blur", expression, &error.message)
+                    })?
+                }
+                Some("ease") => {
+                    ease = ease_value(argument).map_err(|error| {
+                        self.invalid_call("camera.blur", expression, &error.message)
+                    })?
+                }
+                _ => {
+                    return Err(self.invalid_call(
+                        "camera.blur",
+                        expression,
+                        "expected intensity with optional duration and ease",
+                    ));
+                }
+            }
+        }
+        let intensity = intensity
+            .ok_or_else(|| self.invalid_call("camera.blur", expression, "intensity is required"))?;
+        if intensity < 0.0 || duration < 0.0 {
+            return Err(self.invalid_call(
+                "camera.blur",
+                expression,
+                "intensity and duration must not be negative",
+            ));
+        }
+        self.instructions
+            .push(IrInstruction::Emit(IrCommand::SetCamera {
+                blur: Some(intensity),
+                zoom: None,
+                duration_ms: (duration * 1000.0).round() as u64,
+                ease: ease_name(ease).to_string(),
+            }));
+        Ok(())
+    }
+
+    fn camera_zoom(&mut self, expression: &Expr) -> Result<(), HksStoryCompileError> {
+        let zoom = normalize_camera_zoom(expression)
+            .map_err(|error| self.invalid_call("camera.zoom", expression, &error.message))?;
+        if !matches!(zoom.at, PositionSpec::Preset(PresetPosition::Center)) {
+            return Err(self.invalid_call(
+                "camera.zoom",
+                expression,
+                "the transitional IR runtime currently supports only .center",
+            ));
+        }
+        self.instructions
+            .push(IrInstruction::Emit(IrCommand::SetCamera {
+                blur: None,
+                zoom: Some(zoom.scale),
+                duration_ms: (zoom.duration * 1000.0).round() as u64,
+                ease: ease_name(zoom.ease).to_string(),
+            }));
         Ok(())
     }
 
@@ -477,36 +723,19 @@ impl HksStoryLowerer<'_> {
     }
 }
 
+fn ease_name(ease: Ease) -> &'static str {
+    match ease {
+        Ease::Linear => "linear",
+        Ease::EaseIn => "ease_in",
+        Ease::EaseOut => "ease_out",
+        Ease::EaseInOut => "ease_in_out",
+    }
+}
+
 fn flatten_callee(expression: &Expr) -> Option<String> {
     match &expression.kind {
         ExprKind::Ident(name) => Some(name.clone()),
         ExprKind::Member { object, name } => Some(format!("{}.{}", flatten_callee(object)?, name)),
-        _ => None,
-    }
-}
-
-fn collect_character_chain<'a>(
-    expression: &'a Expr,
-    methods: &mut Vec<(&'a str, &'a [Argument])>,
-) -> Option<&'a [Argument]> {
-    let ExprKind::Call {
-        callee,
-        arguments,
-        trailing_block,
-    } = &expression.kind
-    else {
-        return None;
-    };
-    if trailing_block.is_some() || arguments.iter().any(|argument| argument.label.is_some()) {
-        return None;
-    }
-    match &callee.kind {
-        ExprKind::Ident(name) if name == "char" => Some(arguments),
-        ExprKind::Member { object, name } => {
-            let base = collect_character_chain(object, methods)?;
-            methods.push((name, arguments));
-            Some(base)
-        }
         _ => None,
     }
 }
@@ -538,13 +767,6 @@ fn one_scalar_number(arguments: &[Argument]) -> Option<f64> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-fn statement_span(statement: &Stmt) -> &Span {
-    match statement {
-        Stmt::Let { span, .. } => span,
-        Stmt::Expr(expression) => &expression.span,
     }
 }
 
@@ -609,7 +831,7 @@ mod tests {
     fn lowers_migrated_gallery_story_to_ir() {
         let program = compile_story_to_ir(
             "scripts/gallery.story.hks",
-            "clear_text()\nnarrate(\"Gallery\")\nreturn_to_title()",
+            "clearText()\nnarrate(\"Gallery\")\nreturnToTitle()",
         )
         .unwrap();
         assert_eq!(
@@ -634,20 +856,17 @@ mod tests {
             "char(\"ema\").at(\"center\").e(\"happy\").scale(0.14)",
         )
         .unwrap();
-        assert!(matches!(
-            program.instructions.first(),
-            Some(IrInstruction::Emit(IrCommand::ShowCharacter {
-                actor_id,
-                character_name,
-                expressions,
-                position,
-                scale,
-            })) if actor_id == "ema"
-                && character_name == "ema"
-                && expressions == &vec!["happy".to_string()]
-                && position == &[0.0, 0.0]
-                && (*scale - 0.14).abs() < f32::EPSILON
-        ));
+        let Some(IrInstruction::Emit(IrCommand::HksStatement { bytecode })) =
+            program.instructions.first()
+        else {
+            panic!("expected a native HKS statement");
+        };
+        let commands = crate::hks_character::execute(bytecode.clone()).unwrap();
+        assert!(matches!(&commands[0], IrCommand::ShowCharacter {
+            actor_id, character_name, expressions, position, scale,
+        } if actor_id == "ema" && character_name == "ema"
+            && expressions == &["happy"] && position == &[0.0, 0.0]
+            && (*scale - 0.14).abs() < f32::EPSILON));
     }
 
     #[test]
@@ -678,10 +897,61 @@ mod tests {
             vec![
                 IrInstruction::Emit(IrCommand::Log("manosaba bootstrap startup".to_string())),
                 IrInstruction::Emit(IrCommand::LoadScript {
-                    path: "system.rhai".to_string(),
+                    path: "system.story.hks".to_string(),
                 }),
                 IrInstruction::Halt,
             ]
         );
+    }
+
+    #[test]
+    fn lowers_settings_story_control_flow() {
+        let source =
+            include_str!("../../../manosabars/assets/main_hdp_contents/scripts/settings.story.hks");
+        let program = compile_story_to_ir("scripts/settings.story.hks", source).unwrap();
+        assert!(program.validate().is_ok());
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::OpenUi { path, result })
+                    if path == "../ui/settings.ui.hks" && result == "action"
+            )
+        }));
+        assert!(program.instructions.windows(2).any(|instructions| matches!(
+            instructions,
+            [
+                IrInstruction::Emit(IrCommand::OpenUi { .. }),
+                IrInstruction::Wait(IrWaitKind::UiIntent)
+            ]
+        )));
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                IrInstruction::Emit(IrCommand::AdjustSetting { name, delta })
+                    if name == "bgmVolume" && (*delta - 0.1).abs() < f32::EPSILON
+            )
+        }));
+    }
+
+    #[test]
+    fn lowers_the_hks_title_system() {
+        let source = include_str!("../../../manosabars/assets/main_hdp_contents/system.story.hks");
+        let program = compile_story_to_ir("system.story.hks", source).unwrap();
+        assert!(program.validate().is_ok());
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            IrInstruction::Emit(IrCommand::PlayBgm { path, .. }) if path == "title"
+        )));
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            IrInstruction::Emit(IrCommand::OpenUi { path, .. }) if path == "ui/title.ui.hks"
+        )));
+        assert!(program.instructions.windows(2).any(|instructions| matches!(
+            instructions,
+            [
+                IrInstruction::Emit(IrCommand::OpenUi { path, .. }),
+                IrInstruction::Wait(IrWaitKind::UiIntent)
+            ] if path == "ui/title.ui.hks"
+        )));
     }
 }

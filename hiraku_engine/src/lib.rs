@@ -3,6 +3,7 @@ mod audio;
 mod character;
 mod data;
 mod effect;
+mod hks_character;
 pub mod hks_prelude;
 mod proto;
 mod scene;
@@ -15,10 +16,7 @@ mod vfs;
 
 use std::sync::Arc;
 
-use assets::{
-    BytesAsset, BytesAssetLoader, HdpArchive, HdpArchiveLoader, RhaiScriptAsset,
-    RhaiScriptAssetLoader,
-};
+use assets::{BytesAsset, BytesAssetLoader, HdpArchive, HdpArchiveLoader};
 use bevy::{
     app::PluginGroupBuilder,
     asset::{AssetApp, io::AssetSourceId},
@@ -41,12 +39,10 @@ use scene::{
 #[cfg(target_arch = "wasm32")]
 use script::drive_web_script_runtime;
 pub use script::{
-    IrChoiceOption, IrCommand, IrCompileError, IrEvent, IrExpressionId, IrInstruction, IrProgram,
-    IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, compile_to_ir,
+    IrChoiceOption, IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram,
+    IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind,
 };
-use script::{
-    IrRuntime, ScriptBootstrap, compile_story_program, spawn_script_runtime, tick_ir_runtime,
-};
+use script::{IrRuntime, compile_story_program, tick_ir_runtime};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
@@ -123,14 +119,12 @@ impl Plugin for HirakuPlugin {
         let archive_path = archive_path_from_config(app.world().resource::<RuntimeLaunchConfig>());
 
         app.init_asset::<HdpArchive>()
-            .init_asset::<RhaiScriptAsset>()
             .init_asset::<BytesAsset>()
             .init_asset::<TextureAtlasLayout>()
             .init_resource::<texture::TextureAtlasCatalog>()
             .init_resource::<IrRuntime>()
             .init_resource::<script::InlineDialogueControlResource>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
-            .init_asset_loader::<RhaiScriptAssetLoader>()
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(
                 Update,
@@ -173,11 +167,23 @@ impl Plugin for HirakuPlugin {
                     .after(process_script_commands)
                     .in_set(HirakuRuntimeSystems),
             )
-            .add_systems(Update, cleanup_stale_screen_ui.in_set(HirakuRuntimeSystems))
-            .add_systems(Update, handle_screen_buttons.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
-                handle_screen_image_buttons.in_set(HirakuRuntimeSystems),
+                cleanup_stale_screen_ui
+                    .after(process_script_commands)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                handle_screen_buttons
+                    .after(cleanup_stale_screen_ui)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                handle_screen_image_buttons
+                    .after(cleanup_stale_screen_ui)
+                    .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, handle_choice_buttons.in_set(HirakuRuntimeSystems))
             .add_systems(
@@ -264,36 +270,26 @@ fn runtime_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool {
     frontend.is_some()
 }
 
-fn boot_runtime(
-    mut commands: Commands,
-    vfs: Res<VfsResource>,
-    scene_state: Res<SceneSharedState>,
-    mut ir_runtime: ResMut<IrRuntime>,
-    mut booted: Local<bool>,
-) {
+fn boot_runtime(vfs: Res<VfsResource>, mut ir_runtime: ResMut<IrRuntime>, mut booted: Local<bool>) {
     if *booted {
         return;
     }
     match vfs.0.load_startup_script_path() {
         Ok(startup_script) => {
             info!("startup script: {startup_script}");
-            let ir_program = vfs
+            let result = vfs
                 .0
                 .read_text(&startup_script)
-                .ok()
-                .and_then(|source| compile_story_program(&startup_script, &source).ok())
-                .and_then(|program| IrVm::new(program).ok());
-            if let Some(vm) = ir_program {
-                info!("starting startup script in IR runtime");
-                ir_runtime.vm = Some(vm);
-                ir_runtime.current_script = Some(startup_script);
-            } else {
-                spawn_script_runtime(
-                    &mut commands,
-                    vfs.0.clone(),
-                    scene_state.0.clone(),
-                    ScriptBootstrap::new(startup_script),
-                );
+                .map_err(|error| error.to_string())
+                .and_then(|source| compile_story_program(&startup_script, &source))
+                .and_then(|program| IrVm::new(program).map_err(|error| error.to_string()));
+            match result {
+                Ok(vm) => {
+                    info!("starting startup script in HKS IR runtime");
+                    ir_runtime.vm = Some(vm);
+                    ir_runtime.current_script = Some(startup_script);
+                }
+                Err(error) => error!("failed to start HKS script `{startup_script}`: {error}"),
             }
             *booted = true;
         }
