@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::mpsc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::mpsc,
+};
 
 use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
@@ -278,6 +281,15 @@ impl IrVm {
         }
     }
 
+    pub fn suspend(&mut self, wait: IrWaitKind) -> bool {
+        if matches!(self.status, IrVmStatus::Ready) {
+            self.status = IrVmStatus::Waiting(wait);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn step(&mut self) -> Option<IrEvent> {
         if !matches!(self.status, IrVmStatus::Ready) {
             return None;
@@ -395,7 +407,7 @@ pub enum IrValidationError {
 #[derive(Default, Resource)]
 pub struct IrRuntime {
     pub vm: Option<IrVm>,
-    pub events: Vec<IrEvent>,
+    pub events: VecDeque<IrEvent>,
     pub wait_response:
         Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
     pub current_script: Option<String>,
@@ -410,7 +422,7 @@ pub fn tick_ir_runtime(mut runtime: bevy::prelude::ResMut<IrRuntime>) {
         return;
     };
     if let Some(event) = vm.step() {
-        runtime.events.push(event);
+        runtime.events.push_back(event);
     }
 }
 
@@ -448,6 +460,26 @@ mod tests {
             Some(IrEvent::Command(IrCommand::Log("after".to_string())))
         );
         assert_eq!(vm.step(), Some(IrEvent::Completed));
+    }
+
+    #[test]
+    fn runtime_event_queue_preserves_program_order() {
+        let mut runtime = IrRuntime::default();
+        runtime
+            .events
+            .push_back(IrEvent::Command(IrCommand::Log("first".to_string())));
+        runtime
+            .events
+            .push_back(IrEvent::Command(IrCommand::Log("second".to_string())));
+
+        assert_eq!(
+            runtime.events.pop_front(),
+            Some(IrEvent::Command(IrCommand::Log("first".to_string())))
+        );
+        assert_eq!(
+            runtime.events.pop_front(),
+            Some(IrEvent::Command(IrCommand::Log("second".to_string())))
+        );
     }
 
     #[test]

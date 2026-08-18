@@ -42,11 +42,17 @@ pub struct HdpArchiveStore(Arc<RwLock<Option<Arc<[u8]>>>>);
 
 impl HdpArchiveStore {
     pub fn replace(&self, bytes: Arc<[u8]>) {
-        *self.0.write().unwrap() = Some(bytes);
+        *self
+            .0
+            .write()
+            .expect("archive byte store lock must not be poisoned") = Some(bytes);
     }
 
     fn bytes(&self) -> Option<Arc<[u8]>> {
-        self.0.read().unwrap().clone()
+        self.0
+            .read()
+            .expect("archive byte store lock must not be poisoned")
+            .clone()
     }
 
     pub fn is_ready(&self) -> bool {

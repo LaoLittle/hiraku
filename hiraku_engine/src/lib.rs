@@ -3,7 +3,7 @@ mod audio;
 mod character;
 mod data;
 mod effect;
-mod hks_character;
+mod hks_capabilities;
 pub mod hks_prelude;
 mod proto;
 mod scene;

@@ -9,10 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use super::{Expr, ExprKind, Program, Span, Stmt};
 
-pub const BYTECODE_VERSION: u16 = 2;
+pub const BYTECODE_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FunctionId(pub u32);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuiltinManifest {
@@ -68,7 +71,16 @@ pub struct Bytecode {
     #[serde(default)]
     pub builtin_manifest_hash: u64,
     pub instructions: Vec<Instruction>,
+    #[serde(default)]
+    pub functions: Vec<FunctionTemplate>,
     pub tasks: Vec<TaskTemplate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FunctionTemplate {
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub instructions: Vec<Instruction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -93,11 +105,19 @@ pub enum Instruction {
     MakeTuple(usize),
     MakeMap(Vec<String>),
     Negate,
+    Equal,
     CallBuiltin {
         builtin: BuiltinId,
         labels: Vec<Option<String>>,
         has_receiver: bool,
     },
+    CallFunction {
+        function: FunctionId,
+        argument_count: usize,
+    },
+    Jump(usize),
+    JumpIfFalse(usize),
+    Return,
     StatementCommit,
     SpawnTask {
         task: u32,
@@ -129,14 +149,33 @@ fn compile_inner(
     source_hash: u64,
     manifest: Option<&BuiltinManifest>,
 ) -> Result<Bytecode, Vec<CompileError>> {
+    let mut function_names = BTreeMap::new();
+    let mut declaration_errors = Vec::new();
+    for statement in &program.statements {
+        if let Stmt::Function { name, span, .. } = statement {
+            if function_names.contains_key(name) {
+                declaration_errors.push(CompileError {
+                    message: format!("function `{name}` is defined more than once"),
+                    span: span.clone(),
+                });
+            } else {
+                function_names.insert(name.clone(), FunctionId(function_names.len() as u32));
+            }
+        }
+    }
     let mut compiler = Compiler {
         instructions: Vec::new(),
+        functions: Vec::new(),
         tasks: Vec::new(),
-        errors: Vec::new(),
+        errors: declaration_errors,
         manifest,
+        function_names,
     };
+    compiler.compile_functions(program);
     for statement in &program.statements {
-        compiler.statement(statement);
+        if !matches!(statement, Stmt::Function { .. }) {
+            compiler.statement(statement);
+        }
     }
     compiler.instructions.push(Instruction::Halt);
     if compiler.errors.is_empty() {
@@ -145,6 +184,7 @@ fn compile_inner(
             source_hash,
             builtin_manifest_hash: manifest.map(BuiltinManifest::hash).unwrap_or_default(),
             instructions: compiler.instructions,
+            functions: compiler.functions,
             tasks: compiler.tasks,
         })
     } else {
@@ -154,14 +194,61 @@ fn compile_inner(
 
 struct Compiler<'a> {
     instructions: Vec<Instruction>,
+    functions: Vec<FunctionTemplate>,
     tasks: Vec<TaskTemplate>,
     errors: Vec<CompileError>,
     manifest: Option<&'a BuiltinManifest>,
+    function_names: BTreeMap<String, FunctionId>,
 }
 
 impl Compiler<'_> {
+    fn compile_functions(&mut self, program: &Program) {
+        let declarations = program
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::Function {
+                    name,
+                    parameters,
+                    body,
+                    ..
+                } => Some((name.clone(), parameters.clone(), body.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (name, parameters, body) in declarations {
+            let parent = std::mem::take(&mut self.instructions);
+            for (index, statement) in body.statements.iter().enumerate() {
+                let is_last = index + 1 == body.statements.len();
+                if is_last && let Stmt::Expr(expression) = statement {
+                    self.expression(expression);
+                    if self.manifest.is_some() {
+                        self.instructions.push(Instruction::StatementCommit);
+                    }
+                    self.instructions.push(Instruction::Return);
+                } else {
+                    self.statement(statement);
+                }
+            }
+            if !matches!(self.instructions.last(), Some(Instruction::Return)) {
+                self.instructions.push(Instruction::Constant(Value::Null));
+                self.instructions.push(Instruction::Return);
+            }
+            let instructions = std::mem::replace(&mut self.instructions, parent);
+            self.functions.push(FunctionTemplate {
+                name,
+                parameters,
+                instructions,
+            });
+        }
+    }
+
     fn statement(&mut self, statement: &Stmt) {
         match statement {
+            Stmt::Function { span, .. } => self.errors.push(CompileError {
+                message: "nested function definitions are not supported".to_string(),
+                span: span.clone(),
+            }),
             Stmt::Let { name, value, .. } => {
                 self.expression(value);
                 self.instructions
@@ -177,11 +264,46 @@ impl Compiler<'_> {
                     self.instructions.push(Instruction::StatementCommit);
                 }
             }
-            Stmt::If { span, .. } | Stmt::While { span, .. } => {
-                self.errors.push(CompileError {
-                    message: "control flow requires an embedding prelude compiler".to_string(),
-                    span: span.clone(),
-                });
+            Stmt::If {
+                condition,
+                then_block,
+                else_block,
+                ..
+            } => {
+                self.expression(condition);
+                let branch = self.instructions.len();
+                self.instructions.push(Instruction::JumpIfFalse(usize::MAX));
+                for statement in &then_block.statements {
+                    self.statement(statement);
+                }
+                if let Some(else_block) = else_block {
+                    let end_jump = self.instructions.len();
+                    self.instructions.push(Instruction::Jump(usize::MAX));
+                    let else_start = self.instructions.len();
+                    self.instructions[branch] = Instruction::JumpIfFalse(else_start);
+                    for statement in &else_block.statements {
+                        self.statement(statement);
+                    }
+                    let end = self.instructions.len();
+                    self.instructions[end_jump] = Instruction::Jump(end);
+                } else {
+                    let end = self.instructions.len();
+                    self.instructions[branch] = Instruction::JumpIfFalse(end);
+                }
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                let start = self.instructions.len();
+                self.expression(condition);
+                let exit = self.instructions.len();
+                self.instructions.push(Instruction::JumpIfFalse(usize::MAX));
+                for statement in &body.statements {
+                    self.statement(statement);
+                }
+                self.instructions.push(Instruction::Jump(start));
+                let end = self.instructions.len();
+                self.instructions[exit] = Instruction::JumpIfFalse(end);
             }
         }
     }
@@ -252,6 +374,24 @@ impl Compiler<'_> {
                     self.instructions.push(Instruction::SpawnTask { task });
                     return;
                 }
+                if let ExprKind::Ident(name) = &callee.kind
+                    && let Some(function) = self.function_names.get(name).copied()
+                {
+                    for argument in arguments {
+                        if argument.label.is_some() {
+                            self.errors.push(CompileError {
+                                message: "user functions do not accept named arguments".to_string(),
+                                span: argument.span.clone(),
+                            });
+                        }
+                        self.expression(&argument.value);
+                    }
+                    self.instructions.push(Instruction::CallFunction {
+                        function,
+                        argument_count: arguments.len(),
+                    });
+                    return;
+                }
                 if let Some(manifest) = self.manifest {
                     if let Some(name) = flatten_callee(callee)
                         && let Some(builtin) = manifest.resolve(&name)
@@ -301,10 +441,13 @@ impl Compiler<'_> {
                 message: "expression is not a value".to_string(),
                 span: expression.span.clone(),
             }),
-            ExprKind::Binary { .. } => self.errors.push(CompileError {
-                message: "binary expressions require an embedding prelude compiler".to_string(),
-                span: expression.span.clone(),
-            }),
+            ExprKind::Binary { left, op, right } => {
+                self.expression(left);
+                self.expression(right);
+                match op {
+                    super::BinaryOp::Equal => self.instructions.push(Instruction::Equal),
+                }
+            }
         }
     }
 
@@ -399,17 +542,30 @@ pub struct VmSnapshot {
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
     pub pc: usize,
+    #[serde(default)]
+    pub current_function: Option<FunctionId>,
     pub stack: Vec<Value>,
     pub locals: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub call_frames: Vec<CallFrame>,
     pub status: VmStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallFrame {
+    pub function: Option<FunctionId>,
+    pub pc: usize,
+    pub locals: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vm {
     bytecode: Bytecode,
     pc: usize,
+    current_function: Option<FunctionId>,
     stack: Vec<Value>,
     locals: BTreeMap<String, Value>,
+    call_frames: Vec<CallFrame>,
     status: VmStatus,
 }
 
@@ -421,8 +577,10 @@ impl Vm {
         Ok(Self {
             bytecode,
             pc: 0,
+            current_function: None,
             stack: Vec::new(),
             locals: BTreeMap::new(),
+            call_frames: Vec::new(),
             status: VmStatus::Ready,
         })
     }
@@ -433,8 +591,7 @@ impl Vm {
         }
         loop {
             let instruction = self
-                .bytecode
-                .instructions
+                .current_instructions()?
                 .get(self.pc)
                 .cloned()
                 .ok_or(VmError::InvalidProgramCounter(self.pc))?;
@@ -466,6 +623,11 @@ impl Vm {
                     };
                     self.stack.push(Value::Number(-value));
                 }
+                Instruction::Equal => {
+                    let right = self.pop()?;
+                    let left = self.pop()?;
+                    self.stack.push(Value::Bool(left == right));
+                }
                 Instruction::CallBuiltin {
                     builtin,
                     labels,
@@ -486,6 +648,53 @@ impl Vm {
                             .map(|(label, value)| CallArgument { label, value })
                             .collect(),
                     })));
+                }
+                Instruction::CallFunction {
+                    function,
+                    argument_count,
+                } => {
+                    let template = self
+                        .bytecode
+                        .functions
+                        .get(function.0 as usize)
+                        .ok_or(VmError::UnknownFunction(function))?;
+                    if template.parameters.len() != argument_count {
+                        return Err(VmError::FunctionArity {
+                            function,
+                            expected: template.parameters.len(),
+                            actual: argument_count,
+                        });
+                    }
+                    let parameters = template.parameters.clone();
+                    let values = self.pop_count(argument_count)?;
+                    self.call_frames.push(CallFrame {
+                        function: self.current_function,
+                        pc: self.pc,
+                        locals: std::mem::take(&mut self.locals),
+                    });
+                    self.current_function = Some(function);
+                    self.pc = 0;
+                    self.locals = parameters.into_iter().zip(values).collect();
+                }
+                Instruction::Jump(target) => self.pc = target,
+                Instruction::JumpIfFalse(target) => {
+                    let Value::Bool(condition) = self.pop()? else {
+                        return Err(VmError::TypeMismatch("condition must be bool"));
+                    };
+                    if !condition {
+                        self.pc = target;
+                    }
+                }
+                Instruction::Return => {
+                    let value = self.pop()?;
+                    let frame = self
+                        .call_frames
+                        .pop()
+                        .ok_or(VmError::ReturnOutsideFunction)?;
+                    self.current_function = frame.function;
+                    self.pc = frame.pc;
+                    self.locals = frame.locals;
+                    self.stack.push(value);
                 }
                 Instruction::StatementCommit => return Ok(Some(VmEvent::StatementCommit)),
                 Instruction::SpawnTask { task } => {
@@ -530,8 +739,10 @@ impl Vm {
             source_hash: self.bytecode.source_hash,
             builtin_manifest_hash: self.bytecode.builtin_manifest_hash,
             pc: self.pc,
+            current_function: self.current_function,
             stack: self.stack.clone(),
             locals: self.locals.clone(),
+            call_frames: self.call_frames.clone(),
             status: self.status.clone(),
         }
     }
@@ -546,20 +757,45 @@ impl Vm {
         if bytecode.version != BYTECODE_VERSION {
             return Err(VmError::UnsupportedBytecode(bytecode.version));
         }
-        if snapshot.pc > bytecode.instructions.len() {
+        let instruction_length = snapshot
+            .current_function
+            .map(|function| {
+                bytecode
+                    .functions
+                    .get(function.0 as usize)
+                    .map(|template| template.instructions.len())
+                    .ok_or(VmError::UnknownFunction(function))
+            })
+            .transpose()?
+            .unwrap_or(bytecode.instructions.len());
+        if snapshot.pc > instruction_length {
             return Err(VmError::InvalidProgramCounter(snapshot.pc));
         }
         Ok(Self {
             bytecode,
             pc: snapshot.pc,
+            current_function: snapshot.current_function,
             stack: snapshot.stack,
             locals: snapshot.locals,
+            call_frames: snapshot.call_frames,
             status: snapshot.status,
         })
     }
 
     fn pop(&mut self) -> Result<Value, VmError> {
         self.stack.pop().ok_or(VmError::StackUnderflow)
+    }
+
+    fn current_instructions(&self) -> Result<&[Instruction], VmError> {
+        match self.current_function {
+            Some(function) => self
+                .bytecode
+                .functions
+                .get(function.0 as usize)
+                .map(|template| template.instructions.as_slice())
+                .ok_or(VmError::UnknownFunction(function)),
+            None => Ok(&self.bytecode.instructions),
+        }
     }
 
     fn pop_count(&mut self, count: usize) -> Result<Vec<Value>, VmError> {
@@ -586,8 +822,10 @@ pub struct TaskScheduler {
 struct ScheduledTask {
     template: u32,
     pc: usize,
+    current_function: Option<FunctionId>,
     stack: Vec<Value>,
     locals: BTreeMap<String, Value>,
+    call_frames: Vec<CallFrame>,
     status: TaskStatus,
 }
 
@@ -611,8 +849,12 @@ pub struct TaskSchedulerSnapshot {
 pub struct TaskSnapshot {
     pub template: u32,
     pub pc: usize,
+    #[serde(default)]
+    pub current_function: Option<FunctionId>,
     pub stack: Vec<Value>,
     pub locals: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub call_frames: Vec<CallFrame>,
     pub status: TaskStatus,
 }
 
@@ -645,8 +887,10 @@ impl TaskScheduler {
             ScheduledTask {
                 template,
                 pc: 0,
+                current_function: None,
                 stack: Vec::new(),
                 locals: BTreeMap::new(),
+                call_frames: Vec::new(),
                 status: TaskStatus::Ready,
             },
         );
@@ -701,8 +945,10 @@ impl TaskScheduler {
                         TaskSnapshot {
                             template: task.template,
                             pc: task.pc,
+                            current_function: task.current_function,
                             stack: task.stack.clone(),
                             locals: task.locals.clone(),
+                            call_frames: task.call_frames.clone(),
                             status: task.status.clone(),
                         },
                     )
@@ -724,8 +970,24 @@ impl TaskScheduler {
         let mut scheduler = Self::new(bytecode)?;
         scheduler.next_task_id = snapshot.next_task_id;
         for (id, task) in snapshot.tasks {
-            let template = scheduler.template(task.template)?;
-            if task.pc > template.instructions.len() {
+            scheduler.template(task.template)?;
+            let instruction_length = task
+                .current_function
+                .map(|function| {
+                    scheduler
+                        .bytecode
+                        .functions
+                        .get(function.0 as usize)
+                        .map(|function| function.instructions.len())
+                        .ok_or(TaskSchedulerError::UnknownFunction(function))
+                })
+                .transpose()?
+                .unwrap_or_else(|| {
+                    scheduler.bytecode.tasks[task.template as usize]
+                        .instructions
+                        .len()
+                });
+            if task.pc > instruction_length {
                 return Err(TaskSchedulerError::InvalidProgramCounter(task.pc));
             }
             scheduler.tasks.insert(
@@ -733,8 +995,10 @@ impl TaskScheduler {
                 ScheduledTask {
                     template: task.template,
                     pc: task.pc,
+                    current_function: task.current_function,
                     stack: task.stack,
                     locals: task.locals,
+                    call_frames: task.call_frames,
                     status: task.status,
                 },
             );
@@ -749,7 +1013,11 @@ impl TaskScheduler {
             .ok_or(TaskSchedulerError::UnknownTask(task_id))?
             .template;
         let template = self.template(template_id)?.clone();
-        if template.mode == TaskMode::Parallel {
+        let at_template_root = self
+            .tasks
+            .get(&task_id)
+            .is_some_and(|task| task.current_function.is_none() && task.pc == 0);
+        if template.mode == TaskMode::Parallel && at_template_root {
             let children = template
                 .children
                 .iter()
@@ -762,13 +1030,26 @@ impl TaskScheduler {
             return Ok(None);
         }
 
+        let current_function = self
+            .tasks
+            .get(&task_id)
+            .ok_or(TaskSchedulerError::UnknownTask(task_id))?
+            .current_function;
+        let instructions = match current_function {
+            Some(function) => self
+                .bytecode
+                .functions
+                .get(function.0 as usize)
+                .map(|function| function.instructions.clone())
+                .ok_or(TaskSchedulerError::UnknownFunction(function))?,
+            None => template.instructions.clone(),
+        };
         let instruction = {
             let task = self
                 .tasks
                 .get_mut(&task_id)
                 .ok_or(TaskSchedulerError::UnknownTask(task_id))?;
-            let instruction = template
-                .instructions
+            let instruction = instructions
                 .get(task.pc)
                 .cloned()
                 .ok_or(TaskSchedulerError::InvalidProgramCounter(task.pc))?;
@@ -808,6 +1089,13 @@ impl TaskScheduler {
                 };
                 self.task_mut(task_id)?.stack.push(Value::Number(-value));
             }
+            Instruction::Equal => {
+                let right = self.pop_task(task_id)?;
+                let left = self.pop_task(task_id)?;
+                self.task_mut(task_id)?
+                    .stack
+                    .push(Value::Bool(left == right));
+            }
             Instruction::CallBuiltin {
                 builtin,
                 labels,
@@ -832,6 +1120,56 @@ impl TaskScheduler {
                             .collect(),
                     },
                 }));
+            }
+            Instruction::CallFunction {
+                function,
+                argument_count,
+            } => {
+                let parameters = self
+                    .bytecode
+                    .functions
+                    .get(function.0 as usize)
+                    .ok_or(TaskSchedulerError::UnknownFunction(function))?
+                    .parameters
+                    .clone();
+                if parameters.len() != argument_count {
+                    return Err(TaskSchedulerError::FunctionArity {
+                        function,
+                        expected: parameters.len(),
+                        actual: argument_count,
+                    });
+                }
+                let values = self.pop_task_count(task_id, argument_count)?;
+                let task = self.task_mut(task_id)?;
+                task.call_frames.push(CallFrame {
+                    function: task.current_function,
+                    pc: task.pc,
+                    locals: std::mem::take(&mut task.locals),
+                });
+                task.current_function = Some(function);
+                task.pc = 0;
+                task.locals = parameters.into_iter().zip(values).collect();
+            }
+            Instruction::Return => {
+                let value = self.pop_task(task_id)?;
+                let task = self.task_mut(task_id)?;
+                let frame = task
+                    .call_frames
+                    .pop()
+                    .ok_or(TaskSchedulerError::ReturnOutsideFunction)?;
+                task.current_function = frame.function;
+                task.pc = frame.pc;
+                task.locals = frame.locals;
+                task.stack.push(value);
+            }
+            Instruction::Jump(target) => self.task_mut(task_id)?.pc = target,
+            Instruction::JumpIfFalse(target) => {
+                let Value::Bool(condition) = self.pop_task(task_id)? else {
+                    return Err(TaskSchedulerError::TypeMismatch("condition must be bool"));
+                };
+                if !condition {
+                    self.task_mut(task_id)?.pc = target;
+                }
             }
             Instruction::StatementCommit => {
                 return Ok(Some(TaskEvent::StatementCommit { task: task_id }));
@@ -933,6 +1271,13 @@ pub enum TaskSchedulerError {
     UnknownTemplate(u32),
     NotWaitingForHost,
     TypeMismatch(&'static str),
+    UnknownFunction(FunctionId),
+    FunctionArity {
+        function: FunctionId,
+        expected: usize,
+        actual: usize,
+    },
+    ReturnOutsideFunction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -944,6 +1289,13 @@ pub enum VmError {
     StackUnderflow,
     UnknownLocal(String),
     UnknownTask(u32),
+    UnknownFunction(FunctionId),
+    FunctionArity {
+        function: FunctionId,
+        expected: usize,
+        actual: usize,
+    },
+    ReturnOutsideFunction,
     NotWaitingForHost,
     TypeMismatch(&'static str),
 }
@@ -952,6 +1304,63 @@ pub enum VmError {
 mod tests {
     use super::*;
     use crate::hks::parse_program;
+
+    #[test]
+    fn calls_user_functions_and_restores_call_frames() {
+        let program = parse_program(
+            r#"
+                fn relay(value) {
+                    nativeEcho(value)
+                }
+                relay("hello")
+            "#,
+        )
+        .unwrap();
+        let manifest = BuiltinManifest::new([("nativeEcho", BuiltinId(7))]);
+        let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
+        assert_eq!(bytecode.functions.len(), 1);
+
+        let mut vm = Vm::new(bytecode.clone()).unwrap();
+        let Some(VmEvent::Call(call)) = vm.step().unwrap() else {
+            panic!("expected native call from user function")
+        };
+        assert_eq!(call.arguments[0].value, Value::String("hello".to_string()));
+        let snapshot = vm.snapshot();
+        assert_eq!(snapshot.current_function, Some(FunctionId(0)));
+        assert_eq!(snapshot.call_frames.len(), 1);
+
+        let mut restored = Vm::restore(bytecode, snapshot).unwrap();
+        restored
+            .resume_builtin(Value::String("hello".to_string()))
+            .unwrap();
+        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
+        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(VmEvent::Completed(Value::Null))
+        );
+    }
+
+    #[test]
+    fn compiles_generic_equality_and_control_flow() {
+        let program = parse_program(
+            r#"
+                if "route" == "gallery" {
+                    log("yes")
+                } else {
+                    log("no")
+                }
+            "#,
+        )
+        .unwrap();
+        let manifest = BuiltinManifest::new([("log", BuiltinId(1))]);
+        let bytecode = compile_with_manifest(&program, 1, &manifest).unwrap();
+        let mut vm = Vm::new(bytecode).unwrap();
+        let Some(VmEvent::Call(call)) = vm.step().unwrap() else {
+            panic!("expected selected branch call")
+        };
+        assert_eq!(call.arguments[0].value, Value::String("no".to_string()));
+    }
 
     #[test]
     fn registered_fluent_calls_use_handles_and_commit_after_the_statement() {
@@ -1113,6 +1522,44 @@ mod tests {
                 value: Value::Null,
             })
         );
+    }
+
+    #[test]
+    fn scheduler_restores_user_function_call_frames() {
+        let program = parse_program(
+            r#"
+                fn relay(value) { nativeEcho(value) }
+                seq { relay("task") }
+            "#,
+        )
+        .unwrap();
+        let manifest = BuiltinManifest::new([("nativeEcho", BuiltinId(9))]);
+        let bytecode = compile_with_manifest(&program, 55, &manifest).unwrap();
+        let mut scheduler = TaskScheduler::new(bytecode.clone()).unwrap();
+        let task = scheduler.spawn(0).unwrap();
+        let Some(TaskEvent::Call { call, .. }) = scheduler.step().unwrap() else {
+            panic!("expected call from task function")
+        };
+        assert_eq!(call.arguments[0].value, Value::String("task".to_string()));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.tasks[&task].current_function, Some(FunctionId(0)));
+
+        let mut restored = TaskScheduler::restore(bytecode, snapshot).unwrap();
+        restored
+            .resume(task, Value::String("task".to_string()))
+            .unwrap();
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(TaskEvent::StatementCommit { task })
+        );
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(TaskEvent::StatementCommit { task })
+        );
+        assert!(matches!(
+            restored.step().unwrap(),
+            Some(TaskEvent::Completed { task: completed, .. }) if completed == task
+        ));
     }
 
     #[test]

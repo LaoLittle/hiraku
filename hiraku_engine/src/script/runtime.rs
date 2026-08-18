@@ -394,6 +394,9 @@ pub enum ScriptResponse {
 pub struct ScriptBootstrap {
     pub startup_script: String,
     pub values: BTreeMap<String, StoredValue>,
+    pub snapshot: Option<IrVmSnapshot>,
+    pub pending_input_variable: Option<String>,
+    pub pending_ui_screen: Option<String>,
 }
 
 impl ScriptBootstrap {
@@ -401,6 +404,9 @@ impl ScriptBootstrap {
         Self {
             startup_script,
             values: BTreeMap::new(),
+            snapshot: None,
+            pending_input_variable: None,
+            pending_ui_screen: None,
         }
     }
 
@@ -410,6 +416,9 @@ impl ScriptBootstrap {
         Self {
             startup_script: data.resume_script.clone(),
             values,
+            snapshot: data.ir_snapshot.clone(),
+            pending_input_variable: data.pending_input_variable.clone(),
+            pending_ui_screen: data.pending_ui_screen.clone(),
         }
     }
 }
@@ -424,17 +433,39 @@ pub fn start_hks_runtime(
         .read_text(&bootstrap.startup_script)
         .map_err(|error| error.to_string())?;
     let program = compile_story_program(&bootstrap.startup_script, &source)?;
-    let mut vm = IrVm::new(program).map_err(|error| error.to_string())?;
-    for (name, value) in bootstrap.values {
-        vm.set_stored_value(name, value);
-    }
+    let vm = if let Some(snapshot) = bootstrap.snapshot {
+        IrVm::restore(program, snapshot).map_err(|error| error.to_string())?
+    } else {
+        let mut vm = IrVm::new(program).map_err(|error| error.to_string())?;
+        for (name, value) in bootstrap.values {
+            vm.set_stored_value(name, value);
+        }
+        vm
+    };
+    let restored_wait = match vm.status() {
+        IrVmStatus::Waiting(wait) => Some(wait.clone()),
+        _ => None,
+    };
     runtime.vm = Some(vm);
     runtime.current_script = Some(bootstrap.startup_script);
     runtime.events.clear();
     runtime.wait_response = None;
-    runtime.pending_input_variable = None;
-    runtime.pending_ui_screen = None;
+    runtime.pending_input_variable = bootstrap.pending_input_variable;
+    runtime.pending_ui_screen = bootstrap.pending_ui_screen;
     runtime.pending_response = None;
+    if let Some(wait) = restored_wait {
+        runtime.events.push_back(IrEvent::Waiting(wait.clone()));
+        if matches!(wait, IrWaitKind::UiIntent | IrWaitKind::ScreenChoice)
+            && let (Some(path), Some(result)) = (
+                runtime.pending_ui_screen.clone(),
+                runtime.pending_input_variable.clone(),
+            )
+        {
+            runtime
+                .events
+                .push_back(IrEvent::Command(IrCommand::OpenUi { path, result }));
+        }
+    }
     Ok(())
 }
 
@@ -450,10 +481,17 @@ pub fn save_runtime_slot(
         .map(IrVm::story_values)
         .unwrap_or_default();
     let data = SaveGameData {
-        version: 4,
+        version: 5,
         resume_script: current_script,
         globals: values,
-        scene: shared_state.0.lock().unwrap().clone(),
+        scene: shared_state
+            .0
+            .lock()
+            .expect("scene state mutex must not be poisoned while saving")
+            .clone(),
+        ir_snapshot: runtime.vm.as_ref().map(IrVm::snapshot),
+        pending_input_variable: runtime.pending_input_variable.clone(),
+        pending_ui_screen: runtime.pending_ui_screen.clone(),
         ..Default::default()
     };
     write_save_data_to_root(&save_root_path(), slot, &data)

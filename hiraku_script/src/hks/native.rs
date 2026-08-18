@@ -9,10 +9,12 @@ use super::vm::{BuiltinCall, BuiltinId, BuiltinManifest, Value};
 
 type NativeResult = Result<Value, NativeError>;
 type NativeThunk<C> = dyn Fn(&mut C, &[Value]) -> NativeResult + Send + Sync + 'static;
+type RawNativeThunk<C> = dyn Fn(&mut C, &BuiltinCall) -> NativeResult + Send + Sync + 'static;
 
 pub struct NativeRegistry<C> {
     names: BTreeMap<String, BuiltinId>,
     functions: BTreeMap<BuiltinId, Box<NativeThunk<C>>>,
+    raw_functions: BTreeMap<BuiltinId, Box<RawNativeThunk<C>>>,
 }
 
 impl<C> Default for NativeRegistry<C> {
@@ -26,6 +28,7 @@ impl<C> NativeRegistry<C> {
         Self {
             names: BTreeMap::new(),
             functions: BTreeMap::new(),
+            raw_functions: BTreeMap::new(),
         }
     }
 
@@ -75,11 +78,50 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
+    /// Registers a low-level function that needs named-argument metadata or custom validation.
+    pub fn register_raw_fn_with_id<F>(
+        &mut self,
+        id: BuiltinId,
+        name: impl Into<String>,
+        function: F,
+    ) -> Result<(), RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let name = name.into();
+        if self.names.contains_key(&name) {
+            return Err(RegistrationError::DuplicateName(name));
+        }
+        if let Some(existing) = self
+            .names
+            .iter()
+            .find_map(|(name, existing)| (*existing == id).then_some(name.clone()))
+        {
+            return Err(RegistrationError::DuplicateId {
+                id,
+                existing,
+                attempted: name,
+            });
+        }
+        self.names.insert(name, id);
+        self.functions.insert(
+            id,
+            Box::new(move |_context, _| {
+                unreachable!("raw functions are dispatched before typed thunks")
+            }),
+        );
+        self.raw_functions.insert(id, Box::new(function));
+        Ok(())
+    }
+
     pub fn manifest(&self) -> BuiltinManifest {
         BuiltinManifest::new(self.names.iter().map(|(name, id)| (name.clone(), *id)))
     }
 
     pub fn call(&self, context: &mut C, call: &BuiltinCall) -> NativeResult {
+        if let Some(function) = self.raw_functions.get(&call.builtin) {
+            return function(context, call);
+        }
         let function = self
             .functions
             .get(&call.builtin)

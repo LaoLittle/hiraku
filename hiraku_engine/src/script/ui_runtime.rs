@@ -466,7 +466,11 @@ fn resolve_texture(catalog: &TextureCatalog, name: &str) -> Result<ScreenTexture
 fn stored_value(value: Value) -> Result<StoredValue, UiScriptError> {
     match value {
         Value::Bool(value) => Ok(StoredValue::Bool(value)),
-        Value::Number(value) if value.is_i64() => Ok(StoredValue::Int(value.as_i64().unwrap())),
+        Value::Number(value) if value.is_i64() => {
+            Ok(StoredValue::Int(value.as_i64().expect(
+                "JSON number checked as i64 must remain representable",
+            )))
+        }
         Value::Number(value) => value
             .as_f64()
             .map(StoredValue::Float)

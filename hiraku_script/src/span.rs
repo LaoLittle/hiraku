@@ -162,7 +162,9 @@ impl Interner {
     }
 
     pub fn get(&self, symbol: Symbol) -> &SymbolName {
-        self.map.get_index(symbol.as_index()).unwrap()
+        self.map
+            .get_index(symbol.as_index())
+            .expect("interned symbol must reference an existing string")
     }
 }
 

@@ -188,7 +188,9 @@ pub fn build_texture_atlases(
             builder.max_size(UVec2::splat(8192));
             let paths = scattered_paths.keys().cloned().collect::<Vec<_>>();
             for path in &paths {
-                let image = source_images.get(&state.images[path]).unwrap();
+                let image = source_images
+                    .get(&state.images[path])
+                    .expect("loaded texture handle must have a source image");
                 builder.add_texture(Some(state.images[path].id()), image);
             }
             match builder.build() {

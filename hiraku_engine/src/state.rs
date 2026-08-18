@@ -6,6 +6,8 @@ use std::{
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::script::IrVmSnapshot;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoredValue {
     Bool(bool),
@@ -126,6 +128,12 @@ pub struct SaveGameData {
     pub input_log: Vec<SavedInput>,
     #[serde(default)]
     pub scene: SceneSnapshot,
+    #[serde(default)]
+    pub ir_snapshot: Option<IrVmSnapshot>,
+    #[serde(default)]
+    pub pending_input_variable: Option<String>,
+    #[serde(default)]
+    pub pending_ui_screen: Option<String>,
 }
 
 fn default_save_version() -> u32 {

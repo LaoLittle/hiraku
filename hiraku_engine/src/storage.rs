@@ -224,6 +224,13 @@ impl From<&SaveGameData> for proto::SaveGameData {
             scope: stored_entries_from_map(&data.scope),
             input_log: data.input_log.iter().map(Into::into).collect(),
             scene: Some((&data.scene).into()),
+            ir_snapshot_json: data
+                .ir_snapshot
+                .as_ref()
+                .and_then(|snapshot| serde_json::to_vec(snapshot).ok())
+                .unwrap_or_default(),
+            pending_input_variable: data.pending_input_variable.clone(),
+            pending_ui_screen: data.pending_ui_screen.clone(),
         }
     }
 }
@@ -252,6 +259,17 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                 .map(TryInto::try_into)
                 .transpose()?
                 .unwrap_or_default(),
+            ir_snapshot: if data.ir_snapshot_json.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_slice(&data.ir_snapshot_json).map_err(|error| {
+                        StorageError::InvalidSave(format!("invalid IR snapshot: {error}"))
+                    })?,
+                )
+            },
+            pending_input_variable: data.pending_input_variable,
+            pending_ui_screen: data.pending_ui_screen,
         })
     }
 }
@@ -596,4 +614,40 @@ fn default_volume() -> f32 {
 
 fn default_volume_f64() -> f64 {
     1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::script::{IrInstruction, IrProgram, IrVm, IrWaitKind};
+
+    #[test]
+    fn save_roundtrip_preserves_exact_ir_wait_state() {
+        let program = IrProgram::new(
+            77,
+            vec![
+                IrInstruction::Wait(IrWaitKind::UiIntent),
+                IrInstruction::Halt,
+            ],
+        );
+        let mut vm = IrVm::new(program).unwrap();
+        assert!(vm.step().is_some());
+        let snapshot = vm.snapshot();
+        let data = SaveGameData {
+            version: 5,
+            resume_script: "system.story.hks".to_string(),
+            ir_snapshot: Some(snapshot.clone()),
+            pending_input_variable: Some("action".to_string()),
+            pending_ui_screen: Some("ui/title.ui.hks".to_string()),
+            ..Default::default()
+        };
+
+        let restored = decode_save_data(&encode_save_data(&data)).unwrap();
+        assert_eq!(restored.ir_snapshot, Some(snapshot));
+        assert_eq!(restored.pending_input_variable.as_deref(), Some("action"));
+        assert_eq!(
+            restored.pending_ui_screen.as_deref(),
+            Some("ui/title.ui.hks")
+        );
+    }
 }

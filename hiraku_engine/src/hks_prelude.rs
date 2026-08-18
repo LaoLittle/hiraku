@@ -231,6 +231,12 @@ pub fn compile_story_to_ir(path: &str, source: &str) -> Result<IrProgram, HksSto
         source_hash: source_hash(source),
         expressions: Vec::new(),
         instructions: Vec::new(),
+        functions: program
+            .statements
+            .iter()
+            .filter(|statement| matches!(statement, Stmt::Function { .. }))
+            .cloned()
+            .collect(),
     };
     for statement in &program.statements {
         lowerer.statement(statement)?;
@@ -269,11 +275,13 @@ struct HksStoryLowerer<'a> {
     source_hash: u64,
     expressions: Vec<IrExpression>,
     instructions: Vec<IrInstruction>,
+    functions: Vec<Stmt>,
 }
 
 impl HksStoryLowerer<'_> {
     fn statement(&mut self, statement: &Stmt) -> Result<(), HksStoryCompileError> {
         match statement {
+            Stmt::Function { .. } => Ok(()),
             Stmt::Let {
                 name, value, span, ..
             } => self.let_statement(name, value, span),
@@ -341,8 +349,9 @@ impl HksStoryLowerer<'_> {
     }
 
     fn expression_statement(&mut self, expression: &Expr) -> Result<(), HksStoryCompileError> {
-        if let Some(bytecode) = crate::hks_character::compile_expression(
+        if let Some(bytecode) = crate::hks_capabilities::compile_expression(
             expression,
+            &self.functions,
             self.source_hash ^ expression.span.start as u64,
         ) {
             self.instructions
@@ -789,6 +798,19 @@ mod tests {
         expression.clone()
     }
 
+    fn native_outputs(program: &IrProgram) -> Vec<crate::hks_capabilities::CapabilityOutput> {
+        program
+            .instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                IrInstruction::Emit(IrCommand::HksStatement { bytecode }) => {
+                    Some(crate::hks_capabilities::execute(bytecode.clone()).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn applies_camera_zoom_defaults() {
         assert_eq!(
@@ -834,19 +856,13 @@ mod tests {
             "clearText()\nnarrate(\"Gallery\")\nreturnToTitle()",
         )
         .unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                IrInstruction::Emit(IrCommand::ClearDialogue),
-                IrInstruction::Emit(IrCommand::Say {
-                    speaker: String::new(),
-                    text: "Gallery".to_string(),
-                }),
-                IrInstruction::Wait(IrWaitKind::DialogueAdvance),
-                IrInstruction::Emit(IrCommand::ReturnToTitle),
-                IrInstruction::Halt,
-            ]
+        let outputs = native_outputs(&program);
+        assert!(matches!(outputs[0].commands[0], IrCommand::ClearDialogue));
+        assert!(
+            matches!(&outputs[1].commands[0], IrCommand::Say { text, .. } if text == "Gallery")
         );
+        assert_eq!(outputs[1].wait, Some(IrWaitKind::DialogueAdvance));
+        assert!(matches!(outputs[2].commands[0], IrCommand::ReturnToTitle));
     }
 
     #[test]
@@ -861,8 +877,8 @@ mod tests {
         else {
             panic!("expected a native HKS statement");
         };
-        let commands = crate::hks_character::execute(bytecode.clone()).unwrap();
-        assert!(matches!(&commands[0], IrCommand::ShowCharacter {
+        let output = crate::hks_capabilities::execute(bytecode.clone()).unwrap();
+        assert!(matches!(&output.commands[0], IrCommand::ShowCharacter {
             actor_id, character_name, expressions, position, scale,
         } if actor_id == "ema" && character_name == "ema"
             && expressions == &["happy"] && position == &[0.0, 0.0]
@@ -876,13 +892,9 @@ mod tests {
         let program = compile_story_to_ir("scripts/new_game.story.hks", source).unwrap();
         assert!(program.validate().is_ok());
         assert_eq!(
-            program
-                .instructions
+            native_outputs(&program)
                 .iter()
-                .filter(|instruction| matches!(
-                    instruction,
-                    IrInstruction::Wait(IrWaitKind::DialogueAdvance)
-                ))
+                .filter(|output| output.wait == Some(IrWaitKind::DialogueAdvance))
                 .count(),
             24
         );
@@ -892,15 +904,15 @@ mod tests {
     fn lowers_hks_startup_handoff() {
         let source = include_str!("../../../manosabars/assets/main_hdp_contents/startup.story.hks");
         let program = compile_story_to_ir("startup.story.hks", source).unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                IrInstruction::Emit(IrCommand::Log("manosaba bootstrap startup".to_string())),
-                IrInstruction::Emit(IrCommand::LoadScript {
-                    path: "system.story.hks".to_string(),
-                }),
-                IrInstruction::Halt,
-            ]
+        let commands = native_outputs(&program)
+            .into_iter()
+            .flat_map(|output| output.commands)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(&commands[0], IrCommand::Log(message) if message == "manosaba bootstrap startup")
+        );
+        assert!(
+            matches!(&commands[1], IrCommand::LoadScript { path } if path == "system.story.hks")
         );
     }
 
@@ -924,13 +936,14 @@ mod tests {
                 IrInstruction::Wait(IrWaitKind::UiIntent)
             ]
         )));
-        assert!(program.instructions.iter().any(|instruction| {
-            matches!(
-                instruction,
-                IrInstruction::Emit(IrCommand::AdjustSetting { name, delta })
-                    if name == "bgmVolume" && (*delta - 0.1).abs() < f32::EPSILON
-            )
-        }));
+        assert!(
+            native_outputs(&program)
+                .iter()
+                .any(|output| output.commands.iter().any(|command| {
+                    matches!(command, IrCommand::AdjustSetting { name, delta }
+                if name == "bgmVolume" && (*delta - 0.1).abs() < f32::EPSILON)
+                }))
+        );
     }
 
     #[test]
@@ -938,10 +951,13 @@ mod tests {
         let source = include_str!("../../../manosabars/assets/main_hdp_contents/system.story.hks");
         let program = compile_story_to_ir("system.story.hks", source).unwrap();
         assert!(program.validate().is_ok());
-        assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            IrInstruction::Emit(IrCommand::PlayBgm { path, .. }) if path == "title"
-        )));
+        assert!(
+            native_outputs(&program)
+                .iter()
+                .any(|output| output.commands.iter().any(|command| {
+                    matches!(command, IrCommand::PlayBgm { path, .. } if path == "title")
+                }))
+        );
         assert!(program.instructions.iter().any(|instruction| matches!(
             instruction,
             IrInstruction::Emit(IrCommand::OpenUi { path, .. }) if path == "ui/title.ui.hks"
@@ -953,5 +969,23 @@ mod tests {
                 IrInstruction::Wait(IrWaitKind::UiIntent)
             ] if path == "ui/title.ui.hks"
         )));
+    }
+
+    #[test]
+    fn user_functions_call_registered_story_capabilities() {
+        let program = compile_story_to_ir(
+            "function.story.hks",
+            r#"
+                fn announce(text) {
+                    log(text)
+                }
+                announce("from function")
+            "#,
+        )
+        .unwrap();
+        let outputs = native_outputs(&program);
+        assert!(
+            matches!(&outputs[0].commands[0], IrCommand::Log(message) if message == "from function")
+        );
     }
 }

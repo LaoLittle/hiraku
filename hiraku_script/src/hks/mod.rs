@@ -28,6 +28,12 @@ pub struct Program {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
+    Function {
+        name: String,
+        parameters: Vec<String>,
+        body: Block,
+        span: Span,
+    },
     Let {
         mutable: bool,
         name: String,
@@ -416,6 +422,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Stmt {
         if let TokenKind::Ident(name) = &self.current().kind {
             match name.as_str() {
+                "fn" => return self.parse_function(),
                 "let" | "var" => return self.parse_let(),
                 "if" => return self.parse_if(),
                 "while" => return self.parse_while(),
@@ -423,6 +430,42 @@ impl Parser {
             }
         }
         Stmt::Expr(self.parse_expression())
+    }
+
+    fn parse_function(&mut self) -> Stmt {
+        let start = self.advance();
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected function name after `fn`");
+                "<error>".to_string()
+            }
+        };
+        self.expect(TokenKind::LParen, "expected `(` after function name");
+        let mut parameters = Vec::new();
+        self.skip_newlines();
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            match self.advance().kind {
+                TokenKind::Ident(parameter) => parameters.push(parameter),
+                _ => self.error_here("expected parameter name"),
+            }
+            self.skip_newlines();
+            if self.at(TokenKind::Comma) {
+                self.advance();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "expected `)` after parameters");
+        let body = self.parse_block();
+        let span = Span::join(&start.span, &body.span);
+        Stmt::Function {
+            name,
+            parameters,
+            body,
+            span,
+        }
     }
 
     fn parse_if(&mut self) -> Stmt {
@@ -876,6 +919,31 @@ mod tests {
         };
         assert_eq!(fields.len(), 3);
         assert!(matches!(fields[2].value.kind, ExprKind::Map(_)));
+    }
+
+    #[test]
+    fn parses_function_definitions() {
+        let program = parse_program(
+            r#"
+                fn decorate(actor, emotion) {
+                    actor.e(emotion)
+                }
+                decorate(char("Alice"), "happy")
+            "#,
+        )
+        .unwrap();
+        let Stmt::Function {
+            name,
+            parameters,
+            body,
+            ..
+        } = &program.statements[0]
+        else {
+            panic!("expected function definition")
+        };
+        assert_eq!(name, "decorate");
+        assert_eq!(parameters, &["actor", "emotion"]);
+        assert_eq!(body.statements.len(), 1);
     }
 
     #[test]
