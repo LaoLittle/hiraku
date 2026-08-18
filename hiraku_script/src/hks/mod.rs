@@ -3,6 +3,7 @@
 //! This is separate from the older Kotlin experiment under `ast`/`parse`.
 //! It models only the syntax that the recoverable Hiraku VM needs.
 
+pub mod native;
 pub mod vm;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

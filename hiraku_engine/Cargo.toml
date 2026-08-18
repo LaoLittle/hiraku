@@ -10,11 +10,7 @@ bevy_ui_render = "0.19"
 futures-lite.workspace = true
 hiraku-script.workspace = true
 prost.workspace = true
-rand.workspace = true
-rand_pcg.workspace = true
-rhai = { workspace = true, features = ["internals"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-time.workspace = true
 zip.workspace = true

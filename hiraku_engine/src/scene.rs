@@ -6,10 +6,14 @@ use std::{
 use bevy::{
     app::AppExit,
     audio::{AudioSink, AudioSinkPlayback, Volume},
+    camera::RenderTarget,
     ecs::system::SystemParam,
     log::{info, warn},
     math::Rect,
     prelude::*,
+    render::render_resource::TextureFormat,
+    ui::{ComputedStackIndex, UiGlobalTransform},
+    window::PrimaryWindow,
 };
 
 use crate::{
@@ -21,11 +25,10 @@ use crate::{
         custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
     },
     script::{
-        BatchSubmissionItem, BatchSubmitMode, CharacterEase, InlineDialogueControlResource,
-        IrCommand, IrEvent, IrRuntime, IrVm, IrWaitKind, ResolvedCharacterKeyframe,
-        ScriptBootstrap, ScriptCommand, ScriptInbox, ScriptResponse, ScriptRuntimeState, UiContext,
-        UiIntent, compile_story_program, evaluate_ui_script, save_runtime_slot,
-        script_command_from_ir, spawn_script_runtime,
+        BatchSubmissionItem, BatchSubmitMode, CharacterEase, IrCommand, IrEvent, IrRuntime, IrVm,
+        IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptResponse,
+        UiContext, UiIntent, compile_story_program, evaluate_ui_script, save_runtime_slot,
+        script_command_from_ir, start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -764,7 +767,6 @@ pub struct SceneCommandContext<'w, 's> {
     pub ui_fonts: Res<'w, UiFonts>,
     pub ui_style: ResMut<'w, UiStyle>,
     pub frontend: ResMut<'w, FrontendState>,
-    pub inbox: Option<Res<'w, ScriptInbox>>,
     pub stage: ResMut<'w, StageState>,
     pub waits: ResMut<'w, PendingWaits>,
     pub pending_cancels: ResMut<'w, PendingAnimationCancels>,
@@ -829,7 +831,7 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub ui_fonts: Res<'w, UiFonts>,
     pub vfs: Res<'w, VfsResource>,
     pub shared_state: Res<'w, SceneSharedState>,
-    pub runtime_state: Option<Res<'w, ScriptRuntimeState>>,
+    pub ir_runtime: ResMut<'w, IrRuntime>,
     pub frontend: ResMut<'w, FrontendState>,
     pub user_settings: Res<'w, UserSettings>,
     pub ui_style: Res<'w, UiStyle>,
@@ -867,9 +869,21 @@ pub fn setup_stage(
     ui_fonts: Res<UiFonts>,
     ui_style: Res<UiStyle>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     config: Res<crate::RuntimeLaunchConfig>,
     shared_state: Res<SceneSharedState>,
 ) {
+    let canvas_size = config.canvas_size.max(UVec2::ONE);
+    let canvas_image = images.add(Image::new_target_texture(
+        canvas_size.x,
+        canvas_size.y,
+        TextureFormat::Rgba8Unorm,
+        Some(TextureFormat::Rgba8UnormSrgb),
+    ));
+    commands.insert_resource(crate::HirakuCanvas {
+        image: canvas_image.clone(),
+        size: canvas_size,
+    });
     commands.spawn((
         Camera2d,
         IsDefaultUiCamera,
@@ -880,7 +894,7 @@ pub fn setup_stage(
             clear_color: config.camera_clear_color.clone(),
             ..default()
         },
-        config.render_target.clone(),
+        RenderTarget::Image(canvas_image.into()),
         MainCamera,
     ));
     commands.insert_resource(RuleTransitionMesh(meshes.add(Rectangle::default())));
@@ -1017,10 +1031,9 @@ pub fn setup_frontend(
 
     let mut frontend = FrontendState {
         startup_script,
-        gallery_script: vfs.0.resolve_path(
-            Some(vfs.0.settings_path()),
-            "scripts/character_gallery.rhai",
-        ),
+        gallery_script: vfs
+            .0
+            .resolve_path(Some(vfs.0.settings_path()), "scripts/gallery.story.hks"),
         screen: FrontendScreen::InGame,
         runtime_started: true,
         dirty: false,
@@ -1105,7 +1118,7 @@ pub fn rebuild_frontend_ui(
                     TextColor(Color::srgb(0.95, 0.82, 0.67)),
                 ));
                 panel.spawn((
-                    Text::new("Bevy + Rhai visual novel runtime"),
+                    Text::new("Bevy + HKS visual novel runtime"),
                     ui_text_font(&ui_fonts, 24.0),
                     TextColor(Color::WHITE.with_alpha(0.72)),
                 ));
@@ -1572,6 +1585,7 @@ pub fn handle_frontend_buttons(
     mut stage: ResMut<StageState>,
     mut dialogue_state: ResMut<DialogueState>,
     mut choice_state: ResMut<ChoiceState>,
+    mut ir_runtime: ResMut<IrRuntime>,
     mut interaction_query: Query<
         (&Interaction, &mut BackgroundColor, &FrontendButton),
         Changed<Interaction>,
@@ -1620,6 +1634,7 @@ pub fn handle_frontend_buttons(
                             &mut line_text,
                             &user_settings,
                             &mut frontend,
+                            &mut ir_runtime,
                             bootstrap,
                             SceneSnapshot::default(),
                         );
@@ -1636,7 +1651,7 @@ pub fn handle_frontend_buttons(
                             continue;
                         }
                         let mut bootstrap = ScriptBootstrap::new(frontend.gallery_script.clone());
-                        bootstrap.globals.insert(
+                        bootstrap.values.insert(
                             "route".to_string(),
                             StoredValue::String("gallery".to_string()),
                         );
@@ -1655,6 +1670,7 @@ pub fn handle_frontend_buttons(
                             &mut line_text,
                             &user_settings,
                             &mut frontend,
+                            &mut ir_runtime,
                             bootstrap,
                             SceneSnapshot::default(),
                         );
@@ -1701,6 +1717,7 @@ pub fn handle_frontend_buttons(
                                 &mut line_text,
                                 &user_settings,
                                 &mut frontend,
+                                &mut ir_runtime,
                                 bootstrap,
                                 snapshot,
                             );
@@ -1791,17 +1808,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut line_color = ctx.line_color;
     let mut hint_color = ctx.hint_color;
 
-    let inbox = ctx.inbox;
-
-    while let Some(command) = pending_script_commands.items.pop_front().or_else(|| {
-        inbox.as_ref().and_then(|inbox| {
-            inbox
-                .0
-                .lock()
-                .ok()
-                .and_then(|receiver| receiver.try_recv().ok())
-        })
-    }) {
+    while let Some(command) = pending_script_commands.items.pop_front() {
         if screen_state.active_root.is_some()
             && screen_state.waiting.is_none()
             && should_clear_stale_screen_before_command(&command)
@@ -3018,6 +3025,96 @@ pub fn handle_choice_buttons(
     }
 }
 
+/// Maps primary-window pointer input into Hiraku's fixed offscreen canvas.
+///
+/// Bevy's built-in UI focus system only produces [`Interaction`] for cameras targeting a window.
+/// Hiraku renders UI into an image, so the engine performs the equivalent topmost-node hit test in
+/// canvas coordinates before the existing semantic button handlers run.
+pub fn update_offscreen_ui_interactions(
+    canvas: Res<crate::HirakuCanvas>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    screen_state: Res<ScreenUiState>,
+    mut buttons: Query<
+        (
+            Entity,
+            &ComputedNode,
+            &UiGlobalTransform,
+            &ComputedStackIndex,
+            &InheritedVisibility,
+            &mut Interaction,
+            Option<&ScreenUiButton>,
+            Option<&ScreenUiImageButton>,
+        ),
+        Or<(
+            With<ScreenUiButton>,
+            With<ScreenUiImageButton>,
+            With<ChoiceButton>,
+            With<RuntimeMenuButton>,
+        )>,
+    >,
+) {
+    let cursor = windows
+        .single()
+        .ok()
+        .and_then(|window| window.cursor_position().map(|cursor| (window, cursor)))
+        .and_then(|(window, cursor)| {
+            window_cursor_to_canvas(
+                Vec2::new(window.width(), window.height()),
+                cursor,
+                canvas.size.as_vec2(),
+            )
+        });
+
+    let mut topmost = None::<(u32, Entity)>;
+    if let Some(cursor) = cursor {
+        for (entity, computed, transform, stack, visibility, _, screen_button, image_button) in
+            &mut buttons
+        {
+            let belongs_to_active_screen = screen_button
+                .map(|button| Some(button.root) == screen_state.active_root)
+                .or_else(|| {
+                    image_button.map(|button| Some(button.root) == screen_state.active_root)
+                })
+                .unwrap_or(true);
+            if !belongs_to_active_screen
+                || !visibility.get()
+                || !computed.contains_point(*transform, cursor)
+            {
+                continue;
+            }
+            if topmost.is_none_or(|(index, _)| stack.0 >= index) {
+                topmost = Some((stack.0, entity));
+            }
+        }
+    }
+
+    let topmost = topmost.map(|(_, entity)| entity);
+    for (entity, _, _, _, _, mut interaction, _, _) in &mut buttons {
+        let next = if Some(entity) == topmost {
+            if mouse.just_pressed(MouseButton::Left) {
+                Interaction::Pressed
+            } else {
+                Interaction::Hovered
+            }
+        } else {
+            Interaction::None
+        };
+        interaction.set_if_neq(next);
+    }
+}
+
+fn window_cursor_to_canvas(window_size: Vec2, cursor: Vec2, canvas_size: Vec2) -> Option<Vec2> {
+    let scale = (window_size.x / canvas_size.x).min(window_size.y / canvas_size.y);
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let displayed_size = canvas_size * scale;
+    let origin = (window_size - displayed_size) * 0.5;
+    let cursor = (cursor - origin) / scale;
+    (cursor.cmpge(Vec2::ZERO).all() && cursor.cmplt(canvas_size).all()).then_some(cursor)
+}
+
 pub fn handle_screen_buttons(
     mut screen_state: ResMut<ScreenUiState>,
     mut interaction_query: Query<
@@ -3219,8 +3316,6 @@ pub fn advance_dialogue_on_input(
     mouse: Res<ButtonInput<MouseButton>>,
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,
-    inline_control: Res<InlineDialogueControlResource>,
-    mut pending_cancels: ResMut<PendingAnimationCancels>,
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
     choice_state: Res<ChoiceState>,
     runtime_menu: Res<RuntimeMenuState>,
@@ -3257,18 +3352,6 @@ pub fn advance_dialogue_on_input(
     {
         return;
     }
-
-    let mut inline = inline_control.0.lock().unwrap();
-    if inline.active {
-        inline.skip_requested = true;
-        if let Some(handle) = inline.current_handle.clone() {
-            pending_cancels.ids.push(handle);
-        }
-        drop(inline);
-        reveal_all_dialogue_chars(&mut dialogue_state, &mut dialogue_chars);
-        return;
-    }
-    drop(inline);
 
     if dialogue_reveal_has_hidden_chars(&dialogue_state) {
         reveal_all_dialogue_chars(&mut dialogue_state, &mut dialogue_chars);
@@ -4612,6 +4695,7 @@ fn start_frontend_session(
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
     user_settings: &UserSettings,
     frontend: &mut FrontendState,
+    ir_runtime: &mut IrRuntime,
     bootstrap: ScriptBootstrap,
     snapshot: SceneSnapshot,
 ) {
@@ -4639,7 +4723,11 @@ fn start_frontend_session(
     frontend.screen = FrontendScreen::InGame;
     frontend.dirty = false;
 
-    spawn_script_runtime(commands, vfs.0.clone(), shared_state.0.clone(), bootstrap);
+    if let Err(error) = start_hks_runtime(vfs, ir_runtime, bootstrap) {
+        frontend.notice = Some(format!("Failed to start HKS runtime: {error}"));
+        frontend.runtime_started = false;
+        frontend.dirty = true;
+    }
 }
 
 fn shorten_path(path: &str) -> String {
@@ -5937,9 +6025,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 *color = ctx.ui_style.quick_button_pressed.into();
                 match button.action {
                     RuntimeMenuButtonAction::QuickSave => {
-                        if let Some(runtime_state) = ctx.runtime_state.as_ref() {
-                            let _ = save_runtime_slot("quick", runtime_state, &ctx.shared_state);
-                        }
+                        let _ = save_runtime_slot("quick", &ctx.ir_runtime, &ctx.shared_state);
                     }
                     RuntimeMenuButtonAction::QuickLoad => {
                         let Ok(save_data) = load_save_data("quick") else {
@@ -5974,6 +6060,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.line_text,
                             &ctx.user_settings,
                             &mut ctx.frontend,
+                            &mut ctx.ir_runtime,
                             ScriptBootstrap::from_save(&save_data),
                             save_data.scene.clone(),
                         );
@@ -6023,6 +6110,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.line_text,
                             &ctx.user_settings,
                             &mut ctx.frontend,
+                            &mut ctx.ir_runtime,
                             ScriptBootstrap::new(startup_script),
                             SceneSnapshot::default(),
                         );
@@ -6345,5 +6433,33 @@ fn tween_fraction(timer: &Timer) -> f32 {
         1.0
     } else {
         (timer.elapsed_secs() / duration).clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_cursor_to_canvas;
+    use bevy::prelude::Vec2;
+
+    #[test]
+    fn maps_pointer_through_letterboxing() {
+        let canvas = Vec2::new(1280.0, 720.0);
+        let mapped =
+            window_cursor_to_canvas(Vec2::new(1000.0, 1000.0), Vec2::new(500.0, 500.0), canvas);
+        assert_eq!(mapped, Some(Vec2::new(640.0, 360.0)));
+        assert_eq!(
+            window_cursor_to_canvas(Vec2::new(1000.0, 1000.0), Vec2::new(500.0, 100.0), canvas,),
+            None
+        );
+    }
+
+    #[test]
+    fn maps_pointer_through_pillarboxing() {
+        let mapped = window_cursor_to_canvas(
+            Vec2::new(2000.0, 720.0),
+            Vec2::new(1000.0, 360.0),
+            Vec2::new(1280.0, 720.0),
+        );
+        assert_eq!(mapped, Some(Vec2::new(640.0, 360.0)));
     }
 }

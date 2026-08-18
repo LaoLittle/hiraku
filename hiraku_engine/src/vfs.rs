@@ -971,12 +971,12 @@ mod tests {
 
         let vfs = HdpVfs::new_with_config(&root, "settings.data.hks", "startup.story.hks");
         assert_eq!(
-            vfs.resolve_background_path(Some("scripts/chapter.rhai"), "forest.png")
+            vfs.resolve_background_path(Some("scripts/chapter.story.hks"), "forest.png")
                 .unwrap(),
             "art/backgrounds/forest.png"
         );
         assert_eq!(
-            vfs.resolve_soundeffect_path(Some("scripts/chapter.rhai"), "click.wav")
+            vfs.resolve_soundeffect_path(Some("scripts/chapter.story.hks"), "click.wav")
                 .unwrap(),
             "audio/sfx/click.wav"
         );
@@ -999,7 +999,7 @@ mod tests {
 
         assert_eq!(
             vfs.resolve_background_path(
-                Some("hdp://side-story.hdp/scripts/chapter.rhai"),
+                Some("hdp://side-story.hdp/scripts/chapter.story.hks"),
                 "forest.png"
             )
             .unwrap(),

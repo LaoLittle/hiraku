@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::StoredValue;
 
-/// A modal screen described by Rhai data.
+/// A modal screen described by declarative HKS UI.
 ///
 /// `ScreenSpec` is the engine-side form of the map passed to `screen(#{ ... })`.
 /// It intentionally mirrors common Ren'Py screen-language concepts: a full-screen
@@ -52,7 +52,7 @@ pub struct ScreenSpec {
     pub children: Vec<ScreenNode>,
 }
 
-/// A single displayable in a Rhai screen tree.
+/// A single displayable in an HKS screen tree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ScreenNode {
     /// Static UI text.
@@ -120,7 +120,7 @@ pub struct ScreenLayout {
     pub bottom_percent: Option<f32>,
 }
 
-/// Static text in a Rhai screen.
+/// Static text in an HKS screen.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextNode {
     /// Text content.
@@ -139,7 +139,7 @@ pub struct TextNode {
     pub layout: ScreenLayout,
 }
 
-/// A clickable text button in a Rhai screen.
+/// A clickable text button in an HKS screen.
 ///
 /// The button is intentionally text-first because that is the common Ren'Py
 /// `textbutton` case. Image-backed buttons can be added later without changing
@@ -214,7 +214,7 @@ pub struct ButtonNode {
     pub layout: ScreenLayout,
 }
 
-/// An image displayable in a Rhai screen.
+/// An image displayable in an HKS screen.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenImageNode {
     pub texture: ScreenTexture,
@@ -282,7 +282,7 @@ pub struct BarNode {
     pub border: Option<[f32; 4]>,
 }
 
-/// A flex container used by `vbox`, `hbox`, and `frame` Rhai nodes.
+/// A flex container used by `vbox`, `hbox`, and `frame` HKS nodes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContainerNode {
     /// Gap between children in logical pixels.
@@ -469,7 +469,7 @@ fn default_bar_height() -> f32 {
     18.0
 }
 
-/// Converts a Rhai-friendly `[r, g, b, a]` color into Bevy's sRGB color type.
+/// Converts an HKS `[r, g, b, a]` color into Bevy's sRGB color type.
 pub fn color_from_rgba(rgba: [f32; 4]) -> Color {
     Color::srgba(rgba[0], rgba[1], rgba[2], rgba[3])
 }

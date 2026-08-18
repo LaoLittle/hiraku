@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 
+use hiraku_script::hks::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
 use hiraku_script::hks::vm::{
-    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, Instruction, Value, Vm, VmEvent,
-    compile_with_manifest,
+    BuiltinId, BuiltinManifest, Bytecode, Instruction, Value, Vm, VmEvent, compile_with_manifest,
 };
 use hiraku_script::hks::{Expr, Program, Stmt};
 use thiserror::Error;
@@ -18,7 +18,22 @@ const AT: BuiltinId = BuiltinId(3);
 const SCALE: BuiltinId = BuiltinId(4);
 
 pub fn manifest() -> BuiltinManifest {
-    BuiltinManifest::new([("char", CHAR), ("e", EMOTION), ("at", AT), ("scale", SCALE)])
+    registry().manifest()
+}
+
+fn registry() -> NativeRegistry<CharacterContext> {
+    let mut registry = NativeRegistry::new();
+    registry
+        .register_fn_with_id(CHAR, "char", native_char)
+        .unwrap();
+    registry
+        .register_fn_with_id(EMOTION, "e", native_emotion)
+        .unwrap();
+    registry.register_fn_with_id(AT, "at", native_at).unwrap();
+    registry
+        .register_fn_with_id(SCALE, "scale", native_scale)
+        .unwrap();
+    registry
 }
 
 pub fn compile_expression(expression: &Expr, source_hash: u64) -> Option<Bytecode> {
@@ -57,91 +72,50 @@ struct CharacterContext {
 }
 
 impl CharacterContext {
-    fn call(&mut self, call: BuiltinCall) -> Result<Value, CharacterCapabilityError> {
-        match call.builtin {
-            CHAR => self.char_call(&call),
-            EMOTION => self.emotion_call(&call),
-            AT => self.at_call(&call),
-            SCALE => self.scale_call(&call),
-            id => Err(CharacterCapabilityError::UnknownBuiltin(id)),
-        }
-    }
-
-    fn char_call(&mut self, call: &BuiltinCall) -> Result<Value, CharacterCapabilityError> {
-        let [argument] = call.arguments.as_slice() else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "char expects one name",
-            ));
-        };
-        let Value::String(name) = &argument.value else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "char name must be a string",
-            ));
-        };
-        if let Some(handle) = self.handles_by_name.get(name).copied() {
+    fn char(&mut self, name: String) -> Result<ActorHandle, CharacterCapabilityError> {
+        if let Some(handle) = self.handles_by_name.get(&name).copied() {
             self.flush(handle)?;
-            self.actors.insert(handle, pending_actor(name));
-            return Ok(actor_value(handle));
+            self.actors.insert(handle, pending_actor(&name));
+            return Ok(ActorHandle(handle));
         }
         self.next_handle += 1;
         let handle = self.next_handle;
         self.handles_by_name.insert(name.clone(), handle);
-        self.actors.insert(handle, pending_actor(name));
-        Ok(actor_value(handle))
+        self.actors.insert(handle, pending_actor(&name));
+        Ok(ActorHandle(handle))
     }
 
-    fn emotion_call(&mut self, call: &BuiltinCall) -> Result<Value, CharacterCapabilityError> {
-        let [actor, emotion] = call.arguments.as_slice() else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "e expects an actor and emotion",
-            ));
-        };
-        let handle = actor_handle(&actor.value)?;
-        let Value::String(emotion) = &emotion.value else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "emotion must be a string",
-            ));
-        };
+    fn emotion(
+        &mut self,
+        ActorHandle(handle): ActorHandle,
+        emotion: String,
+    ) -> Result<ActorHandle, CharacterCapabilityError> {
         let pending = self.actor_mut(handle)?;
-        pending.expressions.push(emotion.clone());
+        pending.expressions.push(emotion);
         pending.dirty = true;
-        Ok(actor_value(handle))
+        Ok(ActorHandle(handle))
     }
 
-    fn at_call(&mut self, call: &BuiltinCall) -> Result<Value, CharacterCapabilityError> {
-        let [actor, position] = call.arguments.as_slice() else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "at expects an actor and position",
-            ));
-        };
-        let handle = actor_handle(&actor.value)?;
-        let Value::String(position) = &position.value else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "position must be a string",
-            ));
-        };
+    fn at(
+        &mut self,
+        ActorHandle(handle): ActorHandle,
+        position: String,
+    ) -> Result<ActorHandle, CharacterCapabilityError> {
         self.actor_mut(handle)?.position = match position.as_str() {
             "left" => [-600.0, 0.0],
             "center" => [0.0, 0.0],
             "right" => [600.0, 0.0],
-            _ => return Err(CharacterCapabilityError::InvalidPosition(position.clone())),
+            _ => return Err(CharacterCapabilityError::InvalidPosition(position)),
         };
         self.actor_mut(handle)?.dirty = true;
-        Ok(actor_value(handle))
+        Ok(ActorHandle(handle))
     }
 
-    fn scale_call(&mut self, call: &BuiltinCall) -> Result<Value, CharacterCapabilityError> {
-        let [actor, scale] = call.arguments.as_slice() else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "scale expects an actor and number",
-            ));
-        };
-        let handle = actor_handle(&actor.value)?;
-        let Value::Number(scale) = scale.value else {
-            return Err(CharacterCapabilityError::InvalidArguments(
-                "scale must be numeric",
-            ));
-        };
+    fn scale(
+        &mut self,
+        ActorHandle(handle): ActorHandle,
+        scale: f64,
+    ) -> Result<ActorHandle, CharacterCapabilityError> {
         if scale <= 0.0 {
             return Err(CharacterCapabilityError::InvalidArguments(
                 "scale must be positive",
@@ -149,7 +123,7 @@ impl CharacterContext {
         }
         self.actor_mut(handle)?.scale = scale as f32;
         self.actor_mut(handle)?.dirty = true;
-        Ok(actor_value(handle))
+        Ok(ActorHandle(handle))
     }
 
     fn actor_mut(&mut self, handle: u64) -> Result<&mut PendingActor, CharacterCapabilityError> {
@@ -186,6 +160,59 @@ impl CharacterContext {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ActorHandle(u64);
+
+impl FromHksValue for ActorHandle {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        actor_handle(value)
+            .map(Self)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
+}
+
+impl IntoHksValue for ActorHandle {
+    fn into_hks_value(self) -> Value {
+        actor_value(self.0)
+    }
+}
+
+fn native_char(context: &mut CharacterContext, name: String) -> Result<ActorHandle, NativeError> {
+    context
+        .char(name)
+        .map_err(|error| NativeError::message(error.to_string()))
+}
+
+fn native_emotion(
+    context: &mut CharacterContext,
+    actor: ActorHandle,
+    emotion: String,
+) -> Result<ActorHandle, NativeError> {
+    context
+        .emotion(actor, emotion)
+        .map_err(|error| NativeError::message(error.to_string()))
+}
+
+fn native_at(
+    context: &mut CharacterContext,
+    actor: ActorHandle,
+    position: String,
+) -> Result<ActorHandle, NativeError> {
+    context
+        .at(actor, position)
+        .map_err(|error| NativeError::message(error.to_string()))
+}
+
+fn native_scale(
+    context: &mut CharacterContext,
+    actor: ActorHandle,
+    scale: f64,
+) -> Result<ActorHandle, NativeError> {
+    context
+        .scale(actor, scale)
+        .map_err(|error| NativeError::message(error.to_string()))
+}
+
 fn pending_actor(name: &str) -> PendingActor {
     PendingActor {
         name: name.to_string(),
@@ -220,13 +247,16 @@ pub fn execute(bytecode: Bytecode) -> Result<Vec<IrCommand>, CharacterCapability
     let mut vm =
         Vm::new(bytecode).map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
     let mut context = CharacterContext::default();
+    let registry = registry();
     loop {
         match vm
             .step()
             .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?
         {
             Some(VmEvent::Call(call)) => {
-                let value = context.call(call)?;
+                let value = registry
+                    .call(&mut context, &call)
+                    .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
                 vm.resume_builtin(value)
                     .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
             }
@@ -246,8 +276,6 @@ pub fn execute(bytecode: Bytecode) -> Result<Vec<IrCommand>, CharacterCapability
 pub enum CharacterCapabilityError {
     #[error("character builtin manifest does not match bytecode")]
     ManifestMismatch,
-    #[error("unknown builtin {0:?}")]
-    UnknownBuiltin(BuiltinId),
     #[error("invalid native arguments: {0}")]
     InvalidArguments(&'static str),
     #[error("invalid actor handle")]
@@ -260,6 +288,8 @@ pub enum CharacterCapabilityError {
     TasksUnsupported,
     #[error("HKS VM error: {0}")]
     Vm(String),
+    #[error("HKS native error: {0}")]
+    Native(String),
 }
 
 #[cfg(test)]

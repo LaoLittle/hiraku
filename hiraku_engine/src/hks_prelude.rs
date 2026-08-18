@@ -216,7 +216,7 @@ fn error(value: &impl Spanned, message: impl Into<String>) -> SchemaError {
 }
 
 /// Compiles the capability-approved HKS story subset into the existing
-/// deterministic IR runtime during the migration away from Rhai.
+/// deterministic IR runtime used by the engine embedding.
 pub fn compile_story_to_ir(path: &str, source: &str) -> Result<IrProgram, HksStoryCompileError> {
     let program = parse_program(source).map_err(|errors| HksStoryCompileError::Parse {
         path: path.to_string(),

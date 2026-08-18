@@ -7,6 +7,7 @@ mod hks_character;
 pub mod hks_prelude;
 mod proto;
 mod scene;
+#[path = "script/runtime.rs"]
 mod script;
 mod state;
 mod storage;
@@ -20,7 +21,7 @@ use assets::{BytesAsset, BytesAssetLoader, HdpArchive, HdpArchiveLoader};
 use bevy::{
     app::PluginGroupBuilder,
     asset::{AssetApp, io::AssetSourceId},
-    camera::{ClearColorConfig, RenderTarget},
+    camera::ClearColorConfig,
     prelude::*,
     sprite_render::Material2dPlugin,
 };
@@ -35,9 +36,8 @@ use scene::{
     handle_screen_image_buttons, poll_pending_character_shows, poll_voice_playback,
     process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
     tick_animation_waits, tick_pending_waits, tick_script_batches,
+    update_offscreen_ui_interactions,
 };
-#[cfg(target_arch = "wasm32")]
-use script::drive_web_script_runtime;
 pub use script::{
     IrChoiceOption, IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram,
     IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind,
@@ -53,9 +53,20 @@ pub struct RuntimeLaunchConfig {
     pub settings_path: String,
     pub default_startup_script: String,
     pub window_title: String,
-    pub render_target: RenderTarget,
+    /// Fixed logical resolution rendered by Hiraku before presentation by the host game.
+    pub canvas_size: UVec2,
     pub camera_order: isize,
     pub camera_clear_color: ClearColorConfig,
+}
+
+/// Fixed-resolution image produced by Hiraku's scene and UI camera.
+///
+/// Host games present this image in their own window camera, which keeps the engine independent
+/// from window sizing and platform-specific letterboxing.
+#[derive(Clone, Debug, Resource)]
+pub struct HirakuCanvas {
+    pub image: Handle<Image>,
+    pub size: UVec2,
 }
 
 impl Default for RuntimeLaunchConfig {
@@ -65,8 +76,8 @@ impl Default for RuntimeLaunchConfig {
             settings_path: vfs::DEFAULT_SETTINGS_PATH.to_string(),
             default_startup_script: vfs::DEFAULT_STARTUP_SCRIPT.to_string(),
             window_title: "hiraku".to_string(),
-            render_target: RenderTarget::Window(bevy::window::WindowRef::Primary),
-            camera_order: 0,
+            canvas_size: UVec2::new(1920, 1080),
+            camera_order: -1,
             camera_clear_color: ClearColorConfig::Default,
         }
     }
@@ -123,7 +134,6 @@ impl Plugin for HirakuPlugin {
             .init_asset::<TextureAtlasLayout>()
             .init_resource::<texture::TextureAtlasCatalog>()
             .init_resource::<IrRuntime>()
-            .init_resource::<script::InlineDialogueControlResource>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(
@@ -175,20 +185,33 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
-                handle_screen_buttons
+                update_offscreen_ui_interactions
                     .after(cleanup_stale_screen_ui)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                handle_screen_buttons
+                    .after(update_offscreen_ui_interactions)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
                 handle_screen_image_buttons
-                    .after(cleanup_stale_screen_ui)
+                    .after(update_offscreen_ui_interactions)
                     .in_set(HirakuRuntimeSystems),
             )
-            .add_systems(Update, handle_choice_buttons.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
-                handle_runtime_menu_buttons.in_set(HirakuRuntimeSystems),
+                handle_choice_buttons
+                    .after(update_offscreen_ui_interactions)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                handle_runtime_menu_buttons
+                    .after(update_offscreen_ui_interactions)
+                    .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, handle_choice_keyboard.in_set(HirakuRuntimeSystems))
             .add_systems(
@@ -197,7 +220,9 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
-                advance_dialogue_on_input.in_set(HirakuRuntimeSystems),
+                advance_dialogue_on_input
+                    .after(update_offscreen_ui_interactions)
+                    .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, tick_pending_waits.in_set(HirakuRuntimeSystems))
             .add_systems(
@@ -217,12 +242,6 @@ impl Plugin for HirakuPlugin {
                     sync_scene_snapshot.in_set(HirakuRuntimeSystems),
                 ),
             );
-
-        #[cfg(target_arch = "wasm32")]
-        app.add_systems(
-            Update,
-            drive_web_script_runtime.before(process_script_commands),
-        );
 
         let archive = app.world().resource::<AssetServer>().load(archive_path);
         app.insert_resource(HdpArchiveHandle(archive));
