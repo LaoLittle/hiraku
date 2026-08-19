@@ -319,9 +319,9 @@ impl CharacterContext {
         position: String,
     ) -> Result<ActorHandle, CharacterCapabilityError> {
         self.actor_mut(handle)?.position = match position.as_str() {
-            "left" => [-600.0, 0.0],
-            "center" => [0.0, 0.0],
-            "right" => [600.0, 0.0],
+            "left" => [-600.0, -200.0],
+            "center" => [0.0, -200.0],
+            "right" => [600.0, -200.0],
             _ => return Err(CharacterCapabilityError::InvalidPosition(position)),
         };
         self.actor_mut(handle)?.dirty = true;
