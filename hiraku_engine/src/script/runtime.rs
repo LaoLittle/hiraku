@@ -481,7 +481,7 @@ pub fn save_runtime_slot(
         .map(IrVm::story_values)
         .unwrap_or_default();
     let data = SaveGameData {
-        version: 5,
+        version: 6,
         resume_script: current_script,
         globals: values,
         scene: shared_state

@@ -1066,7 +1066,7 @@ pub fn setup_frontend(
 
     if frontend.startup_script.is_empty() {
         frontend.notice =
-            Some("startup.story.hks not found. Fix settings.data.hks before starting.".to_string());
+            Some("startup.story.hks not found. Fix settings.hson before starting.".to_string());
     }
 
     commands.insert_resource(UiFonts {
@@ -1635,7 +1635,7 @@ pub fn handle_frontend_buttons(
                         }
                         if frontend.startup_script.is_empty() {
                             frontend.notice = Some(
-                                "No startup script is configured. Check hdp://main.hdp/settings.data.hks."
+                                "No startup script is configured. Check hdp://main.hdp/settings.hson."
                                     .to_string(),
                             );
                             frontend.dirty = true;

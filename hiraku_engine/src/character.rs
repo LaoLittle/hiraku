@@ -1,11 +1,12 @@
 use std::{collections::BTreeMap, path::Path};
 
 use bevy::{math::Vec2, prelude::Resource};
+use hiraku_script::hson;
 use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::{
-    data::evaluate_hks_map,
+    data::evaluate_hson_map,
     texture::{TextureCatalog, TextureCatalogError, load_texture_catalog},
     vfs::{HdpVfs, VfsError},
 };
@@ -211,7 +212,7 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
     let textures = load_texture_catalog(vfs)?;
     let catalog_path = vfs.resolve_path(
         Some(vfs.settings_path()),
-        &format!("{directory}/characters.data.hks"),
+        &format!("{directory}/characters.hson"),
     );
     let catalog_text = match vfs.read_text(&catalog_path) {
         Ok(catalog_text) => catalog_text,
@@ -225,9 +226,7 @@ pub fn load_character_catalog(vfs: &HdpVfs) -> Result<CharacterCatalog, Characte
     let mut characters = BTreeMap::new();
     for entry in file.characters {
         let character_directory = vfs.resolve_path(Some(&catalog_path), &entry.dir);
-        let config_relative = entry
-            .config
-            .unwrap_or_else(|| "character.data.hks".to_string());
+        let config_relative = entry.config.unwrap_or_else(|| "character.hson".to_string());
         let config_path = vfs.resolve_path(
             Some(&format!("{character_directory}/__dir__")),
             &config_relative,
@@ -267,7 +266,7 @@ fn load_character_data_files(
         }
         Err(error) => return Err(error.into()),
     };
-    paths.retain(|path| path.ends_with(".char.data.hks"));
+    paths.retain(|path| path.ends_with(".char.hson"));
     paths.sort();
 
     let mut characters = BTreeMap::new();
@@ -508,15 +507,13 @@ fn parse_hks_data<T>(path: &str, source: &str) -> Result<T, CharacterCatalogErro
 where
     T: DeserializeOwned,
 {
-    let data = evaluate_hks_map(path, source).map_err(|error| CharacterCatalogError::Data {
+    let data = evaluate_hson_map(path, source).map_err(|error| CharacterCatalogError::Data {
         path: path.to_string(),
         message: error.to_string(),
     })?;
-    serde_json::from_value(serde_json::Value::Object(data)).map_err(|error| {
-        CharacterCatalogError::Data {
-            path: path.to_string(),
-            message: error.to_string(),
-        }
+    hson::from_value(hson::HsonValue::Map(data)).map_err(|error| CharacterCatalogError::Data {
+        path: path.to_string(),
+        message: error.to_string(),
     })
 }
 
@@ -531,22 +528,22 @@ mod tests {
         let characters = root.join("characters/alice");
         std::fs::create_dir_all(&characters).unwrap();
         std::fs::write(
-            root.join("settings.data.hks"),
+            root.join("settings.hson"),
             ".{ charactersDir: \"characters\" }",
         )
         .unwrap();
         std::fs::write(
-            root.join("characters/characters.data.hks"),
+            root.join("characters/characters.hson"),
             ".{ characters: (.{ name: \"alice\", dir: \"alice\" }) }",
         )
         .unwrap();
         std::fs::write(
-            characters.join("character.data.hks"),
+            characters.join("character.hson"),
             ".{ slots: (\"body\", \"face\"), parts: .{ body: .{ path: \"body.png\", slot: \"body\", offset: (12.5, -3.0), layer: -1.0 }, face: .{ path: \"face.png\", slot: \"face\", layer: 2.0 } }, expressions: .{ happy: (\"body\", \"face\") }, default_expression: \"happy\" }",
         )
         .unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.data.hks", "startup.story.hks");
+        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.story.hks");
         let catalog = load_character_catalog(&vfs).unwrap();
         let alice = &catalog.characters["alice"];
 

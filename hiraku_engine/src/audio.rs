@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use bevy::prelude::Resource;
+use hiraku_script::hson;
 use serde::Deserialize;
-use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    data::evaluate_hks_map,
+    data::evaluate_hson_map,
     vfs::{HdpVfs, VfsError},
 };
 
@@ -52,9 +52,9 @@ struct AudioFile {
 
 pub fn load_audio_catalog(vfs: &HdpVfs) -> Result<AudioCatalog, AudioCatalogError> {
     Ok(AudioCatalog {
-        music: load_channel(vfs, &vfs.load_bgm_dir_path(None)?, ".music.data.hks")?,
-        voices: load_channel(vfs, &vfs.load_voice_dir_path(None)?, ".voice.data.hks")?,
-        sfx: load_channel(vfs, &vfs.load_soundeffects_dir_path(None)?, ".sfx.data.hks")?,
+        music: load_channel(vfs, &vfs.load_bgm_dir_path(None)?, ".music.hson")?,
+        voices: load_channel(vfs, &vfs.load_voice_dir_path(None)?, ".voice.hson")?,
+        sfx: load_channel(vfs, &vfs.load_soundeffects_dir_path(None)?, ".sfx.hson")?,
     })
 }
 
@@ -74,13 +74,13 @@ fn load_channel(
     let mut definitions = BTreeMap::new();
     for descriptor_path in paths {
         let source = vfs.read_text(&descriptor_path)?;
-        let data = evaluate_hks_map(&descriptor_path, &source).map_err(|error| {
+        let data = evaluate_hson_map(&descriptor_path, &source).map_err(|error| {
             AudioCatalogError::Data {
                 path: descriptor_path.clone(),
                 message: error.to_string(),
             }
         })?;
-        let file: AudioFile = serde_json::from_value(Value::Object(data)).map_err(|error| {
+        let file: AudioFile = hson::from_value(hson::HsonValue::Map(data)).map_err(|error| {
             AudioCatalogError::Data {
                 path: descriptor_path.clone(),
                 message: error.to_string(),
@@ -109,24 +109,24 @@ mod tests {
         std::fs::create_dir_all(root.join("bgm")).unwrap();
         std::fs::create_dir_all(root.join("voice")).unwrap();
         std::fs::create_dir_all(root.join("soundeffects")).unwrap();
-        std::fs::write(root.join("settings.data.hks"), ".{}").unwrap();
+        std::fs::write(root.join("settings.hson"), ".{}").unwrap();
         std::fs::write(
-            root.join("bgm/title.music.data.hks"),
+            root.join("bgm/title.music.hson"),
             ".{ name: \"title\", audio: \"Title.ogg\" }",
         )
         .unwrap();
         std::fs::write(
-            root.join("voice/ema_001.voice.data.hks"),
+            root.join("voice/ema_001.voice.hson"),
             ".{ name: \"ema/001\", audio: \"Ema_001.ogg\" }",
         )
         .unwrap();
         std::fs::write(
-            root.join("soundeffects/click.sfx.data.hks"),
+            root.join("soundeffects/click.sfx.hson"),
             ".{ name: \"ui/click\", audio: \"click.wav\" }",
         )
         .unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.data.hks", "startup.story.hks");
+        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.story.hks");
         let catalog = load_audio_catalog(&vfs).unwrap();
         assert_eq!(
             catalog.resolve_music("title").unwrap().path,

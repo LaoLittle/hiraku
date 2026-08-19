@@ -4,13 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy::prelude::Resource;
+use hiraku_script::hson;
 use prost::Message;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    data::evaluate_hks_map,
     proto,
     state::{
         AudioSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint, SaveGameData,
@@ -21,40 +19,8 @@ use crate::{
 
 const SAVE_ROOT: &str = "saves";
 const SAVE_EXTENSION: &str = "sav";
-const USER_SETTINGS_PATH: &str = "config/hiraku.data.hks";
-
-#[derive(Clone, Debug, Resource, Serialize, Deserialize)]
-pub struct UserSettings {
-    #[serde(default = "default_volume")]
-    pub bgm_volume: f32,
-    #[serde(default = "default_volume")]
-    pub voice_volume: f32,
-    #[serde(default = "default_volume")]
-    pub sfx_volume: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct UserSettingsFile {
-    #[serde(rename = "bgmVolume")]
-    #[serde(default = "default_volume_f64")]
-    bgm_volume: f64,
-    #[serde(rename = "voiceVolume")]
-    #[serde(default = "default_volume_f64")]
-    voice_volume: f64,
-    #[serde(rename = "sfxVolume")]
-    #[serde(default = "default_volume_f64")]
-    sfx_volume: f64,
-}
-
-impl Default for UserSettings {
-    fn default() -> Self {
-        Self {
-            bgm_volume: 1.0,
-            voice_volume: 1.0,
-            sfx_volume: 1.0,
-        }
-    }
-}
+mod user_settings;
+pub use user_settings::{UserSettings, read_user_settings, write_user_settings};
 
 #[derive(Clone, Debug)]
 pub struct SaveSlotSummary {
@@ -68,8 +34,8 @@ pub struct SaveSlotSummary {
 pub enum StorageError {
     #[error("failed to access storage: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to load HKS data: {0}")]
-    HksData(String),
+    #[error("failed to load HSON data: {0}")]
+    HsonData(String),
     #[error("failed to decode save protobuf: {0}")]
     ProstDecode(#[from] prost::DecodeError),
     #[error("invalid save data: {0}")]
@@ -80,55 +46,6 @@ pub enum StorageError {
 
 pub fn save_root_path() -> PathBuf {
     workspace_base_path().join(SAVE_ROOT)
-}
-
-pub fn read_user_settings() -> Result<UserSettings, StorageError> {
-    #[cfg(target_arch = "wasm32")]
-    return Ok(UserSettings::default());
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let path = workspace_base_path().join(USER_SETTINGS_PATH);
-        match fs::read_to_string(path) {
-            Ok(payload) => {
-                let data = evaluate_hks_map(USER_SETTINGS_PATH, &payload)
-                    .map_err(|error| StorageError::HksData(error.to_string()))?;
-                let settings =
-                    serde_json::from_value::<UserSettingsFile>(serde_json::Value::Object(data))
-                        .map_err(|error| StorageError::HksData(error.to_string()))?;
-                Ok(UserSettings {
-                    bgm_volume: settings.bgm_volume as f32,
-                    voice_volume: settings.voice_volume as f32,
-                    sfx_volume: settings.sfx_volume as f32,
-                })
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(UserSettings::default()),
-            Err(err) => Err(StorageError::Io(err)),
-        }
-    }
-}
-
-pub fn write_user_settings(settings: &UserSettings) -> Result<(), StorageError> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = settings;
-        return Ok(());
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let path = workspace_base_path().join(USER_SETTINGS_PATH);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let payload = format!(
-            ".{{\n    bgmVolume: {:?},\n    voiceVolume: {:?},\n    sfxVolume: {:?},\n}}\n",
-            settings.bgm_volume, settings.voice_volume, settings.sfx_volume
-        );
-        fs::write(path, payload)?;
-        Ok(())
-    }
 }
 
 pub fn load_save_data(slot: &str) -> Result<SaveGameData, StorageError> {
@@ -224,10 +141,10 @@ impl From<&SaveGameData> for proto::SaveGameData {
             scope: stored_entries_from_map(&data.scope),
             input_log: data.input_log.iter().map(Into::into).collect(),
             scene: Some((&data.scene).into()),
-            ir_snapshot_json: data
+            ir_snapshot_hson: data
                 .ir_snapshot
                 .as_ref()
-                .and_then(|snapshot| serde_json::to_vec(snapshot).ok())
+                .and_then(|snapshot| hson::to_vec(snapshot).ok())
                 .unwrap_or_default(),
             pending_input_variable: data.pending_input_variable.clone(),
             pending_ui_screen: data.pending_ui_screen.clone(),
@@ -259,14 +176,12 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                 .map(TryInto::try_into)
                 .transpose()?
                 .unwrap_or_default(),
-            ir_snapshot: if data.ir_snapshot_json.is_empty() {
+            ir_snapshot: if data.ir_snapshot_hson.is_empty() || data.version < 6 {
                 None
             } else {
-                Some(
-                    serde_json::from_slice(&data.ir_snapshot_json).map_err(|error| {
-                        StorageError::InvalidSave(format!("invalid IR snapshot: {error}"))
-                    })?,
-                )
+                Some(hson::from_slice(&data.ir_snapshot_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid HSON IR snapshot: {error}"))
+                })?)
             },
             pending_input_variable: data.pending_input_variable,
             pending_ui_screen: data.pending_ui_screen,
@@ -608,14 +523,6 @@ fn global_string(globals: &BTreeMap<String, StoredValue>, key: &str) -> Option<S
     }
 }
 
-fn default_volume() -> f32 {
-    1.0
-}
-
-fn default_volume_f64() -> f64 {
-    1.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,7 +531,7 @@ mod tests {
     #[test]
     fn save_roundtrip_preserves_exact_ir_wait_state() {
         let program = IrProgram::new(
-            77,
+            u64::MAX - 1,
             vec![
                 IrInstruction::Wait(IrWaitKind::UiIntent),
                 IrInstruction::Halt,
@@ -634,7 +541,7 @@ mod tests {
         assert!(vm.step().is_some());
         let snapshot = vm.snapshot();
         let data = SaveGameData {
-            version: 5,
+            version: 6,
             resume_script: "system.story.hks".to_string(),
             ir_snapshot: Some(snapshot.clone()),
             pending_input_variable: Some("action".to_string()),

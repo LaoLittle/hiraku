@@ -25,7 +25,7 @@ pub struct SaveGameData {
     #[prost(message, optional, tag = "11")]
     pub rng_state: Option<RngState>,
     #[prost(bytes = "vec", tag = "12")]
-    pub ir_snapshot_json: Vec<u8>,
+    pub ir_snapshot_hson: Vec<u8>,
     #[prost(string, optional, tag = "13")]
     pub pending_input_variable: Option<String>,
     #[prost(string, optional, tag = "14")]

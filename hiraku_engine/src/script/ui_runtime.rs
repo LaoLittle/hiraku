@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value};
 use thiserror::Error;
 
-use hiraku_script::hks::{Argument, Block, Expr, ExprKind, NumberUnit, Stmt, parse_program};
+use hiraku_script::{
+    hks::{Argument, Block, Expr, ExprKind, NumberUnit, Stmt, parse_program},
+    hson::{HsonMap as Map, HsonValue as Value},
+};
 
 use crate::{
     state::StoredValue,
@@ -111,7 +113,7 @@ pub fn evaluate_ui_script(
     };
     let screen = lower_builder(root, true)?;
     let screen = screen
-        .as_object()
+        .as_map()
         .cloned()
         .ok_or_else(|| invalid("`screen` did not produce a screen object"))?;
     parse_screen(screen, context, textures)
@@ -160,14 +162,14 @@ fn lower_builder(expression: &Expr, root: bool) -> Result<Value, UiScriptError> 
         }
         (_, None) => {}
     }
-    Ok(Value::Object(object))
+    Ok(Value::Map(object))
 }
 
 fn lower_arguments(
     builder: &str,
     arguments: &[Argument],
     positional_key: Option<&str>,
-    output: &mut Map<String, Value>,
+    output: &mut Map,
 ) -> Result<(), UiScriptError> {
     let mut used_positional = false;
     for argument in arguments {
@@ -215,20 +217,18 @@ fn lower_literal(expression: &Expr) -> Result<Value, UiScriptError> {
                     "percent literals are not accepted here; use a camelCase `*Percent` argument",
                 ));
             }
-            serde_json::Number::from_f64(*value)
-                .map(Value::Number)
+            value
+                .is_finite()
+                .then_some(Value::Float(*value))
                 .ok_or_else(|| invalid("UI numbers must be finite"))
         }
         ExprKind::String(value) | ExprKind::Symbol(value) => Ok(Value::String(value.clone())),
         ExprKind::UnaryMinus(value) => {
-            let Value::Number(value) = lower_literal(value)? else {
+            let value = lower_literal(value)?;
+            let Some(value) = value.as_f64() else {
                 return Err(invalid("unary minus requires a numeric UI literal"));
             };
-            let value = value
-                .as_f64()
-                .and_then(|value| serde_json::Number::from_f64(-value))
-                .ok_or_else(|| invalid("UI numbers must be finite"))?;
-            Ok(Value::Number(value))
+            Ok(Value::Float(-value))
         }
         ExprKind::Tuple(values) => values
             .iter()
@@ -238,8 +238,8 @@ fn lower_literal(expression: &Expr) -> Result<Value, UiScriptError> {
         ExprKind::Map(fields) => fields
             .iter()
             .map(|field| Ok((field.name.clone(), lower_literal(&field.value)?)))
-            .collect::<Result<Map<_, _>, UiScriptError>>()
-            .map(Value::Object),
+            .collect::<Result<Map, UiScriptError>>()
+            .map(Value::Map),
         _ => Err(invalid(
             "UI arguments may contain only literals, symbols, tuples, and maps",
         )),
@@ -247,7 +247,7 @@ fn lower_literal(expression: &Expr) -> Result<Value, UiScriptError> {
 }
 
 fn parse_screen(
-    mut screen: Map<String, Value>,
+    mut screen: Map,
     context: &UiContext,
     textures: &TextureCatalog,
 ) -> Result<ScreenSpec, UiScriptError> {
@@ -291,7 +291,7 @@ fn parse_node(
     textures: &TextureCatalog,
 ) -> Result<ScreenNode, UiScriptError> {
     let mut node = value
-        .as_object()
+        .as_map()
         .cloned()
         .ok_or_else(|| invalid("screen nodes must be maps"))?;
     let kind = required_string(&mut node, "type", context)?;
@@ -466,22 +466,18 @@ fn resolve_texture(catalog: &TextureCatalog, name: &str) -> Result<ScreenTexture
 fn stored_value(value: Value) -> Result<StoredValue, UiScriptError> {
     match value {
         Value::Bool(value) => Ok(StoredValue::Bool(value)),
-        Value::Number(value) if value.is_i64() => {
-            Ok(StoredValue::Int(value.as_i64().expect(
-                "JSON number checked as i64 must remain representable",
-            )))
-        }
-        Value::Number(value) => value
-            .as_f64()
-            .map(StoredValue::Float)
-            .ok_or_else(|| invalid("invalid numeric UI value")),
+        Value::Integer(value) => Ok(StoredValue::Int(value)),
+        Value::Unsigned(value) => i64::try_from(value)
+            .map(StoredValue::Int)
+            .map_err(|_| invalid("unsigned UI integer exceeds the stored integer range")),
+        Value::Float(value) => Ok(StoredValue::Float(value)),
         Value::String(value) => Ok(StoredValue::String(value)),
         Value::Array(values) => values
             .into_iter()
             .map(stored_value)
             .collect::<Result<Vec<_>, _>>()
             .map(StoredValue::Array),
-        Value::Object(values) => values
+        Value::Map(values) => values
             .into_iter()
             .map(|(key, value)| Ok((key, stored_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, UiScriptError>>()
@@ -490,7 +486,7 @@ fn stored_value(value: Value) -> Result<StoredValue, UiScriptError> {
     }
 }
 
-fn take_layout(map: &mut Map<String, Value>) -> Result<ScreenLayout, UiScriptError> {
+fn take_layout(map: &mut Map) -> Result<ScreenLayout, UiScriptError> {
     Ok(ScreenLayout {
         width: optional_number(map, "width")?,
         height: optional_number(map, "height")?,
@@ -508,15 +504,12 @@ fn take_layout(map: &mut Map<String, Value>) -> Result<ScreenLayout, UiScriptErr
     })
 }
 
-fn optional_layout(
-    map: &mut Map<String, Value>,
-    key: &str,
-) -> Result<Option<ScreenLayout>, UiScriptError> {
+fn optional_layout(map: &mut Map, key: &str) -> Result<Option<ScreenLayout>, UiScriptError> {
     let Some(value) = map.remove(key) else {
         return Ok(None);
     };
     let mut value = value
-        .as_object()
+        .as_map()
         .cloned()
         .ok_or_else(|| invalid(format!("`{key}` must be a map")))?;
     let layout = take_layout(&mut value)?;
@@ -524,22 +517,18 @@ fn optional_layout(
     Ok(Some(layout))
 }
 
-fn required_tuple(map: &mut Map<String, Value>, key: &str) -> Result<Vec<Value>, UiScriptError> {
+fn required_tuple(map: &mut Map, key: &str) -> Result<Vec<Value>, UiScriptError> {
     map.remove(key)
-        .and_then(|value| value.as_array().cloned())
+        .and_then(|value| value.as_array().map(ToOwned::to_owned))
         .ok_or_else(|| invalid(format!("`{key}` must be a tuple")))
 }
 
-fn required_string(
-    map: &mut Map<String, Value>,
-    key: &str,
-    context: &UiContext,
-) -> Result<String, UiScriptError> {
+fn required_string(map: &mut Map, key: &str, context: &UiContext) -> Result<String, UiScriptError> {
     optional_string(map, key, context)?.ok_or_else(|| invalid(format!("`{key}` must be a string")))
 }
 
 fn optional_string(
-    map: &mut Map<String, Value>,
+    map: &mut Map,
     key: &str,
     context: &UiContext,
 ) -> Result<Option<String>, UiScriptError> {
@@ -554,7 +543,7 @@ fn optional_string(
         .transpose()
 }
 
-fn optional_number(map: &mut Map<String, Value>, key: &str) -> Result<Option<f32>, UiScriptError> {
+fn optional_number(map: &mut Map, key: &str) -> Result<Option<f32>, UiScriptError> {
     map.remove(key)
         .map(|value| {
             value
@@ -565,7 +554,7 @@ fn optional_number(map: &mut Map<String, Value>, key: &str) -> Result<Option<f32
         .transpose()
 }
 
-fn optional_bool(map: &mut Map<String, Value>, key: &str) -> Result<Option<bool>, UiScriptError> {
+fn optional_bool(map: &mut Map, key: &str) -> Result<Option<bool>, UiScriptError> {
     map.remove(key)
         .map(|value| {
             value
@@ -575,10 +564,7 @@ fn optional_bool(map: &mut Map<String, Value>, key: &str) -> Result<Option<bool>
         .transpose()
 }
 
-fn optional_rgba(
-    map: &mut Map<String, Value>,
-    key: &str,
-) -> Result<Option<[f32; 4]>, UiScriptError> {
+fn optional_rgba(map: &mut Map, key: &str) -> Result<Option<[f32; 4]>, UiScriptError> {
     let Some(value) = map.remove(key) else {
         return Ok(None);
     };
@@ -598,7 +584,7 @@ fn optional_rgba(
     Ok(Some(rgba))
 }
 
-fn no_unknown(kind: &str, map: &Map<String, Value>) -> Result<(), UiScriptError> {
+fn no_unknown(kind: &str, map: &Map) -> Result<(), UiScriptError> {
     if map.is_empty() {
         return Ok(());
     }
