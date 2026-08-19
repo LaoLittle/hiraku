@@ -5,3 +5,5 @@ edition.workspace = true
 
 [dependencies]
 clap = "4.6.6"
+hiraku-script.workspace = true
+serde.workspace = true

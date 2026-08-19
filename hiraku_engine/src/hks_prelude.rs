@@ -331,17 +331,37 @@ impl HksStoryLowerer<'_> {
                 offset: span.start,
             });
         };
+        let name =
+            flatten_callee(callee).ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
+                path: self.path.to_string(),
+                offset: value.span.start,
+            })?;
+        if trailing_block.is_some()
+            && arguments.is_empty()
+            && matches!(name.as_str(), "seq" | "par")
+        {
+            let bytecode = crate::hks_capabilities::compile_expression(
+                value,
+                &self.functions,
+                self.source_hash ^ value.span.start as u64,
+            )
+            .ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
+                path: self.path.to_string(),
+                offset: span.start,
+            })?;
+            self.instructions
+                .push(IrInstruction::Emit(IrCommand::HksStatement {
+                    bytecode,
+                    task_result: Some(variable.to_string()),
+                }));
+            return Ok(());
+        }
         if trailing_block.is_some() {
             return Err(HksStoryCompileError::UnsupportedStatement {
                 path: self.path.to_string(),
                 offset: span.start,
             });
         }
-        let name =
-            flatten_callee(callee).ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
-                path: self.path.to_string(),
-                offset: value.span.start,
-            })?;
         if name != "openUi" || arguments.len() != 1 || arguments[0].label.is_some() {
             return Err(HksStoryCompileError::UnsupportedCall {
                 path: self.path.to_string(),
@@ -369,7 +389,10 @@ impl HksStoryLowerer<'_> {
             self.source_hash ^ expression.span.start as u64,
         ) {
             self.instructions
-                .push(IrInstruction::Emit(IrCommand::HksStatement { bytecode }));
+                .push(IrInstruction::Emit(IrCommand::HksStatement {
+                    bytecode,
+                    task_result: None,
+                }));
             return Ok(());
         }
         let ExprKind::Call {
@@ -397,6 +420,27 @@ impl HksStoryLowerer<'_> {
         match name.as_str() {
             "camera.blur" => return self.camera_blur(expression, arguments),
             "camera.zoom" => return self.camera_zoom(expression),
+            "wait" => {
+                if arguments.len() != 1 || arguments[0].label.is_some() {
+                    return Err(self.invalid_call(
+                        "wait",
+                        expression,
+                        "expected one task handle",
+                    ));
+                }
+                let ExprKind::Ident(handle) = &arguments[0].value.kind else {
+                    return Err(self.invalid_call(
+                        "wait",
+                        expression,
+                        "expected a task handle variable",
+                    ));
+                };
+                self.instructions
+                    .push(IrInstruction::Emit(IrCommand::WaitHksTask {
+                        handle: handle.clone(),
+                    }));
+                return Ok(());
+            }
             _ => {}
         }
         if arguments.iter().any(|argument| argument.label.is_some()) {
@@ -825,7 +869,7 @@ mod tests {
             .instructions
             .iter()
             .filter_map(|instruction| match instruction {
-                IrInstruction::Emit(IrCommand::HksStatement { bytecode }) => {
+                IrInstruction::Emit(IrCommand::HksStatement { bytecode, .. }) => {
                     Some(crate::hks_capabilities::execute(bytecode.clone()).unwrap())
                 }
                 _ => None,
@@ -902,7 +946,7 @@ mod tests {
             "char(\"ema\").at(\"center\").e(\"happy\").scale(0.14)",
         )
         .unwrap();
-        let Some(IrInstruction::Emit(IrCommand::HksStatement { bytecode })) =
+        let Some(IrInstruction::Emit(IrCommand::HksStatement { bytecode, .. })) =
             program.instructions.first()
         else {
             panic!("expected a native HKS statement");
@@ -913,6 +957,39 @@ mod tests {
         } if actor_id == "ema" && character_name == "ema"
             && expressions == &["happy"] && position == &[0.0, 0.0]
             && (*scale - 0.14).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn task_creation_is_non_blocking_until_wait_is_called() {
+        let program = compile_story_to_ir(
+            "scripts/task.story.hks",
+            r#"
+                let voices = par {
+                    voice("voice/first")
+                    voice("voice/second")
+                }
+                log("task started")
+                wait(voices)
+                log("task completed")
+            "#,
+        )
+        .expect("task handle story must lower to transitional IR");
+
+        assert!(matches!(
+            &program.instructions[0],
+            IrInstruction::Emit(IrCommand::HksStatement {
+                task_result: Some(handle),
+                ..
+            }) if handle == "voices"
+        ));
+        assert!(matches!(
+            &program.instructions[2],
+            IrInstruction::Emit(IrCommand::WaitHksTask { handle }) if handle == "voices"
+        ));
+        assert!(!program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            IrInstruction::Wait(IrWaitKind::TaskCompletion)
+        )));
     }
 
     #[test]

@@ -117,6 +117,10 @@ pub enum IrCommand {
         volume: f32,
         fade_in_ms: Option<u64>,
     },
+    PlayVoice {
+        path: String,
+        volume: f32,
+    },
     SetCamera {
         blur: Option<f32>,
         zoom: Option<f32>,
@@ -155,6 +159,11 @@ pub enum IrCommand {
     },
     HksStatement {
         bytecode: Bytecode,
+        #[serde(default)]
+        task_result: Option<String>,
+    },
+    WaitHksTask {
+        handle: String,
     },
 }
 
@@ -176,6 +185,7 @@ pub enum IrWaitKind {
     DialogueAdvance,
     ScreenChoice,
     UiIntent,
+    TaskCompletion,
     DurationMs(u64),
 }
 
@@ -424,6 +434,11 @@ pub struct IrRuntime {
     pub pending_ui_screen: Option<String>,
     pub pending_response:
         Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
+    pub next_native_task_id: u64,
+    pub native_tasks: BTreeMap<
+        String,
+        std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>,
+    >,
 }
 
 pub fn tick_ir_runtime(mut runtime: bevy::prelude::ResMut<IrRuntime>) {

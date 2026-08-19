@@ -26,8 +26,8 @@ use crate::{
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, IrCommand, IrEvent, IrRuntime, IrVm,
         IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptResponse,
-        UiContext, UiIntent, compile_story_program, evaluate_ui_script, save_runtime_slot,
-        script_command_from_ir, start_hks_runtime,
+        UiContext, UiIntent, VoicePlaybackMode, compile_story_program, evaluate_ui_script,
+        save_runtime_slot, script_command_from_ir, start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -292,6 +292,7 @@ pub struct PendingAnimationCancels {
 #[derive(Resource, Default)]
 pub struct VoiceState {
     pub active: Option<ActiveVoice>,
+    pub concurrent: HashMap<Entity, ActiveVoice>,
 }
 
 #[derive(Resource, Default)]
@@ -368,6 +369,7 @@ pub fn bridge_ir_events(
                     runtime.pending_input_variable = None;
                     runtime.pending_ui_screen = None;
                     runtime.pending_response = None;
+                    runtime.native_tasks.clear();
                 }
                 Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
             }
@@ -471,7 +473,42 @@ pub fn bridge_ir_events(
                 None => warn!("music `{path}` is not defined"),
             }
         }
-        IrEvent::Command(IrCommand::HksStatement { bytecode }) => {
+        IrEvent::Command(IrCommand::PlayVoice { path, volume }) => {
+            match audio
+                .as_deref()
+                .and_then(|catalog| catalog.resolve_voice(&path))
+            {
+                Some(definition) => {
+                    pending_script_commands
+                        .items
+                        .push_back(ScriptCommand::PlayVoice {
+                            path: definition.path.clone(),
+                            volume,
+                            mode: VoicePlaybackMode::Exclusive,
+                            animation_id: None,
+                            done: None,
+                        })
+                }
+                None => warn!("voice `{path}` is not defined"),
+            }
+        }
+        IrEvent::Command(IrCommand::WaitHksTask { handle }) => {
+            let Some(receiver) = runtime.native_tasks.get(&handle).cloned() else {
+                warn!("HKS task handle `{handle}` is not defined");
+                return;
+            };
+            if runtime
+                .vm
+                .as_mut()
+                .is_some_and(|vm| vm.suspend(IrWaitKind::TaskCompletion))
+            {
+                runtime.wait_response = Some(receiver);
+            }
+        }
+        IrEvent::Command(IrCommand::HksStatement {
+            bytecode,
+            mut task_result,
+        }) => {
             match crate::hks_capabilities::execute(bytecode) {
                 Ok(output) => {
                     for command in output.commands {
@@ -481,6 +518,7 @@ pub fn bridge_ir_events(
                                 | IrCommand::Choose { .. }
                                 | IrCommand::OpenUi { .. }
                                 | IrCommand::PlayBgm { .. }
+                                | IrCommand::PlayVoice { .. }
                         ) {
                             runtime.events.push_back(IrEvent::Command(command));
                             continue;
@@ -488,6 +526,69 @@ pub fn bridge_ir_events(
                         match script_command_from_ir(command, textures.as_deref()) {
                             Ok(command) => pending_script_commands.items.push_back(command),
                             Err(error) => warn!("HKS native command rejected: {error}"),
+                        }
+                    }
+                    for task in output.tasks {
+                        let batch_id = runtime.next_native_task_id;
+                        runtime.next_native_task_id += 1;
+                        let mut items = Vec::new();
+                        for (index, command) in task.commands.into_iter().enumerate() {
+                            let IrCommand::PlayVoice { path, volume } = command else {
+                                warn!("HKS task command is not yet supported by the story runtime");
+                                continue;
+                            };
+                            let Some(definition) = audio
+                                .as_deref()
+                                .and_then(|catalog| catalog.resolve_voice(&path))
+                            else {
+                                warn!("voice `{path}` is not defined");
+                                continue;
+                            };
+                            let handle = format!("hks-task-{batch_id}-{index}");
+                            items.push(BatchSubmissionItem {
+                                handle: handle.clone(),
+                                command: Box::new(ScriptCommand::PlayVoice {
+                                    path: definition.path.clone(),
+                                    volume,
+                                    mode: VoicePlaybackMode::Concurrent,
+                                    animation_id: Some(handle),
+                                    done: None,
+                                }),
+                            });
+                        }
+                        let handles = items
+                            .iter()
+                            .map(|item| item.handle.clone())
+                            .collect::<Vec<_>>();
+                        let mode = match task.mode {
+                            hiraku_script::hks::vm::TaskMode::Sequence => {
+                                BatchSubmitMode::Sequence
+                            }
+                            hiraku_script::hks::vm::TaskMode::Parallel => {
+                                BatchSubmitMode::Parallel
+                            }
+                        };
+                        if !items.is_empty() {
+                            pending_script_commands
+                                .items
+                                .push_back(ScriptCommand::SubmitBatch { mode, items });
+                        }
+                        if let Some(handle) = task_result.take() {
+                            let (response_tx, response_rx) = mpsc::channel();
+                            if handles.is_empty() {
+                                let _ = response_tx.send(ScriptResponse::Continue);
+                            } else {
+                                pending_script_commands
+                                    .items
+                                    .push_back(ScriptCommand::WaitAnimations {
+                                        ids: handles,
+                                        done: response_tx,
+                                    });
+                            }
+                            runtime.native_tasks.insert(
+                                handle,
+                                std::sync::Arc::new(std::sync::Mutex::new(response_rx)),
+                            );
                         }
                     }
                     if let Some(wait) = output.wait
@@ -522,6 +623,10 @@ pub fn bridge_ir_events(
                     ScriptCommand::WaitForScreenChoice { done: response_tx }
                 }
                 IrWaitKind::UiIntent => ScriptCommand::WaitForScreenChoice { done: response_tx },
+                IrWaitKind::TaskCompletion => ScriptCommand::WaitAnimations {
+                    ids: Vec::new(),
+                    done: response_tx,
+                },
                 IrWaitKind::DurationMs(milliseconds) => ScriptCommand::Wait {
                     duration: std::time::Duration::from_millis(milliseconds),
                     animation_id: None,
@@ -2871,11 +2976,14 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::PlayVoice {
                 path,
                 volume,
+                mode,
                 animation_id,
                 done,
             } => {
                 let playback_volume = apply_volume_setting(volume, user_settings.voice_volume);
-                finish_active_voice(&mut commands, &mut animations, &mut voice_state);
+                if mode == VoicePlaybackMode::Exclusive {
+                    finish_active_voice(&mut commands, &mut animations, &mut voice_state);
+                }
                 let voice = commands
                     .spawn((
                         VoiceChannel {
@@ -2886,14 +2994,20 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         PlaybackSettings::ONCE.with_volume(Volume::Linear(playback_volume)),
                     ))
                     .id();
-                voice_state.active = Some(ActiveVoice {
+                let active = ActiveVoice {
                     entity: voice,
                     animation_id,
                     done,
-                });
+                };
+                match mode {
+                    VoicePlaybackMode::Exclusive => voice_state.active = Some(active),
+                    VoicePlaybackMode::Concurrent => {
+                        voice_state.concurrent.insert(voice, active);
+                    }
+                }
             }
             ScriptCommand::StopVoice => {
-                finish_active_voice(&mut commands, &mut animations, &mut voice_state);
+                finish_all_voices(&mut commands, &mut animations, &mut voice_state);
             }
             ScriptCommand::PlaySfx { path, volume } => {
                 let playback_volume = apply_volume_setting(volume, user_settings.sfx_volume);
@@ -2929,7 +3043,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 app_exit.write(AppExit::Success);
             }
             ScriptCommand::ReturnToTitle => {
-                finish_active_voice(&mut commands, &mut animations, &mut voice_state);
+                finish_all_voices(&mut commands, &mut animations, &mut voice_state);
                 clear_choice_ui(&mut commands, &choice_ui_roots);
                 clear_screen_ui(&mut commands, &mut screen_state);
                 clear_overlay_ui(&mut commands, &mut overlay_state);
@@ -3698,18 +3812,24 @@ pub fn poll_voice_playback(
     mut voice_state: ResMut<VoiceState>,
     sinks: Query<&AudioSink>,
 ) {
-    let Some(active) = voice_state.active.as_ref() else {
-        return;
-    };
-
-    let entity = active.entity;
-    let finished = match sinks.get(entity) {
-        Ok(sink) => sink.empty(),
-        Err(_) => false,
-    };
-
-    if finished {
+    let exclusive_finished = voice_state
+        .active
+        .as_ref()
+        .is_some_and(|active| sinks.get(active.entity).is_ok_and(|sink| sink.empty()));
+    if exclusive_finished {
         finish_active_voice(&mut commands, &mut animations, &mut voice_state);
+    }
+
+    let completed = voice_state
+        .concurrent
+        .keys()
+        .copied()
+        .filter(|entity| sinks.get(*entity).is_ok_and(|sink| sink.empty()))
+        .collect::<Vec<_>>();
+    for entity in completed {
+        if let Some(active) = voice_state.concurrent.remove(&entity) {
+            finish_voice(&mut commands, &mut animations, active);
+        }
     }
 }
 
@@ -4570,7 +4690,7 @@ fn abort_runtime_waiters(
     active_batches.items.clear();
     pending_characters.items.clear();
     animations.waits.clear();
-    finish_active_voice(commands, animations, voice_state);
+    finish_all_voices(commands, animations, voice_state);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4707,10 +4827,30 @@ fn finish_active_voice(
     animations: &mut AnimationState,
     voice_state: &mut VoiceState,
 ) {
-    let Some(mut active) = voice_state.active.take() else {
+    let Some(active) = voice_state.active.take() else {
         return;
     };
 
+    finish_voice(commands, animations, active);
+}
+
+fn finish_all_voices(
+    commands: &mut Commands,
+    animations: &mut AnimationState,
+    voice_state: &mut VoiceState,
+) {
+    finish_active_voice(commands, animations, voice_state);
+    let concurrent = std::mem::take(&mut voice_state.concurrent);
+    for active in concurrent.into_values() {
+        finish_voice(commands, animations, active);
+    }
+}
+
+fn finish_voice(
+    commands: &mut Commands,
+    animations: &mut AnimationState,
+    mut active: ActiveVoice,
+) {
     commands.entity(active.entity).try_despawn();
     if let Some(animation_id) = active.animation_id.take() {
         animations.completed.insert(animation_id);

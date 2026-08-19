@@ -231,6 +231,7 @@ pub enum ScriptCommand {
     PlayVoice {
         path: String,
         volume: f32,
+        mode: VoicePlaybackMode,
         animation_id: Option<String>,
         done: Option<mpsc::Sender<ScriptResponse>>,
     },
@@ -272,6 +273,13 @@ pub(crate) fn script_command_from_ir(
             path,
             volume,
             fade_in: fade_in_ms.map(Duration::from_millis),
+            animation_id: None,
+            done: None,
+        },
+        IrCommand::PlayVoice { path, volume } => ScriptCommand::PlayVoice {
+            path,
+            volume,
+            mode: VoicePlaybackMode::Exclusive,
             animation_id: None,
             done: None,
         },
@@ -329,7 +337,7 @@ pub(crate) fn script_command_from_ir(
             animation_id: None,
             done: None,
         },
-        IrCommand::HksStatement { .. } => {
+        IrCommand::HksStatement { .. } | IrCommand::WaitHksTask { .. } => {
             return Err("HKS native statements are handled by the IR runtime".to_string());
         }
     })
@@ -351,6 +359,12 @@ fn parse_ir_camera_ease(name: &str) -> Result<CharacterEase, String> {
 pub enum BatchSubmitMode {
     Sequence,
     Parallel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoicePlaybackMode {
+    Exclusive,
+    Concurrent,
 }
 
 #[derive(Debug)]

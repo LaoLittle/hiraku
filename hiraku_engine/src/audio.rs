@@ -51,11 +51,74 @@ struct AudioFile {
 }
 
 pub fn load_audio_catalog(vfs: &HdpVfs) -> Result<AudioCatalog, AudioCatalogError> {
+    let voice_directory = vfs.load_voice_dir_path(None)?;
     Ok(AudioCatalog {
         music: load_channel(vfs, &vfs.load_bgm_dir_path(None)?, ".music.hson")?,
-        voices: load_channel(vfs, &vfs.load_voice_dir_path(None)?, ".voice.hson")?,
+        voices: load_voice_channel(vfs, &voice_directory)?,
         sfx: load_channel(vfs, &vfs.load_soundeffects_dir_path(None)?, ".sfx.hson")?,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct CharacterVoiceFile {
+    #[serde(rename = "char")]
+    _character: String,
+    voices: Vec<CharacterVoiceEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CharacterVoiceEntry {
+    name: String,
+    file: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum VoiceDescriptor {
+    Character(CharacterVoiceFile),
+    Single(AudioFile),
+}
+
+fn load_voice_channel(
+    vfs: &HdpVfs,
+    directory: &str,
+) -> Result<BTreeMap<String, AudioDefinition>, AudioCatalogError> {
+    let mut definitions = BTreeMap::new();
+    let mut paths = match vfs.list_files_recursive(directory) {
+        Ok(paths) => paths,
+        Err(VfsError::NotFound(_)) => return Ok(definitions),
+        Err(error) => return Err(error.into()),
+    };
+    paths.retain(|path| path.ends_with(".voice.hson") || path.ends_with(".voices.hson"));
+    paths.sort();
+
+    for descriptor_path in paths {
+        let source = vfs.read_text(&descriptor_path)?;
+        let descriptor: VoiceDescriptor =
+            hson::from_str(&source).map_err(|error| AudioCatalogError::Data {
+                path: descriptor_path.clone(),
+                message: error.to_string(),
+            })?;
+        let voices = match descriptor {
+            VoiceDescriptor::Character(file) => file.voices,
+            VoiceDescriptor::Single(file) => vec![CharacterVoiceEntry {
+                name: file.name,
+                file: file.audio,
+            }],
+        };
+        for voice in voices {
+            let definition = AudioDefinition {
+                path: vfs.resolve_path(Some(&descriptor_path), &voice.file),
+            };
+            if definitions.insert(voice.name.clone(), definition).is_some() {
+                return Err(AudioCatalogError::Data {
+                    path: descriptor_path.clone(),
+                    message: format!("audio `{}` is defined more than once", voice.name),
+                });
+            }
+        }
+    }
+    Ok(definitions)
 }
 
 fn load_channel(
@@ -121,6 +184,17 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            root.join("voice/alice.voice.hson"),
+            r#".{
+                char: "alice",
+                voices: (
+                    .{ name: "voice/scene01/hash1", file: "hash1.ogg" },
+                    .{ name: "voice/scene01/hash2", file: "hash2.ogg" }
+                )
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
             root.join("soundeffects/click.sfx.hson"),
             ".{ name: \"ui/click\", audio: \"click.wav\" }",
         )
@@ -135,6 +209,10 @@ mod tests {
         assert_eq!(
             catalog.resolve_voice("ema/001").unwrap().path,
             "voice/Ema_001.ogg"
+        );
+        assert_eq!(
+            catalog.resolve_voice("voice/scene01/hash1").unwrap().path,
+            "voice/hash1.ogg"
         );
         assert_eq!(
             catalog.resolve_sfx("ui/click").unwrap().path,

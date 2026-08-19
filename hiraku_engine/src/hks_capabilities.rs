@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use hiraku_script::hks::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
 use hiraku_script::hks::vm::{
-    BuiltinId, BuiltinManifest, Bytecode, Value, Vm, VmEvent, compile_with_manifest,
+    BuiltinId, BuiltinManifest, Bytecode, TaskEvent, TaskMode, TaskScheduler, TaskStatus, Value, Vm,
+    VmEvent, compile_with_manifest,
 };
 use hiraku_script::hks::{Expr, Program, Stmt};
 use thiserror::Error;
@@ -28,6 +29,8 @@ const PLAY_BGM: BuiltinId = BuiltinId(18);
 const NARRATE: BuiltinId = BuiltinId(19);
 const CAMERA_BLUR: BuiltinId = BuiltinId(20);
 const CAMERA_ZOOM: BuiltinId = BuiltinId(21);
+const VOICE: BuiltinId = BuiltinId(22);
+const SAY: BuiltinId = BuiltinId(23);
 
 pub fn manifest() -> BuiltinManifest {
     registry().manifest()
@@ -77,6 +80,12 @@ fn registry() -> NativeRegistry<CharacterContext> {
     registry
         .register_fn_with_id(NARRATE, "narrate", native_narrate)
         .expect("built-in `narrate` registration must be unique");
+    registry
+        .register_fn_with_id(VOICE, "voice", native_voice)
+        .expect("built-in `voice` registration must be unique");
+    registry
+        .register_fn_with_id(SAY, "say", native_say)
+        .expect("built-in `say` registration must be unique");
     registry
         .register_raw_fn_with_id(CAMERA_BLUR, "camera.blur", native_camera_blur)
         .expect("built-in `camera.blur` registration must be unique");
@@ -332,6 +341,26 @@ fn native_narrate(context: &mut CharacterContext, text: String) -> Result<(), Na
     Ok(())
 }
 
+fn native_say(
+    context: &mut CharacterContext,
+    speaker: String,
+    text: String,
+) -> Result<(), NativeError> {
+    context.commands.push(IrCommand::Say { speaker, text });
+    context.wait = Some(IrWaitKind::DialogueAdvance);
+    Ok(())
+}
+
+fn native_voice(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
+    if path.trim().is_empty() {
+        return Err(NativeError::message("voice path must not be empty"));
+    }
+    context
+        .commands
+        .push(IrCommand::PlayVoice { path, volume: 1.0 });
+    Ok(())
+}
+
 fn native_camera_blur(
     context: &mut CharacterContext,
     call: &hiraku_script::hks::vm::BuiltinCall,
@@ -465,16 +494,25 @@ fn actor_handle(value: &Value) -> Result<u64, CharacterCapabilityError> {
 pub struct CapabilityOutput {
     pub commands: Vec<IrCommand>,
     pub wait: Option<IrWaitKind>,
+    pub tasks: Vec<CapabilityTask>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CapabilityTask {
+    pub mode: TaskMode,
+    pub commands: Vec<IrCommand>,
 }
 
 pub fn execute(bytecode: Bytecode) -> Result<CapabilityOutput, CharacterCapabilityError> {
     if bytecode.builtin_manifest_hash != manifest().hash() {
         return Err(CharacterCapabilityError::ManifestMismatch);
     }
+    let scheduler_bytecode = bytecode.clone();
     let mut vm =
         Vm::new(bytecode).map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
     let mut context = CharacterContext::default();
     let registry = registry();
+    let mut tasks = Vec::new();
     loop {
         match vm
             .step()
@@ -498,9 +536,19 @@ pub fn execute(bytecode: Bytecode) -> Result<CapabilityOutput, CharacterCapabili
                 return Ok(CapabilityOutput {
                     commands: context.commands,
                     wait: context.wait,
+                    tasks,
                 });
             }
-            Some(VmEvent::SpawnTask(_)) => return Err(CharacterCapabilityError::TasksUnsupported),
+            Some(VmEvent::SpawnTask(request)) => {
+                tasks.push(execute_task(
+                    scheduler_bytecode.clone(),
+                    request.task,
+                    request.template.mode,
+                    &registry,
+                )?);
+                vm.resume(Value::Task(request.task as u64))
+                    .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
+            }
             None => {
                 return Err(CharacterCapabilityError::Vm(
                     "VM stopped before completion".to_string(),
@@ -508,6 +556,60 @@ pub fn execute(bytecode: Bytecode) -> Result<CapabilityOutput, CharacterCapabili
             }
         }
     }
+}
+
+fn execute_task(
+    bytecode: Bytecode,
+    template: u32,
+    mode: TaskMode,
+    registry: &NativeRegistry<CharacterContext>,
+) -> Result<CapabilityTask, CharacterCapabilityError> {
+    let mut scheduler = TaskScheduler::new(bytecode)
+        .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
+    let root = scheduler
+        .spawn(template)
+        .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
+    let mut contexts = BTreeMap::<u64, CharacterContext>::new();
+
+    while !matches!(scheduler.status(root), Some(TaskStatus::Completed(_))) {
+        match scheduler
+            .step()
+            .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?
+        {
+            Some(TaskEvent::Call { task, call }) => {
+                let context = contexts.entry(task).or_default();
+                if context.wait.is_some() {
+                    return Err(CharacterCapabilityError::SuspendingTaskCapability);
+                }
+                let value = registry
+                    .call(context, &call)
+                    .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
+                if context.wait.is_some() {
+                    return Err(CharacterCapabilityError::SuspendingTaskCapability);
+                }
+                scheduler
+                    .resume(task, value)
+                    .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
+            }
+            Some(TaskEvent::StatementCommit { task }) => {
+                contexts.entry(task).or_default().commit()?;
+            }
+            Some(TaskEvent::Completed { .. }) => {}
+            None => {
+                return Err(CharacterCapabilityError::Vm(
+                    "task scheduler stopped before the root task completed".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(CapabilityTask {
+        mode,
+        commands: contexts
+            .into_values()
+            .flat_map(|context| context.commands)
+            .collect(),
+    })
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -522,8 +624,8 @@ pub enum CharacterCapabilityError {
     UnknownActor(u64),
     #[error("invalid character position `{0}`")]
     InvalidPosition(String),
-    #[error("tasks are not supported in a character statement")]
-    TasksUnsupported,
+    #[error("capabilities which suspend for host input are not yet supported inside seq/par")]
+    SuspendingTaskCapability,
     #[error("HKS VM error: {0}")]
     Vm(String),
     #[error("HKS native error: {0}")]
@@ -550,6 +652,76 @@ mod tests {
             matches!(&output.commands[0], IrCommand::ShowCharacter { actor_id, expressions, position, scale, .. }
             if actor_id == "Alice" && expressions == &["happy_eyes", "happy_face"]
                 && position == &[600.0, 0.0] && (*scale - 0.5).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn voice_is_a_non_suspending_native_command_by_default() {
+        let program = parse_program(r#"voice("voice/scene01/hash1")"#).unwrap();
+        let Stmt::Expr(expression) = &program.statements[0] else {
+            panic!("expected a voice expression")
+        };
+        let output = execute(compile_expression(expression, &[], 43).unwrap()).unwrap();
+        assert_eq!(output.wait, None);
+        assert_eq!(
+            output.commands,
+            vec![IrCommand::PlayVoice {
+                path: "voice/scene01/hash1".to_string(),
+                volume: 1.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn parallel_voice_block_is_executed_through_the_task_scheduler() {
+        let program = parse_program(
+            r#"par {
+                voice("voice/scene01/first")
+                voice("voice/scene01/second")
+            }"#,
+        )
+        .expect("parallel voice block must parse");
+        let Stmt::Expr(expression) = &program.statements[0] else {
+            panic!("expected a parallel task expression")
+        };
+        let output = execute(
+            compile_expression(expression, &[], 45)
+                .expect("parallel voice block must compile to native bytecode"),
+        )
+        .expect("parallel voice block must execute through the task scheduler");
+
+        assert!(output.commands.is_empty());
+        assert_eq!(output.tasks.len(), 1);
+        assert_eq!(output.tasks[0].mode, TaskMode::Parallel);
+        assert_eq!(
+            output.tasks[0].commands,
+            vec![
+                IrCommand::PlayVoice {
+                    path: "voice/scene01/first".to_string(),
+                    volume: 1.0,
+                },
+                IrCommand::PlayVoice {
+                    path: "voice/scene01/second".to_string(),
+                    volume: 1.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn say_emits_dialogue_and_suspends_for_advance() {
+        let program = parse_program(r#"say("Alice", "Hello")"#).unwrap();
+        let Stmt::Expr(expression) = &program.statements[0] else {
+            panic!("expected a say expression")
+        };
+        let output = execute(compile_expression(expression, &[], 44).unwrap()).unwrap();
+        assert_eq!(output.wait, Some(IrWaitKind::DialogueAdvance));
+        assert_eq!(
+            output.commands,
+            vec![IrCommand::Say {
+                speaker: "Alice".to_string(),
+                text: "Hello".to_string(),
+            }]
         );
     }
 }
