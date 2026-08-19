@@ -9,7 +9,7 @@ use hiraku_script::hks::vm::{
 use hiraku_script::hks::{Expr, Program, Stmt};
 use thiserror::Error;
 
-use crate::script::{IrCommand, IrWaitKind};
+use crate::script::{CameraEffectScope, IrCommand, IrWaitKind};
 
 const ACTOR_HANDLE_TYPE: u32 = 1;
 const CHAR: BuiltinId = BuiltinId(1);
@@ -339,11 +339,13 @@ fn native_camera_blur(
     let mut intensity = None;
     let mut duration = 0.0;
     let mut ease = "linear".to_string();
+    let mut scope = CameraEffectScope::World;
     for argument in &call.arguments {
         match argument.label.as_deref() {
             None if intensity.is_none() => intensity = Some(number_value(&argument.value)?),
             Some("duration") => duration = number_value(&argument.value)?,
             Some("ease") => ease = symbol_value(&argument.value)?,
+            Some("scope") => scope = camera_scope_value(&argument.value)?,
             _ => return Err(NativeError::message("invalid camera.blur arguments")),
         }
     }
@@ -356,6 +358,7 @@ fn native_camera_blur(
     context.commands.push(IrCommand::SetCamera {
         blur: Some(intensity as f32),
         zoom: None,
+        scope,
         duration_ms: (duration * 1000.0).round() as u64,
         ease: normalize_ease(&ease)?,
     });
@@ -369,11 +372,13 @@ fn native_camera_zoom(
     let mut scale = None;
     let mut duration = 0.0;
     let mut ease = "linear".to_string();
+    let mut scope = CameraEffectScope::World;
     for argument in &call.arguments {
         match argument.label.as_deref() {
             None if scale.is_none() => scale = Some(number_value(&argument.value)?),
             Some("duration") => duration = number_value(&argument.value)?,
             Some("ease") => ease = symbol_value(&argument.value)?,
+            Some("scope") => scope = camera_scope_value(&argument.value)?,
             Some("at") if matches!(argument.value, Value::Symbol(ref value) if value == "center") =>
                 {}
             _ => return Err(NativeError::message("invalid camera.zoom arguments")),
@@ -388,6 +393,7 @@ fn native_camera_zoom(
     context.commands.push(IrCommand::SetCamera {
         blur: None,
         zoom: Some(scale as f32),
+        scope,
         duration_ms: (duration * 1000.0).round() as u64,
         ease: normalize_ease(&ease)?,
     });
@@ -404,6 +410,17 @@ fn number_value(value: &Value) -> Result<f64, NativeError> {
 fn symbol_value(value: &Value) -> Result<String, NativeError> {
     match value {
         Value::Symbol(value) => Ok(value.clone()),
+        _ => Err(NativeError::TypeMismatch("symbol")),
+    }
+}
+
+fn camera_scope_value(value: &Value) -> Result<CameraEffectScope, NativeError> {
+    match value {
+        Value::Symbol(value) if value == "world" => Ok(CameraEffectScope::World),
+        Value::Symbol(value) if value == "canvas" => Ok(CameraEffectScope::Canvas),
+        Value::Symbol(_) => Err(NativeError::message(
+            "camera scope must be .world or .canvas",
+        )),
         _ => Err(NativeError::TypeMismatch("symbol")),
     }
 }

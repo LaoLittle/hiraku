@@ -18,8 +18,9 @@ mod ir;
 pub mod ui_runtime;
 
 pub use ir::{
-    IrChoiceOption, IrCommand, IrEvent, IrExpression, IrExpressionId, IrInstruction, IrProgram,
-    IrRuntime, IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
+    CameraEffectScope, IrChoiceOption, IrCommand, IrEvent, IrExpression, IrExpressionId,
+    IrInstruction, IrProgram, IrRuntime, IrValidationError, IrVm, IrVmSnapshot, IrVmStatus,
+    IrWaitKind, tick_ir_runtime,
 };
 pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
 
@@ -90,6 +91,7 @@ pub enum ScriptCommand {
     SetCamera {
         blur_intensity: Option<f32>,
         zoom: Option<f32>,
+        scope: CameraEffectScope,
         center: Option<Vec2>,
         duration: Duration,
         ease: CharacterEase,
@@ -276,11 +278,13 @@ pub(crate) fn script_command_from_ir(
         IrCommand::SetCamera {
             blur,
             zoom,
+            scope,
             duration_ms,
             ease,
         } => ScriptCommand::SetCamera {
             blur_intensity: blur,
             zoom,
+            scope,
             center: None,
             duration: Duration::from_millis(duration_ms),
             ease: parse_ir_camera_ease(&ease)?,

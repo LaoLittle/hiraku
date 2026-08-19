@@ -120,6 +120,8 @@ pub enum IrCommand {
     SetCamera {
         blur: Option<f32>,
         zoom: Option<f32>,
+        #[serde(default)]
+        scope: CameraEffectScope,
         duration_ms: u64,
         ease: String,
     },
@@ -154,6 +156,13 @@ pub enum IrCommand {
     HksStatement {
         bytecode: Bytecode,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CameraEffectScope {
+    #[default]
+    World,
+    Canvas,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

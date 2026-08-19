@@ -6,8 +6,8 @@ mod effect;
 mod hks_capabilities;
 pub mod hks_prelude;
 mod proto;
+pub mod render;
 mod scene;
-#[path = "script/runtime.rs"]
 mod script;
 mod state;
 mod storage;
@@ -27,6 +27,7 @@ use bevy::{
 };
 use effect::transition::RuleTransitionMaterial;
 use effect::{blur::BlurEffectPlugin, custom::CustomScreenEffectMaterial};
+use render::camera::assign_render_layers;
 use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_camera_shake, animate_camera_transition,
     animate_character_motion_effects, animate_custom_effects, animate_dialogue_text_reveal,
@@ -144,6 +145,7 @@ impl Plugin for HirakuPlugin {
                     .run_if(runtime_not_initialized),
             )
             .add_systems(Update, build_texture_atlases)
+            .add_systems(Update, assign_render_layers)
             .configure_sets(Update, HirakuRuntimeSystems.run_if(runtime_initialized))
             .add_systems(
                 Update,

@@ -6,12 +6,10 @@ use std::{
 use bevy::{
     app::AppExit,
     audio::{AudioSink, AudioSinkPlayback, Volume},
-    camera::RenderTarget,
     ecs::system::SystemParam,
     log::{info, warn},
     math::Rect,
     prelude::*,
-    render::render_resource::TextureFormat,
     ui::{ComputedStackIndex, UiGlobalTransform},
     window::PrimaryWindow,
 };
@@ -23,6 +21,11 @@ use crate::{
     effect::{
         blur::BlurSettings,
         custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
+    },
+    render::camera::{
+        CameraPositionTween, CameraScalarTween, CameraShake, CameraShakeState, CameraState,
+        CameraTween, CameraTweenCompletion, CameraTweenState, CanvasEffectCamera, WorldCamera,
+        WorldEffectCamera, focus_layer, setup_stage_cameras,
     },
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, IrCommand, IrEvent, IrRuntime, IrVm,
@@ -257,62 +260,6 @@ pub struct ChoiceState {
 #[derive(Resource, Default)]
 pub struct PendingWaits {
     pub items: Vec<PendingWait>,
-}
-
-#[derive(Resource, Default)]
-pub struct CameraShakeState {
-    pub active: Option<CameraShake>,
-}
-
-#[derive(Resource)]
-pub struct CameraState {
-    pub blur_intensity: f32,
-    pub zoom: f32,
-    pub center: Vec2,
-}
-
-impl Default for CameraState {
-    fn default() -> Self {
-        Self {
-            blur_intensity: 0.0,
-            zoom: 1.0,
-            center: Vec2::ZERO,
-        }
-    }
-}
-
-#[derive(Resource, Default)]
-pub struct CameraTweenState {
-    pub active: Option<CameraTween>,
-}
-
-pub struct CameraTween {
-    pub blur: Option<CameraScalarTween>,
-    pub zoom: Option<CameraScalarTween>,
-    pub center: Option<CameraPositionTween>,
-    pub completions: Vec<CameraTweenCompletion>,
-}
-
-pub struct CameraTweenCompletion {
-    pub blur: bool,
-    pub zoom: bool,
-    pub center: bool,
-    pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
-}
-
-pub struct CameraScalarTween {
-    pub from: f32,
-    pub to: f32,
-    pub timer: Timer,
-    pub ease: CharacterEase,
-}
-
-pub struct CameraPositionTween {
-    pub from: Vec2,
-    pub to: Vec2,
-    pub timer: Timer,
-    pub ease: CharacterEase,
 }
 
 #[derive(Resource, Default)]
@@ -593,13 +540,6 @@ pub struct PendingAnimationWait {
     pub done: mpsc::Sender<ScriptResponse>,
 }
 
-pub struct CameraShake {
-    pub timer: Timer,
-    pub amplitude: f32,
-    pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
-}
-
 pub struct ActiveVoice {
     pub entity: Entity,
     pub animation_id: Option<String>,
@@ -718,9 +658,6 @@ pub enum FrontendAction {
     AdjustVoice(f32),
     AdjustSfx(f32),
 }
-
-#[derive(Component)]
-pub struct MainCamera;
 
 #[derive(Component, Clone)]
 pub struct SpriteActor {
@@ -894,30 +831,7 @@ pub fn setup_stage(
     config: Res<crate::RuntimeLaunchConfig>,
     shared_state: Res<SceneSharedState>,
 ) {
-    let canvas_size = config.canvas_size.max(UVec2::ONE);
-    let canvas_image = images.add(Image::new_target_texture(
-        canvas_size.x,
-        canvas_size.y,
-        TextureFormat::Rgba8Unorm,
-        Some(TextureFormat::Rgba8UnormSrgb),
-    ));
-    commands.insert_resource(crate::HirakuCanvas {
-        image: canvas_image.clone(),
-        size: canvas_size,
-    });
-    commands.spawn((
-        Camera2d,
-        IsDefaultUiCamera,
-        Projection::Orthographic(OrthographicProjection::default_2d()),
-        BlurSettings::default(),
-        Camera {
-            order: config.camera_order,
-            clear_color: config.camera_clear_color.clone(),
-            ..default()
-        },
-        RenderTarget::Image(canvas_image.into()),
-        MainCamera,
-    ));
+    setup_stage_cameras(&mut commands, &mut images, &config);
     commands.insert_resource(RuleTransitionMesh(meshes.add(Rectangle::default())));
 
     let overlay = commands
@@ -925,6 +839,7 @@ pub fn setup_stage(
             OverlayMarker,
             Sprite::from_color(Color::BLACK.with_alpha(0.0), Vec2::new(6000.0, 6000.0)),
             Transform::from_xyz(0.0, 0.0, STAGE_Z_OVERLAY),
+            focus_layer(),
         ))
         .id();
 
@@ -2366,6 +2281,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::SetCamera {
                 blur_intensity,
                 zoom,
+                scope,
                 center,
                 duration,
                 ease,
@@ -2376,6 +2292,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 &mut camera_tweens,
                 blur_intensity,
                 zoom,
+                scope,
                 center,
                 duration,
                 ease,
@@ -3568,7 +3485,7 @@ pub fn apply_animation_cancellations(
     mut tweens: Query<(Entity, Option<&SpriteActor>, &mut VisualTween)>,
     mut bgm_fades: Query<(Entity, &mut BgmFade)>,
     mut motion_queries: ParamSet<(
-        Query<'_, '_, &'static mut Transform, With<MainCamera>>,
+        Query<'_, '_, &'static mut Transform, With<WorldCamera>>,
         Query<
             '_,
             '_,
@@ -3579,7 +3496,7 @@ pub fn apply_animation_cancellations(
                 Option<&'static mut CharacterShakeEffect>,
                 Option<&'static mut CharacterTimelineEffect>,
             ),
-            Without<MainCamera>,
+            Without<WorldCamera>,
         >,
     )>,
     mut transitions: Query<(Entity, &mut RuleTransitionPlayer)>,
@@ -3624,7 +3541,7 @@ pub fn apply_animation_cancellations(
             .as_ref()
             .is_some_and(|animation_id| cancelled.contains(animation_id))
     {
-        if let Ok(mut camera) = motion_queries.p0().single_mut() {
+        for mut camera in &mut motion_queries.p0() {
             camera.translation.x = 0.0;
             camera.translation.y = 0.0;
         }
@@ -3849,15 +3766,13 @@ pub fn animate_camera_shake(
     mut animations: ResMut<AnimationState>,
     mut shake_state: ResMut<CameraShakeState>,
     camera_state: Res<CameraState>,
-    mut camera: Query<&mut Transform, With<MainCamera>>,
+    mut cameras: Query<&mut Transform, With<WorldCamera>>,
 ) {
-    let Ok(mut camera) = camera.single_mut() else {
-        return;
-    };
-
     let Some(shake) = shake_state.active.as_mut() else {
-        camera.translation.x = camera_state.center.x;
-        camera.translation.y = camera_state.center.y;
+        for mut camera in &mut cameras {
+            camera.translation.x = camera_state.center.x;
+            camera.translation.y = camera_state.center.y;
+        }
         return;
     };
 
@@ -3866,12 +3781,16 @@ pub fn animate_camera_shake(
     let elapsed = shake.timer.elapsed_secs();
     let amplitude = shake.amplitude * decay;
 
-    camera.translation.x = camera_state.center.x + (elapsed * 43.0).sin() * amplitude;
-    camera.translation.y = camera_state.center.y + (elapsed * 31.0).cos() * amplitude;
+    for mut camera in &mut cameras {
+        camera.translation.x = camera_state.center.x + (elapsed * 43.0).sin() * amplitude;
+        camera.translation.y = camera_state.center.y + (elapsed * 31.0).cos() * amplitude;
+    }
 
     if shake.timer.is_finished() {
-        camera.translation.x = camera_state.center.x;
-        camera.translation.y = camera_state.center.y;
+        for mut camera in &mut cameras {
+            camera.translation.x = camera_state.center.x;
+            camera.translation.y = camera_state.center.y;
+        }
         if let Some(animation_id) = shake.animation_id.take() {
             animations.completed.insert(animation_id);
         }
@@ -3887,6 +3806,7 @@ fn start_camera_tween(
     tweens: &mut CameraTweenState,
     blur_intensity: Option<f32>,
     zoom: Option<f32>,
+    scope: crate::script::CameraEffectScope,
     center: Option<Vec2>,
     duration: std::time::Duration,
     ease: CharacterEase,
@@ -3894,6 +3814,7 @@ fn start_camera_tween(
     done: Option<mpsc::Sender<ScriptResponse>>,
     animations: &mut AnimationState,
 ) {
+    camera.effect_scope = scope;
     if duration.is_zero() {
         if let Some(tween) = tweens.active.as_mut() {
             cancel_camera_completions(
@@ -3995,13 +3916,20 @@ pub fn animate_camera_transition(
     mut animations: ResMut<AnimationState>,
     mut camera_state: ResMut<CameraState>,
     mut tweens: ResMut<CameraTweenState>,
-    mut camera: Query<(&mut Projection, &mut BlurSettings, &mut Transform), With<MainCamera>>,
-    mut screen_roots: Query<&mut UiTransform, With<ScreenUiRoot>>,
+    mut world_cameras: Query<(&mut Projection, &mut Transform), With<WorldCamera>>,
+    mut effect_cameras: Query<
+        &mut BlurSettings,
+        (With<WorldEffectCamera>, Without<CanvasEffectCamera>),
+    >,
+    mut canvas_camera: Query<
+        (&mut Projection, &mut Transform, &mut BlurSettings),
+        (
+            With<CanvasEffectCamera>,
+            Without<WorldCamera>,
+            Without<WorldEffectCamera>,
+        ),
+    >,
 ) {
-    let Ok((mut projection, mut blur, mut transform)) = camera.single_mut() else {
-        return;
-    };
-
     let mut completed = Vec::new();
     if let Some(tween) = tweens.active.as_mut() {
         if let Some(blur_tween) = tween.blur.as_mut() {
@@ -4062,14 +3990,43 @@ pub fn animate_camera_transition(
         tweens.active = None;
     }
 
-    blur.set_radius(camera_state.blur_intensity);
-    if let Projection::Orthographic(projection) = projection.as_mut() {
-        projection.scale = 1.0 / camera_state.zoom.max(0.01);
+    let world_active = matches!(
+        camera_state.effect_scope,
+        crate::script::CameraEffectScope::World
+    );
+    for mut blur in &mut effect_cameras {
+        blur.set_radius(if world_active {
+            camera_state.blur_intensity
+        } else {
+            0.0
+        });
     }
-    transform.translation.x = camera_state.center.x;
-    transform.translation.y = camera_state.center.y;
-    for mut transform in &mut screen_roots {
-        transform.scale = Vec2::splat(camera_state.zoom);
+    for (mut projection, mut transform) in &mut world_cameras {
+        if let Projection::Orthographic(projection) = projection.as_mut() {
+            projection.scale = if world_active {
+                1.0 / camera_state.zoom.max(0.01)
+            } else {
+                1.0
+            };
+        }
+        transform.translation.x = if world_active { camera_state.center.x } else { 0.0 };
+        transform.translation.y = if world_active { camera_state.center.y } else { 0.0 };
+    }
+    if let Ok((mut projection, mut transform, mut blur)) = canvas_camera.single_mut() {
+        blur.set_radius(if world_active {
+            0.0
+        } else {
+            camera_state.blur_intensity
+        });
+        if let Projection::Orthographic(projection) = projection.as_mut() {
+            projection.scale = if world_active {
+                1.0
+            } else {
+                1.0 / camera_state.zoom.max(0.01)
+            };
+        }
+        transform.translation.x = if world_active { 0.0 } else { camera_state.center.x };
+        transform.translation.y = if world_active { 0.0 } else { camera_state.center.y };
     }
 }
 
@@ -4086,7 +4043,7 @@ pub fn animate_character_motion_effects(
             Option<&'static mut CharacterShakeEffect>,
             Option<&'static mut CharacterTimelineEffect>,
         ),
-        Without<MainCamera>,
+        Without<WorldCamera>,
     >,
 ) {
     for (entity, mut transform, jump, shake, timeline) in &mut movers {

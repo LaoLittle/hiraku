@@ -10,7 +10,8 @@ use hiraku_script::hks::{
 use thiserror::Error;
 
 use crate::script::{
-    IrCommand, IrExpression, IrExpressionId, IrInstruction, IrProgram, IrWaitKind,
+    CameraEffectScope, IrCommand, IrExpression, IrExpressionId, IrInstruction, IrProgram,
+    IrWaitKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,6 +42,7 @@ pub struct CameraZoom {
     pub at: PositionSpec,
     pub duration: f32,
     pub ease: Ease,
+    pub scope: CameraEffectScope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +73,7 @@ pub fn normalize_camera_zoom(expression: &Expr) -> Result<CameraZoom, SchemaErro
     let mut at = None;
     let mut duration = None;
     let mut ease = None;
+    let mut scope = None;
     for argument in arguments {
         match argument.label.as_deref() {
             None if scale.is_none() => scale = Some(number(argument, "scale")?),
@@ -85,7 +88,8 @@ pub fn normalize_camera_zoom(expression: &Expr) -> Result<CameraZoom, SchemaErro
                 duration = Some(number(argument, "duration")?)
             }
             Some("ease") if ease.is_none() => ease = Some(ease_value(argument)?),
-            Some("at" | "duration" | "ease") => {
+            Some("scope") if scope.is_none() => scope = Some(scope_value(argument)?),
+            Some("at" | "duration" | "ease" | "scope") => {
                 return Err(error(
                     argument,
                     "camera.zoom argument was specified more than once",
@@ -116,6 +120,7 @@ pub fn normalize_camera_zoom(expression: &Expr) -> Result<CameraZoom, SchemaErro
         at: at.unwrap_or(PositionSpec::Preset(PresetPosition::Center)),
         duration,
         ease: ease.unwrap_or(Ease::Linear),
+        scope: scope.unwrap_or_default(),
     })
 }
 
@@ -189,6 +194,15 @@ fn ease_value(argument: &Argument) -> Result<Ease, SchemaError> {
             _ => Err(error(argument, "unsupported camera easing")),
         },
         _ => Err(error(argument, "ease must be a symbol literal")),
+    }
+}
+
+fn scope_value(argument: &Argument) -> Result<CameraEffectScope, SchemaError> {
+    match &argument.value.kind {
+        ExprKind::Symbol(symbol) if symbol == "world" => Ok(CameraEffectScope::World),
+        ExprKind::Symbol(symbol) if symbol == "canvas" => Ok(CameraEffectScope::Canvas),
+        ExprKind::Symbol(_) => Err(error(argument, "camera scope must be .world or .canvas")),
+        _ => Err(error(argument, "camera scope must be a symbol literal")),
     }
 }
 
@@ -631,6 +645,7 @@ impl HksStoryLowerer<'_> {
         let mut intensity = None;
         let mut duration = 0.0;
         let mut ease = Ease::Linear;
+        let mut scope = CameraEffectScope::World;
         for argument in arguments {
             match argument.label.as_deref() {
                 None if intensity.is_none() => {
@@ -645,6 +660,11 @@ impl HksStoryLowerer<'_> {
                 }
                 Some("ease") => {
                     ease = ease_value(argument).map_err(|error| {
+                        self.invalid_call("camera.blur", expression, &error.message)
+                    })?
+                }
+                Some("scope") => {
+                    scope = scope_value(argument).map_err(|error| {
                         self.invalid_call("camera.blur", expression, &error.message)
                     })?
                 }
@@ -670,6 +690,7 @@ impl HksStoryLowerer<'_> {
             .push(IrInstruction::Emit(IrCommand::SetCamera {
                 blur: Some(intensity),
                 zoom: None,
+                scope,
                 duration_ms: (duration * 1000.0).round() as u64,
                 ease: ease_name(ease).to_string(),
             }));
@@ -690,6 +711,7 @@ impl HksStoryLowerer<'_> {
             .push(IrInstruction::Emit(IrCommand::SetCamera {
                 blur: None,
                 zoom: Some(zoom.scale),
+                scope: zoom.scope,
                 duration_ms: (zoom.duration * 1000.0).round() as u64,
                 ease: ease_name(zoom.ease).to_string(),
             }));
@@ -820,6 +842,7 @@ mod tests {
                 at: PositionSpec::Preset(PresetPosition::Center),
                 duration: 0.0,
                 ease: Ease::Linear,
+                scope: CameraEffectScope::World,
             }
         );
         assert_eq!(
@@ -829,7 +852,14 @@ mod tests {
                 at: PositionSpec::Preset(PresetPosition::Center),
                 duration: 1.0,
                 ease: Ease::Linear,
+                scope: CameraEffectScope::World,
             }
+        );
+        assert_eq!(
+            normalize_camera_zoom(&zoom("camera.zoom(1.2, scope: .canvas)"))
+                .unwrap()
+                .scope,
+            CameraEffectScope::Canvas
         );
     }
 
