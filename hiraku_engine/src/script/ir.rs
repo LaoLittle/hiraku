@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::state::StoredValue;
-use hiraku_script::hks::vm::Bytecode;
+use hiraku_script::hks::vm::{Bytecode, Value};
 
 pub type IrPc = u32;
 
@@ -432,6 +432,8 @@ pub struct IrRuntime {
     pub next_request_id: u64,
     pub next_native_task_id: u64,
     pub native_tasks: BTreeMap<String, super::ScriptRequestId>,
+    pub hks_locals: BTreeMap<String, Value>,
+    pub hks_host: crate::hks_capabilities::StoryNativeHost,
 }
 
 impl IrRuntime {

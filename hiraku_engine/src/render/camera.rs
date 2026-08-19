@@ -278,16 +278,16 @@ pub fn assign_render_layers(
     >,
 ) {
     for entity in &backgrounds {
-        commands.entity(entity).insert(background_layer());
+        commands.entity(entity).try_insert(background_layer());
     }
     for entity in &actors {
-        commands.entity(entity).insert(scene_layer());
+        commands.entity(entity).try_insert(scene_layer());
     }
     for entity in &overlays {
-        commands.entity(entity).insert(focus_layer());
+        commands.entity(entity).try_insert(focus_layer());
     }
     for entity in &ui_roots {
-        commands.entity(entity).insert(ui_layer());
+        commands.entity(entity).try_insert(ui_layer());
     }
 }
 
@@ -640,5 +640,31 @@ mod tests {
                 .get::<RenderLayers>(overlay)
                 .is_some_and(|layers| layers.intersects(&focus_layer()))
         );
+    }
+
+    #[test]
+    fn render_layer_assignment_tolerates_same_frame_despawn() {
+        fn despawn_added_actors(mut commands: Commands, actors: Query<Entity, Added<SpriteActor>>) {
+            for entity in &actors {
+                commands.entity(entity).try_despawn();
+            }
+        }
+
+        let mut app = App::new();
+        app.add_systems(
+            Update,
+            (despawn_added_actors, assign_render_layers).chain_ignore_deferred(),
+        );
+        let actor = app
+            .world_mut()
+            .spawn(SpriteActor {
+                id: "alice".to_string(),
+                path: "alice.webp".to_string(),
+            })
+            .id();
+
+        app.update();
+
+        assert!(app.world().get_entity(actor).is_err());
     }
 }

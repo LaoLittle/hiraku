@@ -260,6 +260,16 @@ pub fn compile_expression(
     compile_with_manifest(&program, source_hash, &manifest()).ok()
 }
 
+pub fn compile_statement(
+    statement: &Stmt,
+    functions: &[Stmt],
+    source_hash: u64,
+) -> Option<Bytecode> {
+    let mut statements = functions.to_vec();
+    statements.push(statement.clone());
+    compile_with_manifest(&Program { statements }, source_hash, &manifest()).ok()
+}
+
 #[derive(Clone, Debug)]
 struct PendingActor {
     name: String,
@@ -668,6 +678,7 @@ pub struct CapabilityOutput {
     pub commands: Vec<StoryEffect>,
     pub wait: Option<StoryWait>,
     pub tasks: Vec<CapabilityTask>,
+    pub locals: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -677,13 +688,21 @@ pub struct CapabilityTask {
 }
 
 pub fn execute(bytecode: Bytecode) -> Result<CapabilityOutput, CharacterCapabilityError> {
+    execute_with_host(bytecode, &mut StoryNativeHost::new(), BTreeMap::new())
+}
+
+pub fn execute_with_host(
+    bytecode: Bytecode,
+    host: &mut StoryNativeHost,
+    locals: BTreeMap<String, Value>,
+) -> Result<CapabilityOutput, CharacterCapabilityError> {
     if bytecode.builtin_manifest_hash != manifest().hash() {
         return Err(CharacterCapabilityError::ManifestMismatch);
     }
     let scheduler_bytecode = bytecode.clone();
     let mut vm =
         Vm::new(bytecode).map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
-    let mut context = CharacterContext::default();
+    vm.set_locals(locals);
     let registry = registry();
     let mut tasks = Vec::new();
     loop {
@@ -692,24 +711,25 @@ pub fn execute(bytecode: Bytecode) -> Result<CapabilityOutput, CharacterCapabili
             .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?
         {
             Some(VmEvent::Call(call)) => {
-                if context.wait.is_some() {
+                if host.context.wait.is_some() {
                     return Err(CharacterCapabilityError::Native(
                         "a suspending capability must be the final native call in a statement"
                             .to_string(),
                     ));
                 }
                 let value = registry
-                    .call(&mut context, &call)
+                    .call(&mut host.context, &call)
                     .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
                 vm.resume_builtin(value)
                     .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
             }
-            Some(VmEvent::StatementCommit) => context.commit()?,
+            Some(VmEvent::StatementCommit) => host.context.commit()?,
             Some(VmEvent::Completed(_)) => {
                 return Ok(CapabilityOutput {
-                    commands: context.commands,
-                    wait: context.wait,
+                    commands: host.drain_effects(),
+                    wait: host.take_wait(),
                     tasks,
+                    locals: vm.locals().clone(),
                 });
             }
             Some(VmEvent::SpawnTask(request)) => {

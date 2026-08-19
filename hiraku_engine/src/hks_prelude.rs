@@ -298,7 +298,7 @@ impl HksStoryLowerer<'_> {
             Stmt::Function { .. } => Ok(()),
             Stmt::Let {
                 name, value, span, ..
-            } => self.let_statement(name, value, span),
+            } => self.let_statement(statement, name, value, span),
             Stmt::If {
                 condition,
                 then_block,
@@ -316,69 +316,76 @@ impl HksStoryLowerer<'_> {
 
     fn let_statement(
         &mut self,
+        statement: &Stmt,
         variable: &str,
         value: &Expr,
         span: &Span,
     ) -> Result<(), HksStoryCompileError> {
-        let ExprKind::Call {
+        if let ExprKind::Call {
             callee,
             arguments,
             trailing_block,
         } = &value.kind
-        else {
-            return Err(HksStoryCompileError::UnsupportedStatement {
-                path: self.path.to_string(),
-                offset: span.start,
-            });
-        };
-        let name =
-            flatten_callee(callee).ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
-                path: self.path.to_string(),
-                offset: value.span.start,
-            })?;
-        if trailing_block.is_some()
-            && arguments.is_empty()
-            && matches!(name.as_str(), "seq" | "par")
         {
-            let bytecode = crate::hks_capabilities::compile_expression(
-                value,
-                &self.functions,
-                self.source_hash ^ value.span.start as u64,
-            )
-            .ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
-                path: self.path.to_string(),
-                offset: span.start,
+            let name = flatten_callee(callee).ok_or_else(|| {
+                HksStoryCompileError::UnsupportedStatement {
+                    path: self.path.to_string(),
+                    offset: value.span.start,
+                }
             })?;
-            self.instructions
-                .push(IrInstruction::Emit(IrCommand::HksStatement {
-                    bytecode,
-                    task_result: Some(variable.to_string()),
-                }));
-            return Ok(());
+            if trailing_block.is_some()
+                && arguments.is_empty()
+                && matches!(name.as_str(), "seq" | "par")
+            {
+                let bytecode = crate::hks_capabilities::compile_expression(
+                    value,
+                    &self.functions,
+                    self.source_hash ^ value.span.start as u64,
+                )
+                .ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
+                    path: self.path.to_string(),
+                    offset: span.start,
+                })?;
+                self.instructions
+                    .push(IrInstruction::Emit(IrCommand::HksStatement {
+                        bytecode,
+                        task_result: Some(variable.to_string()),
+                    }));
+                return Ok(());
+            }
+            if name == "openUi" {
+                if trailing_block.is_some() || arguments.len() != 1 || arguments[0].label.is_some()
+                {
+                    return Err(self.invalid_call("openUi", value, "expected one string path"));
+                }
+                let ExprKind::String(path) = &arguments[0].value.kind else {
+                    return Err(self.invalid_call("openUi", value, "expected one string path"));
+                };
+                self.instructions
+                    .push(IrInstruction::Emit(IrCommand::OpenUi {
+                        path: path.clone(),
+                        result: variable.to_string(),
+                    }));
+                self.instructions
+                    .push(IrInstruction::Wait(IrWaitKind::UiIntent));
+                return Ok(());
+            }
         }
-        if trailing_block.is_some() {
-            return Err(HksStoryCompileError::UnsupportedStatement {
-                path: self.path.to_string(),
-                offset: span.start,
-            });
-        }
-        if name != "openUi" || arguments.len() != 1 || arguments[0].label.is_some() {
-            return Err(HksStoryCompileError::UnsupportedCall {
-                path: self.path.to_string(),
-                name,
-                offset: value.span.start,
-            });
-        }
-        let ExprKind::String(path) = &arguments[0].value.kind else {
-            return Err(self.invalid_call("openUi", value, "expected one string path"));
-        };
+
+        let bytecode = crate::hks_capabilities::compile_statement(
+            statement,
+            &self.functions,
+            self.source_hash ^ span.start as u64,
+        )
+        .ok_or_else(|| HksStoryCompileError::UnsupportedStatement {
+            path: self.path.to_string(),
+            offset: span.start,
+        })?;
         self.instructions
-            .push(IrInstruction::Emit(IrCommand::OpenUi {
-                path: path.clone(),
-                result: variable.to_string(),
+            .push(IrInstruction::Emit(IrCommand::HksStatement {
+                bytecode,
+                task_result: None,
             }));
-        self.instructions
-            .push(IrInstruction::Wait(IrWaitKind::UiIntent));
         Ok(())
     }
 
@@ -850,8 +857,12 @@ fn source_hash(source: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hks_capabilities::{StoryEffect, StoryWait};
+    use crate::hks_capabilities::{
+        CharacterCapabilityError, StoryEffect, StoryNativeHost, StoryWait, execute_with_host,
+    };
+    use hiraku_script::hks::vm::Value;
     use hiraku_script::hks::{Stmt, parse_program};
+    use std::collections::BTreeMap;
 
     fn zoom(source: &str) -> Expr {
         let program = parse_program(source).unwrap();
@@ -862,16 +873,76 @@ mod tests {
     }
 
     fn native_outputs(program: &IrProgram) -> Vec<crate::hks_capabilities::CapabilityOutput> {
+        let mut host = StoryNativeHost::new();
+        let mut locals = BTreeMap::new();
         program
             .instructions
             .iter()
-            .filter_map(|instruction| match instruction {
-                IrInstruction::Emit(IrCommand::HksStatement { bytecode, .. }) => {
-                    Some(crate::hks_capabilities::execute(bytecode.clone()).unwrap())
-                }
-                _ => None,
+            .filter_map(|instruction| {
+                let IrInstruction::Emit(IrCommand::HksStatement { bytecode, .. }) = instruction
+                else {
+                    return None;
+                };
+                let output =
+                    execute_with_host(bytecode.clone(), &mut host, locals.clone()).unwrap();
+                locals = output.locals.clone();
+                Some(output)
             })
             .collect()
+    }
+
+    fn execute_native_chunks(
+        program: &IrProgram,
+    ) -> Result<Vec<StoryEffect>, CharacterCapabilityError> {
+        let mut host = StoryNativeHost::new();
+        let mut locals = BTreeMap::<String, Value>::new();
+        let mut effects = Vec::new();
+        for instruction in &program.instructions {
+            if let IrInstruction::Emit(IrCommand::HksStatement { bytecode, .. }) = instruction {
+                let output = execute_with_host(bytecode.clone(), &mut host, locals)?;
+                locals = output.locals;
+                effects.extend(output.commands);
+            }
+        }
+        Ok(effects)
+    }
+
+    #[test]
+    fn actor_handles_survive_let_bindings_across_statement_chunks() {
+        let program = compile_story_to_ir(
+            "actor.story.hks",
+            r#"
+                let ema = char("ema")
+                ema.at("center").scale(0.32)
+                narrate("张嘴")
+                ema.e("mouth_open")
+                narrate("神秘张嘴闭眼女")
+                ema.e("eyes_closed")
+            "#,
+        )
+        .expect("actor variable story must compile");
+        let effects = execute_native_chunks(&program).expect("actor handle calls must execute");
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::ShowCharacter { expressions, scale, .. }
+                if expressions == &["mouth_open", "eyes_closed"]
+                    && (*scale - 0.32).abs() < f32::EPSILON
+        )));
+    }
+
+    #[test]
+    fn actor_methods_reject_non_actor_receivers_at_runtime() {
+        let program = compile_story_to_ir(
+            "invalid-actor.story.hks",
+            "let ema = 42\nema.at(\"center\")",
+        )
+        .expect("dynamic receiver type is checked at runtime, not by the transitional lowerer");
+        let error = execute_native_chunks(&program).expect_err("number is not an Actor handle");
+        assert!(matches!(
+            error,
+            CharacterCapabilityError::Native(message) if message.contains("invalid actor handle")
+        ));
     }
 
     #[test]
@@ -1000,7 +1071,7 @@ mod tests {
                 .iter()
                 .filter(|output| output.wait == Some(StoryWait::DialogueAdvance))
                 .count(),
-            24
+            26
         );
     }
 

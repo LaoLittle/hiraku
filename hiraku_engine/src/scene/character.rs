@@ -166,12 +166,99 @@ pub(super) fn queue_character_show(
     fade: Option<std::time::Duration>,
     animation_id: Option<String>,
 ) {
+    const DEFAULT_CHARACTER_FADE: std::time::Duration = std::time::Duration::from_millis(120);
+
+    let fade = fade.or(Some(DEFAULT_CHARACTER_FADE));
+    let prefix = character_part_prefix(&actor_id);
+    let desired_ids = parts
+        .iter()
+        .map(|part| character_part_id(&actor_id, part))
+        .collect::<HashSet<_>>();
+
+    // A previous statement can still be waiting for its images. Retain only
+    // parts that are also present in the newly committed actor state.
+    pending.items.retain_mut(|item| {
+        if item.actor_id != actor_id {
+            return true;
+        }
+        for index in (0..item.entity_ids.len()).rev() {
+            if desired_ids.contains(&item.entity_ids[index]) {
+                continue;
+            }
+            let id = item.entity_ids.remove(index);
+            let entity = item.entities.remove(index);
+            item.handles.remove(index);
+            if stage.sprites.get(&id) == Some(&entity) {
+                stage.sprites.remove(&id);
+            }
+            commands.entity(entity).try_despawn();
+        }
+        if item.entities.is_empty() {
+            complete_missing_animation(animations, item.animation_id.take());
+            false
+        } else {
+            true
+        }
+    });
+
+    let existing_ids = stage
+        .sprites
+        .keys()
+        .filter(|id| id.starts_with(&prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+    let new_part_count = parts
+        .iter()
+        .filter(|part| {
+            !stage
+                .sprites
+                .contains_key(&character_part_id(&actor_id, part))
+        })
+        .count();
+    let mut pending_animation = animation_id;
+
+    // Slots absent from the committed state fade out. Stable part IDs remain
+    // alive, retaining texture/visibility/tween state across expression changes.
+    for id in existing_ids {
+        if desired_ids.contains(&id) {
+            continue;
+        }
+        let Some(entity) = stage.sprites.remove(&id) else {
+            continue;
+        };
+        commands.entity(entity).try_insert(VisualTween {
+            from_alpha: Some(1.0),
+            to_alpha: Some(0.0),
+            from_translation: None,
+            to_translation: None,
+            from_scale: None,
+            to_scale: None,
+            timer: Timer::new(fade.expect("character fade is always set"), TimerMode::Once),
+            animation_id: (new_part_count == 0)
+                .then(|| pending_animation.take())
+                .flatten(),
+            despawn_on_finish: true,
+        });
+    }
+
     let mut entities = Vec::new();
     let mut entity_ids = Vec::new();
     let mut handles = Vec::new();
 
     for part in &parts {
         let sprite_id = character_part_id(&actor_id, part);
+        if let Some(entity) = stage.sprites.get(&sprite_id).copied() {
+            commands.entity(entity).try_insert(Transform {
+                translation: Vec3::new(
+                    position.x + part.offset.x * scale,
+                    position.y + part.offset.y * scale,
+                    STAGE_Z_SPRITE + part.layer,
+                ),
+                scale: Vec3::splat(scale),
+                ..default()
+            });
+            continue;
+        }
         let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
         let handle = atlas
             .map(|texture| texture.image.clone())
@@ -203,7 +290,7 @@ pub(super) fn queue_character_show(
     }
 
     if entities.is_empty() {
-        complete_missing_animation(animations, animation_id);
+        complete_missing_animation(animations, pending_animation);
         return;
     }
 
@@ -213,7 +300,7 @@ pub(super) fn queue_character_show(
         entities,
         handles,
         fade,
-        animation_id,
+        animation_id: pending_animation,
     });
 }
 

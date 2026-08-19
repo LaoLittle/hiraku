@@ -516,6 +516,8 @@ pub fn start_hks_runtime(
     runtime.pending_ui_screen = bootstrap.pending_ui_screen;
     runtime.pending_request = None;
     runtime.response_inbox.clear();
+    runtime.hks_locals.clear();
+    runtime.hks_host = crate::hks_capabilities::StoryNativeHost::new();
     if let Some(wait) = restored_wait {
         runtime.events.push_back(IrEvent::Waiting(wait.clone()));
         if matches!(wait, IrWaitKind::UiIntent | IrWaitKind::ScreenChoice)

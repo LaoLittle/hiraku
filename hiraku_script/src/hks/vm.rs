@@ -631,6 +631,17 @@ impl Vm {
         })
     }
 
+    /// Seeds top-level locals when an embedding executes separately compiled
+    /// statement chunks. Values remain VM-owned and are still checked by native
+    /// argument conversion when used as call receivers or arguments.
+    pub fn set_locals(&mut self, locals: BTreeMap<String, Value>) {
+        self.locals = locals;
+    }
+
+    pub fn locals(&self) -> &BTreeMap<String, Value> {
+        &self.locals
+    }
+
     pub fn step(&mut self) -> Result<Option<VmEvent>, VmError> {
         if !matches!(self.status, VmStatus::Ready) {
             return Ok(None);

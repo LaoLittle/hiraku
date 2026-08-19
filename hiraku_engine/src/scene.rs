@@ -367,6 +367,8 @@ pub fn bridge_ir_events(
                     runtime.wait_request = None;
                     runtime.response_inbox.clear();
                     runtime.native_tasks.clear();
+                    runtime.hks_locals.clear();
+                    runtime.hks_host = crate::hks_capabilities::StoryNativeHost::new();
                 }
                 Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
             }
@@ -500,128 +502,138 @@ pub fn bridge_ir_events(
         IrEvent::Command(IrCommand::HksStatement {
             bytecode,
             mut task_result,
-        }) => match crate::hks_capabilities::execute(bytecode) {
-            Ok(output) => {
-                for command in output.commands {
-                    let command: IrCommand = command.into();
-                    if matches!(
-                        command,
-                        IrCommand::LoadScript { .. }
-                            | IrCommand::Choose { .. }
-                            | IrCommand::OpenUi { .. }
-                            | IrCommand::PlayBgm { .. }
-                            | IrCommand::PlayVoice { .. }
-                    ) {
-                        runtime.events.push_back(IrEvent::Command(command));
-                        continue;
-                    }
-                    match script_command_from_ir(command, textures.as_deref()) {
-                        Ok(command) => pending_script_commands.items.push_back(command),
-                        Err(error) => warn!("HKS native command rejected: {error}"),
-                    }
-                }
-                for task in output.tasks {
-                    let batch_id = runtime.next_native_task_id;
-                    runtime.next_native_task_id += 1;
-                    let mut items = Vec::new();
-                    for (index, command) in task.commands.into_iter().enumerate() {
-                        let handle = format!("hks-task-{batch_id}-{index}");
+        }) => {
+            let locals = runtime.hks_locals.clone();
+            match crate::hks_capabilities::execute_with_host(
+                bytecode,
+                &mut runtime.hks_host,
+                locals,
+            ) {
+                Ok(output) => {
+                    runtime.hks_locals = output.locals;
+                    for command in output.commands {
                         let command: IrCommand = command.into();
-                        let command = match command {
-                            IrCommand::PlayVoice { path, volume } => {
-                                let Some(definition) = audio
-                                    .as_deref()
-                                    .and_then(|catalog| catalog.resolve_voice(&path))
-                                else {
-                                    warn!("voice `{path}` is not defined");
-                                    continue;
-                                };
-                                ScriptCommand::PlayVoice {
-                                    path: definition.path.clone(),
-                                    volume,
-                                    mode: VoicePlaybackMode::Concurrent,
-                                    animation_id: Some(handle.clone()),
-                                }
-                            }
-                            command @ IrCommand::ShowCharacter { .. } => {
-                                match script_command_from_ir(command, textures.as_deref()) {
-                                    Ok(ScriptCommand::ShowCharacter {
-                                        actor_id,
-                                        character_name,
-                                        expressions,
-                                        position,
-                                        scale,
-                                        fade,
-                                        ..
-                                    }) => ScriptCommand::ShowCharacter {
-                                        actor_id,
-                                        character_name,
-                                        expressions,
-                                        position,
-                                        scale,
-                                        fade,
-                                        animation_id: Some(handle.clone()),
-                                    },
-                                    Ok(_) => unreachable!(
-                                        "show character IR must stay a show character command"
-                                    ),
-                                    Err(error) => {
-                                        warn!("HKS character task command rejected: {error}");
+                        if matches!(
+                            command,
+                            IrCommand::LoadScript { .. }
+                                | IrCommand::Choose { .. }
+                                | IrCommand::OpenUi { .. }
+                                | IrCommand::PlayBgm { .. }
+                                | IrCommand::PlayVoice { .. }
+                        ) {
+                            runtime.events.push_back(IrEvent::Command(command));
+                            continue;
+                        }
+                        match script_command_from_ir(command, textures.as_deref()) {
+                            Ok(command) => pending_script_commands.items.push_back(command),
+                            Err(error) => warn!("HKS native command rejected: {error}"),
+                        }
+                    }
+                    for task in output.tasks {
+                        let batch_id = runtime.next_native_task_id;
+                        runtime.next_native_task_id += 1;
+                        let mut items = Vec::new();
+                        for (index, command) in task.commands.into_iter().enumerate() {
+                            let handle = format!("hks-task-{batch_id}-{index}");
+                            let command: IrCommand = command.into();
+                            let command = match command {
+                                IrCommand::PlayVoice { path, volume } => {
+                                    let Some(definition) = audio
+                                        .as_deref()
+                                        .and_then(|catalog| catalog.resolve_voice(&path))
+                                    else {
+                                        warn!("voice `{path}` is not defined");
                                         continue;
+                                    };
+                                    ScriptCommand::PlayVoice {
+                                        path: definition.path.clone(),
+                                        volume,
+                                        mode: VoicePlaybackMode::Concurrent,
+                                        animation_id: Some(handle.clone()),
                                     }
                                 }
-                            }
-                            _ => {
-                                warn!("HKS task command is not yet supported by the story runtime");
-                                continue;
+                                command @ IrCommand::ShowCharacter { .. } => {
+                                    match script_command_from_ir(command, textures.as_deref()) {
+                                        Ok(ScriptCommand::ShowCharacter {
+                                            actor_id,
+                                            character_name,
+                                            expressions,
+                                            position,
+                                            scale,
+                                            fade,
+                                            ..
+                                        }) => ScriptCommand::ShowCharacter {
+                                            actor_id,
+                                            character_name,
+                                            expressions,
+                                            position,
+                                            scale,
+                                            fade,
+                                            animation_id: Some(handle.clone()),
+                                        },
+                                        Ok(_) => unreachable!(
+                                            "show character IR must stay a show character command"
+                                        ),
+                                        Err(error) => {
+                                            warn!("HKS character task command rejected: {error}");
+                                            continue;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    warn!(
+                                        "HKS task command is not yet supported by the story runtime"
+                                    );
+                                    continue;
+                                }
+                            };
+                            items.push(BatchSubmissionItem {
+                                handle: handle.clone(),
+                                command: Box::new(command),
+                            });
+                        }
+                        let handles = items
+                            .iter()
+                            .map(|item| item.handle.clone())
+                            .collect::<Vec<_>>();
+                        let mode = match task.mode {
+                            hiraku_script::hks::vm::TaskMode::Sequence => BatchSubmitMode::Sequence,
+                            hiraku_script::hks::vm::TaskMode::Parallel => BatchSubmitMode::Parallel,
+                        };
+                        if !items.is_empty() {
+                            pending_script_commands
+                                .items
+                                .push_back(ScriptCommand::SubmitBatch { mode, items });
+                        }
+                        if let Some(handle) = task_result.take() {
+                            let request = runtime.allocate_request();
+                            pending_script_commands.items.push_back(
+                                ScriptCommand::WaitAnimations {
+                                    ids: handles,
+                                    done: request,
+                                },
+                            );
+                            runtime.native_tasks.insert(handle, request);
+                        }
+                    }
+                    if let Some(wait) = output.wait {
+                        let wait = match wait {
+                            crate::hks_capabilities::StoryWait::DialogueAdvance => {
+                                IrWaitKind::DialogueAdvance
                             }
                         };
-                        items.push(BatchSubmissionItem {
-                            handle: handle.clone(),
-                            command: Box::new(command),
-                        });
-                    }
-                    let handles = items
-                        .iter()
-                        .map(|item| item.handle.clone())
-                        .collect::<Vec<_>>();
-                    let mode = match task.mode {
-                        hiraku_script::hks::vm::TaskMode::Sequence => BatchSubmitMode::Sequence,
-                        hiraku_script::hks::vm::TaskMode::Parallel => BatchSubmitMode::Parallel,
-                    };
-                    if !items.is_empty() {
-                        pending_script_commands
-                            .items
-                            .push_back(ScriptCommand::SubmitBatch { mode, items });
-                    }
-                    if let Some(handle) = task_result.take() {
-                        let request = runtime.allocate_request();
-                        pending_script_commands
-                            .items
-                            .push_back(ScriptCommand::WaitAnimations {
-                                ids: handles,
-                                done: request,
-                            });
-                        runtime.native_tasks.insert(handle, request);
-                    }
-                }
-                if let Some(wait) = output.wait {
-                    let wait = match wait {
-                        crate::hks_capabilities::StoryWait::DialogueAdvance => {
-                            IrWaitKind::DialogueAdvance
+                        if runtime
+                            .vm
+                            .as_mut()
+                            .is_some_and(|vm| vm.suspend(wait.clone()))
+                        {
+                            runtime.events.push_back(IrEvent::Waiting(wait));
                         }
-                    };
-                    if runtime
-                        .vm
-                        .as_mut()
-                        .is_some_and(|vm| vm.suspend(wait.clone()))
-                    {
-                        runtime.events.push_back(IrEvent::Waiting(wait));
                     }
                 }
+                Err(error) => warn!("HKS native statement failed: {error}"),
             }
-            Err(error) => warn!("HKS native statement failed: {error}"),
-        },
+        }
         IrEvent::Command(command) => match script_command_from_ir(command, textures.as_deref()) {
             Ok(command) => pending_script_commands.items.push_back(command),
             Err(error) => warn!("IR command rejected: {error}"),
@@ -2522,12 +2534,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     }
                 };
 
-                despawn_character_actor(
-                    &mut commands,
-                    &mut stage,
-                    &mut pending_characters,
-                    &actor_id,
-                );
                 stage.character_positions.insert(actor_id.clone(), position);
                 queue_character_show(
                     &mut commands,
