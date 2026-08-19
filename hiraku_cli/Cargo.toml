@@ -1,5 +1,5 @@
 [package]
-name = "hiraku_cli"
+name = "hiraku-cli"
 version.workspace = true
 edition.workspace = true
 

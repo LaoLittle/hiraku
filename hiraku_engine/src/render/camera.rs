@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use crate::{
     HirakuCanvas, RuntimeLaunchConfig,
     effect::blur::BlurSettings,
+    scene::{AnimationState, apply_character_ease, complete_missing_animation, tween_fraction},
     script::CameraEffectScope,
 };
 use crate::{
@@ -227,10 +228,7 @@ pub fn setup_stage_cameras(
 
     // Focus and UI are intentionally composed after world post-processing.
     let final_compositor_layer = RenderLayers::layer(FINAL_COMPOSITOR_LAYER);
-    for (index, image) in [world_image, focus_image, ui_image]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, image) in [world_image, focus_image, ui_image].into_iter().enumerate() {
         commands.spawn((
             Sprite::from_image(image),
             Transform::from_xyz(0.0, 0.0, index as f32),
@@ -318,6 +316,288 @@ fn spawn_world_camera<M: Bundle>(
         WorldCamera,
         marker,
     ));
+}
+
+pub fn animate_camera_shake(
+    time: Res<Time>,
+    mut animations: ResMut<AnimationState>,
+    mut shake_state: ResMut<CameraShakeState>,
+    camera_state: Res<CameraState>,
+    mut cameras: Query<&mut Transform, With<WorldCamera>>,
+) {
+    let Some(shake) = shake_state.active.as_mut() else {
+        for mut camera in &mut cameras {
+            camera.translation.x = camera_state.center.x;
+            camera.translation.y = camera_state.center.y;
+        }
+        return;
+    };
+
+    shake.timer.tick(time.delta());
+    let decay = 1.0 - tween_fraction(&shake.timer);
+    let elapsed = shake.timer.elapsed_secs();
+    let amplitude = shake.amplitude * decay;
+    for mut camera in &mut cameras {
+        camera.translation.x = camera_state.center.x + (elapsed * 43.0).sin() * amplitude;
+        camera.translation.y = camera_state.center.y + (elapsed * 31.0).cos() * amplitude;
+    }
+
+    if shake.timer.is_finished() {
+        for mut camera in &mut cameras {
+            camera.translation.x = camera_state.center.x;
+            camera.translation.y = camera_state.center.y;
+        }
+        if let Some(animation_id) = shake.animation_id.take() {
+            animations.completed.insert(animation_id);
+        }
+        if let Some(done) = shake.done.take() {
+            let _ = done.send(ScriptResponse::Continue);
+        }
+        shake_state.active = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_camera_tween(
+    camera: &mut CameraState,
+    tweens: &mut CameraTweenState,
+    blur_intensity: Option<f32>,
+    zoom: Option<f32>,
+    scope: CameraEffectScope,
+    center: Option<Vec2>,
+    duration: std::time::Duration,
+    ease: CharacterEase,
+    animation_id: Option<String>,
+    done: Option<mpsc::Sender<ScriptResponse>>,
+    animations: &mut AnimationState,
+) {
+    camera.effect_scope = scope;
+    if duration.is_zero() {
+        if let Some(tween) = tweens.active.as_mut() {
+            cancel_camera_completions(
+                tween,
+                blur_intensity.is_some(),
+                zoom.is_some(),
+                center.is_some(),
+                animations,
+            );
+            if blur_intensity.is_some() {
+                tween.blur = None;
+            }
+            if zoom.is_some() {
+                tween.zoom = None;
+            }
+            if center.is_some() {
+                tween.center = None;
+            }
+        }
+        if let Some(blur_intensity) = blur_intensity {
+            camera.blur_intensity = blur_intensity;
+        }
+        if let Some(zoom) = zoom {
+            camera.zoom = zoom;
+        }
+        if let Some(center) = center {
+            camera.center = center;
+        }
+        complete_missing_animation(animations, animation_id, done);
+        return;
+    }
+
+    let tween = tweens.active.get_or_insert_with(|| CameraTween {
+        blur: None,
+        zoom: None,
+        center: None,
+        completions: Vec::new(),
+    });
+    cancel_camera_completions(
+        tween,
+        blur_intensity.is_some(),
+        zoom.is_some(),
+        center.is_some(),
+        animations,
+    );
+    if let Some(to) = blur_intensity {
+        tween.blur = Some(CameraScalarTween {
+            from: camera.blur_intensity,
+            to,
+            timer: Timer::new(duration, TimerMode::Once),
+            ease,
+        });
+    }
+    if let Some(to) = zoom {
+        tween.zoom = Some(CameraScalarTween {
+            from: camera.zoom,
+            to,
+            timer: Timer::new(duration, TimerMode::Once),
+            ease,
+        });
+    }
+    if let Some(to) = center {
+        tween.center = Some(CameraPositionTween {
+            from: camera.center,
+            to,
+            timer: Timer::new(duration, TimerMode::Once),
+            ease,
+        });
+    }
+    tween.completions.push(CameraTweenCompletion {
+        blur: blur_intensity.is_some(),
+        zoom: zoom.is_some(),
+        center: center.is_some(),
+        animation_id,
+        done,
+    });
+}
+
+fn cancel_camera_completions(
+    tween: &mut CameraTween,
+    blur: bool,
+    zoom: bool,
+    center: bool,
+    animations: &mut AnimationState,
+) {
+    let mut retained = Vec::new();
+    for completion in tween.completions.drain(..) {
+        if (blur && completion.blur) || (zoom && completion.zoom) || (center && completion.center) {
+            complete_missing_animation(animations, completion.animation_id, completion.done);
+        } else {
+            retained.push(completion);
+        }
+    }
+    tween.completions = retained;
+}
+
+pub fn animate_camera_transition(
+    time: Res<Time>,
+    mut animations: ResMut<AnimationState>,
+    mut camera_state: ResMut<CameraState>,
+    mut tweens: ResMut<CameraTweenState>,
+    mut world_cameras: Query<(&mut Projection, &mut Transform), With<WorldCamera>>,
+    mut effect_cameras: Query<
+        &mut BlurSettings,
+        (With<WorldEffectCamera>, Without<CanvasEffectCamera>),
+    >,
+    mut canvas_camera: Query<
+        (&mut Projection, &mut Transform, &mut BlurSettings),
+        (
+            With<CanvasEffectCamera>,
+            Without<WorldCamera>,
+            Without<WorldEffectCamera>,
+        ),
+    >,
+) {
+    let mut completed = Vec::new();
+    if let Some(tween) = tweens.active.as_mut() {
+        if let Some(blur_tween) = tween.blur.as_mut() {
+            blur_tween.timer.tick(time.delta());
+            camera_state.blur_intensity = blur_tween.from.lerp(
+                blur_tween.to,
+                apply_character_ease(blur_tween.ease, tween_fraction(&blur_tween.timer)),
+            );
+        }
+        if let Some(zoom_tween) = tween.zoom.as_mut() {
+            zoom_tween.timer.tick(time.delta());
+            camera_state.zoom = zoom_tween.from.lerp(
+                zoom_tween.to,
+                apply_character_ease(zoom_tween.ease, tween_fraction(&zoom_tween.timer)),
+            );
+        }
+        if let Some(center_tween) = tween.center.as_mut() {
+            center_tween.timer.tick(time.delta());
+            camera_state.center = center_tween.from.lerp(
+                center_tween.to,
+                apply_character_ease(center_tween.ease, tween_fraction(&center_tween.timer)),
+            );
+        }
+
+        let blur_finished = tween
+            .blur
+            .as_ref()
+            .is_none_or(|tween| tween.timer.is_finished());
+        let zoom_finished = tween
+            .zoom
+            .as_ref()
+            .is_none_or(|tween| tween.timer.is_finished());
+        let center_finished = tween
+            .center
+            .as_ref()
+            .is_none_or(|tween| tween.timer.is_finished());
+        let mut pending = Vec::new();
+        for completion in tween.completions.drain(..) {
+            if (!completion.blur || blur_finished)
+                && (!completion.zoom || zoom_finished)
+                && (!completion.center || center_finished)
+            {
+                completed.push(completion);
+            } else {
+                pending.push(completion);
+            }
+        }
+        tween.completions = pending;
+    }
+    for completion in completed {
+        complete_missing_animation(&mut animations, completion.animation_id, completion.done);
+    }
+    if tweens
+        .active
+        .as_ref()
+        .is_some_and(|tween| tween.completions.is_empty())
+    {
+        tweens.active = None;
+    }
+
+    let world_active = matches!(camera_state.effect_scope, CameraEffectScope::World);
+    for mut blur in &mut effect_cameras {
+        blur.set_radius(if world_active {
+            camera_state.blur_intensity
+        } else {
+            0.0
+        });
+    }
+    for (mut projection, mut transform) in &mut world_cameras {
+        if let Projection::Orthographic(projection) = projection.as_mut() {
+            projection.scale = if world_active {
+                1.0 / camera_state.zoom.max(0.01)
+            } else {
+                1.0
+            };
+        }
+        transform.translation.x = if world_active {
+            camera_state.center.x
+        } else {
+            0.0
+        };
+        transform.translation.y = if world_active {
+            camera_state.center.y
+        } else {
+            0.0
+        };
+    }
+    if let Ok((mut projection, mut transform, mut blur)) = canvas_camera.single_mut() {
+        blur.set_radius(if world_active {
+            0.0
+        } else {
+            camera_state.blur_intensity
+        });
+        if let Projection::Orthographic(projection) = projection.as_mut() {
+            projection.scale = if world_active {
+                1.0
+            } else {
+                1.0 / camera_state.zoom.max(0.01)
+            };
+        }
+        transform.translation.x = if world_active {
+            0.0
+        } else {
+            camera_state.center.x
+        };
+        transform.translation.y = if world_active {
+            0.0
+        } else {
+            camera_state.center.y
+        };
+    }
 }
 
 #[cfg(test)]
