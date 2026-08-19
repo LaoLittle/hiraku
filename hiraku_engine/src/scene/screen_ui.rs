@@ -44,9 +44,6 @@ pub fn cleanup_stale_screen_ui(
             }
             screen_state.active_root = Some(pending.entity);
             screen_state.waiting = pending.done;
-            if let Some(shown) = pending.shown {
-                let _ = shown.send(ScriptResponse::Continue);
-            }
         } else {
             if screen_images_ready(&images, &pending.wait_images) {
                 commands
@@ -875,6 +872,7 @@ pub(super) fn window_cursor_to_canvas(
 
 pub fn handle_screen_buttons(
     mut screen_state: ResMut<ScreenUiState>,
+    mut responses: MessageWriter<ScriptResponseMessage>,
     mut interaction_query: Query<
         (&Interaction, &mut BackgroundColor, &ScreenUiButton),
         Changed<Interaction>,
@@ -903,7 +901,10 @@ pub fn handle_screen_buttons(
                 let Some(done) = screen_state.waiting.take() else {
                     continue;
                 };
-                let _ = done.send(ScriptResponse::Choice(button.value.clone()));
+                responses.write(ScriptResponseMessage {
+                    request: done,
+                    response: ScriptResponse::Choice(button.value.clone()),
+                });
             }
             Interaction::Hovered => {
                 *color = button.hovered_background.into();
@@ -923,6 +924,7 @@ pub fn handle_screen_buttons(
 
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
+    mut responses: MessageWriter<ScriptResponseMessage>,
     mut interaction_query: Query<
         (
             &Interaction,
@@ -956,7 +958,10 @@ pub fn handle_screen_image_buttons(
                 let Some(done) = screen_state.waiting.take() else {
                     continue;
                 };
-                let _ = done.send(ScriptResponse::Choice(button.value.clone()));
+                responses.write(ScriptResponseMessage {
+                    request: done,
+                    response: ScriptResponse::Choice(button.value.clone()),
+                });
             }
             Interaction::Hovered if button.enabled || button.hovered_when_disabled => {
                 image.image = button

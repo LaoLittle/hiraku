@@ -334,8 +334,8 @@ pub struct ScreenUiState {
     pub pending_root: Option<PendingScreenRoot>,
     /// Old roots kept under the active screen for flicker-free replacement.
     pub stale_roots: Vec<StaleScreenRoot>,
-    /// Response channel for the script currently blocked in `screen(...)`.
-    pub waiting: Option<std::sync::mpsc::Sender<crate::script::ScriptResponse>>,
+    /// Stable request currently blocked in `openUi(...)`.
+    pub waiting: Option<crate::script::ScriptRequestId>,
 }
 
 /// Active non-modal overlays spawned by `show_overlay(...)`.
@@ -355,9 +355,8 @@ pub struct PendingScreenRoot {
     pub wait_images: Vec<Handle<Image>>,
     /// Extra update frames after image readiness, allowing layout and texture preparation to settle.
     pub ready_frames_remaining: u8,
-    /// Response channel for the blocked script call.
-    pub shown: Option<std::sync::mpsc::Sender<crate::script::ScriptResponse>>,
-    pub done: Option<std::sync::mpsc::Sender<crate::script::ScriptResponse>>,
+    /// Stable request completed by a button intent.
+    pub done: Option<crate::script::ScriptRequestId>,
 }
 
 /// An old screen root kept briefly under a replacement screen.

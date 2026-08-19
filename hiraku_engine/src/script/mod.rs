@@ -107,11 +107,10 @@ pub enum ScriptCommand {
     ResetUiStyle,
     ShowScreen {
         screen: ScreenSpec,
-        shown: Option<mpsc::Sender<ScriptResponse>>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
+        done: Option<ScriptRequestId>,
     },
     WaitForScreenChoice {
-        done: mpsc::Sender<ScriptResponse>,
+        done: ScriptRequestId,
     },
     ShowOverlay {
         name: String,
@@ -123,7 +122,7 @@ pub enum ScriptCommand {
     Choose {
         prompt: String,
         options: Vec<ChoiceOption>,
-        done: mpsc::Sender<ScriptResponse>,
+        done: ScriptRequestId,
     },
     ShowCharacter {
         actor_id: String,
@@ -408,6 +407,21 @@ pub enum ScriptResponse {
     Choice(StoredValue),
 }
 
+/// Stable identifier joining an ECS-owned script wait with its eventual response.
+///
+/// Request identifiers, unlike Bevy entities or message sequence numbers, can be
+/// retained in a script snapshot and restored deterministically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScriptRequestId(pub u64);
+
+/// Transient response emitted by UI/input systems. Durable waiting state lives
+/// in the script runtime; this message only reports that an external fact occurred.
+#[derive(bevy::prelude::Message, Clone, Debug)]
+pub struct ScriptResponseMessage {
+    pub request: ScriptRequestId,
+    pub response: ScriptResponse,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScriptBootstrap {
     pub startup_script: String,
@@ -468,9 +482,11 @@ pub fn start_hks_runtime(
     runtime.current_script = Some(bootstrap.startup_script);
     runtime.events.clear();
     runtime.wait_response = None;
+    runtime.wait_request = None;
     runtime.pending_input_variable = bootstrap.pending_input_variable;
     runtime.pending_ui_screen = bootstrap.pending_ui_screen;
-    runtime.pending_response = None;
+    runtime.pending_request = None;
+    runtime.response_inbox.clear();
     if let Some(wait) = restored_wait {
         runtime.events.push_back(IrEvent::Waiting(wait.clone()));
         if matches!(wait, IrWaitKind::UiIntent | IrWaitKind::ScreenChoice)

@@ -42,7 +42,7 @@ pub use script::{
     IrChoiceOption, IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram,
     IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind,
 };
-use script::{IrRuntime, compile_story_program, tick_ir_runtime};
+use script::{IrRuntime, ScriptResponseMessage, compile_story_program, tick_ir_runtime};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
@@ -134,6 +134,7 @@ impl Plugin for HirakuPlugin {
             .init_asset::<TextureAtlasLayout>()
             .init_resource::<texture::TextureAtlasCatalog>()
             .insert_non_send(IrRuntime::default())
+            .add_message::<ScriptResponseMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(

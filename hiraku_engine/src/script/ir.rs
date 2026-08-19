@@ -427,12 +427,38 @@ pub struct IrRuntime {
     pub vm: Option<IrVm>,
     pub events: VecDeque<IrEvent>,
     pub wait_response: Option<mpsc::Receiver<super::ScriptResponse>>,
+    pub wait_request: Option<super::ScriptRequestId>,
     pub current_script: Option<String>,
     pub pending_input_variable: Option<String>,
     pub pending_ui_screen: Option<String>,
-    pub pending_response: Option<mpsc::Receiver<super::ScriptResponse>>,
+    pub pending_request: Option<super::ScriptRequestId>,
+    pub response_inbox: BTreeMap<super::ScriptRequestId, super::ScriptResponse>,
+    pub next_request_id: u64,
     pub next_native_task_id: u64,
     pub native_tasks: BTreeMap<String, mpsc::Receiver<super::ScriptResponse>>,
+}
+
+impl IrRuntime {
+    pub fn allocate_request(&mut self) -> super::ScriptRequestId {
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .expect("script request identifier space must not be exhausted");
+        super::ScriptRequestId(self.next_request_id)
+    }
+
+    pub fn accept_response(&mut self, message: super::ScriptResponseMessage) {
+        self.response_inbox
+            .insert(message.request, message.response);
+    }
+
+    pub fn take_response(
+        &mut self,
+        request: super::ScriptRequestId,
+    ) -> Option<super::ScriptResponse> {
+        self.response_inbox.retain(|id, _| *id >= request);
+        self.response_inbox.remove(&request)
+    }
 }
 
 pub fn tick_ir_runtime(mut runtime: bevy::prelude::NonSendMut<IrRuntime>) {
@@ -447,6 +473,29 @@ pub fn tick_ir_runtime(mut runtime: bevy::prelude::NonSendMut<IrRuntime>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_request_ids_are_stable_and_monotonic() {
+        let mut runtime = IrRuntime::default();
+        assert_eq!(runtime.allocate_request(), super::super::ScriptRequestId(1));
+        assert_eq!(runtime.allocate_request(), super::super::ScriptRequestId(2));
+    }
+
+    #[test]
+    fn script_responses_are_correlated_even_when_they_arrive_early() {
+        let mut runtime = IrRuntime::default();
+        let first = runtime.allocate_request();
+        let second = runtime.allocate_request();
+        runtime.accept_response(super::super::ScriptResponseMessage {
+            request: second,
+            response: super::super::ScriptResponse::Continue,
+        });
+        assert!(runtime.take_response(first).is_none());
+        assert!(matches!(
+            runtime.take_response(second),
+            Some(super::super::ScriptResponse::Continue)
+        ));
+    }
 
     #[test]
     fn executes_commands_and_waits_at_stable_program_counters() {

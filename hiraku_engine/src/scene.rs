@@ -25,9 +25,10 @@ use crate::{
     },
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, IrCommand, IrEvent, IrRuntime, IrVm,
-        IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptResponse,
-        UiContext, UiIntent, VoicePlaybackMode, compile_story_program, evaluate_ui_script,
-        save_runtime_slot, script_command_from_ir, start_hks_runtime,
+        IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptRequestId,
+        ScriptResponse, ScriptResponseMessage, UiContext, UiIntent, VoicePlaybackMode,
+        compile_story_program, evaluate_ui_script, save_runtime_slot, script_command_from_ir,
+        start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -269,7 +270,7 @@ pub struct DialogueCharSpan {
 
 #[derive(Resource, Default)]
 pub struct ChoiceState {
-    pub waiting: Option<mpsc::Sender<ScriptResponse>>,
+    pub waiting: Option<ScriptRequestId>,
     pub options: Vec<ChoiceOption>,
 }
 
@@ -307,12 +308,17 @@ pub struct PendingScriptCommands {
 
 pub fn bridge_ir_events(
     mut runtime: NonSendMut<IrRuntime>,
+    mut response_messages: MessageReader<ScriptResponseMessage>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
     textures: Option<Res<TextureCatalog>>,
     audio: Option<Res<AudioCatalog>>,
     vfs: Res<VfsResource>,
     user_settings: Res<UserSettings>,
 ) {
+    for message in response_messages.read() {
+        runtime.accept_response(message.clone());
+    }
+
     if let Some(receiver) = runtime.wait_response.as_ref() {
         let response = receiver.try_recv();
         match response {
@@ -344,6 +350,34 @@ pub fn bridge_ir_events(
         }
     }
 
+    if let Some(request) = runtime.wait_request {
+        let Some(response) = runtime.take_response(request) else {
+            return;
+        };
+        match response {
+            ScriptResponse::Choice(value) => {
+                let value = if let Some(screen) = runtime.pending_ui_screen.take() {
+                    UiIntent { screen, value }.value
+                } else {
+                    value
+                };
+                if let Some(variable) = runtime.pending_input_variable.take()
+                    && let Some(vm) = runtime.vm.as_mut()
+                {
+                    vm.set_stored_value(variable, value);
+                }
+            }
+            ScriptResponse::Continue => {
+                runtime.pending_input_variable = None;
+                runtime.pending_ui_screen = None;
+            }
+        }
+        runtime.wait_request = None;
+        if let Some(vm) = runtime.vm.as_mut() {
+            vm.resume();
+        }
+    }
+
     let Some(event) = runtime.events.pop_front() else {
         return;
     };
@@ -365,7 +399,9 @@ pub fn bridge_ir_events(
                     runtime.wait_response = None;
                     runtime.pending_input_variable = None;
                     runtime.pending_ui_screen = None;
-                    runtime.pending_response = None;
+                    runtime.pending_request = None;
+                    runtime.wait_request = None;
+                    runtime.response_inbox.clear();
                     runtime.native_tasks.clear();
                 }
                 Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
@@ -376,10 +412,10 @@ pub fn bridge_ir_events(
             options,
             result,
         }) => {
-            let (response_tx, response_rx) = mpsc::channel();
+            let request = runtime.allocate_request();
             runtime.pending_input_variable = Some(result);
             runtime.pending_ui_screen = None;
-            runtime.pending_response = Some(response_rx);
+            runtime.pending_request = Some(request);
             pending_script_commands
                 .items
                 .push_back(ScriptCommand::Choose {
@@ -391,7 +427,7 @@ pub fn bridge_ir_events(
                             value: StoredValue::String(option.value),
                         })
                         .collect(),
-                    done: response_tx,
+                    done: request,
                 });
         }
         IrEvent::Command(IrCommand::OpenUi { path, result }) => {
@@ -424,24 +460,23 @@ pub fn bridge_ir_events(
                     evaluate_ui_script(&source, &UiContext::new(story), textures)
                         .map_err(|error| error.to_string())
                 });
-            let (response_tx, response_rx) = mpsc::channel();
+            let request = runtime.allocate_request();
             runtime.pending_input_variable = Some(result);
             runtime.pending_ui_screen = Some(target.clone());
-            runtime.pending_response = Some(response_rx);
+            runtime.pending_request = Some(request);
             match screen {
                 Ok(screen) => pending_script_commands
                     .items
                     .push_back(ScriptCommand::ShowScreen {
                         screen,
-                        shown: None,
-                        done: Some(response_tx),
+                        done: Some(request),
                     }),
                 Err(error) => {
                     warn!("failed to render UI script `{target}`: {error}");
                     runtime.vm = None;
                     runtime.pending_input_variable = None;
                     runtime.pending_ui_screen = None;
-                    runtime.pending_response = None;
+                    runtime.pending_request = None;
                 }
             }
         }
@@ -630,9 +665,17 @@ pub fn bridge_ir_events(
         },
         IrEvent::Waiting(wait_kind) => {
             if matches!(wait_kind, IrWaitKind::ScreenChoice | IrWaitKind::UiIntent)
-                && let Some(receiver) = runtime.pending_response.take()
+                && let Some(request) = runtime.pending_request.take()
             {
-                runtime.wait_response = Some(receiver);
+                runtime.wait_request = Some(request);
+                return;
+            }
+            if matches!(wait_kind, IrWaitKind::ScreenChoice | IrWaitKind::UiIntent) {
+                let request = runtime.allocate_request();
+                runtime.wait_request = Some(request);
+                pending_script_commands
+                    .items
+                    .push_back(ScriptCommand::WaitForScreenChoice { done: request });
                 return;
             }
             let (response_tx, response_rx) = mpsc::channel();
@@ -640,10 +683,9 @@ pub fn bridge_ir_events(
                 IrWaitKind::DialogueAdvance => {
                     ScriptCommand::AwaitDialogueAdvance { done: response_tx }
                 }
-                IrWaitKind::ScreenChoice => {
-                    ScriptCommand::WaitForScreenChoice { done: response_tx }
+                IrWaitKind::ScreenChoice | IrWaitKind::UiIntent => {
+                    unreachable!("interactive waits are handled through ECS request messages")
                 }
-                IrWaitKind::UiIntent => ScriptCommand::WaitForScreenChoice { done: response_tx },
                 IrWaitKind::TaskCompletion => ScriptCommand::WaitAnimations {
                     ids: Vec::new(),
                     done: response_tx,
@@ -1903,7 +1945,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     ir_runtime.wait_response = None;
                     ir_runtime.pending_input_variable = None;
                     ir_runtime.pending_ui_screen = None;
-                    ir_runtime.pending_response = None;
+                    ir_runtime.pending_request = None;
+                    ir_runtime.wait_request = None;
+                    ir_runtime.response_inbox.clear();
                 }
                 Err(error) => warn!("failed to start IR program: {error}"),
             },
@@ -2449,11 +2493,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut hint_color,
                 );
             }
-            ScriptCommand::ShowScreen {
-                screen,
-                shown,
-                done,
-            } => {
+            ScriptCommand::ShowScreen { screen, done } => {
                 let spawned = spawn_screen_ui(
                     &mut commands,
                     &asset_server,
@@ -2471,9 +2511,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z)));
                     screen_state.active_root = Some(root);
                     screen_state.waiting = done;
-                    if let Some(shown) = shown {
-                        let _ = shown.send(ScriptResponse::Continue);
-                    }
                 } else {
                     commands
                         .entity(root)
@@ -2483,7 +2520,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         previous,
                         wait_images: spawned.image_handles,
                         ready_frames_remaining: SCREEN_READY_FRAMES,
-                        shown,
                         done,
                     });
                     screen_state.waiting = None;
@@ -2493,7 +2529,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if screen_state.active_root.is_some() && screen_state.pending_root.is_none() {
                     screen_state.waiting = Some(done);
                 } else {
-                    let _ = done.send(ScriptResponse::Continue);
+                    commands.write_message(ScriptResponseMessage {
+                        request: done,
+                        response: ScriptResponse::Continue,
+                    });
                 }
             }
             ScriptCommand::ShowOverlay { name, screen } => {
@@ -3013,7 +3052,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             ir_runtime.wait_response = None;
                             ir_runtime.pending_input_variable = None;
                             ir_runtime.pending_ui_screen = None;
-                            ir_runtime.pending_response = None;
+                            ir_runtime.pending_request = None;
+                            ir_runtime.wait_request = None;
+                            ir_runtime.response_inbox.clear();
                         }
                         Err(error) => warn!("failed to return to HKS title: {error}"),
                     }
@@ -4363,7 +4404,10 @@ fn resolve_choice(
 
     clear_choice_ui(commands, choice_ui);
     choice_state.options.clear();
-    let _ = done.send(ScriptResponse::Choice(selected.value));
+    commands.write_message(ScriptResponseMessage {
+        request: done,
+        response: ScriptResponse::Choice(selected.value),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
