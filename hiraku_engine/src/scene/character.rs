@@ -36,11 +36,7 @@ pub fn animate_character_motion_effects(
                 .insert(effect.actor_id.clone(), actor_position);
 
             if effect.elapsed >= effect.duration {
-                complete_missing_animation(
-                    &mut animations,
-                    effect.animation_id.take(),
-                    effect.done.take(),
-                );
+                complete_missing_animation(&mut animations, effect.animation_id.take());
                 commands
                     .entity(entity)
                     .try_remove::<CharacterTimelineEffect>();
@@ -52,11 +48,7 @@ pub fn animate_character_motion_effects(
             let progress = tween_fraction(&effect.timer);
             translation.y += (std::f32::consts::PI * progress).sin().max(0.0) * effect.height;
             if effect.timer.is_finished() {
-                complete_missing_animation(
-                    &mut animations,
-                    effect.animation_id.take(),
-                    effect.done.take(),
-                );
+                complete_missing_animation(&mut animations, effect.animation_id.take());
                 commands.entity(entity).try_remove::<CharacterJumpEffect>();
             }
         }
@@ -71,11 +63,7 @@ pub fn animate_character_motion_effects(
                 0.0,
             );
             if effect.timer.is_finished() {
-                complete_missing_animation(
-                    &mut animations,
-                    effect.animation_id.take(),
-                    effect.done.take(),
-                );
+                complete_missing_animation(&mut animations, effect.animation_id.take());
                 commands.entity(entity).try_remove::<CharacterShakeEffect>();
             }
         }
@@ -112,7 +100,7 @@ pub fn poll_pending_character_shows(
             for id in item.entity_ids.drain(..) {
                 stage.sprites.remove(&id);
             }
-            complete_missing_animation(&mut animations, item.animation_id.take(), item.done.take());
+            complete_missing_animation(&mut animations, item.animation_id.take());
             return false;
         }
 
@@ -132,17 +120,11 @@ pub fn poll_pending_character_shows(
             return true;
         }
 
-        completed.push((
-            item.entities.clone(),
-            item.fade,
-            item.animation_id.take(),
-            item.done.take(),
-        ));
+        completed.push((item.entities.clone(), item.fade, item.animation_id.take()));
         false
     });
 
-    for (entities, fade, animation_id, done) in completed {
-        let mut pending_done = done;
+    for (entities, fade, animation_id) in completed {
         let mut pending_animation = animation_id;
         for (index, entity) in entities.into_iter().enumerate() {
             if let Ok((mut sprite, mut visibility)) = sprites.get_mut(entity) {
@@ -158,7 +140,6 @@ pub fn poll_pending_character_shows(
                         to_scale: None,
                         timer: Timer::new(fade, TimerMode::Once),
                         animation_id: (index == 0).then(|| pending_animation.take()).flatten(),
-                        done: (index == 0).then(|| pending_done.take()).flatten(),
                         despawn_on_finish: false,
                     });
                 }
@@ -166,7 +147,7 @@ pub fn poll_pending_character_shows(
         }
 
         if fade.is_none() {
-            complete_missing_animation(&mut animations, pending_animation, pending_done);
+            complete_missing_animation(&mut animations, pending_animation);
         }
     }
 }
@@ -184,7 +165,6 @@ pub(super) fn queue_character_show(
     scale: f32,
     fade: Option<std::time::Duration>,
     animation_id: Option<String>,
-    done: Option<mpsc::Sender<ScriptResponse>>,
 ) {
     let mut entities = Vec::new();
     let mut entity_ids = Vec::new();
@@ -223,7 +203,7 @@ pub(super) fn queue_character_show(
     }
 
     if entities.is_empty() {
-        complete_missing_animation(animations, animation_id, done);
+        complete_missing_animation(animations, animation_id);
         return;
     }
 
@@ -234,7 +214,6 @@ pub(super) fn queue_character_show(
         handles,
         fade,
         animation_id,
-        done,
     });
 }
 
@@ -246,7 +225,6 @@ pub(super) fn apply_character_motion(
     kind: CharacterMotionKind,
     duration: std::time::Duration,
     animation_id: Option<String>,
-    done: Option<mpsc::Sender<ScriptResponse>>,
     animations: &mut AnimationState,
 ) {
     let prefix = character_part_prefix(actor_id);
@@ -260,12 +238,11 @@ pub(super) fn apply_character_motion(
     part_ids.sort_by(|left, right| left.0.cmp(&right.0));
 
     if part_ids.is_empty() {
-        complete_missing_animation(animations, animation_id, done);
+        complete_missing_animation(animations, animation_id);
         return;
     }
 
     let mut pending_animation = animation_id;
-    let mut pending_done = done;
     for (index, (id, x, y, layer)) in part_ids.into_iter().enumerate() {
         let Some(entity) = stage.sprites.get(&id).copied() else {
             continue;
@@ -277,7 +254,6 @@ pub(super) fn apply_character_motion(
                     timer: Timer::new(duration, TimerMode::Once),
                     height,
                     animation_id: (index == 0).then(|| pending_animation.take()).flatten(),
-                    done: (index == 0).then(|| pending_done.take()).flatten(),
                 });
             }
             CharacterMotionKind::Shake { amplitude } => {
@@ -286,7 +262,6 @@ pub(super) fn apply_character_motion(
                     timer: Timer::new(duration, TimerMode::Once),
                     amplitude,
                     animation_id: (index == 0).then(|| pending_animation.take()).flatten(),
-                    done: (index == 0).then(|| pending_done.take()).flatten(),
                 });
             }
         }
@@ -301,11 +276,10 @@ pub(super) fn apply_character_timeline(
     actor_id: &str,
     keyframes: Vec<ResolvedCharacterKeyframe>,
     animation_id: Option<String>,
-    done: Option<mpsc::Sender<ScriptResponse>>,
     animations: &mut AnimationState,
 ) {
     let Some(actor_origin) = stage.character_positions.get(actor_id).copied() else {
-        complete_missing_animation(animations, animation_id, done);
+        complete_missing_animation(animations, animation_id);
         return;
     };
 
@@ -316,7 +290,7 @@ pub(super) fn apply_character_timeline(
                 .character_positions
                 .insert(actor_id.to_string(), final_position);
         }
-        complete_missing_animation(animations, animation_id, done);
+        complete_missing_animation(animations, animation_id);
         return;
     }
 
@@ -331,12 +305,11 @@ pub(super) fn apply_character_timeline(
     part_ids.sort_by(|left, right| left.0.cmp(&right.0));
 
     if part_ids.is_empty() {
-        complete_missing_animation(animations, animation_id, done);
+        complete_missing_animation(animations, animation_id);
         return;
     }
 
     let mut pending_animation = animation_id;
-    let mut pending_done = done;
     for (index, (id, x, y, layer)) in part_ids.into_iter().enumerate() {
         let Some(entity) = stage.sprites.get(&id).copied() else {
             continue;
@@ -349,7 +322,6 @@ pub(super) fn apply_character_timeline(
             elapsed: 0.0,
             duration,
             animation_id: (index == 0).then(|| pending_animation.take()).flatten(),
-            done: (index == 0).then(|| pending_done.take()).flatten(),
         });
     }
 }

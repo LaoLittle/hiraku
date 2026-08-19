@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::mpsc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use bevy::math::Vec2;
 use serde::Deserialize;
@@ -14,14 +14,71 @@ use crate::{
     vfs::VfsResource,
 };
 
+mod hks_runtime;
 mod ir;
 pub mod ui_runtime;
+
+pub use hks_runtime::{HksRuntime, HksRuntimeError, HksRuntimeEvent};
 
 pub use ir::{
     CameraEffectScope, IrChoiceOption, IrCommand, IrEvent, IrExpression, IrExpressionId,
     IrInstruction, IrProgram, IrRuntime, IrValidationError, IrVm, IrVmSnapshot, IrVmStatus,
     IrWaitKind, tick_ir_runtime,
 };
+
+impl From<crate::hks_capabilities::StoryEffect> for IrCommand {
+    fn from(effect: crate::hks_capabilities::StoryEffect) -> Self {
+        use crate::hks_capabilities::StoryEffect;
+
+        match effect {
+            StoryEffect::Log(message) => Self::Log(message),
+            StoryEffect::ClearDialogue => Self::ClearDialogue,
+            StoryEffect::StopBgm => Self::StopBgm,
+            StoryEffect::Exit => Self::Exit,
+            StoryEffect::ReturnToTitle => Self::ReturnToTitle,
+            StoryEffect::SetBackground { texture } => Self::SetBackground { texture },
+            StoryEffect::LoadScript { path } => Self::LoadScript { path },
+            StoryEffect::AdjustSetting { name, delta } => Self::AdjustSetting { name, delta },
+            StoryEffect::PlayBgm {
+                path,
+                volume,
+                fade_in_ms,
+            } => Self::PlayBgm {
+                path,
+                volume,
+                fade_in_ms,
+            },
+            StoryEffect::Say { speaker, text } => Self::Say { speaker, text },
+            StoryEffect::PlayVoice { path, volume } => Self::PlayVoice { path, volume },
+            StoryEffect::SetCamera {
+                blur,
+                zoom,
+                scope,
+                duration_ms,
+                ease,
+            } => Self::SetCamera {
+                blur,
+                zoom,
+                scope,
+                duration_ms,
+                ease,
+            },
+            StoryEffect::ShowCharacter {
+                actor_id,
+                character_name,
+                expressions,
+                position,
+                scale,
+            } => Self::ShowCharacter {
+                actor_id,
+                character_name,
+                expressions,
+                position,
+                scale,
+            },
+        }
+    }
+}
 pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
 
 pub(crate) fn compile_story_program(path: &str, source: &str) -> Result<IrProgram, String> {
@@ -44,7 +101,6 @@ pub enum ScriptCommand {
         path: String,
         fade: Option<Duration>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     ShowSprite {
         id: String,
@@ -55,35 +111,30 @@ pub enum ScriptCommand {
         scale: f32,
         fade: Option<Duration>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     HideSprite {
         id: String,
         fade: Option<Duration>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     SetOverlay {
         alpha: f32,
         fade: Option<Duration>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     Say {
         speaker: String,
         text: String,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     AwaitDialogueAdvance {
-        done: mpsc::Sender<ScriptResponse>,
+        done: ScriptRequestId,
     },
     SetDialogue {
         speaker: String,
         text: String,
         reveal_from: Option<usize>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     ClearDialogue,
     SetTextEffect(DialogueTextEffectSpec),
@@ -96,7 +147,6 @@ pub enum ScriptCommand {
         duration: Duration,
         ease: CharacterEase,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     ApplyUserSettings(crate::storage::UserSettings),
     AdjustUserSetting {
@@ -132,7 +182,6 @@ pub enum ScriptCommand {
         scale: f32,
         fade: Option<Duration>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     HideCharacter {
         actor_id: String,
@@ -142,29 +191,24 @@ pub enum ScriptCommand {
         height: f32,
         duration: Duration,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     ShakeCharacter {
         actor_id: String,
         amplitude: f32,
         duration: Duration,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     AnimateCharacter {
         actor_id: String,
         keyframes: Vec<ResolvedCharacterKeyframe>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     RestoreSnapshot {
         snapshot: SceneSnapshot,
-        done: mpsc::Sender<ScriptResponse>,
     },
     PlayCustomEffect {
         options: CustomEffectOptions,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     RuleTransitionBg {
         path: String,
@@ -172,50 +216,44 @@ pub enum ScriptCommand {
         duration: Duration,
         vague: f32,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     MoveSprite {
         id: String,
         position: Vec2,
         duration: Duration,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     ScaleSprite {
         id: String,
         scale: f32,
         duration: Duration,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     FadeSprite {
         id: String,
         alpha: f32,
         duration: Duration,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     Wait {
         duration: Duration,
         animation_id: Option<String>,
-        done: mpsc::Sender<ScriptResponse>,
+        done: ScriptRequestId,
     },
     WaitAnimations {
         ids: Vec<String>,
-        done: mpsc::Sender<ScriptResponse>,
+        done: ScriptRequestId,
     },
     Shake {
         duration: Duration,
         amplitude: f32,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     PlayBgm {
         path: String,
         volume: f32,
         fade_in: Option<Duration>,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     SetBgmVolume {
         volume: f32,
@@ -224,7 +262,6 @@ pub enum ScriptCommand {
         volume: f32,
         duration: Duration,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     StopBgm,
     PlayVoice {
@@ -232,7 +269,6 @@ pub enum ScriptCommand {
         volume: f32,
         mode: VoicePlaybackMode,
         animation_id: Option<String>,
-        done: Option<mpsc::Sender<ScriptResponse>>,
     },
     StopVoice,
     PlaySfx {
@@ -261,7 +297,6 @@ pub(crate) fn script_command_from_ir(
             speaker,
             text,
             animation_id: None,
-            done: None,
         },
         IrCommand::StopBgm => ScriptCommand::StopBgm,
         IrCommand::PlayBgm {
@@ -273,14 +308,12 @@ pub(crate) fn script_command_from_ir(
             volume,
             fade_in: fade_in_ms.map(Duration::from_millis),
             animation_id: None,
-            done: None,
         },
         IrCommand::PlayVoice { path, volume } => ScriptCommand::PlayVoice {
             path,
             volume,
             mode: VoicePlaybackMode::Exclusive,
             animation_id: None,
-            done: None,
         },
         IrCommand::SetCamera {
             blur,
@@ -296,7 +329,6 @@ pub(crate) fn script_command_from_ir(
             duration: Duration::from_millis(duration_ms),
             ease: parse_ir_camera_ease(&ease)?,
             animation_id: None,
-            done: None,
         },
         IrCommand::AdjustSetting { name, delta } => {
             ScriptCommand::AdjustUserSetting { name, delta }
@@ -317,7 +349,6 @@ pub(crate) fn script_command_from_ir(
                 path: definition.path.clone(),
                 fade: None,
                 animation_id: None,
-                done: None,
             }
         }
         IrCommand::ShowCharacter {
@@ -334,7 +365,6 @@ pub(crate) fn script_command_from_ir(
             scale,
             fade: None,
             animation_id: None,
-            done: None,
         },
         IrCommand::HksStatement { .. } | IrCommand::WaitHksTask { .. } => {
             return Err("HKS native statements are handled by the IR runtime".to_string());
@@ -481,7 +511,6 @@ pub fn start_hks_runtime(
     runtime.vm = Some(vm);
     runtime.current_script = Some(bootstrap.startup_script);
     runtime.events.clear();
-    runtime.wait_response = None;
     runtime.wait_request = None;
     runtime.pending_input_variable = bootstrap.pending_input_variable;
     runtime.pending_ui_screen = bootstrap.pending_ui_screen;

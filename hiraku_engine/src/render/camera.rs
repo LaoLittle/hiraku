@@ -1,10 +1,3 @@
-use bevy::{
-    camera::{ClearColorConfig, RenderTarget, visibility::RenderLayers},
-    prelude::*,
-    render::render_resource::TextureFormat,
-};
-use std::sync::mpsc;
-
 use crate::{
     HirakuCanvas, RuntimeLaunchConfig,
     effect::blur::BlurSettings,
@@ -17,8 +10,13 @@ use crate::{
         BackgroundLayer, ChoiceUi, DialogueRoot, FrontendRoot, OverlayMarker, PauseMenuRoot,
         SpriteActor,
     },
-    script::{CharacterEase, ScriptResponse},
+    script::CharacterEase,
     ui::ScreenUiRoot,
+};
+use bevy::{
+    camera::{ClearColorConfig, RenderTarget, visibility::RenderLayers},
+    prelude::*,
+    render::render_resource::TextureFormat,
 };
 
 /// Static background artwork and background-only effects such as rain or fog.
@@ -114,7 +112,6 @@ pub struct CameraTweenCompletion {
     pub zoom: bool,
     pub center: bool,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 pub struct CameraScalarTween {
@@ -135,7 +132,6 @@ pub struct CameraShake {
     pub timer: Timer,
     pub amplitude: f32,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 pub fn setup_stage_cameras(
@@ -350,9 +346,6 @@ pub fn animate_camera_shake(
         if let Some(animation_id) = shake.animation_id.take() {
             animations.completed.insert(animation_id);
         }
-        if let Some(done) = shake.done.take() {
-            let _ = done.send(ScriptResponse::Continue);
-        }
         shake_state.active = None;
     }
 }
@@ -368,7 +361,6 @@ pub(crate) fn start_camera_tween(
     duration: std::time::Duration,
     ease: CharacterEase,
     animation_id: Option<String>,
-    done: Option<mpsc::Sender<ScriptResponse>>,
     animations: &mut AnimationState,
 ) {
     camera.effect_scope = scope;
@@ -400,7 +392,7 @@ pub(crate) fn start_camera_tween(
         if let Some(center) = center {
             camera.center = center;
         }
-        complete_missing_animation(animations, animation_id, done);
+        complete_missing_animation(animations, animation_id);
         return;
     }
 
@@ -446,7 +438,6 @@ pub(crate) fn start_camera_tween(
         zoom: zoom.is_some(),
         center: center.is_some(),
         animation_id,
-        done,
     });
 }
 
@@ -460,7 +451,7 @@ fn cancel_camera_completions(
     let mut retained = Vec::new();
     for completion in tween.completions.drain(..) {
         if (blur && completion.blur) || (zoom && completion.zoom) || (center && completion.center) {
-            complete_missing_animation(animations, completion.animation_id, completion.done);
+            complete_missing_animation(animations, completion.animation_id);
         } else {
             retained.push(completion);
         }
@@ -537,7 +528,7 @@ pub fn animate_camera_transition(
         tween.completions = pending;
     }
     for completion in completed {
-        complete_missing_animation(&mut animations, completion.animation_id, completion.done);
+        complete_missing_animation(&mut animations, completion.animation_id);
     }
     if tweens
         .active

@@ -1,9 +1,9 @@
 use bevy::{
-    asset::{AssetPath, Handle},
+    asset::Handle,
     prelude::*,
     reflect::TypePath,
     render::render_resource::{AsBindGroup, ShaderType},
-    shader::{Shader, ShaderRef},
+    shader::ShaderRef,
     sprite_render::{AlphaMode2d, Material2d},
 };
 
@@ -100,5 +100,4 @@ pub struct CustomScreenEffectPlayer {
     pub target_image: Option<Handle<Image>>,
     pub previous_background: Option<Entity>,
     pub animation_id: Option<String>,
-    pub done: Option<std::sync::mpsc::Sender<crate::script::ScriptResponse>>,
 }

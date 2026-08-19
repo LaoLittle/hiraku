@@ -4,13 +4,69 @@ use std::collections::BTreeMap;
 
 use hiraku_script::hks::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
 use hiraku_script::hks::vm::{
-    BuiltinId, BuiltinManifest, Bytecode, TaskEvent, TaskMode, TaskScheduler, TaskStatus, Value,
-    Vm, VmEvent, compile_with_manifest,
+    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, TaskEvent, TaskMode, TaskScheduler,
+    TaskStatus, Value, Vm, VmEvent, compile_with_manifest,
 };
-use hiraku_script::hks::{Expr, Program, Stmt};
+use hiraku_script::hks::{Expr, Program, Stmt, parse_program};
 use thiserror::Error;
 
-use crate::script::{CameraEffectScope, IrCommand, IrWaitKind};
+use crate::script::CameraEffectScope;
+
+/// Engine-facing effects produced by HKS native functions.
+///
+/// This is deliberately independent of the transitional story IR. The direct
+/// runtime can dispatch these effects to ECS, while the legacy bridge may still
+/// translate them into `IrCommand` during the migration.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StoryEffect {
+    Log(String),
+    ClearDialogue,
+    StopBgm,
+    Exit,
+    ReturnToTitle,
+    SetBackground {
+        texture: String,
+    },
+    LoadScript {
+        path: String,
+    },
+    AdjustSetting {
+        name: String,
+        delta: f32,
+    },
+    PlayBgm {
+        path: String,
+        volume: f32,
+        fade_in_ms: Option<u64>,
+    },
+    Say {
+        speaker: String,
+        text: String,
+    },
+    PlayVoice {
+        path: String,
+        volume: f32,
+    },
+    SetCamera {
+        blur: Option<f32>,
+        zoom: Option<f32>,
+        scope: CameraEffectScope,
+        duration_ms: u64,
+        ease: String,
+    },
+    ShowCharacter {
+        actor_id: String,
+        character_name: String,
+        expressions: Vec<String>,
+        position: [f32; 2],
+        scale: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoryWait {
+    DialogueAdvance,
+}
 
 const ACTOR_HANDLE_TYPE: u32 = 1;
 const CHAR: BuiltinId = BuiltinId(1);
@@ -31,9 +87,45 @@ const CAMERA_BLUR: BuiltinId = BuiltinId(20);
 const CAMERA_ZOOM: BuiltinId = BuiltinId(21);
 const VOICE: BuiltinId = BuiltinId(22);
 const SAY: BuiltinId = BuiltinId(23);
+pub const OPEN_UI: BuiltinId = BuiltinId(24);
+pub const WAIT: BuiltinId = BuiltinId(25);
 
 pub fn manifest() -> BuiltinManifest {
     registry().manifest()
+}
+
+/// Manifest used by the direct whole-story HKS runtime. Async capabilities are
+/// registered here so the generic compiler can resolve them without engine AST lowering.
+pub fn story_manifest() -> BuiltinManifest {
+    story_registry().manifest()
+}
+
+pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, String> {
+    let program = parse_program(source).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| format!("{} at byte {}", error.message, error.span.start))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
+        |errors| {
+            errors
+                .into_iter()
+                .map(|error| format!("{} at byte {}", error.message, error.span.start))
+                .collect::<Vec<_>>()
+                .join("; ")
+        },
+    )
+}
+
+fn source_hash(path: &str, source: &str) -> u64 {
+    path.bytes()
+        .chain([0])
+        .chain(source.bytes())
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
+        })
 }
 
 fn registry() -> NativeRegistry<CharacterContext> {
@@ -95,6 +187,68 @@ fn registry() -> NativeRegistry<CharacterContext> {
     registry
 }
 
+fn story_registry() -> NativeRegistry<CharacterContext> {
+    let mut registry = registry();
+    registry
+        .register_raw_fn_with_id(OPEN_UI, "openUi", async_capability_placeholder)
+        .expect("built-in `openUi` registration must be unique");
+    registry
+        .register_raw_fn_with_id(WAIT, "wait", async_capability_placeholder)
+        .expect("built-in `wait` registration must be unique");
+    registry
+}
+
+fn async_capability_placeholder(
+    _context: &mut CharacterContext,
+    _call: &BuiltinCall,
+) -> Result<Value, NativeError> {
+    Err(NativeError::message(
+        "async capability requires the direct engine HKS runtime",
+    ))
+}
+
+/// Stateful native-function host for the direct HKS runtime.
+///
+/// It owns statement-scoped actor builders and exposes effects as plain data so
+/// an ECS system can dispatch them without giving native functions world access.
+pub struct StoryNativeHost {
+    context: CharacterContext,
+    registry: NativeRegistry<CharacterContext>,
+}
+
+impl Default for StoryNativeHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StoryNativeHost {
+    pub fn new() -> Self {
+        Self {
+            context: CharacterContext::default(),
+            registry: story_registry(),
+        }
+    }
+
+    pub fn call(&mut self, call: &BuiltinCall) -> Result<Value, CharacterCapabilityError> {
+        self.registry
+            .call(&mut self.context, call)
+            .map_err(|error| CharacterCapabilityError::Native(error.to_string()))
+    }
+
+    pub fn commit_statement(&mut self) -> Result<(), CharacterCapabilityError> {
+        self.context.commit()
+    }
+
+    pub fn drain_effects(&mut self) -> Vec<StoryEffect> {
+        std::mem::take(&mut self.context.commands)
+    }
+
+    pub fn take_wait(&mut self) -> Option<StoryWait> {
+        self.context.wait.take()
+    }
+}
+
 pub fn compile_expression(
     expression: &Expr,
     functions: &[Stmt],
@@ -120,8 +274,8 @@ struct CharacterContext {
     next_handle: u64,
     actors: BTreeMap<u64, PendingActor>,
     handles_by_name: BTreeMap<String, u64>,
-    commands: Vec<IrCommand>,
-    wait: Option<IrWaitKind>,
+    commands: Vec<StoryEffect>,
+    wait: Option<StoryWait>,
 }
 
 impl CharacterContext {
@@ -192,7 +346,7 @@ impl CharacterContext {
                 return Ok(());
             }
             pending.dirty = false;
-            IrCommand::ShowCharacter {
+            StoryEffect::ShowCharacter {
                 actor_id: pending.name.clone(),
                 character_name: pending.name.clone(),
                 expressions: pending.expressions.clone(),
@@ -267,37 +421,39 @@ fn native_scale(
 }
 
 fn native_log(context: &mut CharacterContext, message: String) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::Log(message));
+    context.commands.push(StoryEffect::Log(message));
     Ok(())
 }
 
 fn native_clear_text(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::ClearDialogue);
+    context.commands.push(StoryEffect::ClearDialogue);
     Ok(())
 }
 
 fn native_stop_bgm(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::StopBgm);
+    context.commands.push(StoryEffect::StopBgm);
     Ok(())
 }
 
 fn native_exit(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::Exit);
+    context.commands.push(StoryEffect::Exit);
     Ok(())
 }
 
 fn native_return_to_title(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::ReturnToTitle);
+    context.commands.push(StoryEffect::ReturnToTitle);
     Ok(())
 }
 
 fn native_bg(context: &mut CharacterContext, texture: String) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::SetBackground { texture });
+    context
+        .commands
+        .push(StoryEffect::SetBackground { texture });
     Ok(())
 }
 
 fn native_load_script(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::LoadScript { path });
+    context.commands.push(StoryEffect::LoadScript { path });
     Ok(())
 }
 
@@ -306,7 +462,7 @@ fn native_adjust_setting(
     name: String,
     delta: f64,
 ) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::AdjustSetting {
+    context.commands.push(StoryEffect::AdjustSetting {
         name,
         delta: delta as f32,
     });
@@ -324,7 +480,7 @@ fn native_play_bgm(
             "playBgm volume must be between 0 and 1 and fade must be non-negative",
         ));
     }
-    context.commands.push(IrCommand::PlayBgm {
+    context.commands.push(StoryEffect::PlayBgm {
         path,
         volume: volume as f32,
         fade_in_ms: Some(fade_ms.round() as u64),
@@ -333,11 +489,11 @@ fn native_play_bgm(
 }
 
 fn native_narrate(context: &mut CharacterContext, text: String) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::Say {
+    context.commands.push(StoryEffect::Say {
         speaker: String::new(),
         text,
     });
-    context.wait = Some(IrWaitKind::DialogueAdvance);
+    context.wait = Some(StoryWait::DialogueAdvance);
     Ok(())
 }
 
@@ -346,8 +502,8 @@ fn native_say(
     speaker: String,
     text: String,
 ) -> Result<(), NativeError> {
-    context.commands.push(IrCommand::Say { speaker, text });
-    context.wait = Some(IrWaitKind::DialogueAdvance);
+    context.commands.push(StoryEffect::Say { speaker, text });
+    context.wait = Some(StoryWait::DialogueAdvance);
     Ok(())
 }
 
@@ -357,7 +513,7 @@ fn native_voice(context: &mut CharacterContext, path: String) -> Result<(), Nati
     }
     context
         .commands
-        .push(IrCommand::PlayVoice { path, volume: 1.0 });
+        .push(StoryEffect::PlayVoice { path, volume: 1.0 });
     Ok(())
 }
 
@@ -385,7 +541,7 @@ fn native_camera_blur(
             "blur intensity and duration must be non-negative",
         ));
     }
-    context.commands.push(IrCommand::SetCamera {
+    context.commands.push(StoryEffect::SetCamera {
         blur: Some(intensity as f32),
         zoom: None,
         scope,
@@ -421,7 +577,7 @@ fn native_camera_zoom(
             "zoom scale must be positive and duration non-negative",
         ));
     }
-    context.commands.push(IrCommand::SetCamera {
+    context.commands.push(StoryEffect::SetCamera {
         blur: None,
         zoom: Some(scale as f32),
         scope,
@@ -509,15 +665,15 @@ fn actor_handle(value: &Value) -> Result<u64, CharacterCapabilityError> {
 }
 
 pub struct CapabilityOutput {
-    pub commands: Vec<IrCommand>,
-    pub wait: Option<IrWaitKind>,
+    pub commands: Vec<StoryEffect>,
+    pub wait: Option<StoryWait>,
     pub tasks: Vec<CapabilityTask>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct CapabilityTask {
     pub mode: TaskMode,
-    pub commands: Vec<IrCommand>,
+    pub commands: Vec<StoryEffect>,
 }
 
 pub fn execute(bytecode: Bytecode) -> Result<CapabilityOutput, CharacterCapabilityError> {
@@ -666,7 +822,7 @@ mod tests {
         let output = execute(compile_expression(expression, &[], 42).unwrap()).unwrap();
         assert_eq!(output.commands.len(), 1);
         assert!(
-            matches!(&output.commands[0], IrCommand::ShowCharacter { actor_id, expressions, position, scale, .. }
+            matches!(&output.commands[0], StoryEffect::ShowCharacter { actor_id, expressions, position, scale, .. }
             if actor_id == "Alice" && expressions == &["happy_eyes", "happy_face"]
                 && position == &[600.0, 0.0] && (*scale - 0.5).abs() < f32::EPSILON)
         );
@@ -682,7 +838,7 @@ mod tests {
         assert_eq!(output.wait, None);
         assert_eq!(
             output.commands,
-            vec![IrCommand::PlayVoice {
+            vec![StoryEffect::PlayVoice {
                 path: "voice/scene01/hash1".to_string(),
                 volume: 1.0,
             }]
@@ -713,11 +869,11 @@ mod tests {
         assert_eq!(
             output.tasks[0].commands,
             vec![
-                IrCommand::PlayVoice {
+                StoryEffect::PlayVoice {
                     path: "voice/scene01/first".to_string(),
                     volume: 1.0,
                 },
-                IrCommand::PlayVoice {
+                StoryEffect::PlayVoice {
                     path: "voice/scene01/second".to_string(),
                     volume: 1.0,
                 },
@@ -745,7 +901,7 @@ mod tests {
                 output.tasks[0]
                     .commands
                     .iter()
-                    .all(|command| matches!(command, IrCommand::ShowCharacter { .. }))
+                    .all(|command| matches!(command, StoryEffect::ShowCharacter { .. }))
             );
         }
     }
@@ -757,10 +913,10 @@ mod tests {
             panic!("expected a say expression")
         };
         let output = execute(compile_expression(expression, &[], 44).unwrap()).unwrap();
-        assert_eq!(output.wait, Some(IrWaitKind::DialogueAdvance));
+        assert_eq!(output.wait, Some(StoryWait::DialogueAdvance));
         assert_eq!(
             output.commands,
-            vec![IrCommand::Say {
+            vec![StoryEffect::Say {
                 speaker: "Alice".to_string(),
                 text: "Hello".to_string(),
             }]

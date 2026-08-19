@@ -850,6 +850,7 @@ fn source_hash(source: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hks_capabilities::{StoryEffect, StoryWait};
     use hiraku_script::hks::{Stmt, parse_program};
 
     fn zoom(source: &str) -> Expr {
@@ -927,12 +928,12 @@ mod tests {
         )
         .unwrap();
         let outputs = native_outputs(&program);
-        assert!(matches!(outputs[0].commands[0], IrCommand::ClearDialogue));
+        assert!(matches!(outputs[0].commands[0], StoryEffect::ClearDialogue));
         assert!(
-            matches!(&outputs[1].commands[0], IrCommand::Say { text, .. } if text == "Gallery")
+            matches!(&outputs[1].commands[0], StoryEffect::Say { text, .. } if text == "Gallery")
         );
-        assert_eq!(outputs[1].wait, Some(IrWaitKind::DialogueAdvance));
-        assert!(matches!(outputs[2].commands[0], IrCommand::ReturnToTitle));
+        assert_eq!(outputs[1].wait, Some(StoryWait::DialogueAdvance));
+        assert!(matches!(outputs[2].commands[0], StoryEffect::ReturnToTitle));
     }
 
     #[test]
@@ -948,7 +949,7 @@ mod tests {
             panic!("expected a native HKS statement");
         };
         let output = crate::hks_capabilities::execute(bytecode.clone()).unwrap();
-        assert!(matches!(&output.commands[0], IrCommand::ShowCharacter {
+        assert!(matches!(&output.commands[0], StoryEffect::ShowCharacter {
             actor_id, character_name, expressions, position, scale,
         } if actor_id == "ema" && character_name == "ema"
             && expressions == &["happy"] && position == &[0.0, 0.0]
@@ -997,7 +998,7 @@ mod tests {
         assert_eq!(
             native_outputs(&program)
                 .iter()
-                .filter(|output| output.wait == Some(IrWaitKind::DialogueAdvance))
+                .filter(|output| output.wait == Some(StoryWait::DialogueAdvance))
                 .count(),
             24
         );
@@ -1012,10 +1013,10 @@ mod tests {
             .flat_map(|output| output.commands)
             .collect::<Vec<_>>();
         assert!(
-            matches!(&commands[0], IrCommand::Log(message) if message == "manosaba bootstrap startup")
+            matches!(&commands[0], StoryEffect::Log(message) if message == "manosaba bootstrap startup")
         );
         assert!(
-            matches!(&commands[1], IrCommand::LoadScript { path } if path == "system.story.hks")
+            matches!(&commands[1], StoryEffect::LoadScript { path } if path == "system.story.hks")
         );
     }
 
@@ -1043,7 +1044,7 @@ mod tests {
             native_outputs(&program)
                 .iter()
                 .any(|output| output.commands.iter().any(|command| {
-                    matches!(command, IrCommand::AdjustSetting { name, delta }
+                    matches!(command, StoryEffect::AdjustSetting { name, delta }
                 if name == "bgmVolume" && (*delta - 0.1).abs() < f32::EPSILON)
                 }))
         );
@@ -1058,7 +1059,7 @@ mod tests {
             native_outputs(&program)
                 .iter()
                 .any(|output| output.commands.iter().any(|command| {
-                    matches!(command, IrCommand::PlayBgm { path, .. } if path == "title")
+                    matches!(command, StoryEffect::PlayBgm { path, .. } if path == "title")
                 }))
         );
         assert!(program.instructions.iter().any(|instruction| matches!(
@@ -1088,7 +1089,7 @@ mod tests {
         .unwrap();
         let outputs = native_outputs(&program);
         assert!(
-            matches!(&outputs[0].commands[0], IrCommand::Log(message) if message == "from function")
+            matches!(&outputs[0].commands[0], StoryEffect::Log(message) if message == "from function")
         );
     }
 }

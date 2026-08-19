@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::mpsc,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bevy::{
     app::AppExit,
@@ -225,7 +222,7 @@ pub struct DialogueState {
 
 pub struct PendingDialogueAdvance {
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
+    pub request: Option<ScriptRequestId>,
 }
 
 pub struct DialogueRevealState {
@@ -235,7 +232,6 @@ pub struct DialogueRevealState {
     pub interval: f32,
     pub fade_seconds: f32,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 #[derive(Clone)]
@@ -319,37 +315,6 @@ pub fn bridge_ir_events(
         runtime.accept_response(message.clone());
     }
 
-    if let Some(receiver) = runtime.wait_response.as_ref() {
-        let response = receiver.try_recv();
-        match response {
-            Ok(ScriptResponse::Choice(value)) => {
-                let value = if let Some(screen) = runtime.pending_ui_screen.take() {
-                    UiIntent { screen, value }.value
-                } else {
-                    value
-                };
-                if let Some(variable) = runtime.pending_input_variable.take()
-                    && let Some(vm) = runtime.vm.as_mut()
-                {
-                    vm.set_stored_value(variable, value);
-                }
-                runtime.wait_response = None;
-                if let Some(vm) = runtime.vm.as_mut() {
-                    vm.resume();
-                }
-            }
-            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
-                runtime.wait_response = None;
-                runtime.pending_input_variable = None;
-                runtime.pending_ui_screen = None;
-                if let Some(vm) = runtime.vm.as_mut() {
-                    vm.resume();
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => return,
-        }
-    }
-
     if let Some(request) = runtime.wait_request {
         let Some(response) = runtime.take_response(request) else {
             return;
@@ -396,7 +361,6 @@ pub fn bridge_ir_events(
                     runtime.vm = Some(vm);
                     runtime.current_script = Some(target);
                     runtime.events.clear();
-                    runtime.wait_response = None;
                     runtime.pending_input_variable = None;
                     runtime.pending_ui_screen = None;
                     runtime.pending_request = None;
@@ -497,7 +461,6 @@ pub fn bridge_ir_events(
                             volume,
                             fade_in: fade_in_ms.map(std::time::Duration::from_millis),
                             animation_id: None,
-                            done: None,
                         })
                 }
                 None => warn!("music `{path}` is not defined"),
@@ -516,14 +479,13 @@ pub fn bridge_ir_events(
                             volume,
                             mode: VoicePlaybackMode::Exclusive,
                             animation_id: None,
-                            done: None,
                         })
                 }
                 None => warn!("voice `{path}` is not defined"),
             }
         }
         IrEvent::Command(IrCommand::WaitHksTask { handle }) => {
-            let Some(receiver) = runtime.native_tasks.remove(&handle) else {
+            let Some(request) = runtime.native_tasks.remove(&handle) else {
                 warn!("HKS task handle `{handle}` is not defined");
                 return;
             };
@@ -532,7 +494,7 @@ pub fn bridge_ir_events(
                 .as_mut()
                 .is_some_and(|vm| vm.suspend(IrWaitKind::TaskCompletion))
             {
-                runtime.wait_response = Some(receiver);
+                runtime.wait_request = Some(request);
             }
         }
         IrEvent::Command(IrCommand::HksStatement {
@@ -541,6 +503,7 @@ pub fn bridge_ir_events(
         }) => match crate::hks_capabilities::execute(bytecode) {
             Ok(output) => {
                 for command in output.commands {
+                    let command: IrCommand = command.into();
                     if matches!(
                         command,
                         IrCommand::LoadScript { .. }
@@ -563,6 +526,7 @@ pub fn bridge_ir_events(
                     let mut items = Vec::new();
                     for (index, command) in task.commands.into_iter().enumerate() {
                         let handle = format!("hks-task-{batch_id}-{index}");
+                        let command: IrCommand = command.into();
                         let command = match command {
                             IrCommand::PlayVoice { path, volume } => {
                                 let Some(definition) = audio
@@ -577,7 +541,6 @@ pub fn bridge_ir_events(
                                     volume,
                                     mode: VoicePlaybackMode::Concurrent,
                                     animation_id: Some(handle.clone()),
-                                    done: None,
                                 }
                             }
                             command @ IrCommand::ShowCharacter { .. } => {
@@ -589,7 +552,6 @@ pub fn bridge_ir_events(
                                         position,
                                         scale,
                                         fade,
-                                        done,
                                         ..
                                     }) => ScriptCommand::ShowCharacter {
                                         actor_id,
@@ -599,7 +561,6 @@ pub fn bridge_ir_events(
                                         scale,
                                         fade,
                                         animation_id: Some(handle.clone()),
-                                        done,
                                     },
                                     Ok(_) => unreachable!(
                                         "show character IR must stay a show character command"
@@ -634,27 +595,29 @@ pub fn bridge_ir_events(
                             .push_back(ScriptCommand::SubmitBatch { mode, items });
                     }
                     if let Some(handle) = task_result.take() {
-                        let (response_tx, response_rx) = mpsc::channel();
-                        if handles.is_empty() {
-                            let _ = response_tx.send(ScriptResponse::Continue);
-                        } else {
-                            pending_script_commands.items.push_back(
-                                ScriptCommand::WaitAnimations {
-                                    ids: handles,
-                                    done: response_tx,
-                                },
-                            );
-                        }
-                        runtime.native_tasks.insert(handle, response_rx);
+                        let request = runtime.allocate_request();
+                        pending_script_commands
+                            .items
+                            .push_back(ScriptCommand::WaitAnimations {
+                                ids: handles,
+                                done: request,
+                            });
+                        runtime.native_tasks.insert(handle, request);
                     }
                 }
-                if let Some(wait) = output.wait
-                    && runtime
+                if let Some(wait) = output.wait {
+                    let wait = match wait {
+                        crate::hks_capabilities::StoryWait::DialogueAdvance => {
+                            IrWaitKind::DialogueAdvance
+                        }
+                    };
+                    if runtime
                         .vm
                         .as_mut()
                         .is_some_and(|vm| vm.suspend(wait.clone()))
-                {
-                    runtime.events.push_back(IrEvent::Waiting(wait));
+                    {
+                        runtime.events.push_back(IrEvent::Waiting(wait));
+                    }
                 }
             }
             Err(error) => warn!("HKS native statement failed: {error}"),
@@ -678,25 +641,33 @@ pub fn bridge_ir_events(
                     .push_back(ScriptCommand::WaitForScreenChoice { done: request });
                 return;
             }
-            let (response_tx, response_rx) = mpsc::channel();
+            if matches!(wait_kind, IrWaitKind::DialogueAdvance) {
+                let request = runtime.allocate_request();
+                runtime.wait_request = Some(request);
+                pending_script_commands
+                    .items
+                    .push_back(ScriptCommand::AwaitDialogueAdvance { done: request });
+                return;
+            }
+            let request = runtime.allocate_request();
             let command = match wait_kind {
                 IrWaitKind::DialogueAdvance => {
-                    ScriptCommand::AwaitDialogueAdvance { done: response_tx }
+                    unreachable!("dialogue waits are handled through ECS request messages")
                 }
                 IrWaitKind::ScreenChoice | IrWaitKind::UiIntent => {
                     unreachable!("interactive waits are handled through ECS request messages")
                 }
                 IrWaitKind::TaskCompletion => ScriptCommand::WaitAnimations {
                     ids: Vec::new(),
-                    done: response_tx,
+                    done: request,
                 },
                 IrWaitKind::DurationMs(milliseconds) => ScriptCommand::Wait {
                     duration: std::time::Duration::from_millis(milliseconds),
                     animation_id: None,
-                    done: response_tx,
+                    done: request,
                 },
             };
-            runtime.wait_response = Some(response_rx);
+            runtime.wait_request = Some(request);
             pending_script_commands.items.push_back(command);
         }
         IrEvent::Completed => {}
@@ -716,18 +687,17 @@ pub struct ActiveScriptBatch {
 pub struct PendingWait {
     pub timer: Timer,
     pub animation_id: Option<String>,
-    pub done: mpsc::Sender<ScriptResponse>,
+    pub done: ScriptRequestId,
 }
 
 pub struct PendingAnimationWait {
     pub ids: Vec<String>,
-    pub done: mpsc::Sender<ScriptResponse>,
+    pub done: ScriptRequestId,
 }
 
 pub struct ActiveVoice {
     pub entity: Entity,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 pub struct PendingCharacterShow {
@@ -737,7 +707,6 @@ pub struct PendingCharacterShow {
     pub handles: Vec<Handle<Image>>,
     pub fade: Option<std::time::Duration>,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 #[derive(Component)]
@@ -746,7 +715,6 @@ pub struct CharacterJumpEffect {
     pub timer: Timer,
     pub height: f32,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 #[derive(Component)]
@@ -755,7 +723,6 @@ pub struct CharacterShakeEffect {
     pub timer: Timer,
     pub amplitude: f32,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 #[derive(Component)]
@@ -767,7 +734,6 @@ pub struct CharacterTimelineEffect {
     pub elapsed: f32,
     pub duration: f32,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 #[derive(Clone, Copy)]
@@ -866,7 +832,6 @@ pub struct BgmFade {
     pub to: f32,
     pub timer: Timer,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
 }
 
 #[derive(Component)]
@@ -891,7 +856,6 @@ pub struct VisualTween {
     pub to_scale: Option<Vec3>,
     pub timer: Timer,
     pub animation_id: Option<String>,
-    pub done: Option<mpsc::Sender<ScriptResponse>>,
     pub despawn_on_finish: bool,
 }
 
@@ -1942,7 +1906,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     ir_runtime.vm = Some(vm);
                     ir_runtime.current_script = Some(path);
                     ir_runtime.events.clear();
-                    ir_runtime.wait_response = None;
                     ir_runtime.pending_input_variable = None;
                     ir_runtime.pending_ui_screen = None;
                     ir_runtime.pending_request = None;
@@ -1956,7 +1919,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 path,
                 fade,
                 animation_id,
-                done,
             } => {
                 let current_background = shared_state
                     .0
@@ -1966,9 +1928,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if fade.is_none() && current_background.as_deref() == Some(path.as_str()) {
                     if let Some(animation_id) = animation_id {
                         animations.completed.insert(animation_id);
-                    }
-                    if let Some(done) = done {
-                        let _ = done.send(ScriptResponse::Continue);
                     }
                     continue;
                 }
@@ -1997,7 +1956,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                                 to_scale: None,
                                 timer: Timer::new(duration, TimerMode::Once),
                                 animation_id,
-                                done,
                                 despawn_on_finish: false,
                             },
                         ))
@@ -2010,9 +1968,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                         ))
                         .id();
-                    if let Some(done) = done {
-                        let _ = done.send(ScriptResponse::Continue);
-                    }
                     if let Some(animation_id) = animation_id {
                         animations.completed.insert(animation_id);
                     }
@@ -2030,7 +1985,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             to_scale: None,
                             timer: Timer::new(duration, TimerMode::Once),
                             animation_id: None,
-                            done: None,
                             despawn_on_finish: true,
                         });
                     } else {
@@ -2046,7 +2000,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 duration,
                 vague,
                 animation_id,
-                done,
             } => {
                 if let Some(effect) = stage.screen_effect.take() {
                     commands.entity(effect).try_despawn();
@@ -2066,9 +2019,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         .id();
                     stage.background = Some(entity);
                     shared_state.0.background = Some(ImageLayerSnapshot { path });
-                    if let Some(done) = done {
-                        let _ = done.send(ScriptResponse::Continue);
-                    }
                     if let Some(animation_id) = animation_id {
                         animations.completed.insert(animation_id);
                     }
@@ -2090,9 +2040,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         ))
                         .id();
                     stage.background = Some(entity);
-                    if let Some(done) = done {
-                        let _ = done.send(ScriptResponse::Continue);
-                    }
                     if let Some(animation_id) = animation_id {
                         animations.completed.insert(animation_id);
                     }
@@ -2125,7 +2072,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             previous_background,
                             timer: Timer::new(duration, TimerMode::Once),
                             animation_id,
-                            done,
                         },
                     ))
                     .id();
@@ -2134,7 +2080,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::PlayCustomEffect {
                 options,
                 animation_id,
-                done,
             } => {
                 if let Some(effect) = stage.screen_effect.take() {
                     commands.entity(effect).try_despawn();
@@ -2184,7 +2129,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             target_image: options.commit_to_bg.then_some(target_image),
                             previous_background,
                             animation_id,
-                            done,
                         },
                     ))
                     .id();
@@ -2199,7 +2143,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 scale,
                 fade,
                 animation_id,
-                done,
             } => {
                 let handle = asset_server.load(path.clone());
                 let entity = if let Some(entity) = stage.sprites.get(&id).copied() {
@@ -2259,18 +2202,16 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         to_scale: None,
                         timer: Timer::new(duration, TimerMode::Once),
                         animation_id,
-                        done,
                         despawn_on_finish: false,
                     });
                 } else {
-                    complete_missing_animation(&mut animations, animation_id, done);
+                    complete_missing_animation(&mut animations, animation_id);
                 }
             }
             ScriptCommand::HideSprite {
                 id,
                 fade,
                 animation_id,
-                done,
             } => {
                 if let Some(entity) = stage.sprites.remove(&id) {
                     if let Some(duration) = fade {
@@ -2283,22 +2224,20 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             to_scale: None,
                             timer: Timer::new(duration, TimerMode::Once),
                             animation_id,
-                            done,
                             despawn_on_finish: true,
                         });
                     } else {
                         commands.entity(entity).try_despawn();
-                        complete_missing_animation(&mut animations, animation_id, done);
+                        complete_missing_animation(&mut animations, animation_id);
                     }
                 } else {
-                    complete_missing_animation(&mut animations, animation_id, done);
+                    complete_missing_animation(&mut animations, animation_id);
                 }
             }
             ScriptCommand::SetOverlay {
                 alpha,
                 fade,
                 animation_id,
-                done,
             } => {
                 if let Some(overlay) = stage.overlay {
                     if let Some(duration) = fade {
@@ -2312,7 +2251,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             to_scale: None,
                             timer: Timer::new(duration, TimerMode::Once),
                             animation_id,
-                            done,
                             despawn_on_finish: false,
                         });
                     } else {
@@ -2320,9 +2258,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             Color::BLACK.with_alpha(alpha),
                             Vec2::new(6000.0, 6000.0),
                         ));
-                        if let Some(done) = done {
-                            let _ = done.send(ScriptResponse::Continue);
-                        }
                         if let Some(animation_id) = animation_id {
                             animations.completed.insert(animation_id);
                         }
@@ -2334,10 +2269,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 speaker,
                 text,
                 animation_id,
-                done,
             } => {
                 if let Some(waiting) = dialogue_state.waiting.take() {
-                    complete_missing_animation(&mut animations, waiting.animation_id, waiting.done);
+                    complete_dialogue_wait(&mut commands, &mut animations, waiting);
                 }
                 if let Ok(mut visibility) = dialogue_root.single_mut() {
                     *visibility = Visibility::Visible;
@@ -2356,16 +2290,18 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         &text,
                         0,
                         None,
-                        None,
                     );
                 }
-                dialogue_state.waiting = Some(PendingDialogueAdvance { animation_id, done });
+                dialogue_state.waiting = Some(PendingDialogueAdvance {
+                    animation_id,
+                    request: None,
+                });
                 shared_state.0.dialogue = Some(DialogueSnapshot { speaker, text });
             }
             ScriptCommand::AwaitDialogueAdvance { done } => {
                 dialogue_state.waiting = Some(PendingDialogueAdvance {
                     animation_id: None,
-                    done: Some(done),
+                    request: Some(done),
                 });
             }
             ScriptCommand::SetDialogue {
@@ -2373,7 +2309,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 text,
                 reveal_from,
                 animation_id,
-                done,
             } => {
                 if let Ok(mut visibility) = dialogue_root.single_mut() {
                     *visibility = Visibility::Visible;
@@ -2392,14 +2327,13 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         &text,
                         reveal_from.unwrap_or_else(|| text.chars().count()),
                         animation_id,
-                        done,
                     );
                 }
                 shared_state.0.dialogue = Some(DialogueSnapshot { speaker, text });
             }
             ScriptCommand::ClearDialogue => {
                 if let Some(waiting) = dialogue_state.waiting.take() {
-                    complete_missing_animation(&mut animations, waiting.animation_id, waiting.done);
+                    complete_dialogue_wait(&mut commands, &mut animations, waiting);
                 }
                 clear_dialogue_spans(&mut commands, &mut dialogue_state);
                 if let Ok(mut visibility) = dialogue_root.single_mut() {
@@ -2429,7 +2363,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 duration,
                 ease,
                 animation_id,
-                done,
             } => start_camera_tween(
                 &mut camera_state,
                 &mut camera_tweens,
@@ -2440,7 +2373,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 duration,
                 ease,
                 animation_id,
-                done,
                 &mut animations,
             ),
             ScriptCommand::ApplyUserSettings(settings) => *user_settings = settings,
@@ -2575,18 +2507,17 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 scale,
                 fade,
                 animation_id,
-                done,
             } => {
                 let Some(character) = characters.characters.get(&character_name).cloned() else {
                     warn!("character `{character_name}` not found in catalog");
-                    complete_missing_animation(&mut animations, animation_id, done);
+                    complete_missing_animation(&mut animations, animation_id);
                     continue;
                 };
                 let parts = match character.parts_for_expressions(&expressions) {
                     Ok(parts) => parts,
                     Err(message) => {
                         warn!("{message}");
-                        complete_missing_animation(&mut animations, animation_id, done);
+                        complete_missing_animation(&mut animations, animation_id);
                         continue;
                     }
                 };
@@ -2611,7 +2542,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     scale,
                     fade,
                     animation_id,
-                    done,
                 );
             }
             ScriptCommand::HideCharacter { actor_id } => {
@@ -2628,7 +2558,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 height,
                 duration,
                 animation_id,
-                done,
             } => {
                 apply_character_motion(
                     &mut commands,
@@ -2638,7 +2567,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     CharacterMotionKind::Jump { height },
                     duration,
                     animation_id,
-                    done,
                     &mut animations,
                 );
             }
@@ -2647,7 +2575,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 amplitude,
                 duration,
                 animation_id,
-                done,
             } => {
                 apply_character_motion(
                     &mut commands,
@@ -2657,7 +2584,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     CharacterMotionKind::Shake { amplitude },
                     duration,
                     animation_id,
-                    done,
                     &mut animations,
                 );
             }
@@ -2665,7 +2591,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 actor_id,
                 keyframes,
                 animation_id,
-                done,
             } => {
                 apply_character_timeline(
                     &mut commands,
@@ -2674,11 +2599,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &actor_id,
                     keyframes,
                     animation_id,
-                    done,
                     &mut animations,
                 );
             }
-            ScriptCommand::RestoreSnapshot { snapshot, done } => {
+            ScriptCommand::RestoreSnapshot { snapshot } => {
                 clear_choice_ui(&mut commands, &choice_ui_roots);
                 clear_screen_ui(&mut commands, &mut screen_state);
                 // clear_overlay_ui(&mut commands, &mut overlay_state);
@@ -2698,14 +2622,12 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     snapshot.clone(),
                 );
                 shared_state.0 = snapshot;
-                let _ = done.send(ScriptResponse::Continue);
             }
             ScriptCommand::MoveSprite {
                 id,
                 position,
                 duration,
                 animation_id,
-                done,
             } => {
                 if let Some(entity) = stage.sprites.get(&id).copied() {
                     let snapshot = &shared_state.0;
@@ -2724,16 +2646,15 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             to_scale: None,
                             timer: Timer::new(duration, TimerMode::Once),
                             animation_id,
-                            done,
                             despawn_on_finish: false,
                         });
                     } else {
                         warn!("sprite `{id}` missing snapshot during move");
-                        complete_missing_animation(&mut animations, animation_id, done);
+                        complete_missing_animation(&mut animations, animation_id);
                     }
                 } else {
                     warn!("sprite `{id}` not found for move_sprite");
-                    complete_missing_animation(&mut animations, animation_id, done);
+                    complete_missing_animation(&mut animations, animation_id);
                 }
             }
             ScriptCommand::ScaleSprite {
@@ -2741,7 +2662,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 scale,
                 duration,
                 animation_id,
-                done,
             } => {
                 if let Some(entity) = stage.sprites.get(&id).copied() {
                     let snapshot = &shared_state.0;
@@ -2756,16 +2676,15 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             to_scale: Some(Vec3::splat(scale)),
                             timer: Timer::new(duration, TimerMode::Once),
                             animation_id,
-                            done,
                             despawn_on_finish: false,
                         });
                     } else {
                         warn!("sprite `{id}` missing snapshot during scale");
-                        complete_missing_animation(&mut animations, animation_id, done);
+                        complete_missing_animation(&mut animations, animation_id);
                     }
                 } else {
                     warn!("sprite `{id}` not found for scale_sprite");
-                    complete_missing_animation(&mut animations, animation_id, done);
+                    complete_missing_animation(&mut animations, animation_id);
                 }
             }
             ScriptCommand::FadeSprite {
@@ -2773,7 +2692,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 alpha,
                 duration,
                 animation_id,
-                done,
             } => {
                 if let Some(entity) = stage.sprites.get(&id).copied() {
                     let snapshot = &shared_state.0;
@@ -2787,16 +2705,15 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             to_scale: None,
                             timer: Timer::new(duration, TimerMode::Once),
                             animation_id,
-                            done,
                             despawn_on_finish: false,
                         });
                     } else {
                         warn!("sprite `{id}` missing snapshot during fade");
-                        complete_missing_animation(&mut animations, animation_id, done);
+                        complete_missing_animation(&mut animations, animation_id);
                     }
                 } else {
                     warn!("sprite `{id}` not found for fade_sprite");
-                    complete_missing_animation(&mut animations, animation_id, done);
+                    complete_missing_animation(&mut animations, animation_id);
                 }
             }
             ScriptCommand::Wait {
@@ -2812,7 +2729,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             }
             ScriptCommand::WaitAnimations { ids, done } => {
                 if ids.iter().all(|id| animations.completed.contains(id)) {
-                    let _ = done.send(ScriptResponse::Continue);
+                    commands.write_message(ScriptResponseMessage {
+                        request: done,
+                        response: ScriptResponse::Continue,
+                    });
                 } else {
                     animations.waits.push(PendingAnimationWait { ids, done });
                 }
@@ -2821,14 +2741,12 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 duration,
                 amplitude,
                 animation_id,
-                done,
             } => {
                 commands.insert_resource(CameraShakeState {
                     active: Some(CameraShake {
                         timer: Timer::new(duration, TimerMode::Once),
                         amplitude,
                         animation_id,
-                        done,
                     }),
                 });
             }
@@ -2837,7 +2755,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 volume,
                 fade_in,
                 animation_id,
-                done,
             } => {
                 let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
                 if let Some(previous) = stage.bgm.take() {
@@ -2864,14 +2781,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         to: playback_volume,
                         timer: Timer::new(fade_in, TimerMode::Once),
                         animation_id,
-                        done,
                     });
                 } else {
                     if let Some(animation_id) = animation_id {
                         animations.completed.insert(animation_id);
-                    }
-                    if let Some(done) = done {
-                        let _ = done.send(ScriptResponse::Continue);
                     }
                 }
                 stage.bgm = Some(bgm);
@@ -2891,7 +2804,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         to: playback_volume,
                         timer: Timer::new(std::time::Duration::ZERO, TimerMode::Once),
                         animation_id: None,
-                        done: None,
                     });
                 }
                 if let Some(snapshot) = shared_state.0.bgm.as_mut() {
@@ -2902,7 +2814,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 volume,
                 duration,
                 animation_id,
-                done,
             } => {
                 let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
                 let from = shared_state
@@ -2924,7 +2835,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         to: playback_volume,
                         timer: Timer::new(duration, TimerMode::Once),
                         animation_id,
-                        done,
                     });
                     if let Some(snapshot) = shared_state.0.bgm.as_mut() {
                         snapshot.volume = volume;
@@ -2932,9 +2842,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 } else {
                     if let Some(animation_id) = animation_id {
                         animations.completed.insert(animation_id);
-                    }
-                    if let Some(done) = done {
-                        let _ = done.send(ScriptResponse::Continue);
                     }
                 }
             }
@@ -2949,7 +2856,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 volume,
                 mode,
                 animation_id,
-                done,
             } => {
                 let playback_volume = apply_volume_setting(volume, user_settings.voice_volume);
                 if mode == VoicePlaybackMode::Exclusive {
@@ -2968,7 +2874,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 let active = ActiveVoice {
                     entity: voice,
                     animation_id,
-                    done,
                 };
                 match mode {
                     VoicePlaybackMode::Exclusive => voice_state.active = Some(active),
@@ -3049,7 +2954,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             ir_runtime.vm = Some(vm);
                             ir_runtime.current_script = Some(startup);
                             ir_runtime.events.clear();
-                            ir_runtime.wait_response = None;
                             ir_runtime.pending_input_variable = None;
                             ir_runtime.pending_ui_screen = None;
                             ir_runtime.pending_request = None;
@@ -3082,9 +2986,6 @@ pub fn animate_bgm_fades(
         if fade.timer.is_finished() {
             if let Some(animation_id) = fade.animation_id.take() {
                 animations.completed.insert(animation_id);
-            }
-            if let Some(done) = fade.done.take() {
-                let _ = done.send(ScriptResponse::Continue);
             }
             commands.entity(entity).try_remove::<BgmFade>();
         }
@@ -3213,6 +3114,7 @@ pub fn advance_dialogue_on_input(
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
+    mut responses: MessageWriter<ScriptResponseMessage>,
     choice_state: Res<ChoiceState>,
     runtime_menu: Res<RuntimeMenuState>,
     ui_interactions: Query<
@@ -3258,8 +3160,11 @@ pub fn advance_dialogue_on_input(
         if let Some(animation_id) = waiting.animation_id {
             animations.completed.insert(animation_id);
         }
-        if let Some(done) = waiting.done {
-            let _ = done.send(ScriptResponse::Continue);
+        if let Some(request) = waiting.request {
+            responses.write(ScriptResponseMessage {
+                request,
+                response: ScriptResponse::Continue,
+            });
         }
     }
 }
@@ -3311,9 +3216,6 @@ pub fn animate_dialogue_text_reveal(
         if let Some(animation_id) = reveal.animation_id.take() {
             animations.completed.insert(animation_id);
         }
-        if let Some(done) = reveal.done.take() {
-            let _ = done.send(ScriptResponse::Continue);
-        }
         dialogue_state.reveal = None;
     }
 }
@@ -3322,6 +3224,7 @@ pub fn tick_pending_waits(
     time: Res<Time>,
     mut waits: ResMut<PendingWaits>,
     mut animations: ResMut<AnimationState>,
+    mut responses: MessageWriter<ScriptResponseMessage>,
 ) {
     for wait in waits.items.iter_mut() {
         wait.timer.tick(time.delta());
@@ -3341,7 +3244,10 @@ pub fn tick_pending_waits(
         if let Some(animation_id) = animation_id {
             animations.completed.insert(animation_id);
         }
-        let _ = done.send(ScriptResponse::Continue);
+        responses.write(ScriptResponseMessage {
+            request: done,
+            response: ScriptResponse::Continue,
+        });
     }
 }
 
@@ -3391,7 +3297,10 @@ pub fn apply_animation_cancellations(
             .as_ref()
             .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            let _ = wait.done.send(ScriptResponse::Continue);
+            commands.write_message(ScriptResponseMessage {
+                request: wait.done,
+                response: ScriptResponse::Continue,
+            });
             false
         } else {
             true
@@ -3405,7 +3314,7 @@ pub fn apply_animation_cancellations(
         .is_some_and(|animation_id| cancelled.contains(animation_id))
     {
         if let Some(waiting) = dialogue_state.waiting.take() {
-            complete_missing_animation(&mut animations, waiting.animation_id, waiting.done);
+            complete_dialogue_wait(&mut commands, &mut animations, waiting);
         }
     }
 
@@ -3419,11 +3328,7 @@ pub fn apply_animation_cancellations(
             camera.translation.x = 0.0;
             camera.translation.y = 0.0;
         }
-        complete_missing_animation(
-            &mut animations,
-            shake.animation_id.take(),
-            shake.done.take(),
-        );
+        complete_missing_animation(&mut animations, shake.animation_id.take());
         shake_state.active = None;
     }
 
@@ -3448,7 +3353,7 @@ pub fn apply_animation_cancellations(
             for id in item.entity_ids.drain(..) {
                 stage.sprites.remove(&id);
             }
-            complete_missing_animation(&mut animations, item.animation_id.take(), item.done.take());
+            complete_missing_animation(&mut animations, item.animation_id.take());
             false
         } else {
             true
@@ -3466,11 +3371,7 @@ pub fn apply_animation_cancellations(
             {
                 stage.sprites.insert(actor.id.clone(), entity);
             }
-            complete_missing_animation(
-                &mut animations,
-                tween.animation_id.take(),
-                tween.done.take(),
-            );
+            complete_missing_animation(&mut animations, tween.animation_id.take());
             commands.entity(entity).try_remove::<VisualTween>();
         }
     }
@@ -3481,7 +3382,7 @@ pub fn apply_animation_cancellations(
             .as_ref()
             .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            complete_missing_animation(&mut animations, fade.animation_id.take(), fade.done.take());
+            complete_missing_animation(&mut animations, fade.animation_id.take());
             commands.entity(entity).try_remove::<BgmFade>();
         }
     }
@@ -3500,11 +3401,7 @@ pub fn apply_animation_cancellations(
                 .as_ref()
                 .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            complete_missing_animation(
-                &mut animations,
-                effect.animation_id.take(),
-                effect.done.take(),
-            );
+            complete_missing_animation(&mut animations, effect.animation_id.take());
             commands.entity(entity).try_remove::<CharacterJumpEffect>();
             reset_translation = true;
         }
@@ -3515,11 +3412,7 @@ pub fn apply_animation_cancellations(
                 .as_ref()
                 .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            complete_missing_animation(
-                &mut animations,
-                effect.animation_id.take(),
-                effect.done.take(),
-            );
+            complete_missing_animation(&mut animations, effect.animation_id.take());
             commands.entity(entity).try_remove::<CharacterShakeEffect>();
             reset_translation = true;
         }
@@ -3535,11 +3428,7 @@ pub fn apply_animation_cancellations(
                     .character_positions
                     .insert(effect.actor_id.clone(), final_keyframe.position);
             }
-            complete_missing_animation(
-                &mut animations,
-                effect.animation_id.take(),
-                effect.done.take(),
-            );
+            complete_missing_animation(&mut animations, effect.animation_id.take());
             commands
                 .entity(entity)
                 .try_remove::<CharacterTimelineEffect>();
@@ -3562,11 +3451,7 @@ pub fn apply_animation_cancellations(
             if stage.transition == Some(entity) {
                 stage.transition = None;
             }
-            complete_missing_animation(
-                &mut animations,
-                transition.animation_id.take(),
-                transition.done.take(),
-            );
+            complete_missing_animation(&mut animations, transition.animation_id.take());
             commands.entity(entity).try_despawn();
         }
     }
@@ -3580,11 +3465,7 @@ pub fn apply_animation_cancellations(
             if stage.screen_effect == Some(entity) {
                 stage.screen_effect = None;
             }
-            complete_missing_animation(
-                &mut animations,
-                effect.animation_id.take(),
-                effect.done.take(),
-            );
+            complete_missing_animation(&mut animations, effect.animation_id.take());
             commands.entity(entity).try_despawn();
         }
     }
@@ -3622,9 +3503,6 @@ pub fn animate_visual_tweens(
             }
             if let Some(animation_id) = tween.animation_id.take() {
                 animations.completed.insert(animation_id);
-            }
-            if let Some(done) = tween.done.take() {
-                let _ = done.send(ScriptResponse::Continue);
             }
             if tween.despawn_on_finish {
                 commands.entity(entity).try_despawn();
@@ -3675,9 +3553,6 @@ pub fn animate_rule_transitions(
             if let Some(animation_id) = transition.animation_id.take() {
                 animations.completed.insert(animation_id);
             }
-            if let Some(done) = transition.done.take() {
-                let _ = done.send(ScriptResponse::Continue);
-            }
         }
     }
 }
@@ -3727,14 +3602,14 @@ pub fn animate_custom_effects(
             if let Some(animation_id) = effect.animation_id.take() {
                 animations.completed.insert(animation_id);
             }
-            if let Some(done) = effect.done.take() {
-                let _ = done.send(ScriptResponse::Continue);
-            }
         }
     }
 }
 
-pub fn tick_animation_waits(mut animations: ResMut<AnimationState>) {
+pub fn tick_animation_waits(
+    mut animations: ResMut<AnimationState>,
+    mut responses: MessageWriter<ScriptResponseMessage>,
+) {
     let completed = animations.completed.clone();
     let mut resolved = Vec::new();
     animations.waits.retain(|wait| {
@@ -3747,7 +3622,10 @@ pub fn tick_animation_waits(mut animations: ResMut<AnimationState>) {
     });
 
     for done in resolved {
-        let _ = done.send(ScriptResponse::Continue);
+        responses.write(ScriptResponseMessage {
+            request: done,
+            response: ScriptResponse::Continue,
+        });
     }
 }
 
@@ -4061,7 +3939,6 @@ fn set_dialogue_line_text(
     text: &str,
     visible_prefix_chars: usize,
     animation_id: Option<String>,
-    done: Option<mpsc::Sender<ScriptResponse>>,
 ) {
     clear_dialogue_spans(commands, dialogue_state);
 
@@ -4105,18 +3982,10 @@ fn set_dialogue_line_text(
             interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
             fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
             animation_id,
-            done,
         });
     } else {
         dialogue_state.reveal = None;
-        if let Some(animation_id) = animation_id {
-            if let Some(done) = done {
-                let _ = done.send(ScriptResponse::Continue);
-            }
-            let _ = animation_id;
-        } else if let Some(done) = done {
-            let _ = done.send(ScriptResponse::Continue);
-        }
+        let _ = animation_id;
     }
 }
 
@@ -4818,21 +4687,28 @@ fn finish_voice(commands: &mut Commands, animations: &mut AnimationState, mut ac
     if let Some(animation_id) = active.animation_id.take() {
         animations.completed.insert(animation_id);
     }
-    if let Some(done) = active.done.take() {
-        let _ = done.send(ScriptResponse::Continue);
-    }
 }
 
 pub(crate) fn complete_missing_animation(
     animations: &mut AnimationState,
     animation_id: Option<String>,
-    done: Option<mpsc::Sender<ScriptResponse>>,
 ) {
     if let Some(animation_id) = animation_id {
         animations.completed.insert(animation_id);
     }
-    if let Some(done) = done {
-        let _ = done.send(ScriptResponse::Continue);
+}
+
+fn complete_dialogue_wait(
+    commands: &mut Commands,
+    animations: &mut AnimationState,
+    waiting: PendingDialogueAdvance,
+) {
+    complete_missing_animation(animations, waiting.animation_id);
+    if let Some(request) = waiting.request {
+        commands.write_message(ScriptResponseMessage {
+            request,
+            response: ScriptResponse::Continue,
+        });
     }
 }
 

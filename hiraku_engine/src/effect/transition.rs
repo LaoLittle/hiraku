@@ -1,9 +1,9 @@
 use bevy::{
-    asset::{AssetPath, Handle},
+    asset::Handle,
     prelude::*,
     reflect::TypePath,
     render::render_resource::{AsBindGroup, ShaderType},
-    shader::{Shader, ShaderRef},
+    shader::ShaderRef,
     sprite_render::{AlphaMode2d, Material2d},
 };
 
@@ -65,5 +65,4 @@ pub struct RuleTransitionPlayer {
     pub previous_background: Entity,
     pub timer: Timer,
     pub animation_id: Option<String>,
-    pub done: Option<std::sync::mpsc::Sender<crate::script::ScriptResponse>>,
 }

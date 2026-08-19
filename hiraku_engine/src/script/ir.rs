@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::mpsc,
-};
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -426,7 +423,6 @@ pub enum IrValidationError {
 pub struct IrRuntime {
     pub vm: Option<IrVm>,
     pub events: VecDeque<IrEvent>,
-    pub wait_response: Option<mpsc::Receiver<super::ScriptResponse>>,
     pub wait_request: Option<super::ScriptRequestId>,
     pub current_script: Option<String>,
     pub pending_input_variable: Option<String>,
@@ -435,7 +431,7 @@ pub struct IrRuntime {
     pub response_inbox: BTreeMap<super::ScriptRequestId, super::ScriptResponse>,
     pub next_request_id: u64,
     pub next_native_task_id: u64,
-    pub native_tasks: BTreeMap<String, mpsc::Receiver<super::ScriptResponse>>,
+    pub native_tasks: BTreeMap<String, super::ScriptRequestId>,
 }
 
 impl IrRuntime {
