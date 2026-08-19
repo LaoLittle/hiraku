@@ -133,7 +133,7 @@ impl Plugin for HirakuPlugin {
             .init_asset::<BytesAsset>()
             .init_asset::<TextureAtlasLayout>()
             .init_resource::<texture::TextureAtlasCatalog>()
-            .init_resource::<IrRuntime>()
+            .insert_non_send(IrRuntime::default())
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(
@@ -290,7 +290,11 @@ fn runtime_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool {
     frontend.is_some()
 }
 
-fn boot_runtime(vfs: Res<VfsResource>, mut ir_runtime: ResMut<IrRuntime>, mut booted: Local<bool>) {
+fn boot_runtime(
+    vfs: Res<VfsResource>,
+    mut ir_runtime: NonSendMut<IrRuntime>,
+    mut booted: Local<bool>,
+) {
     if *booted {
         return;
     }

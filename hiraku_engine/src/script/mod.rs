@@ -502,11 +502,7 @@ pub fn save_runtime_slot(
         version: 6,
         resume_script: current_script,
         globals: values,
-        scene: shared_state
-            .0
-            .lock()
-            .expect("scene state mutex must not be poisoned while saving")
-            .clone(),
+        scene: shared_state.0.clone(),
         ir_snapshot: runtime.vm.as_ref().map(IrVm::snapshot),
         pending_input_variable: runtime.pending_input_variable.clone(),
         pending_ui_screen: runtime.pending_ui_screen.clone(),

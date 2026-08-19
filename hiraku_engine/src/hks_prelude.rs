@@ -422,11 +422,7 @@ impl HksStoryLowerer<'_> {
             "camera.zoom" => return self.camera_zoom(expression),
             "wait" => {
                 if arguments.len() != 1 || arguments[0].label.is_some() {
-                    return Err(self.invalid_call(
-                        "wait",
-                        expression,
-                        "expected one task handle",
-                    ));
+                    return Err(self.invalid_call("wait", expression, "expected one task handle"));
                 }
                 let ExprKind::Ident(handle) = &arguments[0].value.kind else {
                     return Err(self.invalid_call(

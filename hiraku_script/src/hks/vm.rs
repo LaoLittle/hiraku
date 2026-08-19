@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Expr, ExprKind, Program, Span, Stmt};
 
-pub const BYTECODE_VERSION: u16 = 3;
+pub const BYTECODE_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
@@ -21,6 +21,7 @@ pub struct FunctionId(pub u32);
 pub struct BuiltinManifest {
     hash: u64,
     names: BTreeMap<String, BuiltinId>,
+    selectors: BTreeMap<(String, String), BuiltinId>,
 }
 
 impl BuiltinManifest {
@@ -29,6 +30,13 @@ impl BuiltinManifest {
             .into_iter()
             .map(|(name, id)| (name.into(), id))
             .collect::<BTreeMap<_, _>>();
+        Self::with_selectors(names, BTreeMap::new())
+    }
+
+    pub fn with_selectors(
+        names: BTreeMap<String, BuiltinId>,
+        selectors: BTreeMap<(String, String), BuiltinId>,
+    ) -> Self {
         let hash = names
             .iter()
             .fold(0xcbf2_9ce4_8422_2325, |hash, (name, id)| {
@@ -38,7 +46,23 @@ impl BuiltinManifest {
                         (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
                     })
             });
-        Self { hash, names }
+        let hash = selectors
+            .iter()
+            .fold(hash, |hash, ((selector, method), id)| {
+                selector
+                    .bytes()
+                    .chain([b'.'])
+                    .chain(method.bytes())
+                    .chain(id.0.to_le_bytes())
+                    .fold(hash, |hash, byte| {
+                        (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
+                    })
+            });
+        Self {
+            hash,
+            names,
+            selectors,
+        }
     }
 
     pub fn hash(&self) -> u64 {
@@ -47,6 +71,12 @@ impl BuiltinManifest {
 
     pub fn resolve(&self, name: &str) -> Option<BuiltinId> {
         self.names.get(name).copied()
+    }
+
+    pub fn resolve_selector(&self, selector: &str, method: &str) -> Option<BuiltinId> {
+        self.selectors
+            .get(&(selector.to_string(), method.to_string()))
+            .copied()
     }
 }
 
@@ -58,6 +88,7 @@ pub enum Value {
     Percent(f64),
     String(String),
     Symbol(String),
+    Selector(String),
     Handle { type_id: u32, id: u64 },
     Task(u64),
     Tuple(Vec<Value>),
@@ -393,7 +424,7 @@ impl Compiler<'_> {
                     return;
                 }
                 if let Some(manifest) = self.manifest {
-                    if let Some(name) = flatten_callee(callee)
+                    if let ExprKind::Ident(name) = &callee.kind
                         && let Some(builtin) = manifest.resolve(&name)
                     {
                         for argument in arguments {
@@ -409,22 +440,36 @@ impl Compiler<'_> {
                         });
                         return;
                     }
-                    if let ExprKind::Member { object, name } = &callee.kind
-                        && let Some(builtin) = manifest.resolve(name)
-                    {
-                        self.expression(object);
-                        for argument in arguments {
-                            self.expression(&argument.value);
+                    if let ExprKind::Member { object, name } = &callee.kind {
+                        let selector = match &object.kind {
+                            ExprKind::Ident(selector) => manifest
+                                .resolve_selector(selector, name)
+                                .map(|builtin| (builtin, Some(selector.clone()))),
+                            _ => None,
+                        };
+                        let method = selector
+                            .map(|(builtin, selector)| (builtin, selector))
+                            .or_else(|| manifest.resolve(name).map(|builtin| (builtin, None)));
+                        if let Some((builtin, selector)) = method {
+                            if let Some(selector) = selector {
+                                self.instructions
+                                    .push(Instruction::Constant(Value::Selector(selector)));
+                            } else {
+                                self.expression(object);
+                            }
+                            for argument in arguments {
+                                self.expression(&argument.value);
+                            }
+                            self.instructions.push(Instruction::CallBuiltin {
+                                builtin,
+                                labels: arguments
+                                    .iter()
+                                    .map(|argument| argument.label.clone())
+                                    .collect(),
+                                has_receiver: true,
+                            });
+                            return;
                         }
-                        self.instructions.push(Instruction::CallBuiltin {
-                            builtin,
-                            labels: arguments
-                                .iter()
-                                .map(|argument| argument.label.clone())
-                                .collect(),
-                            has_receiver: true,
-                        });
-                        return;
                     }
                     self.errors.push(CompileError {
                         message: "call is not registered in the builtin manifest".to_string(),
@@ -507,6 +552,7 @@ fn flatten_callee(expression: &Expr) -> Option<String> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuiltinCall {
     pub builtin: BuiltinId,
+    pub receiver: Option<Value>,
     pub arguments: Vec<CallArgument>,
 }
 
@@ -633,15 +679,16 @@ impl Vm {
                     labels,
                     has_receiver,
                 } => {
-                    let values = self.pop_count(labels.len() + usize::from(has_receiver))?;
-                    let labels = if has_receiver {
-                        std::iter::once(None).chain(labels).collect()
+                    let mut values = self.pop_count(labels.len() + usize::from(has_receiver))?;
+                    let receiver = if has_receiver {
+                        Some(values.remove(0))
                     } else {
-                        labels
+                        None
                     };
                     self.status = VmStatus::WaitingForHost;
                     return Ok(Some(VmEvent::Call(BuiltinCall {
                         builtin,
+                        receiver,
                         arguments: labels
                             .into_iter()
                             .zip(values)
@@ -1101,18 +1148,19 @@ impl TaskScheduler {
                 labels,
                 has_receiver,
             } => {
-                let values =
+                let mut values =
                     self.pop_task_count(task_id, labels.len() + usize::from(has_receiver))?;
-                let labels = if has_receiver {
-                    std::iter::once(None).chain(labels).collect()
+                let receiver = if has_receiver {
+                    Some(values.remove(0))
                 } else {
-                    labels
+                    None
                 };
                 self.task_mut(task_id)?.status = TaskStatus::WaitingForHost;
                 return Ok(Some(TaskEvent::Call {
                     task: task_id,
                     call: BuiltinCall {
                         builtin,
+                        receiver,
                         arguments: labels
                             .into_iter()
                             .zip(values)
@@ -1305,6 +1353,13 @@ mod tests {
     use super::*;
     use crate::hks::parse_program;
 
+    fn camera_manifest() -> BuiltinManifest {
+        BuiltinManifest::with_selectors(
+            BTreeMap::new(),
+            BTreeMap::from([(("camera".to_string(), "zoom".to_string()), BuiltinId(10))]),
+        )
+    }
+
     #[test]
     fn calls_user_functions_and_restores_call_frames() {
         let program = parse_program(
@@ -1381,7 +1436,8 @@ mod tests {
             panic!()
         };
         assert_eq!(call.builtin, BuiltinId(2));
-        assert_eq!(call.arguments[0].value, Value::Handle { type_id: 7, id: 9 });
+        assert_eq!(call.receiver, Some(Value::Handle { type_id: 7, id: 9 }));
+        assert_eq!(call.arguments[0].value, Value::String("eyes".to_string()));
         vm.resume_builtin(Value::Handle { type_id: 7, id: 9 })
             .unwrap();
 
@@ -1405,7 +1461,7 @@ mod tests {
     fn yields_named_builtin_calls_and_restores_waiting_state() {
         let program =
             parse_program("let result = camera.zoom(1.2, at: .center, duration: 1)").unwrap();
-        let manifest = BuiltinManifest::new([("camera.zoom", BuiltinId(10))]);
+        let manifest = camera_manifest();
         let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         let mut vm = Vm::new(bytecode.clone()).unwrap();
 
@@ -1429,7 +1485,7 @@ mod tests {
     #[test]
     fn preserves_percent_tuple_arguments_for_typed_builtins() {
         let program = parse_program("camera.zoom(1.2, at: (20%, 30%))").unwrap();
-        let manifest = BuiltinManifest::new([("camera.zoom", BuiltinId(10))]);
+        let manifest = camera_manifest();
         let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         let mut vm = Vm::new(bytecode).unwrap();
         let Some(VmEvent::Call(call)) = vm.step().unwrap() else {
@@ -1444,7 +1500,7 @@ mod tests {
     #[test]
     fn compiles_seq_as_a_host_spawned_task_template() {
         let program = parse_program("let handle = seq { camera.zoom(1.2) }").unwrap();
-        let manifest = BuiltinManifest::new([("camera.zoom", BuiltinId(10))]);
+        let manifest = camera_manifest();
         let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         assert_eq!(bytecode.tasks.len(), 1);
         assert_eq!(bytecode.tasks[0].mode, TaskMode::Sequence);

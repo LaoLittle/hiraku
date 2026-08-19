@@ -250,11 +250,7 @@ pub(super) fn apply_character_motion(
     animations: &mut AnimationState,
 ) {
     let prefix = character_part_prefix(actor_id);
-    let snapshot = shared_state
-        .0
-        .lock()
-        .expect("scene state mutex must not be poisoned")
-        .clone();
+    let snapshot = &shared_state.0;
     let mut part_ids = snapshot
         .sprites
         .iter()
@@ -325,11 +321,7 @@ pub(super) fn apply_character_timeline(
     }
 
     let prefix = character_part_prefix(actor_id);
-    let snapshot = shared_state
-        .0
-        .lock()
-        .expect("scene state mutex must not be poisoned")
-        .clone();
+    let snapshot = &shared_state.0;
     let mut part_ids = snapshot
         .sprites
         .iter()

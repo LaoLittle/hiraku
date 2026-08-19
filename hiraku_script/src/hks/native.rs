@@ -13,6 +13,7 @@ type RawNativeThunk<C> = dyn Fn(&mut C, &BuiltinCall) -> NativeResult + Send + S
 
 pub struct NativeRegistry<C> {
     names: BTreeMap<String, BuiltinId>,
+    selectors: BTreeMap<(String, String), BuiltinId>,
     functions: BTreeMap<BuiltinId, Box<NativeThunk<C>>>,
     raw_functions: BTreeMap<BuiltinId, Box<RawNativeThunk<C>>>,
 }
@@ -27,6 +28,7 @@ impl<C> NativeRegistry<C> {
     pub fn new() -> Self {
         Self {
             names: BTreeMap::new(),
+            selectors: BTreeMap::new(),
             functions: BTreeMap::new(),
             raw_functions: BTreeMap::new(),
         }
@@ -62,11 +64,7 @@ impl<C> NativeRegistry<C> {
         if self.names.contains_key(&name) {
             return Err(RegistrationError::DuplicateName(name));
         }
-        if let Some(existing) = self
-            .names
-            .iter()
-            .find_map(|(name, existing)| (*existing == id).then_some(name.clone()))
-        {
+        if let Some(existing) = self.name_for_id(id) {
             return Err(RegistrationError::DuplicateId {
                 id,
                 existing,
@@ -92,11 +90,7 @@ impl<C> NativeRegistry<C> {
         if self.names.contains_key(&name) {
             return Err(RegistrationError::DuplicateName(name));
         }
-        if let Some(existing) = self
-            .names
-            .iter()
-            .find_map(|(name, existing)| (*existing == id).then_some(name.clone()))
-        {
+        if let Some(existing) = self.name_for_id(id) {
             return Err(RegistrationError::DuplicateId {
                 id,
                 existing,
@@ -114,8 +108,72 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
+    pub fn register_selector_raw_fn_with_id<F>(
+        &mut self,
+        id: BuiltinId,
+        selector: impl Into<String>,
+        method: impl Into<String>,
+        function: F,
+    ) -> Result<(), RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let key = (selector.into(), method.into());
+        if self.selectors.contains_key(&key) {
+            return Err(RegistrationError::DuplicateName(format!(
+                "{}.{}",
+                key.0, key.1
+            )));
+        }
+        if let Some(existing) = self.name_for_id(id) {
+            return Err(RegistrationError::DuplicateId {
+                id,
+                existing,
+                attempted: format!("{}.{}", key.0, key.1),
+            });
+        }
+        self.selectors.insert(key, id);
+        self.functions.insert(
+            id,
+            Box::new(move |_context, _| {
+                unreachable!("raw functions are dispatched before typed thunks")
+            }),
+        );
+        self.raw_functions.insert(id, Box::new(function));
+        Ok(())
+    }
+
+    pub fn register_selector_fn_with_id<F, Args>(
+        &mut self,
+        id: BuiltinId,
+        selector: impl Into<String>,
+        method: impl Into<String>,
+        function: F,
+    ) -> Result<(), RegistrationError>
+    where
+        F: IntoNativeFunction<C, Args>,
+    {
+        let key = (selector.into(), method.into());
+        if self.selectors.contains_key(&key) {
+            return Err(RegistrationError::DuplicateName(format!(
+                "{}.{}",
+                key.0, key.1
+            )));
+        }
+        if let Some(existing) = self.name_for_id(id) {
+            return Err(RegistrationError::DuplicateId {
+                id,
+                existing,
+                attempted: format!("{}.{}", key.0, key.1),
+            });
+        }
+        self.selectors.insert(key, id);
+        self.functions.insert(id, function.into_native_function());
+        Ok(())
+    }
+
     pub fn manifest(&self) -> BuiltinManifest {
-        BuiltinManifest::new(self.names.iter().map(|(name, id)| (name.clone(), *id)))
+        BuiltinManifest::with_selectors(self.names.clone(), self.selectors.clone())
     }
 
     pub fn call(&self, context: &mut C, call: &BuiltinCall) -> NativeResult {
@@ -127,11 +185,25 @@ impl<C> NativeRegistry<C> {
             .get(&call.builtin)
             .ok_or(NativeError::UnknownBuiltin(call.builtin))?;
         let values = call
-            .arguments
+            .receiver
             .iter()
-            .map(|argument| argument.value.clone())
+            .cloned()
+            .chain(call.arguments.iter().map(|argument| argument.value.clone()))
             .collect::<Vec<_>>();
         function(context, &values)
+    }
+
+    fn name_for_id(&self, id: BuiltinId) -> Option<String> {
+        self.names
+            .iter()
+            .find_map(|(name, existing)| (*existing == id).then_some(name.clone()))
+            .or_else(|| {
+                self.selectors
+                    .iter()
+                    .find_map(|((selector, method), existing)| {
+                        (*existing == id).then_some(format!("{selector}.{method}"))
+                    })
+            })
     }
 }
 
@@ -145,6 +217,18 @@ pub fn stable_builtin_id(name: &str) -> BuiltinId {
 
 pub trait FromHksValue: Sized {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectorValue(pub String);
+
+impl FromHksValue for SelectorValue {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::Selector(selector) => Ok(Self(selector.clone())),
+            _ => Err(NativeError::TypeMismatch("selector")),
+        }
+    }
 }
 
 pub trait IntoHksValue {
@@ -329,6 +413,17 @@ mod tests {
         Ok(format!("hello {name}"))
     }
 
+    fn selector_zoom(
+        context: &mut Context,
+        selector: SelectorValue,
+        scale: f64,
+    ) -> Result<(), NativeError> {
+        assert_eq!(selector.0, "camera");
+        assert_eq!(scale, 1.2);
+        context.calls += 1;
+        Ok(())
+    }
+
     #[test]
     fn registers_a_typed_rust_function_and_dispatches_compiled_calls() {
         let mut registry = NativeRegistry::new();
@@ -351,6 +446,7 @@ mod tests {
                 &mut context,
                 &BuiltinCall {
                     builtin: id,
+                    receiver: None,
                     arguments: vec![super::super::vm::CallArgument {
                         label: None,
                         value: Value::String("HKS".to_string()),
@@ -359,6 +455,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, Value::String("hello HKS".to_string()));
+        assert_eq!(context.calls, 1);
+    }
+
+    #[test]
+    fn selector_methods_preserve_a_typed_receiver_in_bytecode_calls() {
+        let mut registry = NativeRegistry::<Context>::new();
+        let id = BuiltinId(77);
+        registry
+            .register_selector_raw_fn_with_id(id, "camera", "zoom", |_context, call| {
+                assert_eq!(call.receiver, Some(Value::Selector("camera".to_string())));
+                Ok(Value::Null)
+            })
+            .expect("selector method registration must succeed");
+        let bytecode = compile_with_manifest(
+            &parse_program("camera.zoom(1.2)").expect("selector call must parse"),
+            43,
+            &registry.manifest(),
+        )
+        .expect("selector call must compile");
+        assert!(matches!(
+            bytecode.instructions.first(),
+            Some(super::super::vm::Instruction::Constant(Value::Selector(selector)))
+                if selector == "camera"
+        ));
+        let mut vm = super::super::vm::Vm::new(bytecode).expect("selector VM must initialize");
+        let Some(super::super::vm::VmEvent::Call(call)) =
+            vm.step().expect("selector VM step must succeed")
+        else {
+            panic!("expected selector builtin call")
+        };
+        registry
+            .call(&mut Context::default(), &call)
+            .expect("selector call must dispatch with its receiver");
+    }
+
+    #[test]
+    fn selector_methods_can_register_typed_rust_functions() {
+        let mut registry = NativeRegistry::<Context>::new();
+        registry
+            .register_selector_fn_with_id(BuiltinId(78), "camera", "zoom", selector_zoom)
+            .expect("typed selector method registration must succeed");
+        let bytecode = compile_with_manifest(
+            &parse_program("camera.zoom(1.2)").expect("selector call must parse"),
+            44,
+            &registry.manifest(),
+        )
+        .expect("typed selector call must compile");
+        let mut vm = super::super::vm::Vm::new(bytecode).expect("selector VM must initialize");
+        let Some(super::super::vm::VmEvent::Call(call)) =
+            vm.step().expect("selector VM step must succeed")
+        else {
+            panic!("expected selector builtin call")
+        };
+        let mut context = Context::default();
+        registry
+            .call(&mut context, &call)
+            .expect("typed selector call must dispatch");
         assert_eq!(context.calls, 1);
     }
 

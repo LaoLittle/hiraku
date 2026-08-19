@@ -306,7 +306,7 @@ pub struct PendingScriptCommands {
 }
 
 pub fn bridge_ir_events(
-    mut runtime: ResMut<IrRuntime>,
+    mut runtime: NonSendMut<IrRuntime>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
     textures: Option<Res<TextureCatalog>>,
     audio: Option<Res<AudioCatalog>>,
@@ -314,10 +314,7 @@ pub fn bridge_ir_events(
     user_settings: Res<UserSettings>,
 ) {
     if let Some(receiver) = runtime.wait_response.as_ref() {
-        let response = receiver
-            .lock()
-            .expect("IR wait response mutex must not be poisoned")
-            .try_recv();
+        let response = receiver.try_recv();
         match response {
             Ok(ScriptResponse::Choice(value)) => {
                 let value = if let Some(screen) = runtime.pending_ui_screen.take() {
@@ -382,8 +379,7 @@ pub fn bridge_ir_events(
             let (response_tx, response_rx) = mpsc::channel();
             runtime.pending_input_variable = Some(result);
             runtime.pending_ui_screen = None;
-            runtime.pending_response =
-                Some(std::sync::Arc::new(std::sync::Mutex::new(response_rx)));
+            runtime.pending_response = Some(response_rx);
             pending_script_commands
                 .items
                 .push_back(ScriptCommand::Choose {
@@ -431,8 +427,7 @@ pub fn bridge_ir_events(
             let (response_tx, response_rx) = mpsc::channel();
             runtime.pending_input_variable = Some(result);
             runtime.pending_ui_screen = Some(target.clone());
-            runtime.pending_response =
-                Some(std::sync::Arc::new(std::sync::Mutex::new(response_rx)));
+            runtime.pending_response = Some(response_rx);
             match screen {
                 Ok(screen) => pending_script_commands
                     .items
@@ -493,7 +488,7 @@ pub fn bridge_ir_events(
             }
         }
         IrEvent::Command(IrCommand::WaitHksTask { handle }) => {
-            let Some(receiver) = runtime.native_tasks.get(&handle).cloned() else {
+            let Some(receiver) = runtime.native_tasks.remove(&handle) else {
                 warn!("HKS task handle `{handle}` is not defined");
                 return;
             };
@@ -508,101 +503,127 @@ pub fn bridge_ir_events(
         IrEvent::Command(IrCommand::HksStatement {
             bytecode,
             mut task_result,
-        }) => {
-            match crate::hks_capabilities::execute(bytecode) {
-                Ok(output) => {
-                    for command in output.commands {
-                        if matches!(
-                            command,
-                            IrCommand::LoadScript { .. }
-                                | IrCommand::Choose { .. }
-                                | IrCommand::OpenUi { .. }
-                                | IrCommand::PlayBgm { .. }
-                                | IrCommand::PlayVoice { .. }
-                        ) {
-                            runtime.events.push_back(IrEvent::Command(command));
-                            continue;
-                        }
-                        match script_command_from_ir(command, textures.as_deref()) {
-                            Ok(command) => pending_script_commands.items.push_back(command),
-                            Err(error) => warn!("HKS native command rejected: {error}"),
-                        }
+        }) => match crate::hks_capabilities::execute(bytecode) {
+            Ok(output) => {
+                for command in output.commands {
+                    if matches!(
+                        command,
+                        IrCommand::LoadScript { .. }
+                            | IrCommand::Choose { .. }
+                            | IrCommand::OpenUi { .. }
+                            | IrCommand::PlayBgm { .. }
+                            | IrCommand::PlayVoice { .. }
+                    ) {
+                        runtime.events.push_back(IrEvent::Command(command));
+                        continue;
                     }
-                    for task in output.tasks {
-                        let batch_id = runtime.next_native_task_id;
-                        runtime.next_native_task_id += 1;
-                        let mut items = Vec::new();
-                        for (index, command) in task.commands.into_iter().enumerate() {
-                            let IrCommand::PlayVoice { path, volume } = command else {
-                                warn!("HKS task command is not yet supported by the story runtime");
-                                continue;
-                            };
-                            let Some(definition) = audio
-                                .as_deref()
-                                .and_then(|catalog| catalog.resolve_voice(&path))
-                            else {
-                                warn!("voice `{path}` is not defined");
-                                continue;
-                            };
-                            let handle = format!("hks-task-{batch_id}-{index}");
-                            items.push(BatchSubmissionItem {
-                                handle: handle.clone(),
-                                command: Box::new(ScriptCommand::PlayVoice {
+                    match script_command_from_ir(command, textures.as_deref()) {
+                        Ok(command) => pending_script_commands.items.push_back(command),
+                        Err(error) => warn!("HKS native command rejected: {error}"),
+                    }
+                }
+                for task in output.tasks {
+                    let batch_id = runtime.next_native_task_id;
+                    runtime.next_native_task_id += 1;
+                    let mut items = Vec::new();
+                    for (index, command) in task.commands.into_iter().enumerate() {
+                        let handle = format!("hks-task-{batch_id}-{index}");
+                        let command = match command {
+                            IrCommand::PlayVoice { path, volume } => {
+                                let Some(definition) = audio
+                                    .as_deref()
+                                    .and_then(|catalog| catalog.resolve_voice(&path))
+                                else {
+                                    warn!("voice `{path}` is not defined");
+                                    continue;
+                                };
+                                ScriptCommand::PlayVoice {
                                     path: definition.path.clone(),
                                     volume,
                                     mode: VoicePlaybackMode::Concurrent,
-                                    animation_id: Some(handle),
+                                    animation_id: Some(handle.clone()),
                                     done: None,
-                                }),
-                            });
-                        }
-                        let handles = items
-                            .iter()
-                            .map(|item| item.handle.clone())
-                            .collect::<Vec<_>>();
-                        let mode = match task.mode {
-                            hiraku_script::hks::vm::TaskMode::Sequence => {
-                                BatchSubmitMode::Sequence
+                                }
                             }
-                            hiraku_script::hks::vm::TaskMode::Parallel => {
-                                BatchSubmitMode::Parallel
+                            command @ IrCommand::ShowCharacter { .. } => {
+                                match script_command_from_ir(command, textures.as_deref()) {
+                                    Ok(ScriptCommand::ShowCharacter {
+                                        actor_id,
+                                        character_name,
+                                        expressions,
+                                        position,
+                                        scale,
+                                        fade,
+                                        done,
+                                        ..
+                                    }) => ScriptCommand::ShowCharacter {
+                                        actor_id,
+                                        character_name,
+                                        expressions,
+                                        position,
+                                        scale,
+                                        fade,
+                                        animation_id: Some(handle.clone()),
+                                        done,
+                                    },
+                                    Ok(_) => unreachable!(
+                                        "show character IR must stay a show character command"
+                                    ),
+                                    Err(error) => {
+                                        warn!("HKS character task command rejected: {error}");
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => {
+                                warn!("HKS task command is not yet supported by the story runtime");
+                                continue;
                             }
                         };
-                        if !items.is_empty() {
-                            pending_script_commands
-                                .items
-                                .push_back(ScriptCommand::SubmitBatch { mode, items });
-                        }
-                        if let Some(handle) = task_result.take() {
-                            let (response_tx, response_rx) = mpsc::channel();
-                            if handles.is_empty() {
-                                let _ = response_tx.send(ScriptResponse::Continue);
-                            } else {
-                                pending_script_commands
-                                    .items
-                                    .push_back(ScriptCommand::WaitAnimations {
-                                        ids: handles,
-                                        done: response_tx,
-                                    });
-                            }
-                            runtime.native_tasks.insert(
-                                handle,
-                                std::sync::Arc::new(std::sync::Mutex::new(response_rx)),
+                        items.push(BatchSubmissionItem {
+                            handle: handle.clone(),
+                            command: Box::new(command),
+                        });
+                    }
+                    let handles = items
+                        .iter()
+                        .map(|item| item.handle.clone())
+                        .collect::<Vec<_>>();
+                    let mode = match task.mode {
+                        hiraku_script::hks::vm::TaskMode::Sequence => BatchSubmitMode::Sequence,
+                        hiraku_script::hks::vm::TaskMode::Parallel => BatchSubmitMode::Parallel,
+                    };
+                    if !items.is_empty() {
+                        pending_script_commands
+                            .items
+                            .push_back(ScriptCommand::SubmitBatch { mode, items });
+                    }
+                    if let Some(handle) = task_result.take() {
+                        let (response_tx, response_rx) = mpsc::channel();
+                        if handles.is_empty() {
+                            let _ = response_tx.send(ScriptResponse::Continue);
+                        } else {
+                            pending_script_commands.items.push_back(
+                                ScriptCommand::WaitAnimations {
+                                    ids: handles,
+                                    done: response_tx,
+                                },
                             );
                         }
-                    }
-                    if let Some(wait) = output.wait
-                        && runtime
-                            .vm
-                            .as_mut()
-                            .is_some_and(|vm| vm.suspend(wait.clone()))
-                    {
-                        runtime.events.push_back(IrEvent::Waiting(wait));
+                        runtime.native_tasks.insert(handle, response_rx);
                     }
                 }
-                Err(error) => warn!("HKS native statement failed: {error}"),
+                if let Some(wait) = output.wait
+                    && runtime
+                        .vm
+                        .as_mut()
+                        .is_some_and(|vm| vm.suspend(wait.clone()))
+                {
+                    runtime.events.push_back(IrEvent::Waiting(wait));
+                }
             }
-        }
+            Err(error) => warn!("HKS native statement failed: {error}"),
+        },
         IrEvent::Command(command) => match script_command_from_ir(command, textures.as_deref()) {
             Ok(command) => pending_script_commands.items.push_back(command),
             Err(error) => warn!("IR command rejected: {error}"),
@@ -633,7 +654,7 @@ pub fn bridge_ir_events(
                     done: response_tx,
                 },
             };
-            runtime.wait_response = Some(std::sync::Arc::new(std::sync::Mutex::new(response_rx)));
+            runtime.wait_response = Some(response_rx);
             pending_script_commands.items.push_back(command);
         }
         IrEvent::Completed => {}
@@ -840,7 +861,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub images: Res<'w, Assets<Image>>,
     pub texture_atlases: Res<'w, TextureAtlasCatalog>,
     pub vfs: Res<'w, VfsResource>,
-    pub shared_state: Res<'w, SceneSharedState>,
+    pub shared_state: ResMut<'w, SceneSharedState>,
     pub characters: Res<'w, CharacterCatalog>,
     pub user_settings: ResMut<'w, UserSettings>,
     pub ui_fonts: Res<'w, UiFonts>,
@@ -852,7 +873,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub camera_state: ResMut<'w, CameraState>,
     pub camera_tweens: ResMut<'w, CameraTweenState>,
     pub pending_script_commands: ResMut<'w, PendingScriptCommands>,
-    pub ir_runtime: ResMut<'w, IrRuntime>,
+    pub ir_runtime: NonSendMut<'w, IrRuntime>,
     pub active_batches: ResMut<'w, ActiveScriptBatches>,
     pub dialogue_state: ResMut<'w, DialogueState>,
     pub choice_state: ResMut<'w, ChoiceState>,
@@ -909,8 +930,8 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub asset_server: Res<'w, AssetServer>,
     pub ui_fonts: Res<'w, UiFonts>,
     pub vfs: Res<'w, VfsResource>,
-    pub shared_state: Res<'w, SceneSharedState>,
-    pub ir_runtime: ResMut<'w, IrRuntime>,
+    pub shared_state: ResMut<'w, SceneSharedState>,
+    pub ir_runtime: NonSendMut<'w, IrRuntime>,
     pub frontend: ResMut<'w, FrontendState>,
     pub user_settings: Res<'w, UserSettings>,
     pub ui_style: Res<'w, UiStyle>,
@@ -950,7 +971,7 @@ pub fn setup_stage(
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     config: Res<crate::RuntimeLaunchConfig>,
-    shared_state: Res<SceneSharedState>,
+    mut shared_state: ResMut<SceneSharedState>,
 ) {
     setup_stage_cameras(&mut commands, &mut images, &config);
     commands.insert_resource(RuleTransitionMesh(meshes.add(Rectangle::default())));
@@ -1038,10 +1059,7 @@ pub fn setup_stage(
 
     let mut snapshot = SceneSnapshot::default();
     snapshot.text_effect = text_effect_snapshot(&DialogueTextEffect::default());
-    *shared_state
-        .0
-        .lock()
-        .expect("scene state mutex must not be poisoned") = snapshot;
+    shared_state.0 = snapshot;
 }
 
 pub fn setup_frontend(
@@ -1639,13 +1657,13 @@ pub fn handle_frontend_buttons(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     vfs: Res<VfsResource>,
-    shared_state: Res<SceneSharedState>,
+    mut shared_state: ResMut<SceneSharedState>,
     mut frontend: ResMut<FrontendState>,
     mut user_settings: ResMut<UserSettings>,
     mut stage: ResMut<StageState>,
     mut dialogue_state: ResMut<DialogueState>,
     mut choice_state: ResMut<ChoiceState>,
-    mut ir_runtime: ResMut<IrRuntime>,
+    mut ir_runtime: NonSendMut<IrRuntime>,
     mut interaction_query: Query<
         (&Interaction, &mut BackgroundColor, &FrontendButton),
         Changed<Interaction>,
@@ -1684,7 +1702,7 @@ pub fn handle_frontend_buttons(
                             &mut commands,
                             &asset_server,
                             &vfs,
-                            &shared_state,
+                            &mut shared_state,
                             &mut stage,
                             &mut dialogue_state,
                             &mut choice_state,
@@ -1720,7 +1738,7 @@ pub fn handle_frontend_buttons(
                             &mut commands,
                             &asset_server,
                             &vfs,
-                            &shared_state,
+                            &mut shared_state,
                             &mut stage,
                             &mut dialogue_state,
                             &mut choice_state,
@@ -1767,7 +1785,7 @@ pub fn handle_frontend_buttons(
                                 &mut commands,
                                 &asset_server,
                                 &vfs,
-                                &shared_state,
+                                &mut shared_state,
                                 &mut stage,
                                 &mut dialogue_state,
                                 &mut choice_state,
@@ -1828,7 +1846,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let images = ctx.images;
     let texture_atlases = ctx.texture_atlases;
     let vfs = ctx.vfs;
-    let shared_state = ctx.shared_state;
+    let mut shared_state = ctx.shared_state;
     let characters = ctx.characters;
     let mut user_settings = ctx.user_settings;
     let ui_fonts = ctx.ui_fonts;
@@ -1898,8 +1916,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             } => {
                 let current_background = shared_state
                     .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
                     .background
                     .as_ref()
                     .map(|background| background.path.clone());
@@ -1978,11 +1994,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     }
                 }
 
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .background = Some(ImageLayerSnapshot { path });
+                shared_state.0.background = Some(ImageLayerSnapshot { path });
             }
             ScriptCommand::RuleTransitionBg {
                 path,
@@ -2009,11 +2021,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         ))
                         .id();
                     stage.background = Some(entity);
-                    shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned")
-                        .background = Some(ImageLayerSnapshot { path });
+                    shared_state.0.background = Some(ImageLayerSnapshot { path });
                     if let Some(done) = done {
                         let _ = done.send(ScriptResponse::Continue);
                     }
@@ -2025,8 +2033,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
 
                 let Some(previous_path) = shared_state
                     .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
                     .background
                     .as_ref()
                     .map(|background| background.path.clone())
@@ -2252,11 +2258,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             } => {
                 if let Some(overlay) = stage.overlay {
                     if let Some(duration) = fade {
-                        let current_alpha = shared_state
-                            .0
-                            .lock()
-                            .expect("scene state mutex must not be poisoned")
-                            .overlay_alpha;
+                        let current_alpha = shared_state.0.overlay_alpha;
                         commands.entity(overlay).insert(VisualTween {
                             from_alpha: Some(current_alpha),
                             to_alpha: Some(alpha),
@@ -2281,11 +2283,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             animations.completed.insert(animation_id);
                         }
                     }
-                    shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned")
-                        .overlay_alpha = alpha;
+                    shared_state.0.overlay_alpha = alpha;
                 }
             }
             ScriptCommand::Say {
@@ -2318,11 +2316,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     );
                 }
                 dialogue_state.waiting = Some(PendingDialogueAdvance { animation_id, done });
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .dialogue = Some(DialogueSnapshot { speaker, text });
+                shared_state.0.dialogue = Some(DialogueSnapshot { speaker, text });
             }
             ScriptCommand::AwaitDialogueAdvance { done } => {
                 dialogue_state.waiting = Some(PendingDialogueAdvance {
@@ -2357,11 +2351,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         done,
                     );
                 }
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .dialogue = Some(DialogueSnapshot { speaker, text });
+                shared_state.0.dialogue = Some(DialogueSnapshot { speaker, text });
             }
             ScriptCommand::ClearDialogue => {
                 if let Some(waiting) = dialogue_state.waiting.take() {
@@ -2377,27 +2367,15 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if let Ok(mut line_node) = line_text.single_mut() {
                     **line_node = String::new();
                 }
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .dialogue = None;
+                shared_state.0.dialogue = None;
             }
             ScriptCommand::SetTextEffect(effect) => {
                 apply_text_effect_spec(&mut dialogue_state.effect, effect);
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .text_effect = text_effect_snapshot(&dialogue_state.effect);
+                shared_state.0.text_effect = text_effect_snapshot(&dialogue_state.effect);
             }
             ScriptCommand::ResetTextEffect => {
                 dialogue_state.effect = DialogueTextEffect::default();
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .text_effect = text_effect_snapshot(&dialogue_state.effect);
+                shared_state.0.text_effect = text_effect_snapshot(&dialogue_state.effect);
             }
             ScriptCommand::SetCamera {
                 blur_intensity,
@@ -2680,10 +2658,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &user_settings,
                     snapshot.clone(),
                 );
-                *shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned") = snapshot;
+                shared_state.0 = snapshot;
                 let _ = done.send(ScriptResponse::Continue);
             }
             ScriptCommand::MoveSprite {
@@ -2694,10 +2669,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 done,
             } => {
                 if let Some(entity) = stage.sprites.get(&id).copied() {
-                    let snapshot = shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned");
+                    let snapshot = &shared_state.0;
                     if let Some(sprite) = snapshot.sprites.iter().find(|sprite| sprite.id == id) {
                         let from = Vec3::new(sprite.x, sprite.y, STAGE_Z_SPRITE + sprite.layer);
                         commands.entity(entity).insert(VisualTween {
@@ -2733,10 +2705,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 done,
             } => {
                 if let Some(entity) = stage.sprites.get(&id).copied() {
-                    let snapshot = shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned");
+                    let snapshot = &shared_state.0;
                     if let Some(sprite) = snapshot.sprites.iter().find(|sprite| sprite.id == id) {
                         let from = Vec3::splat(sprite.scale);
                         commands.entity(entity).insert(VisualTween {
@@ -2768,10 +2737,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 done,
             } => {
                 if let Some(entity) = stage.sprites.get(&id).copied() {
-                    let snapshot = shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned");
+                    let snapshot = &shared_state.0;
                     if let Some(sprite) = snapshot.sprites.iter().find(|sprite| sprite.id == id) {
                         commands.entity(entity).insert(VisualTween {
                             from_alpha: Some(sprite.alpha),
@@ -2870,22 +2836,12 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     }
                 }
                 stage.bgm = Some(bgm);
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .bgm = Some(AudioSnapshot { path, volume });
+                shared_state.0.bgm = Some(AudioSnapshot { path, volume });
             }
             ScriptCommand::SetBgmVolume { volume } => {
                 let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
                 if let Some(bgm) = stage.bgm {
-                    if let Some(snapshot) = shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned")
-                        .bgm
-                        .as_ref()
-                    {
+                    if let Some(snapshot) = shared_state.0.bgm.as_ref() {
                         commands.entity(bgm).insert(BgmChannel {
                             path: snapshot.path.clone(),
                             volume,
@@ -2899,13 +2855,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         done: None,
                     });
                 }
-                if let Some(snapshot) = shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .bgm
-                    .as_mut()
-                {
+                if let Some(snapshot) = shared_state.0.bgm.as_mut() {
                     snapshot.volume = volume;
                 }
             }
@@ -2918,21 +2868,13 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
                 let from = shared_state
                     .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
                     .bgm
                     .as_ref()
                     .map(|bgm| bgm.volume)
                     .map(|volume| apply_volume_setting(volume, user_settings.bgm_volume))
                     .unwrap_or(playback_volume);
                 if let Some(bgm) = stage.bgm {
-                    if let Some(snapshot) = shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned")
-                        .bgm
-                        .as_ref()
-                    {
+                    if let Some(snapshot) = shared_state.0.bgm.as_ref() {
                         commands.entity(bgm).insert(BgmChannel {
                             path: snapshot.path.clone(),
                             volume,
@@ -2945,13 +2887,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         animation_id,
                         done,
                     });
-                    if let Some(snapshot) = shared_state
-                        .0
-                        .lock()
-                        .expect("scene state mutex must not be poisoned")
-                        .bgm
-                        .as_mut()
-                    {
+                    if let Some(snapshot) = shared_state.0.bgm.as_mut() {
                         snapshot.volume = volume;
                     }
                 } else {
@@ -2967,11 +2903,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if let Some(previous) = stage.bgm.take() {
                     commands.entity(previous).try_despawn();
                 }
-                shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned")
-                    .bgm = None;
+                shared_state.0.bgm = None;
             }
             ScriptCommand::PlayVoice {
                 path,
@@ -3048,10 +2980,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 clear_screen_ui(&mut commands, &mut screen_state);
                 clear_overlay_ui(&mut commands, &mut overlay_state);
                 pending_characters.items.clear();
-                *shared_state
-                    .0
-                    .lock()
-                    .expect("scene state mutex must not be poisoned") = SceneSnapshot::default();
+                shared_state.0 = SceneSnapshot::default();
                 restore_scene_snapshot(
                     &mut commands,
                     &asset_server,
@@ -3834,7 +3763,7 @@ pub fn poll_voice_playback(
 }
 
 pub fn sync_scene_snapshot(
-    shared_state: Res<SceneSharedState>,
+    mut shared_state: ResMut<SceneSharedState>,
     stage: Res<StageState>,
     dialogue_state: Res<DialogueState>,
     background_layers: Query<&BackgroundLayer>,
@@ -3842,10 +3771,7 @@ pub fn sync_scene_snapshot(
     overlay: Query<&Sprite, With<OverlayMarker>>,
     sprites: Query<(&SpriteActor, &Sprite, &Transform)>,
 ) {
-    let mut snapshot = shared_state
-        .0
-        .lock()
-        .expect("scene state mutex must not be poisoned");
+    let snapshot = &mut shared_state.0;
 
     snapshot.background = stage
         .background
@@ -3893,7 +3819,7 @@ fn start_frontend_session(
     commands: &mut Commands,
     asset_server: &AssetServer,
     vfs: &VfsResource,
-    shared_state: &SceneSharedState,
+    shared_state: &mut SceneSharedState,
     stage: &mut StageState,
     dialogue_state: &mut DialogueState,
     choice_state: &mut ChoiceState,
@@ -3912,10 +3838,7 @@ fn start_frontend_session(
     }
 
     clear_choice_ui(commands, choice_ui);
-    *shared_state
-        .0
-        .lock()
-        .expect("scene state mutex must not be poisoned") = snapshot.clone();
+    shared_state.0 = snapshot.clone();
     restore_scene_snapshot(
         commands,
         asset_server,
@@ -4476,7 +4399,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.commands,
                             &ctx.asset_server,
                             &ctx.vfs,
-                            &ctx.shared_state,
+                            &mut ctx.shared_state,
                             &mut ctx.stage,
                             &mut ctx.dialogue_state,
                             &mut ctx.choice_state,
@@ -4526,7 +4449,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.commands,
                             &ctx.asset_server,
                             &ctx.vfs,
-                            &ctx.shared_state,
+                            &mut ctx.shared_state,
                             &mut ctx.stage,
                             &mut ctx.dialogue_state,
                             &mut ctx.choice_state,
@@ -4846,11 +4769,7 @@ fn finish_all_voices(
     }
 }
 
-fn finish_voice(
-    commands: &mut Commands,
-    animations: &mut AnimationState,
-    mut active: ActiveVoice,
-) {
+fn finish_voice(commands: &mut Commands, animations: &mut AnimationState, mut active: ActiveVoice) {
     commands.entity(active.entity).try_despawn();
     if let Some(animation_id) = active.animation_id.take() {
         animations.completed.insert(animation_id);

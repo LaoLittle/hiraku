@@ -1,7 +1,7 @@
 use std::{
     io::{Cursor, Read, Seek},
     path::{Component, Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock},
 };
 
 use bevy::{
@@ -40,21 +40,15 @@ pub struct VfsResource(pub Arc<HdpVfs>);
 
 /// Archive bytes published by Bevy's asynchronous `HdpArchiveLoader`.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct HdpArchiveStore(Arc<RwLock<Option<Arc<[u8]>>>>);
+pub struct HdpArchiveStore(Arc<OnceLock<Arc<[u8]>>>);
 
 impl HdpArchiveStore {
-    pub fn replace(&self, bytes: Arc<[u8]>) {
-        *self
-            .0
-            .write()
-            .expect("archive byte store lock must not be poisoned") = Some(bytes);
+    pub fn publish(&self, bytes: Arc<[u8]>) -> Result<(), Arc<[u8]>> {
+        self.0.set(bytes)
     }
 
     fn bytes(&self) -> Option<Arc<[u8]>> {
-        self.0
-            .read()
-            .expect("archive byte store lock must not be poisoned")
-            .clone()
+        self.0.get().cloned()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -916,7 +910,9 @@ mod tests {
         zip.finish().unwrap();
 
         let store = HdpArchiveStore::default();
-        store.replace(Arc::from(std::fs::read(root.join("main.hdp")).unwrap()));
+        store
+            .publish(Arc::from(std::fs::read(root.join("main.hdp")).unwrap()))
+            .expect("test archive must only be published once");
         let vfs = HdpVfs::new_with_config_and_store(
             &root,
             DEFAULT_SETTINGS_PATH,

@@ -30,6 +30,8 @@ pub enum HdpArchiveLoaderError {
     Io(#[from] std::io::Error),
     #[error("invalid HDP archive: {0}")]
     Zip(#[from] ZipError),
+    #[error("HDP archive bytes were already published")]
+    AlreadyLoaded,
 }
 
 impl AssetLoader for HdpArchiveLoader {
@@ -46,7 +48,9 @@ impl AssetLoader for HdpArchiveLoader {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
         ZipArchive::new(Cursor::new(&bytes))?;
-        self.store.replace(Arc::from(bytes));
+        self.store
+            .publish(Arc::from(bytes))
+            .map_err(|_| HdpArchiveLoaderError::AlreadyLoaded)?;
         Ok(HdpArchive)
     }
 

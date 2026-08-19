@@ -3,7 +3,6 @@ use std::{
     sync::mpsc,
 };
 
-use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -423,25 +422,20 @@ pub enum IrValidationError {
     SourceHashMismatch { expected: u64, actual: u64 },
 }
 
-#[derive(Default, Resource)]
+#[derive(Default)]
 pub struct IrRuntime {
     pub vm: Option<IrVm>,
     pub events: VecDeque<IrEvent>,
-    pub wait_response:
-        Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
+    pub wait_response: Option<mpsc::Receiver<super::ScriptResponse>>,
     pub current_script: Option<String>,
     pub pending_input_variable: Option<String>,
     pub pending_ui_screen: Option<String>,
-    pub pending_response:
-        Option<std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>>,
+    pub pending_response: Option<mpsc::Receiver<super::ScriptResponse>>,
     pub next_native_task_id: u64,
-    pub native_tasks: BTreeMap<
-        String,
-        std::sync::Arc<std::sync::Mutex<mpsc::Receiver<super::ScriptResponse>>>,
-    >,
+    pub native_tasks: BTreeMap<String, mpsc::Receiver<super::ScriptResponse>>,
 }
 
-pub fn tick_ir_runtime(mut runtime: bevy::prelude::ResMut<IrRuntime>) {
+pub fn tick_ir_runtime(mut runtime: bevy::prelude::NonSendMut<IrRuntime>) {
     let Some(vm) = runtime.vm.as_mut() else {
         return;
     };

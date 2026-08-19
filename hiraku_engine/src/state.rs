@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::collections::BTreeMap;
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -186,4 +183,4 @@ pub struct UiStylePatch {
 }
 
 #[derive(Resource, Clone, Default)]
-pub struct SceneSharedState(pub Arc<Mutex<SceneSnapshot>>);
+pub struct SceneSharedState(pub SceneSnapshot);

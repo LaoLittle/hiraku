@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use hiraku_script::hks::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
 use hiraku_script::hks::vm::{
-    BuiltinId, BuiltinManifest, Bytecode, TaskEvent, TaskMode, TaskScheduler, TaskStatus, Value, Vm,
-    VmEvent, compile_with_manifest,
+    BuiltinId, BuiltinManifest, Bytecode, TaskEvent, TaskMode, TaskScheduler, TaskStatus, Value,
+    Vm, VmEvent, compile_with_manifest,
 };
 use hiraku_script::hks::{Expr, Program, Stmt};
 use thiserror::Error;
@@ -87,10 +87,10 @@ fn registry() -> NativeRegistry<CharacterContext> {
         .register_fn_with_id(SAY, "say", native_say)
         .expect("built-in `say` registration must be unique");
     registry
-        .register_raw_fn_with_id(CAMERA_BLUR, "camera.blur", native_camera_blur)
+        .register_selector_raw_fn_with_id(CAMERA_BLUR, "camera", "blur", native_camera_blur)
         .expect("built-in `camera.blur` registration must be unique");
     registry
-        .register_raw_fn_with_id(CAMERA_ZOOM, "camera.zoom", native_camera_zoom)
+        .register_selector_raw_fn_with_id(CAMERA_ZOOM, "camera", "zoom", native_camera_zoom)
         .expect("built-in `camera.zoom` registration must be unique");
     registry
 }
@@ -365,6 +365,7 @@ fn native_camera_blur(
     context: &mut CharacterContext,
     call: &hiraku_script::hks::vm::BuiltinCall,
 ) -> Result<Value, NativeError> {
+    require_selector(call, "camera")?;
     let mut intensity = None;
     let mut duration = 0.0;
     let mut ease = "linear".to_string();
@@ -398,6 +399,7 @@ fn native_camera_zoom(
     context: &mut CharacterContext,
     call: &hiraku_script::hks::vm::BuiltinCall,
 ) -> Result<Value, NativeError> {
+    require_selector(call, "camera")?;
     let mut scale = None;
     let mut duration = 0.0;
     let mut ease = "linear".to_string();
@@ -427,6 +429,21 @@ fn native_camera_zoom(
         ease: normalize_ease(&ease)?,
     });
     Ok(Value::Null)
+}
+
+fn require_selector(
+    call: &hiraku_script::hks::vm::BuiltinCall,
+    expected: &str,
+) -> Result<(), NativeError> {
+    match &call.receiver {
+        Some(Value::Selector(selector)) if selector == expected => Ok(()),
+        Some(_) => Err(NativeError::message(format!(
+            "expected `{expected}` selector receiver"
+        ))),
+        None => Err(NativeError::message(format!(
+            "selector method requires `{expected}` receiver"
+        ))),
+    }
 }
 
 fn number_value(value: &Value) -> Result<f64, NativeError> {
@@ -706,6 +723,31 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn character_calls_are_valid_sequence_and_parallel_task_commands() {
+        for source in [
+            r#"seq { char("Alice").e("happy").at("left") }"#,
+            "par {\nchar(\"Alice\").e(\"happy\")\nchar(\"Bob\").at(\"right\")\n}",
+        ] {
+            let program = parse_program(source).expect("character task must parse");
+            let Stmt::Expr(expression) = &program.statements[0] else {
+                panic!("expected a task expression")
+            };
+            let output = execute(
+                compile_expression(expression, &[], 46)
+                    .expect("character task must compile to bytecode"),
+            )
+            .expect("character task must execute through the scheduler");
+            assert_eq!(output.tasks.len(), 1);
+            assert!(
+                output.tasks[0]
+                    .commands
+                    .iter()
+                    .all(|command| matches!(command, IrCommand::ShowCharacter { .. }))
+            );
+        }
     }
 
     #[test]
