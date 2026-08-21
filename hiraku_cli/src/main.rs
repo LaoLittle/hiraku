@@ -29,6 +29,9 @@ enum Command {
         /// Path or directory prefix that must be stored in volume zero.
         #[arg(long)]
         bootstrap: Vec<String>,
+        /// File extension (without a leading dot) to keep in volume zero.
+        #[arg(long)]
+        bootstrap_extension: Vec<String>,
     },
     /// Print the index of an HDP package.
     HdpList { package: PathBuf },
@@ -45,6 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             chunk_size,
             zstd_level,
             bootstrap,
+            bootstrap_extension,
         } => {
             let package = pack_directory_with(
                 source,
@@ -58,7 +62,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     },
                 },
                 |path| FileOptions {
-                    bootstrap: bootstrap.iter().any(|prefix| path_matches(path, prefix)),
+                    bootstrap: bootstrap.iter().any(|prefix| path_matches(path, prefix))
+                        || bootstrap_extension
+                            .iter()
+                            .any(|extension| path_has_extension(path, extension)),
                     ..Default::default()
                 },
             )?;
@@ -86,12 +93,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .iter()
                     .map(|chunk| chunk.stored_size)
                     .sum::<u64>();
+                let volumes = file
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.volume.to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(",");
                 println!(
-                    "{}\t{}\t{}\t{} chunk(s)",
+                    "{}\t{}\t{}\t{} chunk(s)\tvolume(s) {}",
                     file.path,
                     file.decoded_size,
                     stored,
-                    file.chunks.len()
+                    file.chunks.len(),
+                    volumes
                 );
             }
         }
@@ -116,4 +132,9 @@ fn path_matches(path: &str, prefix: &str) -> bool {
         || path
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn path_has_extension(path: &str, extension: &str) -> bool {
+    let extension = extension.trim_start_matches('.');
+    !extension.is_empty() && path.ends_with(&format!(".{extension}"))
 }

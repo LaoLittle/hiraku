@@ -465,6 +465,25 @@ mod tests {
                 .iter()
                 .all(|chunk| chunk.volume == 0)
         );
+        let streaming = Archive::from_first_volume(Arc::<[u8]>::from(package.volumes[0].clone()))
+            .expect("volume zero must open independently");
+        assert_eq!(
+            streaming.read_file("startup.story.hks").unwrap(),
+            vec![b's'; 256]
+        );
+        assert!(matches!(
+            streaming.read_file("voice/chapter.ogg"),
+            Err(HdpError::MissingVolume(_))
+        ));
+        for (volume, bytes) in package.volumes.iter().enumerate().skip(1) {
+            streaming
+                .provide_volume(volume as u32, Arc::<[u8]>::from(bytes.clone()))
+                .expect("streamed volume must validate");
+        }
+        assert_eq!(
+            streaming.read_file("voice/chapter.ogg").unwrap(),
+            vec![b'v'; 1500]
+        );
         let archive =
             Archive::from_volumes(package.volumes.iter().cloned().map(Arc::<[u8]>::from)).unwrap();
         assert_eq!(

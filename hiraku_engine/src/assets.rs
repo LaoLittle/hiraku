@@ -1,22 +1,26 @@
-use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::vfs::HdpArchiveStore;
 use bevy::{
-    asset::{AssetLoader, AssetPath, LoadContext, io::Reader},
+    asset::{AssetLoader, AssetPath, LoadContext, LoadState, io::Reader},
     prelude::*,
     reflect::TypePath,
 };
 use thiserror::Error;
 
 #[derive(Asset, TypePath, Debug, Clone)]
-pub struct HdpArchive {
-    first_volume: Arc<[u8]>,
-    remaining_volumes: Vec<Handle<BytesAsset>>,
-    assembly_finished: bool,
+pub struct HdpArchive;
+
+#[derive(TypePath)]
+pub struct HdpArchiveLoader {
+    store: HdpArchiveStore,
 }
 
-#[derive(Default, TypePath)]
-pub struct HdpArchiveLoader;
+impl HdpArchiveLoader {
+    pub fn new(store: HdpArchiveStore) -> Self {
+        Self { store }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum HdpArchiveLoaderError {
@@ -24,6 +28,8 @@ pub enum HdpArchiveLoaderError {
     Io(#[from] std::io::Error),
     #[error("invalid HDP archive: {0}")]
     Hdp(#[from] hiraku_hdp::HdpError),
+    #[error("HDP archive bytes were already published")]
+    AlreadyLoaded,
 }
 
 impl AssetLoader for HdpArchiveLoader {
@@ -40,20 +46,11 @@ impl AssetLoader for HdpArchiveLoader {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
         let first_volume = Arc::<[u8]>::from(bytes);
-        let index = hiraku_hdp::Archive::read_index(&first_volume)?;
-        let mut remaining_volumes =
-            Vec::with_capacity(index.volume_count.saturating_sub(1) as usize);
-        for volume in 1..index.volume_count {
-            let path = numbered_volume_path(load_context.path().path(), volume);
-            let source = load_context.path().source().clone_owned();
-            let asset_path = AssetPath::from_path_buf(path).with_source(source);
-            remaining_volumes.push(load_context.load::<BytesAsset>(asset_path));
-        }
-        Ok(HdpArchive {
-            first_volume,
-            remaining_volumes,
-            assembly_finished: false,
-        })
+        let archive = Arc::new(hiraku_hdp::Archive::from_first_volume(first_volume)?);
+        self.store
+            .publish(archive, load_context.path().path().to_path_buf())
+            .map_err(|_| HdpArchiveLoaderError::AlreadyLoaded)?;
+        Ok(HdpArchive)
     }
 
     fn extensions(&self) -> &[&str] {
@@ -61,46 +58,56 @@ impl AssetLoader for HdpArchiveLoader {
     }
 }
 
-pub fn assemble_hdp_archives(
-    mut archives: ResMut<Assets<HdpArchive>>,
+#[derive(Resource, Default)]
+pub struct HdpVolumeLoads(BTreeMap<u32, Handle<BytesAsset>>);
+
+pub fn stream_requested_hdp_volumes(
+    asset_server: Res<AssetServer>,
     volume_assets: Res<Assets<BytesAsset>>,
     archive_store: Res<HdpArchiveStore>,
+    mut loads: ResMut<HdpVolumeLoads>,
 ) {
-    if archive_store.is_ready() {
-        return;
+    for (volume, path) in archive_store.requested_volumes() {
+        loads
+            .0
+            .entry(volume)
+            .or_insert_with(|| asset_server.load(AssetPath::from_path_buf(path)));
     }
 
-    for (_, pending) in archives.iter_mut() {
-        if pending.assembly_finished {
-            continue;
-        }
-        let Some(remaining) = pending
-            .remaining_volumes
-            .iter()
-            .map(|handle| volume_assets.get(handle))
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
-
-        let volumes = std::iter::once(pending.first_volume.clone())
-            .chain(remaining.into_iter().map(|volume| volume.bytes.clone()));
-        pending.assembly_finished = true;
-        match hiraku_hdp::Archive::from_volumes(volumes) {
-            Ok(archive) => {
-                if archive_store.publish(Arc::new(archive)).is_err() {
-                    warn!("an HDP archive was already published");
-                }
+    let ready = loads
+        .0
+        .iter()
+        .filter_map(|(volume, handle)| {
+            volume_assets
+                .get(handle)
+                .map(|asset| (*volume, asset.bytes.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (volume, bytes) in ready {
+        match archive_store.provide_volume(volume, bytes) {
+            Ok(()) => {
+                loads.0.remove(&volume);
             }
-            Err(error) => error!("failed to assemble HDP archive volumes: {error}"),
+            Err(error) => {
+                error!("failed to load HDP volume {volume}: {error}");
+                loads.0.remove(&volume);
+            }
         }
     }
-}
 
-fn numbered_volume_path(path: &std::path::Path, volume: u32) -> PathBuf {
-    let mut name = OsString::from(path.as_os_str());
-    name.push(format!(".{volume:03}"));
-    PathBuf::from(name)
+    let failed = loads
+        .0
+        .iter()
+        .filter_map(|(volume, handle)| match asset_server.load_state(handle) {
+            LoadState::Failed(error) => Some((*volume, error.to_string())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (volume, error) in failed {
+        archive_store.fail_volume(volume, error.clone());
+        loads.0.remove(&volume);
+        error!("failed to fetch HDP volume {volume}: {error}");
+    }
 }
 
 #[derive(Asset, TypePath, Debug, Clone)]
@@ -138,12 +145,14 @@ impl AssetLoader for BytesAssetLoader {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use hiraku_hdp::{PackOptions, PackageBuilder};
 
     use super::*;
 
     #[test]
-    fn ecs_assembles_and_publishes_an_archive_without_external_coordination() {
+    fn first_volume_can_be_published_without_the_rest_of_the_package() {
         let mut builder = PackageBuilder::new();
         builder
             .add_file("startup.story.hks", b"narrate(\"ready\")")
@@ -153,31 +162,13 @@ mod tests {
             .expect("test package must build");
 
         let store = HdpArchiveStore::default();
-        let mut app = App::new();
-        app.add_plugins(bevy::asset::AssetPlugin::default())
-            .insert_resource(store.clone())
-            .init_asset::<HdpArchive>()
-            .init_asset::<BytesAsset>()
-            .add_systems(Update, assemble_hdp_archives);
-        let _archive_handle =
-            app.world_mut()
-                .resource_mut::<Assets<HdpArchive>>()
-                .add(HdpArchive {
-                    first_volume: Arc::<[u8]>::from(package.volumes[0].clone()),
-                    remaining_volumes: Vec::new(),
-                    assembly_finished: false,
-                });
-
-        app.update();
-
-        assert!(store.is_ready(), "archive must be published by ECS");
-    }
-
-    #[test]
-    fn numbered_volumes_are_siblings_of_the_first_volume() {
-        assert_eq!(
-            numbered_volume_path(std::path::Path::new("nested/main.hdp"), 12),
-            PathBuf::from("nested/main.hdp.012")
+        let archive = Arc::new(
+            hiraku_hdp::Archive::from_first_volume(Arc::<[u8]>::from(package.volumes[0].clone()))
+                .expect("first volume must open"),
         );
+        store
+            .publish(archive, PathBuf::from("main.hdp"))
+            .expect("archive store must be empty");
+        assert!(store.is_ready(), "archive must be published by ECS");
     }
 }

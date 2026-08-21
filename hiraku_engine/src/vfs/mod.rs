@@ -1,12 +1,16 @@
 use std::{
     path::{Component, Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use bevy::{
     asset::io::{AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, VecReader},
     prelude::*,
 };
+use event_listener::Event;
 use futures_lite::stream;
 use hiraku_hdp::{Archive, HdpError};
 use thiserror::Error;
@@ -38,20 +42,120 @@ pub fn workspace_base_path() -> PathBuf {
 pub struct VfsResource(pub Arc<HdpVfs>);
 
 /// Parsed archive published by Bevy's asynchronous `HdpArchiveLoader`.
+#[derive(Debug)]
+struct HdpArchiveState {
+    archive: Arc<Archive>,
+    archive_path: PathBuf,
+    requested: Vec<AtomicBool>,
+    available: Vec<Event>,
+    failures: Vec<OnceLock<String>>,
+}
+
 #[derive(Resource, Clone, Debug, Default)]
-pub struct HdpArchiveStore(Arc<OnceLock<Arc<Archive>>>);
+pub struct HdpArchiveStore(Arc<OnceLock<Arc<HdpArchiveState>>>);
 
 impl HdpArchiveStore {
-    pub fn publish(&self, archive: Arc<Archive>) -> Result<(), Arc<Archive>> {
-        self.0.set(archive)
+    pub fn publish(
+        &self,
+        archive: Arc<Archive>,
+        archive_path: PathBuf,
+    ) -> Result<(), Arc<Archive>> {
+        let volume_count = archive.index().volume_count as usize;
+        self.0
+            .set(Arc::new(HdpArchiveState {
+                archive,
+                archive_path,
+                requested: (0..volume_count).map(|_| AtomicBool::new(false)).collect(),
+                available: (0..volume_count).map(|_| Event::new()).collect(),
+                failures: (0..volume_count).map(|_| OnceLock::new()).collect(),
+            }))
+            .map_err(|state| state.archive.clone())
     }
 
     fn archive(&self) -> Option<Arc<Archive>> {
-        self.0.get().cloned()
+        self.0.get().map(|state| state.archive.clone())
     }
 
     pub fn is_ready(&self) -> bool {
         self.archive().is_some()
+    }
+
+    pub(crate) fn requested_volumes(&self) -> Vec<(u32, PathBuf)> {
+        let Some(state) = self.0.get() else {
+            return Vec::new();
+        };
+        state
+            .requested
+            .iter()
+            .enumerate()
+            .filter(|(volume, requested)| {
+                *volume != 0
+                    && requested.load(Ordering::Acquire)
+                    && !state.archive.is_volume_available(*volume as u32)
+            })
+            .map(|(volume, _)| {
+                let mut path = state.archive_path.as_os_str().to_os_string();
+                path.push(format!(".{volume:03}"));
+                (volume as u32, PathBuf::from(path))
+            })
+            .collect()
+    }
+
+    pub(crate) fn provide_volume(&self, volume: u32, bytes: Arc<[u8]>) -> Result<(), HdpError> {
+        let state = self.0.get().ok_or(HdpError::MissingVolume(volume))?;
+        state.archive.provide_volume(volume, bytes)?;
+        if let Some(event) = state.available.get(volume as usize) {
+            event.notify(usize::MAX);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fail_volume(&self, volume: u32, message: String) {
+        let Some(state) = self.0.get() else {
+            return;
+        };
+        if let Some(failure) = state.failures.get(volume as usize) {
+            let _ = failure.set(message);
+        }
+        if let Some(event) = state.available.get(volume as usize) {
+            event.notify(usize::MAX);
+        }
+    }
+
+    async fn wait_for_volume(&self, volume: u32) -> Result<(), VfsError> {
+        let state = self
+            .0
+            .get()
+            .ok_or_else(|| VfsError::NotFound("HDP archive".into()))?;
+        let requested = state
+            .requested
+            .get(volume as usize)
+            .ok_or(HdpError::MissingVolume(volume))?;
+        let available = state
+            .available
+            .get(volume as usize)
+            .ok_or(HdpError::MissingVolume(volume))?;
+        loop {
+            if state.archive.is_volume_available(volume) {
+                return Ok(());
+            }
+            if let Some(message) = state.failures[volume as usize].get() {
+                return Err(VfsError::Hdp(HdpError::InvalidFormat(format!(
+                    "failed to load volume {volume}: {message}"
+                ))));
+            }
+            let listener = available.listen();
+            requested.store(true, Ordering::Release);
+            if state.archive.is_volume_available(volume) {
+                return Ok(());
+            }
+            if let Some(message) = state.failures[volume as usize].get() {
+                return Err(VfsError::Hdp(HdpError::InvalidFormat(format!(
+                    "failed to load volume {volume}: {message}"
+                ))));
+            }
+            listener.await;
+        }
     }
 }
 
@@ -429,6 +533,26 @@ impl HdpVfs {
             .map_err(|err| map_fs_not_found(err, full_path.display().to_string()))
     }
 
+    async fn read_bytes_async(&self, path: &str) -> Result<Vec<u8>, VfsError> {
+        let Some((archive_name, entry)) = split_hdp_asset_path(path) else {
+            return self.read_bytes(path);
+        };
+        loop {
+            let Some(archive) = self.archive_store.archive() else {
+                return Err(VfsError::NotFound(archive_name));
+            };
+            match archive.read_file(&entry) {
+                Ok(bytes) => return Ok(bytes),
+                Err(HdpError::MissingVolume(volume)) => {
+                    self.archive_store.wait_for_volume(volume).await?;
+                }
+                Err(error) => {
+                    return Err(map_hdp_not_found(error, format!("{archive_name}!{entry}")));
+                }
+            }
+        }
+    }
+
     pub fn list_directory(&self, path: &str) -> Result<Vec<String>, VfsError> {
         if let Some((archive, entry)) = split_hdp_asset_path(path) {
             return self
@@ -603,9 +727,10 @@ impl HdpAssetReader {
         }
     }
 
-    fn read_virtual_bytes(&self, path: &Path) -> Result<Vec<u8>, AssetReaderError> {
+    async fn read_virtual_bytes_async(&self, path: &Path) -> Result<Vec<u8>, AssetReaderError> {
         self.vfs
-            .read_bytes(&path.to_string_lossy())
+            .read_bytes_async(&path.to_string_lossy())
+            .await
             .map_err(vfs_to_reader_error)
     }
 }
@@ -613,7 +738,7 @@ impl HdpAssetReader {
 impl AssetReader for HdpAssetReader {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<VecReader, AssetReaderError> {
         if split_hdp_asset_path(&path.to_string_lossy()).is_some() {
-            let bytes = self.read_virtual_bytes(path)?;
+            let bytes = self.read_virtual_bytes_async(path).await?;
             return Ok(VecReader::new(bytes));
         }
 
@@ -794,7 +919,9 @@ fn reader_to_vfs_error(error: AssetReaderError) -> VfsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hiraku_hdp::{PackOptions, PackageBuilder};
+    use hiraku_hdp::{
+        CompressionMethod, CompressionOptions, FileOptions, PackOptions, PackageBuilder,
+    };
 
     #[test]
     fn normalizes_hdp_asset_source_uris() {
@@ -873,7 +1000,7 @@ mod tests {
 
         let store = HdpArchiveStore::default();
         store
-            .publish(Arc::new(archive))
+            .publish(Arc::new(archive), PathBuf::from("main.hdp"))
             .expect("test archive must only be published once");
         let vfs = HdpVfs::new_with_config_and_store(
             "assets",
@@ -886,5 +1013,73 @@ mod tests {
                 .unwrap(),
             b"hdp-test"
         );
+    }
+
+    #[test]
+    fn async_reader_requests_and_resumes_streamed_volumes() {
+        let mut builder = PackageBuilder::new();
+        builder
+            .add_file_with_options(
+                "startup.story.hks",
+                vec![b's'; 128],
+                FileOptions {
+                    bootstrap: true,
+                    compression: Some(CompressionOptions {
+                        method: CompressionMethod::STORED,
+                        ..Default::default()
+                    }),
+                },
+            )
+            .unwrap();
+        builder
+            .add_file_with_options(
+                "voice/test.ogg",
+                vec![b'v'; 1500],
+                FileOptions {
+                    compression: Some(CompressionOptions {
+                        method: CompressionMethod::STORED,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let package = builder
+            .build(PackOptions {
+                chunk_size: 300,
+                max_volume_size: Some(800),
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = Archive::from_first_volume(Arc::<[u8]>::from(package.volumes[0].clone()))
+            .expect("first volume must open");
+        let store = HdpArchiveStore::default();
+        store
+            .publish(Arc::new(archive), PathBuf::from("main.hdp"))
+            .expect("archive store must be empty");
+        let vfs = HdpVfs::new_with_config_and_store(
+            "assets",
+            DEFAULT_SETTINGS_PATH,
+            DEFAULT_STARTUP_SCRIPT,
+            store.clone(),
+        );
+
+        let read = vfs.read_bytes_async("hdp://main.hdp/voice/test.ogg");
+        let provide = async {
+            for (volume, bytes) in package.volumes.iter().enumerate().skip(1) {
+                while !store
+                    .requested_volumes()
+                    .iter()
+                    .any(|(requested, _)| *requested == volume as u32)
+                {
+                    futures_lite::future::yield_now().await;
+                }
+                store
+                    .provide_volume(volume as u32, Arc::<[u8]>::from(bytes.clone()))
+                    .expect("requested volume must validate");
+            }
+        };
+        let (bytes, ()) = futures_lite::future::block_on(futures_lite::future::zip(read, provide));
+        assert_eq!(bytes.unwrap(), vec![b'v'; 1500]);
     }
 }

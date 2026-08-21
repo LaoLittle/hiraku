@@ -1,4 +1,8 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use crate::{
     HdpError, PackageIndex,
@@ -14,7 +18,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct Archive {
     index: PackageIndex,
-    volumes: Vec<Arc<[u8]>>,
+    volumes: Vec<OnceLock<Arc<[u8]>>>,
 }
 
 impl Archive {
@@ -35,56 +39,134 @@ impl Archive {
         Self::from_volumes([bytes.into()])
     }
 
+    /// Opens the package index and volume zero without requiring later volumes.
+    pub fn from_first_volume(bytes: impl Into<Arc<[u8]>>) -> Result<Self, HdpError> {
+        let first = bytes.into();
+        let index = Self::read_index(&first)?;
+        let volumes = (0..index.volume_count)
+            .map(|_| OnceLock::new())
+            .collect::<Vec<_>>();
+        volumes[0]
+            .set(first)
+            .expect("volume zero slot must be empty during archive construction");
+        let archive = Self { index, volumes };
+        archive.validate_index()?;
+        archive.validate_volume(0)?;
+        Ok(archive)
+    }
+
     pub fn from_volumes(volumes: impl IntoIterator<Item = Arc<[u8]>>) -> Result<Self, HdpError> {
-        let volumes = volumes.into_iter().collect::<Vec<_>>();
-        let first = volumes.first().ok_or(HdpError::MissingVolume(0))?;
-        let index = Self::read_index(first)?;
-        if volumes.len() != index.volume_count as usize {
-            return Err(HdpError::MissingVolume(volumes.len() as u32));
+        let mut volumes = volumes.into_iter();
+        let first = volumes.next().ok_or(HdpError::MissingVolume(0))?;
+        let archive = Self::from_first_volume(first)?;
+        for (position, volume) in volumes.enumerate() {
+            archive.provide_volume((position + 1) as u32, volume)?;
         }
-
-        for (position, volume) in volumes.iter().enumerate() {
-            let header = decode_header(volume)?;
-            if header.package_id != index.package_id {
-                return Err(HdpError::InvalidFormat(format!(
-                    "volume {position} belongs to another package"
-                )));
-            }
-            if header.volume_index != position as u32 {
-                return Err(HdpError::InvalidFormat(format!(
-                    "expected volume {position}, found {}",
-                    header.volume_index
-                )));
-            }
-            if header.volume_count != index.volume_count {
-                return Err(HdpError::InvalidFormat(format!(
-                    "volume {position} has an inconsistent volume count"
-                )));
-            }
-            if position != 0 && (header.index_size != 0 || header.index_checksum != 0) {
-                return Err(HdpError::InvalidFormat(format!(
-                    "volume {position} unexpectedly contains an index"
-                )));
-            }
-            if header.data_offset < HEADER_SIZE as u64 || header.data_offset > volume.len() as u64 {
-                return Err(HdpError::InvalidFormat(format!(
-                    "volume {position} has an invalid data offset"
-                )));
-            }
+        if !archive.is_complete() {
+            return Err(HdpError::MissingVolume(
+                archive.first_missing_volume().unwrap_or(0),
+            ));
         }
+        Ok(archive)
+    }
 
-        for file in index.files.values() {
-            let mut decoded_size = 0_u64;
-            for chunk in &file.chunks {
-                let volume = volumes
-                    .get(chunk.volume as usize)
-                    .ok_or(HdpError::MissingVolume(chunk.volume))?;
+    /// Validates and publishes one physical volume. Each slot can be filled once.
+    pub fn provide_volume(&self, position: u32, volume: Arc<[u8]>) -> Result<(), HdpError> {
+        let slot = self
+            .volumes
+            .get(position as usize)
+            .ok_or(HdpError::MissingVolume(position))?;
+        if slot.get().is_some() {
+            return Err(HdpError::InvalidFormat(format!(
+                "volume {position} was provided more than once"
+            )));
+        }
+        self.validate_volume_bytes(position as usize, &volume)?;
+        slot.set(volume).map_err(|_| {
+            HdpError::InvalidFormat(format!("volume {position} was provided more than once"))
+        })?;
+        Ok(())
+    }
+
+    pub fn is_volume_available(&self, volume: u32) -> bool {
+        self.volumes
+            .get(volume as usize)
+            .is_some_and(|slot| slot.get().is_some())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.volumes.iter().all(|volume| volume.get().is_some())
+    }
+
+    fn first_missing_volume(&self) -> Option<u32> {
+        self.volumes
+            .iter()
+            .position(|volume| volume.get().is_none())
+            .map(|position| position as u32)
+    }
+
+    fn validate_volume(&self, position: usize) -> Result<(), HdpError> {
+        let volume = self.volumes[position]
+            .get()
+            .ok_or(HdpError::MissingVolume(position as u32))?;
+        self.validate_volume_bytes(position, volume)
+    }
+
+    fn validate_volume_bytes(&self, position: usize, volume: &[u8]) -> Result<(), HdpError> {
+        let header = decode_header(volume)?;
+        if header.package_id != self.index.package_id {
+            return Err(HdpError::InvalidFormat(format!(
+                "volume {position} belongs to another package"
+            )));
+        }
+        if header.volume_index != position as u32 {
+            return Err(HdpError::InvalidFormat(format!(
+                "expected volume {position}, found {}",
+                header.volume_index
+            )));
+        }
+        if header.volume_count != self.index.volume_count {
+            return Err(HdpError::InvalidFormat(format!(
+                "volume {position} has an inconsistent volume count"
+            )));
+        }
+        if position != 0 && (header.index_size != 0 || header.index_checksum != 0) {
+            return Err(HdpError::InvalidFormat(format!(
+                "volume {position} unexpectedly contains an index"
+            )));
+        }
+        if header.data_offset < HEADER_SIZE as u64 || header.data_offset > volume.len() as u64 {
+            return Err(HdpError::InvalidFormat(format!(
+                "volume {position} has an invalid data offset"
+            )));
+        }
+        for file in self.index.files.values() {
+            for chunk in file
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.volume == position as u32)
+            {
                 let end = chunk.offset.checked_add(chunk.stored_size).ok_or_else(|| {
                     HdpError::InvalidFormat(format!("chunk offset overflows for `{}`", file.path))
                 })?;
                 if end > volume.len() as u64 {
                     return Err(HdpError::InvalidFormat(format!(
-                        "chunk range is outside volume {} for `{}`",
+                        "chunk range is outside volume {position} for `{}`",
+                        file.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_index(&self) -> Result<(), HdpError> {
+        for file in self.index.files.values() {
+            let mut decoded_size = 0_u64;
+            for chunk in &file.chunks {
+                if chunk.volume >= self.index.volume_count {
+                    return Err(HdpError::InvalidFormat(format!(
+                        "chunk references missing volume {} for `{}`",
                         chunk.volume, file.path
                     )));
                 }
@@ -110,8 +192,7 @@ impl Archive {
                 )));
             }
         }
-
-        Ok(Self { index, volumes })
+        Ok(())
     }
 
     pub fn read_index(first_volume: &[u8]) -> Result<PackageIndex, HdpError> {
@@ -176,6 +257,7 @@ impl Archive {
             let volume = self
                 .volumes
                 .get(chunk.volume as usize)
+                .and_then(OnceLock::get)
                 .ok_or(HdpError::MissingVolume(chunk.volume))?;
             let start = usize::try_from(chunk.offset).map_err(|_| HdpError::CorruptChunk {
                 path: path.to_string(),
