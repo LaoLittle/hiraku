@@ -3117,6 +3117,7 @@ pub fn handle_choice_keyboard(
 pub fn advance_dialogue_on_input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
@@ -3143,13 +3144,14 @@ pub fn advance_dialogue_on_input(
 
     let advance = keys.just_pressed(KeyCode::Enter)
         || keys.just_pressed(KeyCode::Space)
-        || mouse.just_pressed(MouseButton::Left);
+        || mouse.just_pressed(MouseButton::Left)
+        || touches.any_just_pressed();
 
     if !advance {
         return;
     }
 
-    if mouse.just_pressed(MouseButton::Left)
+    if (mouse.just_pressed(MouseButton::Left) || touches.any_just_pressed())
         && ui_interactions
             .iter()
             .any(|interaction| !matches!(*interaction, Interaction::None))

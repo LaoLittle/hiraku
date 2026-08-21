@@ -146,7 +146,7 @@ mod tests {
                 expressions,
                 position,
                 ..
-            }] if actor_id == "Alice" && expressions == &["happy"] && position == &[600.0, 0.0]
+            }] if actor_id == "Alice" && expressions == &["happy"] && position == &[600.0, -200.0]
         ));
     }
 

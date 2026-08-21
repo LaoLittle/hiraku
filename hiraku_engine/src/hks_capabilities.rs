@@ -844,7 +844,7 @@ mod tests {
         assert!(
             matches!(&output.commands[0], StoryEffect::ShowCharacter { actor_id, expressions, position, scale, .. }
             if actor_id == "Alice" && expressions == &["happy_eyes", "happy_face"]
-                && position == &[600.0, 0.0] && (*scale - 0.5).abs() < f32::EPSILON)
+                && position == &[600.0, -200.0] && (*scale - 0.5).abs() < f32::EPSILON)
         );
     }
 

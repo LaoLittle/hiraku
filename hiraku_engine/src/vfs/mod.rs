@@ -1,5 +1,4 @@
 use std::{
-    io::{Cursor, Read, Seek},
     path::{Component, Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -9,8 +8,8 @@ use bevy::{
     prelude::*,
 };
 use futures_lite::stream;
+use hiraku_hdp::{Archive, HdpError};
 use thiserror::Error;
-use zip::{ZipArchive, result::ZipError};
 
 use crate::data::evaluate_hson_map;
 
@@ -38,21 +37,21 @@ pub fn workspace_base_path() -> PathBuf {
 #[derive(Resource, Clone)]
 pub struct VfsResource(pub Arc<HdpVfs>);
 
-/// Archive bytes published by Bevy's asynchronous `HdpArchiveLoader`.
+/// Parsed archive published by Bevy's asynchronous `HdpArchiveLoader`.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct HdpArchiveStore(Arc<OnceLock<Arc<[u8]>>>);
+pub struct HdpArchiveStore(Arc<OnceLock<Arc<Archive>>>);
 
 impl HdpArchiveStore {
-    pub fn publish(&self, bytes: Arc<[u8]>) -> Result<(), Arc<[u8]>> {
-        self.0.set(bytes)
+    pub fn publish(&self, archive: Arc<Archive>) -> Result<(), Arc<Archive>> {
+        self.0.set(archive)
     }
 
-    fn bytes(&self) -> Option<Arc<[u8]>> {
+    fn archive(&self) -> Option<Arc<Archive>> {
         self.0.get().cloned()
     }
 
     pub fn is_ready(&self) -> bool {
-        self.bytes().is_some()
+        self.archive().is_some()
     }
 }
 
@@ -70,8 +69,8 @@ pub enum VfsError {
     NotFound(String),
     #[error("failed to read file: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to read archive: {0}")]
-    Zip(#[from] ZipError),
+    #[error("failed to read HDP archive: {0}")]
+    Hdp(#[from] HdpError),
     #[error("file is not valid UTF-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("failed to load settings data `{path}`: {message}")]
@@ -416,12 +415,13 @@ impl HdpVfs {
     }
 
     pub fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
-        if let Some((archive, entry)) = split_hdp_asset_path(path) {
-            if let Some(bytes) = self.archive_store.bytes() {
-                return read_zip_entry(Cursor::new(bytes.as_ref()), &archive, &entry)
-                    .map_err(|error| map_zip_not_found(error, format!("{archive}!{entry}")));
+        if let Some((archive_name, entry)) = split_hdp_asset_path(path) {
+            if let Some(archive) = self.archive_store.archive() {
+                return archive
+                    .read_file(&entry)
+                    .map_err(|error| map_hdp_not_found(error, format!("{archive_name}!{entry}")));
             }
-            return Err(VfsError::NotFound(archive));
+            return Err(VfsError::NotFound(archive_name));
         }
 
         let full_path = self.root.join(path);
@@ -471,11 +471,11 @@ impl HdpVfs {
     }
 
     pub fn list_files_recursive(&self, path: &str) -> Result<Vec<String>, VfsError> {
-        if let Some((archive, entry)) = split_hdp_asset_path(path) {
-            if let Some(bytes) = self.archive_store.bytes() {
-                return list_zip_files(Cursor::new(bytes.as_ref()), &archive, &entry);
+        if let Some((archive_name, entry)) = split_hdp_asset_path(path) {
+            if let Some(archive) = self.archive_store.archive() {
+                return Ok(list_archive_files(&archive, &archive_name, &entry));
             }
-            return Err(VfsError::NotFound(archive));
+            return Err(VfsError::NotFound(archive_name));
         }
 
         let full_path = self.root.join(path);
@@ -489,9 +489,8 @@ impl HdpVfs {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         };
 
-        let items = if let Some(bytes) = self.archive_store.bytes() {
-            list_zip_directory(Cursor::new(bytes.as_ref()), &archive, &entry)
-                .map_err(zip_to_reader_error)?
+        let items = if let Some(package) = self.archive_store.archive() {
+            list_archive_directory(&package, &archive, &entry)
         } else {
             return Err(AssetReaderError::NotFound(PathBuf::from(archive)));
         };
@@ -535,48 +534,20 @@ fn collect_files_recursive(
     Ok(())
 }
 
-fn read_zip_entry<R: Read + Seek>(
-    reader: R,
-    _archive: &str,
-    entry: &str,
-) -> Result<Vec<u8>, ZipError> {
-    let mut zip = ZipArchive::new(reader)?;
-    let mut file = zip.by_name(entry)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn list_zip_files<R: Read + Seek>(
-    reader: R,
-    archive: &str,
-    entry: &str,
-) -> Result<Vec<String>, VfsError> {
-    let mut zip = ZipArchive::new(reader)?;
+fn list_archive_files(package: &Archive, archive: &str, entry: &str) -> Vec<String> {
     let prefix = normalize_entry_prefix(entry);
-    let mut paths = Vec::new();
-    for index in 0..zip.len() {
-        let zip_file = zip.by_index(index)?;
-        let name = zip_file.name();
-        if !name.ends_with('/') && name.starts_with(&prefix) {
-            paths.push(format!("hdp://{archive}/{name}"));
-        }
-    }
-    Ok(paths)
+    package
+        .files()
+        .filter(|name| name.starts_with(&prefix))
+        .map(|name| format!("hdp://{archive}/{name}"))
+        .collect()
 }
 
-fn list_zip_directory<R: Read + Seek>(
-    reader: R,
-    archive: &str,
-    entry: &str,
-) -> Result<Vec<PathBuf>, ZipError> {
-    let mut zip = ZipArchive::new(reader)?;
+fn list_archive_directory(package: &Archive, archive: &str, entry: &str) -> Vec<PathBuf> {
     let directory_prefix = normalize_entry_prefix(entry);
     let mut items = Vec::new();
 
-    for index in 0..zip.len() {
-        let zip_file = zip.by_index(index)?;
-        let name = zip_file.name();
+    for name in package.files() {
         if !name.starts_with(&directory_prefix) {
             continue;
         }
@@ -602,7 +573,7 @@ fn list_zip_directory<R: Read + Seek>(
         }
     }
 
-    Ok(items)
+    items
 }
 
 pub fn hdp_asset_source_builder(
@@ -788,18 +759,10 @@ fn map_fs_not_found(error: std::io::Error, path: String) -> VfsError {
     }
 }
 
-fn map_zip_not_found(error: ZipError, path: String) -> VfsError {
-    if matches!(error, ZipError::FileNotFound) {
-        VfsError::NotFound(path)
-    } else {
-        VfsError::Zip(error)
-    }
-}
-
-fn zip_to_reader_error(error: ZipError) -> AssetReaderError {
+fn map_hdp_not_found(error: HdpError, path: String) -> VfsError {
     match error {
-        ZipError::FileNotFound => AssetReaderError::NotFound(PathBuf::new()),
-        other => AssetReaderError::from(std::io::Error::other(other.to_string())),
+        HdpError::MissingFile(_) => VfsError::NotFound(path),
+        other => VfsError::Hdp(other),
     }
 }
 
@@ -807,7 +770,9 @@ fn vfs_to_reader_error(error: VfsError) -> AssetReaderError {
     match error {
         VfsError::NotFound(path) => AssetReaderError::NotFound(PathBuf::from(path)),
         VfsError::Io(error) => AssetReaderError::from(error),
-        VfsError::Zip(error) => AssetReaderError::from(std::io::Error::other(error.to_string())),
+        VfsError::Hdp(error) => {
+            AssetReaderError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }
         VfsError::Utf8(error) => {
             AssetReaderError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         }
@@ -829,8 +794,7 @@ fn reader_to_vfs_error(error: AssetReaderError) -> VfsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use zip::{ZipWriter, write::SimpleFileOptions};
+    use hiraku_hdp::{PackOptions, PackageBuilder};
 
     #[test]
     fn normalizes_hdp_asset_source_uris() {
@@ -900,21 +864,19 @@ mod tests {
 
     #[test]
     fn reads_hdp_uri_through_the_archive_reader() {
-        let root = std::env::temp_dir().join(format!("hiraku-hdp-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&root);
-        let archive = std::fs::File::create(root.join("main.hdp")).unwrap();
-        let mut zip = ZipWriter::new(archive);
-        zip.start_file("backgrounds/forest.png", SimpleFileOptions::default())
+        let mut builder = PackageBuilder::new();
+        builder
+            .add_file("backgrounds/forest.png", b"hdp-test")
             .unwrap();
-        zip.write_all(b"hdp-test").unwrap();
-        zip.finish().unwrap();
+        let package = builder.build(PackOptions::default()).unwrap();
+        let archive = Archive::from_bytes(Arc::<[u8]>::from(package.volumes[0].clone())).unwrap();
 
         let store = HdpArchiveStore::default();
         store
-            .publish(Arc::from(std::fs::read(root.join("main.hdp")).unwrap()))
+            .publish(Arc::new(archive))
             .expect("test archive must only be published once");
         let vfs = HdpVfs::new_with_config_and_store(
-            &root,
+            "assets",
             DEFAULT_SETTINGS_PATH,
             DEFAULT_STARTUP_SCRIPT,
             store,
@@ -924,8 +886,5 @@ mod tests {
                 .unwrap(),
             b"hdp-test"
         );
-
-        let _ = std::fs::remove_file(root.join("main.hdp"));
-        let _ = std::fs::remove_dir(&root);
     }
 }

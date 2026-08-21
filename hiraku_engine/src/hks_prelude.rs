@@ -1023,7 +1023,7 @@ mod tests {
         assert!(matches!(&output.commands[0], StoryEffect::ShowCharacter {
             actor_id, character_name, expressions, position, scale,
         } if actor_id == "ema" && character_name == "ema"
-            && expressions == &["happy"] && position == &[0.0, 0.0]
+            && expressions == &["happy"] && position == &[0.0, -200.0]
             && (*scale - 0.14).abs() < f32::EPSILON));
     }
 

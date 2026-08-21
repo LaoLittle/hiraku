@@ -785,6 +785,7 @@ pub fn update_offscreen_ui_interactions(
     canvas: Res<crate::HirakuCanvas>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     screen_state: Res<ScreenUiState>,
     mut buttons: Query<
         (
@@ -805,20 +806,27 @@ pub fn update_offscreen_ui_interactions(
         )>,
     >,
 ) {
-    let cursor = windows
-        .single()
-        .ok()
-        .and_then(|window| window.cursor_position().map(|cursor| (window, cursor)))
-        .and_then(|(window, cursor)| {
-            window_cursor_to_canvas(
-                Vec2::new(window.width(), window.height()),
-                cursor,
-                canvas.size.as_vec2(),
-            )
-        });
+    let pointer = windows.single().ok().and_then(|window| {
+        let touch = touches
+            .iter_just_pressed()
+            .next()
+            .map(|touch| (touch.position(), true))
+            .or_else(|| touches.iter().next().map(|touch| (touch.position(), false)));
+        let (position, pressed) = touch.or_else(|| {
+            window
+                .cursor_position()
+                .map(|position| (position, mouse.just_pressed(MouseButton::Left)))
+        })?;
+        let canvas_position = window_cursor_to_canvas(
+            Vec2::new(window.width(), window.height()),
+            position,
+            canvas.size.as_vec2(),
+        )?;
+        Some((canvas_position, pressed))
+    });
 
     let mut topmost = None::<(u32, Entity)>;
-    if let Some(cursor) = cursor {
+    if let Some((pointer, _)) = pointer {
         for (entity, computed, transform, stack, visibility, _, screen_button, image_button) in
             &mut buttons
         {
@@ -830,7 +838,7 @@ pub fn update_offscreen_ui_interactions(
                 .unwrap_or(true);
             if !belongs_to_active_screen
                 || !visibility.get()
-                || !computed.contains_point(*transform, cursor)
+                || !computed.contains_point(*transform, pointer)
             {
                 continue;
             }
@@ -841,9 +849,10 @@ pub fn update_offscreen_ui_interactions(
     }
 
     let topmost = topmost.map(|(_, entity)| entity);
+    let pressed = pointer.is_some_and(|(_, pressed)| pressed);
     for (entity, _, _, _, _, mut interaction, _, _) in &mut buttons {
         let next = if Some(entity) == topmost {
-            if mouse.just_pressed(MouseButton::Left) {
+            if pressed {
                 Interaction::Pressed
             } else {
                 Interaction::Hovered

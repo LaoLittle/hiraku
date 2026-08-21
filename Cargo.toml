@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_cli"]
+members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_cli", "hiraku_hdp"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,9 +12,9 @@ prost = "0.14.4"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 toml = "1.1.4"
-zip = "8.6.0"
 
 hiraku-engine = { path = "hiraku_engine" }
+hiraku-hdp = { path = "hiraku_hdp" }
 hiraku-script = { path = "hiraku_script" }
 
 [workspace.dependencies.bevy]

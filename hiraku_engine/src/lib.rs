@@ -17,7 +17,7 @@ mod vfs;
 
 use std::sync::Arc;
 
-use assets::{BytesAsset, BytesAssetLoader, HdpArchive, HdpArchiveLoader};
+use assets::{BytesAsset, BytesAssetLoader, HdpArchive, HdpArchiveLoader, assemble_hdp_archives};
 use bevy::{
     app::PluginGroupBuilder,
     asset::{AssetApp, io::AssetSourceId},
@@ -126,7 +126,6 @@ impl Plugin for HirakuPlugin {
         effect::custom::load_internal_shaders(app);
         effect::transition::load_internal_shaders(app);
 
-        let archive_store = app.world().resource::<HdpArchiveStore>().clone();
         let archive_path = archive_path_from_config(app.world().resource::<RuntimeLaunchConfig>());
 
         app.init_asset::<HdpArchive>()
@@ -135,8 +134,9 @@ impl Plugin for HirakuPlugin {
             .init_resource::<texture::TextureAtlasCatalog>()
             .insert_non_send(IrRuntime::default())
             .add_message::<ScriptResponseMessage>()
-            .register_asset_loader(HdpArchiveLoader::new(archive_store))
+            .init_asset_loader::<HdpArchiveLoader>()
             .init_asset_loader::<BytesAssetLoader>()
+            .add_systems(Update, assemble_hdp_archives)
             .add_systems(
                 Update,
                 (setup_frontend, setup_stage)

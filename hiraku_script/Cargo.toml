@@ -2,7 +2,7 @@
 name = "hiraku-script"
 version.workspace = true
 edition.workspace = true
-description = "Embeddable visual-novel runtime and HDP resource engine"
+description = "Embeddable visual-novel scripting language"
 
 [dependencies]
 unicode-xid = "0.2.6"
