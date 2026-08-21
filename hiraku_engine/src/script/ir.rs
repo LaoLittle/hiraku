@@ -457,15 +457,23 @@ impl IrRuntime {
         self.response_inbox.retain(|id, _| *id >= request);
         self.response_inbox.remove(&request)
     }
+
+    fn tick(&mut self) {
+        // An event may expand into another event during engine-side resolution (for example a
+        // BGM catalog name becomes a resolved PlayBgm event). Do not run past that undispatched
+        // work: a later HKS statement may be the dialogue wait that must stop execution first.
+        if !self.events.is_empty() {
+            return;
+        }
+
+        if let Some(event) = self.vm.as_mut().and_then(IrVm::step) {
+            self.events.push_back(event);
+        }
+    }
 }
 
 pub fn tick_ir_runtime(mut runtime: bevy::prelude::NonSendMut<IrRuntime>) {
-    let Some(vm) = runtime.vm.as_mut() else {
-        return;
-    };
-    if let Some(event) = vm.step() {
-        runtime.events.push_back(event);
-    }
+    runtime.tick();
 }
 
 #[cfg(test)]
@@ -545,6 +553,37 @@ mod tests {
             runtime.events.pop_front(),
             Some(IrEvent::Command(IrCommand::Log("second".to_string())))
         );
+    }
+
+    #[test]
+    fn runtime_does_not_prefetch_past_an_undispatched_event() {
+        let program = IrProgram::new(
+            42,
+            vec![
+                IrInstruction::Emit(IrCommand::Log("first".to_string())),
+                IrInstruction::Emit(IrCommand::Log("must wait".to_string())),
+                IrInstruction::Halt,
+            ],
+        );
+        let mut runtime = IrRuntime {
+            vm: Some(IrVm::new(program).expect("test IR must be valid")),
+            ..Default::default()
+        };
+
+        runtime.tick();
+        assert_eq!(runtime.vm.as_ref().expect("VM must exist").pc(), 1);
+        assert_eq!(runtime.events.len(), 1);
+
+        runtime.tick();
+        assert_eq!(runtime.vm.as_ref().expect("VM must exist").pc(), 1);
+        assert_eq!(runtime.events.len(), 1);
+
+        assert!(matches!(
+            runtime.events.pop_front(),
+            Some(IrEvent::Command(IrCommand::Log(message))) if message == "first"
+        ));
+        runtime.tick();
+        assert_eq!(runtime.vm.as_ref().expect("VM must exist").pc(), 2);
     }
 
     #[test]
