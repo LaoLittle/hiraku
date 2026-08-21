@@ -24,6 +24,7 @@ use assets::{
 use bevy::{
     app::PluginGroupBuilder,
     asset::{AssetApp, io::AssetSourceId},
+    audio::AddAudioSource,
     camera::ClearColorConfig,
     prelude::*,
     sprite_render::Material2dPlugin,
@@ -37,9 +38,10 @@ use scene::{
     animate_visual_tweens, apply_animation_cancellations, apply_live_audio_settings,
     bridge_ir_events, cleanup_stale_screen_ui, handle_choice_buttons, handle_choice_keyboard,
     handle_runtime_menu_buttons, handle_screen_buttons, handle_screen_image_buttons,
-    poll_pending_character_shows, poll_voice_playback, process_script_commands, setup_frontend,
-    setup_stage, sync_scene_snapshot, tick_animation_waits, tick_pending_waits,
-    tick_script_batches, update_offscreen_ui_interactions,
+    poll_pending_character_shows, poll_voice_playback, prepare_bgm_preludes,
+    process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
+    tick_animation_waits, tick_pending_waits, tick_script_batches,
+    update_offscreen_ui_interactions,
 };
 pub use script::{
     IrChoiceOption, IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram,
@@ -135,6 +137,7 @@ impl Plugin for HirakuPlugin {
         app.init_asset::<HdpArchive>()
             .init_asset::<BytesAsset>()
             .init_asset::<TextureAtlasLayout>()
+            .add_audio_source::<audio::PreludeLoopAudio>()
             .init_resource::<HdpVolumeLoads>()
             .init_resource::<texture::TextureAtlasCatalog>()
             .insert_non_send(IrRuntime::default())
@@ -181,6 +184,12 @@ impl Plugin for HirakuPlugin {
             .add_systems(
                 Update,
                 apply_live_audio_settings
+                    .after(process_script_commands)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                prepare_bgm_preludes
                     .after(process_script_commands)
                     .in_set(HirakuRuntimeSystems),
             )

@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
-use bevy::prelude::Resource;
+use bevy::{
+    audio::{AudioSource, ChannelCount, Decodable, SampleRate, Source},
+    prelude::{Asset, Resource},
+    reflect::TypePath,
+};
 use hiraku_script::hson;
 use serde::Deserialize;
 use thiserror::Error;
@@ -20,6 +24,98 @@ pub struct AudioCatalog {
 #[derive(Clone, Debug)]
 pub struct AudioDefinition {
     pub path: String,
+    pub prelude: Option<String>,
+}
+
+/// Plays a one-shot prelude followed by an indefinitely decoded loop on one audio sink.
+#[derive(Asset, Clone, Debug, TypePath)]
+pub struct PreludeLoopAudio {
+    prelude: AudioSource,
+    loop_audio: AudioSource,
+}
+
+impl PreludeLoopAudio {
+    pub fn new(prelude: AudioSource, loop_audio: AudioSource) -> Self {
+        Self {
+            prelude,
+            loop_audio,
+        }
+    }
+}
+
+type FileAudioDecoder = <AudioSource as Decodable>::Decoder;
+
+pub struct PreludeLoopDecoder {
+    prelude: Option<FileAudioDecoder>,
+    loop_audio: AudioSource,
+    loop_decoder: FileAudioDecoder,
+}
+
+impl Iterator for PreludeLoopDecoder {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(prelude) = self.prelude.as_mut() {
+            if let Some(sample) = prelude.next() {
+                return Some(sample);
+            }
+            self.prelude = None;
+        }
+
+        if let Some(sample) = self.loop_decoder.next() {
+            return Some(sample);
+        }
+
+        self.loop_decoder = self.loop_audio.decoder();
+        self.loop_decoder.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+impl Source for PreludeLoopDecoder {
+    fn current_span_len(&self) -> Option<usize> {
+        // This finite fallback makes rodio re-check format metadata at source boundaries.
+        const MAX_SPAN_SAMPLES: usize = 10_240;
+        let decoder = self.prelude.as_ref().unwrap_or(&self.loop_decoder);
+        decoder
+            .current_span_len()
+            .or_else(|| decoder.size_hint().1)
+            .map(|length| length.min(MAX_SPAN_SAMPLES))
+            .or(Some(MAX_SPAN_SAMPLES))
+    }
+
+    fn channels(&self) -> ChannelCount {
+        self.prelude
+            .as_ref()
+            .unwrap_or(&self.loop_decoder)
+            .channels()
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        self.prelude
+            .as_ref()
+            .unwrap_or(&self.loop_decoder)
+            .sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+impl Decodable for PreludeLoopAudio {
+    type Decoder = PreludeLoopDecoder;
+
+    fn decoder(&self) -> Self::Decoder {
+        PreludeLoopDecoder {
+            prelude: Some(self.prelude.decoder()),
+            loop_audio: self.loop_audio.clone(),
+            loop_decoder: self.loop_audio.decoder(),
+        }
+    }
 }
 
 impl AudioCatalog {
@@ -48,6 +144,8 @@ pub enum AudioCatalogError {
 struct AudioFile {
     name: String,
     audio: String,
+    #[serde(default)]
+    prelude: Option<String>,
 }
 
 pub fn load_audio_catalog(vfs: &HdpVfs) -> Result<AudioCatalog, AudioCatalogError> {
@@ -109,6 +207,7 @@ fn load_voice_channel(
         for voice in voices {
             let definition = AudioDefinition {
                 path: vfs.resolve_path(Some(&descriptor_path), &voice.file),
+                prelude: None,
             };
             if definitions.insert(voice.name.clone(), definition).is_some() {
                 return Err(AudioCatalogError::Data {
@@ -151,6 +250,10 @@ fn load_channel(
         })?;
         let definition = AudioDefinition {
             path: vfs.resolve_path(Some(&descriptor_path), &file.audio),
+            prelude: file
+                .prelude
+                .as_deref()
+                .map(|path| vfs.resolve_path(Some(&descriptor_path), path)),
         };
         if definitions.insert(file.name.clone(), definition).is_some() {
             return Err(AudioCatalogError::Data {
@@ -175,7 +278,7 @@ mod tests {
         std::fs::write(root.join("settings.hson"), ".{}").unwrap();
         std::fs::write(
             root.join("bgm/title.music.hson"),
-            ".{ name: \"title\", audio: \"Title.ogg\" }",
+            ".{ name: \"title\", prelude: \"TitlePrelude.ogg\", audio: \"Title.ogg\" }",
         )
         .unwrap();
         std::fs::write(
@@ -205,6 +308,10 @@ mod tests {
         assert_eq!(
             catalog.resolve_music("title").unwrap().path,
             "bgm/Title.ogg"
+        );
+        assert_eq!(
+            catalog.resolve_music("title").unwrap().prelude.as_deref(),
+            Some("bgm/TitlePrelude.ogg")
         );
         assert_eq!(
             catalog.resolve_voice("ema/001").unwrap().path,

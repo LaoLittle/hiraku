@@ -12,7 +12,7 @@ use bevy::{
 };
 
 use crate::{
-    audio::{AudioCatalog, load_audio_catalog},
+    audio::{AudioCatalog, PreludeLoopAudio, load_audio_catalog},
     character::{CharacterCatalog, CharacterPartDefinition, load_character_catalog},
     effect::custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
@@ -460,6 +460,7 @@ pub fn bridge_ir_events(
                         .items
                         .push_back(ScriptCommand::PlayBgm {
                             path: definition.path.clone(),
+                            prelude: definition.prelude.clone(),
                             volume,
                             fade_in: fade_in_ms.map(std::time::Duration::from_millis),
                             animation_id: None,
@@ -836,6 +837,14 @@ pub struct BackgroundLayer {
 pub struct BgmChannel {
     pub path: String,
     pub volume: f32,
+}
+
+/// Holds both file handles until the continuous prelude/loop source can be built.
+#[derive(Component)]
+pub struct BgmPrelude {
+    pub prelude_audio: Handle<AudioSource>,
+    pub loop_audio: Handle<AudioSource>,
+    pub start_volume: f32,
 }
 
 #[derive(Component)]
@@ -2758,6 +2767,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             }
             ScriptCommand::PlayBgm {
                 path,
+                prelude,
                 volume,
                 fade_in,
                 animation_id,
@@ -2771,16 +2781,33 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 } else {
                     playback_volume
                 };
-                let bgm = commands
-                    .spawn((
-                        BgmChannel {
-                            path: path.clone(),
-                            volume,
-                        },
-                        AudioPlayer::new(asset_server.load(path.clone())),
-                        PlaybackSettings::LOOP.with_volume(Volume::Linear(start_volume)),
-                    ))
-                    .id();
+                let loop_audio = asset_server.load(path.clone());
+                let bgm = if let Some(prelude) = prelude {
+                    commands
+                        .spawn((
+                            BgmChannel {
+                                path: path.clone(),
+                                volume,
+                            },
+                            BgmPrelude {
+                                prelude_audio: asset_server.load(prelude),
+                                loop_audio,
+                                start_volume,
+                            },
+                        ))
+                        .id()
+                } else {
+                    commands
+                        .spawn((
+                            BgmChannel {
+                                path: path.clone(),
+                                volume,
+                            },
+                            AudioPlayer::new(loop_audio),
+                            PlaybackSettings::LOOP.with_volume(Volume::Linear(start_volume)),
+                        ))
+                        .id()
+                };
                 if let Some(fade_in) = fade_in {
                     commands.entity(bgm).insert(BgmFade {
                         from: start_volume,
@@ -2981,13 +3008,15 @@ pub fn animate_bgm_fades(
     mut bgms: Query<(Entity, Option<&mut AudioSink>, &mut BgmFade)>,
 ) {
     for (entity, sink, mut fade) in &mut bgms {
+        let Some(mut sink) = sink else {
+            // Asset loading is asynchronous. The fade starts with audible playback, not while
+            // the source is still waiting to be decoded.
+            continue;
+        };
         fade.timer.tick(time.delta());
         let fraction = tween_fraction(&fade.timer);
         let volume = fade.from + (fade.to - fade.from) * fraction;
-
-        if let Some(mut sink) = sink {
-            sink.set_volume(Volume::Linear(volume));
-        }
+        sink.set_volume(Volume::Linear(volume));
 
         if fade.timer.is_finished() {
             if let Some(animation_id) = fade.animation_id.take() {
@@ -2995,6 +3024,35 @@ pub fn animate_bgm_fades(
             }
             commands.entity(entity).try_remove::<BgmFade>();
         }
+    }
+}
+
+/// Waits until both files are cached, then starts one decoder with no ECS boundary switch.
+pub fn prepare_bgm_preludes(
+    mut commands: Commands,
+    file_audio: Res<Assets<AudioSource>>,
+    mut prelude_loop_audio: ResMut<Assets<PreludeLoopAudio>>,
+    preludes: Query<(Entity, &BgmPrelude)>,
+) {
+    for (entity, prelude) in &preludes {
+        let Some(prelude_source) = file_audio.get(&prelude.prelude_audio) else {
+            continue;
+        };
+        let Some(loop_source) = file_audio.get(&prelude.loop_audio) else {
+            continue;
+        };
+
+        let audio = prelude_loop_audio.add(PreludeLoopAudio::new(
+            prelude_source.clone(),
+            loop_source.clone(),
+        ));
+        commands
+            .entity(entity)
+            .insert((
+                AudioPlayer(audio),
+                PlaybackSettings::ONCE.with_volume(Volume::Linear(prelude.start_volume)),
+            ))
+            .try_remove::<BgmPrelude>();
     }
 }
 

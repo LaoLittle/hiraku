@@ -251,6 +251,7 @@ pub enum ScriptCommand {
     },
     PlayBgm {
         path: String,
+        prelude: Option<String>,
         volume: f32,
         fade_in: Option<Duration>,
         animation_id: Option<String>,
@@ -305,6 +306,7 @@ pub(crate) fn script_command_from_ir(
             fade_in_ms,
         } => ScriptCommand::PlayBgm {
             path,
+            prelude: None,
             volume,
             fade_in: fade_in_ms.map(Duration::from_millis),
             animation_id: None,
