@@ -36,6 +36,7 @@ pub struct EncryptionMethod(u8);
 
 impl EncryptionMethod {
     pub const NONE: Self = Self(0);
+    pub const CHACHA20_POLY1305: Self = Self(1);
 
     pub const fn from_id(id: u8) -> Self {
         Self(id)
@@ -46,7 +47,7 @@ impl EncryptionMethod {
     }
 
     pub const fn is_supported(self) -> bool {
-        self.0 == Self::NONE.0
+        matches!(self, Self::NONE)
     }
 }
 
