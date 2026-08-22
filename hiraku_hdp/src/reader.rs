@@ -4,8 +4,10 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
 use crate::{
-    HdpError, PackageIndex,
+    ChunkDescriptor, HdpError, PackageIndex,
     codec::decode,
     format::{HEADER_SIZE, checksum64, decode_header, decode_index},
 };
@@ -250,43 +252,14 @@ impl Archive {
             .map_err(|_| HdpError::InvalidFormat(format!("`{path}` is too large")))?;
         let mut output = Vec::with_capacity(capacity);
 
-        for (chunk_index, chunk) in file.chunks.iter().enumerate() {
-            if chunk.encryption.id() != 0 {
-                return Err(HdpError::UnsupportedEncryption(chunk.encryption.id()));
-            }
-            let volume = self
-                .volumes
-                .get(chunk.volume as usize)
-                .and_then(OnceLock::get)
-                .ok_or(HdpError::MissingVolume(chunk.volume))?;
-            let start = usize::try_from(chunk.offset).map_err(|_| HdpError::CorruptChunk {
-                path: path.to_string(),
-                chunk: chunk_index,
-            })?;
-            let end = usize::try_from(chunk.offset + chunk.stored_size).map_err(|_| {
-                HdpError::CorruptChunk {
-                    path: path.to_string(),
-                    chunk: chunk_index,
-                }
-            })?;
-            let stored = volume
-                .get(start..end)
-                .ok_or_else(|| HdpError::CorruptChunk {
-                    path: path.to_string(),
-                    chunk: chunk_index,
-                })?;
-            let decoded =
-                decode(chunk.compression, stored).map_err(|_| HdpError::CorruptChunk {
-                    path: path.to_string(),
-                    chunk: chunk_index,
-                })?;
-            if decoded.len() as u64 != chunk.decoded_size || checksum64(&decoded) != chunk.checksum
-            {
-                return Err(HdpError::CorruptChunk {
-                    path: path.to_string(),
-                    chunk: chunk_index,
-                });
-            }
+        let decoded_chunks = file
+            .chunks
+            .par_iter()
+            .enumerate()
+            .map(|(idx, chunk)| self.decode_chunk(idx, chunk, path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for decoded in decoded_chunks {
             output.extend_from_slice(&decoded);
         }
 
@@ -296,5 +269,49 @@ impl Archive {
             )));
         }
         Ok(output)
+    }
+
+    fn decode_chunk(
+        &self,
+        chunk_index: usize,
+        chunk: &ChunkDescriptor,
+        path: &str,
+    ) -> Result<Vec<u8>, HdpError> {
+        if chunk.encryption.id() != 0 {
+            return Err(HdpError::UnsupportedEncryption(chunk.encryption.id()));
+        }
+        let volume = self
+            .volumes
+            .get(chunk.volume as usize)
+            .and_then(OnceLock::get)
+            .ok_or(HdpError::MissingVolume(chunk.volume))?;
+        let start = usize::try_from(chunk.offset).map_err(|_| HdpError::CorruptChunk {
+            path: path.to_string(),
+            chunk: chunk_index,
+        })?;
+        let end = usize::try_from(chunk.offset + chunk.stored_size).map_err(|_| {
+            HdpError::CorruptChunk {
+                path: path.to_string(),
+                chunk: chunk_index,
+            }
+        })?;
+        let stored = volume
+            .get(start..end)
+            .ok_or_else(|| HdpError::CorruptChunk {
+                path: path.to_string(),
+                chunk: chunk_index,
+            })?;
+        let decoded = decode(chunk.compression, stored).map_err(|_| HdpError::CorruptChunk {
+            path: path.to_string(),
+            chunk: chunk_index,
+        })?;
+        if decoded.len() as u64 != chunk.decoded_size || checksum64(&decoded) != chunk.checksum {
+            return Err(HdpError::CorruptChunk {
+                path: path.to_string(),
+                chunk: chunk_index,
+            });
+        }
+
+        Ok(decoded)
     }
 }

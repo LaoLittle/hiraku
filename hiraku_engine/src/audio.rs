@@ -66,6 +66,8 @@ impl Iterator for PreludeLoopDecoder {
             return Some(sample);
         }
 
+        // Decoder has run out of samples,
+        // we reset the loop decoder so that it can be played again.
         self.loop_decoder = self.loop_audio.decoder();
         self.loop_decoder.next()
     }

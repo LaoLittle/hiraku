@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 use crate::{
     ChunkDescriptor, CompressionMethod, CompressionOptions, EncryptionMethod, FileEntry, HdpError,
     PackageIndex,
@@ -118,7 +120,7 @@ impl PackageBuilder {
         let package_id = package_id(&self.files);
         let mut prepared = self
             .files
-            .into_iter()
+            .into_par_iter()
             .map(|(path, source)| prepare_file(path, source, options))
             .collect::<Result<Vec<_>, HdpError>>()?;
         prepared.sort_by(|left, right| {
