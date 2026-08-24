@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use bevy::{
     app::AppExit,
@@ -21,11 +21,11 @@ use crate::{
         setup_stage_cameras, start_camera_tween,
     },
     script::{
-        BatchSubmissionItem, BatchSubmitMode, CharacterEase, IrCommand, IrEvent, IrRuntime, IrVm,
-        IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptRequestId,
-        ScriptResponse, ScriptResponseMessage, UiContext, UiIntent, VoicePlaybackMode,
-        compile_story_program, evaluate_ui_script, save_runtime_slot, script_command_from_effect,
-        script_command_from_ir, start_hks_runtime,
+        BatchSubmissionItem, BatchSubmitMode, CharacterEase, ResolvedCharacterKeyframe,
+        ScriptBootstrap, ScriptCommand, ScriptRequestId, ScriptResponse, ScriptResponseMessage,
+        ScriptRuntimeState, StoryRuntime, StoryRuntimeEvent, UiContext, VoicePlaybackMode,
+        compile_story_bytecode, evaluate_ui_script, save_runtime_slot, script_command_from_effect,
+        start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -302,8 +302,56 @@ pub struct PendingScriptCommands {
     pub items: VecDeque<ScriptCommand>,
 }
 
-pub fn bridge_ir_events(
-    mut runtime: NonSendMut<IrRuntime>,
+fn stored_to_hks(value: StoredValue) -> hiraku_script::vm::Value {
+    match value {
+        StoredValue::Bool(value) => hiraku_script::vm::Value::Bool(value),
+        StoredValue::Int(value) => hiraku_script::vm::Value::Number(value as f64),
+        StoredValue::Float(value) => hiraku_script::vm::Value::Number(value),
+        StoredValue::String(value) => hiraku_script::vm::Value::String(value),
+        StoredValue::Array(values) => {
+            hiraku_script::vm::Value::List(values.into_iter().map(stored_to_hks).collect())
+        }
+        StoredValue::Map(values) => hiraku_script::vm::Value::Map(
+            values
+                .into_iter()
+                .map(|(name, value)| (name, stored_to_hks(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn hks_globals_to_stored(
+    globals: &BTreeMap<String, hiraku_script::vm::Value>,
+) -> BTreeMap<String, StoredValue> {
+    globals
+        .iter()
+        .filter_map(|(name, value)| hks_to_stored(value).map(|value| (name.clone(), value)))
+        .collect()
+}
+
+fn hks_to_stored(value: &hiraku_script::vm::Value) -> Option<StoredValue> {
+    match value {
+        hiraku_script::vm::Value::Bool(value) => Some(StoredValue::Bool(*value)),
+        hiraku_script::vm::Value::Number(value) => Some(StoredValue::Float(*value)),
+        hiraku_script::vm::Value::String(value) | hiraku_script::vm::Value::Symbol(value) => {
+            Some(StoredValue::String(value.clone()))
+        }
+        hiraku_script::vm::Value::List(values) | hiraku_script::vm::Value::Tuple(values) => Some(
+            StoredValue::Array(values.iter().filter_map(hks_to_stored).collect()),
+        ),
+        hiraku_script::vm::Value::Map(values) => Some(StoredValue::Map(
+            values
+                .iter()
+                .filter_map(|(name, value)| hks_to_stored(value).map(|value| (name.clone(), value)))
+                .collect(),
+        )),
+        hiraku_script::vm::Value::Typed { value, .. } => hks_to_stored(value),
+        _ => None,
+    }
+}
+
+pub fn bridge_story_events(
+    mut runtime: ResMut<ScriptRuntimeState>,
     mut response_messages: MessageReader<ScriptResponseMessage>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
     textures: Option<Res<TextureCatalog>>,
@@ -312,146 +360,72 @@ pub fn bridge_ir_events(
     user_settings: Res<UserSettings>,
 ) {
     for message in response_messages.read() {
-        runtime.accept_response(message.clone());
+        if let Some(task) = runtime.task_requests.remove(&message.request) {
+            if let Some(story) = runtime.story.as_mut()
+                && let Err(error) = story.resume_task(task)
+            {
+                warn!("failed to resume HKS task {task}: {error}");
+                runtime.story = None;
+            }
+        } else {
+            runtime.accept_response(message.clone());
+        }
     }
 
-    if let Some(request) = runtime.wait_request {
-        let Some(response) = runtime.take_response(request) else {
-            return;
+    if let Some(request) = runtime.wait_request
+        && let Some(response) = runtime.take_response(request)
+    {
+        let direct_value = match &response {
+            ScriptResponse::Choice(value) => stored_to_hks(value.clone()),
+            ScriptResponse::Continue => hiraku_script::vm::Value::Null,
         };
-        match response {
-            ScriptResponse::Choice(value) => {
-                let value = if let Some(screen) = runtime.pending_ui_screen.take() {
-                    UiIntent { screen, value }.value
-                } else {
-                    value
-                };
-                if let Some(variable) = runtime.pending_input_variable.take()
-                    && let Some(vm) = runtime.vm.as_mut()
-                {
-                    vm.set_stored_value(variable, value);
-                }
-            }
-            ScriptResponse::Continue => {
-                runtime.pending_input_variable = None;
-                runtime.pending_ui_screen = None;
-            }
-        }
+        runtime.pending_ui_screen = None;
         runtime.wait_request = None;
-        if let Some(vm) = runtime.vm.as_mut() {
-            vm.resume();
+        if let Some(story) = runtime.story.as_mut()
+            && let Err(error) = story.resume(direct_value)
+        {
+            warn!("failed to resume direct HKS runtime: {error}");
+            runtime.story = None;
         }
     }
 
-    let Some(event) = runtime.events.pop_front() else {
-        return;
-    };
-
-    match event {
-        IrEvent::Command(IrCommand::LoadScript { path }) => {
-            let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
-            let program = vfs
-                .0
-                .read_text(&target)
-                .map_err(|error| error.to_string())
-                .and_then(|source| compile_story_program(&target, &source))
-                .and_then(|program| IrVm::new(program).map_err(|error| error.to_string()));
-            match program {
-                Ok(vm) => {
-                    runtime.vm = Some(vm);
-                    runtime.current_script = Some(target);
-                    runtime.events.clear();
-                    runtime.pending_input_variable = None;
-                    runtime.pending_ui_screen = None;
-                    runtime.pending_request = None;
-                    runtime.wait_request = None;
-                    runtime.response_inbox.clear();
-                    runtime.native_tasks.clear();
-                    runtime.hks_locals.clear();
-                    runtime.hks_host = crate::script::capabilities::StoryNativeHost::new();
-                }
-                Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
-            }
-        }
-        IrEvent::Command(IrCommand::Choose {
-            prompt,
-            options,
-            result,
-        }) => {
-            let request = runtime.allocate_request();
-            runtime.pending_input_variable = Some(result);
-            runtime.pending_ui_screen = None;
-            runtime.pending_request = Some(request);
-            pending_script_commands
-                .items
-                .push_back(ScriptCommand::Choose {
-                    prompt,
-                    options: options
-                        .into_iter()
-                        .map(|option| ChoiceOption {
-                            text: option.text,
-                            value: StoredValue::String(option.value),
-                        })
-                        .collect(),
-                    done: request,
-                });
-        }
-        IrEvent::Command(IrCommand::OpenUi { path, result }) => {
-            let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
-            let mut story = runtime
-                .vm
-                .as_ref()
-                .map(IrVm::story_values)
-                .unwrap_or_default();
-            story.insert(
-                "bgmVolume".to_string(),
-                StoredValue::Float(user_settings.bgm_volume as f64),
-            );
-            story.insert(
-                "voiceVolume".to_string(),
-                StoredValue::Float(user_settings.voice_volume as f64),
-            );
-            story.insert(
-                "sfxVolume".to_string(),
-                StoredValue::Float(user_settings.sfx_volume as f64),
-            );
-            let screen = vfs
-                .0
-                .read_text(&target)
-                .map_err(|error| error.to_string())
-                .and_then(|source| {
-                    let textures = textures
-                        .as_deref()
-                        .ok_or_else(|| "texture catalog is unavailable".to_string())?;
-                    evaluate_ui_script(&source, &UiContext::new(story), textures)
-                        .map_err(|error| error.to_string())
-                });
-            let request = runtime.allocate_request();
-            runtime.pending_input_variable = Some(result);
-            runtime.pending_ui_screen = Some(target.clone());
-            runtime.pending_request = Some(request);
-            match screen {
-                Ok(screen) => pending_script_commands
-                    .items
-                    .push_back(ScriptCommand::ShowScreen {
-                        screen,
-                        done: Some(request),
-                    }),
-                Err(error) => {
-                    warn!("failed to render UI script `{target}`: {error}");
-                    runtime.vm = None;
-                    runtime.pending_input_variable = None;
-                    runtime.pending_ui_screen = None;
-                    runtime.pending_request = None;
+    if let Some(event) = runtime.story_events.pop_front() {
+        match event {
+            StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::LoadScript {
+                path,
+            }) => {
+                let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
+                let inherited_globals = runtime
+                    .story
+                    .as_ref()
+                    .map(|story| story.globals().clone())
+                    .unwrap_or_default();
+                let result = vfs
+                    .0
+                    .read_text(&target)
+                    .map_err(|error| error.to_string())
+                    .and_then(|source| compile_story_bytecode(&target, &source))
+                    .and_then(|bytecode| {
+                        StoryRuntime::new(bytecode).map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(mut story) => {
+                        let mut globals = inherited_globals;
+                        globals.extend(crate::script::capabilities::engine_globals(&user_settings));
+                        story.set_globals(globals);
+                        runtime.story = Some(story);
+                        runtime.current_script = Some(target);
+                        runtime.story_events.clear();
+                        runtime.task_requests.clear();
+                    }
+                    Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
                 }
             }
-        }
-        IrEvent::Command(IrCommand::PlayBgm {
-            path,
-            volume,
-            fade_in_ms,
-        }) => {
-            match audio
+            StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayBgm {
+                path,
+                volume,
+                fade_in_ms,
+            }) => match audio
                 .as_deref()
                 .and_then(|catalog| catalog.resolve_music(&path))
             {
@@ -467,10 +441,11 @@ pub fn bridge_ir_events(
                         })
                 }
                 None => warn!("music `{path}` is not defined"),
-            }
-        }
-        IrEvent::Command(IrCommand::PlayVoice { path, volume }) => {
-            match audio
+            },
+            StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayVoice {
+                path,
+                volume,
+            }) => match audio
                 .as_deref()
                 .and_then(|catalog| catalog.resolve_voice(&path))
             {
@@ -485,241 +460,115 @@ pub fn bridge_ir_events(
                         })
                 }
                 None => warn!("voice `{path}` is not defined"),
-            }
-        }
-        IrEvent::Command(IrCommand::WaitHksTask { handle }) => {
-            let Some(request) = runtime.native_tasks.remove(&handle) else {
-                warn!("HKS task handle `{handle}` is not defined");
-                return;
-            };
-            if runtime
-                .vm
-                .as_mut()
-                .is_some_and(|vm| vm.suspend(IrWaitKind::TaskCompletion))
-            {
-                runtime.wait_request = Some(request);
-            }
-        }
-        IrEvent::Command(IrCommand::HksStatement {
-            bytecode,
-            mut task_result,
-        }) => {
-            let locals = runtime.hks_locals.clone();
-            match crate::script::capabilities::execute_with_host(
-                bytecode,
-                &mut runtime.hks_host,
-                locals,
-            ) {
-                Ok(output) => {
-                    runtime.hks_locals = output.locals;
-                    for effect in output.commands {
-                        match effect {
-                            crate::script::capabilities::StoryEffect::LoadScript { path } => {
-                                runtime
-                                    .events
-                                    .push_back(IrEvent::Command(IrCommand::LoadScript { path }))
-                            }
-                            crate::script::capabilities::StoryEffect::PlayBgm {
-                                path,
-                                volume,
-                                fade_in_ms,
-                            } => match audio
-                                .as_deref()
-                                .and_then(|catalog| catalog.resolve_music(&path))
-                            {
-                                Some(definition) => pending_script_commands.items.push_back(
-                                    ScriptCommand::PlayBgm {
-                                        path: definition.path.clone(),
-                                        prelude: definition.prelude.clone(),
-                                        volume,
-                                        fade_in: fade_in_ms.map(std::time::Duration::from_millis),
-                                        animation_id: None,
-                                    },
-                                ),
-                                None => warn!("music `{path}` is not defined"),
-                            },
-                            crate::script::capabilities::StoryEffect::PlayVoice {
-                                path,
-                                volume,
-                            } => match audio
-                                .as_deref()
-                                .and_then(|catalog| catalog.resolve_voice(&path))
-                            {
-                                Some(definition) => pending_script_commands.items.push_back(
-                                    ScriptCommand::PlayVoice {
-                                        path: definition.path.clone(),
-                                        volume,
-                                        mode: VoicePlaybackMode::Exclusive,
-                                        animation_id: None,
-                                    },
-                                ),
-                                None => warn!("voice `{path}` is not defined"),
-                            },
-                            effect => match script_command_from_effect(effect, textures.as_deref())
-                            {
-                                Ok(command) => pending_script_commands.items.push_back(command),
-                                Err(error) => warn!("HKS native command rejected: {error}"),
-                            },
-                        }
-                    }
-                    for task in output.tasks {
-                        let batch_id = runtime.next_native_task_id;
-                        runtime.next_native_task_id += 1;
-                        let mut items = Vec::new();
-                        for (index, effect) in task.commands.into_iter().enumerate() {
-                            let handle = format!("hks-task-{batch_id}-{index}");
-                            let command = match effect {
-                                crate::script::capabilities::StoryEffect::PlayVoice {
-                                    path,
-                                    volume,
-                                } => {
-                                    let Some(definition) = audio
-                                        .as_deref()
-                                        .and_then(|catalog| catalog.resolve_voice(&path))
-                                    else {
-                                        warn!("voice `{path}` is not defined");
-                                        continue;
-                                    };
-                                    ScriptCommand::PlayVoice {
-                                        path: definition.path.clone(),
-                                        volume,
-                                        mode: VoicePlaybackMode::Concurrent,
-                                        animation_id: Some(handle.clone()),
-                                    }
-                                }
-                                effect @ crate::script::capabilities::StoryEffect::ShowCharacter {
-                                    ..
-                                } => {
-                                    match script_command_from_effect(effect, textures.as_deref()) {
-                                        Ok(ScriptCommand::ShowCharacter {
-                                            actor_id,
-                                            character_name,
-                                            expressions,
-                                            position,
-                                            scale,
-                                            fade,
-                                            ..
-                                        }) => ScriptCommand::ShowCharacter {
-                                            actor_id,
-                                            character_name,
-                                            expressions,
-                                            position,
-                                            scale,
-                                            fade,
-                                            animation_id: Some(handle.clone()),
-                                        },
-                                        Ok(_) => unreachable!(
-                                            "show character IR must stay a show character command"
-                                        ),
-                                        Err(error) => {
-                                            warn!("HKS character task command rejected: {error}");
-                                            continue;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    warn!(
-                                        "HKS task command is not yet supported by the story runtime"
-                                    );
-                                    continue;
-                                }
-                            };
-                            items.push(BatchSubmissionItem {
-                                handle: handle.clone(),
-                                command: Box::new(command),
-                            });
-                        }
-                        let handles = items
-                            .iter()
-                            .map(|item| item.handle.clone())
-                            .collect::<Vec<_>>();
-                        let mode = match task.mode {
-                            hiraku_script::vm::TaskMode::Sequence => BatchSubmitMode::Sequence,
-                            hiraku_script::vm::TaskMode::Parallel => BatchSubmitMode::Parallel,
-                        };
-                        if !items.is_empty() {
-                            pending_script_commands
-                                .items
-                                .push_back(ScriptCommand::SubmitBatch { mode, items });
-                        }
-                        if let Some(handle) = task_result.take() {
-                            let request = runtime.allocate_request();
-                            pending_script_commands.items.push_back(
-                                ScriptCommand::WaitAnimations {
-                                    ids: handles,
-                                    done: request,
-                                },
-                            );
-                            runtime.native_tasks.insert(handle, request);
-                        }
-                    }
-                    if let Some(wait) = output.wait {
-                        let wait = match wait {
-                            crate::script::capabilities::StoryWait::DialogueAdvance => {
-                                IrWaitKind::DialogueAdvance
-                            }
-                        };
-                        if runtime
-                            .vm
-                            .as_mut()
-                            .is_some_and(|vm| vm.suspend(wait.clone()))
-                        {
-                            runtime.events.push_back(IrEvent::Waiting(wait));
-                        }
-                    }
+            },
+            StoryRuntimeEvent::Effect(effect) => {
+                match script_command_from_effect(effect, textures.as_deref()) {
+                    Ok(command) => pending_script_commands.items.push_back(command),
+                    Err(error) => warn!("HKS native command rejected: {error}"),
                 }
-                Err(error) => warn!("HKS native statement failed: {error}"),
             }
-        }
-        IrEvent::Command(command) => match script_command_from_ir(command, textures.as_deref()) {
-            Ok(command) => pending_script_commands.items.push_back(command),
-            Err(error) => warn!("IR command rejected: {error}"),
-        },
-        IrEvent::Waiting(wait_kind) => {
-            if matches!(wait_kind, IrWaitKind::ScreenChoice | IrWaitKind::UiIntent)
-                && let Some(request) = runtime.pending_request.take()
-            {
-                runtime.wait_request = Some(request);
-                return;
-            }
-            if matches!(wait_kind, IrWaitKind::ScreenChoice | IrWaitKind::UiIntent) {
-                let request = runtime.allocate_request();
-                runtime.wait_request = Some(request);
-                pending_script_commands
-                    .items
-                    .push_back(ScriptCommand::WaitForScreenChoice { done: request });
-                return;
-            }
-            if matches!(wait_kind, IrWaitKind::DialogueAdvance) {
+            StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::DialogueAdvance) => {
                 let request = runtime.allocate_request();
                 runtime.wait_request = Some(request);
                 pending_script_commands
                     .items
                     .push_back(ScriptCommand::AwaitDialogueAdvance { done: request });
-                return;
             }
-            let request = runtime.allocate_request();
-            let command = match wait_kind {
-                IrWaitKind::DialogueAdvance => {
-                    unreachable!("dialogue waits are handled through ECS request messages")
+            StoryRuntimeEvent::OpenUi { path } => {
+                let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
+                let mut story_values = runtime
+                    .story
+                    .as_ref()
+                    .map(|story| hks_globals_to_stored(story.globals()))
+                    .unwrap_or_default();
+                story_values.insert(
+                    "bgmVolume".to_string(),
+                    StoredValue::Float(user_settings.bgm_volume as f64),
+                );
+                story_values.insert(
+                    "voiceVolume".to_string(),
+                    StoredValue::Float(user_settings.voice_volume as f64),
+                );
+                story_values.insert(
+                    "sfxVolume".to_string(),
+                    StoredValue::Float(user_settings.sfx_volume as f64),
+                );
+                let screen = vfs
+                    .0
+                    .read_text(&target)
+                    .map_err(|error| error.to_string())
+                    .and_then(|source| {
+                        let textures = textures
+                            .as_deref()
+                            .ok_or_else(|| "texture catalog is unavailable".to_string())?;
+                        evaluate_ui_script(&source, &UiContext::new(story_values), textures)
+                            .map_err(|error| error.to_string())
+                    });
+                let request = runtime.allocate_request();
+                runtime.pending_ui_screen = Some(target.clone());
+                runtime.wait_request = Some(request);
+                match screen {
+                    Ok(screen) => {
+                        pending_script_commands
+                            .items
+                            .push_back(ScriptCommand::ShowScreen {
+                                screen,
+                                done: Some(request),
+                            })
+                    }
+                    Err(error) => {
+                        warn!("failed to render UI script `{target}`: {error}");
+                        runtime.story = None;
+                        runtime.wait_request = None;
+                    }
                 }
-                IrWaitKind::ScreenChoice | IrWaitKind::UiIntent => {
-                    unreachable!("interactive waits are handled through ECS request messages")
+            }
+            StoryRuntimeEvent::TaskEffect {
+                task,
+                effect: crate::script::capabilities::StoryEffect::PlayVoice { path, volume },
+            } => match audio
+                .as_deref()
+                .and_then(|catalog| catalog.resolve_voice(&path))
+            {
+                Some(definition) => {
+                    let request = runtime.allocate_request();
+                    let animation_id = format!("hks-task-voice-{}", request.0);
+                    runtime.task_requests.insert(request, task);
+                    pending_script_commands
+                        .items
+                        .push_back(ScriptCommand::PlayVoice {
+                            path: definition.path.clone(),
+                            volume,
+                            mode: VoicePlaybackMode::Concurrent,
+                            animation_id: Some(animation_id.clone()),
+                        });
+                    pending_script_commands
+                        .items
+                        .push_back(ScriptCommand::WaitAnimations {
+                            ids: vec![animation_id],
+                            done: request,
+                        });
                 }
-                IrWaitKind::TaskCompletion => ScriptCommand::WaitAnimations {
-                    ids: Vec::new(),
-                    done: request,
-                },
-                IrWaitKind::DurationMs(milliseconds) => ScriptCommand::Wait {
-                    duration: std::time::Duration::from_millis(milliseconds),
-                    animation_id: None,
-                    done: request,
-                },
-            };
-            runtime.wait_request = Some(request);
-            pending_script_commands.items.push_back(command);
+                None => {
+                    warn!("voice `{path}` is not defined");
+                    if let Some(story) = runtime.story.as_mut()
+                        && let Err(error) = story.resume_task(task)
+                    {
+                        warn!("failed to skip missing HKS task voice: {error}");
+                    }
+                }
+            },
+            StoryRuntimeEvent::TaskEffect { task, effect } => {
+                warn!("unsupported HKS task effect for task {task}: {effect:?}");
+                if let Some(story) = runtime.story.as_mut()
+                    && let Err(error) = story.resume_task(task)
+                {
+                    warn!("failed to resume unsupported HKS task effect: {error}");
+                }
+            }
+            StoryRuntimeEvent::Completed(_) => {}
         }
-        IrEvent::Completed => {}
+        return;
     }
 }
 
@@ -936,7 +785,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub camera_state: ResMut<'w, CameraState>,
     pub camera_tweens: ResMut<'w, CameraTweenState>,
     pub pending_script_commands: ResMut<'w, PendingScriptCommands>,
-    pub ir_runtime: NonSendMut<'w, IrRuntime>,
+    pub script_runtime: ResMut<'w, ScriptRuntimeState>,
     pub active_batches: ResMut<'w, ActiveScriptBatches>,
     pub dialogue_state: ResMut<'w, DialogueState>,
     pub choice_state: ResMut<'w, ChoiceState>,
@@ -994,7 +843,7 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub ui_fonts: Res<'w, UiFonts>,
     pub vfs: Res<'w, VfsResource>,
     pub shared_state: ResMut<'w, SceneSharedState>,
-    pub ir_runtime: NonSendMut<'w, IrRuntime>,
+    pub script_runtime: ResMut<'w, ScriptRuntimeState>,
     pub frontend: ResMut<'w, FrontendState>,
     pub user_settings: Res<'w, UserSettings>,
     pub ui_style: Res<'w, UiStyle>,
@@ -1726,7 +1575,7 @@ pub fn handle_frontend_buttons(
     mut stage: ResMut<StageState>,
     mut dialogue_state: ResMut<DialogueState>,
     mut choice_state: ResMut<ChoiceState>,
-    mut ir_runtime: NonSendMut<IrRuntime>,
+    mut script_runtime: ResMut<ScriptRuntimeState>,
     mut interaction_query: Query<
         (&Interaction, &mut BackgroundColor, &FrontendButton),
         Changed<Interaction>,
@@ -1775,7 +1624,7 @@ pub fn handle_frontend_buttons(
                             &mut line_text,
                             &user_settings,
                             &mut frontend,
-                            &mut ir_runtime,
+                            &mut script_runtime,
                             bootstrap,
                             SceneSnapshot::default(),
                         );
@@ -1811,7 +1660,7 @@ pub fn handle_frontend_buttons(
                             &mut line_text,
                             &user_settings,
                             &mut frontend,
-                            &mut ir_runtime,
+                            &mut script_runtime,
                             bootstrap,
                             SceneSnapshot::default(),
                         );
@@ -1858,7 +1707,7 @@ pub fn handle_frontend_buttons(
                                 &mut line_text,
                                 &user_settings,
                                 &mut frontend,
-                                &mut ir_runtime,
+                                &mut script_runtime,
                                 bootstrap,
                                 snapshot,
                             );
@@ -1921,7 +1770,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut camera_state = ctx.camera_state;
     let mut camera_tweens = ctx.camera_tweens;
     let mut pending_script_commands = ctx.pending_script_commands;
-    let mut ir_runtime = ctx.ir_runtime;
+    let mut script_runtime = ctx.script_runtime;
     let mut active_batches = ctx.active_batches;
     let mut dialogue_state = ctx.dialogue_state;
     let mut choice_state = ctx.choice_state;
@@ -3049,22 +2898,26 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 frontend.dirty = false;
                 if !frontend.startup_script.is_empty() {
                     let startup = frontend.startup_script.clone();
-                    let program = vfs
+                    let story = vfs
                         .0
                         .read_text(&startup)
                         .map_err(|error| error.to_string())
-                        .and_then(|source| compile_story_program(&startup, &source))
-                        .and_then(|program| IrVm::new(program).map_err(|error| error.to_string()));
-                    match program {
-                        Ok(vm) => {
-                            ir_runtime.vm = Some(vm);
-                            ir_runtime.current_script = Some(startup);
-                            ir_runtime.events.clear();
-                            ir_runtime.pending_input_variable = None;
-                            ir_runtime.pending_ui_screen = None;
-                            ir_runtime.pending_request = None;
-                            ir_runtime.wait_request = None;
-                            ir_runtime.response_inbox.clear();
+                        .and_then(|source| compile_story_bytecode(&startup, &source))
+                        .and_then(|bytecode| {
+                            StoryRuntime::new(bytecode).map_err(|error| error.to_string())
+                        });
+                    match story {
+                        Ok(mut story) => {
+                            story.set_globals(crate::script::capabilities::engine_globals(
+                                &user_settings,
+                            ));
+                            script_runtime.story = Some(story);
+                            script_runtime.current_script = Some(startup);
+                            script_runtime.story_events.clear();
+                            script_runtime.pending_ui_screen = None;
+                            script_runtime.wait_request = None;
+                            script_runtime.response_inbox.clear();
+                            script_runtime.task_requests.clear();
                         }
                         Err(error) => warn!("failed to return to HKS title: {error}"),
                     }
@@ -3887,7 +3740,7 @@ fn start_frontend_session(
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
     user_settings: &UserSettings,
     frontend: &mut FrontendState,
-    ir_runtime: &mut IrRuntime,
+    script_runtime: &mut ScriptRuntimeState,
     bootstrap: ScriptBootstrap,
     snapshot: SceneSnapshot,
 ) {
@@ -3915,7 +3768,7 @@ fn start_frontend_session(
     frontend.screen = FrontendScreen::InGame;
     frontend.dirty = false;
 
-    if let Err(error) = start_hks_runtime(vfs, ir_runtime, bootstrap) {
+    if let Err(error) = start_hks_runtime(vfs, script_runtime, bootstrap, user_settings) {
         frontend.notice = Some(format!("Failed to start HKS runtime: {error}"));
         frontend.runtime_started = false;
         frontend.dirty = true;
@@ -4483,7 +4336,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 *color = ctx.ui_style.quick_button_pressed.into();
                 match button.action {
                     RuntimeMenuButtonAction::QuickSave => {
-                        let _ = save_runtime_slot("quick", &ctx.ir_runtime, &ctx.shared_state);
+                        let _ = save_runtime_slot("quick", &ctx.script_runtime, &ctx.shared_state);
                     }
                     RuntimeMenuButtonAction::QuickLoad => {
                         let Ok(save_data) = load_save_data("quick") else {
@@ -4518,7 +4371,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.line_text,
                             &ctx.user_settings,
                             &mut ctx.frontend,
-                            &mut ctx.ir_runtime,
+                            &mut ctx.script_runtime,
                             ScriptBootstrap::from_save(&save_data),
                             save_data.scene.clone(),
                         );
@@ -4568,7 +4421,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             &mut ctx.line_text,
                             &ctx.user_settings,
                             &mut ctx.frontend,
-                            &mut ctx.ir_runtime,
+                            &mut ctx.script_runtime,
                             ScriptBootstrap::new(startup_script),
                             SceneSnapshot::default(),
                         );

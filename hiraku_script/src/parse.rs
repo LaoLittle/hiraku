@@ -272,6 +272,7 @@ impl Parser {
         if let TokenKind::Ident(name) = &self.current().kind {
             match name.as_str() {
                 "fn" => return self.parse_function(),
+                "type" => return self.parse_type_alias(),
                 "let" | "var" => return self.parse_let(),
                 "global" => return self.parse_global(),
                 "if" => return self.parse_if(),
@@ -307,10 +308,29 @@ impl Parser {
         let mut parameters = Vec::new();
         self.skip_newlines();
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-            match self.advance().kind {
-                TokenKind::Ident(parameter) => parameters.push(parameter),
-                _ => self.error_here("expected parameter name"),
-            }
+            let parameter_start = self.current().span.clone();
+            let name = match self.advance().kind {
+                TokenKind::Ident(parameter) => parameter,
+                _ => {
+                    self.error_here("expected parameter name");
+                    "<error>".to_string()
+                }
+            };
+            let ty = if self.at(TokenKind::Colon) {
+                self.advance();
+                Some(self.parse_type())
+            } else {
+                None
+            };
+            let end = ty
+                .as_ref()
+                .map(|ty| ty.span.clone())
+                .unwrap_or_else(|| parameter_start.clone());
+            parameters.push(FunctionParameter {
+                name,
+                ty,
+                span: Span::join(&parameter_start, &end),
+            });
             self.skip_newlines();
             if self.at(TokenKind::Comma) {
                 self.advance();
@@ -320,14 +340,37 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen, "expected `)` after parameters");
+        let return_type = if self.at(TokenKind::Minus) && self.peek().kind == TokenKind::Gt {
+            self.advance();
+            self.advance();
+            Some(self.parse_type())
+        } else {
+            None
+        };
         let body = self.parse_block();
         let span = Span::join(&start.span, &body.span);
         Stmt::Function {
             name,
             parameters,
+            return_type,
             body,
             span,
         }
+    }
+
+    fn parse_type_alias(&mut self) -> Stmt {
+        let start = self.advance();
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected type name after `type`");
+                "<error>".to_string()
+            }
+        };
+        self.expect(TokenKind::Equal, "expected `=` after type name");
+        let ty = self.parse_type();
+        let span = Span::join(&start.span, &ty.span);
+        Stmt::TypeAlias { name, ty, span }
     }
 
     fn parse_if(&mut self) -> Stmt {
@@ -1006,8 +1049,38 @@ mod tests {
             panic!("expected function definition")
         };
         assert_eq!(name, "decorate");
-        assert_eq!(parameters, &["actor", "emotion"]);
+        assert_eq!(
+            parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            ["actor", "emotion"]
+        );
         assert_eq!(body.statements.len(), 1);
+    }
+
+    #[test]
+    fn parses_type_aliases_and_typed_function_signatures() {
+        let program = parse_program(
+            r#"
+                type Player = .{ name: String, health: Int }
+                fn health(player: Player) -> Int { player.health }
+            "#,
+        )
+        .expect("typed declarations must parse");
+        assert!(
+            matches!(program.statements[0], Stmt::TypeAlias { ref name, .. } if name == "Player")
+        );
+        let Stmt::Function {
+            parameters,
+            return_type: Some(return_type),
+            ..
+        } = &program.statements[1]
+        else {
+            panic!("expected typed function")
+        };
+        assert!(parameters[0].ty.is_some());
+        assert!(matches!(return_type.kind, TypeExprKind::Named(ref name) if name == "Int"));
     }
 
     #[test]

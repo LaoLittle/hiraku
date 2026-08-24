@@ -141,12 +141,11 @@ impl From<&SaveGameData> for proto::SaveGameData {
             scope: stored_entries_from_map(&data.scope),
             input_log: data.input_log.iter().map(Into::into).collect(),
             scene: Some((&data.scene).into()),
-            ir_snapshot_hson: data
-                .ir_snapshot
+            vm_snapshot_hson: data
+                .vm_snapshot
                 .as_ref()
                 .and_then(|snapshot| hson::to_vec(snapshot).ok())
                 .unwrap_or_default(),
-            pending_input_variable: data.pending_input_variable.clone(),
             pending_ui_screen: data.pending_ui_screen.clone(),
         }
     }
@@ -176,14 +175,13 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                 .map(TryInto::try_into)
                 .transpose()?
                 .unwrap_or_default(),
-            ir_snapshot: if data.ir_snapshot_hson.is_empty() || data.version < 6 {
+            vm_snapshot: if data.vm_snapshot_hson.is_empty() || data.version < 7 {
                 None
             } else {
-                Some(hson::from_slice(&data.ir_snapshot_hson).map_err(|error| {
-                    StorageError::InvalidSave(format!("invalid HSON IR snapshot: {error}"))
+                Some(hson::from_slice(&data.vm_snapshot_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid HSON VM snapshot: {error}"))
                 })?)
             },
-            pending_input_variable: data.pending_input_variable,
             pending_ui_screen: data.pending_ui_screen,
         })
     }
@@ -526,32 +524,32 @@ fn global_string(globals: &BTreeMap<String, StoredValue>, key: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::{IrInstruction, IrProgram, IrVm, IrWaitKind};
+    use crate::script::{StoryRuntime, StoryRuntimeEvent, compile_story_bytecode};
 
     #[test]
-    fn save_roundtrip_preserves_exact_ir_wait_state() {
-        let program = IrProgram::new(
-            u64::MAX - 1,
-            vec![
-                IrInstruction::Wait(IrWaitKind::UiIntent),
-                IrInstruction::Halt,
-            ],
-        );
-        let mut vm = IrVm::new(program).unwrap();
-        assert!(vm.step().is_some());
-        let snapshot = vm.snapshot();
+    fn save_roundtrip_preserves_exact_vm_wait_state() {
+        let bytecode = compile_story_bytecode("save.story.hks", "\"save here\"")
+            .expect("save story must compile");
+        let mut runtime = StoryRuntime::new(bytecode).expect("runtime must initialize");
+        assert!(matches!(
+            runtime.step().expect("dialogue effect must run"),
+            Some(StoryRuntimeEvent::Effect(_))
+        ));
+        assert!(matches!(
+            runtime.step().expect("dialogue wait must run"),
+            Some(StoryRuntimeEvent::Wait(_))
+        ));
+        let snapshot = runtime.snapshot().expect("wait boundary must be saveable");
         let data = SaveGameData {
-            version: 6,
+            version: 7,
             resume_script: "system.story.hks".to_string(),
-            ir_snapshot: Some(snapshot.clone()),
-            pending_input_variable: Some("action".to_string()),
+            vm_snapshot: Some(snapshot.clone()),
             pending_ui_screen: Some("ui/title.ui.hks".to_string()),
             ..Default::default()
         };
 
         let restored = decode_save_data(&encode_save_data(&data)).unwrap();
-        assert_eq!(restored.ir_snapshot, Some(snapshot));
-        assert_eq!(restored.pending_input_variable.as_deref(), Some("action"));
+        assert_eq!(restored.vm_snapshot, Some(snapshot));
         assert_eq!(
             restored.pending_ui_screen.as_deref(),
             Some("ui/title.ui.hks")

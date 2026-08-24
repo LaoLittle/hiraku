@@ -168,6 +168,7 @@ impl Collector<'_> {
 
     fn nested(&mut self, statement: &Stmt) {
         match statement {
+            Stmt::TypeAlias { .. } => {}
             Stmt::Function { body, .. } | Stmt::While { body, .. } => self.block(body),
             Stmt::If {
                 then_block,
@@ -336,6 +337,7 @@ fn string_argument(argument: &hiraku_script::Argument) -> Option<String> {
 
 fn statement_span(statement: &Stmt) -> &Span {
     match statement {
+        Stmt::TypeAlias { span, .. } => span,
         Stmt::Function { span, .. }
         | Stmt::Let { span, .. }
         | Stmt::Global { span, .. }

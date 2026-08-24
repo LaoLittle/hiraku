@@ -9,9 +9,15 @@ pub struct Program {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
+    TypeAlias {
+        name: String,
+        ty: TypeExpr,
+        span: Span,
+    },
     Function {
         name: String,
-        parameters: Vec<String>,
+        parameters: Vec<FunctionParameter>,
+        return_type: Option<TypeExpr>,
         body: Block,
         span: Span,
     },
@@ -45,6 +51,13 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FunctionParameter {
+    pub name: String,
+    pub ty: Option<TypeExpr>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]

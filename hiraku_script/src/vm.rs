@@ -422,12 +422,41 @@ fn compile_inner(
     manifest: Option<&BuiltinManifest>,
 ) -> Result<Bytecode, Vec<CompileError>> {
     let mut function_names = BTreeMap::new();
+    let mut function_signatures = BTreeMap::new();
+    let mut type_aliases = BTreeMap::new();
     let mut global_types = manifest
         .map(|manifest| manifest.globals().clone())
         .unwrap_or_default();
     let mut declaration_errors = Vec::new();
     for statement in &program.statements {
-        if let Stmt::Function { name, span, .. } = statement {
+        if let Stmt::TypeAlias { name, ty, span } = statement {
+            if type_aliases.contains_key(name) {
+                declaration_errors.push(CompileError {
+                    message: format!("type `{name}` is defined more than once"),
+                    span: span.clone(),
+                });
+                continue;
+            }
+            match script_type_from_ast(ty, &type_aliases, manifest) {
+                Some(ty) => {
+                    type_aliases.insert(name.clone(), ty);
+                }
+                None => declaration_errors.push(CompileError {
+                    message: format!("type `{name}` refers to an unknown type"),
+                    span: ty.span,
+                }),
+            }
+        }
+    }
+    for statement in &program.statements {
+        if let Stmt::Function {
+            name,
+            parameters,
+            return_type,
+            body,
+            span,
+        } = statement
+        {
             if function_names.contains_key(name) {
                 declaration_errors.push(CompileError {
                     message: format!("function `{name}` is defined more than once"),
@@ -435,6 +464,53 @@ fn compile_inner(
                 });
             } else {
                 function_names.insert(name.clone(), FunctionId(function_names.len() as u32));
+                let parameter_types = parameters
+                    .iter()
+                    .map(|parameter| {
+                        parameter
+                            .ty
+                            .as_ref()
+                            .and_then(|ty| script_type_from_ast(ty, &type_aliases, manifest))
+                            .or_else(|| parameter.ty.is_none().then_some(ScriptType::Any))
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let result = return_type
+                    .as_ref()
+                    .and_then(|ty| script_type_from_ast(ty, &type_aliases, manifest));
+                if let Some(parameter_types) = parameter_types
+                    && (return_type.is_none() || result.is_some())
+                {
+                    let parameter_locals = parameters
+                        .iter()
+                        .zip(&parameter_types)
+                        .map(|(parameter, ty)| (parameter.name.clone(), ty.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    let inferred_result = body
+                        .statements
+                        .last()
+                        .and_then(|statement| match statement {
+                            Stmt::Expr(expression) => Some(expression),
+                            _ => None,
+                        })
+                        .map(|expression| {
+                            infer_expression_type(manifest, &parameter_locals, expression)
+                        })
+                        .unwrap_or(ScriptType::Null);
+                    let result = result.unwrap_or(inferred_result);
+                    function_signatures.insert(
+                        name.clone(),
+                        FunctionSignature {
+                            receiver: None,
+                            parameters: parameter_types,
+                            result,
+                        },
+                    );
+                } else {
+                    declaration_errors.push(CompileError {
+                        message: format!("function `{name}` uses an unknown type"),
+                        span: span.clone(),
+                    });
+                }
             }
         }
         if let Stmt::Global {
@@ -457,7 +533,7 @@ fn compile_inner(
             } else {
                 let ty = type_annotation
                     .as_ref()
-                    .map(script_type_from_ast)
+                    .and_then(|ty| script_type_from_ast(ty, &type_aliases, manifest))
                     .or_else(|| {
                         value
                             .as_ref()
@@ -475,8 +551,10 @@ fn compile_inner(
         errors: declaration_errors,
         manifest,
         function_names,
+        function_signatures,
         local_types: global_types.clone(),
         global_types,
+        type_aliases,
     };
     compiler.compile_functions(program);
     for statement in &program.statements {
@@ -506,11 +584,23 @@ struct Compiler<'a> {
     errors: Vec<CompileError>,
     manifest: Option<&'a BuiltinManifest>,
     function_names: BTreeMap<String, FunctionId>,
+    function_signatures: BTreeMap<String, FunctionSignature>,
     local_types: BTreeMap<String, ScriptType>,
     global_types: BTreeMap<String, ScriptType>,
+    type_aliases: BTreeMap<String, ScriptType>,
 }
 
 impl Compiler<'_> {
+    fn infer_type(&self, expression: &Expr) -> ScriptType {
+        if let ExprKind::Call { callee, .. } = &expression.kind
+            && let ExprKind::Ident(name) = &callee.kind
+            && let Some(signature) = self.function_signatures.get(name)
+        {
+            return signature.result.clone();
+        }
+        infer_expression_type(self.manifest, &self.local_types, expression)
+    }
+
     fn compile_functions(&mut self, program: &Program) {
         let declarations = program
             .statements
@@ -528,15 +618,35 @@ impl Compiler<'_> {
         for (name, parameters, body) in declarations {
             let parent = std::mem::take(&mut self.instructions);
             let parent_types = std::mem::take(&mut self.local_types);
+            self.local_types = self.global_types.clone();
+            let signature =
+                self.function_signatures
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or(FunctionSignature {
+                        receiver: None,
+                        parameters: vec![ScriptType::Any; parameters.len()],
+                        result: ScriptType::Any,
+                    });
             self.local_types.extend(
                 parameters
                     .iter()
-                    .cloned()
-                    .map(|parameter| (parameter, ScriptType::Any)),
+                    .zip(&signature.parameters)
+                    .map(|(parameter, ty)| (parameter.name.clone(), ty.clone())),
             );
             for (index, statement) in body.statements.iter().enumerate() {
                 let is_last = index + 1 == body.statements.len();
                 if is_last && let Stmt::Expr(expression) = statement {
+                    let actual = self.infer_type(expression);
+                    if signature.result != ScriptType::Any && !signature.result.accepts(&actual) {
+                        self.errors.push(CompileError {
+                            message: format!(
+                                "function `{name}` returns {:?}, got {actual:?}",
+                                signature.result
+                            ),
+                            span: expression.span,
+                        });
+                    }
                     if let ExprKind::String(value) = &expression.kind {
                         self.instructions
                             .push(Instruction::Statement(StatementValue::String(
@@ -555,6 +665,17 @@ impl Compiler<'_> {
                 }
             }
             if !matches!(self.instructions.last(), Some(Instruction::Return)) {
+                if signature.result != ScriptType::Any
+                    && !signature.result.accepts(&ScriptType::Null)
+                {
+                    self.errors.push(CompileError {
+                        message: format!(
+                            "function `{name}` may return Null, expected {:?}",
+                            signature.result
+                        ),
+                        span: body.span,
+                    });
+                }
                 self.instructions.push(Instruction::Constant(Value::Null));
                 self.instructions.push(Instruction::Return);
             }
@@ -562,7 +683,10 @@ impl Compiler<'_> {
             self.local_types = parent_types;
             self.functions.push(FunctionTemplate {
                 name,
-                parameters,
+                parameters: parameters
+                    .into_iter()
+                    .map(|parameter| parameter.name)
+                    .collect(),
                 instructions,
             });
         }
@@ -570,6 +694,7 @@ impl Compiler<'_> {
 
     fn statement(&mut self, statement: &Stmt) {
         match statement {
+            Stmt::TypeAlias { .. } => {}
             Stmt::Function { span, .. } => self.errors.push(CompileError {
                 message: "nested function definitions are not supported".to_string(),
                 span: span.clone(),
@@ -580,8 +705,16 @@ impl Compiler<'_> {
                 value,
                 ..
             } => {
-                let value_type = infer_expression_type(self.manifest, &self.local_types, value);
-                let declared_type = type_annotation.as_ref().map(script_type_from_ast);
+                let value_type = self.infer_type(value);
+                let declared_type = type_annotation
+                    .as_ref()
+                    .and_then(|ty| script_type_from_ast(ty, &self.type_aliases, self.manifest));
+                if type_annotation.is_some() && declared_type.is_none() {
+                    self.errors.push(CompileError {
+                        message: format!("local `{name}` uses an unknown type"),
+                        span: type_annotation.as_ref().expect("checked above").span,
+                    });
+                }
                 if let Some(expected) = &declared_type
                     && !expected.accepts(&value_type)
                 {
@@ -607,7 +740,7 @@ impl Compiler<'_> {
                     .cloned()
                     .unwrap_or(ScriptType::Any);
                 if let Some(value) = value {
-                    let actual = infer_expression_type(self.manifest, &self.local_types, value);
+                    let actual = self.infer_type(value);
                     if !expected.accepts(&actual) {
                         self.errors.push(CompileError {
                             message: format!(
@@ -628,7 +761,7 @@ impl Compiler<'_> {
                 let _ = span;
             }
             Stmt::Assign { target, value, .. } => {
-                let actual = infer_expression_type(self.manifest, &self.local_types, value);
+                let actual = self.infer_type(value);
                 if let Some((root, path)) = assignment_member_path(target) {
                     let Some(root_type) = self.global_types.get(&root) else {
                         self.errors.push(CompileError {
@@ -856,12 +989,40 @@ impl Compiler<'_> {
                 if let ExprKind::Ident(name) = &callee.kind
                     && let Some(function) = self.function_names.get(name).copied()
                 {
-                    for argument in arguments {
+                    let signature = self.function_signatures.get(name).cloned();
+                    if let Some(signature) = &signature
+                        && signature.parameters.len() != arguments.len()
+                    {
+                        self.errors.push(CompileError {
+                            message: format!(
+                                "function `{name}` expects {} arguments, got {}",
+                                signature.parameters.len(),
+                                arguments.len()
+                            ),
+                            span: expression.span,
+                        });
+                    }
+                    for (index, argument) in arguments.iter().enumerate() {
                         if argument.label.is_some() {
                             self.errors.push(CompileError {
                                 message: "user functions do not accept named arguments".to_string(),
                                 span: argument.span.clone(),
                             });
+                        }
+                        if let Some(expected) = signature
+                            .as_ref()
+                            .and_then(|signature| signature.parameters.get(index))
+                        {
+                            let actual = self.infer_type(&argument.value);
+                            if !expected.accepts(&actual) {
+                                self.errors.push(CompileError {
+                                    message: format!(
+                                        "function `{name}` argument {} expects {expected:?}, got {actual:?}",
+                                        index + 1
+                                    ),
+                                    span: argument.span,
+                                });
+                            }
                         }
                         self.expression(&argument.value);
                     }
@@ -1077,7 +1238,7 @@ impl Compiler<'_> {
         }
         for (index, (expected, argument)) in signature.parameters.iter().zip(arguments).enumerate()
         {
-            let actual = infer_expression_type(self.manifest, &self.local_types, &argument.value);
+            let actual = self.infer_type(&argument.value);
             if !expected.accepts(&actual) {
                 self.errors.push(CompileError {
                     message: format!(
@@ -1105,7 +1266,7 @@ impl Compiler<'_> {
             return;
         };
         if let Some(expected) = &signature.receiver {
-            let actual = infer_expression_type(self.manifest, &self.local_types, receiver);
+            let actual = self.infer_type(receiver);
             if !expected.accepts(&actual) {
                 self.errors.push(CompileError {
                     message: format!("receiver expects {expected:?}, got {actual:?}"),
@@ -1126,7 +1287,7 @@ impl Compiler<'_> {
         }
         for (index, (expected, argument)) in signature.parameters.iter().zip(arguments).enumerate()
         {
-            let actual = infer_expression_type(self.manifest, &self.local_types, &argument.value);
+            let actual = self.infer_type(&argument.value);
             if !expected.accepts(&actual) {
                 self.errors.push(CompileError {
                     message: format!(
@@ -1267,29 +1428,42 @@ fn infer_expression_type(
     }
 }
 
-fn script_type_from_ast(ty: &crate::TypeExpr) -> ScriptType {
+fn script_type_from_ast(
+    ty: &crate::TypeExpr,
+    aliases: &BTreeMap<String, ScriptType>,
+    manifest: Option<&BuiltinManifest>,
+) -> Option<ScriptType> {
     match &ty.kind {
         crate::TypeExprKind::Named(name) => match name.as_str() {
-            "Any" => ScriptType::Any,
-            "Null" => ScriptType::Null,
-            "Bool" => ScriptType::Bool,
-            "Int" => ScriptType::Int,
-            "Float" | "Number" => ScriptType::Number,
-            "String" => ScriptType::String,
-            _ => ScriptType::Any,
+            "Any" => Some(ScriptType::Any),
+            "Null" => Some(ScriptType::Null),
+            "Bool" => Some(ScriptType::Bool),
+            "Int" => Some(ScriptType::Int),
+            "Float" | "Number" => Some(ScriptType::Number),
+            "String" => Some(ScriptType::String),
+            _ => aliases.get(name).cloned().or_else(|| {
+                manifest
+                    .and_then(|manifest| manifest.symbols().find(name))
+                    .map(ScriptType::Named)
+            }),
         },
-        crate::TypeExprKind::Nullable(inner) => {
-            ScriptType::Nullable(Box::new(script_type_from_ast(inner)))
-        }
-        crate::TypeExprKind::List(element) => {
-            ScriptType::List(Box::new(script_type_from_ast(element)))
-        }
-        crate::TypeExprKind::Record(fields) => ScriptType::Record(
+        crate::TypeExprKind::Nullable(inner) => Some(ScriptType::Nullable(Box::new(
+            script_type_from_ast(inner, aliases, manifest)?,
+        ))),
+        crate::TypeExprKind::List(element) => Some(ScriptType::List(Box::new(
+            script_type_from_ast(element, aliases, manifest)?,
+        ))),
+        crate::TypeExprKind::Record(fields) => Some(ScriptType::Record(
             fields
                 .iter()
-                .map(|field| (field.name.clone(), script_type_from_ast(&field.ty)))
-                .collect(),
-        ),
+                .map(|field| {
+                    Some((
+                        field.name.clone(),
+                        script_type_from_ast(&field.ty, aliases, manifest)?,
+                    ))
+                })
+                .collect::<Option<BTreeMap<_, _>>>()?,
+        )),
     }
 }
 
@@ -1431,6 +1605,10 @@ impl Vm {
 
     pub fn globals(&self) -> &BTreeMap<String, Value> {
         &self.globals
+    }
+
+    pub fn status(&self) -> &VmStatus {
+        &self.status
     }
 
     pub fn eval_template(
@@ -2767,6 +2945,35 @@ mod tests {
         let errors = compile_with_manifest(&invalid, 73, &manifest)
             .expect_err("unknown settings fields must be compile errors");
         assert!(errors[0].message.contains("unknown or non-record field"));
+    }
+
+    #[test]
+    fn type_aliases_and_user_function_signatures_are_checked() {
+        let valid = parse_program(
+            r#"
+                type Player = .{ name: String, health: Int }
+                fn health(player: Player) -> Int { player.health }
+                global player: Player = .{ name: "Alice", health: 123 }
+                health(player)
+            "#,
+        )
+        .expect("typed program must parse");
+        compile(&valid, 74).expect("matching alias and function types must compile");
+
+        let invalid = parse_program(
+            r#"
+                type Player = .{ name: String, health: Int }
+                fn health(player: Player) -> Int { player.health }
+                health("Alice")
+            "#,
+        )
+        .expect("invalid typed call must still parse");
+        let errors = compile(&invalid, 75).expect_err("typed arguments must be enforced");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("argument 1"))
+        );
     }
 
     #[test]

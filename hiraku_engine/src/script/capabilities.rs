@@ -4,19 +4,20 @@ use std::collections::BTreeMap;
 
 use hiraku_script::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
 use hiraku_script::vm::{
-    BuiltinCall, BuiltinManifest, Bytecode, FunctionSignature, ScriptType, TaskEvent, TaskMode,
-    TaskScheduler, TaskStatus, Value, Vm, VmEvent, compile_with_manifest,
+    BuiltinCall, BuiltinManifest, Bytecode, FunctionSignature, ScriptType, Value,
+    compile_with_manifest,
 };
-use hiraku_script::{Expr, Program, StatementValue, Stmt, parse_program};
+use hiraku_script::{StatementValue, parse_program};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::script::CameraEffectScope;
+use crate::storage::UserSettings;
 
 /// Engine-facing effects produced by HKS native functions.
 ///
-/// This is deliberately independent of the transitional story IR. Engine code
-/// dispatches these effects directly to ECS-facing script commands.
-#[derive(Clone, Debug, PartialEq)]
+/// Engine code dispatches these effects directly to ECS-facing systems.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
     Log(String),
     ClearDialogue,
@@ -71,10 +72,6 @@ pub enum StoryWait {
 }
 
 const ACTOR_HANDLE_TYPE: u32 = 1;
-pub fn manifest() -> BuiltinManifest {
-    registry().manifest()
-}
-
 /// Manifest used by the direct whole-story HKS runtime. Async capabilities are
 /// registered here so the generic compiler can resolve them without engine AST lowering.
 pub fn story_manifest() -> BuiltinManifest {
@@ -98,6 +95,49 @@ pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, Stri
                 .join("; ")
         },
     )
+}
+
+pub fn engine_globals(settings: &UserSettings) -> BTreeMap<String, Value> {
+    BTreeMap::from([(
+        "settings".to_string(),
+        Value::Map(BTreeMap::from([
+            (
+                "bgmVolume".to_string(),
+                Value::Number(f64::from(settings.bgm_volume)),
+            ),
+            (
+                "voiceVolume".to_string(),
+                Value::Number(f64::from(settings.voice_volume)),
+            ),
+            (
+                "sfxVolume".to_string(),
+                Value::Number(f64::from(settings.sfx_volume)),
+            ),
+        ])),
+    )])
+}
+
+pub fn apply_engine_globals(
+    globals: &BTreeMap<String, Value>,
+    settings: &mut UserSettings,
+) -> Result<(), String> {
+    let Some(Value::Map(fields)) = globals.get("settings") else {
+        return Err("engine global `settings` is missing or not a record".to_string());
+    };
+    settings.bgm_volume = setting_number(fields, "bgmVolume")?;
+    settings.voice_volume = setting_number(fields, "voiceVolume")?;
+    settings.sfx_volume = setting_number(fields, "sfxVolume")?;
+    Ok(())
+}
+
+fn setting_number(fields: &BTreeMap<String, Value>, name: &str) -> Result<f32, String> {
+    let Some(Value::Number(value)) = fields.get(name) else {
+        return Err(format!("settings.{name} is missing or not a Number"));
+    };
+    if !value.is_finite() || !(0.0..=1.0).contains(value) {
+        return Err(format!("settings.{name} must be between 0 and 1"));
+    }
+    Ok(*value as f32)
 }
 
 fn source_hash(path: &str, source: &str) -> u64 {
@@ -277,30 +317,43 @@ impl StoryNativeHost {
     pub fn take_wait(&mut self) -> Option<StoryWait> {
         self.context.wait.take()
     }
+
+    pub fn snapshot(&self) -> StoryNativeHostSnapshot {
+        StoryNativeHostSnapshot {
+            next_handle: self.context.next_handle,
+            actors: self.context.actors.clone(),
+            handles_by_name: self.context.handles_by_name.clone(),
+            last_speaker: self.context.last_speaker.clone(),
+            dialogue_buffer: self.context.dialogue_buffer.clone(),
+        }
+    }
+
+    pub fn restore(snapshot: StoryNativeHostSnapshot) -> Self {
+        Self {
+            context: CharacterContext {
+                next_handle: snapshot.next_handle,
+                actors: snapshot.actors,
+                handles_by_name: snapshot.handles_by_name,
+                commands: Vec::new(),
+                wait: None,
+                last_speaker: snapshot.last_speaker,
+                dialogue_buffer: snapshot.dialogue_buffer,
+            },
+            registry: story_registry(),
+        }
+    }
 }
 
-pub fn compile_expression(
-    expression: &Expr,
-    functions: &[Stmt],
-    source_hash: u64,
-) -> Option<Bytecode> {
-    let mut statements = functions.to_vec();
-    statements.push(Stmt::Expr(expression.clone()));
-    let program = Program { statements };
-    compile_with_manifest(&program, source_hash, &manifest()).ok()
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoryNativeHostSnapshot {
+    next_handle: u64,
+    actors: BTreeMap<u64, PendingActor>,
+    handles_by_name: BTreeMap<String, u64>,
+    last_speaker: Option<String>,
+    dialogue_buffer: Option<String>,
 }
 
-pub fn compile_statement(
-    statement: &Stmt,
-    functions: &[Stmt],
-    source_hash: u64,
-) -> Option<Bytecode> {
-    let mut statements = functions.to_vec();
-    statements.push(statement.clone());
-    compile_with_manifest(&Program { statements }, source_hash, &manifest()).ok()
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PendingActor {
     name: String,
     expressions: Vec<String>,
@@ -813,151 +866,14 @@ fn actor_handle(value: &Value) -> Result<u64, CharacterCapabilityError> {
     }
 }
 
-pub struct CapabilityOutput {
-    pub commands: Vec<StoryEffect>,
-    pub wait: Option<StoryWait>,
-    pub tasks: Vec<CapabilityTask>,
-    pub locals: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct CapabilityTask {
-    pub mode: TaskMode,
-    pub commands: Vec<StoryEffect>,
-}
-
-pub fn execute(bytecode: Bytecode) -> Result<CapabilityOutput, CharacterCapabilityError> {
-    execute_with_host(bytecode, &mut StoryNativeHost::new(), BTreeMap::new())
-}
-
-pub fn execute_with_host(
-    bytecode: Bytecode,
-    host: &mut StoryNativeHost,
-    locals: BTreeMap<String, Value>,
-) -> Result<CapabilityOutput, CharacterCapabilityError> {
-    if bytecode.builtin_manifest_hash != manifest().hash() {
-        return Err(CharacterCapabilityError::ManifestMismatch);
-    }
-    let scheduler_bytecode = bytecode.clone();
-    let mut vm =
-        Vm::new(bytecode).map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
-    vm.set_locals(locals);
-    let registry = registry();
-    let mut tasks = Vec::new();
-    loop {
-        match vm
-            .step()
-            .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?
-        {
-            Some(VmEvent::Call(call)) => {
-                if host.context.wait.is_some() {
-                    return Err(CharacterCapabilityError::Native(
-                        "a suspending capability must be the final native call in a statement"
-                            .to_string(),
-                    ));
-                }
-                let value = registry
-                    .call(&mut host.context, &call)
-                    .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
-                vm.resume_builtin(value)
-                    .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
-            }
-            Some(VmEvent::Statement(value)) => host.context.handle_statement(&value)?,
-            Some(VmEvent::Completed(_)) => {
-                return Ok(CapabilityOutput {
-                    commands: host.drain_effects(),
-                    wait: host.take_wait(),
-                    tasks,
-                    locals: vm.locals().clone(),
-                });
-            }
-            Some(VmEvent::SpawnTask(request)) => {
-                tasks.push(execute_task(
-                    scheduler_bytecode.clone(),
-                    request.task,
-                    request.template.mode,
-                    &registry,
-                )?);
-                vm.resume(Value::Task(request.task as u64))
-                    .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
-            }
-            None => {
-                return Err(CharacterCapabilityError::Vm(
-                    "VM stopped before completion".to_string(),
-                ));
-            }
-        }
-    }
-}
-
-fn execute_task(
-    bytecode: Bytecode,
-    template: u32,
-    mode: TaskMode,
-    registry: &NativeRegistry<CharacterContext>,
-) -> Result<CapabilityTask, CharacterCapabilityError> {
-    let mut scheduler = TaskScheduler::new(bytecode)
-        .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
-    let root = scheduler
-        .spawn(template)
-        .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
-    let mut contexts = BTreeMap::<u64, CharacterContext>::new();
-
-    while !matches!(scheduler.status(root), Some(TaskStatus::Completed(_))) {
-        match scheduler
-            .step()
-            .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?
-        {
-            Some(TaskEvent::Call { task, call }) => {
-                let context = contexts.entry(task).or_default();
-                if context.wait.is_some() {
-                    return Err(CharacterCapabilityError::SuspendingTaskCapability);
-                }
-                let value = registry
-                    .call(context, &call)
-                    .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
-                if context.wait.is_some() {
-                    return Err(CharacterCapabilityError::SuspendingTaskCapability);
-                }
-                scheduler
-                    .resume(task, value)
-                    .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
-            }
-            Some(TaskEvent::Statement { task, value }) => {
-                contexts.entry(task).or_default().handle_statement(&value)?;
-            }
-            Some(TaskEvent::Completed { .. }) => {}
-            None => {
-                return Err(CharacterCapabilityError::Vm(
-                    "task scheduler stopped before the root task completed".to_string(),
-                ));
-            }
-        }
-    }
-
-    Ok(CapabilityTask {
-        mode,
-        commands: contexts
-            .into_values()
-            .flat_map(|context| context.commands)
-            .collect(),
-    })
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum CharacterCapabilityError {
-    #[error("character builtin manifest does not match bytecode")]
-    ManifestMismatch,
     #[error("invalid native arguments: {0}")]
     InvalidArguments(&'static str),
     #[error("invalid actor handle")]
     InvalidActorHandle,
     #[error("unknown actor handle {0}")]
     UnknownActor(u64),
-    #[error("capabilities which suspend for host input are not yet supported inside seq/par")]
-    SuspendingTaskCapability,
-    #[error("HKS VM error: {0}")]
-    Vm(String),
     #[error("HKS native error: {0}")]
     Native(String),
 }
@@ -966,45 +882,29 @@ pub enum CharacterCapabilityError {
 mod tests {
     use super::*;
     use crate::script::hks_runtime::{HksRuntime, HksRuntimeEvent};
-    use hiraku_script::parse_program;
 
     #[test]
-    fn fluent_calls_flush_once_at_the_statement_boundary() {
-        let program =
-            parse_program(r#"char("Alice").e("happy_eyes").e("happy_face").at(.right).scale(0.5)"#)
-                .unwrap();
-        let Stmt::Expr(expression) = &program.statements[0] else {
-            panic!()
+    fn engine_settings_roundtrip_through_the_fixed_global_record() {
+        let original = UserSettings {
+            bgm_volume: 0.8,
+            voice_volume: 0.7,
+            sfx_volume: 0.6,
         };
-        let output = execute(compile_expression(expression, &[], 42).unwrap()).unwrap();
-        assert_eq!(output.commands.len(), 1);
-        assert!(
-            matches!(&output.commands[0], StoryEffect::ShowCharacter { actor_id, expressions, position, scale, .. }
-            if actor_id == "Alice" && expressions == &["happy_eyes", "happy_face"]
-                && position == &[600.0, -200.0] && (*scale - 0.5).abs() < f32::EPSILON)
-        );
-    }
-
-    #[test]
-    fn typed_positions_support_relative_constructors_and_getters() {
-        for (source, expected) in [
-            (r#"char("Alice").at(.rel(50, 50))"#, [0.0, 0.0]),
-            (r#"char("Alice").at(.left)"#, [-600.0, -200.0]),
-        ] {
-            let program = parse_program(source).expect("typed position syntax must parse");
-            let Stmt::Expr(expression) = &program.statements[0] else {
-                panic!("expected character expression")
-            };
-            let output = execute(
-                compile_expression(expression, &[], 48)
-                    .expect("typed position must pass signature checking"),
-            )
-            .expect("typed position calls must execute");
-            assert!(matches!(
-                &output.commands[0],
-                StoryEffect::ShowCharacter { position, .. } if position == &expected
-            ));
+        let mut globals = engine_globals(&original);
+        if let Some(Value::Map(settings)) = globals.get_mut("settings") {
+            settings.insert("bgmVolume".to_string(), Value::Number(0.25));
+        } else {
+            panic!("settings must be a record")
         }
+        let mut restored = UserSettings::default();
+        apply_engine_globals(&globals, &mut restored).expect("valid settings must apply");
+        assert!((restored.bgm_volume - 0.25).abs() < f32::EPSILON);
+        assert!((restored.voice_volume - 0.7).abs() < f32::EPSILON);
+
+        if let Some(Value::Map(settings)) = globals.get_mut("settings") {
+            settings.insert("bgmVolume".to_string(), Value::Number(2.0));
+        }
+        assert!(apply_engine_globals(&globals, &mut restored).is_err());
     }
 
     #[test]
@@ -1016,101 +916,6 @@ not_actor.at(.left)"#,
         )
         .expect_err("a string must not be accepted as an Actor receiver");
         assert!(error.contains("receiver expects Named"));
-    }
-
-    #[test]
-    fn voice_is_a_non_suspending_native_command_by_default() {
-        let program = parse_program(r#"voice("voice/scene01/hash1")"#).unwrap();
-        let Stmt::Expr(expression) = &program.statements[0] else {
-            panic!("expected a voice expression")
-        };
-        let output = execute(compile_expression(expression, &[], 43).unwrap()).unwrap();
-        assert_eq!(output.wait, None);
-        assert_eq!(
-            output.commands,
-            vec![StoryEffect::PlayVoice {
-                path: "voice/scene01/hash1".to_string(),
-                volume: 1.0,
-            }]
-        );
-    }
-
-    #[test]
-    fn parallel_voice_block_is_executed_through_the_task_scheduler() {
-        let program = parse_program(
-            r#"par {
-                voice("voice/scene01/first")
-                voice("voice/scene01/second")
-            }"#,
-        )
-        .expect("parallel voice block must parse");
-        let Stmt::Expr(expression) = &program.statements[0] else {
-            panic!("expected a parallel task expression")
-        };
-        let output = execute(
-            compile_expression(expression, &[], 45)
-                .expect("parallel voice block must compile to native bytecode"),
-        )
-        .expect("parallel voice block must execute through the task scheduler");
-
-        assert!(output.commands.is_empty());
-        assert_eq!(output.tasks.len(), 1);
-        assert_eq!(output.tasks[0].mode, TaskMode::Parallel);
-        assert_eq!(
-            output.tasks[0].commands,
-            vec![
-                StoryEffect::PlayVoice {
-                    path: "voice/scene01/first".to_string(),
-                    volume: 1.0,
-                },
-                StoryEffect::PlayVoice {
-                    path: "voice/scene01/second".to_string(),
-                    volume: 1.0,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn character_calls_are_valid_sequence_and_parallel_task_commands() {
-        for source in [
-            r#"seq { char("Alice").e("happy").at(.left) }"#,
-            "par {\nchar(\"Alice\").e(\"happy\")\nchar(\"Bob\").at(.right)\n}",
-        ] {
-            let program = parse_program(source).expect("character task must parse");
-            let Stmt::Expr(expression) = &program.statements[0] else {
-                panic!("expected a task expression")
-            };
-            let output = execute(
-                compile_expression(expression, &[], 46)
-                    .expect("character task must compile to bytecode"),
-            )
-            .expect("character task must execute through the scheduler");
-            assert_eq!(output.tasks.len(), 1);
-            assert!(
-                output.tasks[0]
-                    .commands
-                    .iter()
-                    .all(|command| matches!(command, StoryEffect::ShowCharacter { .. }))
-            );
-        }
-    }
-
-    #[test]
-    fn say_emits_dialogue_and_suspends_for_advance() {
-        let program = parse_program(r#"say("Alice", "Hello")"#).unwrap();
-        let Stmt::Expr(expression) = &program.statements[0] else {
-            panic!("expected a say expression")
-        };
-        let output = execute(compile_expression(expression, &[], 44).unwrap()).unwrap();
-        assert_eq!(output.wait, Some(StoryWait::DialogueAdvance));
-        assert_eq!(
-            output.commands,
-            vec![StoryEffect::Say {
-                speaker: "Alice".to_string(),
-                text: "Hello".to_string(),
-            }]
-        );
     }
 
     #[test]

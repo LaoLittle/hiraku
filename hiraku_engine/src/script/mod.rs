@@ -16,26 +16,25 @@ use crate::{
 
 pub(crate) mod capabilities;
 mod hks_runtime;
-mod ir;
-pub(crate) mod legacy_lowering;
+mod runtime;
 pub mod ui_runtime;
 
-pub(crate) use ir::{
-    CameraEffectScope, IrCommand, IrEvent, IrExpression, IrExpressionId, IrInstruction, IrProgram,
-    IrRuntime, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
-};
+pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
+pub(crate) use runtime::{CameraEffectScope, ScriptRuntimeState, tick_script_runtime};
 
-pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
-
-pub(crate) fn compile_story_program(path: &str, source: &str) -> Result<IrProgram, String> {
+pub(crate) fn compile_story_bytecode(
+    path: &str,
+    source: &str,
+) -> Result<hiraku_script::vm::Bytecode, String> {
     if !path.ends_with(".hks") {
         return Err(format!(
             "executable scripts must use the `.hks` extension: `{path}`"
         ));
     }
-    crate::script::legacy_lowering::compile_story_to_ir(path, source)
-        .map_err(|error| error.to_string())
+    capabilities::compile_story_bytecode(path, source)
 }
+
+pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
 
 #[derive(Debug)]
 pub enum ScriptCommand {
@@ -234,93 +233,6 @@ pub enum ScriptCommand {
     Exit,
 }
 
-pub(crate) fn script_command_from_ir(
-    command: IrCommand,
-    textures: Option<&TextureCatalog>,
-) -> Result<ScriptCommand, String> {
-    Ok(match command {
-        IrCommand::Log(message) => ScriptCommand::Log(message),
-        IrCommand::ClearDialogue => ScriptCommand::ClearDialogue,
-        IrCommand::Say { speaker, text } => ScriptCommand::Say {
-            speaker,
-            text,
-            animation_id: None,
-        },
-        IrCommand::StopBgm => ScriptCommand::StopBgm,
-        IrCommand::PlayBgm {
-            path,
-            volume,
-            fade_in_ms,
-        } => ScriptCommand::PlayBgm {
-            path,
-            prelude: None,
-            volume,
-            fade_in: fade_in_ms.map(Duration::from_millis),
-            animation_id: None,
-        },
-        IrCommand::PlayVoice { path, volume } => ScriptCommand::PlayVoice {
-            path,
-            volume,
-            mode: VoicePlaybackMode::Exclusive,
-            animation_id: None,
-        },
-        IrCommand::SetCamera {
-            blur,
-            zoom,
-            scope,
-            duration_ms,
-            ease,
-        } => ScriptCommand::SetCamera {
-            blur_intensity: blur,
-            zoom,
-            scope,
-            center: None,
-            duration: Duration::from_millis(duration_ms),
-            ease: parse_camera_ease(&ease)?,
-            animation_id: None,
-        },
-        IrCommand::AdjustSetting { name, delta } => {
-            ScriptCommand::AdjustUserSetting { name, delta }
-        }
-        IrCommand::Exit => ScriptCommand::Exit,
-        IrCommand::Choose { .. } | IrCommand::OpenUi { .. } => {
-            return Err("interactive UI commands are handled by the IR runtime".to_string());
-        }
-        IrCommand::LoadScript { .. } => {
-            return Err("loadScript is handled by the IR runtime".to_string());
-        }
-        IrCommand::ReturnToTitle => ScriptCommand::ReturnToTitle,
-        IrCommand::SetBackground { texture } => {
-            let definition = textures
-                .and_then(|catalog| catalog.resolve(&texture))
-                .ok_or_else(|| format!("texture `{texture}` is not defined"))?;
-            ScriptCommand::SetBackground {
-                path: definition.path.clone(),
-                fade: None,
-                animation_id: None,
-            }
-        }
-        IrCommand::ShowCharacter {
-            actor_id,
-            character_name,
-            expressions,
-            position,
-            scale,
-        } => ScriptCommand::ShowCharacter {
-            actor_id,
-            character_name,
-            expressions,
-            position: Vec2::new(position[0], position[1]),
-            scale,
-            fade: None,
-            animation_id: None,
-        },
-        IrCommand::HksStatement { .. } | IrCommand::WaitHksTask { .. } => {
-            return Err("HKS native statements are handled by the IR runtime".to_string());
-        }
-    })
-}
-
 pub(crate) fn script_command_from_effect(
     effect: capabilities::StoryEffect,
     textures: Option<&TextureCatalog>,
@@ -477,8 +389,7 @@ pub struct ScriptResponseMessage {
 pub struct ScriptBootstrap {
     pub startup_script: String,
     pub values: BTreeMap<String, StoredValue>,
-    pub snapshot: Option<IrVmSnapshot>,
-    pub pending_input_variable: Option<String>,
+    pub snapshot: Option<StoryRuntimeSnapshot>,
     pub pending_ui_screen: Option<String>,
 }
 
@@ -488,7 +399,6 @@ impl ScriptBootstrap {
             startup_script,
             values: BTreeMap::new(),
             snapshot: None,
-            pending_input_variable: None,
             pending_ui_screen: None,
         }
     }
@@ -499,8 +409,7 @@ impl ScriptBootstrap {
         Self {
             startup_script: data.resume_script.clone(),
             values,
-            snapshot: data.ir_snapshot.clone(),
-            pending_input_variable: data.pending_input_variable.clone(),
+            snapshot: data.vm_snapshot.clone(),
             pending_ui_screen: data.pending_ui_screen.clone(),
         }
     }
@@ -508,48 +417,43 @@ impl ScriptBootstrap {
 
 pub fn start_hks_runtime(
     vfs: &VfsResource,
-    runtime: &mut IrRuntime,
+    runtime: &mut ScriptRuntimeState,
     bootstrap: ScriptBootstrap,
+    user_settings: &crate::storage::UserSettings,
 ) -> Result<(), String> {
     let source = vfs
         .0
         .read_text(&bootstrap.startup_script)
         .map_err(|error| error.to_string())?;
-    let program = compile_story_program(&bootstrap.startup_script, &source)?;
-    let vm = if let Some(snapshot) = bootstrap.snapshot {
-        IrVm::restore(program, snapshot).map_err(|error| error.to_string())?
+    let bytecode = compile_story_bytecode(&bootstrap.startup_script, &source)?;
+    let story = if let Some(snapshot) = bootstrap.snapshot {
+        StoryRuntime::restore(bytecode, snapshot).map_err(|error| error.to_string())?
     } else {
-        let mut vm = IrVm::new(program).map_err(|error| error.to_string())?;
+        let mut story = StoryRuntime::new(bytecode).map_err(|error| error.to_string())?;
+        let mut globals = capabilities::engine_globals(user_settings);
         for (name, value) in bootstrap.values {
-            vm.set_stored_value(name, value);
+            globals.insert(name, stored_value_to_hks(value));
         }
-        vm
+        story.set_globals(globals);
+        story
     };
-    let restored_wait = match vm.status() {
-        IrVmStatus::Waiting(wait) => Some(wait.clone()),
-        _ => None,
-    };
-    runtime.vm = Some(vm);
+    let restored_blocked = story.is_blocked();
+    runtime.story = Some(story);
     runtime.current_script = Some(bootstrap.startup_script);
-    runtime.events.clear();
+    runtime.story_events.clear();
     runtime.wait_request = None;
-    runtime.pending_input_variable = bootstrap.pending_input_variable;
     runtime.pending_ui_screen = bootstrap.pending_ui_screen;
-    runtime.pending_request = None;
     runtime.response_inbox.clear();
-    runtime.hks_locals.clear();
-    runtime.hks_host = crate::script::capabilities::StoryNativeHost::new();
-    if let Some(wait) = restored_wait {
-        runtime.events.push_back(IrEvent::Waiting(wait.clone()));
-        if matches!(wait, IrWaitKind::UiIntent | IrWaitKind::ScreenChoice)
-            && let (Some(path), Some(result)) = (
-                runtime.pending_ui_screen.clone(),
-                runtime.pending_input_variable.clone(),
-            )
-        {
+    runtime.task_requests.clear();
+    if restored_blocked {
+        if let Some(path) = runtime.pending_ui_screen.clone() {
             runtime
-                .events
-                .push_back(IrEvent::Command(IrCommand::OpenUi { path, result }));
+                .story_events
+                .push_back(StoryRuntimeEvent::OpenUi { path });
+        } else {
+            runtime.story_events.push_back(StoryRuntimeEvent::Wait(
+                capabilities::StoryWait::DialogueAdvance,
+            ));
         }
     }
     Ok(())
@@ -557,24 +461,79 @@ pub fn start_hks_runtime(
 
 pub fn save_runtime_slot(
     slot: &str,
-    runtime: &IrRuntime,
+    runtime: &ScriptRuntimeState,
     shared_state: &SceneSharedState,
 ) -> Result<(), StorageError> {
     let current_script = runtime.current_script.clone().unwrap_or_default();
     let values = runtime
-        .vm
+        .story
         .as_ref()
-        .map(IrVm::story_values)
+        .map(|story| hks_globals_to_stored(story.globals()))
         .unwrap_or_default();
+    let snapshot = runtime
+        .story
+        .as_ref()
+        .map(StoryRuntime::snapshot)
+        .transpose()
+        .map_err(|error| StorageError::InvalidSave(error.to_string()))?;
     let data = SaveGameData {
-        version: 6,
+        version: 7,
         resume_script: current_script,
         globals: values,
         scene: shared_state.0.clone(),
-        ir_snapshot: runtime.vm.as_ref().map(IrVm::snapshot),
-        pending_input_variable: runtime.pending_input_variable.clone(),
+        vm_snapshot: snapshot,
         pending_ui_screen: runtime.pending_ui_screen.clone(),
         ..Default::default()
     };
     write_save_data_to_root(&save_root_path(), slot, &data)
+}
+
+fn stored_value_to_hks(value: StoredValue) -> hiraku_script::vm::Value {
+    match value {
+        StoredValue::Bool(value) => hiraku_script::vm::Value::Bool(value),
+        StoredValue::Int(value) => hiraku_script::vm::Value::Number(value as f64),
+        StoredValue::Float(value) => hiraku_script::vm::Value::Number(value),
+        StoredValue::String(value) => hiraku_script::vm::Value::String(value),
+        StoredValue::Array(values) => {
+            hiraku_script::vm::Value::List(values.into_iter().map(stored_value_to_hks).collect())
+        }
+        StoredValue::Map(values) => hiraku_script::vm::Value::Map(
+            values
+                .into_iter()
+                .map(|(name, value)| (name, stored_value_to_hks(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn hks_globals_to_stored(
+    globals: &BTreeMap<String, hiraku_script::vm::Value>,
+) -> BTreeMap<String, StoredValue> {
+    globals
+        .iter()
+        .filter_map(|(name, value)| hks_value_to_stored(value).map(|value| (name.clone(), value)))
+        .collect()
+}
+
+fn hks_value_to_stored(value: &hiraku_script::vm::Value) -> Option<StoredValue> {
+    match value {
+        hiraku_script::vm::Value::Bool(value) => Some(StoredValue::Bool(*value)),
+        hiraku_script::vm::Value::Number(value) => Some(StoredValue::Float(*value)),
+        hiraku_script::vm::Value::String(value) | hiraku_script::vm::Value::Symbol(value) => {
+            Some(StoredValue::String(value.clone()))
+        }
+        hiraku_script::vm::Value::List(values) | hiraku_script::vm::Value::Tuple(values) => Some(
+            StoredValue::Array(values.iter().filter_map(hks_value_to_stored).collect()),
+        ),
+        hiraku_script::vm::Value::Map(values) => Some(StoredValue::Map(
+            values
+                .iter()
+                .filter_map(|(name, value)| {
+                    hks_value_to_stored(value).map(|value| (name.clone(), value))
+                })
+                .collect(),
+        )),
+        hiraku_script::vm::Value::Typed { value, .. } => hks_value_to_stored(value),
+        _ => None,
+    }
 }

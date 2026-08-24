@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::script::IrVmSnapshot;
+use crate::script::StoryRuntimeSnapshot;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoredValue {
@@ -126,9 +126,7 @@ pub struct SaveGameData {
     #[serde(default)]
     pub scene: SceneSnapshot,
     #[serde(default)]
-    pub ir_snapshot: Option<IrVmSnapshot>,
-    #[serde(default)]
-    pub pending_input_variable: Option<String>,
+    pub vm_snapshot: Option<StoryRuntimeSnapshot>,
     #[serde(default)]
     pub pending_ui_screen: Option<String>,
 }

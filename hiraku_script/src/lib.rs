@@ -10,8 +10,8 @@ pub mod template;
 pub mod vm;
 
 pub use ast::{
-    Argument, BinaryOp, Block, Expr, ExprKind, MapField, NumberUnit, Program, Stmt, TypeExpr,
-    TypeExprKind, TypeField,
+    Argument, BinaryOp, Block, Expr, ExprKind, FunctionParameter, MapField, NumberUnit, Program,
+    Stmt, TypeExpr, TypeExprKind, TypeField,
 };
 pub use hir::StatementValue;
 pub use hiraku_script_derive::hks_define;

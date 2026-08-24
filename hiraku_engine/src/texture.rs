@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_background_commands_resolve_catalog_names() {
+    fn story_background_effects_resolve_catalog_names() {
         let catalog = TextureCatalog {
             textures: BTreeMap::from([(
                 "bg/016/001".to_string(),
@@ -422,8 +422,8 @@ mod tests {
             )]),
         };
 
-        let command = crate::script::script_command_from_ir(
-            crate::script::IrCommand::SetBackground {
+        let command = crate::script::script_command_from_effect(
+            crate::script::capabilities::StoryEffect::SetBackground {
                 texture: "bg/016/001".to_string(),
             },
             Some(&catalog),

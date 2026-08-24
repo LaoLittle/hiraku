@@ -13,6 +13,8 @@ mod texture;
 mod ui;
 mod vfs;
 
+pub use script::{UiContext, UiIntent};
+
 use std::sync::Arc;
 
 use assets::{
@@ -34,14 +36,17 @@ use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_character_motion_effects,
     animate_custom_effects, animate_dialogue_text_reveal, animate_rule_transitions,
     animate_visual_tweens, apply_animation_cancellations, apply_live_audio_settings,
-    bridge_ir_events, cleanup_stale_screen_ui, handle_choice_buttons, handle_choice_keyboard,
+    bridge_story_events, cleanup_stale_screen_ui, handle_choice_buttons, handle_choice_keyboard,
     handle_runtime_menu_buttons, handle_screen_buttons, handle_screen_image_buttons,
     poll_pending_character_shows, poll_voice_playback, prepare_bgm_preludes,
     process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
     tick_animation_waits, tick_pending_waits, tick_script_batches,
     update_offscreen_ui_interactions,
 };
-use script::{IrRuntime, IrVm, ScriptResponseMessage, compile_story_program, tick_ir_runtime};
+use script::{
+    ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
+    tick_script_runtime,
+};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
@@ -134,7 +139,7 @@ impl Plugin for HirakuPlugin {
             .add_audio_source::<audio::PreludeLoopAudio>()
             .init_resource::<HdpVolumeLoads>()
             .init_resource::<texture::TextureAtlasCatalog>()
-            .insert_non_send(IrRuntime::default())
+            .init_resource::<ScriptRuntimeState>()
             .add_message::<ScriptResponseMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<BytesAssetLoader>()
@@ -155,17 +160,17 @@ impl Plugin for HirakuPlugin {
                     .after(build_texture_atlases)
                     .run_if(texture_atlases_ready),
             )
-            .add_systems(Update, tick_ir_runtime.in_set(HirakuRuntimeSystems))
+            .add_systems(Update, tick_script_runtime.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
-                bridge_ir_events
-                    .after(tick_ir_runtime)
+                bridge_story_events
+                    .after(tick_script_runtime)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
                 process_script_commands
-                    .after(bridge_ir_events)
+                    .after(bridge_story_events)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
@@ -301,7 +306,8 @@ fn runtime_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool {
 
 fn boot_runtime(
     vfs: Res<VfsResource>,
-    mut ir_runtime: NonSendMut<IrRuntime>,
+    user_settings: Res<storage::UserSettings>,
+    mut script_runtime: ResMut<ScriptRuntimeState>,
     mut booted: Local<bool>,
 ) {
     if *booted {
@@ -314,13 +320,16 @@ fn boot_runtime(
                 .0
                 .read_text(&startup_script)
                 .map_err(|error| error.to_string())
-                .and_then(|source| compile_story_program(&startup_script, &source))
-                .and_then(|program| IrVm::new(program).map_err(|error| error.to_string()));
+                .and_then(|source| compile_story_bytecode(&startup_script, &source))
+                .and_then(|bytecode| {
+                    StoryRuntime::new(bytecode).map_err(|error| error.to_string())
+                });
             match result {
-                Ok(vm) => {
-                    info!("starting startup script in HKS IR runtime");
-                    ir_runtime.vm = Some(vm);
-                    ir_runtime.current_script = Some(startup_script);
+                Ok(mut story) => {
+                    info!("starting startup script in direct HKS runtime");
+                    story.set_globals(script::capabilities::engine_globals(&user_settings));
+                    script_runtime.story = Some(story);
+                    script_runtime.current_script = Some(startup_script);
                 }
                 Err(error) => error!("failed to start HKS script `{startup_script}`: {error}"),
             }

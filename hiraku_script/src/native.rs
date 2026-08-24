@@ -121,6 +121,22 @@ impl<C> NativeRegistry<C> {
         Ok(id)
     }
 
+    pub fn register_selector_fn<F, Args>(
+        &mut self,
+        selector: impl Into<String>,
+        method: impl Into<String>,
+        function: F,
+    ) -> Result<BuiltinId, RegistrationError>
+    where
+        F: IntoNativeFunction<C, Args>,
+    {
+        let selector = selector.into();
+        let method = method.into();
+        let id = stable_builtin_id(&format!("{selector}.{method}"));
+        self.register_selector_fn_with_id(id, selector, method, function)?;
+        Ok(id)
+    }
+
     pub fn register_operator_raw_fn<F>(
         &mut self,
         operator: impl Into<String>,
@@ -132,6 +148,20 @@ impl<C> NativeRegistry<C> {
         let operator = operator.into();
         let id = stable_builtin_id(&format!("operator {operator}"));
         self.register_operator_raw_fn_with_id(id, operator, function)?;
+        Ok(id)
+    }
+
+    pub fn register_operator_fn<F, Args>(
+        &mut self,
+        operator: impl Into<String>,
+        function: F,
+    ) -> Result<BuiltinId, RegistrationError>
+    where
+        F: IntoNativeFunction<C, Args>,
+    {
+        let operator = operator.into();
+        let id = stable_builtin_id(&format!("operator {operator}"));
+        self.register_operator_fn_with_id(id, operator, function)?;
         Ok(id)
     }
 
@@ -806,9 +836,8 @@ mod tests {
     #[test]
     fn selector_methods_preserve_a_typed_receiver_in_bytecode_calls() {
         let mut registry = NativeRegistry::<Context>::new();
-        let id = BuiltinId(77);
         registry
-            .register_selector_raw_fn_with_id(id, "camera", "zoom", |_context, call| {
+            .register_selector_raw_fn("camera", "zoom", |_context, call| {
                 assert_eq!(call.receiver, Some(Value::Selector("camera".to_string())));
                 Ok(Value::Null)
             })
@@ -839,7 +868,7 @@ mod tests {
     fn selector_methods_can_register_typed_rust_functions() {
         let mut registry = NativeRegistry::<Context>::new();
         registry
-            .register_selector_fn_with_id(BuiltinId(78), "camera", "zoom", selector_zoom)
+            .register_selector_fn("camera", "zoom", selector_zoom)
             .expect("typed selector method registration must succeed");
         let bytecode = compile_with_manifest(
             &parse_program("camera.zoom(1.2)").expect("selector call must parse"),
@@ -876,8 +905,7 @@ mod tests {
     fn operators_are_embedding_registered_native_functions() {
         let mut registry = NativeRegistry::<Context>::new();
         registry
-            .register_operator_fn_with_id(
-                BuiltinId(90),
+            .register_operator_fn(
                 ":",
                 |context: &mut Context, speaker: Value, text: String| {
                     assert_eq!(speaker, Value::Ellipsis);
@@ -908,9 +936,8 @@ mod tests {
     fn registered_types_expose_static_methods_and_getters() {
         let mut registry = NativeRegistry::<Context>::new();
         let position = registry.define_type("Position");
-        registry
-            .register_static_raw_fn_with_id(
-                BuiltinId(100),
+        let rel = registry
+            .register_static_raw_fn(
                 position,
                 "rel",
                 FunctionSignature {
@@ -929,9 +956,8 @@ mod tests {
                 },
             )
             .expect("Position.rel must register");
-        registry
-            .register_static_raw_fn_with_id(
-                BuiltinId(101),
+        let left = registry
+            .register_static_raw_fn(
                 position,
                 "left",
                 FunctionSignature {
@@ -956,18 +982,18 @@ mod tests {
         assert!(bytecode.instructions.iter().any(|instruction| matches!(
             instruction,
             crate::vm::Instruction::CallBuiltin {
-                builtin: BuiltinId(100),
+                builtin,
                 has_receiver: false,
                 ..
-            }
+            } if *builtin == rel
         )));
         assert!(bytecode.instructions.iter().any(|instruction| matches!(
             instruction,
             crate::vm::Instruction::CallBuiltin {
-                builtin: BuiltinId(101),
+                builtin,
                 has_receiver: false,
                 ..
-            }
+            } if *builtin == left
         )));
     }
 
@@ -976,8 +1002,7 @@ mod tests {
         let mut registry = NativeRegistry::<Context>::new();
         let position = registry.define_type("Position");
         registry
-            .register_static_raw_fn_with_id(
-                BuiltinId(102),
+            .register_static_raw_fn(
                 position,
                 "rel",
                 FunctionSignature {
