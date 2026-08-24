@@ -14,71 +14,17 @@ use crate::{
     vfs::VfsResource,
 };
 
+pub(crate) mod capabilities;
 mod hks_runtime;
 mod ir;
+pub(crate) mod legacy_lowering;
 pub mod ui_runtime;
 
-pub use hks_runtime::{HksRuntime, HksRuntimeError, HksRuntimeEvent};
-
-pub use ir::{
-    CameraEffectScope, IrChoiceOption, IrCommand, IrEvent, IrExpression, IrExpressionId,
-    IrInstruction, IrProgram, IrRuntime, IrValidationError, IrVm, IrVmSnapshot, IrVmStatus,
-    IrWaitKind, tick_ir_runtime,
+pub(crate) use ir::{
+    CameraEffectScope, IrCommand, IrEvent, IrExpression, IrExpressionId, IrInstruction, IrProgram,
+    IrRuntime, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind, tick_ir_runtime,
 };
 
-impl From<crate::hks_capabilities::StoryEffect> for IrCommand {
-    fn from(effect: crate::hks_capabilities::StoryEffect) -> Self {
-        use crate::hks_capabilities::StoryEffect;
-
-        match effect {
-            StoryEffect::Log(message) => Self::Log(message),
-            StoryEffect::ClearDialogue => Self::ClearDialogue,
-            StoryEffect::StopBgm => Self::StopBgm,
-            StoryEffect::Exit => Self::Exit,
-            StoryEffect::ReturnToTitle => Self::ReturnToTitle,
-            StoryEffect::SetBackground { texture } => Self::SetBackground { texture },
-            StoryEffect::LoadScript { path } => Self::LoadScript { path },
-            StoryEffect::AdjustSetting { name, delta } => Self::AdjustSetting { name, delta },
-            StoryEffect::PlayBgm {
-                path,
-                volume,
-                fade_in_ms,
-            } => Self::PlayBgm {
-                path,
-                volume,
-                fade_in_ms,
-            },
-            StoryEffect::Say { speaker, text } => Self::Say { speaker, text },
-            StoryEffect::PlayVoice { path, volume } => Self::PlayVoice { path, volume },
-            StoryEffect::SetCamera {
-                blur,
-                zoom,
-                scope,
-                duration_ms,
-                ease,
-            } => Self::SetCamera {
-                blur,
-                zoom,
-                scope,
-                duration_ms,
-                ease,
-            },
-            StoryEffect::ShowCharacter {
-                actor_id,
-                character_name,
-                expressions,
-                position,
-                scale,
-            } => Self::ShowCharacter {
-                actor_id,
-                character_name,
-                expressions,
-                position,
-                scale,
-            },
-        }
-    }
-}
 pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
 
 pub(crate) fn compile_story_program(path: &str, source: &str) -> Result<IrProgram, String> {
@@ -87,16 +33,13 @@ pub(crate) fn compile_story_program(path: &str, source: &str) -> Result<IrProgra
             "executable scripts must use the `.hks` extension: `{path}`"
         ));
     }
-    crate::hks_prelude::compile_story_to_ir(path, source).map_err(|error| error.to_string())
+    crate::script::legacy_lowering::compile_story_to_ir(path, source)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
 pub enum ScriptCommand {
     Log(String),
-    StartIr {
-        path: String,
-        program: IrProgram,
-    },
     SetBackground {
         path: String,
         fade: Option<Duration>,
@@ -124,6 +67,10 @@ pub enum ScriptCommand {
     },
     Say {
         speaker: String,
+        text: String,
+        animation_id: Option<String>,
+    },
+    ContinueDialogue {
         text: String,
         animation_id: Option<String>,
     },
@@ -329,7 +276,7 @@ pub(crate) fn script_command_from_ir(
             scope,
             center: None,
             duration: Duration::from_millis(duration_ms),
-            ease: parse_ir_camera_ease(&ease)?,
+            ease: parse_camera_ease(&ease)?,
             animation_id: None,
         },
         IrCommand::AdjustSetting { name, delta } => {
@@ -374,7 +321,79 @@ pub(crate) fn script_command_from_ir(
     })
 }
 
-fn parse_ir_camera_ease(name: &str) -> Result<CharacterEase, String> {
+pub(crate) fn script_command_from_effect(
+    effect: capabilities::StoryEffect,
+    textures: Option<&TextureCatalog>,
+) -> Result<ScriptCommand, String> {
+    use capabilities::StoryEffect;
+
+    Ok(match effect {
+        StoryEffect::Log(message) => ScriptCommand::Log(message),
+        StoryEffect::ClearDialogue => ScriptCommand::ClearDialogue,
+        StoryEffect::StopBgm => ScriptCommand::StopBgm,
+        StoryEffect::Exit => ScriptCommand::Exit,
+        StoryEffect::ReturnToTitle => ScriptCommand::ReturnToTitle,
+        StoryEffect::AdjustSetting { name, delta } => {
+            ScriptCommand::AdjustUserSetting { name, delta }
+        }
+        StoryEffect::Say { speaker, text } => ScriptCommand::Say {
+            speaker,
+            text,
+            animation_id: None,
+        },
+        StoryEffect::ContinueDialogue { text } => ScriptCommand::ContinueDialogue {
+            text,
+            animation_id: None,
+        },
+        StoryEffect::SetCamera {
+            blur,
+            zoom,
+            scope,
+            duration_ms,
+            ease,
+        } => ScriptCommand::SetCamera {
+            blur_intensity: blur,
+            zoom,
+            scope,
+            center: None,
+            duration: Duration::from_millis(duration_ms),
+            ease: parse_camera_ease(&ease)?,
+            animation_id: None,
+        },
+        StoryEffect::SetBackground { texture } => {
+            let definition = textures
+                .and_then(|catalog| catalog.resolve(&texture))
+                .ok_or_else(|| format!("texture `{texture}` is not defined"))?;
+            ScriptCommand::SetBackground {
+                path: definition.path.clone(),
+                fade: None,
+                animation_id: None,
+            }
+        }
+        StoryEffect::ShowCharacter {
+            actor_id,
+            character_name,
+            expressions,
+            position,
+            scale,
+        } => ScriptCommand::ShowCharacter {
+            actor_id,
+            character_name,
+            expressions,
+            position: Vec2::new(position[0], position[1]),
+            scale,
+            fade: None,
+            animation_id: None,
+        },
+        StoryEffect::LoadScript { .. }
+        | StoryEffect::PlayBgm { .. }
+        | StoryEffect::PlayVoice { .. } => {
+            return Err("effect requires script runtime asset resolution".to_string());
+        }
+    })
+}
+
+fn parse_camera_ease(name: &str) -> Result<CharacterEase, String> {
     match name {
         "" | "linear" => Ok(CharacterEase::Linear),
         "ease" => Ok(CharacterEase::Ease),
@@ -519,7 +538,7 @@ pub fn start_hks_runtime(
     runtime.pending_request = None;
     runtime.response_inbox.clear();
     runtime.hks_locals.clear();
-    runtime.hks_host = crate::hks_capabilities::StoryNativeHost::new();
+    runtime.hks_host = crate::script::capabilities::StoryNativeHost::new();
     if let Some(wait) = restored_wait {
         runtime.events.push_back(IrEvent::Waiting(wait.clone()));
         if matches!(wait, IrWaitKind::UiIntent | IrWaitKind::ScreenChoice)

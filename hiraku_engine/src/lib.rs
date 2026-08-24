@@ -3,8 +3,6 @@ mod audio;
 mod character;
 mod data;
 mod effect;
-mod hks_capabilities;
-pub mod hks_prelude;
 mod proto;
 pub mod render;
 mod scene;
@@ -43,11 +41,7 @@ use scene::{
     tick_animation_waits, tick_pending_waits, tick_script_batches,
     update_offscreen_ui_interactions,
 };
-pub use script::{
-    IrChoiceOption, IrCommand, IrEvent, IrExpressionId, IrInstruction, IrProgram,
-    IrValidationError, IrVm, IrVmSnapshot, IrVmStatus, IrWaitKind,
-};
-use script::{IrRuntime, ScriptResponseMessage, compile_story_program, tick_ir_runtime};
+use script::{IrRuntime, IrVm, ScriptResponseMessage, compile_story_program, tick_ir_runtime};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};

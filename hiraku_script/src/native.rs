@@ -5,7 +5,13 @@
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use crate::vm::{BuiltinCall, BuiltinId, BuiltinManifest, Value};
+use crate::{
+    symbol::{SymbolId, SymbolInterner},
+    vm::{
+        BuiltinCall, BuiltinId, BuiltinManifest, FunctionSignature, StaticMember, StaticMemberKind,
+        Value,
+    },
+};
 
 type NativeResult = Result<Value, NativeError>;
 type NativeThunk<C> = dyn Fn(&mut C, &[Value]) -> NativeResult + Send + Sync + 'static;
@@ -17,6 +23,9 @@ pub struct NativeRegistry<C> {
     operators: BTreeMap<String, BuiltinId>,
     functions: BTreeMap<BuiltinId, Box<NativeThunk<C>>>,
     raw_functions: BTreeMap<BuiltinId, Box<RawNativeThunk<C>>>,
+    symbols: SymbolInterner,
+    signatures: BTreeMap<BuiltinId, FunctionSignature>,
+    static_members: Vec<StaticMember>,
 }
 
 impl<C> Default for NativeRegistry<C> {
@@ -33,7 +42,81 @@ impl<C> NativeRegistry<C> {
             operators: BTreeMap::new(),
             functions: BTreeMap::new(),
             raw_functions: BTreeMap::new(),
+            symbols: SymbolInterner::new(),
+            signatures: BTreeMap::new(),
+            static_members: Vec::new(),
         }
+    }
+
+    pub fn define_type(&mut self, name: impl Into<String>) -> SymbolId {
+        self.symbols.intern(name)
+    }
+
+    pub fn set_signature(
+        &mut self,
+        builtin: BuiltinId,
+        signature: FunctionSignature,
+    ) -> Result<(), RegistrationError> {
+        if !self.functions.contains_key(&builtin) {
+            return Err(RegistrationError::UnknownBuiltin(builtin));
+        }
+        self.signatures.insert(builtin, signature);
+        Ok(())
+    }
+
+    pub fn register_static_raw_fn_with_id<F>(
+        &mut self,
+        id: BuiltinId,
+        owner: SymbolId,
+        name: impl Into<String>,
+        signature: FunctionSignature,
+        kind: StaticMemberKind,
+        function: F,
+    ) -> Result<(), RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let name = name.into();
+        if self.symbols.resolve(owner).is_none() {
+            return Err(RegistrationError::UnknownType(owner));
+        }
+        if kind == StaticMemberKind::Getter && !signature.parameters.is_empty() {
+            return Err(RegistrationError::GetterHasParameters(name));
+        }
+        if let Some(existing) = self.name_for_id(id) {
+            return Err(RegistrationError::DuplicateId {
+                id,
+                existing,
+                attempted: name,
+            });
+        }
+        let name_id = self.symbols.intern(name.clone());
+        if self
+            .static_members
+            .iter()
+            .any(|member| member.owner == owner && member.name == name_id)
+        {
+            return Err(RegistrationError::DuplicateName(format!(
+                "{}.{}",
+                self.symbols.resolve(owner).unwrap_or("<unknown>"),
+                name
+            )));
+        }
+        self.functions.insert(
+            id,
+            Box::new(move |_context, _| {
+                unreachable!("raw functions are dispatched before typed thunks")
+            }),
+        );
+        self.raw_functions.insert(id, Box::new(function));
+        self.signatures.insert(id, signature);
+        self.static_members.push(StaticMember {
+            owner,
+            name: name_id,
+            builtin: id,
+            kind,
+        });
+        Ok(())
     }
 
     /// Registers a function using an ID deterministically derived from its public name.
@@ -234,6 +317,11 @@ impl<C> NativeRegistry<C> {
             self.selectors.clone(),
             self.operators.clone(),
         )
+        .with_type_metadata(
+            self.symbols.manifest(),
+            self.signatures.clone(),
+            self.static_members.clone(),
+        )
     }
 
     pub fn call(&self, context: &mut C, call: &BuiltinCall) -> NativeResult {
@@ -267,6 +355,17 @@ impl<C> NativeRegistry<C> {
             .or_else(|| {
                 self.operators.iter().find_map(|(operator, existing)| {
                     (*existing == id).then_some(format!("operator {operator}"))
+                })
+            })
+            .or_else(|| {
+                self.static_members.iter().find_map(|member| {
+                    (member.builtin == id).then(|| {
+                        format!(
+                            "{}.{}",
+                            self.symbols.resolve(member.owner).unwrap_or("<unknown>"),
+                            self.symbols.resolve(member.name).unwrap_or("<unknown>")
+                        )
+                    })
                 })
             })
     }
@@ -436,6 +535,9 @@ impl Error for NativeError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistrationError {
     DuplicateName(String),
+    UnknownBuiltin(BuiltinId),
+    UnknownType(SymbolId),
+    GetterHasParameters(String),
     DuplicateId {
         id: BuiltinId,
         existing: String,
@@ -448,6 +550,11 @@ impl fmt::Display for RegistrationError {
         match self {
             Self::DuplicateName(name) => {
                 write!(formatter, "native function `{name}` is already registered")
+            }
+            Self::UnknownBuiltin(id) => write!(formatter, "builtin {id:?} is not registered"),
+            Self::UnknownType(id) => write!(formatter, "script type {id:?} is not registered"),
+            Self::GetterHasParameters(name) => {
+                write!(formatter, "getter `{name}` cannot declare parameters")
             }
             Self::DuplicateId {
                 id,
@@ -466,7 +573,10 @@ impl Error for RegistrationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{parse_program, vm::compile_with_manifest};
+    use crate::{
+        parse_program,
+        vm::{ScriptType, StaticMemberKind, compile_with_manifest},
+    };
 
     #[derive(Default)]
     struct Context {
@@ -621,5 +731,99 @@ mod tests {
             .call(&mut context, &call)
             .expect("operator must dispatch through registry");
         assert_eq!(context.calls, 1);
+    }
+
+    #[test]
+    fn registered_types_expose_static_methods_and_getters() {
+        let mut registry = NativeRegistry::<Context>::new();
+        let position = registry.define_type("Position");
+        registry
+            .register_static_raw_fn_with_id(
+                BuiltinId(100),
+                position,
+                "rel",
+                FunctionSignature {
+                    receiver: None,
+                    parameters: vec![ScriptType::Number, ScriptType::Number],
+                    result: ScriptType::Named(position),
+                },
+                StaticMemberKind::Method,
+                |_context, call| {
+                    Ok(Value::Tuple(
+                        call.arguments
+                            .iter()
+                            .map(|argument| argument.value.clone())
+                            .collect(),
+                    ))
+                },
+            )
+            .expect("Position.rel must register");
+        registry
+            .register_static_raw_fn_with_id(
+                BuiltinId(101),
+                position,
+                "left",
+                FunctionSignature {
+                    receiver: None,
+                    parameters: Vec::new(),
+                    result: ScriptType::Named(position),
+                },
+                StaticMemberKind::Getter,
+                |_context, _call| Ok(Value::Symbol("left".to_string())),
+            )
+            .expect("Position.left must register");
+
+        let manifest = registry.manifest();
+        assert_eq!(manifest.symbols().resolve(position), Some("Position"));
+        let bytecode = compile_with_manifest(
+            &parse_program("let a = .rel(1, 12)\nlet b = .left")
+                .expect("static member syntax must parse"),
+            46,
+            &manifest,
+        )
+        .expect("registered static members must compile");
+        assert!(bytecode.instructions.iter().any(|instruction| matches!(
+            instruction,
+            crate::vm::Instruction::CallBuiltin {
+                builtin: BuiltinId(100),
+                has_receiver: false,
+                ..
+            }
+        )));
+        assert!(bytecode.instructions.iter().any(|instruction| matches!(
+            instruction,
+            crate::vm::Instruction::CallBuiltin {
+                builtin: BuiltinId(101),
+                has_receiver: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn static_method_signatures_are_checked_during_compilation() {
+        let mut registry = NativeRegistry::<Context>::new();
+        let position = registry.define_type("Position");
+        registry
+            .register_static_raw_fn_with_id(
+                BuiltinId(102),
+                position,
+                "rel",
+                FunctionSignature {
+                    receiver: None,
+                    parameters: vec![ScriptType::Number, ScriptType::Number],
+                    result: ScriptType::Named(position),
+                },
+                StaticMemberKind::Method,
+                |_context, _call| Ok(Value::Null),
+            )
+            .expect("Position.rel must register");
+        let errors = compile_with_manifest(
+            &parse_program(r#".rel("wrong", 12)"#).expect("call must parse"),
+            47,
+            &registry.manifest(),
+        )
+        .expect_err("argument type mismatch must fail compilation");
+        assert!(errors[0].message.contains("expects Number"));
     }
 }

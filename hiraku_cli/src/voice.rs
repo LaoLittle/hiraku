@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
-use hiraku_script::hks::{Block, Expr, ExprKind, Program, Span, Stmt, parse_program};
+use hiraku_script::{Block, Expr, ExprKind, Program, Span, Stmt, parse_program};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,7 +220,9 @@ impl Collector<'_> {
                 self.expression(left);
                 self.expression(right);
             }
-            ExprKind::Ident(_)
+            ExprKind::Null
+            | ExprKind::Ellipsis
+            | ExprKind::Ident(_)
             | ExprKind::Symbol(_)
             | ExprKind::Bool(_)
             | ExprKind::Number { .. }
@@ -308,7 +310,7 @@ fn callee_name(expression: &Expr) -> Option<String> {
     }
 }
 
-fn string_argument(argument: &hiraku_script::hks::Argument) -> Option<String> {
+fn string_argument(argument: &hiraku_script::Argument) -> Option<String> {
     if argument.label.is_some() {
         return None;
     }

@@ -3,18 +3,20 @@
 //! This runtime is deliberately independent from the transitional story IR. It
 //! owns the generic VM and task scheduler while ECS systems own waits and effects.
 
-use hiraku_script::hks::vm::{
-    BuiltinCall, Bytecode, TaskEvent, TaskScheduler, TaskSchedulerError, Value, Vm, VmError,
-    VmEvent,
+use hiraku_script::StatementValue;
+use hiraku_script::vm::{
+    BuiltinCall, Bytecode, TaskEvent, TaskScheduler, TaskSchedulerError, TaskSchedulerSnapshot,
+    Value, Vm, VmError, VmEvent, VmSnapshot,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HksRuntimeEvent {
     Call(BuiltinCall),
     TaskCall { task: u64, call: BuiltinCall },
-    StatementCommit,
-    TaskStatementCommit { task: u64 },
+    Statement(StatementValue),
+    TaskStatement { task: u64, value: StatementValue },
     TaskCompleted { task: u64, value: Value },
     Completed(Value),
 }
@@ -22,6 +24,12 @@ pub enum HksRuntimeEvent {
 pub struct HksRuntime {
     vm: Vm,
     scheduler: TaskScheduler,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HksRuntimeSnapshot {
+    pub vm: VmSnapshot,
+    pub scheduler: TaskSchedulerSnapshot,
 }
 
 impl HksRuntime {
@@ -32,16 +40,33 @@ impl HksRuntime {
         })
     }
 
+    pub fn snapshot(&self) -> HksRuntimeSnapshot {
+        HksRuntimeSnapshot {
+            vm: self.vm.snapshot(),
+            scheduler: self.scheduler.snapshot(),
+        }
+    }
+
+    pub fn restore(
+        bytecode: Bytecode,
+        snapshot: HksRuntimeSnapshot,
+    ) -> Result<Self, HksRuntimeError> {
+        Ok(Self {
+            vm: Vm::restore(bytecode.clone(), snapshot.vm)?,
+            scheduler: TaskScheduler::restore(bytecode, snapshot.scheduler)?,
+        })
+    }
+
     /// Advances either the main program or the first ready task to the next host boundary.
     pub fn step(&mut self) -> Result<Option<HksRuntimeEvent>, HksRuntimeError> {
         if let Some(event) = self.vm.step()? {
             return match event {
                 VmEvent::Call(call) => Ok(Some(HksRuntimeEvent::Call(call))),
-                VmEvent::StatementCommit => Ok(Some(HksRuntimeEvent::StatementCommit)),
+                VmEvent::Statement(value) => Ok(Some(HksRuntimeEvent::Statement(value))),
                 VmEvent::SpawnTask(request) => {
                     let task = self.scheduler.spawn(request.task)?;
                     self.vm.resume(Value::Task(task))?;
-                    Ok(Some(HksRuntimeEvent::StatementCommit))
+                    Ok(Some(HksRuntimeEvent::Statement(StatementValue::Commit)))
                 }
                 VmEvent::Completed(value) => Ok(Some(HksRuntimeEvent::Completed(value))),
             };
@@ -51,8 +76,8 @@ impl HksRuntime {
             Some(TaskEvent::Call { task, call }) => {
                 Ok(Some(HksRuntimeEvent::TaskCall { task, call }))
             }
-            Some(TaskEvent::StatementCommit { task }) => {
-                Ok(Some(HksRuntimeEvent::TaskStatementCommit { task }))
+            Some(TaskEvent::Statement { task, value }) => {
+                Ok(Some(HksRuntimeEvent::TaskStatement { task, value }))
             }
             Some(TaskEvent::Completed { task, value }) => {
                 Ok(Some(HksRuntimeEvent::TaskCompleted { task, value }))
@@ -95,8 +120,8 @@ impl From<TaskSchedulerError> for HksRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hks_capabilities::{StoryEffect, StoryNativeHost, compile_story_bytecode};
-    use hiraku_script::hks::vm::BuiltinId;
+    use crate::script::capabilities::{StoryEffect, StoryNativeHost, compile_story_bytecode};
+    use hiraku_script::vm::BuiltinId;
 
     #[test]
     fn whole_program_runtime_yields_native_calls_without_ir() {
@@ -111,6 +136,32 @@ mod tests {
         runtime
             .resume_main(Value::Null)
             .expect("host result must resume the main VM");
+    }
+
+    #[test]
+    fn whole_program_runtime_restores_at_a_host_boundary() {
+        let bytecode = compile_story_bytecode("restore.story.hks", "log(\"before\")\n\"after\"")
+            .expect("whole HKS story must compile");
+        let mut runtime = HksRuntime::new(bytecode.clone()).expect("runtime must initialize");
+        assert!(matches!(
+            runtime.step().expect("runtime must advance"),
+            Some(HksRuntimeEvent::Call(_))
+        ));
+        let snapshot = runtime.snapshot();
+        let mut restored = HksRuntime::restore(bytecode, snapshot).expect("snapshot must restore");
+        restored
+            .resume_main(Value::Null)
+            .expect("restored host call must resume");
+        assert_eq!(
+            restored.step().expect("runtime must reach statement"),
+            Some(HksRuntimeEvent::Statement(StatementValue::Commit))
+        );
+        assert_eq!(
+            restored.step().expect("runtime must reach string hook"),
+            Some(HksRuntimeEvent::Statement(StatementValue::String(
+                "after".to_string()
+            )))
+        );
     }
 
     #[test]
@@ -129,7 +180,7 @@ mod tests {
                         .resume_main(value)
                         .expect("native result must resume the VM");
                 }
-                Some(HksRuntimeEvent::StatementCommit) => {
+                Some(HksRuntimeEvent::Statement(StatementValue::Commit)) => {
                     host.commit_statement()
                         .expect("statement commit must flush actor state");
                 }

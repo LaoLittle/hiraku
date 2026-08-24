@@ -24,8 +24,8 @@ use crate::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, IrCommand, IrEvent, IrRuntime, IrVm,
         IrWaitKind, ResolvedCharacterKeyframe, ScriptBootstrap, ScriptCommand, ScriptRequestId,
         ScriptResponse, ScriptResponseMessage, UiContext, UiIntent, VoicePlaybackMode,
-        compile_story_program, evaluate_ui_script, save_runtime_slot, script_command_from_ir,
-        start_hks_runtime,
+        compile_story_program, evaluate_ui_script, save_runtime_slot, script_command_from_effect,
+        script_command_from_ir, start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -368,7 +368,7 @@ pub fn bridge_ir_events(
                     runtime.response_inbox.clear();
                     runtime.native_tasks.clear();
                     runtime.hks_locals.clear();
-                    runtime.hks_host = crate::hks_capabilities::StoryNativeHost::new();
+                    runtime.hks_host = crate::script::capabilities::StoryNativeHost::new();
                 }
                 Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
             }
@@ -505,40 +505,74 @@ pub fn bridge_ir_events(
             mut task_result,
         }) => {
             let locals = runtime.hks_locals.clone();
-            match crate::hks_capabilities::execute_with_host(
+            match crate::script::capabilities::execute_with_host(
                 bytecode,
                 &mut runtime.hks_host,
                 locals,
             ) {
                 Ok(output) => {
                     runtime.hks_locals = output.locals;
-                    for command in output.commands {
-                        let command: IrCommand = command.into();
-                        if matches!(
-                            command,
-                            IrCommand::LoadScript { .. }
-                                | IrCommand::Choose { .. }
-                                | IrCommand::OpenUi { .. }
-                                | IrCommand::PlayBgm { .. }
-                                | IrCommand::PlayVoice { .. }
-                        ) {
-                            runtime.events.push_back(IrEvent::Command(command));
-                            continue;
-                        }
-                        match script_command_from_ir(command, textures.as_deref()) {
-                            Ok(command) => pending_script_commands.items.push_back(command),
-                            Err(error) => warn!("HKS native command rejected: {error}"),
+                    for effect in output.commands {
+                        match effect {
+                            crate::script::capabilities::StoryEffect::LoadScript { path } => {
+                                runtime
+                                    .events
+                                    .push_back(IrEvent::Command(IrCommand::LoadScript { path }))
+                            }
+                            crate::script::capabilities::StoryEffect::PlayBgm {
+                                path,
+                                volume,
+                                fade_in_ms,
+                            } => match audio
+                                .as_deref()
+                                .and_then(|catalog| catalog.resolve_music(&path))
+                            {
+                                Some(definition) => pending_script_commands.items.push_back(
+                                    ScriptCommand::PlayBgm {
+                                        path: definition.path.clone(),
+                                        prelude: definition.prelude.clone(),
+                                        volume,
+                                        fade_in: fade_in_ms.map(std::time::Duration::from_millis),
+                                        animation_id: None,
+                                    },
+                                ),
+                                None => warn!("music `{path}` is not defined"),
+                            },
+                            crate::script::capabilities::StoryEffect::PlayVoice {
+                                path,
+                                volume,
+                            } => match audio
+                                .as_deref()
+                                .and_then(|catalog| catalog.resolve_voice(&path))
+                            {
+                                Some(definition) => pending_script_commands.items.push_back(
+                                    ScriptCommand::PlayVoice {
+                                        path: definition.path.clone(),
+                                        volume,
+                                        mode: VoicePlaybackMode::Exclusive,
+                                        animation_id: None,
+                                    },
+                                ),
+                                None => warn!("voice `{path}` is not defined"),
+                            },
+                            effect => match script_command_from_effect(effect, textures.as_deref())
+                            {
+                                Ok(command) => pending_script_commands.items.push_back(command),
+                                Err(error) => warn!("HKS native command rejected: {error}"),
+                            },
                         }
                     }
                     for task in output.tasks {
                         let batch_id = runtime.next_native_task_id;
                         runtime.next_native_task_id += 1;
                         let mut items = Vec::new();
-                        for (index, command) in task.commands.into_iter().enumerate() {
+                        for (index, effect) in task.commands.into_iter().enumerate() {
                             let handle = format!("hks-task-{batch_id}-{index}");
-                            let command: IrCommand = command.into();
-                            let command = match command {
-                                IrCommand::PlayVoice { path, volume } => {
+                            let command = match effect {
+                                crate::script::capabilities::StoryEffect::PlayVoice {
+                                    path,
+                                    volume,
+                                } => {
                                     let Some(definition) = audio
                                         .as_deref()
                                         .and_then(|catalog| catalog.resolve_voice(&path))
@@ -553,8 +587,10 @@ pub fn bridge_ir_events(
                                         animation_id: Some(handle.clone()),
                                     }
                                 }
-                                command @ IrCommand::ShowCharacter { .. } => {
-                                    match script_command_from_ir(command, textures.as_deref()) {
+                                effect @ crate::script::capabilities::StoryEffect::ShowCharacter {
+                                    ..
+                                } => {
+                                    match script_command_from_effect(effect, textures.as_deref()) {
                                         Ok(ScriptCommand::ShowCharacter {
                                             actor_id,
                                             character_name,
@@ -598,8 +634,8 @@ pub fn bridge_ir_events(
                             .map(|item| item.handle.clone())
                             .collect::<Vec<_>>();
                         let mode = match task.mode {
-                            hiraku_script::hks::vm::TaskMode::Sequence => BatchSubmitMode::Sequence,
-                            hiraku_script::hks::vm::TaskMode::Parallel => BatchSubmitMode::Parallel,
+                            hiraku_script::vm::TaskMode::Sequence => BatchSubmitMode::Sequence,
+                            hiraku_script::vm::TaskMode::Parallel => BatchSubmitMode::Parallel,
                         };
                         if !items.is_empty() {
                             pending_script_commands
@@ -619,7 +655,7 @@ pub fn bridge_ir_events(
                     }
                     if let Some(wait) = output.wait {
                         let wait = match wait {
-                            crate::hks_capabilities::StoryWait::DialogueAdvance => {
+                            crate::script::capabilities::StoryWait::DialogueAdvance => {
                                 IrWaitKind::DialogueAdvance
                             }
                         };
@@ -1922,19 +1958,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
         }
 
         match command {
-            ScriptCommand::StartIr { path, program } => match IrVm::new(program) {
-                Ok(vm) => {
-                    ir_runtime.vm = Some(vm);
-                    ir_runtime.current_script = Some(path);
-                    ir_runtime.events.clear();
-                    ir_runtime.pending_input_variable = None;
-                    ir_runtime.pending_ui_screen = None;
-                    ir_runtime.pending_request = None;
-                    ir_runtime.wait_request = None;
-                    ir_runtime.response_inbox.clear();
-                }
-                Err(error) => warn!("failed to start IR program: {error}"),
-            },
             ScriptCommand::Log(message) => info!("[hks] {message}"),
             ScriptCommand::SetBackground {
                 path,
@@ -2318,6 +2341,56 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     request: None,
                 });
                 shared_state.0.dialogue = Some(DialogueSnapshot { speaker, text });
+            }
+            ScriptCommand::ContinueDialogue { text, animation_id } => {
+                if let Some(waiting) = dialogue_state.waiting.take() {
+                    complete_dialogue_wait(&mut commands, &mut animations, waiting);
+                }
+                if shared_state.0.dialogue.is_none() {
+                    warn!("dialogue continuation has no UI buffer; treating it as narration");
+                    if let Ok(mut visibility) = dialogue_root.single_mut() {
+                        *visibility = Visibility::Visible;
+                    }
+                    if let Ok(mut speaker_node) = speaker_text.single_mut() {
+                        **speaker_node = String::new();
+                    }
+                    if let Ok(line_root) = line_text_entity.single() {
+                        set_dialogue_line_text(
+                            &mut commands,
+                            &mut dialogue_state,
+                            line_root,
+                            &mut line_text,
+                            &ui_fonts,
+                            &ui_style,
+                            &text,
+                            0,
+                            None,
+                        );
+                    }
+                    shared_state.0.dialogue = Some(DialogueSnapshot {
+                        speaker: String::new(),
+                        text,
+                    });
+                } else {
+                    if let Ok(line_root) = line_text_entity.single() {
+                        append_dialogue_line_text(
+                            &mut commands,
+                            &mut dialogue_state,
+                            line_root,
+                            &ui_fonts,
+                            &ui_style,
+                            &text,
+                            None,
+                        );
+                    }
+                    if let Some(dialogue) = shared_state.0.dialogue.as_mut() {
+                        dialogue.text.push_str(&text);
+                    }
+                }
+                dialogue_state.waiting = Some(PendingDialogueAdvance {
+                    animation_id,
+                    request: None,
+                });
             }
             ScriptCommand::AwaitDialogueAdvance { done } => {
                 dialogue_state.waiting = Some(PendingDialogueAdvance {
@@ -4052,6 +4125,63 @@ fn set_dialogue_line_text(
     } else {
         dialogue_state.reveal = None;
         let _ = animation_id;
+    }
+}
+
+fn append_dialogue_line_text(
+    commands: &mut Commands,
+    dialogue_state: &mut DialogueState,
+    line_root: Entity,
+    ui_fonts: &UiFonts,
+    ui_style: &UiStyle,
+    text: &str,
+    animation_id: Option<String>,
+) {
+    let start_index = dialogue_state.span_entities.len();
+    let target_alpha = ui_style.line_color.alpha();
+    let reveal_enabled = dialogue_state.effect.mode != DialogueTextEffectMode::Instant;
+
+    for ch in text.chars() {
+        let entity = commands
+            .spawn((
+                TextSpan::new(ch.to_string()),
+                ui_text_font(ui_fonts, ui_style.line_size),
+                TextColor(ui_style.line_color.with_alpha(if reveal_enabled {
+                    0.0
+                } else {
+                    target_alpha
+                })),
+                DialogueCharSpan {
+                    target_alpha,
+                    age: if reveal_enabled {
+                        0.0
+                    } else {
+                        dialogue_state.effect.fade_seconds
+                    },
+                    revealed: !reveal_enabled,
+                },
+            ))
+            .id();
+        commands.entity(line_root).add_child(entity);
+        dialogue_state.span_entities.push(entity);
+    }
+
+    if reveal_enabled && start_index < dialogue_state.span_entities.len() {
+        if let Some(reveal) = dialogue_state.reveal.as_mut() {
+            reveal.spans = dialogue_state.span_entities.clone();
+            if reveal.animation_id.is_none() {
+                reveal.animation_id = animation_id;
+            }
+        } else {
+            dialogue_state.reveal = Some(DialogueRevealState {
+                spans: dialogue_state.span_entities.clone(),
+                next_index: start_index,
+                accumulator: 0.0,
+                interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+                fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
+                animation_id,
+            });
+        }
     }
 }
 

@@ -4,9 +4,7 @@
 //! concepts. This module validates engine capabilities before they become ECS
 //! effects.
 
-use hiraku_script::hks::{
-    Argument, BinaryOp, Expr, ExprKind, NumberUnit, Span, Stmt, parse_program,
-};
+use hiraku_script::{Argument, BinaryOp, Expr, ExprKind, NumberUnit, Span, Stmt, parse_program};
 use thiserror::Error;
 
 use crate::script::{
@@ -337,7 +335,7 @@ impl HksStoryLowerer<'_> {
                 && arguments.is_empty()
                 && matches!(name.as_str(), "seq" | "par")
             {
-                let bytecode = crate::hks_capabilities::compile_expression(
+                let bytecode = crate::script::capabilities::compile_expression(
                     value,
                     &self.functions,
                     self.source_hash ^ value.span.start as u64,
@@ -372,7 +370,7 @@ impl HksStoryLowerer<'_> {
             }
         }
 
-        let bytecode = crate::hks_capabilities::compile_statement(
+        let bytecode = crate::script::capabilities::compile_statement(
             statement,
             &self.functions,
             self.source_hash ^ span.start as u64,
@@ -390,7 +388,7 @@ impl HksStoryLowerer<'_> {
     }
 
     fn expression_statement(&mut self, expression: &Expr) -> Result<(), HksStoryCompileError> {
-        if let Some(bytecode) = crate::hks_capabilities::compile_expression(
+        if let Some(bytecode) = crate::script::capabilities::compile_expression(
             expression,
             &self.functions,
             self.source_hash ^ expression.span.start as u64,
@@ -506,8 +504,8 @@ impl HksStoryLowerer<'_> {
     fn if_statement(
         &mut self,
         condition: &Expr,
-        then_block: &hiraku_script::hks::Block,
-        else_block: Option<&hiraku_script::hks::Block>,
+        then_block: &hiraku_script::Block,
+        else_block: Option<&hiraku_script::Block>,
         span: &Span,
     ) -> Result<(), HksStoryCompileError> {
         let expression = self.condition(condition, span)?;
@@ -541,7 +539,7 @@ impl HksStoryLowerer<'_> {
     fn while_statement(
         &mut self,
         condition: &Expr,
-        body: &hiraku_script::hks::Block,
+        body: &hiraku_script::Block,
         span: &Span,
     ) -> Result<(), HksStoryCompileError> {
         let condition_pc = self.instructions.len() as u32;
@@ -857,11 +855,11 @@ fn source_hash(source: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hks_capabilities::{
+    use crate::script::capabilities::{
         CharacterCapabilityError, StoryEffect, StoryNativeHost, StoryWait, execute_with_host,
     };
-    use hiraku_script::hks::vm::Value;
-    use hiraku_script::hks::{Stmt, parse_program};
+    use hiraku_script::vm::Value;
+    use hiraku_script::{Stmt, parse_program};
     use std::collections::BTreeMap;
 
     fn zoom(source: &str) -> Expr {
@@ -872,7 +870,7 @@ mod tests {
         expression.clone()
     }
 
-    fn native_outputs(program: &IrProgram) -> Vec<crate::hks_capabilities::CapabilityOutput> {
+    fn native_outputs(program: &IrProgram) -> Vec<crate::script::capabilities::CapabilityOutput> {
         let mut host = StoryNativeHost::new();
         let mut locals = BTreeMap::new();
         program
@@ -1019,7 +1017,7 @@ mod tests {
         else {
             panic!("expected a native HKS statement");
         };
-        let output = crate::hks_capabilities::execute(bytecode.clone()).unwrap();
+        let output = crate::script::capabilities::execute(bytecode.clone()).unwrap();
         assert!(matches!(&output.commands[0], StoryEffect::ShowCharacter {
             actor_id, character_name, expressions, position, scale,
         } if actor_id == "ema" && character_name == "ema"
@@ -1062,8 +1060,9 @@ mod tests {
 
     #[test]
     fn migrated_new_game_story_is_ready_for_ir_handoff() {
-        let source =
-            include_str!("../../../manosabars/assets/main_hdp_contents/scripts/new_game.story.hks");
+        let source = include_str!(
+            "../../../../manosabars/assets/main_hdp_contents/scripts/new_game.story.hks"
+        );
         let program = compile_story_to_ir("scripts/new_game.story.hks", source).unwrap();
         assert!(program.validate().is_ok());
         assert_eq!(
@@ -1077,7 +1076,8 @@ mod tests {
 
     #[test]
     fn lowers_hks_startup_handoff() {
-        let source = include_str!("../../../manosabars/assets/main_hdp_contents/startup.story.hks");
+        let source =
+            include_str!("../../../../manosabars/assets/main_hdp_contents/startup.story.hks");
         let program = compile_story_to_ir("startup.story.hks", source).unwrap();
         let commands = native_outputs(&program)
             .into_iter()
@@ -1093,8 +1093,9 @@ mod tests {
 
     #[test]
     fn lowers_settings_story_control_flow() {
-        let source =
-            include_str!("../../../manosabars/assets/main_hdp_contents/scripts/settings.story.hks");
+        let source = include_str!(
+            "../../../../manosabars/assets/main_hdp_contents/scripts/settings.story.hks"
+        );
         let program = compile_story_to_ir("scripts/settings.story.hks", source).unwrap();
         assert!(program.validate().is_ok());
         assert!(program.instructions.iter().any(|instruction| {
@@ -1123,7 +1124,8 @@ mod tests {
 
     #[test]
     fn lowers_the_hks_title_system() {
-        let source = include_str!("../../../manosabars/assets/main_hdp_contents/system.story.hks");
+        let source =
+            include_str!("../../../../manosabars/assets/main_hdp_contents/system.story.hks");
         let program = compile_story_to_ir("system.story.hks", source).unwrap();
         assert!(program.validate().is_ok());
         assert!(

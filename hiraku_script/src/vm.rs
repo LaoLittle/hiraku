@@ -11,6 +11,7 @@ use crate::{
     ast::{BinaryOp, Block, Expr, ExprKind, NumberUnit, Program, Stmt},
     hir::{StatementValue, lower_statement},
     span::Span,
+    symbol::{SymbolId, SymbolManifest},
 };
 
 pub const BYTECODE_VERSION: u16 = 5;
@@ -21,12 +22,66 @@ pub struct BuiltinId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FunctionId(pub u32);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScriptType {
+    Any,
+    Null,
+    Bool,
+    Number,
+    Percent,
+    String,
+    Symbol,
+    Selector,
+    Task,
+    Named(SymbolId),
+    Union(Vec<ScriptType>),
+    Tuple,
+    Map,
+}
+
+impl ScriptType {
+    fn accepts(&self, actual: &Self) -> bool {
+        self == &Self::Any
+            || actual == &Self::Any
+            || self == actual
+            || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionSignature {
+    #[serde(default)]
+    pub receiver: Option<ScriptType>,
+    pub parameters: Vec<ScriptType>,
+    pub result: ScriptType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaticMemberKind {
+    Method,
+    Getter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticMember {
+    pub owner: SymbolId,
+    pub name: SymbolId,
+    pub builtin: BuiltinId,
+    pub kind: StaticMemberKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuiltinManifest {
     hash: u64,
     names: BTreeMap<String, BuiltinId>,
     selectors: BTreeMap<(String, String), BuiltinId>,
     operators: BTreeMap<String, BuiltinId>,
+    #[serde(default)]
+    symbols: SymbolManifest,
+    #[serde(default)]
+    signatures: BTreeMap<BuiltinId, FunctionSignature>,
+    #[serde(default)]
+    static_members: Vec<StaticMember>,
 }
 
 impl BuiltinManifest {
@@ -84,7 +139,23 @@ impl BuiltinManifest {
             names,
             selectors,
             operators,
+            symbols: SymbolManifest::default(),
+            signatures: BTreeMap::new(),
+            static_members: Vec::new(),
         }
+    }
+
+    pub fn with_type_metadata(
+        mut self,
+        symbols: SymbolManifest,
+        signatures: BTreeMap<BuiltinId, FunctionSignature>,
+        static_members: Vec<StaticMember>,
+    ) -> Self {
+        self.symbols = symbols;
+        self.signatures = signatures;
+        self.static_members = static_members;
+        self.rehash();
+        self
     }
 
     pub fn hash(&self) -> u64 {
@@ -104,6 +175,63 @@ impl BuiltinManifest {
     pub fn resolve_operator(&self, operator: &str) -> Option<BuiltinId> {
         self.operators.get(operator).copied()
     }
+
+    pub fn symbols(&self) -> &SymbolManifest {
+        &self.symbols
+    }
+
+    pub fn signature(&self, builtin: BuiltinId) -> Option<&FunctionSignature> {
+        self.signatures.get(&builtin)
+    }
+
+    pub fn resolve_static_method(&self, name: &str) -> Result<&StaticMember, &'static str> {
+        self.resolve_static(name, StaticMemberKind::Method)
+    }
+
+    pub fn resolve_getter(&self, name: &str) -> Result<&StaticMember, &'static str> {
+        self.resolve_static(name, StaticMemberKind::Getter)
+    }
+
+    fn resolve_static(
+        &self,
+        name: &str,
+        kind: StaticMemberKind,
+    ) -> Result<&StaticMember, &'static str> {
+        let Some(name) = self.symbols.find(name) else {
+            return Err("unknown");
+        };
+        let mut matches = self
+            .static_members
+            .iter()
+            .filter(|member| member.name == name && member.kind == kind);
+        let Some(member) = matches.next() else {
+            return Err("unknown");
+        };
+        if matches.next().is_some() {
+            return Err("ambiguous");
+        }
+        Ok(member)
+    }
+
+    fn rehash(&mut self) {
+        let mut hash = self.hash;
+        for symbol in self.symbols.symbols() {
+            hash = symbol.bytes().fold(hash, hash_byte);
+            hash = hash_byte(hash, 0xff);
+        }
+        for (builtin, signature) in &self.signatures {
+            hash = builtin.0.to_le_bytes().into_iter().fold(hash, hash_byte);
+            hash = format!("{signature:?}").bytes().fold(hash, hash_byte);
+        }
+        for member in &self.static_members {
+            hash = format!("{member:?}").bytes().fold(hash, hash_byte);
+        }
+        self.hash = hash;
+    }
+}
+
+fn hash_byte(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,7 +244,14 @@ pub enum Value {
     String(String),
     Symbol(String),
     Selector(String),
-    Handle { type_id: u32, id: u64 },
+    Typed {
+        type_id: SymbolId,
+        value: Box<Value>,
+    },
+    Handle {
+        type_id: u32,
+        id: u64,
+    },
     Task(u64),
     Tuple(Vec<Value>),
     Map(BTreeMap<String, Value>),
@@ -228,6 +363,7 @@ fn compile_inner(
         errors: declaration_errors,
         manifest,
         function_names,
+        local_types: BTreeMap::new(),
     };
     compiler.compile_functions(program);
     for statement in &program.statements {
@@ -257,6 +393,7 @@ struct Compiler<'a> {
     errors: Vec<CompileError>,
     manifest: Option<&'a BuiltinManifest>,
     function_names: BTreeMap<String, FunctionId>,
+    local_types: BTreeMap<String, ScriptType>,
 }
 
 impl Compiler<'_> {
@@ -276,6 +413,13 @@ impl Compiler<'_> {
             .collect::<Vec<_>>();
         for (name, parameters, body) in declarations {
             let parent = std::mem::take(&mut self.instructions);
+            let parent_types = std::mem::take(&mut self.local_types);
+            self.local_types.extend(
+                parameters
+                    .iter()
+                    .cloned()
+                    .map(|parameter| (parameter, ScriptType::Any)),
+            );
             for (index, statement) in body.statements.iter().enumerate() {
                 let is_last = index + 1 == body.statements.len();
                 if is_last && let Stmt::Expr(expression) = statement {
@@ -301,6 +445,7 @@ impl Compiler<'_> {
                 self.instructions.push(Instruction::Return);
             }
             let instructions = std::mem::replace(&mut self.instructions, parent);
+            self.local_types = parent_types;
             self.functions.push(FunctionTemplate {
                 name,
                 parameters,
@@ -316,9 +461,11 @@ impl Compiler<'_> {
                 span: span.clone(),
             }),
             Stmt::Let { name, value, .. } => {
+                let value_type = infer_expression_type(self.manifest, &self.local_types, value);
                 self.expression(value);
                 self.instructions
                     .push(Instruction::StoreLocal(name.clone()));
+                self.local_types.insert(name.clone(), value_type);
                 self.instructions
                     .push(Instruction::Statement(StatementValue::Commit));
             }
@@ -385,9 +532,30 @@ impl Compiler<'_> {
                 .instructions
                 .push(Instruction::Constant(Value::Ellipsis)),
             ExprKind::Ident(name) => self.instructions.push(Instruction::LoadLocal(name.clone())),
-            ExprKind::Symbol(name) => self
-                .instructions
-                .push(Instruction::Constant(Value::Symbol(name.clone()))),
+            ExprKind::Symbol(name) => {
+                if let Some(manifest) = self.manifest {
+                    match manifest.resolve_getter(name) {
+                        Ok(member) => {
+                            self.instructions.push(Instruction::CallBuiltin {
+                                builtin: member.builtin,
+                                labels: Vec::new(),
+                                has_receiver: false,
+                            });
+                            return;
+                        }
+                        Err("ambiguous") => {
+                            self.errors.push(CompileError {
+                                message: format!("getter `.{name}` is ambiguous"),
+                                span: expression.span,
+                            });
+                            return;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                self.instructions
+                    .push(Instruction::Constant(Value::Symbol(name.clone())));
+            }
             ExprKind::Bool(value) => self
                 .instructions
                 .push(Instruction::Constant(Value::Bool(*value))),
@@ -467,9 +635,37 @@ impl Compiler<'_> {
                     return;
                 }
                 if let Some(manifest) = self.manifest {
+                    if let ExprKind::Symbol(name) = &callee.kind {
+                        match manifest.resolve_static_method(name) {
+                            Ok(member) => {
+                                self.check_signature(member.builtin, arguments, callee.span);
+                                for argument in arguments {
+                                    self.expression(&argument.value);
+                                }
+                                self.instructions.push(Instruction::CallBuiltin {
+                                    builtin: member.builtin,
+                                    labels: arguments
+                                        .iter()
+                                        .map(|argument| argument.label.clone())
+                                        .collect(),
+                                    has_receiver: false,
+                                });
+                                return;
+                            }
+                            Err("ambiguous") => {
+                                self.errors.push(CompileError {
+                                    message: format!("static method `.{name}` is ambiguous"),
+                                    span: callee.span,
+                                });
+                                return;
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     if let ExprKind::Ident(name) = &callee.kind
                         && let Some(builtin) = manifest.resolve(&name)
                     {
+                        self.check_signature(builtin, arguments, callee.span);
                         for argument in arguments {
                             self.expression(&argument.value);
                         }
@@ -494,6 +690,7 @@ impl Compiler<'_> {
                             .map(|(builtin, selector)| (builtin, selector))
                             .or_else(|| manifest.resolve(name).map(|builtin| (builtin, None)));
                         if let Some((builtin, selector)) = method {
+                            self.check_method_signature(builtin, object, arguments, callee.span);
                             if let Some(selector) = selector {
                                 self.instructions
                                     .push(Instruction::Constant(Value::Selector(selector)));
@@ -587,6 +784,96 @@ impl Compiler<'_> {
         task
     }
 
+    fn check_signature(&mut self, builtin: BuiltinId, arguments: &[crate::Argument], span: Span) {
+        let Some(signature) = self
+            .manifest
+            .and_then(|manifest| manifest.signature(builtin))
+            .cloned()
+        else {
+            return;
+        };
+        if signature.receiver.is_some() {
+            self.errors.push(CompileError {
+                message: "method requires a receiver".to_string(),
+                span,
+            });
+            return;
+        }
+        if signature.parameters.len() != arguments.len() {
+            self.errors.push(CompileError {
+                message: format!(
+                    "expected {} arguments, got {}",
+                    signature.parameters.len(),
+                    arguments.len()
+                ),
+                span,
+            });
+            return;
+        }
+        for (index, (expected, argument)) in signature.parameters.iter().zip(arguments).enumerate()
+        {
+            let actual = infer_expression_type(self.manifest, &self.local_types, &argument.value);
+            if !expected.accepts(&actual) {
+                self.errors.push(CompileError {
+                    message: format!(
+                        "argument {} expects {expected:?}, got {actual:?}",
+                        index + 1
+                    ),
+                    span: argument.span,
+                });
+            }
+        }
+    }
+
+    fn check_method_signature(
+        &mut self,
+        builtin: BuiltinId,
+        receiver: &Expr,
+        arguments: &[crate::Argument],
+        span: Span,
+    ) {
+        let Some(signature) = self
+            .manifest
+            .and_then(|manifest| manifest.signature(builtin))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(expected) = &signature.receiver {
+            let actual = infer_expression_type(self.manifest, &self.local_types, receiver);
+            if !expected.accepts(&actual) {
+                self.errors.push(CompileError {
+                    message: format!("receiver expects {expected:?}, got {actual:?}"),
+                    span: receiver.span,
+                });
+            }
+        }
+        if signature.parameters.len() != arguments.len() {
+            self.errors.push(CompileError {
+                message: format!(
+                    "expected {} arguments, got {}",
+                    signature.parameters.len(),
+                    arguments.len()
+                ),
+                span,
+            });
+            return;
+        }
+        for (index, (expected, argument)) in signature.parameters.iter().zip(arguments).enumerate()
+        {
+            let actual = infer_expression_type(self.manifest, &self.local_types, &argument.value);
+            if !expected.accepts(&actual) {
+                self.errors.push(CompileError {
+                    message: format!(
+                        "argument {} expects {expected:?}, got {actual:?}",
+                        index + 1
+                    ),
+                    span: argument.span,
+                });
+            }
+        }
+    }
+
     fn compile_statement_task(&mut self, statement: &Stmt) -> u32 {
         let parent = std::mem::take(&mut self.instructions);
         self.statement(statement);
@@ -599,6 +886,52 @@ impl Compiler<'_> {
             children: Vec::new(),
         });
         task
+    }
+}
+
+fn infer_expression_type(
+    manifest: Option<&BuiltinManifest>,
+    locals: &BTreeMap<String, ScriptType>,
+    expression: &Expr,
+) -> ScriptType {
+    match &expression.kind {
+        ExprKind::Null => ScriptType::Null,
+        ExprKind::Ellipsis => ScriptType::Any,
+        ExprKind::Bool(_) | ExprKind::Binary { .. } => ScriptType::Bool,
+        ExprKind::Number {
+            unit: NumberUnit::Scalar,
+            ..
+        }
+        | ExprKind::UnaryMinus(_) => ScriptType::Number,
+        ExprKind::Number {
+            unit: NumberUnit::Percent,
+            ..
+        } => ScriptType::Percent,
+        ExprKind::String(_) => ScriptType::String,
+        ExprKind::Symbol(name) => manifest
+            .and_then(|manifest| manifest.resolve_getter(name).ok())
+            .and_then(|member| manifest.and_then(|manifest| manifest.signature(member.builtin)))
+            .map(|signature| signature.result.clone())
+            .unwrap_or(ScriptType::Symbol),
+        ExprKind::Tuple(_) => ScriptType::Tuple,
+        ExprKind::Map(_) => ScriptType::Map,
+        ExprKind::Call { callee, .. } => {
+            let builtin = manifest.and_then(|manifest| match &callee.kind {
+                ExprKind::Ident(name) => manifest.resolve(name),
+                ExprKind::Symbol(name) => manifest
+                    .resolve_static_method(name)
+                    .ok()
+                    .map(|member| member.builtin),
+                ExprKind::Member { name, .. } => manifest.resolve(name),
+                _ => None,
+            });
+            builtin
+                .and_then(|builtin| manifest.and_then(|manifest| manifest.signature(builtin)))
+                .map(|signature| signature.result.clone())
+                .unwrap_or(ScriptType::Any)
+        }
+        ExprKind::Ident(name) => locals.get(name).cloned().unwrap_or(ScriptType::Any),
+        ExprKind::Member { .. } | ExprKind::Block(_) => ScriptType::Any,
     }
 }
 

@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use hiraku_script::{
-    hks::{Argument, Block, Expr, ExprKind, NumberUnit, Stmt, parse_program},
+    Argument, Block, Expr, ExprKind, NumberUnit, Stmt,
     hson::{HsonMap as Map, HsonValue as Value},
+    parse_program,
 };
 
 use crate::{

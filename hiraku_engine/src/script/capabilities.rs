@@ -1,22 +1,22 @@
-//! Engine-owned native capabilities registered into the generic HKS VM.
+//! Engine-owned script capabilities registered into the generic Hiraku VM.
 
 use std::collections::BTreeMap;
 
-use hiraku_script::hks::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
-use hiraku_script::hks::vm::{
-    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, TaskEvent, TaskMode, TaskScheduler,
-    TaskStatus, Value, Vm, VmEvent, compile_with_manifest,
+use hiraku_script::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
+use hiraku_script::vm::{
+    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, FunctionSignature, ScriptType,
+    StaticMemberKind, TaskEvent, TaskMode, TaskScheduler, TaskStatus, Value, Vm, VmEvent,
+    compile_with_manifest,
 };
-use hiraku_script::hks::{Expr, Program, Stmt, parse_program};
+use hiraku_script::{Expr, Program, StatementValue, Stmt, parse_program};
 use thiserror::Error;
 
 use crate::script::CameraEffectScope;
 
 /// Engine-facing effects produced by HKS native functions.
 ///
-/// This is deliberately independent of the transitional story IR. The direct
-/// runtime can dispatch these effects to ECS, while the legacy bridge may still
-/// translate them into `IrCommand` during the migration.
+/// This is deliberately independent of the transitional story IR. Engine code
+/// dispatches these effects directly to ECS-facing script commands.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoryEffect {
     Log(String),
@@ -41,6 +41,9 @@ pub enum StoryEffect {
     },
     Say {
         speaker: String,
+        text: String,
+    },
+    ContinueDialogue {
         text: String,
     },
     PlayVoice {
@@ -89,6 +92,12 @@ const VOICE: BuiltinId = BuiltinId(22);
 const SAY: BuiltinId = BuiltinId(23);
 pub const OPEN_UI: BuiltinId = BuiltinId(24);
 pub const WAIT: BuiltinId = BuiltinId(25);
+const DIALOGUE_OPERATOR: BuiltinId = BuiltinId(26);
+const POSITION_ABSOLUTE: BuiltinId = BuiltinId(27);
+const POSITION_RELATIVE: BuiltinId = BuiltinId(28);
+const POSITION_LEFT: BuiltinId = BuiltinId(29);
+const POSITION_CENTER: BuiltinId = BuiltinId(30);
+const POSITION_RIGHT: BuiltinId = BuiltinId(31);
 
 pub fn manifest() -> BuiltinManifest {
     registry().manifest()
@@ -130,6 +139,8 @@ fn source_hash(path: &str, source: &str) -> u64 {
 
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
+    let actor_type = registry.define_type("Actor");
+    let position_type = registry.define_type("Position");
     registry
         .register_fn_with_id(CHAR, "char", native_char)
         .expect("built-in `char` registration must be unique");
@@ -179,12 +190,127 @@ fn registry() -> NativeRegistry<CharacterContext> {
         .register_fn_with_id(SAY, "say", native_say)
         .expect("built-in `say` registration must be unique");
     registry
+        .register_operator_raw_fn_with_id(DIALOGUE_OPERATOR, ":", native_dialogue_operator)
+        .expect("built-in `:` operator registration must be unique");
+    registry
         .register_selector_raw_fn_with_id(CAMERA_BLUR, "camera", "blur", native_camera_blur)
         .expect("built-in `camera.blur` registration must be unique");
     registry
         .register_selector_raw_fn_with_id(CAMERA_ZOOM, "camera", "zoom", native_camera_zoom)
         .expect("built-in `camera.zoom` registration must be unique");
     registry
+        .set_signature(
+            CHAR,
+            FunctionSignature {
+                receiver: None,
+                parameters: vec![ScriptType::String],
+                result: ScriptType::Named(actor_type),
+            },
+        )
+        .expect("char signature must target a registered builtin");
+    for (builtin, parameters) in [
+        (EMOTION, vec![ScriptType::String]),
+        (
+            AT,
+            vec![ScriptType::Union(vec![
+                ScriptType::String,
+                ScriptType::Named(position_type),
+            ])],
+        ),
+        (SCALE, vec![ScriptType::Number]),
+    ] {
+        registry
+            .set_signature(
+                builtin,
+                FunctionSignature {
+                    receiver: Some(ScriptType::Named(actor_type)),
+                    parameters,
+                    result: ScriptType::Named(actor_type),
+                },
+            )
+            .expect("actor method signature must target a registered builtin");
+    }
+    register_position_api(&mut registry, position_type);
+    registry
+}
+
+fn register_position_api(
+    registry: &mut NativeRegistry<CharacterContext>,
+    position_type: hiraku_script::SymbolId,
+) {
+    for (builtin, name, kind, position) in [
+        (
+            POSITION_LEFT,
+            "left",
+            StaticMemberKind::Getter,
+            Position::Absolute(-600.0, -200.0),
+        ),
+        (
+            POSITION_CENTER,
+            "center",
+            StaticMemberKind::Getter,
+            Position::Absolute(0.0, -200.0),
+        ),
+        (
+            POSITION_RIGHT,
+            "right",
+            StaticMemberKind::Getter,
+            Position::Absolute(600.0, -200.0),
+        ),
+    ] {
+        registry
+            .register_static_raw_fn_with_id(
+                builtin,
+                position_type,
+                name,
+                FunctionSignature {
+                    receiver: None,
+                    parameters: Vec::new(),
+                    result: ScriptType::Named(position_type),
+                },
+                kind,
+                move |_context, _call| Ok(position_value(position_type, position)),
+            )
+            .expect("position getter registration must be unique");
+    }
+    for (builtin, name, relative) in [
+        (POSITION_ABSOLUTE, "pos", false),
+        (POSITION_RELATIVE, "rel", true),
+    ] {
+        registry
+            .register_static_raw_fn_with_id(
+                builtin,
+                position_type,
+                name,
+                FunctionSignature {
+                    receiver: None,
+                    parameters: vec![ScriptType::Number, ScriptType::Number],
+                    result: ScriptType::Named(position_type),
+                },
+                StaticMemberKind::Method,
+                move |_context, call| {
+                    let [x, y] = call.arguments.as_slice() else {
+                        return Err(NativeError::Arity {
+                            expected: 2,
+                            actual: call.arguments.len(),
+                        });
+                    };
+                    let Value::Number(x) = &x.value else {
+                        return Err(NativeError::TypeMismatch("number"));
+                    };
+                    let Value::Number(y) = &y.value else {
+                        return Err(NativeError::TypeMismatch("number"));
+                    };
+                    let position = if relative {
+                        Position::relative(*x, *y)?
+                    } else {
+                        Position::Absolute(*x, *y)
+                    };
+                    Ok(position_value(position_type, position))
+                },
+            )
+            .expect("position constructor registration must be unique");
+    }
 }
 
 fn story_registry() -> NativeRegistry<CharacterContext> {
@@ -240,6 +366,13 @@ impl StoryNativeHost {
         self.context.commit()
     }
 
+    pub fn handle_statement(
+        &mut self,
+        statement: &StatementValue,
+    ) -> Result<(), CharacterCapabilityError> {
+        self.context.handle_statement(statement)
+    }
+
     pub fn drain_effects(&mut self) -> Vec<StoryEffect> {
         std::mem::take(&mut self.context.commands)
     }
@@ -286,9 +419,23 @@ struct CharacterContext {
     handles_by_name: BTreeMap<String, u64>,
     commands: Vec<StoryEffect>,
     wait: Option<StoryWait>,
+    last_speaker: Option<String>,
+    dialogue_buffer: Option<String>,
 }
 
 impl CharacterContext {
+    fn handle_statement(
+        &mut self,
+        statement: &StatementValue,
+    ) -> Result<(), CharacterCapabilityError> {
+        self.commit()?;
+        if let StatementValue::String(text) = statement {
+            native_narrate(self, text.clone())
+                .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn char(&mut self, name: String) -> Result<ActorHandle, CharacterCapabilityError> {
         if let Some(handle) = self.handles_by_name.get(&name).copied() {
             self.flush(handle)?;
@@ -316,14 +463,9 @@ impl CharacterContext {
     fn at(
         &mut self,
         ActorHandle(handle): ActorHandle,
-        position: String,
+        position: Position,
     ) -> Result<ActorHandle, CharacterCapabilityError> {
-        self.actor_mut(handle)?.position = match position.as_str() {
-            "left" => [-600.0, -200.0],
-            "center" => [0.0, -200.0],
-            "right" => [600.0, -200.0],
-            _ => return Err(CharacterCapabilityError::InvalidPosition(position)),
-        };
+        self.actor_mut(handle)?.position = position.resolve();
         self.actor_mut(handle)?.dirty = true;
         Ok(ActorHandle(handle))
     }
@@ -380,6 +522,83 @@ impl CharacterContext {
 #[derive(Clone, Copy)]
 struct ActorHandle(u64);
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Position {
+    Absolute(f64, f64),
+    Relative(u16, u16),
+}
+
+impl Position {
+    fn relative(x: f64, y: f64) -> Result<Self, NativeError> {
+        fn component(value: f64) -> Result<u16, NativeError> {
+            if !value.is_finite() || value.fract() != 0.0 || !(0.0..=100.0).contains(&value) {
+                return Err(NativeError::message(
+                    "relative position components must be integers from 0 through 100",
+                ));
+            }
+            Ok(value as u16)
+        }
+        Ok(Self::Relative(component(x)?, component(y)?))
+    }
+
+    fn resolve(self) -> [f32; 2] {
+        match self {
+            Self::Absolute(x, y) => [x as f32, y as f32],
+            // Relative coordinates use a bottom-left origin in the canonical 1920x1080 canvas.
+            Self::Relative(x, y) => [
+                f32::from(x) / 100.0 * 1920.0 - 960.0,
+                f32::from(y) / 100.0 * 1080.0 - 540.0,
+            ],
+        }
+    }
+}
+
+impl FromHksValue for Position {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::String(preset) => match preset.as_str() {
+                "left" => Ok(Self::Absolute(-600.0, -200.0)),
+                "center" => Ok(Self::Absolute(0.0, -200.0)),
+                "right" => Ok(Self::Absolute(600.0, -200.0)),
+                _ => Err(NativeError::message(format!(
+                    "unknown character position `{preset}`"
+                ))),
+            },
+            Value::Typed { value, .. } => position_payload(value),
+            _ => Err(NativeError::TypeMismatch("Position")),
+        }
+    }
+}
+
+fn position_value(type_id: hiraku_script::SymbolId, position: Position) -> Value {
+    let (kind, x, y) = match position {
+        Position::Absolute(x, y) => ("absolute", x, y),
+        Position::Relative(x, y) => ("relative", f64::from(x), f64::from(y)),
+    };
+    Value::Typed {
+        type_id,
+        value: Box::new(Value::Tuple(vec![
+            Value::Symbol(kind.to_string()),
+            Value::Number(x),
+            Value::Number(y),
+        ])),
+    }
+}
+
+fn position_payload(value: &Value) -> Result<Position, NativeError> {
+    let Value::Tuple(fields) = value else {
+        return Err(NativeError::TypeMismatch("Position"));
+    };
+    let [Value::Symbol(kind), Value::Number(x), Value::Number(y)] = fields.as_slice() else {
+        return Err(NativeError::TypeMismatch("Position"));
+    };
+    match kind.as_str() {
+        "absolute" => Ok(Position::Absolute(*x, *y)),
+        "relative" => Position::relative(*x, *y),
+        _ => Err(NativeError::message("unknown Position variant")),
+    }
+}
+
 impl FromHksValue for ActorHandle {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         actor_handle(value)
@@ -413,7 +632,7 @@ fn native_emotion(
 fn native_at(
     context: &mut CharacterContext,
     actor: ActorHandle,
-    position: String,
+    position: Position,
 ) -> Result<ActorHandle, NativeError> {
     context
         .at(actor, position)
@@ -436,6 +655,8 @@ fn native_log(context: &mut CharacterContext, message: String) -> Result<(), Nat
 }
 
 fn native_clear_text(context: &mut CharacterContext) -> Result<(), NativeError> {
+    context.last_speaker = None;
+    context.dialogue_buffer = None;
     context.commands.push(StoryEffect::ClearDialogue);
     Ok(())
 }
@@ -499,6 +720,8 @@ fn native_play_bgm(
 }
 
 fn native_narrate(context: &mut CharacterContext, text: String) -> Result<(), NativeError> {
+    context.last_speaker = Some(String::new());
+    context.dialogue_buffer = Some(text.clone());
     context.commands.push(StoryEffect::Say {
         speaker: String::new(),
         text,
@@ -512,9 +735,51 @@ fn native_say(
     speaker: String,
     text: String,
 ) -> Result<(), NativeError> {
+    context.last_speaker = Some(speaker.clone());
+    context.dialogue_buffer = Some(text.clone());
     context.commands.push(StoryEffect::Say { speaker, text });
     context.wait = Some(StoryWait::DialogueAdvance);
     Ok(())
+}
+
+fn native_dialogue_operator(
+    context: &mut CharacterContext,
+    call: &BuiltinCall,
+) -> Result<Value, NativeError> {
+    if call.receiver.is_some() || call.arguments.len() != 2 {
+        return Err(NativeError::message("operator `:` expects two operands"));
+    }
+    let continuation = matches!(call.arguments[0].value, Value::Ellipsis);
+    let speaker = match &call.arguments[0].value {
+        Value::Handle {
+            type_id: ACTOR_HANDLE_TYPE,
+            id,
+        } => context
+            .actors
+            .get(id)
+            .map(|actor| actor.name.clone())
+            .ok_or_else(|| NativeError::message(format!("unknown actor handle {id}")))?,
+        Value::Ellipsis => context.last_speaker.clone().unwrap_or_default(),
+        _ => return Err(NativeError::TypeMismatch("actor or ellipsis")),
+    };
+    let Value::String(text) = &call.arguments[1].value else {
+        return Err(NativeError::TypeMismatch("string"));
+    };
+    if continuation {
+        if let Some(buffer) = context.dialogue_buffer.as_mut() {
+            buffer.push_str(text);
+            context
+                .commands
+                .push(StoryEffect::ContinueDialogue { text: text.clone() });
+            context.wait = Some(StoryWait::DialogueAdvance);
+        } else {
+            bevy::log::warn!("`...` has no dialogue buffer; treating it as narration");
+            native_narrate(context, text.clone())?;
+        }
+    } else {
+        native_say(context, speaker, text.clone())?;
+    }
+    Ok(Value::Null)
 }
 
 fn native_voice(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
@@ -529,7 +794,7 @@ fn native_voice(context: &mut CharacterContext, path: String) -> Result<(), Nati
 
 fn native_camera_blur(
     context: &mut CharacterContext,
-    call: &hiraku_script::hks::vm::BuiltinCall,
+    call: &hiraku_script::vm::BuiltinCall,
 ) -> Result<Value, NativeError> {
     require_selector(call, "camera")?;
     let mut intensity = None;
@@ -563,7 +828,7 @@ fn native_camera_blur(
 
 fn native_camera_zoom(
     context: &mut CharacterContext,
-    call: &hiraku_script::hks::vm::BuiltinCall,
+    call: &hiraku_script::vm::BuiltinCall,
 ) -> Result<Value, NativeError> {
     require_selector(call, "camera")?;
     let mut scale = None;
@@ -598,7 +863,7 @@ fn native_camera_zoom(
 }
 
 fn require_selector(
-    call: &hiraku_script::hks::vm::BuiltinCall,
+    call: &hiraku_script::vm::BuiltinCall,
     expected: &str,
 ) -> Result<(), NativeError> {
     match &call.receiver {
@@ -723,7 +988,7 @@ pub fn execute_with_host(
                 vm.resume_builtin(value)
                     .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
             }
-            Some(VmEvent::StatementCommit) => host.context.commit()?,
+            Some(VmEvent::Statement(value)) => host.context.handle_statement(&value)?,
             Some(VmEvent::Completed(_)) => {
                 return Ok(CapabilityOutput {
                     commands: host.drain_effects(),
@@ -784,8 +1049,8 @@ fn execute_task(
                     .resume(task, value)
                     .map_err(|error| CharacterCapabilityError::Vm(format!("{error:?}")))?;
             }
-            Some(TaskEvent::StatementCommit { task }) => {
-                contexts.entry(task).or_default().commit()?;
+            Some(TaskEvent::Statement { task, value }) => {
+                contexts.entry(task).or_default().handle_statement(&value)?;
             }
             Some(TaskEvent::Completed { .. }) => {}
             None => {
@@ -815,8 +1080,6 @@ pub enum CharacterCapabilityError {
     InvalidActorHandle,
     #[error("unknown actor handle {0}")]
     UnknownActor(u64),
-    #[error("invalid character position `{0}`")]
-    InvalidPosition(String),
     #[error("capabilities which suspend for host input are not yet supported inside seq/par")]
     SuspendingTaskCapability,
     #[error("HKS VM error: {0}")]
@@ -828,7 +1091,8 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hiraku_script::hks::parse_program;
+    use crate::script::hks_runtime::{HksRuntime, HksRuntimeEvent};
+    use hiraku_script::parse_program;
 
     #[test]
     fn fluent_calls_flush_once_at_the_statement_boundary() {
@@ -846,6 +1110,39 @@ mod tests {
             if actor_id == "Alice" && expressions == &["happy_eyes", "happy_face"]
                 && position == &[600.0, -200.0] && (*scale - 0.5).abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn typed_positions_support_relative_constructors_and_getters() {
+        for (source, expected) in [
+            (r#"char("Alice").at(.rel(50, 50))"#, [0.0, 0.0]),
+            (r#"char("Alice").at(.left)"#, [-600.0, -200.0]),
+        ] {
+            let program = parse_program(source).expect("typed position syntax must parse");
+            let Stmt::Expr(expression) = &program.statements[0] else {
+                panic!("expected character expression")
+            };
+            let output = execute(
+                compile_expression(expression, &[], 48)
+                    .expect("typed position must pass signature checking"),
+            )
+            .expect("typed position calls must execute");
+            assert!(matches!(
+                &output.commands[0],
+                StoryEffect::ShowCharacter { position, .. } if position == &expected
+            ));
+        }
+    }
+
+    #[test]
+    fn actor_receiver_types_are_checked_across_let_bindings() {
+        let error = compile_story_bytecode(
+            "invalid.story.hks",
+            r#"let not_actor = "text"
+not_actor.at(.left)"#,
+        )
+        .expect_err("a string must not be accepted as an Actor receiver");
+        assert!(error.contains("receiver expects Named"));
     }
 
     #[test]
@@ -939,6 +1236,79 @@ mod tests {
             vec![StoryEffect::Say {
                 speaker: "Alice".to_string(),
                 text: "Hello".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn engine_hooks_dialogue_sugar_without_vm_story_knowledge() {
+        let bytecode = compile_story_bytecode(
+            "dialogue.story.hks",
+            r#"
+                let ema = char("ema")
+                ema: "first"
+                ...: "continued"
+                "narration"
+                char("ema").e("happy"): "inline"
+            "#,
+        )
+        .expect("dialogue sugar must compile");
+        let mut runtime = HksRuntime::new(bytecode).expect("runtime must initialize");
+        let mut host = StoryNativeHost::new();
+        loop {
+            match runtime.step().expect("runtime must advance") {
+                Some(HksRuntimeEvent::Call(call)) => {
+                    let value = host.call(&call).expect("native call must succeed");
+                    runtime
+                        .resume_main(value)
+                        .expect("native result must resume VM");
+                }
+                Some(HksRuntimeEvent::Statement(value)) => host
+                    .handle_statement(&value)
+                    .expect("statement hook must succeed"),
+                Some(HksRuntimeEvent::Completed(_)) => break,
+                Some(event) => panic!("unexpected runtime event: {event:?}"),
+                None => panic!("runtime stopped before completion"),
+            }
+        }
+
+        let dialogue = host
+            .drain_effects()
+            .into_iter()
+            .filter_map(|effect| match effect {
+                StoryEffect::Say { speaker, text } => Some((false, speaker, text)),
+                StoryEffect::ContinueDialogue { text } => Some((true, String::new(), text)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dialogue,
+            vec![
+                (false, "ema".to_string(), "first".to_string()),
+                (true, String::new(), "continued".to_string()),
+                (false, String::new(), "narration".to_string()),
+                (false, "ema".to_string(), "inline".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn orphaned_continuation_falls_back_to_narration() {
+        let bytecode = compile_story_bytecode("orphan.story.hks", r#"...: "orphan""#)
+            .expect("orphaned continuation must compile");
+        let mut runtime = HksRuntime::new(bytecode).expect("runtime must initialize");
+        let mut host = StoryNativeHost::new();
+        let Some(HksRuntimeEvent::Call(call)) = runtime.step().expect("runtime must advance")
+        else {
+            panic!("expected dialogue operator call")
+        };
+        host.call(&call)
+            .expect("orphaned continuation must degrade gracefully");
+        assert_eq!(
+            host.drain_effects(),
+            vec![StoryEffect::Say {
+                speaker: String::new(),
+                text: "orphan".to_string(),
             }]
         );
     }
