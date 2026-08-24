@@ -147,6 +147,8 @@ impl From<&SaveGameData> for proto::SaveGameData {
                 .and_then(|snapshot| hson::to_vec(snapshot).ok())
                 .unwrap_or_default(),
             pending_ui_screen: data.pending_ui_screen.clone(),
+            script_call_stack_hson: hson::to_vec(&data.script_call_stack)
+                .expect("script call stack snapshots must serialize to HSON"),
         }
     }
 }
@@ -183,6 +185,13 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                 })?)
             },
             pending_ui_screen: data.pending_ui_screen,
+            script_call_stack: if data.script_call_stack_hson.is_empty() {
+                Vec::new()
+            } else {
+                hson::from_slice(&data.script_call_stack_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid HSON script call stack: {error}"))
+                })?
+            },
         })
     }
 }
@@ -542,7 +551,7 @@ mod tests {
         let snapshot = runtime.snapshot().expect("wait boundary must be saveable");
         let data = SaveGameData {
             version: 7,
-            resume_script: "system.story.hks".to_string(),
+            resume_script: "system.hks".to_string(),
             vm_snapshot: Some(snapshot.clone()),
             pending_ui_screen: Some("ui/title.ui.hks".to_string()),
             ..Default::default()

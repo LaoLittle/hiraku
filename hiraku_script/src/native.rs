@@ -521,6 +521,11 @@ pub trait IntoHksValue {
     fn into_hks_value(self) -> Value;
 }
 
+/// Maps a Rust native API type to the compiler-visible HKS type.
+pub trait HksScriptType {
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType;
+}
+
 pub trait HksNativeType: Sized {
     const HKS_TYPE_NAME: &'static str;
 
@@ -538,6 +543,12 @@ pub trait HksNativeType: Sized {
 impl FromHksValue for Value {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         Ok(value.clone())
+    }
+}
+
+impl HksScriptType for Value {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::Any
     }
 }
 
@@ -562,6 +573,12 @@ impl IntoHksValue for String {
     }
 }
 
+impl HksScriptType for String {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::String
+    }
+}
+
 impl FromHksValue for bool {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
@@ -574,6 +591,12 @@ impl FromHksValue for bool {
 impl IntoHksValue for bool {
     fn into_hks_value(self) -> Value {
         Value::Bool(self)
+    }
+}
+
+impl HksScriptType for bool {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::Bool
     }
 }
 
@@ -592,6 +615,12 @@ impl IntoHksValue for f64 {
     }
 }
 
+impl HksScriptType for f64 {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::Number
+    }
+}
+
 impl FromHksValue for f32 {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         f64::from_hks_value(value).map(|value| value as f32)
@@ -601,6 +630,12 @@ impl FromHksValue for f32 {
 impl IntoHksValue for f32 {
     fn into_hks_value(self) -> Value {
         Value::Number(f64::from(self))
+    }
+}
+
+impl HksScriptType for f32 {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::Number
     }
 }
 
@@ -630,6 +665,12 @@ macro_rules! impl_integer_value {
                     Value::Number(self as f64)
                 }
             }
+
+            impl HksScriptType for $type {
+                fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+                    crate::vm::ScriptType::Int
+                }
+            }
         )*
     };
 }
@@ -639,6 +680,24 @@ impl_integer_value!(u8, u16, u32, i8, i16, i32);
 impl IntoHksValue for () {
     fn into_hks_value(self) -> Value {
         Value::Null
+    }
+}
+
+impl HksScriptType for () {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::Unit
+    }
+}
+
+impl<T: HksScriptType> HksScriptType for Option<T> {
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::Nullable(Box::new(T::hks_script_type(registry)))
+    }
+}
+
+impl<T: HksScriptType> HksScriptType for Vec<T> {
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
+        crate::vm::ScriptType::List(Box::new(T::hks_script_type(registry)))
     }
 }
 
@@ -798,6 +857,56 @@ mod tests {
         assert_eq!(scale, 1.2);
         context.calls += 1;
         Ok(())
+    }
+
+    #[crate::hks_module]
+    mod macro_api {
+        use super::*;
+
+        #[hks]
+        fn native_greet_user(context: &mut Context, name: String) -> Result<String, NativeError> {
+            context.calls += 1;
+            Ok(format!("hello {name}"))
+        }
+
+        #[hks(name = "rename", receiver = "Actor", result = "Actor")]
+        fn rename_actor(
+            context: &mut Context,
+            actor: String,
+            _name: String,
+        ) -> Result<String, NativeError> {
+            context.calls += 1;
+            Ok(actor)
+        }
+    }
+
+    #[test]
+    fn hks_module_registers_names_and_signatures_from_rust_functions() {
+        let mut registry = NativeRegistry::<Context>::new();
+        macro_api::register_hks(&mut registry).expect("module API must register");
+        let manifest = registry.manifest();
+        let actor = manifest
+            .symbols()
+            .find("Actor")
+            .expect("receiver override must define Actor");
+        let greet = manifest.resolve("greetUser").expect("camelCase name");
+        assert_eq!(
+            manifest.signature(greet),
+            Some(&FunctionSignature {
+                receiver: None,
+                parameters: vec![ScriptType::String],
+                result: ScriptType::String,
+            })
+        );
+        let rename = manifest.resolve("rename").expect("explicit public name");
+        assert_eq!(
+            manifest.signature(rename),
+            Some(&FunctionSignature {
+                receiver: Some(ScriptType::Named(actor)),
+                parameters: vec![ScriptType::String],
+                result: ScriptType::Named(actor),
+            })
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! The VM never accesses an ECS world. Builtin calls are yielded as data and
 //! resumed by the embedding engine with a value.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +14,7 @@ use crate::{
     symbol::{SymbolId, SymbolManifest},
 };
 
-pub const BYTECODE_VERSION: u16 = 6;
+pub const BYTECODE_VERSION: u16 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
@@ -25,7 +25,7 @@ pub struct FunctionId(pub u32);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScriptType {
     Any,
-    Null,
+    Unit,
     Bool,
     Int,
     Number,
@@ -49,8 +49,12 @@ impl ScriptType {
             || actual == &Self::Any
             || self == actual
             || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))
-            || matches!(self, Self::Nullable(inner) if actual == &Self::Null || inner.accepts(actual))
+            || matches!(self, Self::Nullable(inner) if inner.accepts(actual))
             || matches!((self, actual), (Self::List(expected), Self::List(actual)) if expected.accepts(actual))
+            || matches!((self, actual), (Self::Record(expected), Self::Record(actual))
+                if expected.len() == actual.len()
+                    && expected.iter().all(|(name, expected)|
+                        actual.get(name).is_some_and(|actual| expected.accepts(actual))))
             || matches!((self, actual), (Self::Number, Self::Int))
     }
 }
@@ -361,6 +365,10 @@ pub enum Instruction {
     Constant(Value),
     LoadLocal(String),
     StoreLocal(String),
+    StoreLocalMember {
+        root: String,
+        path: Vec<String>,
+    },
     LoadGlobal(String),
     StoreGlobal(String),
     StoreGlobalMember {
@@ -493,9 +501,14 @@ fn compile_inner(
                             _ => None,
                         })
                         .map(|expression| {
-                            infer_expression_type(manifest, &parameter_locals, expression)
+                            infer_expression_type(
+                                manifest,
+                                &type_aliases,
+                                &parameter_locals,
+                                expression,
+                            )
                         })
-                        .unwrap_or(ScriptType::Null);
+                        .unwrap_or(ScriptType::Unit);
                     let result = result.unwrap_or(inferred_result);
                     function_signatures.insert(
                         name.clone(),
@@ -535,9 +548,9 @@ fn compile_inner(
                     .as_ref()
                     .and_then(|ty| script_type_from_ast(ty, &type_aliases, manifest))
                     .or_else(|| {
-                        value
-                            .as_ref()
-                            .map(|value| infer_expression_type(manifest, &BTreeMap::new(), value))
+                        value.as_ref().map(|value| {
+                            infer_expression_type(manifest, &type_aliases, &BTreeMap::new(), value)
+                        })
                     })
                     .unwrap_or(ScriptType::Any);
                 global_types.insert(name.clone(), ty);
@@ -553,6 +566,7 @@ fn compile_inner(
         function_names,
         function_signatures,
         local_types: global_types.clone(),
+        local_bindings: BTreeSet::new(),
         global_types,
         type_aliases,
     };
@@ -586,6 +600,7 @@ struct Compiler<'a> {
     function_names: BTreeMap<String, FunctionId>,
     function_signatures: BTreeMap<String, FunctionSignature>,
     local_types: BTreeMap<String, ScriptType>,
+    local_bindings: BTreeSet<String>,
     global_types: BTreeMap<String, ScriptType>,
     type_aliases: BTreeMap<String, ScriptType>,
 }
@@ -598,7 +613,51 @@ impl Compiler<'_> {
         {
             return signature.result.clone();
         }
-        infer_expression_type(self.manifest, &self.local_types, expression)
+        infer_expression_type(
+            self.manifest,
+            &self.type_aliases,
+            &self.local_types,
+            expression,
+        )
+    }
+
+    fn expression_matches(&self, expected: &ScriptType, expression: &Expr) -> bool {
+        match (&expression.kind, expected) {
+            (ExprKind::Null, ScriptType::Nullable(_) | ScriptType::Any) => true,
+            (ExprKind::Null, _) => false,
+            (
+                ExprKind::Map(fields) | ExprKind::TypedMap { fields, .. },
+                ScriptType::Record(types),
+            ) => {
+                fields.len() == types.len()
+                    && fields.iter().all(|field| {
+                        types
+                            .get(&field.name)
+                            .is_some_and(|expected| self.expression_matches(expected, &field.value))
+                    })
+            }
+            (ExprKind::List(values), ScriptType::List(element)) => values
+                .iter()
+                .all(|value| self.expression_matches(element, value)),
+            (_, _) => expected.accepts(&self.infer_type(expression)),
+        }
+    }
+
+    fn reject_untyped_null(&mut self, binding: &str, kind: &str, expression: &Expr) {
+        let Some(path) = uncontextual_null_path(expression) else {
+            return;
+        };
+        let target = if path.is_empty() {
+            binding.to_string()
+        } else {
+            format!("{binding}.{}", path.join("."))
+        };
+        self.errors.push(CompileError {
+            message: format!(
+                "cannot infer a type for null at `{target}`; add an explicit type (`{kind} {binding}: Type = ...`) or use a typed record constructor (`{kind} {binding} = Type.{{ ... }}`)"
+            ),
+            span: expression.span,
+        });
     }
 
     fn compile_functions(&mut self, program: &Program) {
@@ -618,6 +677,7 @@ impl Compiler<'_> {
         for (name, parameters, body) in declarations {
             let parent = std::mem::take(&mut self.instructions);
             let parent_types = std::mem::take(&mut self.local_types);
+            let parent_bindings = std::mem::take(&mut self.local_bindings);
             self.local_types = self.global_types.clone();
             let signature =
                 self.function_signatures
@@ -634,11 +694,25 @@ impl Compiler<'_> {
                     .zip(&signature.parameters)
                     .map(|(parameter, ty)| (parameter.name.clone(), ty.clone())),
             );
+            self.local_bindings
+                .extend(parameters.iter().map(|parameter| parameter.name.clone()));
             for (index, statement) in body.statements.iter().enumerate() {
                 let is_last = index + 1 == body.statements.len();
                 if is_last && let Stmt::Expr(expression) = statement {
+                    if matches!(expression.kind, ExprKind::Null)
+                        && !matches!(signature.result, ScriptType::Nullable(_))
+                    {
+                        self.errors.push(CompileError {
+                            message: format!(
+                                "function `{name}` returns null without a nullable return type; declare an explicit `Type?` return type"
+                            ),
+                            span: expression.span,
+                        });
+                    }
                     let actual = self.infer_type(expression);
-                    if signature.result != ScriptType::Any && !signature.result.accepts(&actual) {
+                    if signature.result != ScriptType::Any
+                        && !self.expression_matches(&signature.result, expression)
+                    {
                         self.errors.push(CompileError {
                             message: format!(
                                 "function `{name}` returns {:?}, got {actual:?}",
@@ -666,11 +740,11 @@ impl Compiler<'_> {
             }
             if !matches!(self.instructions.last(), Some(Instruction::Return)) {
                 if signature.result != ScriptType::Any
-                    && !signature.result.accepts(&ScriptType::Null)
+                    && !signature.result.accepts(&ScriptType::Unit)
                 {
                     self.errors.push(CompileError {
                         message: format!(
-                            "function `{name}` may return Null, expected {:?}",
+                            "function `{name}` may return Unit, expected {:?}",
                             signature.result
                         ),
                         span: body.span,
@@ -681,6 +755,7 @@ impl Compiler<'_> {
             }
             let instructions = std::mem::replace(&mut self.instructions, parent);
             self.local_types = parent_types;
+            self.local_bindings = parent_bindings;
             self.functions.push(FunctionTemplate {
                 name,
                 parameters: parameters
@@ -705,6 +780,9 @@ impl Compiler<'_> {
                 value,
                 ..
             } => {
+                if type_annotation.is_none() {
+                    self.reject_untyped_null(name, "let", value);
+                }
                 let value_type = self.infer_type(value);
                 let declared_type = type_annotation
                     .as_ref()
@@ -716,7 +794,7 @@ impl Compiler<'_> {
                     });
                 }
                 if let Some(expected) = &declared_type
-                    && !expected.accepts(&value_type)
+                    && !self.expression_matches(expected, value)
                 {
                     self.errors.push(CompileError {
                         message: format!("local `{name}` expects {expected:?}, got {value_type:?}"),
@@ -728,11 +806,15 @@ impl Compiler<'_> {
                     .push(Instruction::StoreLocal(name.clone()));
                 self.local_types
                     .insert(name.clone(), declared_type.unwrap_or(value_type));
+                self.local_bindings.insert(name.clone());
                 self.instructions
                     .push(Instruction::Statement(StatementValue::Commit));
             }
             Stmt::Global {
-                name, value, span, ..
+                name,
+                type_annotation,
+                value,
+                span,
             } => {
                 let expected = self
                     .global_types
@@ -740,8 +822,11 @@ impl Compiler<'_> {
                     .cloned()
                     .unwrap_or(ScriptType::Any);
                 if let Some(value) = value {
+                    if type_annotation.is_none() {
+                        self.reject_untyped_null(name, "global", value);
+                    }
                     let actual = self.infer_type(value);
-                    if !expected.accepts(&actual) {
+                    if !self.expression_matches(&expected, value) {
                         self.errors.push(CompileError {
                             message: format!(
                                 "global `{name}` expects {expected:?}, got {actual:?}"
@@ -763,10 +848,15 @@ impl Compiler<'_> {
             Stmt::Assign { target, value, .. } => {
                 let actual = self.infer_type(value);
                 if let Some((root, path)) = assignment_member_path(target) {
-                    let Some(root_type) = self.global_types.get(&root) else {
+                    let is_local = self.local_bindings.contains(&root);
+                    let root_type = if is_local {
+                        self.local_types.get(&root)
+                    } else {
+                        self.global_types.get(&root)
+                    };
+                    let Some(root_type) = root_type else {
                         self.errors.push(CompileError {
-                            message: "member assignment is only supported for global records"
-                                .to_string(),
+                            message: format!("unknown assignment root `{root}`"),
                             span: target.span,
                         });
                         return;
@@ -778,7 +868,7 @@ impl Compiler<'_> {
                         });
                         return;
                     };
-                    if !expected.accepts(&actual) {
+                    if !self.expression_matches(expected, value) {
                         self.errors.push(CompileError {
                             message: format!(
                                 "`{root}.{}` expects {expected:?}, got {actual:?}",
@@ -788,8 +878,13 @@ impl Compiler<'_> {
                         });
                     }
                     self.expression(value);
-                    self.instructions
-                        .push(Instruction::StoreGlobalMember { root, path });
+                    if is_local {
+                        self.instructions
+                            .push(Instruction::StoreLocalMember { root, path });
+                    } else {
+                        self.instructions
+                            .push(Instruction::StoreGlobalMember { root, path });
+                    }
                     self.instructions
                         .push(Instruction::Statement(StatementValue::Commit));
                     return;
@@ -802,12 +897,14 @@ impl Compiler<'_> {
                     });
                     return;
                 };
-                let expected = self
-                    .global_types
-                    .get(name)
-                    .or_else(|| self.local_types.get(name));
+                let is_local = self.local_bindings.contains(name);
+                let expected = if is_local {
+                    self.local_types.get(name)
+                } else {
+                    self.global_types.get(name)
+                };
                 if let Some(expected) = expected
-                    && !expected.accepts(&actual)
+                    && !self.expression_matches(expected, value)
                 {
                     self.errors.push(CompileError {
                         message: format!("`{name}` expects {expected:?}, got {actual:?}"),
@@ -815,18 +912,24 @@ impl Compiler<'_> {
                     });
                 }
                 self.expression(value);
-                if self.global_types.contains_key(name) {
-                    self.instructions
-                        .push(Instruction::StoreGlobal(name.clone()));
-                } else {
+                if is_local {
                     self.instructions
                         .push(Instruction::StoreLocal(name.clone()));
-                    self.local_types.insert(name.clone(), actual);
+                } else {
+                    self.instructions
+                        .push(Instruction::StoreGlobal(name.clone()));
                 }
                 self.instructions
                     .push(Instruction::Statement(StatementValue::Commit));
             }
             Stmt::Expr(expression) => {
+                if matches!(expression.kind, ExprKind::Null) {
+                    self.errors.push(CompileError {
+                        message: "standalone null has no type; use it only where an explicit nullable type is expected"
+                            .to_string(),
+                        span: expression.span,
+                    });
+                }
                 let statement_value = lower_statement(statement);
                 if matches!(statement_value, StatementValue::String(_)) {
                     self.instructions
@@ -956,6 +1059,59 @@ impl Compiler<'_> {
                     fields.iter().map(|field| field.name.clone()).collect(),
                 ));
             }
+            ExprKind::TypedMap { type_name, fields } => {
+                match self.type_aliases.get(type_name).cloned() {
+                    Some(ScriptType::Record(expected_fields)) => {
+                        for field in fields {
+                            match expected_fields.get(&field.name) {
+                                Some(expected) => {
+                                    let actual = self.infer_type(&field.value);
+                                    if !self.expression_matches(expected, &field.value) {
+                                        self.errors.push(CompileError {
+                                            message: format!(
+                                                "`{type_name}.{}` expects {expected:?}, got {actual:?}",
+                                                field.name
+                                            ),
+                                            span: field.value.span,
+                                        });
+                                    }
+                                }
+                                None => self.errors.push(CompileError {
+                                    message: format!(
+                                        "type `{type_name}` has no field `{}`",
+                                        field.name
+                                    ),
+                                    span: field.span,
+                                }),
+                            }
+                        }
+                        for name in expected_fields.keys() {
+                            if !fields.iter().any(|field| &field.name == name) {
+                                self.errors.push(CompileError {
+                                    message: format!(
+                                        "typed record `{type_name}` is missing field `{name}`"
+                                    ),
+                                    span: expression.span,
+                                });
+                            }
+                        }
+                    }
+                    Some(_) => self.errors.push(CompileError {
+                        message: format!("type `{type_name}` is not a record type"),
+                        span: expression.span,
+                    }),
+                    None => self.errors.push(CompileError {
+                        message: format!("unknown record type `{type_name}`"),
+                        span: expression.span,
+                    }),
+                }
+                for field in fields {
+                    self.expression(&field.value);
+                }
+                self.instructions.push(Instruction::MakeMap(
+                    fields.iter().map(|field| field.name.clone()).collect(),
+                ));
+            }
             ExprKind::Call {
                 callee,
                 arguments,
@@ -1014,7 +1170,7 @@ impl Compiler<'_> {
                             .and_then(|signature| signature.parameters.get(index))
                         {
                             let actual = self.infer_type(&argument.value);
-                            if !expected.accepts(&actual) {
+                            if !self.expression_matches(expected, &argument.value) {
                                 self.errors.push(CompileError {
                                     message: format!(
                                         "function `{name}` argument {} expects {expected:?}, got {actual:?}",
@@ -1239,7 +1395,7 @@ impl Compiler<'_> {
         for (index, (expected, argument)) in signature.parameters.iter().zip(arguments).enumerate()
         {
             let actual = self.infer_type(&argument.value);
-            if !expected.accepts(&actual) {
+            if !self.expression_matches(expected, &argument.value) {
                 self.errors.push(CompileError {
                     message: format!(
                         "argument {} expects {expected:?}, got {actual:?}",
@@ -1267,7 +1423,7 @@ impl Compiler<'_> {
         };
         if let Some(expected) = &signature.receiver {
             let actual = self.infer_type(receiver);
-            if !expected.accepts(&actual) {
+            if !self.expression_matches(expected, receiver) {
                 self.errors.push(CompileError {
                     message: format!("receiver expects {expected:?}, got {actual:?}"),
                     span: receiver.span,
@@ -1288,7 +1444,7 @@ impl Compiler<'_> {
         for (index, (expected, argument)) in signature.parameters.iter().zip(arguments).enumerate()
         {
             let actual = self.infer_type(&argument.value);
-            if !expected.accepts(&actual) {
+            if !self.expression_matches(expected, &argument.value) {
                 self.errors.push(CompileError {
                     message: format!(
                         "argument {} expects {expected:?}, got {actual:?}",
@@ -1317,11 +1473,12 @@ impl Compiler<'_> {
 
 fn infer_expression_type(
     manifest: Option<&BuiltinManifest>,
+    type_aliases: &BTreeMap<String, ScriptType>,
     locals: &BTreeMap<String, ScriptType>,
     expression: &Expr,
 ) -> ScriptType {
     match &expression.kind {
-        ExprKind::Null => ScriptType::Null,
+        ExprKind::Null => ScriptType::Any,
         ExprKind::Ellipsis => ScriptType::Any,
         ExprKind::Bool(_) | ExprKind::Binary { .. } => ScriptType::Bool,
         ExprKind::Number {
@@ -1334,7 +1491,7 @@ fn infer_expression_type(
                 ScriptType::Number
             }
         }
-        ExprKind::UnaryMinus(value) => infer_expression_type(manifest, locals, value),
+        ExprKind::UnaryMinus(value) => infer_expression_type(manifest, type_aliases, locals, value),
         ExprKind::Number {
             unit: NumberUnit::Percent,
             ..
@@ -1350,10 +1507,16 @@ fn infer_expression_type(
             let mut values = values.iter();
             let element = values
                 .next()
-                .map(|value| infer_expression_type(manifest, locals, value))
+                .map(|value| infer_expression_type(manifest, type_aliases, locals, value))
                 .unwrap_or(ScriptType::Any);
-            if values.all(|value| element.accepts(&infer_expression_type(manifest, locals, value)))
-            {
+            if values.all(|value| {
+                element.accepts(&infer_expression_type(
+                    manifest,
+                    type_aliases,
+                    locals,
+                    value,
+                ))
+            }) {
                 ScriptType::List(Box::new(element))
             } else {
                 ScriptType::List(Box::new(ScriptType::Any))
@@ -1365,11 +1528,15 @@ fn infer_expression_type(
                 .map(|field| {
                     (
                         field.name.clone(),
-                        infer_expression_type(manifest, locals, &field.value),
+                        infer_expression_type(manifest, type_aliases, locals, &field.value),
                     )
                 })
                 .collect(),
         ),
+        ExprKind::TypedMap { type_name, .. } => type_aliases
+            .get(type_name)
+            .cloned()
+            .unwrap_or(ScriptType::Any),
         ExprKind::Call { callee, .. } => {
             let builtin = manifest.and_then(|manifest| match &callee.kind {
                 ExprKind::Ident(name) => manifest.resolve(name),
@@ -1387,7 +1554,7 @@ fn infer_expression_type(
         }
         ExprKind::Ident(name) => locals.get(name).cloned().unwrap_or(ScriptType::Any),
         ExprKind::Member { object, name } => {
-            match infer_expression_type(manifest, locals, object) {
+            match infer_expression_type(manifest, type_aliases, locals, object) {
                 ScriptType::Record(fields) => fields.get(name).cloned().unwrap_or(ScriptType::Any),
                 ScriptType::Nullable(inner) => match *inner {
                     ScriptType::Record(fields) => {
@@ -1399,7 +1566,7 @@ fn infer_expression_type(
             }
         }
         ExprKind::SafeMember { object, name } => {
-            let member = match infer_expression_type(manifest, locals, object) {
+            let member = match infer_expression_type(manifest, type_aliases, locals, object) {
                 ScriptType::Record(fields) => fields.get(name).cloned().unwrap_or(ScriptType::Any),
                 ScriptType::Nullable(inner) => match *inner {
                     ScriptType::Record(fields) => {
@@ -1412,19 +1579,46 @@ fn infer_expression_type(
             ScriptType::Nullable(Box::new(member))
         }
         ExprKind::Elvis { value, fallback } => {
-            let value = infer_expression_type(manifest, locals, value);
-            let fallback = infer_expression_type(manifest, locals, fallback);
-            match value {
-                ScriptType::Nullable(inner) if inner.accepts(&fallback) => *inner,
-                ScriptType::Null => fallback,
+            let value_type = infer_expression_type(manifest, type_aliases, locals, value);
+            let fallback = infer_expression_type(manifest, type_aliases, locals, fallback);
+            match (&value.kind, value_type) {
+                (ExprKind::Null, _) => fallback,
+                (_, ScriptType::Nullable(inner)) if inner.accepts(&fallback) => *inner,
+                (_, other) => other,
+            }
+        }
+        ExprKind::NonNull(value) => {
+            match infer_expression_type(manifest, type_aliases, locals, value) {
+                ScriptType::Nullable(inner) => *inner,
                 other => other,
             }
         }
-        ExprKind::NonNull(value) => match infer_expression_type(manifest, locals, value) {
-            ScriptType::Nullable(inner) => *inner,
-            other => other,
-        },
         ExprKind::Block(_) => ScriptType::Any,
+    }
+}
+
+fn uncontextual_null_path(expression: &Expr) -> Option<Vec<String>> {
+    match &expression.kind {
+        ExprKind::Null => Some(Vec::new()),
+        ExprKind::Map(fields) => fields.iter().find_map(|field| {
+            uncontextual_null_path(&field.value).map(|mut path| {
+                path.insert(0, field.name.clone());
+                path
+            })
+        }),
+        ExprKind::List(values) | ExprKind::Tuple(values) => {
+            values.iter().enumerate().find_map(|(index, value)| {
+                uncontextual_null_path(value).map(|mut path| {
+                    path.insert(0, format!("[{index}]"));
+                    path
+                })
+            })
+        }
+        // A typed constructor supplies context to every field. Other
+        // expressions such as Elvis and equality give `null` their own
+        // operator context and therefore do not infer a Null type either.
+        ExprKind::TypedMap { .. } => None,
+        _ => None,
     }
 }
 
@@ -1436,7 +1630,7 @@ fn script_type_from_ast(
     match &ty.kind {
         crate::TypeExprKind::Named(name) => match name.as_str() {
             "Any" => Some(ScriptType::Any),
-            "Null" => Some(ScriptType::Null),
+            "Unit" => Some(ScriptType::Unit),
             "Bool" => Some(ScriptType::Bool),
             "Int" => Some(ScriptType::Int),
             "Float" | "Number" => Some(ScriptType::Number),
@@ -1640,6 +1834,19 @@ impl Vm {
                 Instruction::StoreLocal(name) => {
                     let value = self.pop()?;
                     self.locals.insert(name, value);
+                }
+                Instruction::StoreLocalMember { root, path } => {
+                    let new_value = self.pop()?;
+                    let value = self
+                        .locals
+                        .get_mut(&root)
+                        .ok_or_else(|| VmError::UnknownLocal(root.clone()))?;
+                    set_member_path(value, &path, new_value).map_err(|error| match error {
+                        MemberPathError::Unknown(name) => VmError::UnknownMember(name),
+                        MemberPathError::NotRecord => {
+                            VmError::TypeMismatch("member receiver is not a record")
+                        }
+                    })?;
                 }
                 Instruction::LoadGlobal(name) => {
                     let value = self
@@ -2194,6 +2401,20 @@ impl TaskScheduler {
             Instruction::StoreLocal(name) => {
                 let value = self.pop_task(task_id)?;
                 self.task_mut(task_id)?.locals.insert(name, value);
+            }
+            Instruction::StoreLocalMember { root, path } => {
+                let new_value = self.pop_task(task_id)?;
+                let value = self
+                    .task_mut(task_id)?
+                    .locals
+                    .get_mut(&root)
+                    .ok_or_else(|| TaskSchedulerError::UnknownLocal(root.clone()))?;
+                set_member_path(value, &path, new_value).map_err(|error| match error {
+                    MemberPathError::Unknown(name) => TaskSchedulerError::UnknownMember(name),
+                    MemberPathError::NotRecord => {
+                        TaskSchedulerError::TypeMismatch("member receiver is not a record")
+                    }
+                })?;
             }
             Instruction::LoadGlobal(name) => {
                 let value = self
@@ -2945,6 +3166,103 @@ mod tests {
         let errors = compile_with_manifest(&invalid, 73, &manifest)
             .expect_err("unknown settings fields must be compile errors");
         assert!(errors[0].message.contains("unknown or non-record field"));
+    }
+
+    #[test]
+    fn typed_nullable_global_fields_accept_later_non_null_values() {
+        let program = parse_program(
+            r#"
+                type Player = .{ name: String?, health: Float }
+                global player: Player = .{ name: null, health: 0.0 }
+                player.name = "Player"
+            "#,
+        )
+        .expect("typed global record must parse");
+        let bytecode = compile(&program, 74).expect("nullable field assignment must compile");
+        let mut vm = Vm::new(bytecode).expect("VM must initialize");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        assert_eq!(
+            vm.globals()["player"],
+            Value::Map(BTreeMap::from([
+                ("health".to_string(), Value::Number(0.0)),
+                ("name".to_string(), Value::String("Player".to_string())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn typed_record_constructor_supplies_the_inferred_global_type() {
+        let program = parse_program(
+            r#"
+                type Player = .{ name: String?, health: Float }
+                global player = Player.{ name: null, health: 0.0 }
+                player.name = "Player"
+            "#,
+        )
+        .expect("typed record constructor must parse");
+        compile(&program, 76).expect("typed constructor must preserve nullable field types");
+    }
+
+    #[test]
+    fn untyped_null_field_error_suggests_both_explicit_forms() {
+        let program = parse_program(
+            r#"
+                global player = .{ name: null }
+                player.name = "Player"
+            "#,
+        )
+        .expect("implicit record must parse");
+        let errors = compile(&program, 77).expect_err("untyped null must be rejected");
+        assert!(errors[0].message.contains("cannot infer a type for null"));
+        assert!(errors[0].message.contains("global player: Type"));
+        assert!(errors[0].message.contains("global player = Type.{ ... }"));
+    }
+
+    #[test]
+    fn standalone_null_cannot_define_a_binding_type() {
+        for source in ["global value = null", "let value = null", "null"] {
+            let program = parse_program(source).expect("null example must parse");
+            let errors = compile(&program, 78).expect_err("standalone null must not have a type");
+            assert!(errors.iter().any(|error| error.message.contains("null")));
+        }
+    }
+
+    #[test]
+    fn local_record_fields_are_written_back_to_the_binding() {
+        let program = parse_program(
+            r#"
+                let player = .{
+                    name: "before",
+                    stats: .{ health: 1.0 }
+                }
+                player.name = "after"
+                player.stats.health = 2.0
+            "#,
+        )
+        .expect("local member assignments must parse");
+        let bytecode = compile(&program, 75).expect("local member assignments must compile");
+        assert!(bytecode.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::StoreLocalMember { root, path }
+                if root == "player" && path == &["stats", "health"]
+        )));
+        let mut vm = Vm::new(bytecode).expect("VM must initialize");
+        for _ in 0..3 {
+            assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        }
+        assert_eq!(
+            vm.locals()["player"],
+            Value::Map(BTreeMap::from([
+                ("name".to_string(), Value::String("after".to_string())),
+                (
+                    "stats".to_string(),
+                    Value::Map(BTreeMap::from([
+                        ("health".to_string(), Value::Number(2.0),)
+                    ])),
+                ),
+            ]))
+        );
     }
 
     #[test]

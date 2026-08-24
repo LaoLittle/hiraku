@@ -127,6 +127,10 @@ pub enum ExprKind {
     Tuple(Vec<Expr>),
     List(Vec<Expr>),
     Map(Vec<MapField>),
+    TypedMap {
+        type_name: String,
+        fields: Vec<MapField>,
+    },
     Block(Block),
     Binary {
         left: Box<Expr>,

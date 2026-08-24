@@ -305,7 +305,7 @@ mod tests {
         )
         .unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.story.hks");
+        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.hks");
         let catalog = load_audio_catalog(&vfs).unwrap();
         assert_eq!(
             catalog.resolve_music("title").unwrap().path,

@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn rejects_procedural_hks() {
-        assert!(parse("loadScript(\"story.hks\")").is_err());
+        assert!(parse("gotoScript(\"story.hks\")").is_err());
     }
 
     #[test]

@@ -42,6 +42,31 @@ pub struct CharacterPartDefinition {
     pub offset: Vec2,
     pub layer: f32,
     pub rect: Option<[f32; 4]>,
+    pub mask: Option<CharacterMaskDefinition>,
+    pub blend: CharacterBlendMode,
+    pub color: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum CharacterMaskKind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub struct CharacterMaskDefinition {
+    pub kind: CharacterMaskKind,
+    #[serde(rename = "ref")]
+    pub reference: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum CharacterBlendMode {
+    #[default]
+    Normal,
+    Multiply,
 }
 
 #[derive(Clone, Debug)]
@@ -102,22 +127,49 @@ impl CharacterDefinition {
                 self.name
             ));
         }
-        let expression = self
-            .expressions
-            .get(name)
-            .ok_or_else(|| format!("character `{}` has no expression named `{name}`", self.name))?;
+        let Some(expression) = self.expressions.get(name) else {
+            if let Some(part) = self.parts.iter().find(|part| part.id == name) {
+                let key = part
+                    .slot
+                    .map(SelectionKey::Slot)
+                    .unwrap_or_else(|| SelectionKey::Expression(name.to_string()));
+                selected.insert(key, vec![name.to_string()]);
+                return Ok(());
+            }
+            return Err(format!(
+                "character `{}` has no expression or part named `{name}`",
+                self.name
+            ));
+        };
         resolving.push(name.to_string());
         for nested in &expression.expressions {
             self.apply_expression(nested, selected, resolving)?;
         }
         resolving.pop();
 
-        if !expression.parts.is_empty() {
-            let key = expression
-                .slot
-                .map(SelectionKey::Slot)
-                .unwrap_or_else(|| SelectionKey::Expression(name.to_string()));
-            selected.insert(key, expression.parts.clone());
+        if let Some(slot) = expression.slot {
+            // An explicitly slotted expression with no parts clears that slot.
+            // This is required by presets such as `Pale1-Off`.
+            selected.insert(SelectionKey::Slot(slot), expression.parts.clone());
+        } else {
+            // Parts are the source of truth for slot ownership. Grouping is
+            // important because one expression may intentionally contain
+            // several layers in the same slot (for example an arm and shadow).
+            let mut grouped = BTreeMap::<SelectionKey, Vec<String>>::new();
+            for part_id in &expression.parts {
+                let part = self.parts.iter().find(|part| &part.id == part_id).ok_or_else(|| {
+                    format!(
+                        "character `{}` expression `{name}` references missing part `{part_id}`",
+                        self.name
+                    )
+                })?;
+                let key = part
+                    .slot
+                    .map(SelectionKey::Slot)
+                    .unwrap_or_else(|| SelectionKey::Expression(part_id.clone()));
+                grouped.entry(key).or_default().push(part_id.clone());
+            }
+            selected.extend(grouped);
         }
         Ok(())
     }
@@ -188,6 +240,16 @@ struct CharacterPartFile {
     layer: Option<f64>,
     #[serde(default)]
     rect: Option<[f64; 4]>,
+    #[serde(default)]
+    mask: Option<CharacterMaskDefinition>,
+    #[serde(default)]
+    blend: CharacterBlendMode,
+    #[serde(default = "default_part_color")]
+    color: [u8; 4],
+}
+
+const fn default_part_color() -> [u8; 4] {
+    [255, 255, 255, 255]
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,6 +406,16 @@ fn character_definition_from_config(
                     texture_rect
                         .map(|rect| [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]])
                 });
+            if part.mask.is_some_and(|mask| mask.kind == CharacterMaskKind::Read)
+                && part.blend == CharacterBlendMode::Multiply
+            {
+                return Err(CharacterCatalogError::Data {
+                    path: config_path.clone(),
+                    message: format!(
+                        "part `{id}` cannot combine `mask: \"read\"` with `blend: \"multiply\"`; use separate parts"
+                    ),
+                });
+            }
             Ok(CharacterPartDefinition {
                 id,
                 slot: part
@@ -358,6 +430,9 @@ fn character_definition_from_config(
                     .unwrap_or(Vec2::ZERO),
                 layer: part.layer.unwrap_or(0.0) as f32,
                 rect,
+                mask: part.mask,
+                blend: part.blend,
+                color: part.color,
             })
         })
         .collect::<Result<Vec<_>, CharacterCatalogError>>()?;
@@ -459,8 +534,10 @@ fn validate_expressions(
     parts: &[CharacterPartDefinition],
     path: &str,
 ) -> Result<(), CharacterCatalogError> {
+    let has_reference =
+        |name: &str| expressions.contains_key(name) || parts.iter().any(|part| part.id == name);
     if let Some(default_expression) = default_expression
-        && !expressions.contains_key(default_expression)
+        && !has_reference(default_expression)
     {
         return Err(CharacterCatalogError::Data {
             path: path.to_string(),
@@ -469,7 +546,7 @@ fn validate_expressions(
     }
 
     for expression in basis {
-        if !expressions.contains_key(expression) {
+        if !has_reference(expression) {
             return Err(CharacterCatalogError::Data {
                 path: path.to_string(),
                 message: format!("basis references undefined expression `{expression}`"),
@@ -489,7 +566,7 @@ fn validate_expressions(
             }
         }
         for nested in &definition.expressions {
-            if !expressions.contains_key(nested) {
+            if !has_reference(nested) {
                 return Err(CharacterCatalogError::Data {
                     path: path.to_string(),
                     message: format!(
@@ -534,23 +611,40 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.join("characters/characters.hson"),
-            ".{ characters: (.{ name: \"alice\", dir: \"alice\" }) }",
+            ".{ characters: [.{ name: \"alice\", dir: \"alice\" }] }",
         )
         .unwrap();
         std::fs::write(
             characters.join("character.hson"),
-            ".{ slots: (\"body\", \"face\"), parts: .{ body: .{ path: \"body.png\", slot: \"body\", offset: (12.5, -3.0), layer: -1.0 }, face: .{ path: \"face.png\", slot: \"face\", layer: 2.0 } }, expressions: .{ happy: (\"body\", \"face\") }, default_expression: \"happy\" }",
+            ".{ slots: [\"body\", \"face\", \"shade\"], parts: .{ body: .{ path: \"body.png\", slot: \"body\", offset: (12.5, -3.0), layer: -1.0, mask: .{ kind: \"write\", ref: 1 } }, face: .{ path: \"face.png\", slot: \"face\", layer: 2.0, mask: .{ kind: \"read\", ref: 1 }, color: [255, 128, 64, 96] }, shade: .{ path: \"shade.png\", slot: \"shade\", layer: 3.0, blend: \"multiply\" } }, expressions: .{ happy: [\"body\", \"face\", \"shade\"] }, default_expression: \"happy\" }",
         )
         .unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.story.hks");
+        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.hks");
         let catalog = load_character_catalog(&vfs).unwrap();
         let alice = &catalog.characters["alice"];
 
-        assert_eq!(alice.parts.len(), 2);
+        assert_eq!(alice.parts.len(), 3);
         assert_eq!(alice.parts[0].id, "body");
         assert_eq!(alice.parts[0].offset, Vec2::new(12.5, -3.0));
         assert_eq!(alice.parts[1].id, "face");
+        assert_eq!(
+            alice.parts[0].mask,
+            Some(CharacterMaskDefinition {
+                kind: CharacterMaskKind::Write,
+                reference: 1,
+            })
+        );
+        assert_eq!(
+            alice.parts[1].mask,
+            Some(CharacterMaskDefinition {
+                kind: CharacterMaskKind::Read,
+                reference: 1,
+            })
+        );
+        assert_eq!(alice.parts[1].blend, CharacterBlendMode::Normal);
+        assert_eq!(alice.parts[1].color, [255, 128, 64, 96]);
+        assert_eq!(alice.parts[2].blend, CharacterBlendMode::Multiply);
         assert_eq!(alice.slots["body"], 0);
         assert_eq!(alice.slots["face"], 1);
         assert_eq!(
@@ -558,7 +652,7 @@ mod tests {
                 .parts_for_expressions(&["happy".to_string()])
                 .unwrap()
                 .len(),
-            2
+            3
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -581,12 +675,15 @@ mod tests {
             .into_iter()
             .map(|id| CharacterPartDefinition {
                 id: id.to_string(),
-                slot: None,
+                slot: (id == "face_happy").then_some(1),
                 path: format!("{id}.png"),
                 atlas_rect: None,
                 offset: Vec2::ZERO,
                 layer: 0.0,
                 rect: None,
+                mask: None,
+                blend: CharacterBlendMode::Normal,
+                color: default_part_color(),
             })
             .collect(),
             expressions: BTreeMap::from([
@@ -623,10 +720,10 @@ mod tests {
                     },
                 ),
                 (
-                    "face_happy".to_string(),
+                    "face_off".to_string(),
                     CharacterExpressionDefinition {
                         slot: Some(1),
-                        parts: vec!["face_happy".to_string()],
+                        parts: Vec::new(),
                         expressions: Vec::new(),
                     },
                 ),
@@ -640,5 +737,11 @@ mod tests {
             .unwrap();
         let ids = parts.into_iter().map(|part| part.id).collect::<Vec<_>>();
         assert_eq!(ids, ["body", "mouth_open", "face_happy"]);
+
+        let parts = definition
+            .parts_for_expressions(&["face_off".to_string()])
+            .expect("an empty slotted expression must clear its slot");
+        let ids = parts.into_iter().map(|part| part.id).collect::<Vec<_>>();
+        assert_eq!(ids, ["body", "mouth_closed"]);
     }
 }

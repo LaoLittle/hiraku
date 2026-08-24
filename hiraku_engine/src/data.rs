@@ -31,10 +31,10 @@ mod tests {
     fn accepts_a_declarative_hson_map() {
         let data = evaluate_hson_map(
             "settings.hson",
-            ".{ startup: \"startup.story.hks\", fonts: .{ path: \"fonts\" } }",
+            ".{ startup: \"startup.hks\", fonts: .{ path: \"fonts\" } }",
         )
         .expect("declarative HSON should parse");
-        assert_eq!(data["startup"].as_str(), Some("startup.story.hks"));
+        assert_eq!(data["startup"].as_str(), Some("startup.hks"));
         assert_eq!(
             data["fonts"]
                 .as_map()

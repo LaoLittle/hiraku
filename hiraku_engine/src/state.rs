@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::script::StoryRuntimeSnapshot;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScriptCallFrameSnapshot {
+    pub script: String,
+    pub snapshot: StoryRuntimeSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoredValue {
     Bool(bool),
     Int(i64),
@@ -127,6 +133,8 @@ pub struct SaveGameData {
     pub scene: SceneSnapshot,
     #[serde(default)]
     pub vm_snapshot: Option<StoryRuntimeSnapshot>,
+    #[serde(default)]
+    pub script_call_stack: Vec<ScriptCallFrameSnapshot>,
     #[serde(default)]
     pub pending_ui_screen: Option<String>,
 }

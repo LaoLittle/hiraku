@@ -751,12 +751,12 @@ mod tests {
     fn all_shipped_stories_compile_as_whole_hks_programs() {
         for (path, source) in [
             (
-                "startup.story.hks",
-                include_str!("../../../../manosabars/assets/main_hdp_contents/startup.story.hks"),
+                "startup.hks",
+                include_str!("../../../../manosabars/assets/main_hdp_contents/startup.hks"),
             ),
             (
-                "system.story.hks",
-                include_str!("../../../../manosabars/assets/main_hdp_contents/system.story.hks"),
+                "system.hks",
+                include_str!("../../../../manosabars/assets/main_hdp_contents/system.hks"),
             ),
             (
                 "scripts/new_game.story.hks",

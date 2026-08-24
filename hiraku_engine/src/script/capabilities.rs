@@ -2,10 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use hiraku_script::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
+use hiraku_script::native::{NativeError, NativeRegistry};
 use hiraku_script::vm::{
-    BuiltinCall, BuiltinManifest, Bytecode, FunctionSignature, ScriptType, Value,
-    compile_with_manifest,
+    BuiltinCall, BuiltinManifest, Bytecode, ScriptType, Value, compile_with_manifest,
 };
 use hiraku_script::{StatementValue, parse_program};
 use serde::{Deserialize, Serialize};
@@ -27,7 +26,10 @@ pub enum StoryEffect {
     SetBackground {
         texture: String,
     },
-    LoadScript {
+    GotoScript {
+        path: String,
+    },
+    CallScript {
         path: String,
     },
     AdjustSetting {
@@ -151,8 +153,7 @@ fn source_hash(path: &str, source: &str) -> u64 {
 
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
-    let actor_type = registry.define_type("Actor");
-    let position_type = Position::register_hks(&mut registry)
+    Position::register_hks(&mut registry)
         .expect("Position API registration must be internally consistent");
     registry
         .define_global(
@@ -164,89 +165,8 @@ fn registry() -> NativeRegistry<CharacterContext> {
             ])),
         )
         .expect("engine settings schema must be defined once");
-    registry
-        .register_fn("char", native_char)
-        .expect("built-in `char` registration must be unique");
-    registry
-        .register_fn("e", native_emotion)
-        .expect("built-in `e` registration must be unique");
-    registry
-        .register_fn("at", native_at)
-        .expect("built-in `at` registration must be unique");
-    registry
-        .register_fn("scale", native_scale)
-        .expect("built-in `scale` registration must be unique");
-    registry
-        .register_fn("log", native_log)
-        .expect("built-in `log` registration must be unique");
-    registry
-        .register_fn("clearText", native_clear_text)
-        .expect("built-in `clearText` registration must be unique");
-    registry
-        .register_fn("stopBgm", native_stop_bgm)
-        .expect("built-in `stopBgm` registration must be unique");
-    registry
-        .register_fn("exit", native_exit)
-        .expect("built-in `exit` registration must be unique");
-    registry
-        .register_fn("returnToTitle", native_return_to_title)
-        .expect("built-in `returnToTitle` registration must be unique");
-    registry
-        .register_fn("bg", native_bg)
-        .expect("built-in `bg` registration must be unique");
-    registry
-        .register_fn("loadScript", native_load_script)
-        .expect("built-in `loadScript` registration must be unique");
-    registry
-        .register_fn("adjustSetting", native_adjust_setting)
-        .expect("built-in `adjustSetting` registration must be unique");
-    registry
-        .register_fn("playBgm", native_play_bgm)
-        .expect("built-in `playBgm` registration must be unique");
-    registry
-        .register_fn("narrate", native_narrate)
-        .expect("built-in `narrate` registration must be unique");
-    registry
-        .register_fn("voice", native_voice)
-        .expect("built-in `voice` registration must be unique");
-    registry
-        .register_fn("say", native_say)
-        .expect("built-in `say` registration must be unique");
-    registry
-        .register_operator_raw_fn(":", native_dialogue_operator)
-        .expect("built-in `:` operator registration must be unique");
-    registry
-        .register_selector_raw_fn("camera", "blur", native_camera_blur)
-        .expect("built-in `camera.blur` registration must be unique");
-    registry
-        .register_selector_raw_fn("camera", "zoom", native_camera_zoom)
-        .expect("built-in `camera.zoom` registration must be unique");
-    registry
-        .set_signature_for(
-            "char",
-            FunctionSignature {
-                receiver: None,
-                parameters: vec![ScriptType::String],
-                result: ScriptType::Named(actor_type),
-            },
-        )
-        .expect("char signature must target a registered builtin");
-    for (name, parameters) in [
-        ("e", vec![ScriptType::String]),
-        ("at", vec![ScriptType::Named(position_type)]),
-        ("scale", vec![ScriptType::Number]),
-    ] {
-        registry
-            .set_signature_for(
-                name,
-                FunctionSignature {
-                    receiver: Some(ScriptType::Named(actor_type)),
-                    parameters,
-                    result: ScriptType::Named(actor_type),
-                },
-            )
-            .expect("actor method signature must target a registered builtin");
-    }
+    native_api::register_hks(&mut registry)
+        .expect("story native API registration must be internally consistent");
     registry
 }
 
@@ -380,7 +300,7 @@ impl CharacterContext {
     ) -> Result<(), CharacterCapabilityError> {
         self.commit()?;
         if let StatementValue::String(text) = statement {
-            native_narrate(self, text.clone())
+            native_api::native_narrate(self, text.clone())
                 .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
         }
         Ok(())
@@ -469,7 +389,8 @@ impl CharacterContext {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, hiraku_script::HksHandle)]
+#[hks(name = "Actor", handle_type = ACTOR_HANDLE_TYPE)]
 struct ActorHandle(u64);
 
 hiraku_script::hks_define! {
@@ -526,267 +447,290 @@ impl Position {
     }
 }
 
-impl FromHksValue for ActorHandle {
-    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
-        actor_handle(value)
-            .map(Self)
+#[hiraku_script::hks_module]
+mod native_api {
+    use super::*;
+
+    #[hks(name = "char")]
+    fn native_char(
+        context: &mut CharacterContext,
+        name: String,
+    ) -> Result<ActorHandle, NativeError> {
+        context
+            .char(name)
             .map_err(|error| NativeError::message(error.to_string()))
     }
-}
 
-impl IntoHksValue for ActorHandle {
-    fn into_hks_value(self) -> Value {
-        actor_value(self.0)
+    #[hks(name = "e", receiver)]
+    fn native_emotion(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        emotion: String,
+    ) -> Result<ActorHandle, NativeError> {
+        context
+            .emotion(actor, emotion)
+            .map_err(|error| NativeError::message(error.to_string()))
     }
-}
 
-fn native_char(context: &mut CharacterContext, name: String) -> Result<ActorHandle, NativeError> {
-    context
-        .char(name)
-        .map_err(|error| NativeError::message(error.to_string()))
-}
-
-fn native_emotion(
-    context: &mut CharacterContext,
-    actor: ActorHandle,
-    emotion: String,
-) -> Result<ActorHandle, NativeError> {
-    context
-        .emotion(actor, emotion)
-        .map_err(|error| NativeError::message(error.to_string()))
-}
-
-fn native_at(
-    context: &mut CharacterContext,
-    actor: ActorHandle,
-    position: Position,
-) -> Result<ActorHandle, NativeError> {
-    context
-        .at(actor, position)
-        .map_err(|error| NativeError::message(error.to_string()))
-}
-
-fn native_scale(
-    context: &mut CharacterContext,
-    actor: ActorHandle,
-    scale: f64,
-) -> Result<ActorHandle, NativeError> {
-    context
-        .scale(actor, scale)
-        .map_err(|error| NativeError::message(error.to_string()))
-}
-
-fn native_log(context: &mut CharacterContext, message: String) -> Result<(), NativeError> {
-    context.commands.push(StoryEffect::Log(message));
-    Ok(())
-}
-
-fn native_clear_text(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.last_speaker = None;
-    context.dialogue_buffer = None;
-    context.commands.push(StoryEffect::ClearDialogue);
-    Ok(())
-}
-
-fn native_stop_bgm(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.commands.push(StoryEffect::StopBgm);
-    Ok(())
-}
-
-fn native_exit(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.commands.push(StoryEffect::Exit);
-    Ok(())
-}
-
-fn native_return_to_title(context: &mut CharacterContext) -> Result<(), NativeError> {
-    context.commands.push(StoryEffect::ReturnToTitle);
-    Ok(())
-}
-
-fn native_bg(context: &mut CharacterContext, texture: String) -> Result<(), NativeError> {
-    context
-        .commands
-        .push(StoryEffect::SetBackground { texture });
-    Ok(())
-}
-
-fn native_load_script(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
-    context.commands.push(StoryEffect::LoadScript { path });
-    Ok(())
-}
-
-fn native_adjust_setting(
-    context: &mut CharacterContext,
-    name: String,
-    delta: f64,
-) -> Result<(), NativeError> {
-    context.commands.push(StoryEffect::AdjustSetting {
-        name,
-        delta: delta as f32,
-    });
-    Ok(())
-}
-
-fn native_play_bgm(
-    context: &mut CharacterContext,
-    path: String,
-    volume: f64,
-    fade_ms: f64,
-) -> Result<(), NativeError> {
-    if !(0.0..=1.0).contains(&volume) || fade_ms < 0.0 {
-        return Err(NativeError::message(
-            "playBgm volume must be between 0 and 1 and fade must be non-negative",
-        ));
+    #[hks(name = "at", receiver)]
+    fn native_at(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        position: Position,
+    ) -> Result<ActorHandle, NativeError> {
+        context
+            .at(actor, position)
+            .map_err(|error| NativeError::message(error.to_string()))
     }
-    context.commands.push(StoryEffect::PlayBgm {
-        path,
-        volume: volume as f32,
-        fade_in_ms: Some(fade_ms.round() as u64),
-    });
-    Ok(())
-}
 
-fn native_narrate(context: &mut CharacterContext, text: String) -> Result<(), NativeError> {
-    context.last_speaker = Some(String::new());
-    context.dialogue_buffer = Some(text.clone());
-    context.commands.push(StoryEffect::Say {
-        speaker: String::new(),
-        text,
-    });
-    context.wait = Some(StoryWait::DialogueAdvance);
-    Ok(())
-}
-
-fn native_say(
-    context: &mut CharacterContext,
-    speaker: String,
-    text: String,
-) -> Result<(), NativeError> {
-    context.last_speaker = Some(speaker.clone());
-    context.dialogue_buffer = Some(text.clone());
-    context.commands.push(StoryEffect::Say { speaker, text });
-    context.wait = Some(StoryWait::DialogueAdvance);
-    Ok(())
-}
-
-fn native_dialogue_operator(
-    context: &mut CharacterContext,
-    call: &BuiltinCall,
-) -> Result<Value, NativeError> {
-    if call.receiver.is_some() || call.arguments.len() != 2 {
-        return Err(NativeError::message("operator `:` expects two operands"));
+    #[hks(name = "scale", receiver)]
+    fn native_scale(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        scale: f64,
+    ) -> Result<ActorHandle, NativeError> {
+        context
+            .scale(actor, scale)
+            .map_err(|error| NativeError::message(error.to_string()))
     }
-    let continuation = matches!(call.arguments[0].value, Value::Ellipsis);
-    let speaker = match &call.arguments[0].value {
-        Value::Handle {
-            type_id: ACTOR_HANDLE_TYPE,
-            id,
-        } => context
-            .actors
-            .get(id)
-            .map(|actor| actor.name.clone())
-            .ok_or_else(|| NativeError::message(format!("unknown actor handle {id}")))?,
-        Value::Ellipsis => context.last_speaker.clone().unwrap_or_default(),
-        _ => return Err(NativeError::TypeMismatch("actor or ellipsis")),
-    };
-    let Value::String(text) = &call.arguments[1].value else {
-        return Err(NativeError::TypeMismatch("string"));
-    };
-    if continuation {
-        if let Some(buffer) = context.dialogue_buffer.as_mut() {
-            buffer.push_str(text);
-            context
-                .commands
-                .push(StoryEffect::ContinueDialogue { text: text.clone() });
-            context.wait = Some(StoryWait::DialogueAdvance);
+
+    #[hks]
+    fn native_log(context: &mut CharacterContext, message: String) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::Log(message));
+        Ok(())
+    }
+
+    #[hks]
+    fn native_clear_text(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.last_speaker = None;
+        context.dialogue_buffer = None;
+        context.commands.push(StoryEffect::ClearDialogue);
+        Ok(())
+    }
+
+    #[hks]
+    fn native_stop_bgm(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::StopBgm);
+        Ok(())
+    }
+
+    #[hks]
+    fn native_exit(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::Exit);
+        Ok(())
+    }
+
+    #[hks]
+    fn native_return_to_title(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::ReturnToTitle);
+        Ok(())
+    }
+
+    #[hks]
+    fn native_bg(context: &mut CharacterContext, texture: String) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::SetBackground { texture });
+        Ok(())
+    }
+
+    #[hks]
+    fn native_goto_script(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::GotoScript { path });
+        Ok(())
+    }
+
+    #[hks]
+    fn native_call_script(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::CallScript { path });
+        Ok(())
+    }
+
+    #[hks]
+    fn native_adjust_setting(
+        context: &mut CharacterContext,
+        name: String,
+        delta: f64,
+    ) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::AdjustSetting {
+            name,
+            delta: delta as f32,
+        });
+        Ok(())
+    }
+
+    #[hks]
+    fn native_play_bgm(
+        context: &mut CharacterContext,
+        path: String,
+        volume: f64,
+        fade_ms: f64,
+    ) -> Result<(), NativeError> {
+        if !(0.0..=1.0).contains(&volume) || fade_ms < 0.0 {
+            return Err(NativeError::message(
+                "playBgm volume must be between 0 and 1 and fade must be non-negative",
+            ));
+        }
+        context.commands.push(StoryEffect::PlayBgm {
+            path,
+            volume: volume as f32,
+            fade_in_ms: Some(fade_ms.round() as u64),
+        });
+        Ok(())
+    }
+
+    #[hks]
+    pub(super) fn native_narrate(
+        context: &mut CharacterContext,
+        text: String,
+    ) -> Result<(), NativeError> {
+        context.last_speaker = Some(String::new());
+        context.dialogue_buffer = Some(text.clone());
+        context.commands.push(StoryEffect::Say {
+            speaker: String::new(),
+            text,
+        });
+        context.wait = Some(StoryWait::DialogueAdvance);
+        Ok(())
+    }
+
+    #[hks]
+    fn native_say(
+        context: &mut CharacterContext,
+        speaker: String,
+        text: String,
+    ) -> Result<(), NativeError> {
+        context.last_speaker = Some(speaker.clone());
+        context.dialogue_buffer = Some(text.clone());
+        context.commands.push(StoryEffect::Say { speaker, text });
+        context.wait = Some(StoryWait::DialogueAdvance);
+        Ok(())
+    }
+
+    #[hks(raw, operator = ":")]
+    fn native_dialogue_operator(
+        context: &mut CharacterContext,
+        call: &BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        if call.receiver.is_some() || call.arguments.len() != 2 {
+            return Err(NativeError::message("operator `:` expects two operands"));
+        }
+        let continuation = matches!(call.arguments[0].value, Value::Ellipsis);
+        let speaker = match &call.arguments[0].value {
+            Value::Handle {
+                type_id: ACTOR_HANDLE_TYPE,
+                id,
+            } => context
+                .actors
+                .get(id)
+                .map(|actor| actor.name.clone())
+                .ok_or_else(|| NativeError::message(format!("unknown actor handle {id}")))?,
+            Value::Ellipsis => context.last_speaker.clone().unwrap_or_default(),
+            _ => return Err(NativeError::TypeMismatch("actor or ellipsis")),
+        };
+        let Value::String(text) = &call.arguments[1].value else {
+            return Err(NativeError::TypeMismatch("string"));
+        };
+        if continuation {
+            if let Some(buffer) = context.dialogue_buffer.as_mut() {
+                buffer.push_str(text);
+                context
+                    .commands
+                    .push(StoryEffect::ContinueDialogue { text: text.clone() });
+                context.wait = Some(StoryWait::DialogueAdvance);
+            } else {
+                bevy::log::warn!("`...` has no dialogue buffer; treating it as narration");
+                native_narrate(context, text.clone())?;
+            }
         } else {
-            bevy::log::warn!("`...` has no dialogue buffer; treating it as narration");
-            native_narrate(context, text.clone())?;
+            native_say(context, speaker, text.clone())?;
         }
-    } else {
-        native_say(context, speaker, text.clone())?;
+        Ok(Value::Null)
     }
-    Ok(Value::Null)
-}
 
-fn native_voice(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
-    if path.trim().is_empty() {
-        return Err(NativeError::message("voice path must not be empty"));
-    }
-    context
-        .commands
-        .push(StoryEffect::PlayVoice { path, volume: 1.0 });
-    Ok(())
-}
-
-fn native_camera_blur(
-    context: &mut CharacterContext,
-    call: &hiraku_script::vm::BuiltinCall,
-) -> Result<Value, NativeError> {
-    require_selector(call, "camera")?;
-    let mut intensity = None;
-    let mut duration = 0.0;
-    let mut ease = "linear".to_string();
-    let mut scope = CameraEffectScope::World;
-    for argument in &call.arguments {
-        match argument.label.as_deref() {
-            None if intensity.is_none() => intensity = Some(number_value(&argument.value)?),
-            Some("duration") => duration = number_value(&argument.value)?,
-            Some("ease") => ease = symbol_value(&argument.value)?,
-            Some("scope") => scope = camera_scope_value(&argument.value)?,
-            _ => return Err(NativeError::message("invalid camera.blur arguments")),
+    #[hks]
+    fn native_voice(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
+        if path.trim().is_empty() {
+            return Err(NativeError::message("voice path must not be empty"));
         }
+        context
+            .commands
+            .push(StoryEffect::PlayVoice { path, volume: 1.0 });
+        Ok(())
     }
-    let intensity = intensity.ok_or_else(|| NativeError::message("blur intensity is required"))?;
-    if intensity < 0.0 || duration < 0.0 {
-        return Err(NativeError::message(
-            "blur intensity and duration must be non-negative",
-        ));
-    }
-    context.commands.push(StoryEffect::SetCamera {
-        blur: Some(intensity as f32),
-        zoom: None,
-        scope,
-        duration_ms: (duration * 1000.0).round() as u64,
-        ease: normalize_ease(&ease)?,
-    });
-    Ok(Value::Null)
-}
 
-fn native_camera_zoom(
-    context: &mut CharacterContext,
-    call: &hiraku_script::vm::BuiltinCall,
-) -> Result<Value, NativeError> {
-    require_selector(call, "camera")?;
-    let mut scale = None;
-    let mut duration = 0.0;
-    let mut ease = "linear".to_string();
-    let mut scope = CameraEffectScope::World;
-    for argument in &call.arguments {
-        match argument.label.as_deref() {
-            None if scale.is_none() => scale = Some(number_value(&argument.value)?),
-            Some("duration") => duration = number_value(&argument.value)?,
-            Some("ease") => ease = symbol_value(&argument.value)?,
-            Some("scope") => scope = camera_scope_value(&argument.value)?,
-            Some("at") if matches!(argument.value, Value::Symbol(ref value) if value == "center") =>
-                {}
-            _ => return Err(NativeError::message("invalid camera.zoom arguments")),
+    #[hks(raw, selector = "camera", name = "blur")]
+    fn native_camera_blur(
+        context: &mut CharacterContext,
+        call: &hiraku_script::vm::BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        require_selector(call, "camera")?;
+        let mut intensity = None;
+        let mut duration = 0.0;
+        let mut ease = "linear".to_string();
+        let mut scope = CameraEffectScope::World;
+        for argument in &call.arguments {
+            match argument.label.as_deref() {
+                None if intensity.is_none() => intensity = Some(number_value(&argument.value)?),
+                Some("duration") => duration = number_value(&argument.value)?,
+                Some("ease") => ease = symbol_value(&argument.value)?,
+                Some("scope") => scope = camera_scope_value(&argument.value)?,
+                _ => return Err(NativeError::message("invalid camera.blur arguments")),
+            }
         }
+        let intensity =
+            intensity.ok_or_else(|| NativeError::message("blur intensity is required"))?;
+        if intensity < 0.0 || duration < 0.0 {
+            return Err(NativeError::message(
+                "blur intensity and duration must be non-negative",
+            ));
+        }
+        context.commands.push(StoryEffect::SetCamera {
+            blur: Some(intensity as f32),
+            zoom: None,
+            scope,
+            duration_ms: (duration * 1000.0).round() as u64,
+            ease: normalize_ease(&ease)?,
+        });
+        Ok(Value::Null)
     }
-    let scale = scale.ok_or_else(|| NativeError::message("zoom scale is required"))?;
-    if scale <= 0.0 || duration < 0.0 {
-        return Err(NativeError::message(
-            "zoom scale must be positive and duration non-negative",
-        ));
+
+    #[hks(raw, selector = "camera", name = "zoom")]
+    fn native_camera_zoom(
+        context: &mut CharacterContext,
+        call: &hiraku_script::vm::BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        require_selector(call, "camera")?;
+        let mut scale = None;
+        let mut duration = 0.0;
+        let mut ease = "linear".to_string();
+        let mut scope = CameraEffectScope::World;
+        for argument in &call.arguments {
+            match argument.label.as_deref() {
+                None if scale.is_none() => scale = Some(number_value(&argument.value)?),
+                Some("duration") => duration = number_value(&argument.value)?,
+                Some("ease") => ease = symbol_value(&argument.value)?,
+                Some("scope") => scope = camera_scope_value(&argument.value)?,
+                Some("at") if matches!(argument.value, Value::Symbol(ref value) if value == "center") =>
+                    {}
+                _ => return Err(NativeError::message("invalid camera.zoom arguments")),
+            }
+        }
+        let scale = scale.ok_or_else(|| NativeError::message("zoom scale is required"))?;
+        if scale <= 0.0 || duration < 0.0 {
+            return Err(NativeError::message(
+                "zoom scale must be positive and duration non-negative",
+            ));
+        }
+        context.commands.push(StoryEffect::SetCamera {
+            blur: None,
+            zoom: Some(scale as f32),
+            scope,
+            duration_ms: (duration * 1000.0).round() as u64,
+            ease: normalize_ease(&ease)?,
+        });
+        Ok(Value::Null)
     }
-    context.commands.push(StoryEffect::SetCamera {
-        blur: None,
-        zoom: Some(scale as f32),
-        scope,
-        duration_ms: (duration * 1000.0).round() as u64,
-        ease: normalize_ease(&ease)?,
-    });
-    Ok(Value::Null)
 }
 
 fn require_selector(
@@ -849,29 +793,10 @@ fn pending_actor(name: &str) -> PendingActor {
     }
 }
 
-fn actor_value(id: u64) -> Value {
-    Value::Handle {
-        type_id: ACTOR_HANDLE_TYPE,
-        id,
-    }
-}
-
-fn actor_handle(value: &Value) -> Result<u64, CharacterCapabilityError> {
-    match value {
-        Value::Handle {
-            type_id: ACTOR_HANDLE_TYPE,
-            id,
-        } => Ok(*id),
-        _ => Err(CharacterCapabilityError::InvalidActorHandle),
-    }
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum CharacterCapabilityError {
     #[error("invalid native arguments: {0}")]
     InvalidArguments(&'static str),
-    #[error("invalid actor handle")]
-    InvalidActorHandle,
     #[error("unknown actor handle {0}")]
     UnknownActor(u64),
     #[error("HKS native error: {0}")]
@@ -916,6 +841,19 @@ not_actor.at(.left)"#,
         )
         .expect_err("a string must not be accepted as an Actor receiver");
         assert!(error.contains("receiver expects Named"));
+    }
+
+    #[test]
+    fn script_transfer_api_uses_explicit_goto_and_call_names() {
+        let manifest = story_manifest();
+        assert!(manifest.resolve("gotoScript").is_some());
+        assert!(manifest.resolve("callScript").is_some());
+        assert!(manifest.resolve("loadScript").is_none());
+        compile_story_bytecode(
+            "entry.hks",
+            "callScript(\"chapter.hks\")\ngotoScript(\"ending.hks\")",
+        )
+        .expect("ordinary .hks paths must compile as story scripts");
     }
 
     #[test]

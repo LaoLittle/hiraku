@@ -226,6 +226,22 @@ impl<'a> TokenAdapter<'a> {
 
 fn unescape_string(source: &str) -> Result<String, String> {
     let mut value = String::new();
+    let mut literal_start = 0;
+    let mut cursor = 0;
+    while let Some(relative_start) = source[cursor..].find("${") {
+        let start = cursor + relative_start;
+        unescape_string_segment(&source[literal_start..start], &mut value)?;
+        let end = template_expression_end(source, start + 2)
+            .ok_or_else(|| "unterminated template expression".to_string())?;
+        value.push_str(&source[start..=end]);
+        cursor = end + 1;
+        literal_start = cursor;
+    }
+    unescape_string_segment(&source[literal_start..], &mut value)?;
+    Ok(value)
+}
+
+fn unescape_string_segment(source: &str, value: &mut String) -> Result<(), String> {
     let mut error = None;
     crate::lex::unescape::unescape_literal(
         source,
@@ -236,7 +252,38 @@ fn unescape_string(source: &str) -> Result<String, String> {
             Err(_) => {}
         },
     );
-    error.map_or(Ok(value), Err)
+    error.map_or(Ok(()), Err)
+}
+
+fn template_expression_end(source: &str, start: usize) -> Option<usize> {
+    let mut braces = 1usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, character) in source[start..].char_indices() {
+        let index = start + relative;
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '{' => braces += 1,
+            '}' => {
+                braces -= 1;
+                if braces == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 struct Parser {
@@ -556,6 +603,23 @@ impl Parser {
     fn parse_expression_mode(&mut self, allow_trailing_block: bool) -> Expr {
         let mut expression = self.parse_primary();
         loop {
+            if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::LBrace) {
+                let ExprKind::Ident(type_name) = &expression.kind else {
+                    self.error_here("typed record constructor must start with a type name");
+                    break;
+                };
+                let type_name = type_name.clone();
+                self.advance();
+                let map = self.parse_map(expression.span.start);
+                let ExprKind::Map(fields) = map.kind else {
+                    unreachable!("parse_map always returns a map expression")
+                };
+                expression = Expr {
+                    kind: ExprKind::TypedMap { type_name, fields },
+                    span: map.span,
+                };
+                continue;
+            }
             if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::Ident(_)) {
                 self.advance();
                 let name = match self.advance().kind {

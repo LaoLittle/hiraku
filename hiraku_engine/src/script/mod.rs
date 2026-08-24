@@ -20,7 +20,9 @@ mod runtime;
 pub mod ui_runtime;
 
 pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
-pub(crate) use runtime::{CameraEffectScope, ScriptRuntimeState, tick_script_runtime};
+pub(crate) use runtime::{
+    CameraEffectScope, ScriptCallFrame, ScriptRuntimeState, tick_script_runtime,
+};
 
 pub(crate) fn compile_story_bytecode(
     path: &str,
@@ -297,7 +299,8 @@ pub(crate) fn script_command_from_effect(
             fade: None,
             animation_id: None,
         },
-        StoryEffect::LoadScript { .. }
+        StoryEffect::GotoScript { .. }
+        | StoryEffect::CallScript { .. }
         | StoryEffect::PlayBgm { .. }
         | StoryEffect::PlayVoice { .. } => {
             return Err("effect requires script runtime asset resolution".to_string());
@@ -390,6 +393,7 @@ pub struct ScriptBootstrap {
     pub startup_script: String,
     pub values: BTreeMap<String, StoredValue>,
     pub snapshot: Option<StoryRuntimeSnapshot>,
+    pub call_stack: Vec<crate::state::ScriptCallFrameSnapshot>,
     pub pending_ui_screen: Option<String>,
 }
 
@@ -399,6 +403,7 @@ impl ScriptBootstrap {
             startup_script,
             values: BTreeMap::new(),
             snapshot: None,
+            call_stack: Vec::new(),
             pending_ui_screen: None,
         }
     }
@@ -410,6 +415,7 @@ impl ScriptBootstrap {
             startup_script: data.resume_script.clone(),
             values,
             snapshot: data.vm_snapshot.clone(),
+            call_stack: data.script_call_stack.clone(),
             pending_ui_screen: data.pending_ui_screen.clone(),
         }
     }
@@ -421,28 +427,52 @@ pub fn start_hks_runtime(
     bootstrap: ScriptBootstrap,
     user_settings: &crate::storage::UserSettings,
 ) -> Result<(), String> {
+    let ScriptBootstrap {
+        startup_script,
+        values,
+        snapshot,
+        call_stack,
+        pending_ui_screen,
+    } = bootstrap;
     let source = vfs
         .0
-        .read_text(&bootstrap.startup_script)
+        .read_text(&startup_script)
         .map_err(|error| error.to_string())?;
-    let bytecode = compile_story_bytecode(&bootstrap.startup_script, &source)?;
-    let story = if let Some(snapshot) = bootstrap.snapshot {
+    let bytecode = compile_story_bytecode(&startup_script, &source)?;
+    let story = if let Some(snapshot) = snapshot {
         StoryRuntime::restore(bytecode, snapshot).map_err(|error| error.to_string())?
     } else {
         let mut story = StoryRuntime::new(bytecode).map_err(|error| error.to_string())?;
         let mut globals = capabilities::engine_globals(user_settings);
-        for (name, value) in bootstrap.values {
+        for (name, value) in values {
             globals.insert(name, stored_value_to_hks(value));
         }
         story.set_globals(globals);
         story
     };
+    let call_stack = call_stack
+        .into_iter()
+        .map(|frame| {
+            let source = vfs
+                .0
+                .read_text(&frame.script)
+                .map_err(|error| error.to_string())?;
+            let bytecode = compile_story_bytecode(&frame.script, &source)?;
+            let story = StoryRuntime::restore(bytecode, frame.snapshot)
+                .map_err(|error| error.to_string())?;
+            Ok(ScriptCallFrame {
+                script: frame.script,
+                story,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let restored_blocked = story.is_blocked();
     runtime.story = Some(story);
-    runtime.current_script = Some(bootstrap.startup_script);
+    runtime.current_script = Some(startup_script);
+    runtime.call_stack = call_stack;
     runtime.story_events.clear();
     runtime.wait_request = None;
-    runtime.pending_ui_screen = bootstrap.pending_ui_screen;
+    runtime.pending_ui_screen = pending_ui_screen;
     runtime.response_inbox.clear();
     runtime.task_requests.clear();
     if restored_blocked {
@@ -476,12 +506,31 @@ pub fn save_runtime_slot(
         .map(StoryRuntime::snapshot)
         .transpose()
         .map_err(|error| StorageError::InvalidSave(error.to_string()))?;
+    let script_call_stack = runtime
+        .call_stack
+        .iter()
+        .map(|frame| {
+            frame
+                .story
+                .snapshot()
+                .map(|snapshot| crate::state::ScriptCallFrameSnapshot {
+                    script: frame.script.clone(),
+                    snapshot,
+                })
+                .map_err(|error| StorageError::InvalidSave(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let data = SaveGameData {
-        version: 7,
+        version: 8,
         resume_script: current_script,
+        script_stack: script_call_stack
+            .iter()
+            .map(|frame| frame.script.clone())
+            .collect(),
         globals: values,
         scene: shared_state.0.clone(),
         vm_snapshot: snapshot,
+        script_call_stack,
         pending_ui_screen: runtime.pending_ui_screen.clone(),
         ..Default::default()
     };

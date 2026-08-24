@@ -13,13 +13,17 @@ use bevy::{
 
 use crate::{
     audio::{AudioCatalog, PreludeLoopAudio, load_audio_catalog},
-    character::{CharacterCatalog, CharacterPartDefinition, load_character_catalog},
+    character::{
+        CharacterBlendMode, CharacterCatalog, CharacterMaskKind, CharacterPartDefinition,
+        load_character_catalog,
+    },
     effect::custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     render::camera::{
         CameraShake, CameraShakeState, CameraState, CameraTweenState, WorldCamera, focus_layer,
         setup_stage_cameras, start_camera_tween,
     },
+    render::character_part::{AlphaMaskMaterial, CharacterPartVisual, MultiplyMaterial},
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, ResolvedCharacterKeyframe,
         ScriptBootstrap, ScriptCommand, ScriptRequestId, ScriptResponse, ScriptResponseMessage,
@@ -391,9 +395,15 @@ pub fn bridge_story_events(
 
     if let Some(event) = runtime.story_events.pop_front() {
         match event {
-            StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::LoadScript {
-                path,
-            }) => {
+            StoryRuntimeEvent::Effect(
+                effect @ (crate::script::capabilities::StoryEffect::GotoScript { .. }
+                | crate::script::capabilities::StoryEffect::CallScript { .. }),
+            ) => {
+                let (path, is_call) = match effect {
+                    crate::script::capabilities::StoryEffect::GotoScript { path } => (path, false),
+                    crate::script::capabilities::StoryEffect::CallScript { path } => (path, true),
+                    _ => unreachable!("matched script transfer effects above"),
+                };
                 let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
                 let inherited_globals = runtime
                     .story
@@ -413,6 +423,18 @@ pub fn bridge_story_events(
                         let mut globals = inherited_globals;
                         globals.extend(crate::script::capabilities::engine_globals(&user_settings));
                         story.set_globals(globals);
+                        if is_call {
+                            if let (Some(script), Some(caller)) =
+                                (runtime.current_script.take(), runtime.story.take())
+                            {
+                                runtime.call_stack.push(crate::script::ScriptCallFrame {
+                                    script,
+                                    story: caller,
+                                });
+                            }
+                        } else {
+                            runtime.call_stack.clear();
+                        }
                         runtime.story = Some(story);
                         runtime.current_script = Some(target);
                         runtime.story_events.clear();
@@ -566,7 +588,21 @@ pub fn bridge_story_events(
                     warn!("failed to resume unsupported HKS task effect: {error}");
                 }
             }
-            StoryRuntimeEvent::Completed(_) => {}
+            StoryRuntimeEvent::Completed(_) => {
+                if let Some(frame) = runtime.call_stack.pop() {
+                    let globals = runtime
+                        .story
+                        .as_ref()
+                        .map(|story| story.globals().clone())
+                        .unwrap_or_default();
+                    let mut caller = frame.story;
+                    caller.set_globals(globals);
+                    runtime.story = Some(caller);
+                    runtime.current_script = Some(frame.script);
+                    runtime.story_events.clear();
+                    runtime.task_requests.clear();
+                }
+            }
         }
         return;
     }
@@ -795,6 +831,9 @@ pub struct SceneCommandContext<'w, 's> {
     pub voice_state: ResMut<'w, VoiceState>,
     pub pending_characters: ResMut<'w, PendingCharacterShows>,
     pub transition_mesh: Res<'w, RuleTransitionMesh>,
+    pub meshes: ResMut<'w, Assets<Mesh>>,
+    pub alpha_mask_materials: ResMut<'w, Assets<AlphaMaskMaterial>>,
+    pub multiply_materials: ResMut<'w, Assets<MultiplyMaterial>>,
     pub custom_effect_materials: ResMut<'w, Assets<CustomScreenEffectMaterial>>,
     pub rule_materials: ResMut<'w, Assets<RuleTransitionMaterial>>,
     pub choice_ui_roots: Query<'w, 's, Entity, (With<ChoiceUi>, Without<ChildOf>)>,
@@ -1032,7 +1071,7 @@ pub fn setup_frontend(
 
     if frontend.startup_script.is_empty() {
         frontend.notice =
-            Some("startup.story.hks not found. Fix settings.hson before starting.".to_string());
+            Some("startup.hks not found. Fix settings.hson before starting.".to_string());
     }
 
     commands.insert_resource(UiFonts {
@@ -1780,6 +1819,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut voice_state = ctx.voice_state;
     let mut pending_characters = ctx.pending_characters;
     let transition_mesh = ctx.transition_mesh;
+    let mut meshes = ctx.meshes;
+    let mut alpha_mask_materials = ctx.alpha_mask_materials;
+    let mut multiply_materials = ctx.multiply_materials;
     let mut custom_effect_materials = ctx.custom_effect_materials;
     let mut rule_materials = ctx.rule_materials;
     let choice_ui_roots = ctx.choice_ui_roots;
@@ -2470,6 +2512,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut commands,
                     &asset_server,
                     &texture_atlases,
+                    &mut meshes,
+                    &mut alpha_mask_materials,
+                    &mut multiply_materials,
                     &mut stage,
                     &mut pending_characters,
                     &mut animations,
@@ -3467,14 +3512,34 @@ pub fn animate_visual_tweens(
     mut commands: Commands,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
-    mut sprites: Query<(Entity, &mut Sprite, &mut Transform, &mut VisualTween)>,
+    mut alpha_mask_materials: ResMut<Assets<AlphaMaskMaterial>>,
+    mut multiply_materials: ResMut<Assets<MultiplyMaterial>>,
+    mut visuals: Query<(
+        Entity,
+        Option<&mut Sprite>,
+        Option<&MeshMaterial2d<AlphaMaskMaterial>>,
+        Option<&MeshMaterial2d<MultiplyMaterial>>,
+        Option<&CharacterPartVisual>,
+        &mut Transform,
+        &mut VisualTween,
+    )>,
 ) {
-    for (entity, mut sprite, mut transform, mut tween) in &mut sprites {
+    for (entity, mut sprite, alpha_mask, multiply, part_visual, mut transform, mut tween) in
+        &mut visuals
+    {
         tween.timer.tick(time.delta());
         let fraction = tween_fraction(&tween.timer);
 
         if let (Some(from), Some(to)) = (tween.from_alpha, tween.to_alpha) {
-            sprite.color.set_alpha(from + (to - from) * fraction);
+            set_visual_alpha(
+                sprite.as_deref_mut(),
+                alpha_mask,
+                multiply,
+                part_visual,
+                &mut alpha_mask_materials,
+                &mut multiply_materials,
+                from + (to - from) * fraction,
+            );
         }
         if let (Some(from), Some(to)) = (tween.from_translation, tween.to_translation) {
             transform.translation = from.lerp(to, fraction);
@@ -3485,7 +3550,15 @@ pub fn animate_visual_tweens(
 
         if tween.timer.is_finished() {
             if let Some(to) = tween.to_alpha {
-                sprite.color.set_alpha(to);
+                set_visual_alpha(
+                    sprite.as_deref_mut(),
+                    alpha_mask,
+                    multiply,
+                    part_visual,
+                    &mut alpha_mask_materials,
+                    &mut multiply_materials,
+                    to,
+                );
             }
             if let Some(to) = tween.to_translation {
                 transform.translation = to;
@@ -3502,6 +3575,34 @@ pub fn animate_visual_tweens(
                 commands.entity(entity).try_remove::<VisualTween>();
             }
         }
+    }
+}
+
+fn set_visual_alpha(
+    sprite: Option<&mut Sprite>,
+    alpha_mask: Option<&MeshMaterial2d<AlphaMaskMaterial>>,
+    multiply: Option<&MeshMaterial2d<MultiplyMaterial>>,
+    part_visual: Option<&CharacterPartVisual>,
+    alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
+    multiply_materials: &mut Assets<MultiplyMaterial>,
+    alpha: f32,
+) {
+    if let Some(sprite) = sprite {
+        sprite.color.set_alpha(
+            part_visual
+                .map(|visual| visual.base_alpha * alpha)
+                .unwrap_or(alpha),
+        );
+    }
+    if let Some(material) = alpha_mask
+        && let Some(mut material) = alpha_mask_materials.get_mut(&material.0)
+    {
+        material.opacity = alpha;
+    }
+    if let Some(material) = multiply
+        && let Some(mut material) = multiply_materials.get_mut(&material.0)
+    {
+        material.opacity = alpha;
     }
 }
 
@@ -3676,11 +3777,20 @@ pub fn poll_voice_playback(
 pub fn sync_scene_snapshot(
     mut shared_state: ResMut<SceneSharedState>,
     stage: Res<StageState>,
+    alpha_mask_materials: Res<Assets<AlphaMaskMaterial>>,
+    multiply_materials: Res<Assets<MultiplyMaterial>>,
     dialogue_state: Res<DialogueState>,
     background_layers: Query<&BackgroundLayer>,
     bgms: Query<&BgmChannel>,
     overlay: Query<&Sprite, With<OverlayMarker>>,
-    sprites: Query<(&SpriteActor, &Sprite, &Transform)>,
+    sprites: Query<(
+        &SpriteActor,
+        Option<&Sprite>,
+        Option<&MeshMaterial2d<AlphaMaskMaterial>>,
+        Option<&MeshMaterial2d<MultiplyMaterial>>,
+        Option<&CharacterPartVisual>,
+        &Transform,
+    )>,
 ) {
     let snapshot = &mut shared_state.0;
 
@@ -3693,16 +3803,32 @@ pub fn sync_scene_snapshot(
 
     let mut sprite_snapshots = sprites
         .iter()
-        .map(|(actor, sprite, transform)| SpriteSnapshot {
-            id: actor.id.clone(),
-            path: actor.path.clone(),
-            x: transform.translation.x,
-            y: transform.translation.y,
-            layer: transform.translation.z - STAGE_Z_SPRITE,
-            scale: transform.scale.x,
-            alpha: sprite.color.alpha(),
-            rect: sprite.rect.map(rect_to_array),
-        })
+        .map(
+            |(actor, sprite, alpha_mask, multiply, visual, transform)| SpriteSnapshot {
+                id: actor.id.clone(),
+                path: actor.path.clone(),
+                x: transform.translation.x,
+                y: transform.translation.y,
+                layer: transform.translation.z - STAGE_Z_SPRITE,
+                scale: transform.scale.x,
+                alpha: sprite
+                    .map(|sprite| sprite.color.alpha())
+                    .unwrap_or_else(|| {
+                        alpha_mask
+                            .and_then(|material| alpha_mask_materials.get(&material.0))
+                            .map(|material| material.tint.w * material.opacity)
+                            .or_else(|| {
+                                multiply
+                                    .and_then(|material| multiply_materials.get(&material.0))
+                                    .map(|material| material.tint.w * material.opacity)
+                            })
+                            .unwrap_or(1.0)
+                    }),
+                rect: sprite
+                    .and_then(|sprite| sprite.rect.map(rect_to_array))
+                    .or_else(|| visual.and_then(|visual| visual.rect)),
+            },
+        )
         .collect::<Vec<_>>();
     sprite_snapshots.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot.sprites = sprite_snapshots;

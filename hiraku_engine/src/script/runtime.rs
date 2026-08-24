@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 use super::{ScriptRequestId, ScriptResponse, ScriptResponseMessage};
 use crate::script::hks_runtime::{StoryRuntime, StoryRuntimeEvent};
 
+pub struct ScriptCallFrame {
+    pub script: String,
+    pub story: StoryRuntime,
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CameraEffectScope {
     #[default]
@@ -23,6 +28,7 @@ pub struct ScriptRuntimeState {
     pub story_events: VecDeque<StoryRuntimeEvent>,
     pub wait_request: Option<ScriptRequestId>,
     pub current_script: Option<String>,
+    pub call_stack: Vec<ScriptCallFrame>,
     pub pending_ui_screen: Option<String>,
     pub response_inbox: BTreeMap<ScriptRequestId, ScriptResponse>,
     pub task_requests: BTreeMap<ScriptRequestId, u64>,

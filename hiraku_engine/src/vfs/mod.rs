@@ -22,7 +22,7 @@ use settings::{SettingsFile, ensure_empty_data_map, settings_from_data, take_dat
 
 pub const DEFAULT_ASSET_ROOT: &str = "assets";
 pub const DEFAULT_SETTINGS_PATH: &str = "hdp://main.hdp/settings.hson";
-pub const DEFAULT_STARTUP_SCRIPT: &str = "hdp://main.hdp/startup.story.hks";
+pub const DEFAULT_STARTUP_SCRIPT: &str = "hdp://main.hdp/startup.hks";
 pub const RESOURCE_ROOT_PREFIX: &str = "res:/";
 pub const DEFAULT_RESOURCE_ROOT: &str = "hdp://main.hdp/";
 pub const HDP_SOURCE_ID: &str = "hdp";
@@ -951,7 +951,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("font-pack/readme.txt"), b"ignored").unwrap();
 
-        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.story.hks");
+        let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.hks");
         assert_eq!(
             vfs.resolve_background_path(Some("scripts/chapter.story.hks"), "forest.png")
                 .unwrap(),
@@ -1020,7 +1020,7 @@ mod tests {
         let mut builder = PackageBuilder::new();
         builder
             .add_file_with_options(
-                "startup.story.hks",
+                "startup.hks",
                 vec![b's'; 128],
                 FileOptions {
                     bootstrap: true,

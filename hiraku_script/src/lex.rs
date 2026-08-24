@@ -699,10 +699,38 @@ impl Cursor<'_> {
                     // Bump again to skip escaped character.
                     self.bump();
                 }
+                '$' if self.first() == '{' => {
+                    self.bump();
+                    if !self.template_expression() {
+                        return false;
+                    }
+                }
                 _ => (),
             }
         }
         // End of file reached.
+        false
+    }
+
+    /// Eats a `${ ... }` expression embedded in a string. Quotes inside the
+    /// expression belong to nested HKS string literals, not to the outer
+    /// template string.
+    fn template_expression(&mut self) -> bool {
+        let mut braces = 1usize;
+        while let Some(c) = self.bump() {
+            match c {
+                '"' if !self.double_quoted_string() => return false,
+                '\'' if !self.single_quoted_string() => return false,
+                '{' => braces += 1,
+                '}' => {
+                    braces -= 1;
+                    if braces == 0 {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
         false
     }
 

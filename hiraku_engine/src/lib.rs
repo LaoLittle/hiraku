@@ -32,6 +32,7 @@ use bevy::{
 use effect::transition::RuleTransitionMaterial;
 use effect::{blur::BlurEffectPlugin, custom::CustomScreenEffectMaterial};
 use render::camera::{animate_camera_shake, animate_camera_transition, assign_render_layers};
+use render::character_part::{AlphaMaskMaterial, MultiplyMaterial};
 use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_character_motion_effects,
     animate_custom_effects, animate_dialogue_text_reveal, animate_rule_transitions,
@@ -125,10 +126,13 @@ impl Plugin for HirakuPlugin {
         app.add_plugins((
             Material2dPlugin::<CustomScreenEffectMaterial>::default(),
             Material2dPlugin::<RuleTransitionMaterial>::default(),
+            Material2dPlugin::<AlphaMaskMaterial>::default(),
+            Material2dPlugin::<MultiplyMaterial>::default(),
             BlurEffectPlugin,
         ));
         effect::custom::load_internal_shaders(app);
         effect::transition::load_internal_shaders(app);
+        render::character_part::load_internal_shaders(app);
 
         let archive_path = archive_path_from_config(app.world().resource::<RuntimeLaunchConfig>());
         let archive_store = app.world().resource::<HdpArchiveStore>().clone();

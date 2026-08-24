@@ -75,11 +75,19 @@ pub fn animate_character_motion_effects(
 pub fn poll_pending_character_shows(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut alpha_mask_materials: ResMut<Assets<AlphaMaskMaterial>>,
+    mut multiply_materials: ResMut<Assets<MultiplyMaterial>>,
     mut stage: ResMut<StageState>,
     mut animations: ResMut<AnimationState>,
     mut pending: ResMut<PendingCharacterShows>,
-    sprite_entities: Query<(), (With<Sprite>, With<Visibility>)>,
-    mut sprites: Query<(&mut Sprite, &mut Visibility)>,
+    visual_entities: Query<(), (With<CharacterPartVisual>, With<Visibility>)>,
+    mut visuals: Query<(
+        &CharacterPartVisual,
+        Option<&mut Sprite>,
+        Option<&MeshMaterial2d<AlphaMaskMaterial>>,
+        Option<&MeshMaterial2d<MultiplyMaterial>>,
+        &mut Visibility,
+    )>,
 ) {
     let mut completed = Vec::new();
     pending.items.retain_mut(|item| {
@@ -115,7 +123,7 @@ pub fn poll_pending_character_shows(
         if !item
             .entities
             .iter()
-            .all(|entity| sprite_entities.get(*entity).is_ok())
+            .all(|entity| visual_entities.get(*entity).is_ok())
         {
             return true;
         }
@@ -127,10 +135,20 @@ pub fn poll_pending_character_shows(
     for (entities, fade, animation_id) in completed {
         let mut pending_animation = animation_id;
         for (index, entity) in entities.into_iter().enumerate() {
-            if let Ok((mut sprite, mut visibility)) = sprites.get_mut(entity) {
+            if let Ok((visual, sprite, alpha_mask, multiply, mut visibility)) =
+                visuals.get_mut(entity)
+            {
                 *visibility = Visibility::Visible;
                 if let Some(fade) = fade {
-                    sprite.color.set_alpha(0.0);
+                    set_character_part_alpha(
+                        visual,
+                        sprite,
+                        alpha_mask,
+                        multiply,
+                        &mut alpha_mask_materials,
+                        &mut multiply_materials,
+                        0.0,
+                    );
                     commands.entity(entity).insert(VisualTween {
                         from_alpha: Some(0.0),
                         to_alpha: Some(1.0),
@@ -152,10 +170,37 @@ pub fn poll_pending_character_shows(
     }
 }
 
+fn set_character_part_alpha(
+    visual: &CharacterPartVisual,
+    sprite: Option<Mut<Sprite>>,
+    alpha_mask: Option<&MeshMaterial2d<AlphaMaskMaterial>>,
+    multiply: Option<&MeshMaterial2d<MultiplyMaterial>>,
+    alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
+    multiply_materials: &mut Assets<MultiplyMaterial>,
+    alpha: f32,
+) {
+    if let Some(mut sprite) = sprite {
+        sprite.color.set_alpha(visual.base_alpha * alpha);
+    }
+    if let Some(material) = alpha_mask
+        && let Some(mut material) = alpha_mask_materials.get_mut(&material.0)
+    {
+        material.opacity = alpha;
+    }
+    if let Some(material) = multiply
+        && let Some(mut material) = multiply_materials.get_mut(&material.0)
+    {
+        material.opacity = alpha;
+    }
+}
+
 pub(super) fn queue_character_show(
     commands: &mut Commands,
     asset_server: &AssetServer,
     texture_atlases: &TextureAtlasCatalog,
+    meshes: &mut Assets<Mesh>,
+    alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
+    multiply_materials: &mut Assets<MultiplyMaterial>,
     stage: &mut StageState,
     pending: &mut PendingCharacterShows,
     animations: &mut AnimationState,
@@ -259,29 +304,147 @@ pub(super) fn queue_character_show(
             });
             continue;
         }
-        let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
-        let handle = atlas
-            .map(|texture| texture.image.clone())
-            .unwrap_or_else(|| asset_server.load(part.path.clone()));
-        let entity = commands
-            .spawn((
-                SpriteActor {
-                    id: sprite_id.clone(),
-                    path: part.path.clone(),
-                },
-                character_part_sprite(handle.clone(), part, atlas),
-                Visibility::Hidden,
-                Transform {
-                    translation: Vec3::new(
-                        position.x + part.offset.x * scale,
-                        position.y + part.offset.y * scale,
-                        STAGE_Z_SPRITE + part.layer,
-                    ),
-                    scale: Vec3::splat(scale),
-                    ..default()
-                },
-            ))
-            .id();
+        let transform = Transform {
+            translation: Vec3::new(
+                position.x + part.offset.x * scale,
+                position.y + part.offset.y * scale,
+                STAGE_Z_SPRITE + part.layer,
+            ),
+            scale: Vec3::splat(scale),
+            ..default()
+        };
+        let color = crate::render::character_part::rgba8_color(part.color);
+        let base_alpha = color.alpha();
+        let visual = CharacterPartVisual {
+            base_alpha,
+            rect: part.rect,
+        };
+
+        let reads_mask = part
+            .mask
+            .is_some_and(|mask| mask.kind == CharacterMaskKind::Read);
+        let requires_material = reads_mask || part.blend != CharacterBlendMode::Normal;
+        let handle = asset_server.load(part.path.clone());
+        let entity = if requires_material {
+            match part.rect {
+                None => {
+                    warn!(
+                        "character part `{}` requires an atlas rect for mask/blend rendering; using a normal sprite",
+                        part.id
+                    );
+                    let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
+                    let fallback_handle = atlas
+                        .map(|texture| texture.image.clone())
+                        .unwrap_or_else(|| handle.clone());
+                    let mut sprite = character_part_sprite(fallback_handle, part, atlas);
+                    sprite.color = color;
+                    commands
+                        .spawn((
+                            SpriteActor {
+                                id: sprite_id.clone(),
+                                path: part.path.clone(),
+                            },
+                            sprite,
+                            visual,
+                            Visibility::Hidden,
+                            transform,
+                        ))
+                        .id()
+                }
+                Some(rect) => {
+                    let width = rect[2] - rect[0];
+                    let height = rect[3] - rect[1];
+                    let mesh = meshes.add(Rectangle::new(width, height));
+                    if reads_mask {
+                        let writer = mask_writer_for_part(&parts, part);
+                        if writer.is_none() {
+                            let reference = part
+                                .mask
+                                .expect("a mask reader must carry mask metadata")
+                                .reference;
+                            warn!(
+                                "character part `{}` reads mask ref `{reference}` but no selected writer exists",
+                                part.id,
+                            );
+                        }
+                        let writer = writer.unwrap_or(part);
+                        let mask_rect = writer.rect.unwrap_or(rect);
+                        let material = alpha_mask_materials.add(AlphaMaskMaterial {
+                            texture: handle.clone(),
+                            mask_texture: asset_server.load(writer.path.clone()),
+                            tint: crate::render::character_part::rgba8_linear(part.color),
+                            main_rect: Vec4::new(rect[0], rect[1], width, height),
+                            mask_rect: Vec4::new(
+                                mask_rect[0],
+                                mask_rect[1],
+                                mask_rect[2] - mask_rect[0],
+                                mask_rect[3] - mask_rect[1],
+                            ),
+                            offsets: Vec4::new(
+                                part.offset.x,
+                                part.offset.y,
+                                writer.offset.x,
+                                writer.offset.y,
+                            ),
+                            opacity: 1.0,
+                            mask_enabled: (writer.id != part.id) as u8 as f32,
+                        });
+                        commands
+                            .spawn((
+                                SpriteActor {
+                                    id: sprite_id.clone(),
+                                    path: part.path.clone(),
+                                },
+                                Mesh2d(mesh),
+                                MeshMaterial2d(material),
+                                visual,
+                                Visibility::Hidden,
+                                transform,
+                            ))
+                            .id()
+                    } else {
+                        let material = multiply_materials.add(MultiplyMaterial {
+                            texture: handle.clone(),
+                            tint: crate::render::character_part::rgba8_linear(part.color),
+                            rect: Vec4::new(rect[0], rect[1], width, height),
+                            opacity: 1.0,
+                        });
+                        commands
+                            .spawn((
+                                SpriteActor {
+                                    id: sprite_id.clone(),
+                                    path: part.path.clone(),
+                                },
+                                Mesh2d(mesh),
+                                MeshMaterial2d(material),
+                                visual,
+                                Visibility::Hidden,
+                                transform,
+                            ))
+                            .id()
+                    }
+                }
+            }
+        } else {
+            let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
+            let sprite_handle = atlas
+                .map(|texture| texture.image.clone())
+                .unwrap_or_else(|| handle.clone());
+            let mut sprite = character_part_sprite(sprite_handle, part, atlas);
+            sprite.color = color;
+            commands
+                .spawn((
+                    SpriteActor {
+                        id: sprite_id.clone(),
+                        path: part.path.clone(),
+                    },
+                    sprite,
+                    visual,
+                    Visibility::Hidden,
+                    transform,
+                ))
+                .id()
+        };
 
         stage.sprites.insert(sprite_id.clone(), entity);
         entities.push(entity);
@@ -302,6 +465,32 @@ pub(super) fn queue_character_show(
         fade,
         animation_id: pending_animation,
     });
+}
+
+fn mask_writer_for_part<'a>(
+    parts: &'a [CharacterPartDefinition],
+    reader: &CharacterPartDefinition,
+) -> Option<&'a CharacterPartDefinition> {
+    let reader_mask = reader
+        .mask
+        .filter(|mask| mask.kind == CharacterMaskKind::Read)?;
+    parts
+        .iter()
+        .filter(|part| {
+            part.mask.is_some_and(|mask| {
+                mask.kind == CharacterMaskKind::Write
+                    && mask.reference == reader_mask.reference
+                    && part.layer <= reader.layer
+            })
+        })
+        .max_by(|left, right| left.layer.total_cmp(&right.layer))
+        .or_else(|| {
+            parts.iter().find(|part| {
+                part.mask.is_some_and(|mask| {
+                    mask.kind == CharacterMaskKind::Write && mask.reference == reader_mask.reference
+                })
+            })
+        })
 }
 
 pub(super) fn apply_character_motion(

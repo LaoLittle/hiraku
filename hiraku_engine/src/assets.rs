@@ -155,7 +155,7 @@ mod tests {
     fn first_volume_can_be_published_without_the_rest_of_the_package() {
         let mut builder = PackageBuilder::new();
         builder
-            .add_file("startup.story.hks", b"narrate(\"ready\")")
+            .add_file("startup.hks", b"narrate(\"ready\")")
             .expect("test file path must be valid");
         let package = builder
             .build(PackOptions::default())
