@@ -5,7 +5,7 @@
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use super::vm::{BuiltinCall, BuiltinId, BuiltinManifest, Value};
+use crate::vm::{BuiltinCall, BuiltinId, BuiltinManifest, Value};
 
 type NativeResult = Result<Value, NativeError>;
 type NativeThunk<C> = dyn Fn(&mut C, &[Value]) -> NativeResult + Send + Sync + 'static;
@@ -14,6 +14,7 @@ type RawNativeThunk<C> = dyn Fn(&mut C, &BuiltinCall) -> NativeResult + Send + S
 pub struct NativeRegistry<C> {
     names: BTreeMap<String, BuiltinId>,
     selectors: BTreeMap<(String, String), BuiltinId>,
+    operators: BTreeMap<String, BuiltinId>,
     functions: BTreeMap<BuiltinId, Box<NativeThunk<C>>>,
     raw_functions: BTreeMap<BuiltinId, Box<RawNativeThunk<C>>>,
 }
@@ -29,6 +30,7 @@ impl<C> NativeRegistry<C> {
         Self {
             names: BTreeMap::new(),
             selectors: BTreeMap::new(),
+            operators: BTreeMap::new(),
             functions: BTreeMap::new(),
             raw_functions: BTreeMap::new(),
         }
@@ -172,8 +174,66 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
+    pub fn register_operator_fn_with_id<F, Args>(
+        &mut self,
+        id: BuiltinId,
+        operator: impl Into<String>,
+        function: F,
+    ) -> Result<(), RegistrationError>
+    where
+        F: IntoNativeFunction<C, Args>,
+    {
+        let operator = operator.into();
+        self.validate_operator(id, &operator)?;
+        self.operators.insert(operator, id);
+        self.functions.insert(id, function.into_native_function());
+        Ok(())
+    }
+
+    pub fn register_operator_raw_fn_with_id<F>(
+        &mut self,
+        id: BuiltinId,
+        operator: impl Into<String>,
+        function: F,
+    ) -> Result<(), RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let operator = operator.into();
+        self.validate_operator(id, &operator)?;
+        self.operators.insert(operator, id);
+        self.functions.insert(
+            id,
+            Box::new(move |_context, _| {
+                unreachable!("raw functions are dispatched before typed thunks")
+            }),
+        );
+        self.raw_functions.insert(id, Box::new(function));
+        Ok(())
+    }
+
+    fn validate_operator(&self, id: BuiltinId, operator: &str) -> Result<(), RegistrationError> {
+        if self.operators.contains_key(operator) {
+            return Err(RegistrationError::DuplicateName(format!(
+                "operator {operator}"
+            )));
+        }
+        if let Some(existing) = self.name_for_id(id) {
+            return Err(RegistrationError::DuplicateId {
+                id,
+                existing,
+                attempted: format!("operator {operator}"),
+            });
+        }
+        Ok(())
+    }
+
     pub fn manifest(&self) -> BuiltinManifest {
-        BuiltinManifest::with_selectors(self.names.clone(), self.selectors.clone())
+        BuiltinManifest::with_operators(
+            self.names.clone(),
+            self.selectors.clone(),
+            self.operators.clone(),
+        )
     }
 
     pub fn call(&self, context: &mut C, call: &BuiltinCall) -> NativeResult {
@@ -203,6 +263,11 @@ impl<C> NativeRegistry<C> {
                     .find_map(|((selector, method), existing)| {
                         (*existing == id).then_some(format!("{selector}.{method}"))
                     })
+            })
+            .or_else(|| {
+                self.operators.iter().find_map(|(operator, existing)| {
+                    (*existing == id).then_some(format!("operator {operator}"))
+                })
             })
     }
 }
@@ -401,7 +466,7 @@ impl Error for RegistrationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hks::{parse_program, vm::compile_with_manifest};
+    use crate::{parse_program, vm::compile_with_manifest};
 
     #[derive(Default)]
     struct Context {
@@ -434,8 +499,7 @@ mod tests {
             &registry.manifest(),
         )
         .unwrap();
-        let super::super::vm::Instruction::CallBuiltin { builtin, .. } = &bytecode.instructions[1]
-        else {
+        let crate::vm::Instruction::CallBuiltin { builtin, .. } = &bytecode.instructions[1] else {
             panic!("expected builtin call")
         };
         assert_eq!(*builtin, id);
@@ -447,7 +511,7 @@ mod tests {
                 &BuiltinCall {
                     builtin: id,
                     receiver: None,
-                    arguments: vec![super::super::vm::CallArgument {
+                    arguments: vec![crate::vm::CallArgument {
                         label: None,
                         value: Value::String("HKS".to_string()),
                     }],
@@ -476,11 +540,11 @@ mod tests {
         .expect("selector call must compile");
         assert!(matches!(
             bytecode.instructions.first(),
-            Some(super::super::vm::Instruction::Constant(Value::Selector(selector)))
+            Some(crate::vm::Instruction::Constant(Value::Selector(selector)))
                 if selector == "camera"
         ));
-        let mut vm = super::super::vm::Vm::new(bytecode).expect("selector VM must initialize");
-        let Some(super::super::vm::VmEvent::Call(call)) =
+        let mut vm = crate::vm::Vm::new(bytecode).expect("selector VM must initialize");
+        let Some(crate::vm::VmEvent::Call(call)) =
             vm.step().expect("selector VM step must succeed")
         else {
             panic!("expected selector builtin call")
@@ -502,8 +566,8 @@ mod tests {
             &registry.manifest(),
         )
         .expect("typed selector call must compile");
-        let mut vm = super::super::vm::Vm::new(bytecode).expect("selector VM must initialize");
-        let Some(super::super::vm::VmEvent::Call(call)) =
+        let mut vm = crate::vm::Vm::new(bytecode).expect("selector VM must initialize");
+        let Some(crate::vm::VmEvent::Call(call)) =
             vm.step().expect("selector VM step must succeed")
         else {
             panic!("expected selector builtin call")
@@ -525,5 +589,37 @@ mod tests {
             .unwrap();
         let b = second.register_fn("greet", greet).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn operators_are_embedding_registered_native_functions() {
+        let mut registry = NativeRegistry::<Context>::new();
+        registry
+            .register_operator_fn_with_id(
+                BuiltinId(90),
+                ":",
+                |context: &mut Context, speaker: Value, text: String| {
+                    assert_eq!(speaker, Value::Ellipsis);
+                    assert_eq!(text, "continued");
+                    context.calls += 1;
+                    Ok(())
+                },
+            )
+            .expect("operator registration must succeed");
+        let bytecode = compile_with_manifest(
+            &parse_program(r#"...: "continued""#).expect("operator expression must parse"),
+            45,
+            &registry.manifest(),
+        )
+        .expect("registered operator must compile");
+        let mut vm = crate::vm::Vm::new(bytecode).expect("VM must initialize");
+        let Some(crate::vm::VmEvent::Call(call)) = vm.step().expect("VM must yield") else {
+            panic!("expected operator native call")
+        };
+        let mut context = Context::default();
+        registry
+            .call(&mut context, &call)
+            .expect("operator must dispatch through registry");
+        assert_eq!(context.calls, 1);
     }
 }

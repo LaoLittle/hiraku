@@ -17,7 +17,7 @@ use serde::{
     },
 };
 
-use crate::hks::{Expr, ExprKind, NumberUnit, Stmt, parse_program};
+use crate::{Expr, ExprKind, NumberUnit, Stmt, parse_program};
 
 pub type HsonMap = BTreeMap<String, HsonValue>;
 
@@ -274,7 +274,7 @@ fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError
     match &expression.kind {
         ExprKind::String(value) | ExprKind::Symbol(value) => Ok(HsonValue::String(value.clone())),
         ExprKind::Bool(value) => Ok(HsonValue::Bool(*value)),
-        ExprKind::Ident(value) if value == "null" => Ok(HsonValue::Null),
+        ExprKind::Null => Ok(HsonValue::Null),
         ExprKind::Number { value, unit } => match unit {
             NumberUnit::Scalar | NumberUnit::Percent if value.is_finite() => {
                 parse_number(expression, source)

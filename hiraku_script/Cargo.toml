@@ -7,5 +7,5 @@ description = "Embeddable visual-novel scripting language"
 [dependencies]
 unicode-xid = "0.2.6"
 unic-emoji-char = "0.9.0"
-indexmap = "2.14.0"
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
+rustc-hash.workspace = true

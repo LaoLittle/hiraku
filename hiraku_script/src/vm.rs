@@ -7,9 +7,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Expr, ExprKind, Program, Span, Stmt};
+use crate::{
+    ast::{BinaryOp, Block, Expr, ExprKind, NumberUnit, Program, Stmt},
+    hir::{StatementValue, lower_statement},
+    span::Span,
+};
 
-pub const BYTECODE_VERSION: u16 = 4;
+pub const BYTECODE_VERSION: u16 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
@@ -22,6 +26,7 @@ pub struct BuiltinManifest {
     hash: u64,
     names: BTreeMap<String, BuiltinId>,
     selectors: BTreeMap<(String, String), BuiltinId>,
+    operators: BTreeMap<String, BuiltinId>,
 }
 
 impl BuiltinManifest {
@@ -36,6 +41,14 @@ impl BuiltinManifest {
     pub fn with_selectors(
         names: BTreeMap<String, BuiltinId>,
         selectors: BTreeMap<(String, String), BuiltinId>,
+    ) -> Self {
+        Self::with_operators(names, selectors, BTreeMap::new())
+    }
+
+    pub fn with_operators(
+        names: BTreeMap<String, BuiltinId>,
+        selectors: BTreeMap<(String, String), BuiltinId>,
+        operators: BTreeMap<String, BuiltinId>,
     ) -> Self {
         let hash = names
             .iter()
@@ -58,10 +71,19 @@ impl BuiltinManifest {
                         (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
                     })
             });
+        let hash = operators.iter().fold(hash, |hash, (operator, id)| {
+            operator
+                .bytes()
+                .chain(id.0.to_le_bytes())
+                .fold(hash, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
+                })
+        });
         Self {
             hash,
             names,
             selectors,
+            operators,
         }
     }
 
@@ -78,11 +100,16 @@ impl BuiltinManifest {
             .get(&(selector.to_string(), method.to_string()))
             .copied()
     }
+
+    pub fn resolve_operator(&self, operator: &str) -> Option<BuiltinId> {
+        self.operators.get(operator).copied()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
+    Ellipsis,
     Bool(bool),
     Number(f64),
     Percent(f64),
@@ -149,7 +176,7 @@ pub enum Instruction {
     Jump(usize),
     JumpIfFalse(usize),
     Return,
-    StatementCommit,
+    Statement(StatementValue),
     SpawnTask {
         task: u32,
     },
@@ -252,9 +279,17 @@ impl Compiler<'_> {
             for (index, statement) in body.statements.iter().enumerate() {
                 let is_last = index + 1 == body.statements.len();
                 if is_last && let Stmt::Expr(expression) = statement {
-                    self.expression(expression);
-                    if self.manifest.is_some() {
-                        self.instructions.push(Instruction::StatementCommit);
+                    if let ExprKind::String(value) = &expression.kind {
+                        self.instructions
+                            .push(Instruction::Statement(StatementValue::String(
+                                value.clone(),
+                            )));
+                        self.instructions
+                            .push(Instruction::Constant(Value::String(value.clone())));
+                    } else {
+                        self.expression(expression);
+                        self.instructions
+                            .push(Instruction::Statement(StatementValue::Commit));
                     }
                     self.instructions.push(Instruction::Return);
                 } else {
@@ -284,15 +319,19 @@ impl Compiler<'_> {
                 self.expression(value);
                 self.instructions
                     .push(Instruction::StoreLocal(name.clone()));
-                if self.manifest.is_some() {
-                    self.instructions.push(Instruction::StatementCommit);
-                }
+                self.instructions
+                    .push(Instruction::Statement(StatementValue::Commit));
             }
             Stmt::Expr(expression) => {
-                self.expression(expression);
-                self.instructions.push(Instruction::Pop);
-                if self.manifest.is_some() {
-                    self.instructions.push(Instruction::StatementCommit);
+                let statement_value = lower_statement(statement);
+                if matches!(statement_value, StatementValue::String(_)) {
+                    self.instructions
+                        .push(Instruction::Statement(statement_value));
+                } else {
+                    self.expression(expression);
+                    self.instructions.push(Instruction::Pop);
+                    self.instructions
+                        .push(Instruction::Statement(statement_value));
                 }
             }
             Stmt::If {
@@ -341,6 +380,10 @@ impl Compiler<'_> {
 
     fn expression(&mut self, expression: &Expr) {
         match &expression.kind {
+            ExprKind::Null => self.instructions.push(Instruction::Constant(Value::Null)),
+            ExprKind::Ellipsis => self
+                .instructions
+                .push(Instruction::Constant(Value::Ellipsis)),
             ExprKind::Ident(name) => self.instructions.push(Instruction::LoadLocal(name.clone())),
             ExprKind::Symbol(name) => self
                 .instructions
@@ -350,8 +393,8 @@ impl Compiler<'_> {
                 .push(Instruction::Constant(Value::Bool(*value))),
             ExprKind::Number { value, unit } => {
                 self.instructions.push(Instruction::Constant(match unit {
-                    super::NumberUnit::Scalar => Value::Number(*value),
-                    super::NumberUnit::Percent => Value::Percent(*value),
+                    NumberUnit::Scalar => Value::Number(*value),
+                    NumberUnit::Percent => Value::Percent(*value),
                 }))
             }
             ExprKind::String(value) => self
@@ -490,13 +533,31 @@ impl Compiler<'_> {
                 self.expression(left);
                 self.expression(right);
                 match op {
-                    super::BinaryOp::Equal => self.instructions.push(Instruction::Equal),
+                    BinaryOp::Equal => self.instructions.push(Instruction::Equal),
+                    BinaryOp::Colon => {
+                        let Some(builtin) = self
+                            .manifest
+                            .and_then(|manifest| manifest.resolve_operator(":"))
+                        else {
+                            self.errors.push(CompileError {
+                                message: "operator `:` is not registered in the builtin manifest"
+                                    .to_string(),
+                                span: expression.span,
+                            });
+                            return;
+                        };
+                        self.instructions.push(Instruction::CallBuiltin {
+                            builtin,
+                            labels: vec![None, None],
+                            has_receiver: false,
+                        });
+                    }
                 }
             }
         }
     }
 
-    fn compile_task(&mut self, block: &super::Block, mode: TaskMode) -> u32 {
+    fn compile_task(&mut self, block: &Block, mode: TaskMode) -> u32 {
         if mode == TaskMode::Parallel {
             let children = block
                 .statements
@@ -571,7 +632,7 @@ pub struct TaskRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmEvent {
     Call(BuiltinCall),
-    StatementCommit,
+    Statement(StatementValue),
     SpawnTask(TaskRequest),
     Completed(Value),
 }
@@ -754,7 +815,7 @@ impl Vm {
                     self.locals = frame.locals;
                     self.stack.push(value);
                 }
-                Instruction::StatementCommit => return Ok(Some(VmEvent::StatementCommit)),
+                Instruction::Statement(value) => return Ok(Some(VmEvent::Statement(value))),
                 Instruction::SpawnTask { task } => {
                     let template = self
                         .bytecode
@@ -919,7 +980,7 @@ pub struct TaskSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TaskEvent {
     Call { task: u64, call: BuiltinCall },
-    StatementCommit { task: u64 },
+    Statement { task: u64, value: StatementValue },
     Completed { task: u64, value: Value },
 }
 
@@ -1230,8 +1291,11 @@ impl TaskScheduler {
                     self.task_mut(task_id)?.pc = target;
                 }
             }
-            Instruction::StatementCommit => {
-                return Ok(Some(TaskEvent::StatementCommit { task: task_id }));
+            Instruction::Statement(value) => {
+                return Ok(Some(TaskEvent::Statement {
+                    task: task_id,
+                    value,
+                }));
             }
             Instruction::SpawnTask { task } => {
                 let child = self.spawn(task)?;
@@ -1362,7 +1426,7 @@ pub enum VmError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hks::parse_program;
+    use crate::parse_program;
 
     fn camera_manifest() -> BuiltinManifest {
         BuiltinManifest::with_selectors(
@@ -1399,8 +1463,14 @@ mod tests {
         restored
             .resume_builtin(Value::String("hello".to_string()))
             .unwrap();
-        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
-        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        );
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        );
         assert_eq!(
             restored.step().unwrap(),
             Some(VmEvent::Completed(Value::Null))
@@ -1461,7 +1531,10 @@ mod tests {
         restored
             .resume_builtin(Value::Handle { type_id: 7, id: 9 })
             .unwrap();
-        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        );
         assert_eq!(
             restored.step().unwrap(),
             Some(VmEvent::Completed(Value::Null))
@@ -1486,7 +1559,10 @@ mod tests {
         let snapshot = vm.snapshot();
         let mut restored = Vm::restore(bytecode, snapshot).unwrap();
         restored.resume_builtin(Value::Null).unwrap();
-        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        );
         assert_eq!(
             restored.step().unwrap(),
             Some(VmEvent::Completed(Value::Null))
@@ -1526,7 +1602,10 @@ mod tests {
         let snapshot = vm.snapshot();
         let mut restored = Vm::restore(bytecode, snapshot).unwrap();
         restored.resume(Value::Task(7)).unwrap();
-        assert_eq!(restored.step().unwrap(), Some(VmEvent::StatementCommit));
+        assert_eq!(
+            restored.step().unwrap(),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        );
         assert_eq!(
             restored.step().unwrap(),
             Some(VmEvent::Completed(Value::Null))
@@ -1566,7 +1645,10 @@ mod tests {
         restored.resume(task, Value::Null).unwrap();
         assert_eq!(
             restored.step().unwrap(),
-            Some(TaskEvent::StatementCommit { task })
+            Some(TaskEvent::Statement {
+                task,
+                value: StatementValue::Commit
+            })
         );
         let Some(TaskEvent::Call {
             task: yielded,
@@ -1580,7 +1662,10 @@ mod tests {
         restored.resume(task, Value::Null).unwrap();
         assert_eq!(
             restored.step().unwrap(),
-            Some(TaskEvent::StatementCommit { task })
+            Some(TaskEvent::Statement {
+                task,
+                value: StatementValue::Commit
+            })
         );
         assert_eq!(
             restored.step().unwrap(),
@@ -1617,11 +1702,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             restored.step().unwrap(),
-            Some(TaskEvent::StatementCommit { task })
+            Some(TaskEvent::Statement {
+                task,
+                value: StatementValue::Commit
+            })
         );
         assert_eq!(
             restored.step().unwrap(),
-            Some(TaskEvent::StatementCommit { task })
+            Some(TaskEvent::Statement {
+                task,
+                value: StatementValue::Commit
+            })
         );
         assert!(matches!(
             restored.step().unwrap(),
@@ -1644,7 +1735,10 @@ mod tests {
         scheduler.resume(first, Value::Null).unwrap();
         assert_eq!(
             scheduler.step().unwrap(),
-            Some(TaskEvent::StatementCommit { task: first })
+            Some(TaskEvent::Statement {
+                task: first,
+                value: StatementValue::Commit
+            })
         );
         assert_eq!(
             scheduler.step().unwrap(),
@@ -1661,7 +1755,10 @@ mod tests {
         scheduler.resume(second, Value::Null).unwrap();
         assert_eq!(
             scheduler.step().unwrap(),
-            Some(TaskEvent::StatementCommit { task: second })
+            Some(TaskEvent::Statement {
+                task: second,
+                value: StatementValue::Commit
+            })
         );
         assert_eq!(
             scheduler.step().unwrap(),
