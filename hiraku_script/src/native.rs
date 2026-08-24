@@ -26,6 +26,7 @@ pub struct NativeRegistry<C> {
     symbols: SymbolInterner,
     signatures: BTreeMap<BuiltinId, FunctionSignature>,
     static_members: Vec<StaticMember>,
+    globals: BTreeMap<String, crate::vm::ScriptType>,
 }
 
 impl<C> Default for NativeRegistry<C> {
@@ -45,11 +46,24 @@ impl<C> NativeRegistry<C> {
             symbols: SymbolInterner::new(),
             signatures: BTreeMap::new(),
             static_members: Vec::new(),
+            globals: BTreeMap::new(),
         }
     }
 
     pub fn define_type(&mut self, name: impl Into<String>) -> SymbolId {
         self.symbols.intern(name)
+    }
+
+    pub fn define_global(
+        &mut self,
+        name: impl Into<String>,
+        ty: crate::vm::ScriptType,
+    ) -> Result<(), RegistrationError> {
+        let name = name.into();
+        if self.globals.insert(name.clone(), ty).is_some() {
+            return Err(RegistrationError::DuplicateName(name));
+        }
+        Ok(())
     }
 
     pub fn set_signature(
@@ -64,7 +78,85 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
-    pub fn register_static_raw_fn_with_id<F>(
+    pub fn set_signature_for(
+        &mut self,
+        name: &str,
+        signature: FunctionSignature,
+    ) -> Result<(), RegistrationError> {
+        let builtin = self
+            .names
+            .get(name)
+            .copied()
+            .ok_or_else(|| RegistrationError::UnknownName(name.to_string()))?;
+        self.set_signature(builtin, signature)
+    }
+
+    pub fn register_raw_fn<F>(
+        &mut self,
+        name: impl Into<String>,
+        function: F,
+    ) -> Result<BuiltinId, RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let name = name.into();
+        let id = stable_builtin_id(&name);
+        self.register_raw_fn_with_id(id, name, function)?;
+        Ok(id)
+    }
+
+    pub fn register_selector_raw_fn<F>(
+        &mut self,
+        selector: impl Into<String>,
+        method: impl Into<String>,
+        function: F,
+    ) -> Result<BuiltinId, RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let selector = selector.into();
+        let method = method.into();
+        let id = stable_builtin_id(&format!("{selector}.{method}"));
+        self.register_selector_raw_fn_with_id(id, selector, method, function)?;
+        Ok(id)
+    }
+
+    pub fn register_operator_raw_fn<F>(
+        &mut self,
+        operator: impl Into<String>,
+        function: F,
+    ) -> Result<BuiltinId, RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let operator = operator.into();
+        let id = stable_builtin_id(&format!("operator {operator}"));
+        self.register_operator_raw_fn_with_id(id, operator, function)?;
+        Ok(id)
+    }
+
+    pub fn register_static_raw_fn<F>(
+        &mut self,
+        owner: SymbolId,
+        name: impl Into<String>,
+        signature: FunctionSignature,
+        kind: StaticMemberKind,
+        function: F,
+    ) -> Result<BuiltinId, RegistrationError>
+    where
+        F: Fn(&mut C, &BuiltinCall) -> Result<Value, NativeError> + Send + Sync + 'static,
+    {
+        let name = name.into();
+        let owner_name = self
+            .symbols
+            .resolve(owner)
+            .ok_or(RegistrationError::UnknownType(owner))?;
+        let id = stable_builtin_id(&format!("{owner_name}.{name}"));
+        self.register_static_raw_fn_with_id(id, owner, name, signature, kind, function)?;
+        Ok(id)
+    }
+
+    fn register_static_raw_fn_with_id<F>(
         &mut self,
         id: BuiltinId,
         owner: SymbolId,
@@ -121,7 +213,6 @@ impl<C> NativeRegistry<C> {
 
     /// Registers a function using an ID deterministically derived from its public name.
     ///
-    /// Use [`Self::register_fn_with_id`] for a shipped API whose numeric ABI must never change.
     pub fn register_fn<F, Args>(
         &mut self,
         name: impl Into<String>,
@@ -136,7 +227,7 @@ impl<C> NativeRegistry<C> {
         Ok(id)
     }
 
-    pub fn register_fn_with_id<F, Args>(
+    fn register_fn_with_id<F, Args>(
         &mut self,
         id: BuiltinId,
         name: impl Into<String>,
@@ -162,7 +253,7 @@ impl<C> NativeRegistry<C> {
     }
 
     /// Registers a low-level function that needs named-argument metadata or custom validation.
-    pub fn register_raw_fn_with_id<F>(
+    fn register_raw_fn_with_id<F>(
         &mut self,
         id: BuiltinId,
         name: impl Into<String>,
@@ -193,7 +284,7 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
-    pub fn register_selector_raw_fn_with_id<F>(
+    fn register_selector_raw_fn_with_id<F>(
         &mut self,
         id: BuiltinId,
         selector: impl Into<String>,
@@ -228,7 +319,7 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
-    pub fn register_selector_fn_with_id<F, Args>(
+    fn register_selector_fn_with_id<F, Args>(
         &mut self,
         id: BuiltinId,
         selector: impl Into<String>,
@@ -257,7 +348,7 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
-    pub fn register_operator_fn_with_id<F, Args>(
+    fn register_operator_fn_with_id<F, Args>(
         &mut self,
         id: BuiltinId,
         operator: impl Into<String>,
@@ -273,7 +364,7 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
-    pub fn register_operator_raw_fn_with_id<F>(
+    fn register_operator_raw_fn_with_id<F>(
         &mut self,
         id: BuiltinId,
         operator: impl Into<String>,
@@ -322,6 +413,7 @@ impl<C> NativeRegistry<C> {
             self.signatures.clone(),
             self.static_members.clone(),
         )
+        .with_globals(self.globals.clone())
     }
 
     pub fn call(&self, context: &mut C, call: &BuiltinCall) -> NativeResult {
@@ -399,6 +491,20 @@ pub trait IntoHksValue {
     fn into_hks_value(self) -> Value;
 }
 
+pub trait HksNativeType: Sized {
+    const HKS_TYPE_NAME: &'static str;
+
+    fn encode_hks_payload(self) -> Value;
+    fn decode_hks_payload(value: &Value) -> Result<Self, NativeError>;
+
+    fn into_hks_typed(self, type_id: SymbolId) -> Value {
+        Value::Typed {
+            type_id,
+            value: Box::new(self.encode_hks_payload()),
+        }
+    }
+}
+
 impl FromHksValue for Value {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         Ok(value.clone())
@@ -455,6 +561,50 @@ impl IntoHksValue for f64 {
         Value::Number(self)
     }
 }
+
+impl FromHksValue for f32 {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        f64::from_hks_value(value).map(|value| value as f32)
+    }
+}
+
+impl IntoHksValue for f32 {
+    fn into_hks_value(self) -> Value {
+        Value::Number(f64::from(self))
+    }
+}
+
+macro_rules! impl_integer_value {
+    ($( $type:ty ),* $(,)?) => {
+        $(
+            impl FromHksValue for $type {
+                fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+                    let Value::Number(value) = value else {
+                        return Err(NativeError::TypeMismatch("integer"));
+                    };
+                    if !value.is_finite() || value.fract() != 0.0
+                        || *value < <$type>::MIN as f64
+                        || *value > <$type>::MAX as f64
+                    {
+                        return Err(NativeError::message(format!(
+                            "number {value} is outside the range of {}",
+                            stringify!($type),
+                        )));
+                    }
+                    Ok(*value as $type)
+                }
+            }
+
+            impl IntoHksValue for $type {
+                fn into_hks_value(self) -> Value {
+                    Value::Number(self as f64)
+                }
+            }
+        )*
+    };
+}
+
+impl_integer_value!(u8, u16, u32, i8, i16, i32);
 
 impl IntoHksValue for () {
     fn into_hks_value(self) -> Value {
@@ -536,6 +686,7 @@ impl Error for NativeError {}
 pub enum RegistrationError {
     DuplicateName(String),
     UnknownBuiltin(BuiltinId),
+    UnknownName(String),
     UnknownType(SymbolId),
     GetterHasParameters(String),
     DuplicateId {
@@ -552,6 +703,7 @@ impl fmt::Display for RegistrationError {
                 write!(formatter, "native function `{name}` is already registered")
             }
             Self::UnknownBuiltin(id) => write!(formatter, "builtin {id:?} is not registered"),
+            Self::UnknownName(name) => write!(formatter, "builtin `{name}` is not registered"),
             Self::UnknownType(id) => write!(formatter, "script type {id:?} is not registered"),
             Self::GetterHasParameters(name) => {
                 write!(formatter, "getter `{name}` cannot declare parameters")
@@ -581,6 +733,25 @@ mod tests {
     #[derive(Default)]
     struct Context {
         calls: usize,
+    }
+
+    crate::hks_define! {
+        #[derive(Clone, Debug, PartialEq)]
+        enum MacroPosition {
+            Absolute(f64, f64),
+            Relative(u16, u16),
+        }
+
+        impl MacroPosition {
+            fn rel(x: u16, y: u16) -> MacroPosition {
+                MacroPosition::Relative(x, y)
+            }
+
+            #[getter]
+            fn left() -> MacroPosition {
+                MacroPosition::Absolute(-600.0, -200.0)
+            }
+        }
     }
 
     fn greet(context: &mut Context, name: String) -> Result<String, NativeError> {
@@ -825,5 +996,36 @@ mod tests {
         )
         .expect_err("argument type mismatch must fail compilation");
         assert!(errors[0].message.contains("expects Number"));
+    }
+
+    #[test]
+    fn hks_define_generates_type_and_member_registration() {
+        let mut registry = NativeRegistry::<Context>::new();
+        let position = MacroPosition::register_hks(&mut registry)
+            .expect("macro generated registration must succeed");
+        let manifest = registry.manifest();
+        assert_eq!(manifest.symbols().resolve(position), Some("MacroPosition"));
+        let bytecode = compile_with_manifest(
+            &parse_program("let a = .rel(20, 40)\nlet b = .left")
+                .expect("generated API syntax must parse"),
+            48,
+            &manifest,
+        )
+        .expect("generated signatures must compile");
+        let mut vm = crate::vm::Vm::new(bytecode).expect("VM must initialize");
+        let Some(crate::vm::VmEvent::Call(call)) = vm.step().expect("VM must advance") else {
+            panic!("expected macro-generated static call")
+        };
+        let value = registry
+            .call(&mut Context::default(), &call)
+            .expect("macro-generated thunk must dispatch");
+        let Value::Typed { type_id, value } = value else {
+            panic!("native type must be tagged")
+        };
+        assert_eq!(type_id, position);
+        assert_eq!(
+            MacroPosition::decode_hks_payload(&value).expect("macro-generated payload must decode"),
+            MacroPosition::Relative(20, 40)
+        );
     }
 }

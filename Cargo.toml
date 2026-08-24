@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_cli", "hiraku_hdp"]
+members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_script_derive", "hiraku_cli", "hiraku_hdp"]
 
 [workspace.package]
 version = "0.1.0"

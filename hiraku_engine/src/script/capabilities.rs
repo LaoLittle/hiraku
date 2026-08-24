@@ -4,9 +4,8 @@ use std::collections::BTreeMap;
 
 use hiraku_script::native::{FromHksValue, IntoHksValue, NativeError, NativeRegistry};
 use hiraku_script::vm::{
-    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, FunctionSignature, ScriptType,
-    StaticMemberKind, TaskEvent, TaskMode, TaskScheduler, TaskStatus, Value, Vm, VmEvent,
-    compile_with_manifest,
+    BuiltinCall, BuiltinManifest, Bytecode, FunctionSignature, ScriptType, TaskEvent, TaskMode,
+    TaskScheduler, TaskStatus, Value, Vm, VmEvent, compile_with_manifest,
 };
 use hiraku_script::{Expr, Program, StatementValue, Stmt, parse_program};
 use thiserror::Error;
@@ -72,33 +71,6 @@ pub enum StoryWait {
 }
 
 const ACTOR_HANDLE_TYPE: u32 = 1;
-const CHAR: BuiltinId = BuiltinId(1);
-const EMOTION: BuiltinId = BuiltinId(2);
-const AT: BuiltinId = BuiltinId(3);
-const SCALE: BuiltinId = BuiltinId(4);
-const LOG: BuiltinId = BuiltinId(10);
-const CLEAR_TEXT: BuiltinId = BuiltinId(11);
-const STOP_BGM: BuiltinId = BuiltinId(12);
-const EXIT: BuiltinId = BuiltinId(13);
-const RETURN_TO_TITLE: BuiltinId = BuiltinId(14);
-const BG: BuiltinId = BuiltinId(15);
-const LOAD_SCRIPT: BuiltinId = BuiltinId(16);
-const ADJUST_SETTING: BuiltinId = BuiltinId(17);
-const PLAY_BGM: BuiltinId = BuiltinId(18);
-const NARRATE: BuiltinId = BuiltinId(19);
-const CAMERA_BLUR: BuiltinId = BuiltinId(20);
-const CAMERA_ZOOM: BuiltinId = BuiltinId(21);
-const VOICE: BuiltinId = BuiltinId(22);
-const SAY: BuiltinId = BuiltinId(23);
-pub const OPEN_UI: BuiltinId = BuiltinId(24);
-pub const WAIT: BuiltinId = BuiltinId(25);
-const DIALOGUE_OPERATOR: BuiltinId = BuiltinId(26);
-const POSITION_ABSOLUTE: BuiltinId = BuiltinId(27);
-const POSITION_RELATIVE: BuiltinId = BuiltinId(28);
-const POSITION_LEFT: BuiltinId = BuiltinId(29);
-const POSITION_CENTER: BuiltinId = BuiltinId(30);
-const POSITION_RIGHT: BuiltinId = BuiltinId(31);
-
 pub fn manifest() -> BuiltinManifest {
     registry().manifest()
 }
@@ -140,67 +112,78 @@ fn source_hash(path: &str, source: &str) -> u64 {
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
     let actor_type = registry.define_type("Actor");
-    let position_type = registry.define_type("Position");
+    let position_type = Position::register_hks(&mut registry)
+        .expect("Position API registration must be internally consistent");
     registry
-        .register_fn_with_id(CHAR, "char", native_char)
+        .define_global(
+            "settings",
+            ScriptType::Record(BTreeMap::from([
+                ("bgmVolume".to_string(), ScriptType::Number),
+                ("voiceVolume".to_string(), ScriptType::Number),
+                ("sfxVolume".to_string(), ScriptType::Number),
+            ])),
+        )
+        .expect("engine settings schema must be defined once");
+    registry
+        .register_fn("char", native_char)
         .expect("built-in `char` registration must be unique");
     registry
-        .register_fn_with_id(EMOTION, "e", native_emotion)
+        .register_fn("e", native_emotion)
         .expect("built-in `e` registration must be unique");
     registry
-        .register_fn_with_id(AT, "at", native_at)
+        .register_fn("at", native_at)
         .expect("built-in `at` registration must be unique");
     registry
-        .register_fn_with_id(SCALE, "scale", native_scale)
+        .register_fn("scale", native_scale)
         .expect("built-in `scale` registration must be unique");
     registry
-        .register_fn_with_id(LOG, "log", native_log)
+        .register_fn("log", native_log)
         .expect("built-in `log` registration must be unique");
     registry
-        .register_fn_with_id(CLEAR_TEXT, "clearText", native_clear_text)
+        .register_fn("clearText", native_clear_text)
         .expect("built-in `clearText` registration must be unique");
     registry
-        .register_fn_with_id(STOP_BGM, "stopBgm", native_stop_bgm)
+        .register_fn("stopBgm", native_stop_bgm)
         .expect("built-in `stopBgm` registration must be unique");
     registry
-        .register_fn_with_id(EXIT, "exit", native_exit)
+        .register_fn("exit", native_exit)
         .expect("built-in `exit` registration must be unique");
     registry
-        .register_fn_with_id(RETURN_TO_TITLE, "returnToTitle", native_return_to_title)
+        .register_fn("returnToTitle", native_return_to_title)
         .expect("built-in `returnToTitle` registration must be unique");
     registry
-        .register_fn_with_id(BG, "bg", native_bg)
+        .register_fn("bg", native_bg)
         .expect("built-in `bg` registration must be unique");
     registry
-        .register_fn_with_id(LOAD_SCRIPT, "loadScript", native_load_script)
+        .register_fn("loadScript", native_load_script)
         .expect("built-in `loadScript` registration must be unique");
     registry
-        .register_fn_with_id(ADJUST_SETTING, "adjustSetting", native_adjust_setting)
+        .register_fn("adjustSetting", native_adjust_setting)
         .expect("built-in `adjustSetting` registration must be unique");
     registry
-        .register_fn_with_id(PLAY_BGM, "playBgm", native_play_bgm)
+        .register_fn("playBgm", native_play_bgm)
         .expect("built-in `playBgm` registration must be unique");
     registry
-        .register_fn_with_id(NARRATE, "narrate", native_narrate)
+        .register_fn("narrate", native_narrate)
         .expect("built-in `narrate` registration must be unique");
     registry
-        .register_fn_with_id(VOICE, "voice", native_voice)
+        .register_fn("voice", native_voice)
         .expect("built-in `voice` registration must be unique");
     registry
-        .register_fn_with_id(SAY, "say", native_say)
+        .register_fn("say", native_say)
         .expect("built-in `say` registration must be unique");
     registry
-        .register_operator_raw_fn_with_id(DIALOGUE_OPERATOR, ":", native_dialogue_operator)
+        .register_operator_raw_fn(":", native_dialogue_operator)
         .expect("built-in `:` operator registration must be unique");
     registry
-        .register_selector_raw_fn_with_id(CAMERA_BLUR, "camera", "blur", native_camera_blur)
+        .register_selector_raw_fn("camera", "blur", native_camera_blur)
         .expect("built-in `camera.blur` registration must be unique");
     registry
-        .register_selector_raw_fn_with_id(CAMERA_ZOOM, "camera", "zoom", native_camera_zoom)
+        .register_selector_raw_fn("camera", "zoom", native_camera_zoom)
         .expect("built-in `camera.zoom` registration must be unique");
     registry
-        .set_signature(
-            CHAR,
+        .set_signature_for(
+            "char",
             FunctionSignature {
                 receiver: None,
                 parameters: vec![ScriptType::String],
@@ -208,20 +191,14 @@ fn registry() -> NativeRegistry<CharacterContext> {
             },
         )
         .expect("char signature must target a registered builtin");
-    for (builtin, parameters) in [
-        (EMOTION, vec![ScriptType::String]),
-        (
-            AT,
-            vec![ScriptType::Union(vec![
-                ScriptType::String,
-                ScriptType::Named(position_type),
-            ])],
-        ),
-        (SCALE, vec![ScriptType::Number]),
+    for (name, parameters) in [
+        ("e", vec![ScriptType::String]),
+        ("at", vec![ScriptType::Named(position_type)]),
+        ("scale", vec![ScriptType::Number]),
     ] {
         registry
-            .set_signature(
-                builtin,
+            .set_signature_for(
+                name,
                 FunctionSignature {
                     receiver: Some(ScriptType::Named(actor_type)),
                     parameters,
@@ -230,96 +207,16 @@ fn registry() -> NativeRegistry<CharacterContext> {
             )
             .expect("actor method signature must target a registered builtin");
     }
-    register_position_api(&mut registry, position_type);
     registry
-}
-
-fn register_position_api(
-    registry: &mut NativeRegistry<CharacterContext>,
-    position_type: hiraku_script::SymbolId,
-) {
-    for (builtin, name, kind, position) in [
-        (
-            POSITION_LEFT,
-            "left",
-            StaticMemberKind::Getter,
-            Position::Absolute(-600.0, -200.0),
-        ),
-        (
-            POSITION_CENTER,
-            "center",
-            StaticMemberKind::Getter,
-            Position::Absolute(0.0, -200.0),
-        ),
-        (
-            POSITION_RIGHT,
-            "right",
-            StaticMemberKind::Getter,
-            Position::Absolute(600.0, -200.0),
-        ),
-    ] {
-        registry
-            .register_static_raw_fn_with_id(
-                builtin,
-                position_type,
-                name,
-                FunctionSignature {
-                    receiver: None,
-                    parameters: Vec::new(),
-                    result: ScriptType::Named(position_type),
-                },
-                kind,
-                move |_context, _call| Ok(position_value(position_type, position)),
-            )
-            .expect("position getter registration must be unique");
-    }
-    for (builtin, name, relative) in [
-        (POSITION_ABSOLUTE, "pos", false),
-        (POSITION_RELATIVE, "rel", true),
-    ] {
-        registry
-            .register_static_raw_fn_with_id(
-                builtin,
-                position_type,
-                name,
-                FunctionSignature {
-                    receiver: None,
-                    parameters: vec![ScriptType::Number, ScriptType::Number],
-                    result: ScriptType::Named(position_type),
-                },
-                StaticMemberKind::Method,
-                move |_context, call| {
-                    let [x, y] = call.arguments.as_slice() else {
-                        return Err(NativeError::Arity {
-                            expected: 2,
-                            actual: call.arguments.len(),
-                        });
-                    };
-                    let Value::Number(x) = &x.value else {
-                        return Err(NativeError::TypeMismatch("number"));
-                    };
-                    let Value::Number(y) = &y.value else {
-                        return Err(NativeError::TypeMismatch("number"));
-                    };
-                    let position = if relative {
-                        Position::relative(*x, *y)?
-                    } else {
-                        Position::Absolute(*x, *y)
-                    };
-                    Ok(position_value(position_type, position))
-                },
-            )
-            .expect("position constructor registration must be unique");
-    }
 }
 
 fn story_registry() -> NativeRegistry<CharacterContext> {
     let mut registry = registry();
     registry
-        .register_raw_fn_with_id(OPEN_UI, "openUi", async_capability_placeholder)
+        .register_raw_fn("openUi", async_capability_placeholder)
         .expect("built-in `openUi` registration must be unique");
     registry
-        .register_raw_fn_with_id(WAIT, "wait", async_capability_placeholder)
+        .register_raw_fn("wait", async_capability_placeholder)
         .expect("built-in `wait` registration must be unique");
     registry
 }
@@ -522,6 +419,7 @@ impl CharacterContext {
 #[derive(Clone, Copy)]
 struct ActorHandle(u64);
 
+hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Position {
     Absolute(f64, f64),
@@ -529,7 +427,11 @@ enum Position {
 }
 
 impl Position {
-    fn relative(x: f64, y: f64) -> Result<Self, NativeError> {
+    fn pos(x: f64, y: f64) -> Position {
+        Self::Absolute(x, y)
+    }
+
+    fn rel(x: f64, y: f64) -> Result<Position, NativeError> {
         fn component(value: f64) -> Result<u16, NativeError> {
             if !value.is_finite() || value.fract() != 0.0 || !(0.0..=100.0).contains(&value) {
                 return Err(NativeError::message(
@@ -541,6 +443,24 @@ impl Position {
         Ok(Self::Relative(component(x)?, component(y)?))
     }
 
+    #[getter]
+    fn left() -> Position {
+        Self::Absolute(-600.0, -200.0)
+    }
+
+    #[getter]
+    fn center() -> Position {
+        Self::Absolute(0.0, -200.0)
+    }
+
+    #[getter]
+    fn right() -> Position {
+        Self::Absolute(600.0, -200.0)
+    }
+}
+}
+
+impl Position {
     fn resolve(self) -> [f32; 2] {
         match self {
             Self::Absolute(x, y) => [x as f32, y as f32],
@@ -550,52 +470,6 @@ impl Position {
                 f32::from(y) / 100.0 * 1080.0 - 540.0,
             ],
         }
-    }
-}
-
-impl FromHksValue for Position {
-    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
-        match value {
-            Value::String(preset) => match preset.as_str() {
-                "left" => Ok(Self::Absolute(-600.0, -200.0)),
-                "center" => Ok(Self::Absolute(0.0, -200.0)),
-                "right" => Ok(Self::Absolute(600.0, -200.0)),
-                _ => Err(NativeError::message(format!(
-                    "unknown character position `{preset}`"
-                ))),
-            },
-            Value::Typed { value, .. } => position_payload(value),
-            _ => Err(NativeError::TypeMismatch("Position")),
-        }
-    }
-}
-
-fn position_value(type_id: hiraku_script::SymbolId, position: Position) -> Value {
-    let (kind, x, y) = match position {
-        Position::Absolute(x, y) => ("absolute", x, y),
-        Position::Relative(x, y) => ("relative", f64::from(x), f64::from(y)),
-    };
-    Value::Typed {
-        type_id,
-        value: Box::new(Value::Tuple(vec![
-            Value::Symbol(kind.to_string()),
-            Value::Number(x),
-            Value::Number(y),
-        ])),
-    }
-}
-
-fn position_payload(value: &Value) -> Result<Position, NativeError> {
-    let Value::Tuple(fields) = value else {
-        return Err(NativeError::TypeMismatch("Position"));
-    };
-    let [Value::Symbol(kind), Value::Number(x), Value::Number(y)] = fields.as_slice() else {
-        return Err(NativeError::TypeMismatch("Position"));
-    };
-    match kind.as_str() {
-        "absolute" => Ok(Position::Absolute(*x, *y)),
-        "relative" => Position::relative(*x, *y),
-        _ => Err(NativeError::message("unknown Position variant")),
     }
 }
 
@@ -1096,10 +970,9 @@ mod tests {
 
     #[test]
     fn fluent_calls_flush_once_at_the_statement_boundary() {
-        let program = parse_program(
-            r#"char("Alice").e("happy_eyes").e("happy_face").at("right").scale(0.5)"#,
-        )
-        .unwrap();
+        let program =
+            parse_program(r#"char("Alice").e("happy_eyes").e("happy_face").at(.right).scale(0.5)"#)
+                .unwrap();
         let Stmt::Expr(expression) = &program.statements[0] else {
             panic!()
         };
@@ -1201,8 +1074,8 @@ not_actor.at(.left)"#,
     #[test]
     fn character_calls_are_valid_sequence_and_parallel_task_commands() {
         for source in [
-            r#"seq { char("Alice").e("happy").at("left") }"#,
-            "par {\nchar(\"Alice\").e(\"happy\")\nchar(\"Bob\").at(\"right\")\n}",
+            r#"seq { char("Alice").e("happy").at(.left) }"#,
+            "par {\nchar(\"Alice\").e(\"happy\")\nchar(\"Bob\").at(.right)\n}",
         ] {
             let program = parse_program(source).expect("character task must parse");
             let Stmt::Expr(expression) = &program.statements[0] else {

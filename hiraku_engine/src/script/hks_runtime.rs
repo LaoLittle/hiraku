@@ -4,6 +4,7 @@
 //! owns the generic VM and task scheduler while ECS systems own waits and effects.
 
 use hiraku_script::StatementValue;
+use hiraku_script::TemplateError;
 use hiraku_script::vm::{
     BuiltinCall, Bytecode, TaskEvent, TaskScheduler, TaskSchedulerError, TaskSchedulerSnapshot,
     Value, Vm, VmError, VmEvent, VmSnapshot,
@@ -61,8 +62,15 @@ impl HksRuntime {
     pub fn step(&mut self) -> Result<Option<HksRuntimeEvent>, HksRuntimeError> {
         if let Some(event) = self.vm.step()? {
             return match event {
-                VmEvent::Call(call) => Ok(Some(HksRuntimeEvent::Call(call))),
-                VmEvent::Statement(value) => Ok(Some(HksRuntimeEvent::Statement(value))),
+                VmEvent::Call(mut call) => {
+                    evaluate_call_templates(&mut call, |text| self.vm.eval_template(text))?;
+                    Ok(Some(HksRuntimeEvent::Call(call)))
+                }
+                VmEvent::Statement(value) => {
+                    let value = evaluate_statement_template(&mut self.vm, value)?;
+                    self.scheduler.set_globals(self.vm.globals().clone());
+                    Ok(Some(HksRuntimeEvent::Statement(value)))
+                }
                 VmEvent::SpawnTask(request) => {
                     let task = self.scheduler.spawn(request.task)?;
                     self.vm.resume(Value::Task(task))?;
@@ -73,10 +81,13 @@ impl HksRuntime {
         }
 
         match self.scheduler.step()? {
-            Some(TaskEvent::Call { task, call }) => {
+            Some(TaskEvent::Call { task, mut call }) => {
+                evaluate_call_templates(&mut call, |text| self.scheduler.eval_template(text))?;
                 Ok(Some(HksRuntimeEvent::TaskCall { task, call }))
             }
             Some(TaskEvent::Statement { task, value }) => {
+                let value = evaluate_task_statement_template(&mut self.scheduler, value)?;
+                self.vm.set_globals(self.scheduler.globals().clone());
                 Ok(Some(HksRuntimeEvent::TaskStatement { task, value }))
             }
             Some(TaskEvent::Completed { task, value }) => {
@@ -91,6 +102,11 @@ impl HksRuntime {
         Ok(())
     }
 
+    pub fn set_globals(&mut self, globals: std::collections::BTreeMap<String, Value>) {
+        self.vm.set_globals(globals.clone());
+        self.scheduler.set_globals(globals);
+    }
+
     pub fn resume_task(&mut self, task: u64, value: Value) -> Result<(), HksRuntimeError> {
         self.scheduler.resume(task, value)?;
         Ok(())
@@ -103,6 +119,43 @@ pub enum HksRuntimeError {
     Vm(VmError),
     #[error("HKS task scheduler failed: {0:?}")]
     Scheduler(TaskSchedulerError),
+    #[error("HKS string template failed: {0}")]
+    Template(#[from] TemplateError),
+}
+
+fn evaluate_statement_template(
+    vm: &mut Vm,
+    value: StatementValue,
+) -> Result<StatementValue, TemplateError> {
+    match value {
+        StatementValue::String(text) => Ok(StatementValue::String(vm.eval_template(&text)?)),
+        value => Ok(value),
+    }
+}
+
+fn evaluate_task_statement_template(
+    scheduler: &mut TaskScheduler,
+    value: StatementValue,
+) -> Result<StatementValue, TemplateError> {
+    match value {
+        StatementValue::String(text) => Ok(StatementValue::String(scheduler.eval_template(&text)?)),
+        value => Ok(value),
+    }
+}
+
+fn evaluate_call_templates(
+    call: &mut BuiltinCall,
+    mut evaluate: impl FnMut(&str) -> Result<String, TemplateError>,
+) -> Result<(), TemplateError> {
+    if let Some(Value::String(text)) = &mut call.receiver {
+        *text = evaluate(text)?;
+    }
+    for argument in &mut call.arguments {
+        if let Value::String(text) = &mut argument.value {
+            *text = evaluate(text)?;
+        }
+    }
+    Ok(())
 }
 
 impl From<VmError> for HksRuntimeError {
@@ -120,8 +173,9 @@ impl From<TaskSchedulerError> for HksRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::capabilities::{StoryEffect, StoryNativeHost, compile_story_bytecode};
-    use hiraku_script::vm::BuiltinId;
+    use crate::script::capabilities::{
+        StoryEffect, StoryNativeHost, compile_story_bytecode, story_manifest,
+    };
 
     #[test]
     fn whole_program_runtime_yields_native_calls_without_ir() {
@@ -132,7 +186,10 @@ mod tests {
         else {
             panic!("expected a native call")
         };
-        assert_eq!(call.builtin, BuiltinId(10));
+        assert_eq!(
+            call.builtin,
+            story_manifest().resolve("log").expect("log registration")
+        );
         runtime
             .resume_main(Value::Null)
             .expect("host result must resume the main VM");
@@ -165,9 +222,29 @@ mod tests {
     }
 
     #[test]
+    fn whole_program_runtime_evaluates_dialogue_templates_from_globals() {
+        let bytecode = compile_story_bytecode(
+            "template.story.hks",
+            "global player = .{ name: \"Alice\" }\n\"Hi, ${player.name}\"",
+        )
+        .expect("template story must compile");
+        let mut runtime = HksRuntime::new(bytecode).expect("runtime must initialize");
+        assert!(matches!(
+            runtime.step().expect("global declaration must run"),
+            Some(HksRuntimeEvent::Statement(StatementValue::Commit))
+        ));
+        assert_eq!(
+            runtime.step().expect("dialogue statement must run"),
+            Some(HksRuntimeEvent::Statement(StatementValue::String(
+                "Hi, Alice".to_string()
+            )))
+        );
+    }
+
+    #[test]
     fn direct_runtime_dispatches_native_calls_at_statement_boundaries() {
         let bytecode =
-            compile_story_bytecode("test.story.hks", r#"char("Alice").e("happy").at("right")"#)
+            compile_story_bytecode("test.story.hks", r#"char("Alice").e("happy").at(.right)"#)
                 .expect("character story must compile");
         let mut runtime = HksRuntime::new(bytecode).expect("direct HKS runtime must initialize");
         let mut host = StoryNativeHost::new();

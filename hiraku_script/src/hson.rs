@@ -296,6 +296,11 @@ fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError
             .map(|value| literal_value(value, source))
             .collect::<Result<Vec<_>, _>>()
             .map(HsonValue::Array),
+        ExprKind::List(values) => values
+            .iter()
+            .map(|value| literal_value(value, source))
+            .collect::<Result<Vec<_>, _>>()
+            .map(HsonValue::Array),
         ExprKind::Map(fields) => {
             let mut map = HsonMap::new();
             for field in fields {
@@ -363,17 +368,14 @@ fn write_value(value: &HsonValue, output: &mut String, depth: usize) -> Result<(
             output.push('"');
         }
         HsonValue::Array(values) => {
-            output.push('(');
+            output.push('[');
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
                     output.push_str(", ");
                 }
                 write_value(value, output, depth)?;
             }
-            if values.len() == 1 {
-                output.push(',');
-            }
-            output.push(')');
+            output.push(']');
         }
         HsonValue::Map(values) => {
             output.push_str(".{");
@@ -1033,9 +1035,22 @@ mod tests {
         };
         let source = to_string(&value).expect("document should serialize");
         assert!(source.starts_with(".{"));
+        assert!(source.contains("values: [1, 2.5]"));
         assert_eq!(
             from_str::<Document>(&source).expect("document should deserialize"),
             value
+        );
+    }
+
+    #[test]
+    fn square_brackets_are_hson_lists() {
+        assert_eq!(
+            parse("[1, 2, 3]").expect("list must parse"),
+            HsonValue::Array(vec![
+                HsonValue::Integer(1),
+                HsonValue::Integer(2),
+                HsonValue::Integer(3),
+            ])
         );
     }
 

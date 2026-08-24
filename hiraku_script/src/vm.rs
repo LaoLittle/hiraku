@@ -14,7 +14,7 @@ use crate::{
     symbol::{SymbolId, SymbolManifest},
 };
 
-pub const BYTECODE_VERSION: u16 = 5;
+pub const BYTECODE_VERSION: u16 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
@@ -27,6 +27,7 @@ pub enum ScriptType {
     Any,
     Null,
     Bool,
+    Int,
     Number,
     Percent,
     String,
@@ -35,7 +36,10 @@ pub enum ScriptType {
     Task,
     Named(SymbolId),
     Union(Vec<ScriptType>),
+    Nullable(Box<ScriptType>),
     Tuple,
+    List(Box<ScriptType>),
+    Record(BTreeMap<String, ScriptType>),
     Map,
 }
 
@@ -45,6 +49,9 @@ impl ScriptType {
             || actual == &Self::Any
             || self == actual
             || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))
+            || matches!(self, Self::Nullable(inner) if actual == &Self::Null || inner.accepts(actual))
+            || matches!((self, actual), (Self::List(expected), Self::List(actual)) if expected.accepts(actual))
+            || matches!((self, actual), (Self::Number, Self::Int))
     }
 }
 
@@ -82,6 +89,10 @@ pub struct BuiltinManifest {
     signatures: BTreeMap<BuiltinId, FunctionSignature>,
     #[serde(default)]
     static_members: Vec<StaticMember>,
+    /// Embedding-owned globals. Source code may read and mutate their fixed fields,
+    /// but cannot redeclare the root object or change its schema.
+    #[serde(default)]
+    globals: BTreeMap<String, ScriptType>,
 }
 
 impl BuiltinManifest {
@@ -142,6 +153,7 @@ impl BuiltinManifest {
             symbols: SymbolManifest::default(),
             signatures: BTreeMap::new(),
             static_members: Vec::new(),
+            globals: BTreeMap::new(),
         }
     }
 
@@ -156,6 +168,16 @@ impl BuiltinManifest {
         self.static_members = static_members;
         self.rehash();
         self
+    }
+
+    pub fn with_globals(mut self, globals: BTreeMap<String, ScriptType>) -> Self {
+        self.globals = globals;
+        self.rehash();
+        self
+    }
+
+    pub fn globals(&self) -> &BTreeMap<String, ScriptType> {
+        &self.globals
     }
 
     pub fn hash(&self) -> u64 {
@@ -214,7 +236,12 @@ impl BuiltinManifest {
     }
 
     fn rehash(&mut self) {
-        let mut hash = self.hash;
+        let mut hash = Self::with_operators(
+            self.names.clone(),
+            self.selectors.clone(),
+            self.operators.clone(),
+        )
+        .hash;
         for symbol in self.symbols.symbols() {
             hash = symbol.bytes().fold(hash, hash_byte);
             hash = hash_byte(hash, 0xff);
@@ -225,6 +252,11 @@ impl BuiltinManifest {
         }
         for member in &self.static_members {
             hash = format!("{member:?}").bytes().fold(hash, hash_byte);
+        }
+        for (name, ty) in &self.globals {
+            hash = name.bytes().fold(hash, hash_byte);
+            hash = hash_byte(hash, 0xfe);
+            hash = format!("{ty:?}").bytes().fold(hash, hash_byte);
         }
         self.hash = hash;
     }
@@ -237,6 +269,7 @@ fn hash_byte(hash: u64, byte: u8) -> u64 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
+    Uninitialized,
     Ellipsis,
     Bool(bool),
     Number(f64),
@@ -254,7 +287,40 @@ pub enum Value {
     },
     Task(u64),
     Tuple(Vec<Value>),
+    List(Vec<Value>),
     Map(BTreeMap<String, Value>),
+}
+
+enum MemberPathError {
+    Unknown(String),
+    NotRecord,
+}
+
+fn set_member_path(
+    value: &mut Value,
+    path: &[String],
+    new_value: Value,
+) -> Result<(), MemberPathError> {
+    let Some((name, remainder)) = path.split_first() else {
+        return Err(MemberPathError::NotRecord);
+    };
+    let fields = match value {
+        Value::Map(fields) => fields,
+        Value::Typed { value, .. } => match value.as_mut() {
+            Value::Map(fields) => fields,
+            _ => return Err(MemberPathError::NotRecord),
+        },
+        _ => return Err(MemberPathError::NotRecord),
+    };
+    let field = fields
+        .get_mut(name)
+        .ok_or_else(|| MemberPathError::Unknown(name.clone()))?;
+    if remainder.is_empty() {
+        *field = new_value;
+        Ok(())
+    } else {
+        set_member_path(field, remainder, new_value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -295,10 +361,22 @@ pub enum Instruction {
     Constant(Value),
     LoadLocal(String),
     StoreLocal(String),
+    LoadGlobal(String),
+    StoreGlobal(String),
+    StoreGlobalMember {
+        root: String,
+        path: Vec<String>,
+    },
     MakeTuple(usize),
+    MakeList(usize),
     MakeMap(Vec<String>),
     Negate,
     Equal,
+    GetMember {
+        name: String,
+        safe: bool,
+    },
+    AssertNonNull,
     CallBuiltin {
         builtin: BuiltinId,
         labels: Vec<Option<String>>,
@@ -310,6 +388,7 @@ pub enum Instruction {
     },
     Jump(usize),
     JumpIfFalse(usize),
+    JumpIfNotNull(usize),
     Return,
     Statement(StatementValue),
     SpawnTask {
@@ -343,6 +422,9 @@ fn compile_inner(
     manifest: Option<&BuiltinManifest>,
 ) -> Result<Bytecode, Vec<CompileError>> {
     let mut function_names = BTreeMap::new();
+    let mut global_types = manifest
+        .map(|manifest| manifest.globals().clone())
+        .unwrap_or_default();
     let mut declaration_errors = Vec::new();
     for statement in &program.statements {
         if let Stmt::Function { name, span, .. } = statement {
@@ -355,6 +437,36 @@ fn compile_inner(
                 function_names.insert(name.clone(), FunctionId(function_names.len() as u32));
             }
         }
+        if let Stmt::Global {
+            name,
+            type_annotation,
+            value,
+            span,
+        } = statement
+        {
+            if manifest.is_some_and(|manifest| manifest.globals().contains_key(name)) {
+                declaration_errors.push(CompileError {
+                    message: format!("embedding-owned global `{name}` cannot be redeclared"),
+                    span: span.clone(),
+                });
+            } else if global_types.contains_key(name) {
+                declaration_errors.push(CompileError {
+                    message: format!("global `{name}` is defined more than once"),
+                    span: span.clone(),
+                });
+            } else {
+                let ty = type_annotation
+                    .as_ref()
+                    .map(script_type_from_ast)
+                    .or_else(|| {
+                        value
+                            .as_ref()
+                            .map(|value| infer_expression_type(manifest, &BTreeMap::new(), value))
+                    })
+                    .unwrap_or(ScriptType::Any);
+                global_types.insert(name.clone(), ty);
+            }
+        }
     }
     let mut compiler = Compiler {
         instructions: Vec::new(),
@@ -363,7 +475,8 @@ fn compile_inner(
         errors: declaration_errors,
         manifest,
         function_names,
-        local_types: BTreeMap::new(),
+        local_types: global_types.clone(),
+        global_types,
     };
     compiler.compile_functions(program);
     for statement in &program.statements {
@@ -394,6 +507,7 @@ struct Compiler<'a> {
     manifest: Option<&'a BuiltinManifest>,
     function_names: BTreeMap<String, FunctionId>,
     local_types: BTreeMap<String, ScriptType>,
+    global_types: BTreeMap<String, ScriptType>,
 }
 
 impl Compiler<'_> {
@@ -460,12 +574,122 @@ impl Compiler<'_> {
                 message: "nested function definitions are not supported".to_string(),
                 span: span.clone(),
             }),
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let {
+                name,
+                type_annotation,
+                value,
+                ..
+            } => {
                 let value_type = infer_expression_type(self.manifest, &self.local_types, value);
+                let declared_type = type_annotation.as_ref().map(script_type_from_ast);
+                if let Some(expected) = &declared_type
+                    && !expected.accepts(&value_type)
+                {
+                    self.errors.push(CompileError {
+                        message: format!("local `{name}` expects {expected:?}, got {value_type:?}"),
+                        span: value.span,
+                    });
+                }
                 self.expression(value);
                 self.instructions
                     .push(Instruction::StoreLocal(name.clone()));
-                self.local_types.insert(name.clone(), value_type);
+                self.local_types
+                    .insert(name.clone(), declared_type.unwrap_or(value_type));
+                self.instructions
+                    .push(Instruction::Statement(StatementValue::Commit));
+            }
+            Stmt::Global {
+                name, value, span, ..
+            } => {
+                let expected = self
+                    .global_types
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(ScriptType::Any);
+                if let Some(value) = value {
+                    let actual = infer_expression_type(self.manifest, &self.local_types, value);
+                    if !expected.accepts(&actual) {
+                        self.errors.push(CompileError {
+                            message: format!(
+                                "global `{name}` expects {expected:?}, got {actual:?}"
+                            ),
+                            span: value.span,
+                        });
+                    }
+                    self.expression(value);
+                } else {
+                    self.instructions
+                        .push(Instruction::Constant(Value::Uninitialized));
+                }
+                self.instructions
+                    .push(Instruction::StoreGlobal(name.clone()));
+                self.instructions
+                    .push(Instruction::Statement(StatementValue::Commit));
+                let _ = span;
+            }
+            Stmt::Assign { target, value, .. } => {
+                let actual = infer_expression_type(self.manifest, &self.local_types, value);
+                if let Some((root, path)) = assignment_member_path(target) {
+                    let Some(root_type) = self.global_types.get(&root) else {
+                        self.errors.push(CompileError {
+                            message: "member assignment is only supported for global records"
+                                .to_string(),
+                            span: target.span,
+                        });
+                        return;
+                    };
+                    let Some(expected) = record_path_type(root_type, &path) else {
+                        self.errors.push(CompileError {
+                            message: format!("unknown or non-record field `{}`", path.join(".")),
+                            span: target.span,
+                        });
+                        return;
+                    };
+                    if !expected.accepts(&actual) {
+                        self.errors.push(CompileError {
+                            message: format!(
+                                "`{root}.{}` expects {expected:?}, got {actual:?}",
+                                path.join(".")
+                            ),
+                            span: value.span,
+                        });
+                    }
+                    self.expression(value);
+                    self.instructions
+                        .push(Instruction::StoreGlobalMember { root, path });
+                    self.instructions
+                        .push(Instruction::Statement(StatementValue::Commit));
+                    return;
+                }
+                let ExprKind::Ident(name) = &target.kind else {
+                    self.errors.push(CompileError {
+                        message: "assignment target must be a variable or global record field"
+                            .to_string(),
+                        span: target.span,
+                    });
+                    return;
+                };
+                let expected = self
+                    .global_types
+                    .get(name)
+                    .or_else(|| self.local_types.get(name));
+                if let Some(expected) = expected
+                    && !expected.accepts(&actual)
+                {
+                    self.errors.push(CompileError {
+                        message: format!("`{name}` expects {expected:?}, got {actual:?}"),
+                        span: value.span,
+                    });
+                }
+                self.expression(value);
+                if self.global_types.contains_key(name) {
+                    self.instructions
+                        .push(Instruction::StoreGlobal(name.clone()));
+                } else {
+                    self.instructions
+                        .push(Instruction::StoreLocal(name.clone()));
+                    self.local_types.insert(name.clone(), actual);
+                }
                 self.instructions
                     .push(Instruction::Statement(StatementValue::Commit));
             }
@@ -531,7 +755,14 @@ impl Compiler<'_> {
             ExprKind::Ellipsis => self
                 .instructions
                 .push(Instruction::Constant(Value::Ellipsis)),
-            ExprKind::Ident(name) => self.instructions.push(Instruction::LoadLocal(name.clone())),
+            ExprKind::Ident(name) => {
+                if self.global_types.contains_key(name) {
+                    self.instructions
+                        .push(Instruction::LoadGlobal(name.clone()));
+                } else {
+                    self.instructions.push(Instruction::LoadLocal(name.clone()));
+                }
+            }
             ExprKind::Symbol(name) => {
                 if let Some(manifest) = self.manifest {
                     match manifest.resolve_getter(name) {
@@ -577,6 +808,12 @@ impl Compiler<'_> {
                     self.expression(value);
                 }
                 self.instructions.push(Instruction::MakeTuple(values.len()));
+            }
+            ExprKind::List(values) => {
+                for value in values {
+                    self.expression(value);
+                }
+                self.instructions.push(Instruction::MakeList(values.len()));
             }
             ExprKind::Map(fields) => {
                 for field in fields {
@@ -722,8 +959,36 @@ impl Compiler<'_> {
                     span: callee.span.clone(),
                 });
             }
-            ExprKind::Member { .. } | ExprKind::Block(_) => self.errors.push(CompileError {
-                message: "expression is not a value".to_string(),
+            ExprKind::Member { object, name } => {
+                self.expression(object);
+                self.instructions.push(Instruction::GetMember {
+                    name: name.clone(),
+                    safe: false,
+                });
+            }
+            ExprKind::SafeMember { object, name } => {
+                self.expression(object);
+                self.instructions.push(Instruction::GetMember {
+                    name: name.clone(),
+                    safe: true,
+                });
+            }
+            ExprKind::NonNull(value) => {
+                self.expression(value);
+                self.instructions.push(Instruction::AssertNonNull);
+            }
+            ExprKind::Elvis { value, fallback } => {
+                self.expression(value);
+                let jump = self.instructions.len();
+                self.instructions
+                    .push(Instruction::JumpIfNotNull(usize::MAX));
+                self.instructions.push(Instruction::Pop);
+                self.expression(fallback);
+                let end = self.instructions.len();
+                self.instructions[jump] = Instruction::JumpIfNotNull(end);
+            }
+            ExprKind::Block(_) => self.errors.push(CompileError {
+                message: "block expression is not a value".to_string(),
                 span: expression.span.clone(),
             }),
             ExprKind::Binary { left, op, right } => {
@@ -899,10 +1164,16 @@ fn infer_expression_type(
         ExprKind::Ellipsis => ScriptType::Any,
         ExprKind::Bool(_) | ExprKind::Binary { .. } => ScriptType::Bool,
         ExprKind::Number {
+            value,
             unit: NumberUnit::Scalar,
-            ..
+        } => {
+            if value.fract() == 0.0 {
+                ScriptType::Int
+            } else {
+                ScriptType::Number
+            }
         }
-        | ExprKind::UnaryMinus(_) => ScriptType::Number,
+        ExprKind::UnaryMinus(value) => infer_expression_type(manifest, locals, value),
         ExprKind::Number {
             unit: NumberUnit::Percent,
             ..
@@ -914,7 +1185,30 @@ fn infer_expression_type(
             .map(|signature| signature.result.clone())
             .unwrap_or(ScriptType::Symbol),
         ExprKind::Tuple(_) => ScriptType::Tuple,
-        ExprKind::Map(_) => ScriptType::Map,
+        ExprKind::List(values) => {
+            let mut values = values.iter();
+            let element = values
+                .next()
+                .map(|value| infer_expression_type(manifest, locals, value))
+                .unwrap_or(ScriptType::Any);
+            if values.all(|value| element.accepts(&infer_expression_type(manifest, locals, value)))
+            {
+                ScriptType::List(Box::new(element))
+            } else {
+                ScriptType::List(Box::new(ScriptType::Any))
+            }
+        }
+        ExprKind::Map(fields) => ScriptType::Record(
+            fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        infer_expression_type(manifest, locals, &field.value),
+                    )
+                })
+                .collect(),
+        ),
         ExprKind::Call { callee, .. } => {
             let builtin = manifest.and_then(|manifest| match &callee.kind {
                 ExprKind::Ident(name) => manifest.resolve(name),
@@ -931,7 +1225,71 @@ fn infer_expression_type(
                 .unwrap_or(ScriptType::Any)
         }
         ExprKind::Ident(name) => locals.get(name).cloned().unwrap_or(ScriptType::Any),
-        ExprKind::Member { .. } | ExprKind::Block(_) => ScriptType::Any,
+        ExprKind::Member { object, name } => {
+            match infer_expression_type(manifest, locals, object) {
+                ScriptType::Record(fields) => fields.get(name).cloned().unwrap_or(ScriptType::Any),
+                ScriptType::Nullable(inner) => match *inner {
+                    ScriptType::Record(fields) => {
+                        fields.get(name).cloned().unwrap_or(ScriptType::Any)
+                    }
+                    _ => ScriptType::Any,
+                },
+                _ => ScriptType::Any,
+            }
+        }
+        ExprKind::SafeMember { object, name } => {
+            let member = match infer_expression_type(manifest, locals, object) {
+                ScriptType::Record(fields) => fields.get(name).cloned().unwrap_or(ScriptType::Any),
+                ScriptType::Nullable(inner) => match *inner {
+                    ScriptType::Record(fields) => {
+                        fields.get(name).cloned().unwrap_or(ScriptType::Any)
+                    }
+                    _ => ScriptType::Any,
+                },
+                _ => ScriptType::Any,
+            };
+            ScriptType::Nullable(Box::new(member))
+        }
+        ExprKind::Elvis { value, fallback } => {
+            let value = infer_expression_type(manifest, locals, value);
+            let fallback = infer_expression_type(manifest, locals, fallback);
+            match value {
+                ScriptType::Nullable(inner) if inner.accepts(&fallback) => *inner,
+                ScriptType::Null => fallback,
+                other => other,
+            }
+        }
+        ExprKind::NonNull(value) => match infer_expression_type(manifest, locals, value) {
+            ScriptType::Nullable(inner) => *inner,
+            other => other,
+        },
+        ExprKind::Block(_) => ScriptType::Any,
+    }
+}
+
+fn script_type_from_ast(ty: &crate::TypeExpr) -> ScriptType {
+    match &ty.kind {
+        crate::TypeExprKind::Named(name) => match name.as_str() {
+            "Any" => ScriptType::Any,
+            "Null" => ScriptType::Null,
+            "Bool" => ScriptType::Bool,
+            "Int" => ScriptType::Int,
+            "Float" | "Number" => ScriptType::Number,
+            "String" => ScriptType::String,
+            _ => ScriptType::Any,
+        },
+        crate::TypeExprKind::Nullable(inner) => {
+            ScriptType::Nullable(Box::new(script_type_from_ast(inner)))
+        }
+        crate::TypeExprKind::List(element) => {
+            ScriptType::List(Box::new(script_type_from_ast(element)))
+        }
+        crate::TypeExprKind::Record(fields) => ScriptType::Record(
+            fields
+                .iter()
+                .map(|field| (field.name.clone(), script_type_from_ast(&field.ty)))
+                .collect(),
+        ),
     }
 }
 
@@ -941,6 +1299,33 @@ fn flatten_callee(expression: &Expr) -> Option<String> {
         ExprKind::Member { object, name } => Some(format!("{}.{}", flatten_callee(object)?, name)),
         _ => None,
     }
+}
+
+fn assignment_member_path(expression: &Expr) -> Option<(String, Vec<String>)> {
+    fn collect(expression: &Expr, path: &mut Vec<String>) -> Option<String> {
+        match &expression.kind {
+            ExprKind::Ident(name) => Some(name.clone()),
+            ExprKind::Member { object, name } => {
+                let root = collect(object, path)?;
+                path.push(name.clone());
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+    let mut path = Vec::new();
+    let root = collect(expression, &mut path)?;
+    (!path.is_empty()).then_some((root, path))
+}
+
+fn record_path_type<'a>(mut ty: &'a ScriptType, path: &[String]) -> Option<&'a ScriptType> {
+    for name in path {
+        let ScriptType::Record(fields) = ty else {
+            return None;
+        };
+        ty = fields.get(name)?;
+    }
+    Some(ty)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -987,6 +1372,8 @@ pub struct VmSnapshot {
     pub stack: Vec<Value>,
     pub locals: BTreeMap<String, Value>,
     #[serde(default)]
+    pub globals: BTreeMap<String, Value>,
+    #[serde(default)]
     pub call_frames: Vec<CallFrame>,
     pub status: VmStatus,
 }
@@ -1005,6 +1392,7 @@ pub struct Vm {
     current_function: Option<FunctionId>,
     stack: Vec<Value>,
     locals: BTreeMap<String, Value>,
+    globals: BTreeMap<String, Value>,
     call_frames: Vec<CallFrame>,
     status: VmStatus,
 }
@@ -1020,6 +1408,7 @@ impl Vm {
             current_function: None,
             stack: Vec::new(),
             locals: BTreeMap::new(),
+            globals: BTreeMap::new(),
             call_frames: Vec::new(),
             status: VmStatus::Ready,
         })
@@ -1034,6 +1423,21 @@ impl Vm {
 
     pub fn locals(&self) -> &BTreeMap<String, Value> {
         &self.locals
+    }
+
+    pub fn set_globals(&mut self, globals: BTreeMap<String, Value>) {
+        self.globals = globals;
+    }
+
+    pub fn globals(&self) -> &BTreeMap<String, Value> {
+        &self.globals
+    }
+
+    pub fn eval_template(
+        &mut self,
+        template: &str,
+    ) -> Result<String, crate::template::TemplateError> {
+        crate::template::eval_template(template, &mut self.globals)
     }
 
     pub fn step(&mut self) -> Result<Option<VmEvent>, VmError> {
@@ -1059,9 +1463,41 @@ impl Vm {
                     let value = self.pop()?;
                     self.locals.insert(name, value);
                 }
+                Instruction::LoadGlobal(name) => {
+                    let value = self
+                        .globals
+                        .get(&name)
+                        .cloned()
+                        .ok_or_else(|| VmError::UnknownGlobal(name.clone()))?;
+                    if value == Value::Uninitialized {
+                        return Err(VmError::UninitializedGlobal(name));
+                    }
+                    self.stack.push(value);
+                }
+                Instruction::StoreGlobal(name) => {
+                    let value = self.pop()?;
+                    self.globals.insert(name, value);
+                }
+                Instruction::StoreGlobalMember { root, path } => {
+                    let new_value = self.pop()?;
+                    let value = self
+                        .globals
+                        .get_mut(&root)
+                        .ok_or_else(|| VmError::UnknownGlobal(root.clone()))?;
+                    set_member_path(value, &path, new_value).map_err(|error| match error {
+                        MemberPathError::Unknown(name) => VmError::UnknownMember(name),
+                        MemberPathError::NotRecord => {
+                            VmError::TypeMismatch("member receiver is not a record")
+                        }
+                    })?;
+                }
                 Instruction::MakeTuple(count) => {
                     let values = self.pop_count(count)?;
                     self.stack.push(Value::Tuple(values));
+                }
+                Instruction::MakeList(count) => {
+                    let values = self.pop_count(count)?;
+                    self.stack.push(Value::List(values));
                 }
                 Instruction::MakeMap(keys) => {
                     let values = self.pop_count(keys.len())?;
@@ -1078,6 +1514,36 @@ impl Vm {
                     let right = self.pop()?;
                     let left = self.pop()?;
                     self.stack.push(Value::Bool(left == right));
+                }
+                Instruction::GetMember { name, safe } => {
+                    let value = self.pop()?;
+                    if value == Value::Null && safe {
+                        self.stack.push(Value::Null);
+                        continue;
+                    }
+                    let value = match value {
+                        Value::Map(mut fields) => fields
+                            .remove(&name)
+                            .ok_or_else(|| VmError::UnknownMember(name.clone()))?,
+                        Value::Typed { value, .. } => match *value {
+                            Value::Map(mut fields) => fields
+                                .remove(&name)
+                                .ok_or_else(|| VmError::UnknownMember(name.clone()))?,
+                            _ => {
+                                return Err(VmError::TypeMismatch(
+                                    "member receiver is not a record",
+                                ));
+                            }
+                        },
+                        Value::Null => return Err(VmError::NullMemberAccess(name)),
+                        _ => return Err(VmError::TypeMismatch("member receiver is not a record")),
+                    };
+                    self.stack.push(value);
+                }
+                Instruction::AssertNonNull => {
+                    if self.stack.last() == Some(&Value::Null) {
+                        return Err(VmError::NullAssertion);
+                    }
                 }
                 Instruction::CallBuiltin {
                     builtin,
@@ -1134,6 +1600,11 @@ impl Vm {
                         return Err(VmError::TypeMismatch("condition must be bool"));
                     };
                     if !condition {
+                        self.pc = target;
+                    }
+                }
+                Instruction::JumpIfNotNull(target) => {
+                    if self.stack.last().is_some_and(|value| value != &Value::Null) {
                         self.pc = target;
                     }
                 }
@@ -1194,6 +1665,7 @@ impl Vm {
             current_function: self.current_function,
             stack: self.stack.clone(),
             locals: self.locals.clone(),
+            globals: self.globals.clone(),
             call_frames: self.call_frames.clone(),
             status: self.status.clone(),
         }
@@ -1229,6 +1701,7 @@ impl Vm {
             current_function: snapshot.current_function,
             stack: snapshot.stack,
             locals: snapshot.locals,
+            globals: snapshot.globals,
             call_frames: snapshot.call_frames,
             status: snapshot.status,
         })
@@ -1268,6 +1741,7 @@ pub struct TaskScheduler {
     bytecode: Bytecode,
     next_task_id: u64,
     tasks: BTreeMap<u64, ScheduledTask>,
+    globals: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1295,6 +1769,8 @@ pub struct TaskSchedulerSnapshot {
     pub builtin_manifest_hash: u64,
     pub next_task_id: u64,
     pub tasks: BTreeMap<u64, TaskSnapshot>,
+    #[serde(default)]
+    pub globals: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1326,7 +1802,23 @@ impl TaskScheduler {
             bytecode,
             next_task_id: 1,
             tasks: BTreeMap::new(),
+            globals: BTreeMap::new(),
         })
+    }
+
+    pub fn set_globals(&mut self, globals: BTreeMap<String, Value>) {
+        self.globals = globals;
+    }
+
+    pub fn globals(&self) -> &BTreeMap<String, Value> {
+        &self.globals
+    }
+
+    pub fn eval_template(
+        &mut self,
+        template: &str,
+    ) -> Result<String, crate::template::TemplateError> {
+        crate::template::eval_template(template, &mut self.globals)
     }
 
     /// Starts a task template and returns its deterministic handle.
@@ -1406,6 +1898,7 @@ impl TaskScheduler {
                     )
                 })
                 .collect(),
+            globals: self.globals.clone(),
         }
     }
 
@@ -1421,6 +1914,7 @@ impl TaskScheduler {
         }
         let mut scheduler = Self::new(bytecode)?;
         scheduler.next_task_id = snapshot.next_task_id;
+        scheduler.globals = snapshot.globals;
         for (id, task) in snapshot.tasks {
             scheduler.template(task.template)?;
             let instruction_length = task
@@ -1523,9 +2017,41 @@ impl TaskScheduler {
                 let value = self.pop_task(task_id)?;
                 self.task_mut(task_id)?.locals.insert(name, value);
             }
+            Instruction::LoadGlobal(name) => {
+                let value = self
+                    .globals
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| TaskSchedulerError::UnknownGlobal(name.clone()))?;
+                if value == Value::Uninitialized {
+                    return Err(TaskSchedulerError::UninitializedGlobal(name));
+                }
+                self.task_mut(task_id)?.stack.push(value);
+            }
+            Instruction::StoreGlobal(name) => {
+                let value = self.pop_task(task_id)?;
+                self.globals.insert(name, value);
+            }
+            Instruction::StoreGlobalMember { root, path } => {
+                let new_value = self.pop_task(task_id)?;
+                let value = self
+                    .globals
+                    .get_mut(&root)
+                    .ok_or_else(|| TaskSchedulerError::UnknownGlobal(root.clone()))?;
+                set_member_path(value, &path, new_value).map_err(|error| match error {
+                    MemberPathError::Unknown(name) => TaskSchedulerError::UnknownMember(name),
+                    MemberPathError::NotRecord => {
+                        TaskSchedulerError::TypeMismatch("member receiver is not a record")
+                    }
+                })?;
+            }
             Instruction::MakeTuple(count) => {
                 let values = self.pop_task_count(task_id, count)?;
                 self.task_mut(task_id)?.stack.push(Value::Tuple(values));
+            }
+            Instruction::MakeList(count) => {
+                let values = self.pop_task_count(task_id, count)?;
+                self.task_mut(task_id)?.stack.push(Value::List(values));
             }
             Instruction::MakeMap(keys) => {
                 let values = self.pop_task_count(task_id, keys.len())?;
@@ -1547,6 +2073,40 @@ impl TaskScheduler {
                 self.task_mut(task_id)?
                     .stack
                     .push(Value::Bool(left == right));
+            }
+            Instruction::GetMember { name, safe } => {
+                let value = self.pop_task(task_id)?;
+                if value == Value::Null && safe {
+                    self.task_mut(task_id)?.stack.push(Value::Null);
+                    return Ok(None);
+                }
+                let value = match value {
+                    Value::Map(mut fields) => fields
+                        .remove(&name)
+                        .ok_or_else(|| TaskSchedulerError::UnknownMember(name.clone()))?,
+                    Value::Typed { value, .. } => match *value {
+                        Value::Map(mut fields) => fields
+                            .remove(&name)
+                            .ok_or_else(|| TaskSchedulerError::UnknownMember(name.clone()))?,
+                        _ => {
+                            return Err(TaskSchedulerError::TypeMismatch(
+                                "member receiver is not a record",
+                            ));
+                        }
+                    },
+                    Value::Null => return Err(TaskSchedulerError::NullMemberAccess(name)),
+                    _ => {
+                        return Err(TaskSchedulerError::TypeMismatch(
+                            "member receiver is not a record",
+                        ));
+                    }
+                };
+                self.task_mut(task_id)?.stack.push(value);
+            }
+            Instruction::AssertNonNull => {
+                if self.task_mut(task_id)?.stack.last() == Some(&Value::Null) {
+                    return Err(TaskSchedulerError::NullAssertion);
+                }
             }
             Instruction::CallBuiltin {
                 builtin,
@@ -1621,6 +2181,16 @@ impl TaskScheduler {
                     return Err(TaskSchedulerError::TypeMismatch("condition must be bool"));
                 };
                 if !condition {
+                    self.task_mut(task_id)?.pc = target;
+                }
+            }
+            Instruction::JumpIfNotNull(target) => {
+                if self
+                    .task_mut(task_id)?
+                    .stack
+                    .last()
+                    .is_some_and(|value| value != &Value::Null)
+                {
                     self.task_mut(task_id)?.pc = target;
                 }
             }
@@ -1723,6 +2293,11 @@ pub enum TaskSchedulerError {
     InvalidProgramCounter(usize),
     StackUnderflow,
     UnknownLocal(String),
+    UnknownGlobal(String),
+    UninitializedGlobal(String),
+    UnknownMember(String),
+    NullMemberAccess(String),
+    NullAssertion,
     UnknownTask(u64),
     UnknownTemplate(u32),
     NotWaitingForHost,
@@ -1744,6 +2319,11 @@ pub enum VmError {
     BuiltinManifestMismatch,
     StackUnderflow,
     UnknownLocal(String),
+    UnknownGlobal(String),
+    UninitializedGlobal(String),
+    UnknownMember(String),
+    NullMemberAccess(String),
+    NullAssertion,
     UnknownTask(u32),
     UnknownFunction(FunctionId),
     FunctionArity {
@@ -2106,6 +2686,117 @@ mod tests {
                 task: parent,
                 value: Value::Tuple(vec![Value::Null, Value::Null]),
             })
+        );
+    }
+
+    #[test]
+    fn globals_support_lazy_initialization_and_snapshot_restore() {
+        let program = parse_program(
+            r#"
+                global name: String
+                name = "Alice"
+                nativeEcho(name)
+            "#,
+        )
+        .expect("global program must parse");
+        let manifest = BuiltinManifest::new([("nativeEcho", BuiltinId(12))]);
+        let bytecode = compile_with_manifest(&program, 70, &manifest)
+            .expect("lazy global assignment must compile");
+        let mut vm = Vm::new(bytecode.clone()).expect("VM must initialize");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        let snapshot = vm.snapshot();
+        let mut vm = Vm::restore(bytecode, snapshot).expect("global snapshot must restore");
+        let Some(VmEvent::Call(call)) = vm.step().expect("VM must advance") else {
+            panic!("expected native call")
+        };
+        assert_eq!(call.arguments[0].value, Value::String("Alice".to_string()));
+    }
+
+    #[test]
+    fn reading_an_uninitialized_global_is_a_runtime_error() {
+        let program =
+            parse_program("global name: String\nnativeEcho(name)").expect("lazy global must parse");
+        let bytecode = compile_with_manifest(
+            &program,
+            71,
+            &BuiltinManifest::new([("nativeEcho", BuiltinId(12))]),
+        )
+        .expect("lazy global declaration must compile");
+        let mut vm = Vm::new(bytecode).expect("VM must initialize");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        assert_eq!(
+            vm.step(),
+            Err(VmError::UninitializedGlobal("name".to_string()))
+        );
+    }
+
+    #[test]
+    fn embedding_globals_have_a_fixed_mutable_schema() {
+        let settings_type = ScriptType::Record(BTreeMap::from([(
+            "bgmVolume".to_string(),
+            ScriptType::Number,
+        )]));
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new())
+            .with_globals(BTreeMap::from([("settings".to_string(), settings_type)]));
+        let program = parse_program("settings.bgmVolume = 0.5")
+            .expect("settings field assignment must parse");
+        let bytecode = compile_with_manifest(&program, 72, &manifest)
+            .expect("known settings field must type-check");
+        let mut vm = Vm::new(bytecode).expect("VM must initialize");
+        vm.set_globals(BTreeMap::from([(
+            "settings".to_string(),
+            Value::Map(BTreeMap::from([(
+                "bgmVolume".to_string(),
+                Value::Number(1.0),
+            )])),
+        )]));
+        assert_eq!(
+            vm.step().expect("assignment must run"),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        );
+        assert_eq!(
+            vm.globals()["settings"],
+            Value::Map(BTreeMap::from([(
+                "bgmVolume".to_string(),
+                Value::Number(0.5),
+            )]))
+        );
+
+        let invalid = parse_program("settings.extra = 1").expect("syntax must parse");
+        let errors = compile_with_manifest(&invalid, 73, &manifest)
+            .expect_err("unknown settings fields must be compile errors");
+        assert!(errors[0].message.contains("unknown or non-record field"));
+    }
+
+    #[test]
+    fn nullable_globals_elvis_and_non_null_assertions_are_checked() {
+        let invalid = parse_program("global name: String = null").expect("syntax must parse");
+        assert!(compile(&invalid, 72).is_err());
+
+        let valid = parse_program(
+            r#"
+                global name: String? = null
+                let shown: String = name ?: "fallback"
+                nativeEcho(shown)
+            "#,
+        )
+        .expect("nullable program must parse");
+        let bytecode = compile_with_manifest(
+            &valid,
+            73,
+            &BuiltinManifest::new([("nativeEcho", BuiltinId(12))]),
+        )
+        .expect("elvis must unwrap nullable String");
+        let mut vm = Vm::new(bytecode).expect("VM must initialize");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        let Some(VmEvent::Call(call)) = vm.step().expect("VM must advance") else {
+            panic!("expected native call")
+        };
+        assert_eq!(
+            call.arguments[0].value,
+            Value::String("fallback".to_string())
         );
     }
 }

@@ -32,11 +32,17 @@ enum TokenKind {
     Colon,
     Equal,
     EqualEqual,
+    Question,
+    Bang,
+    Lt,
+    Gt,
     Minus,
     LParen,
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Eof,
 }
 
@@ -105,10 +111,16 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Comma => TokenKind::Comma,
                 RawToken::Colon => TokenKind::Colon,
                 RawToken::Minus => TokenKind::Minus,
+                RawToken::Question => TokenKind::Question,
+                RawToken::Bang => TokenKind::Bang,
+                RawToken::Lt => TokenKind::Lt,
+                RawToken::Gt => TokenKind::Gt,
                 RawToken::OpenParen => TokenKind::LParen,
                 RawToken::CloseParen => TokenKind::RParen,
                 RawToken::OpenBrace => TokenKind::LBrace,
                 RawToken::CloseBrace => TokenKind::RBrace,
+                RawToken::OpenBracket => TokenKind::LBracket,
+                RawToken::CloseBracket => TokenKind::RBracket,
                 RawToken::Ident => TokenKind::Ident(lexeme.to_string()),
                 RawToken::Eq => {
                     if let Some(Token {
@@ -261,12 +273,25 @@ impl Parser {
             match name.as_str() {
                 "fn" => return self.parse_function(),
                 "let" | "var" => return self.parse_let(),
+                "global" => return self.parse_global(),
                 "if" => return self.parse_if(),
                 "while" => return self.parse_while(),
                 _ => {}
             }
         }
-        Stmt::Expr(self.parse_expression())
+        let target = self.parse_expression();
+        if self.at(TokenKind::Equal) {
+            self.advance();
+            let value = self.parse_expression();
+            let span = Span::join(&target.span, &value.span);
+            Stmt::Assign {
+                target,
+                value,
+                span,
+            }
+        } else {
+            Stmt::Expr(target)
+        }
     }
 
     fn parse_function(&mut self) -> Stmt {
@@ -351,15 +376,130 @@ impl Parser {
                 "<error>".to_string()
             }
         };
+        let type_annotation = if self.at(TokenKind::Colon) {
+            self.advance();
+            Some(self.parse_type())
+        } else {
+            None
+        };
         self.expect(TokenKind::Equal, "expected `=` after variable name");
         let value = self.parse_expression();
         let span = Span::join(&start.span, &value.span);
         Stmt::Let {
             mutable,
             name,
+            type_annotation,
             value,
             span,
         }
+    }
+
+    fn parse_global(&mut self) -> Stmt {
+        let start = self.advance();
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected global variable name");
+                "<error>".to_string()
+            }
+        };
+        let type_annotation = if self.at(TokenKind::Colon) {
+            self.advance();
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        let value = if self.at(TokenKind::Equal) {
+            self.advance();
+            Some(self.parse_expression())
+        } else {
+            None
+        };
+        if type_annotation.is_none() && value.is_none() {
+            self.error_here("a global requires a type or initializer");
+        }
+        let end = value
+            .as_ref()
+            .map(|value| value.span.clone())
+            .or_else(|| type_annotation.as_ref().map(|ty| ty.span.clone()))
+            .unwrap_or_else(|| start.span.clone());
+        Stmt::Global {
+            name,
+            type_annotation,
+            value,
+            span: Span::join(&start.span, &end),
+        }
+    }
+
+    fn parse_type(&mut self) -> TypeExpr {
+        let start = self.current().span.clone();
+        let mut ty = if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::LBrace) {
+            self.advance();
+            self.advance();
+            let mut fields = Vec::new();
+            self.skip_separators();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                let field_start = self.current().span.clone();
+                let name = match self.advance().kind {
+                    TokenKind::Ident(name) => name,
+                    _ => {
+                        self.error_here("expected record field name");
+                        "<error>".to_string()
+                    }
+                };
+                self.expect(TokenKind::Colon, "expected `:` after record field name");
+                let field_type = self.parse_type();
+                let span = Span::join(&field_start, &field_type.span);
+                fields.push(TypeField {
+                    name,
+                    ty: field_type,
+                    span,
+                });
+                if self.at(TokenKind::Comma) {
+                    self.advance();
+                }
+                self.skip_separators();
+            }
+            let end = self
+                .expect(TokenKind::RBrace, "expected `}` after record type")
+                .span;
+            TypeExpr {
+                kind: TypeExprKind::Record(fields),
+                span: Span::join(&start, &end),
+            }
+        } else {
+            let token = self.advance();
+            let TokenKind::Ident(name) = token.kind else {
+                self.error_here("expected type name");
+                return TypeExpr {
+                    kind: TypeExprKind::Named("<error>".to_string()),
+                    span: token.span,
+                };
+            };
+            if name == "List" && self.at(TokenKind::Lt) {
+                self.advance();
+                let element = self.parse_type();
+                let end = self.expect(TokenKind::Gt, "expected `>` after List element type");
+                TypeExpr {
+                    kind: TypeExprKind::List(Box::new(element)),
+                    span: Span::join(&token.span, &end.span),
+                }
+            } else {
+                TypeExpr {
+                    kind: TypeExprKind::Named(name),
+                    span: token.span,
+                }
+            }
+        };
+        if self.at(TokenKind::Question) {
+            let end = self.advance();
+            let span = Span::join(&ty.span, &end.span);
+            ty = TypeExpr {
+                kind: TypeExprKind::Nullable(Box::new(ty)),
+                span,
+            };
+        }
+        ty
     }
 
     fn parse_expression(&mut self) -> Expr {
@@ -385,6 +525,35 @@ impl Parser {
                         object: Box::new(expression),
                         name,
                     },
+                    span,
+                };
+                continue;
+            }
+            if self.at(TokenKind::Question) && matches!(self.peek().kind, TokenKind::Dot) {
+                self.advance();
+                self.advance();
+                let name = match self.advance().kind {
+                    TokenKind::Ident(name) => name,
+                    _ => {
+                        self.error_here("expected member name after `?.`");
+                        "<error>".to_string()
+                    }
+                };
+                let span = Span::join(&expression.span, &self.previous().span);
+                expression = Expr {
+                    kind: ExprKind::SafeMember {
+                        object: Box::new(expression),
+                        name,
+                    },
+                    span,
+                };
+                continue;
+            }
+            if self.at(TokenKind::Bang) {
+                let end = self.advance();
+                let span = Span::join(&expression.span, &end.span);
+                expression = Expr {
+                    kind: ExprKind::NonNull(Box::new(expression)),
                     span,
                 };
                 continue;
@@ -430,6 +599,19 @@ impl Parser {
                     left: Box::new(expression),
                     op: BinaryOp::Equal,
                     right: Box::new(right),
+                },
+                span,
+            };
+        }
+        if self.at(TokenKind::Question) && matches!(self.peek().kind, TokenKind::Colon) {
+            self.advance();
+            self.advance();
+            let fallback = self.parse_expression_mode(false);
+            let span = Span::join(&expression.span, &fallback.span);
+            expression = Expr {
+                kind: ExprKind::Elvis {
+                    value: Box::new(expression),
+                    fallback: Box::new(fallback),
                 },
                 span,
             };
@@ -494,6 +676,7 @@ impl Parser {
                 _ => self.bad_expression(token.span, "expected symbol name or `{` after `.`"),
             },
             TokenKind::LParen => self.parse_tuple(token.span.start),
+            TokenKind::LBracket => self.parse_list(token.span.start),
             TokenKind::LBrace => {
                 self.index -= 1;
                 let block = self.parse_block();
@@ -562,6 +745,29 @@ impl Parser {
             .end;
         Expr {
             kind: ExprKind::Tuple(values),
+            span: Span { start, end },
+        }
+    }
+
+    fn parse_list(&mut self, start: usize) -> Expr {
+        let mut values = Vec::new();
+        self.skip_newlines();
+        while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
+            values.push(self.parse_expression());
+            self.skip_newlines();
+            if self.at(TokenKind::Comma) {
+                self.advance();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        let end = self
+            .expect(TokenKind::RBracket, "expected `]` after list")
+            .span
+            .end;
+        Expr {
+            kind: ExprKind::List(values),
             span: Span { start, end },
         }
     }
@@ -868,6 +1074,73 @@ mod tests {
         assert!(matches!(
             &program.statements[3],
             Stmt::Expr(Expr { kind: ExprKind::String(value), .. }) if value == "narration"
+        ));
+    }
+
+    #[test]
+    fn parses_globals_nullable_types_assignment_and_lists() {
+        let program = parse_program(
+            r#"
+                global player: .{ name: String, health: Int } = .{ name: "", health: 123 }
+                global nickname: String? = null
+                global lazyName: String
+                lazyName = "Alice"
+                let values: List<Int> = [1, 2, 3]
+                let shown = nickname ?: "fallback"
+                nickname?.length
+                nickname!
+            "#,
+        )
+        .expect("typed globals and null-safety syntax must parse");
+        assert!(matches!(
+            &program.statements[0],
+            Stmt::Global {
+                type_annotation: Some(TypeExpr {
+                    kind: TypeExprKind::Record(_),
+                    ..
+                }),
+                value: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(&program.statements[3], Stmt::Assign { .. }));
+        assert!(matches!(
+            &program.statements[4],
+            Stmt::Let {
+                type_annotation: Some(TypeExpr {
+                    kind: TypeExprKind::List(_),
+                    ..
+                }),
+                value: Expr {
+                    kind: ExprKind::List(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &program.statements[5],
+            Stmt::Let {
+                value: Expr {
+                    kind: ExprKind::Elvis { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &program.statements[6],
+            Stmt::Expr(Expr {
+                kind: ExprKind::SafeMember { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            &program.statements[7],
+            Stmt::Expr(Expr {
+                kind: ExprKind::NonNull(_),
+                ..
+            })
         ));
     }
 }

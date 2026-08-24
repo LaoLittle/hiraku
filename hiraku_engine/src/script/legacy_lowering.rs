@@ -309,6 +309,12 @@ impl HksStoryLowerer<'_> {
                 span,
             } => self.while_statement(condition, body, span),
             Stmt::Expr(expression) => self.expression_statement(expression),
+            Stmt::Global { span, .. } | Stmt::Assign { span, .. } => {
+                Err(HksStoryCompileError::UnsupportedStatement {
+                    path: self.path.to_string(),
+                    offset: span.start,
+                })
+            }
         }
     }
 
@@ -911,7 +917,7 @@ mod tests {
             "actor.story.hks",
             r#"
                 let ema = char("ema")
-                ema.at("center").scale(0.32)
+                ema.at(.center).scale(0.32)
                 narrate("张嘴")
                 ema.e("mouth_open")
                 narrate("神秘张嘴闭眼女")
@@ -930,17 +936,13 @@ mod tests {
     }
 
     #[test]
-    fn actor_methods_reject_non_actor_receivers_at_runtime() {
-        let program = compile_story_to_ir(
+    fn actor_methods_reject_non_actor_receivers_during_compilation() {
+        let error = crate::script::capabilities::compile_story_bytecode(
             "invalid-actor.story.hks",
-            "let ema = 42\nema.at(\"center\")",
+            "let ema = 42\nema.at(.center)",
         )
-        .expect("dynamic receiver type is checked at runtime, not by the transitional lowerer");
-        let error = execute_native_chunks(&program).expect_err("number is not an Actor handle");
-        assert!(matches!(
-            error,
-            CharacterCapabilityError::Native(message) if message.contains("invalid actor handle")
-        ));
+        .expect_err("the whole-program compiler must reject a mistyped receiver");
+        assert!(error.contains("receiver"), "unexpected error: {error}");
     }
 
     #[test]
@@ -1009,7 +1011,7 @@ mod tests {
     fn lowers_fluent_character_setup() {
         let program = compile_story_to_ir(
             "scripts/new_game.story.hks",
-            "char(\"ema\").at(\"center\").e(\"happy\").scale(0.14)",
+            "char(\"ema\").at(.center).e(\"happy\").scale(0.14)",
         )
         .unwrap();
         let Some(IrInstruction::Emit(IrCommand::HksStatement { bytecode, .. })) =

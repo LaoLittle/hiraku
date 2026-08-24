@@ -18,6 +18,18 @@ pub enum Stmt {
     Let {
         mutable: bool,
         name: String,
+        type_annotation: Option<TypeExpr>,
+        value: Expr,
+        span: Span,
+    },
+    Global {
+        name: String,
+        type_annotation: Option<TypeExpr>,
+        value: Option<Expr>,
+        span: Span,
+    },
+    Assign {
+        target: Expr,
         value: Expr,
         span: Span,
     },
@@ -33,6 +45,27 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeExpr {
+    pub kind: TypeExprKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeExprKind {
+    Named(String),
+    Nullable(Box<TypeExpr>),
+    List(Box<TypeExpr>),
+    Record(Vec<TypeField>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeField {
+    pub name: String,
+    pub ty: TypeExpr,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,12 +97,22 @@ pub enum ExprKind {
         object: Box<Expr>,
         name: String,
     },
+    SafeMember {
+        object: Box<Expr>,
+        name: String,
+    },
+    Elvis {
+        value: Box<Expr>,
+        fallback: Box<Expr>,
+    },
+    NonNull(Box<Expr>),
     Call {
         callee: Box<Expr>,
         arguments: Vec<Argument>,
         trailing_block: Option<Block>,
     },
     Tuple(Vec<Expr>),
+    List(Vec<Expr>),
     Map(Vec<MapField>),
     Block(Block),
     Binary {

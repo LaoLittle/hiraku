@@ -180,6 +180,15 @@ impl Collector<'_> {
                 }
             }
             Stmt::Let { value, .. } | Stmt::Expr(value) => self.expression(value),
+            Stmt::Global { value, .. } => {
+                if let Some(value) = value {
+                    self.expression(value);
+                }
+            }
+            Stmt::Assign { target, value, .. } => {
+                self.expression(target);
+                self.expression(value);
+            }
         }
     }
 
@@ -202,10 +211,11 @@ impl Collector<'_> {
                     self.block(block);
                 }
             }
-            ExprKind::Member { object, .. } | ExprKind::UnaryMinus(object) => {
-                self.expression(object)
-            }
-            ExprKind::Tuple(values) => {
+            ExprKind::Member { object, .. }
+            | ExprKind::SafeMember { object, .. }
+            | ExprKind::UnaryMinus(object)
+            | ExprKind::NonNull(object) => self.expression(object),
+            ExprKind::Tuple(values) | ExprKind::List(values) => {
                 for value in values {
                     self.expression(value);
                 }
@@ -219,6 +229,10 @@ impl Collector<'_> {
             ExprKind::Binary { left, right, .. } => {
                 self.expression(left);
                 self.expression(right);
+            }
+            ExprKind::Elvis { value, fallback } => {
+                self.expression(value);
+                self.expression(fallback);
             }
             ExprKind::Null
             | ExprKind::Ellipsis
@@ -324,6 +338,8 @@ fn statement_span(statement: &Stmt) -> &Span {
     match statement {
         Stmt::Function { span, .. }
         | Stmt::Let { span, .. }
+        | Stmt::Global { span, .. }
+        | Stmt::Assign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. } => span,
         Stmt::Expr(expression) => &expression.span,
