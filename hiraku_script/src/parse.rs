@@ -1,11 +1,20 @@
 //! The canonical Hiraku Script parser, built on the crate's shared lexer.
 
 use crate::{ast::*, span::Span};
+use hiraku_errors::{Diagnostic, DiagnosticLabel, SourceId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
     pub message: String,
     pub span: Span,
+}
+
+impl ParseError {
+    pub fn diagnostic(&self, source: SourceId) -> Diagnostic {
+        Diagnostic::error(&self.message)
+            .with_code("HKS-PARSE")
+            .with_label(DiagnosticLabel::primary(source, self.span.range()))
+    }
 }
 
 pub fn parse_program(source: &str) -> Result<Program, Vec<ParseError>> {
@@ -32,11 +41,21 @@ enum TokenKind {
     Colon,
     Equal,
     EqualEqual,
+    PlusEqual,
+    MinusEqual,
+    StarEqual,
+    SlashEqual,
+    BangEqual,
+    LessEqual,
+    GreaterEqual,
     Question,
     Bang,
     Lt,
     Gt,
+    Plus,
     Minus,
+    Star,
+    Slash,
     LParen,
     RParen,
     LBrace,
@@ -111,6 +130,9 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Comma => TokenKind::Comma,
                 RawToken::Colon => TokenKind::Colon,
                 RawToken::Minus => TokenKind::Minus,
+                RawToken::Plus => TokenKind::Plus,
+                RawToken::Star => TokenKind::Star,
+                RawToken::Slash => TokenKind::Slash,
                 RawToken::Question => TokenKind::Question,
                 RawToken::Bang => TokenKind::Bang,
                 RawToken::Lt => TokenKind::Lt,
@@ -124,14 +146,27 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Ident => TokenKind::Ident(lexeme.to_string()),
                 RawToken::Eq => {
                     if let Some(Token {
-                        kind: previous @ TokenKind::Equal,
+                        kind: previous,
                         span: previous_span,
                     }) = tokens.last_mut()
                         && previous_span.end == start
                     {
-                        *previous = TokenKind::EqualEqual;
-                        previous_span.end = span.end;
-                        continue;
+                        let combined = match previous {
+                            TokenKind::Equal => Some(TokenKind::EqualEqual),
+                            TokenKind::Plus => Some(TokenKind::PlusEqual),
+                            TokenKind::Minus => Some(TokenKind::MinusEqual),
+                            TokenKind::Star => Some(TokenKind::StarEqual),
+                            TokenKind::Slash => Some(TokenKind::SlashEqual),
+                            TokenKind::Bang => Some(TokenKind::BangEqual),
+                            TokenKind::Lt => Some(TokenKind::LessEqual),
+                            TokenKind::Gt => Some(TokenKind::GreaterEqual),
+                            _ => None,
+                        };
+                        if let Some(combined) = combined {
+                            *previous = combined;
+                            previous_span.end = span.end;
+                            continue;
+                        }
                     }
                     TokenKind::Equal
                 }
@@ -292,6 +327,18 @@ struct Parser {
     errors: Vec<ParseError>,
 }
 
+fn binary_expression(left: Expr, op: BinaryOp, right: Expr) -> Expr {
+    let span = Span::join(&left.span, &right.span);
+    Expr {
+        kind: ExprKind::Binary {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        },
+        span,
+    }
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -328,9 +375,29 @@ impl Parser {
             }
         }
         let target = self.parse_expression();
-        if self.at(TokenKind::Equal) {
+        let assignment = match self.current().kind {
+            TokenKind::Equal => Some(None),
+            TokenKind::PlusEqual => Some(Some(BinaryOp::Add)),
+            TokenKind::MinusEqual => Some(Some(BinaryOp::Subtract)),
+            TokenKind::StarEqual => Some(Some(BinaryOp::Multiply)),
+            TokenKind::SlashEqual => Some(Some(BinaryOp::Divide)),
+            _ => None,
+        };
+        if let Some(operator) = assignment {
             self.advance();
             let value = self.parse_expression();
+            let value = if let Some(operator) = operator {
+                Expr {
+                    span: Span::join(&target.span, &value.span),
+                    kind: ExprKind::Binary {
+                        left: Box::new(target.clone()),
+                        op: operator,
+                        right: Box::new(value),
+                    },
+                }
+            } else {
+                value
+            };
             let span = Span::join(&target.span, &value.span);
             Stmt::Assign {
                 target,
@@ -601,6 +668,108 @@ impl Parser {
     }
 
     fn parse_expression_mode(&mut self, allow_trailing_block: bool) -> Expr {
+        self.parse_colon(allow_trailing_block)
+    }
+
+    fn parse_colon(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_elvis(allow_trailing_block);
+        if self.at(TokenKind::Colon) {
+            self.advance();
+            let right = self.parse_colon(false);
+            let span = Span::join(&expression.span, &right.span);
+            expression = Expr {
+                kind: ExprKind::Binary {
+                    left: Box::new(expression),
+                    op: BinaryOp::Colon,
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+        expression
+    }
+
+    fn parse_elvis(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_equality(allow_trailing_block);
+        if self.at(TokenKind::Question) && matches!(self.peek().kind, TokenKind::Colon) {
+            self.advance();
+            self.advance();
+            let fallback = self.parse_elvis(false);
+            let span = Span::join(&expression.span, &fallback.span);
+            expression = Expr {
+                kind: ExprKind::Elvis {
+                    value: Box::new(expression),
+                    fallback: Box::new(fallback),
+                },
+                span,
+            };
+        }
+        expression
+    }
+
+    fn parse_equality(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_comparison(allow_trailing_block);
+        loop {
+            let operator = match self.current().kind {
+                TokenKind::EqualEqual => BinaryOp::Equal,
+                TokenKind::BangEqual => BinaryOp::NotEqual,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_comparison(false);
+            expression = binary_expression(expression, operator, right);
+        }
+        expression
+    }
+
+    fn parse_comparison(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_additive(allow_trailing_block);
+        loop {
+            let operator = match self.current().kind {
+                TokenKind::Lt => BinaryOp::Less,
+                TokenKind::LessEqual => BinaryOp::LessEqual,
+                TokenKind::Gt => BinaryOp::Greater,
+                TokenKind::GreaterEqual => BinaryOp::GreaterEqual,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_additive(false);
+            expression = binary_expression(expression, operator, right);
+        }
+        expression
+    }
+
+    fn parse_additive(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_multiplicative(allow_trailing_block);
+        loop {
+            let operator = match self.current().kind {
+                TokenKind::Plus => BinaryOp::Add,
+                TokenKind::Minus => BinaryOp::Subtract,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_multiplicative(false);
+            expression = binary_expression(expression, operator, right);
+        }
+        expression
+    }
+
+    fn parse_multiplicative(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_postfix(allow_trailing_block);
+        loop {
+            let operator = match self.current().kind {
+                TokenKind::Star => BinaryOp::Multiply,
+                TokenKind::Slash => BinaryOp::Divide,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_postfix(false);
+            expression = binary_expression(expression, operator, right);
+        }
+        expression
+    }
+
+    fn parse_postfix(&mut self, allow_trailing_block: bool) -> Expr {
         let mut expression = self.parse_primary();
         loop {
             if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::LBrace) {
@@ -696,45 +865,6 @@ impl Parser {
                 continue;
             }
             break;
-        }
-        if self.at(TokenKind::EqualEqual) {
-            self.advance();
-            let right = self.parse_expression_mode(false);
-            let span = Span::join(&expression.span, &right.span);
-            expression = Expr {
-                kind: ExprKind::Binary {
-                    left: Box::new(expression),
-                    op: BinaryOp::Equal,
-                    right: Box::new(right),
-                },
-                span,
-            };
-        }
-        if self.at(TokenKind::Question) && matches!(self.peek().kind, TokenKind::Colon) {
-            self.advance();
-            self.advance();
-            let fallback = self.parse_expression_mode(false);
-            let span = Span::join(&expression.span, &fallback.span);
-            expression = Expr {
-                kind: ExprKind::Elvis {
-                    value: Box::new(expression),
-                    fallback: Box::new(fallback),
-                },
-                span,
-            };
-        }
-        if self.at(TokenKind::Colon) {
-            self.advance();
-            let right = self.parse_expression_mode(false);
-            let span = Span::join(&expression.span, &right.span);
-            expression = Expr {
-                kind: ExprKind::Binary {
-                    left: Box::new(expression),
-                    op: BinaryOp::Colon,
-                    right: Box::new(right),
-                },
-                span,
-            };
         }
         expression
     }
@@ -1058,8 +1188,8 @@ mod tests {
         let program = parse_program(
             r#"
                 let handle = seq {
-                    char("ema").e("shock").fade(0.5)
-                    char("ema").e("happy").fade(0.5).ease(.easeInOut)
+                    char("alice").e("shock").fade(0.5)
+                    char("alice").e("happy").fade(0.5).ease(.easeInOut)
                 }
                 par {
                     camera.zoom(1.2)
@@ -1099,7 +1229,7 @@ mod tests {
                 fn decorate(actor, emotion) {
                     actor.e(emotion)
                 }
-                decorate(char("Alice"), "happy")
+                decorate(char("alice"), "happy")
             "#,
         )
         .unwrap();
@@ -1152,8 +1282,8 @@ mod tests {
         let program = parse_program(
             r#"
                 /* outer /* nested */ comment */
-                let 艾玛 = char("樱羽\u{827e}玛")
-                艾玛.e("微笑")
+                let café_actor = char("alice \u{1f338}")
+                café_actor.e("smile")
             "#,
         )
         .expect("shared lexer syntax must parse");
@@ -1161,37 +1291,37 @@ mod tests {
         let Stmt::Let { name, value, .. } = &program.statements[0] else {
             panic!("expected unicode binding");
         };
-        assert_eq!(name, "艾玛");
+        assert_eq!(name, "café_actor");
         let ExprKind::Call { arguments, .. } = &value.kind else {
             panic!("expected character call");
         };
         assert!(matches!(
             arguments[0].value.kind,
-            ExprKind::String(ref value) if value == "樱羽艾玛"
+            ExprKind::String(ref value) if value == "alice 🌸"
         ));
     }
 
     #[test]
     fn parses_quoted_map_field_names() {
-        let expression = expression(r#".{ regions: .{ "ema/body": (1, 2, 3, 4) } }"#);
+        let expression = expression(r#".{ regions: .{ "alice/body": (1, 2, 3, 4) } }"#);
         let ExprKind::Map(fields) = expression.kind else {
             panic!("expected map");
         };
         let ExprKind::Map(regions) = &fields[0].value.kind else {
             panic!("expected nested map");
         };
-        assert_eq!(regions[0].name, "ema/body");
+        assert_eq!(regions[0].name, "alice/body");
     }
 
     #[test]
     fn parses_dialogue_operator_and_ellipsis() {
         let program = parse_program(
             r#"
-                let ema = char("ema")
-                ema: "first"
+                let alice = char("alice")
+                alice: "first"
                 ...: "continued"
                 "narration"
-                char("ema").e("happy"): "inline"
+                char("alice").e("happy"): "inline"
             "#,
         )
         .expect("dialogue sugar must parse");
@@ -1215,13 +1345,72 @@ mod tests {
     }
 
     #[test]
+    fn parses_arithmetic_comparison_precedence_and_compound_assignment() {
+        let program = parse_program(
+            r#"
+                let value = 1 + 2 * 3
+                while value < 8 {
+                    value += 1
+                    value -= 1
+                    value *= 2
+                    value /= 2
+                }
+            "#,
+        )
+        .expect("common arithmetic syntax must parse");
+
+        let Stmt::Let { value, .. } = &program.statements[0] else {
+            panic!("expected let binding")
+        };
+        assert!(matches!(
+            &value.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                right,
+                ..
+            } if matches!(right.kind, ExprKind::Binary { op: BinaryOp::Multiply, .. })
+        ));
+        let Stmt::While {
+            condition, body, ..
+        } = &program.statements[1]
+        else {
+            panic!("expected while loop")
+        };
+        assert!(matches!(
+            condition.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Less,
+                ..
+            }
+        ));
+        assert_eq!(body.statements.len(), 4);
+        for (statement, operator) in body.statements.iter().zip([
+            BinaryOp::Add,
+            BinaryOp::Subtract,
+            BinaryOp::Multiply,
+            BinaryOp::Divide,
+        ]) {
+            assert!(matches!(
+                statement,
+                Stmt::Assign {
+                    value: Expr {
+                        kind: ExprKind::Binary { op, .. },
+                        ..
+                    },
+                    ..
+                } if *op == operator
+            ));
+        }
+    }
+
+    #[test]
     fn parses_globals_nullable_types_assignment_and_lists() {
         let program = parse_program(
             r#"
                 global player: .{ name: String, health: Int } = .{ name: "", health: 123 }
                 global nickname: String? = null
                 global lazyName: String
-                lazyName = "Alice"
+                lazyName = "alice"
                 let values: List<Int> = [1, 2, 3]
                 let shown = nickname ?: "fallback"
                 nickname?.length

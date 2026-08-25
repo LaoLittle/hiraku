@@ -4,7 +4,7 @@ use bevy::prelude::Resource;
 use hiraku_script::hson;
 use serde::{Deserialize, Serialize};
 
-use crate::{data::evaluate_hson_map, vfs::workspace_base_path};
+use crate::vfs::workspace_base_path;
 
 use super::StorageError;
 
@@ -49,10 +49,9 @@ pub fn read_user_settings() -> Result<UserSettings, StorageError> {
         let path = workspace_base_path().join(USER_SETTINGS_PATH);
         match fs::read_to_string(path) {
             Ok(payload) => {
-                let data = evaluate_hson_map(USER_SETTINGS_PATH, &payload)
-                    .map_err(|error| StorageError::HsonData(error.to_string()))?;
-                let settings = hson::from_value::<UserSettingsFile>(hson::HsonValue::Map(data))
-                    .map_err(|error| StorageError::HsonData(error.to_string()))?;
+                let settings = hson::from_str::<UserSettingsFile>(&payload).map_err(|error| {
+                    StorageError::HsonData(error.render(USER_SETTINGS_PATH, &payload))
+                })?;
                 Ok(UserSettings {
                     bgm_volume: settings.bgm_volume as f32,
                     voice_volume: settings.voice_volume as f32,

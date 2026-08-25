@@ -105,14 +105,22 @@ pub fn export_character_hson(
 /// This transformation intentionally depends only on HKS syntax. Engine playback
 /// policy and asset loading do not belong in the CLI.
 pub fn scaffold_story(source: &str) -> Result<VoiceScaffold, VoiceScaffoldError> {
+    scaffold_story_named("<story>", source)
+}
+
+pub fn scaffold_story_named(path: &str, source: &str) -> Result<VoiceScaffold, VoiceScaffoldError> {
+    let mut sources = hiraku_script::SourceMap::new();
+    let source_id = sources.insert(path, source);
     let program = parse_program(source).map_err(|errors| {
-        VoiceScaffoldError::Parse(
-            errors
-                .into_iter()
-                .map(|error| format!("{} at byte {}", error.message, error.span.start))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
+        let diagnostics = errors
+            .into_iter()
+            .map(|error| error.diagnostic(source_id.clone()))
+            .collect::<Vec<_>>();
+        VoiceScaffoldError::Parse(hiraku_script::render_diagnostics(
+            &diagnostics,
+            &sources,
+            hiraku_script::RenderOptions::default(),
+        ))
     })?;
 
     let mut collector = Collector {
@@ -386,25 +394,35 @@ mod tests {
     #[test]
     fn inserts_voice_before_narrate_and_say() {
         let scaffold =
-            scaffold_story("narrate(\"Opening\")\n\nif true {\n    say(\"Alice\", \"Hello\")\n}\n")
+            scaffold_story("narrate(\"Opening\")\n\nif true {\n    say(\"alice\", \"Hello\")\n}\n")
                 .expect("valid story must scaffold");
 
         assert_eq!(scaffold.lines.len(), 2);
         assert!(scaffold.source.starts_with("voice(\"voice/"));
         assert!(scaffold.source.contains("\n    voice(\"voice/"));
-        assert!(scaffold.source.contains("\n    say(\"Alice\", \"Hello\")"));
+        assert!(scaffold.source.contains("\n    say(\"alice\", \"Hello\")"));
         assert_eq!(scaffold.lines[0].speaker, "");
-        assert_eq!(scaffold.lines[1].speaker, "Alice");
+        assert_eq!(scaffold.lines[1].speaker, "alice");
         assert!(scaffold.lines.iter().all(|line| line.inserted));
     }
 
     #[test]
+    fn invalid_story_reports_source_context() {
+        let error = scaffold_story_named("stories/sample.hks", "narrate(\"missing\"")
+            .expect_err("invalid story must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("[HKS-PARSE]"));
+        assert!(rendered.contains("stories/sample.hks:1:"));
+        assert!(rendered.contains("expected `)` after arguments"));
+    }
+
+    #[test]
     fn keeps_an_existing_voice_and_reports_its_path() {
-        let source = "voice(\"voice/Alice/custom\")\nsay(\"Alice\", \"Hello\")\n";
+        let source = "voice(\"voice/alice/custom\")\nsay(\"alice\", \"Hello\")\n";
         let scaffold = scaffold_story(source).expect("valid story must scaffold");
 
         assert_eq!(scaffold.source, source);
-        assert_eq!(scaffold.lines[0].path, "voice/Alice/custom");
+        assert_eq!(scaffold.lines[0].path, "voice/alice/custom");
         assert!(!scaffold.lines[0].inserted);
     }
 

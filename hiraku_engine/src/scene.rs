@@ -28,8 +28,8 @@ use crate::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, ResolvedCharacterKeyframe,
         ScriptBootstrap, ScriptCommand, ScriptRequestId, ScriptResponse, ScriptResponseMessage,
         ScriptRuntimeState, StoryRuntime, StoryRuntimeEvent, UiContext, VoicePlaybackMode,
-        compile_story_bytecode, evaluate_ui_script, save_runtime_slot, script_command_from_effect,
-        start_hks_runtime,
+        compile_story_bytecode, evaluate_ui_script_named, save_runtime_slot,
+        script_command_from_effect, start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -523,8 +523,13 @@ pub fn bridge_story_events(
                         let textures = textures
                             .as_deref()
                             .ok_or_else(|| "texture catalog is unavailable".to_string())?;
-                        evaluate_ui_script(&source, &UiContext::new(story_values), textures)
-                            .map_err(|error| error.to_string())
+                        evaluate_ui_script_named(
+                            &target,
+                            &source,
+                            &UiContext::new(story_values),
+                            textures,
+                        )
+                        .map_err(|error| error.to_string())
                     });
                 let request = runtime.allocate_request();
                 runtime.pending_ui_screen = Some(target.clone());

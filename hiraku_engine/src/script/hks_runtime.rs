@@ -336,11 +336,13 @@ impl HksRuntime {
     pub fn step_task(&mut self) -> Result<Option<HksRuntimeEvent>, HksRuntimeError> {
         match self.scheduler.step()? {
             Some(TaskEvent::Call { task, mut call }) => {
-                evaluate_call_templates(&mut call, |text| self.scheduler.eval_template(text))?;
+                evaluate_call_templates(&mut call, |text| {
+                    self.scheduler.eval_template(task, text)
+                })?;
                 Ok(Some(HksRuntimeEvent::TaskCall { task, call }))
             }
             Some(TaskEvent::Statement { task, value }) => {
-                let value = evaluate_task_statement_template(&mut self.scheduler, value)?;
+                let value = evaluate_task_statement_template(&mut self.scheduler, task, value)?;
                 self.vm.set_globals(self.scheduler.globals().clone());
                 Ok(Some(HksRuntimeEvent::TaskStatement { task, value }))
             }
@@ -424,10 +426,13 @@ fn evaluate_statement_template(
 
 fn evaluate_task_statement_template(
     scheduler: &mut TaskScheduler,
+    task: u64,
     value: StatementValue,
 ) -> Result<StatementValue, TemplateError> {
     match value {
-        StatementValue::String(text) => Ok(StatementValue::String(scheduler.eval_template(&text)?)),
+        StatementValue::String(text) => Ok(StatementValue::String(
+            scheduler.eval_template(task, &text)?,
+        )),
         value => Ok(value),
     }
 }
@@ -514,7 +519,7 @@ mod tests {
     fn whole_program_runtime_evaluates_dialogue_templates_from_globals() {
         let bytecode = compile_story_bytecode(
             "template.story.hks",
-            "global player = .{ name: \"Alice\" }\n\"Hi, ${player.name}\"",
+            "global player = .{ name: \"alice\" }\n\"Hi, ${player.name}\"",
         )
         .expect("template story must compile");
         let mut runtime = HksRuntime::new(bytecode).expect("runtime must initialize");
@@ -525,7 +530,7 @@ mod tests {
         assert_eq!(
             runtime.step().expect("dialogue statement must run"),
             Some(HksRuntimeEvent::Statement(StatementValue::String(
-                "Hi, Alice".to_string()
+                "Hi, alice".to_string()
             )))
         );
     }
@@ -533,7 +538,7 @@ mod tests {
     #[test]
     fn direct_runtime_dispatches_native_calls_at_statement_boundaries() {
         let bytecode =
-            compile_story_bytecode("test.story.hks", r#"char("Alice").e("happy").at(.right)"#)
+            compile_story_bytecode("test.story.hks", r#"char("alice").e("happy").at(.right)"#)
                 .expect("character story must compile");
         let mut runtime = HksRuntime::new(bytecode).expect("direct HKS runtime must initialize");
         let mut host = StoryNativeHost::new();
@@ -563,7 +568,7 @@ mod tests {
                 expressions,
                 position,
                 ..
-            }] if actor_id == "Alice" && expressions == &["happy"] && position == &[600.0, -200.0]
+            }] if actor_id == "alice" && expressions == &["happy"] && position == &[600.0, -200.0]
         ));
     }
 
@@ -572,7 +577,7 @@ mod tests {
         let bytecode = compile_story_bytecode(
             "driver.story.hks",
             r#"
-                global player = .{ name: "Alice" }
+                global player = .{ name: "alice" }
                 "Hi, ${player.name}"
                 "after"
             "#,
@@ -582,7 +587,7 @@ mod tests {
         assert!(matches!(
             runtime.step().expect("first effect must run"),
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
-                if text == "Hi, Alice"
+                if text == "Hi, alice"
         ));
         assert_eq!(
             runtime
@@ -748,33 +753,39 @@ mod tests {
     }
 
     #[test]
-    fn all_shipped_stories_compile_as_whole_hks_programs() {
+    fn representative_inline_stories_compile_as_whole_programs() {
         for (path, source) in [
+            ("<bootstrap>", r#"gotoScript("chapter.hks")"#),
             (
-                "startup.hks",
-                include_str!("../../../../manosabars/assets/main_hdp_contents/startup.hks"),
+                "<dialogue>",
+                r#"
+                    let alice = char("alice")
+                    alice.at(.center).scale(0.5).e("happy")
+                    alice: "Hello"
+                    ...: " again"
+                    "Narration"
+                "#,
             ),
             (
-                "system.hks",
-                include_str!("../../../../manosabars/assets/main_hdp_contents/system.hks"),
+                "<control-flow>",
+                r#"
+                    let count = 0
+                    while count < 2 {
+                        "Iteration ${count}"
+                        count += 1
+                    }
+                    if count == 2 { log("done") }
+                "#,
             ),
             (
-                "scripts/new_game.story.hks",
-                include_str!(
-                    "../../../../manosabars/assets/main_hdp_contents/scripts/new_game.story.hks"
-                ),
-            ),
-            (
-                "scripts/gallery.story.hks",
-                include_str!(
-                    "../../../../manosabars/assets/main_hdp_contents/scripts/gallery.story.hks"
-                ),
-            ),
-            (
-                "scripts/settings.story.hks",
-                include_str!(
-                    "../../../../manosabars/assets/main_hdp_contents/scripts/settings.story.hks"
-                ),
+                "<tasks>",
+                r#"
+                    let voices = par {
+                        voice("voice/alice/first")
+                        voice("voice/bob/second")
+                    }
+                    wait(voices)
+                "#,
             ),
         ] {
             compile_story_bytecode(path, source).unwrap_or_else(|error| {

@@ -14,6 +14,10 @@ pub use ast::{
     Stmt, TypeExpr, TypeExprKind, TypeField,
 };
 pub use hir::StatementValue;
+pub use hiraku_errors::{
+    Diagnostic, DiagnosticLabel, RenderOptions, Severity, SourceId, SourceMap, render_diagnostics,
+    write_diagnostics,
+};
 pub use hiraku_script_derive::{HksHandle, hks_define, hks_module};
 pub use parse::{ParseError, parse_program};
 pub use span::Span;

@@ -156,13 +156,45 @@ fn evaluate_ast(
                 "unary minus requires a number".to_string(),
             )),
         },
-        ExprKind::Binary {
-            left,
-            op: BinaryOp::Equal,
-            right,
-        } => Ok(Value::Bool(
-            evaluate_ast(left, context)? == evaluate_ast(right, context)?,
-        )),
+        ExprKind::Binary { left, op, right } => {
+            let left = evaluate_ast(left, context)?;
+            let right = evaluate_ast(right, context)?;
+            match op {
+                BinaryOp::Equal => Ok(Value::Bool(left == right)),
+                BinaryOp::NotEqual => Ok(Value::Bool(left != right)),
+                BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::Divide
+                | BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual => {
+                    let (Value::Number(left), Value::Number(right)) = (left, right) else {
+                        return Err(TemplateError::UnsupportedExpression(
+                            "arithmetic and comparison operands must be numbers".to_string(),
+                        ));
+                    };
+                    match op {
+                        BinaryOp::Add => Ok(Value::Number(left + right)),
+                        BinaryOp::Subtract => Ok(Value::Number(left - right)),
+                        BinaryOp::Multiply => Ok(Value::Number(left * right)),
+                        BinaryOp::Divide if right == 0.0 => Err(
+                            TemplateError::UnsupportedExpression("division by zero".to_string()),
+                        ),
+                        BinaryOp::Divide => Ok(Value::Number(left / right)),
+                        BinaryOp::Less => Ok(Value::Bool(left < right)),
+                        BinaryOp::LessEqual => Ok(Value::Bool(left <= right)),
+                        BinaryOp::Greater => Ok(Value::Bool(left > right)),
+                        BinaryOp::GreaterEqual => Ok(Value::Bool(left >= right)),
+                        _ => unreachable!("matched numeric template operator"),
+                    }
+                }
+                BinaryOp::Colon => Err(TemplateError::UnsupportedExpression(
+                    "operator `:` is host-defined and cannot run in a template".to_string(),
+                )),
+            }
+        }
         ExprKind::Call {
             callee,
             arguments,
@@ -291,12 +323,12 @@ mod tests {
             "player".to_string(),
             Value::Map(BTreeMap::from([(
                 "name".to_string(),
-                Value::String("Alice".to_string()),
+                Value::String("alice".to_string()),
             )])),
         )]);
         assert_eq!(
             eval_template("Hi, ${player.name}", &mut context).expect("template must evaluate"),
-            "Hi, Alice"
+            "Hi, alice"
         );
     }
 

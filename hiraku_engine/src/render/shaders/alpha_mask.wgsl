@@ -6,7 +6,7 @@ struct AlphaMaskMaterial {
     mask_rect: vec4<f32>,
     offsets: vec4<f32>,
     opacity: f32,
-    mask_enabled: f32,    // 0.0 ~ 1.0 连续插值
+    mask_enabled: f32,    // Continuous interpolation from 0.0 to 1.0.
     _padding: vec2<f32>,
 };
 

@@ -14,7 +14,7 @@ use crate::{
     symbol::{SymbolId, SymbolManifest},
 };
 
-pub const BYTECODE_VERSION: u16 = 8;
+pub const BYTECODE_VERSION: u16 = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
@@ -379,7 +379,16 @@ pub enum Instruction {
     MakeList(usize),
     MakeMap(Vec<String>),
     Negate,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
     Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
     GetMember {
         name: String,
         safe: bool,
@@ -410,6 +419,22 @@ pub enum Instruction {
 pub struct CompileError {
     pub message: String,
     pub span: Span,
+}
+
+impl CompileError {
+    pub fn diagnostic(&self, source: crate::SourceId) -> crate::Diagnostic {
+        let mut diagnostic = crate::Diagnostic::error(&self.message)
+            .with_code("HKS-COMPILE")
+            .with_label(crate::DiagnosticLabel::primary(source, self.span.range()));
+        if self.message.starts_with("condition expects Bool") {
+            diagnostic =
+                diagnostic.with_help("use a comparison such as `value < limit` to produce a Bool");
+        } else if self.message.contains("is not registered") {
+            diagnostic = diagnostic
+                .with_help("register this function or operator in the embedding manifest");
+        }
+        diagnostic
+    }
 }
 
 pub fn compile(program: &Program, source_hash: u64) -> Result<Bytecode, Vec<CompileError>> {
@@ -947,6 +972,7 @@ impl Compiler<'_> {
                 else_block,
                 ..
             } => {
+                self.check_condition(condition);
                 self.expression(condition);
                 let branch = self.instructions.len();
                 self.instructions.push(Instruction::JumpIfFalse(usize::MAX));
@@ -971,6 +997,7 @@ impl Compiler<'_> {
             Stmt::While {
                 condition, body, ..
             } => {
+                self.check_condition(condition);
                 let start = self.instructions.len();
                 self.expression(condition);
                 let exit = self.instructions.len();
@@ -1309,10 +1336,33 @@ impl Compiler<'_> {
                 span: expression.span.clone(),
             }),
             ExprKind::Binary { left, op, right } => {
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Less
+                        | BinaryOp::LessEqual
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEqual
+                ) {
+                    self.check_numeric_operand(left);
+                    self.check_numeric_operand(right);
+                }
                 self.expression(left);
                 self.expression(right);
                 match op {
+                    BinaryOp::Add => self.instructions.push(Instruction::Add),
+                    BinaryOp::Subtract => self.instructions.push(Instruction::Subtract),
+                    BinaryOp::Multiply => self.instructions.push(Instruction::Multiply),
+                    BinaryOp::Divide => self.instructions.push(Instruction::Divide),
                     BinaryOp::Equal => self.instructions.push(Instruction::Equal),
+                    BinaryOp::NotEqual => self.instructions.push(Instruction::NotEqual),
+                    BinaryOp::Less => self.instructions.push(Instruction::Less),
+                    BinaryOp::LessEqual => self.instructions.push(Instruction::LessEqual),
+                    BinaryOp::Greater => self.instructions.push(Instruction::Greater),
+                    BinaryOp::GreaterEqual => self.instructions.push(Instruction::GreaterEqual),
                     BinaryOp::Colon => {
                         let Some(builtin) = self
                             .manifest
@@ -1364,6 +1414,28 @@ impl Compiler<'_> {
             children: Vec::new(),
         });
         task
+    }
+
+    fn check_condition(&mut self, condition: &Expr) {
+        let actual = self.infer_type(condition);
+        if !ScriptType::Bool.accepts(&actual) {
+            self.errors.push(CompileError {
+                message: format!("condition expects Bool, got {actual:?}"),
+                span: condition.span,
+            });
+        }
+    }
+
+    fn check_numeric_operand(&mut self, operand: &Expr) {
+        let actual = self.infer_type(operand);
+        if !ScriptType::Number.accepts(&actual) {
+            self.errors.push(CompileError {
+                message: format!(
+                    "arithmetic and comparison operators expect Number, got {actual:?}"
+                ),
+                span: operand.span,
+            });
+        }
     }
 
     fn check_signature(&mut self, builtin: BuiltinId, arguments: &[crate::Argument], span: Span) {
@@ -1480,7 +1552,30 @@ fn infer_expression_type(
     match &expression.kind {
         ExprKind::Null => ScriptType::Any,
         ExprKind::Ellipsis => ScriptType::Any,
-        ExprKind::Bool(_) | ExprKind::Binary { .. } => ScriptType::Bool,
+        ExprKind::Bool(_) => ScriptType::Bool,
+        ExprKind::Binary { left, op, right } => match op {
+            BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::Less
+            | BinaryOp::LessEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEqual => ScriptType::Bool,
+            BinaryOp::Divide => ScriptType::Number,
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => {
+                let left = infer_expression_type(manifest, type_aliases, locals, left);
+                let right = infer_expression_type(manifest, type_aliases, locals, right);
+                if left == ScriptType::Int && right == ScriptType::Int {
+                    ScriptType::Int
+                } else {
+                    ScriptType::Number
+                }
+            }
+            BinaryOp::Colon => manifest
+                .and_then(|manifest| manifest.resolve_operator(":"))
+                .and_then(|builtin| manifest.and_then(|manifest| manifest.signature(builtin)))
+                .map(|signature| signature.result.clone())
+                .unwrap_or(ScriptType::Any),
+        },
         ExprKind::Number {
             value,
             unit: NumberUnit::Scalar,
@@ -1765,6 +1860,43 @@ pub struct Vm {
     status: VmStatus,
 }
 
+struct ScopedTemplateContext<'a> {
+    locals: &'a BTreeMap<String, Value>,
+    globals: &'a BTreeMap<String, Value>,
+}
+
+impl crate::template::TemplateContext for ScopedTemplateContext<'_> {
+    fn resolve_template_path(
+        &mut self,
+        path: &[&str],
+    ) -> Result<Value, crate::template::TemplateError> {
+        let full_path = path.join(".");
+        let Some(root) = path.first() else {
+            return Err(crate::template::TemplateError::UnknownPath(full_path));
+        };
+        let mut value = self
+            .locals
+            .get(*root)
+            .or_else(|| self.globals.get(*root))
+            .ok_or_else(|| crate::template::TemplateError::UnknownPath(full_path.clone()))?;
+        for member in &path[1..] {
+            value = match value {
+                Value::Map(fields) => fields.get(*member),
+                Value::Typed { value, .. } => match value.as_ref() {
+                    Value::Map(fields) => fields.get(*member),
+                    _ => None,
+                },
+                _ => None,
+            }
+            .ok_or_else(|| crate::template::TemplateError::UnknownPath(full_path.clone()))?;
+        }
+        if value == &Value::Uninitialized {
+            return Err(crate::template::TemplateError::UninitializedValue);
+        }
+        Ok(value.clone())
+    }
+}
+
 impl Vm {
     pub fn new(bytecode: Bytecode) -> Result<Self, VmError> {
         if bytecode.version != BYTECODE_VERSION {
@@ -1809,7 +1941,13 @@ impl Vm {
         &mut self,
         template: &str,
     ) -> Result<String, crate::template::TemplateError> {
-        crate::template::eval_template(template, &mut self.globals)
+        crate::template::eval_template(
+            template,
+            &mut ScopedTemplateContext {
+                locals: &self.locals,
+                globals: &self.globals,
+            },
+        )
     }
 
     pub fn step(&mut self) -> Result<Option<VmEvent>, VmError> {
@@ -1895,10 +2033,44 @@ impl Vm {
                     };
                     self.stack.push(Value::Number(-value));
                 }
+                instruction @ (Instruction::Add
+                | Instruction::Subtract
+                | Instruction::Multiply
+                | Instruction::Divide
+                | Instruction::Less
+                | Instruction::LessEqual
+                | Instruction::Greater
+                | Instruction::GreaterEqual) => {
+                    let right = self.pop()?;
+                    let left = self.pop()?;
+                    let (Value::Number(left), Value::Number(right)) = (left, right) else {
+                        return Err(VmError::TypeMismatch(
+                            "arithmetic and comparison operands must be numbers",
+                        ));
+                    };
+                    let value = match instruction {
+                        Instruction::Add => Value::Number(left + right),
+                        Instruction::Subtract => Value::Number(left - right),
+                        Instruction::Multiply => Value::Number(left * right),
+                        Instruction::Divide if right == 0.0 => return Err(VmError::DivisionByZero),
+                        Instruction::Divide => Value::Number(left / right),
+                        Instruction::Less => Value::Bool(left < right),
+                        Instruction::LessEqual => Value::Bool(left <= right),
+                        Instruction::Greater => Value::Bool(left > right),
+                        Instruction::GreaterEqual => Value::Bool(left >= right),
+                        _ => unreachable!("matched numeric instruction"),
+                    };
+                    self.stack.push(value);
+                }
                 Instruction::Equal => {
                     let right = self.pop()?;
                     let left = self.pop()?;
                     self.stack.push(Value::Bool(left == right));
+                }
+                Instruction::NotEqual => {
+                    let right = self.pop()?;
+                    let left = self.pop()?;
+                    self.stack.push(Value::Bool(left != right));
                 }
                 Instruction::GetMember { name, safe } => {
                     let value = self.pop()?;
@@ -2201,9 +2373,23 @@ impl TaskScheduler {
 
     pub fn eval_template(
         &mut self,
+        task: u64,
         template: &str,
     ) -> Result<String, crate::template::TemplateError> {
-        crate::template::eval_template(template, &mut self.globals)
+        let locals = &self
+            .tasks
+            .get(&task)
+            .ok_or_else(|| {
+                crate::template::TemplateError::UnknownPath(format!("task {task} scope"))
+            })?
+            .locals;
+        crate::template::eval_template(
+            template,
+            &mut ScopedTemplateContext {
+                locals,
+                globals: &self.globals,
+            },
+        )
     }
 
     /// Starts a task template and returns its deterministic handle.
@@ -2466,12 +2652,50 @@ impl TaskScheduler {
                 };
                 self.task_mut(task_id)?.stack.push(Value::Number(-value));
             }
+            instruction @ (Instruction::Add
+            | Instruction::Subtract
+            | Instruction::Multiply
+            | Instruction::Divide
+            | Instruction::Less
+            | Instruction::LessEqual
+            | Instruction::Greater
+            | Instruction::GreaterEqual) => {
+                let right = self.pop_task(task_id)?;
+                let left = self.pop_task(task_id)?;
+                let (Value::Number(left), Value::Number(right)) = (left, right) else {
+                    return Err(TaskSchedulerError::TypeMismatch(
+                        "arithmetic and comparison operands must be numbers",
+                    ));
+                };
+                let value = match instruction {
+                    Instruction::Add => Value::Number(left + right),
+                    Instruction::Subtract => Value::Number(left - right),
+                    Instruction::Multiply => Value::Number(left * right),
+                    Instruction::Divide if right == 0.0 => {
+                        return Err(TaskSchedulerError::DivisionByZero);
+                    }
+                    Instruction::Divide => Value::Number(left / right),
+                    Instruction::Less => Value::Bool(left < right),
+                    Instruction::LessEqual => Value::Bool(left <= right),
+                    Instruction::Greater => Value::Bool(left > right),
+                    Instruction::GreaterEqual => Value::Bool(left >= right),
+                    _ => unreachable!("matched numeric instruction"),
+                };
+                self.task_mut(task_id)?.stack.push(value);
+            }
             Instruction::Equal => {
                 let right = self.pop_task(task_id)?;
                 let left = self.pop_task(task_id)?;
                 self.task_mut(task_id)?
                     .stack
                     .push(Value::Bool(left == right));
+            }
+            Instruction::NotEqual => {
+                let right = self.pop_task(task_id)?;
+                let left = self.pop_task(task_id)?;
+                self.task_mut(task_id)?
+                    .stack
+                    .push(Value::Bool(left != right));
             }
             Instruction::GetMember { name, safe } => {
                 let value = self.pop_task(task_id)?;
@@ -2701,6 +2925,7 @@ pub enum TaskSchedulerError {
     UnknownTemplate(u32),
     NotWaitingForHost,
     TypeMismatch(&'static str),
+    DivisionByZero,
     UnknownFunction(FunctionId),
     FunctionArity {
         function: FunctionId,
@@ -2733,6 +2958,7 @@ pub enum VmError {
     ReturnOutsideFunction,
     NotWaitingForHost,
     TypeMismatch(&'static str),
+    DivisionByZero,
 }
 
 #[cfg(test)]
@@ -2811,8 +3037,63 @@ mod tests {
     }
 
     #[test]
+    fn while_comparisons_compound_assignments_and_local_templates_execute_together() {
+        let program = parse_program(
+            r#"
+                let a = 1
+                while a < 4 {
+                    "Test loop: ${a}"
+                    a += 1
+                }
+            "#,
+        )
+        .expect("loop syntax must parse");
+        let bytecode = compile(&program, 1).expect("typed loop must compile");
+        let mut vm = Vm::new(bytecode).expect("VM must initialize");
+        let mut rendered = Vec::new();
+
+        loop {
+            match vm.step().expect("loop must execute") {
+                Some(VmEvent::Statement(StatementValue::String(template))) => rendered.push(
+                    vm.eval_template(&template)
+                        .expect("template must see the current local scope"),
+                ),
+                Some(VmEvent::Completed(_)) => break,
+                Some(VmEvent::Statement(StatementValue::Commit)) | None => {}
+                Some(VmEvent::Call(_) | VmEvent::SpawnTask(_)) => {
+                    panic!("test script has no native calls or tasks")
+                }
+            }
+        }
+
+        assert_eq!(rendered, ["Test loop: 1", "Test loop: 2", "Test loop: 3"]);
+        assert_eq!(vm.locals().get("a"), Some(&Value::Number(4.0)));
+    }
+
+    #[test]
+    fn all_numeric_compound_assignments_execute() {
+        let program = parse_program(
+            r#"
+                let value: Number = 8
+                value += 2
+                value -= 4
+                value *= 3
+                value /= 2
+            "#,
+        )
+        .expect("compound assignments must parse");
+        let bytecode = compile(&program, 1).expect("compound assignments must compile");
+        let mut vm = Vm::new(bytecode).expect("VM must initialize");
+        while !matches!(
+            vm.step().expect("compound assignment must execute"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.locals().get("value"), Some(&Value::Number(9.0)));
+    }
+
+    #[test]
     fn registered_fluent_calls_use_handles_and_commit_after_the_statement() {
-        let program = parse_program(r#"char("Alice").e("eyes").e("face")"#).unwrap();
+        let program = parse_program(r#"char("alice").e("eyes").e("face")"#).unwrap();
         let manifest = BuiltinManifest::new([("char", BuiltinId(1)), ("e", BuiltinId(2))]);
         let bytecode = compile_with_manifest(&program, 42, &manifest).unwrap();
         assert_eq!(bytecode.builtin_manifest_hash, manifest.hash());
@@ -3093,7 +3374,7 @@ mod tests {
         let program = parse_program(
             r#"
                 global name: String
-                name = "Alice"
+                name = "alice"
                 nativeEcho(name)
             "#,
         )
@@ -3109,7 +3390,7 @@ mod tests {
         let Some(VmEvent::Call(call)) = vm.step().expect("VM must advance") else {
             panic!("expected native call")
         };
-        assert_eq!(call.arguments[0].value, Value::String("Alice".to_string()));
+        assert_eq!(call.arguments[0].value, Value::String("alice".to_string()));
     }
 
     #[test]
@@ -3271,7 +3552,7 @@ mod tests {
             r#"
                 type Player = .{ name: String, health: Int }
                 fn health(player: Player) -> Int { player.health }
-                global player: Player = .{ name: "Alice", health: 123 }
+                global player: Player = .{ name: "alice", health: 123 }
                 health(player)
             "#,
         )
@@ -3282,7 +3563,7 @@ mod tests {
             r#"
                 type Player = .{ name: String, health: Int }
                 fn health(player: Player) -> Int { player.health }
-                health("Alice")
+                health("alice")
             "#,
         )
         .expect("invalid typed call must still parse");

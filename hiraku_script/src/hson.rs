@@ -18,6 +18,9 @@ use serde::{
 };
 
 use crate::{Expr, ExprKind, NumberUnit, Stmt, parse_program};
+use hiraku_errors::{
+    Diagnostic, DiagnosticLabel, RenderOptions, SourceId, SourceMap, render_diagnostics,
+};
 
 pub type HsonMap = BTreeMap<String, HsonValue>;
 
@@ -180,32 +183,111 @@ impl<'de> Deserialize<'de> for HsonValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HsonError {
+    issues: Vec<HsonIssue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HsonIssue {
+    code: &'static str,
     message: String,
-    offset: Option<usize>,
+    span: Option<crate::Span>,
+    help: Option<String>,
 }
 
 impl HsonError {
     fn new(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
-            offset: None,
+            issues: vec![HsonIssue {
+                code: "HSON-SERDE",
+                message: message.into(),
+                span: None,
+                help: None,
+            }],
         }
     }
 
-    fn at(message: impl Into<String>, offset: usize) -> Self {
+    fn at(message: impl Into<String>, span: crate::Span) -> Self {
         Self {
-            message: message.into(),
-            offset: Some(offset),
+            issues: vec![HsonIssue {
+                code: "HSON-VALUE",
+                message: message.into(),
+                span: Some(span),
+                help: None,
+            }],
         }
+    }
+
+    fn from_parse_errors(errors: Vec<crate::ParseError>) -> Self {
+        Self {
+            issues: errors
+                .into_iter()
+                .map(|error| HsonIssue {
+                    code: "HSON-PARSE",
+                    message: error.message,
+                    span: Some(error.span),
+                    help: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn with_help(mut self, help: impl Into<String>) -> Self {
+        if let Some(issue) = self.issues.last_mut() {
+            issue.help = Some(help.into());
+        }
+        self
+    }
+
+    fn with_document_span(mut self, source: &str) -> Self {
+        for issue in &mut self.issues {
+            issue.span.get_or_insert(crate::Span {
+                start: 0,
+                end: source.len(),
+            });
+        }
+        self
+    }
+
+    pub fn diagnostics(&self, source: SourceId) -> Vec<Diagnostic> {
+        self.issues
+            .iter()
+            .map(|issue| {
+                let mut diagnostic = Diagnostic::error(&issue.message).with_code(issue.code);
+                if let Some(span) = issue.span {
+                    diagnostic = diagnostic
+                        .with_label(DiagnosticLabel::primary(source.clone(), span.range()));
+                }
+                if let Some(help) = &issue.help {
+                    diagnostic = diagnostic.with_help(help);
+                }
+                diagnostic
+            })
+            .collect()
+    }
+
+    pub fn render(&self, path: &str, source: &str) -> String {
+        let mut sources = SourceMap::new();
+        let source_id = sources.insert(path, source);
+        render_diagnostics(
+            &self.diagnostics(source_id),
+            &sources,
+            RenderOptions::default(),
+        )
     }
 }
 
 impl fmt::Display for HsonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.offset {
-            Some(offset) => write!(formatter, "{} at byte {offset}", self.message),
-            None => formatter.write_str(&self.message),
+        for (index, issue) in self.issues.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            formatter.write_str(&issue.message)?;
+            if let Some(span) = issue.span {
+                write!(formatter, " at byte {}", span.start)?;
+            }
         }
+        Ok(())
     }
 }
 
@@ -224,25 +306,22 @@ impl ser::Error for HsonError {
 }
 
 pub fn parse(source: &str) -> Result<HsonValue, HsonError> {
-    let program = parse_program(source).map_err(|errors| {
-        HsonError::new(
-            errors
-                .into_iter()
-                .map(|error| format!("{} at byte {}", error.message, error.span.start))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    })?;
+    let program = parse_program(source).map_err(HsonError::from_parse_errors)?;
     let [Stmt::Expr(expression)] = program.statements.as_slice() else {
-        return Err(HsonError::new(
+        return Err(HsonError::at(
             "an HSON document must contain exactly one value",
-        ));
+            crate::Span {
+                start: 0,
+                end: source.len(),
+            },
+        )
+        .with_help("remove statements and keep one literal, list, tuple, or map value"));
     };
     literal_value(expression, source)
 }
 
 pub fn from_str<T: DeserializeOwned>(source: &str) -> Result<T, HsonError> {
-    T::deserialize(parse(source)?)
+    T::deserialize(parse(source)?).map_err(|error| error.with_document_span(source))
 }
 
 pub fn from_slice<T: DeserializeOwned>(source: &[u8]) -> Result<T, HsonError> {
@@ -270,7 +349,7 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, HsonError> {
 }
 
 fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError> {
-    let invalid = |message: &str| HsonError::at(message, expression.span.start);
+    let invalid = |message: &str| HsonError::at(message, expression.span);
     match &expression.kind {
         ExprKind::String(value) | ExprKind::Symbol(value) => Ok(HsonValue::String(value.clone())),
         ExprKind::Bool(value) => Ok(HsonValue::Bool(*value)),
@@ -310,7 +389,10 @@ fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError
                 {
                     return Err(HsonError::at(
                         format!("duplicate map key `{}`", field.name),
-                        field.span.start,
+                        field.span,
+                    )
+                    .with_help(
+                        "remove one key or rename it; later values do not override earlier values",
                     ));
                 }
             }
@@ -325,7 +407,7 @@ fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError
 fn parse_number(expression: &Expr, source: &str) -> Result<HsonValue, HsonError> {
     let raw = source
         .get(expression.span.start..expression.span.end)
-        .ok_or_else(|| HsonError::at("invalid numeric source span", expression.span.start))?
+        .ok_or_else(|| HsonError::at("invalid numeric source span", expression.span))?
         .trim()
         .trim_end_matches('%');
     if !raw.contains(['.', 'e', 'E']) {
@@ -342,7 +424,7 @@ fn parse_number(expression: &Expr, source: &str) -> Result<HsonValue, HsonError>
         .ok()
         .filter(|value| value.is_finite())
         .map(HsonValue::Float)
-        .ok_or_else(|| HsonError::at("invalid HSON number", expression.span.start))
+        .ok_or_else(|| HsonError::at("invalid HSON number", expression.span))
 }
 
 fn write_value(value: &HsonValue, output: &mut String, depth: usize) -> Result<(), HsonError> {
@@ -1067,5 +1149,35 @@ mod tests {
             from_str::<u64>(&source).expect("u64 should deserialize"),
             value
         );
+    }
+
+    #[test]
+    fn parse_errors_render_all_source_labels() {
+        let source = ".{ first: @, second: # }";
+        let error = parse(source).expect_err("invalid tokens must be rejected");
+        let rendered = error.render("config/test.hson", source);
+        assert_eq!(rendered.matches("[HSON-PARSE]").count(), 2);
+        assert!(rendered.contains("config/test.hson:1:11"));
+        assert!(rendered.contains("config/test.hson:1:22"));
+    }
+
+    #[test]
+    fn duplicate_keys_include_a_fix_hint() {
+        let source = ".{ name: \"first\", name: \"second\" }";
+        let error = parse(source).expect_err("duplicate keys must be rejected");
+        let rendered = error.render("config/test.hson", source);
+        assert!(rendered.contains("[HSON-VALUE]"));
+        assert!(rendered.contains("duplicate map key `name`"));
+        assert!(rendered.contains("remove one key or rename it"));
+    }
+
+    #[test]
+    fn serde_schema_errors_retain_document_context() {
+        let source = ".{ name: 7, values: [], enabled: true }";
+        let error = from_str::<Document>(source).expect_err("name must be a string");
+        let rendered = error.render("config/test.hson", source);
+        assert!(rendered.contains("[HSON-SERDE]"));
+        assert!(rendered.contains("config/test.hson:1:1"));
+        assert!(rendered.contains("expected string"));
     }
 }

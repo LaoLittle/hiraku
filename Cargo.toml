@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_script_derive", "hiraku_cli", "hiraku_hdp"]
+members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_script_derive", "hiraku_cli", "hiraku_hdp", "hiraku_errors"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,10 +12,10 @@ futures-lite = "2.6.1"
 prost = "0.14.4"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
-toml = "1.1.4"
 rustc-hash = "2.1.3"
 
 hiraku-engine = { path = "hiraku_engine" }
+hiraku-errors = { path = "hiraku_errors" }
 hiraku-hdp = { path = "hiraku_hdp" }
 hiraku-script = { path = "hiraku_script" }
 

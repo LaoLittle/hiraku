@@ -6,7 +6,6 @@ use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::{
-    data::evaluate_hson_map,
     texture::{TextureCatalog, TextureCatalogError, load_texture_catalog},
     vfs::{HdpVfs, VfsError},
 };
@@ -584,13 +583,9 @@ fn parse_hks_data<T>(path: &str, source: &str) -> Result<T, CharacterCatalogErro
 where
     T: DeserializeOwned,
 {
-    let data = evaluate_hson_map(path, source).map_err(|error| CharacterCatalogError::Data {
+    hson::from_str(source).map_err(|error| CharacterCatalogError::Data {
         path: path.to_string(),
-        message: error.to_string(),
-    })?;
-    hson::from_value(hson::HsonValue::Map(data)).map_err(|error| CharacterCatalogError::Data {
-        path: path.to_string(),
-        message: error.to_string(),
+        message: error.render(path, source),
     })
 }
 

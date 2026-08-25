@@ -5,10 +5,7 @@ use hiraku_script::hson;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{
-    data::evaluate_hson_map,
-    vfs::{HdpVfs, VfsError},
-};
+use crate::vfs::{HdpVfs, VfsError};
 
 #[derive(Clone, Debug, Default, Resource)]
 pub struct TextureCatalog {
@@ -277,18 +274,10 @@ pub fn load_texture_catalog(vfs: &HdpVfs) -> Result<TextureCatalog, TextureCatal
     let mut textures = BTreeMap::new();
     for descriptor_path in descriptor_paths {
         let source = vfs.read_text(&descriptor_path)?;
-        let data = evaluate_hson_map(&descriptor_path, &source).map_err(|error| {
-            TextureCatalogError::Data {
-                path: descriptor_path.clone(),
-                message: error.to_string(),
-            }
-        })?;
         let texture: TextureFile =
-            hson::from_value(hson::HsonValue::Map(data)).map_err(|error| {
-                TextureCatalogError::Data {
-                    path: descriptor_path.clone(),
-                    message: error.to_string(),
-                }
+            hson::from_str(&source).map_err(|error| TextureCatalogError::Data {
+                path: descriptor_path.clone(),
+                message: error.render(&descriptor_path, &source),
             })?;
         let path = vfs.resolve_path(Some(&descriptor_path), &texture.image);
 

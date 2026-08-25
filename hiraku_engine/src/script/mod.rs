@@ -36,7 +36,7 @@ pub(crate) fn compile_story_bytecode(
     capabilities::compile_story_bytecode(path, source)
 }
 
-pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script};
+pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script_named};
 
 #[derive(Debug)]
 pub enum ScriptCommand {

@@ -9,10 +9,7 @@ use hiraku_script::hson;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{
-    data::evaluate_hson_map,
-    vfs::{HdpVfs, VfsError},
-};
+use crate::vfs::{HdpVfs, VfsError};
 
 #[derive(Clone, Debug, Default, Resource)]
 pub struct AudioCatalog {
@@ -197,7 +194,7 @@ fn load_voice_channel(
         let descriptor: VoiceDescriptor =
             hson::from_str(&source).map_err(|error| AudioCatalogError::Data {
                 path: descriptor_path.clone(),
-                message: error.to_string(),
+                message: error.render(&descriptor_path, &source),
             })?;
         let voices = match descriptor {
             VoiceDescriptor::Character(file) => file.voices,
@@ -238,17 +235,9 @@ fn load_channel(
     let mut definitions = BTreeMap::new();
     for descriptor_path in paths {
         let source = vfs.read_text(&descriptor_path)?;
-        let data = evaluate_hson_map(&descriptor_path, &source).map_err(|error| {
-            AudioCatalogError::Data {
-                path: descriptor_path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        let file: AudioFile = hson::from_value(hson::HsonValue::Map(data)).map_err(|error| {
-            AudioCatalogError::Data {
-                path: descriptor_path.clone(),
-                message: error.to_string(),
-            }
+        let file: AudioFile = hson::from_str(&source).map_err(|error| AudioCatalogError::Data {
+            path: descriptor_path.clone(),
+            message: error.render(&descriptor_path, &source),
         })?;
         let definition = AudioDefinition {
             path: vfs.resolve_path(Some(&descriptor_path), &file.audio),
@@ -284,8 +273,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            root.join("voice/ema_001.voice.hson"),
-            ".{ name: \"ema/001\", audio: \"Ema_001.ogg\" }",
+            root.join("voice/alice_001.voice.hson"),
+            ".{ name: \"alice/001\", audio: \"alice_001.ogg\" }",
         )
         .unwrap();
         std::fs::write(
@@ -316,8 +305,8 @@ mod tests {
             Some("bgm/TitlePrelude.ogg")
         );
         assert_eq!(
-            catalog.resolve_voice("ema/001").unwrap().path,
-            "voice/Ema_001.ogg"
+            catalog.resolve_voice("alice/001").unwrap().path,
+            "voice/alice_001.ogg"
         );
         assert_eq!(
             catalog.resolve_voice("voice/scene01/hash1").unwrap().path,

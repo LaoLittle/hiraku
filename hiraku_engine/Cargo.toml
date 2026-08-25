@@ -10,6 +10,7 @@ bevy_ui_render = "0.19"
 event-listener.workspace = true
 futures-lite.workspace = true
 hiraku-hdp.workspace = true
+hiraku-errors.workspace = true
 hiraku-script.workspace = true
 prost.workspace = true
 serde.workspace = true

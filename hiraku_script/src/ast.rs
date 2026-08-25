@@ -141,7 +141,16 @@ pub enum ExprKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
     Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
     Colon,
 }
 

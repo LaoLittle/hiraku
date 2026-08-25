@@ -6,7 +6,7 @@ use hiraku_script::native::{NativeError, NativeRegistry};
 use hiraku_script::vm::{
     BuiltinCall, BuiltinManifest, Bytecode, ScriptType, Value, compile_with_manifest,
 };
-use hiraku_script::{StatementValue, parse_program};
+use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, render_diagnostics};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -81,20 +81,22 @@ pub fn story_manifest() -> BuiltinManifest {
 }
 
 pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, String> {
+    let mut sources = SourceMap::new();
+    let source_id = sources.insert(path, source);
     let program = parse_program(source).map_err(|errors| {
-        errors
+        let diagnostics = errors
             .into_iter()
-            .map(|error| format!("{} at byte {}", error.message, error.span.start))
-            .collect::<Vec<_>>()
-            .join("; ")
+            .map(|error| error.diagnostic(source_id.clone()))
+            .collect::<Vec<_>>();
+        render_diagnostics(&diagnostics, &sources, RenderOptions::default())
     })?;
     compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
         |errors| {
-            errors
+            let diagnostics = errors
                 .into_iter()
-                .map(|error| format!("{} at byte {}", error.message, error.span.start))
-                .collect::<Vec<_>>()
-                .join("; ")
+                .map(|error| error.diagnostic(source_id.clone()))
+                .collect::<Vec<_>>();
+            render_diagnostics(&diagnostics, &sources, RenderOptions::default())
         },
     )
 }
@@ -844,6 +846,19 @@ not_actor.at(.left)"#,
     }
 
     #[test]
+    fn story_compile_errors_include_rustc_style_source_context() {
+        let error = compile_story_bytecode(
+            "scripts/invalid.hks",
+            "let count = 1\nwhile count {\n    \"never\"\n}\n",
+        )
+        .expect_err("a numeric condition must be rejected");
+        assert!(error.contains("[HKS-COMPILE] Error: condition expects Bool, got Int"));
+        assert!(error.contains("scripts/invalid.hks:2:7"));
+        assert!(error.contains("while count {"));
+        assert!(error.contains("use a comparison such as `value < limit`"));
+    }
+
+    #[test]
     fn script_transfer_api_uses_explicit_goto_and_call_names() {
         let manifest = story_manifest();
         assert!(manifest.resolve("gotoScript").is_some());
@@ -861,11 +876,11 @@ not_actor.at(.left)"#,
         let bytecode = compile_story_bytecode(
             "dialogue.story.hks",
             r#"
-                let ema = char("ema")
-                ema: "first"
+                let alice = char("alice")
+                alice: "first"
                 ...: "continued"
                 "narration"
-                char("ema").e("happy"): "inline"
+                char("alice").e("happy"): "inline"
             "#,
         )
         .expect("dialogue sugar must compile");
@@ -900,10 +915,10 @@ not_actor.at(.left)"#,
         assert_eq!(
             dialogue,
             vec![
-                (false, "ema".to_string(), "first".to_string()),
+                (false, "alice".to_string(), "first".to_string()),
                 (true, String::new(), "continued".to_string()),
                 (false, String::new(), "narration".to_string()),
-                (false, "ema".to_string(), "inline".to_string()),
+                (false, "alice".to_string(), "inline".to_string()),
             ]
         );
     }

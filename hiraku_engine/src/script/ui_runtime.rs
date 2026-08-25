@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use hiraku_script::{
-    Argument, Block, Expr, ExprKind, NumberUnit, Stmt,
+    Argument, Block, Expr, ExprKind, NumberUnit, RenderOptions, SourceMap, Stmt,
     hson::{HsonMap as Map, HsonValue as Value},
-    parse_program,
+    parse_program, render_diagnostics,
 };
 
 use crate::{
@@ -85,24 +85,24 @@ pub enum UiScriptError {
 /// This is deliberately an embedding compiler, not a generic HKS VM feature. UI documents can
 /// only call the builders declared below and their arguments remain declarative literals. Strings
 /// may read immutable context values with `${camelCaseName}`.
-pub fn evaluate_ui_script(
+pub fn evaluate_ui_script_named(
+    path: &str,
     source: &str,
     context: &UiContext,
     textures: &TextureCatalog,
 ) -> Result<ScreenSpec, UiScriptError> {
+    let mut sources = SourceMap::new();
+    let source_id = sources.insert(path, source);
     let program = parse_program(source).map_err(|errors| {
-        UiScriptError::Evaluation(
-            errors
-                .into_iter()
-                .map(|error| {
-                    format!(
-                        "{} at {}..{}",
-                        error.message, error.span.start, error.span.end
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
+        let diagnostics = errors
+            .into_iter()
+            .map(|error| error.diagnostic(source_id.clone()))
+            .collect::<Vec<_>>();
+        UiScriptError::Evaluation(render_diagnostics(
+            &diagnostics,
+            &sources,
+            RenderOptions::default(),
+        ))
     })?;
     if program.statements.len() != 1 {
         return Err(invalid(
@@ -609,7 +609,8 @@ mod tests {
             "bgmVolume".to_string(),
             StoredValue::Float(0.8),
         )]));
-        let screen = evaluate_ui_script(
+        let screen = evaluate_ui_script_named(
+            "test.ui.hks",
             r#"screen(title: "Settings (BGM: ${bgmVolume})") {
                 button("Back", value: "back")
                 spacer()
@@ -627,7 +628,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_calls_in_ui_documents() {
-        let error = evaluate_ui_script(
+        let error = evaluate_ui_script_named(
+            "test.ui.hks",
             r#"screen { launchMissiles() }"#,
             &UiContext::default(),
             &TextureCatalog::default(),
@@ -638,7 +640,8 @@ mod tests {
 
     #[test]
     fn lowers_nested_compose_builders() {
-        let screen = evaluate_ui_script(
+        let screen = evaluate_ui_script_named(
+            "test.ui.hks",
             r#"screen(panel: true) {
                 column(gap: 8) {
                     text("Title")
@@ -657,14 +660,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_settings_ui() {
+    fn parses_a_representative_inline_settings_ui() {
         let context = UiContext::new(BTreeMap::from([(
             "bgmVolume".to_string(),
             StoredValue::Float(0.8),
         )]));
-        let source =
-            include_str!("../../../../manosabars/assets/main_hdp_contents/ui/settings.ui.hks");
-        let screen = evaluate_ui_script(source, &context, &TextureCatalog::default()).unwrap();
+        let source = r#"screen(title: "Settings (BGM: ${bgmVolume})", panel: true) {
+            column(gap: 12) {
+                text("Audio")
+                bar(value: 0.8)
+                row { button("Lower", value: .decrease) button("Raise", value: .increase) }
+                button("Back", value: .back)
+            }
+        }"#;
+        let screen = evaluate_ui_script_named(
+            "<settings-ui>",
+            source,
+            &context,
+            &TextureCatalog::default(),
+        )
+        .unwrap();
         assert_eq!(screen.title.as_deref(), Some("Settings (BGM: 0.8)"));
+        assert_eq!(screen.children.len(), 1);
     }
 }

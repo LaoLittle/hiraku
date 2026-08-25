@@ -1,12 +1,13 @@
+use hiraku_errors::{Diagnostic, DiagnosticLabel, RenderOptions, SourceMap, render_diagnostics};
 use hiraku_script::hson::{self, HsonMap, HsonValue};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum HsonDataError {
-    #[error("failed to parse HSON data `{path}`: {message}")]
+    #[error("{message}")]
     Parse { path: String, message: String },
-    #[error("HSON data `{path}` must contain exactly one map")]
-    ExpectedMap { path: String },
+    #[error("{message}")]
+    ExpectedMap { path: String, message: String },
 }
 
 /// Parses a declarative `.hson` document using the engine-independent HSON
@@ -14,12 +15,21 @@ pub enum HsonDataError {
 pub fn evaluate_hson_map(path: &str, source: &str) -> Result<HsonMap, HsonDataError> {
     match hson::parse(source).map_err(|error| HsonDataError::Parse {
         path: path.to_string(),
-        message: error.to_string(),
+        message: error.render(path, source),
     })? {
         HsonValue::Map(map) => Ok(map),
-        _ => Err(HsonDataError::ExpectedMap {
-            path: path.to_string(),
-        }),
+        _ => {
+            let mut sources = SourceMap::new();
+            let source_id = sources.insert(path, source);
+            let diagnostic = Diagnostic::error("expected an HSON map at the document root")
+                .with_code("HSON-ROOT")
+                .with_label(DiagnosticLabel::primary(source_id, 0..source.len()))
+                .with_help("wrap the document fields in `.{ ... }`");
+            Err(HsonDataError::ExpectedMap {
+                path: path.to_string(),
+                message: render_diagnostics(&[diagnostic], &sources, RenderOptions::default()),
+            })
+        }
     }
 }
 
@@ -65,5 +75,18 @@ mod tests {
         let error = evaluate_hson_map("settings.hson", "let startup = \"startup\"")
             .expect_err("procedural HKS must not be accepted as HSON");
         assert!(matches!(error, HsonDataError::Parse { .. }));
+        let rendered = error.to_string();
+        assert!(rendered.contains("[HSON-PARSE]") || rendered.contains("[HSON-VALUE]"));
+        assert!(rendered.contains("settings.hson:1:"));
+    }
+
+    #[test]
+    fn reports_a_non_map_root_with_source_context() {
+        let error = evaluate_hson_map("settings.hson", "[1, 2, 3]")
+            .expect_err("settings root must be a map");
+        let rendered = error.to_string();
+        assert!(rendered.contains("[HSON-ROOT]"));
+        assert!(rendered.contains("settings.hson:1:1"));
+        assert!(rendered.contains("wrap the document fields in `.{ ... }`"));
     }
 }
