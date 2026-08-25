@@ -2,8 +2,8 @@ use std::{error::Error, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use hiraku_hdp::{
-    Archive, CompressionMethod, CompressionOptions, FileOptions, PackOptions, pack_directory_with,
-    write_package,
+    Archive, CompressionMethod, CompressionOptions, FileOptions, PackOptions,
+    pack_directory_to_with,
 };
 
 #[derive(Parser)]
@@ -50,8 +50,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             bootstrap,
             bootstrap_extension,
         } => {
-            let package = pack_directory_with(
+            let package = pack_directory_to_with(
                 source,
+                &output,
                 PackOptions {
                     chunk_size,
                     max_volume_size: volume_size,
@@ -69,8 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     ..Default::default()
                 },
             )?;
-            write_package(&output, &package)?;
-            let stored = package.volumes.iter().map(Vec::len).sum::<usize>();
+            let stored = package.stored_size();
             let decoded = package
                 .index
                 .files
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!(
                 "packed {} files into {} volume(s): {} -> {} bytes",
                 package.index.files.len(),
-                package.volumes.len(),
+                package.volume_count(),
                 decoded,
                 stored
             );

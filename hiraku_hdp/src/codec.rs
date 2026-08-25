@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 
 use crate::HdpError;
 
@@ -81,6 +81,37 @@ pub(crate) fn encode(
                 Ok((CompressionMethod::STORED, input.to_vec()))
             } else {
                 Ok((CompressionMethod::ZSTD, encoded))
+            }
+        }
+        other => Err(HdpError::UnsupportedCompression(other.id())),
+    }
+}
+
+/// Compresses one bounded package chunk from a reader into a reusable buffer.
+///
+/// The caller owns chunk placement and may reread the source when this returns
+/// `STORED`; this keeps codec selection independent from filesystem/volume
+/// policy while avoiding a package-sized allocation.
+pub(crate) fn encode_stream(
+    input: &mut impl Read,
+    input_size: usize,
+    options: CompressionOptions,
+    output: &mut Vec<u8>,
+) -> Result<CompressionMethod, HdpError> {
+    output.clear();
+    match options.method {
+        CompressionMethod::STORED => {
+            io::copy(input, &mut io::sink())?;
+            Ok(CompressionMethod::STORED)
+        }
+        CompressionMethod::ZSTD => {
+            let mut encoder = zstd::stream::write::Encoder::new(&mut *output, options.level)?;
+            io::copy(input, &mut encoder)?;
+            encoder.finish()?;
+            if output.len().saturating_add(options.min_savings) >= input_size {
+                Ok(CompressionMethod::STORED)
+            } else {
+                Ok(CompressionMethod::ZSTD)
             }
         }
         other => Err(HdpError::UnsupportedCompression(other.id())),

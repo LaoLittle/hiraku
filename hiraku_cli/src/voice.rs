@@ -221,7 +221,7 @@ impl Collector<'_> {
                     self.expression(value);
                 }
             }
-            ExprKind::Map(fields) => {
+            ExprKind::Map(fields) | ExprKind::TypedMap { fields, .. } => {
                 for field in fields {
                     self.expression(&field.value);
                 }
