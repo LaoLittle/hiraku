@@ -15,8 +15,8 @@ pub use ast::{
 };
 pub use hir::StatementValue;
 pub use hiraku_errors::{
-    Diagnostic, DiagnosticLabel, RenderOptions, Severity, SourceId, SourceMap, render_diagnostics,
-    write_diagnostics,
+    Diagnostic, DiagnosticLabel, RenderOptions, Severity, SourceId, SourceMap,
+    emit_rendered_diagnostic, render_diagnostics, write_diagnostics, write_rendered_diagnostic,
 };
 pub use hiraku_script_derive::{HksHandle, hks_define, hks_module};
 pub use parse::{ParseError, parse_program};

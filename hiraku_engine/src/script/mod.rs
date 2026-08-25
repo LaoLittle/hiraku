@@ -33,7 +33,17 @@ pub(crate) fn compile_story_bytecode(
             "executable scripts must use the `.hks` extension: `{path}`"
         ));
     }
-    capabilities::compile_story_bytecode(path, source)
+    capabilities::compile_story_bytecode_with_options(
+        path,
+        source,
+        hiraku_script::RenderOptions::terminal(),
+    )
+}
+
+pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
+    if let Err(error) = hiraku_script::emit_rendered_diagnostic(context, diagnostic) {
+        bevy::log::error!("failed to write script diagnostic to stderr: {error}");
+    }
 }
 
 pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script_named};

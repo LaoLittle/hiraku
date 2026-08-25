@@ -440,7 +440,10 @@ pub fn bridge_story_events(
                         runtime.story_events.clear();
                         runtime.task_requests.clear();
                     }
-                    Err(error) => warn!("failed to load HKS script `{target}`: {error}"),
+                    Err(error) => crate::script::emit_script_diagnostic(
+                        &format!("failed to load HKS script `{target}`:"),
+                        &error,
+                    ),
                 }
             }
             StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayBgm {
@@ -2969,7 +2972,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             script_runtime.response_inbox.clear();
                             script_runtime.task_requests.clear();
                         }
-                        Err(error) => warn!("failed to return to HKS title: {error}"),
+                        Err(error) => crate::script::emit_script_diagnostic(
+                            "failed to return to HKS title:",
+                            &error,
+                        ),
                     }
                 }
             }

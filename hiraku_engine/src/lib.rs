@@ -335,7 +335,10 @@ fn boot_runtime(
                     script_runtime.story = Some(story);
                     script_runtime.current_script = Some(startup_script);
                 }
-                Err(error) => error!("failed to start HKS script `{startup_script}`: {error}"),
+                Err(error) => script::emit_script_diagnostic(
+                    &format!("failed to start HKS script `{startup_script}`:"),
+                    &error,
+                ),
             }
             *booted = true;
         }

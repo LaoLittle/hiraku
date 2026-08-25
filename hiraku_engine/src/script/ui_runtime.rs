@@ -101,7 +101,7 @@ pub fn evaluate_ui_script_named(
         UiScriptError::Evaluation(render_diagnostics(
             &diagnostics,
             &sources,
-            RenderOptions::default(),
+            RenderOptions::terminal(),
         ))
     })?;
     if program.statements.len() != 1 {

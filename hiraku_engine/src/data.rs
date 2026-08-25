@@ -15,7 +15,7 @@ pub enum HsonDataError {
 pub fn evaluate_hson_map(path: &str, source: &str) -> Result<HsonMap, HsonDataError> {
     match hson::parse(source).map_err(|error| HsonDataError::Parse {
         path: path.to_string(),
-        message: error.render(path, source),
+        message: error.render_with_options(path, source, RenderOptions::terminal()),
     })? {
         HsonValue::Map(map) => Ok(map),
         _ => {
@@ -27,7 +27,7 @@ pub fn evaluate_hson_map(path: &str, source: &str) -> Result<HsonMap, HsonDataEr
                 .with_help("wrap the document fields in `.{ ... }`");
             Err(HsonDataError::ExpectedMap {
                 path: path.to_string(),
-                message: render_diagnostics(&[diagnostic], &sources, RenderOptions::default()),
+                message: render_diagnostics(&[diagnostic], &sources, RenderOptions::terminal()),
             })
         }
     }

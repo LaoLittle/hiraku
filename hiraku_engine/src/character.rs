@@ -585,7 +585,7 @@ where
 {
     hson::from_str(source).map_err(|error| CharacterCatalogError::Data {
         path: path.to_string(),
-        message: error.render(path, source),
+        message: error.render_with_options(path, source, hiraku_script::RenderOptions::terminal()),
     })
 }
 

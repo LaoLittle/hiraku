@@ -33,7 +33,7 @@ impl Plugin for BlurEffectPlugin {
         render_app.add_systems(RenderStartup, init_blur_pipeline);
         render_app.add_systems(
             Core2d,
-            blur_pass.after(bevy_ui_render::ui_pass).before(upscaling),
+            blur_pass.after(bevy::ui_render::ui_pass).before(upscaling),
         );
     }
 }

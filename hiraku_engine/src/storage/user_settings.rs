@@ -50,7 +50,11 @@ pub fn read_user_settings() -> Result<UserSettings, StorageError> {
         match fs::read_to_string(path) {
             Ok(payload) => {
                 let settings = hson::from_str::<UserSettingsFile>(&payload).map_err(|error| {
-                    StorageError::HsonData(error.render(USER_SETTINGS_PATH, &payload))
+                    StorageError::HsonData(error.render_with_options(
+                        USER_SETTINGS_PATH,
+                        &payload,
+                        hiraku_script::RenderOptions::terminal(),
+                    ))
                 })?;
                 Ok(UserSettings {
                     bgm_volume: settings.bgm_volume as f32,

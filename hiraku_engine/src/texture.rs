@@ -277,7 +277,11 @@ pub fn load_texture_catalog(vfs: &HdpVfs) -> Result<TextureCatalog, TextureCatal
         let texture: TextureFile =
             hson::from_str(&source).map_err(|error| TextureCatalogError::Data {
                 path: descriptor_path.clone(),
-                message: error.render(&descriptor_path, &source),
+                message: error.render_with_options(
+                    &descriptor_path,
+                    &source,
+                    hiraku_script::RenderOptions::terminal(),
+                ),
             })?;
         let path = vfs.resolve_path(Some(&descriptor_path), &texture.image);
 

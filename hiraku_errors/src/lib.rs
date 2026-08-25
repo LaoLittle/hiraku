@@ -165,9 +165,36 @@ pub struct RenderOptions {
 
 impl Default for RenderOptions {
     fn default() -> Self {
+        Self::plain()
+    }
+}
+
+impl RenderOptions {
+    pub const fn plain() -> Self {
         Self {
             color: false,
             compact: false,
+        }
+    }
+
+    /// Selects colored output only for an interactive native terminal.
+    ///
+    /// Tests, redirected logs, `NO_COLOR`, and WebAssembly remain plain.
+    pub fn terminal() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::io::IsTerminal as _;
+
+            let force_color = std::env::var_os("CLICOLOR_FORCE").is_some_and(|value| value != "0");
+            Self {
+                color: force_color
+                    || (std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()),
+                compact: false,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self::plain()
         }
     }
 }
@@ -181,6 +208,29 @@ pub fn render_diagnostics(
     write_diagnostics(diagnostics, source_map, &mut output, options)
         .expect("writing diagnostics to a byte buffer cannot fail");
     String::from_utf8(output).expect("Ariadne diagnostics are valid UTF-8")
+}
+
+/// Writes an already rendered diagnostic directly to standard error.
+///
+/// Multi-line compiler diagnostics should use this instead of passing ANSI
+/// output through a structured logger, which may escape control characters.
+pub fn emit_rendered_diagnostic(context: &str, diagnostic: &str) -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
+    write_rendered_diagnostic(&mut stderr, context, diagnostic)
+}
+
+pub fn write_rendered_diagnostic(
+    mut writer: impl io::Write,
+    context: &str,
+    diagnostic: &str,
+) -> io::Result<()> {
+    writeln!(writer, "{context}")?;
+    write!(writer, "{diagnostic}")?;
+    if !diagnostic.ends_with('\n') {
+        writeln!(writer)?;
+    }
+    Ok(())
 }
 
 pub fn write_diagnostics(
@@ -305,5 +355,32 @@ mod tests {
         assert!(rendered.contains("scripts/loop.hks:2:7"));
         assert!(rendered.contains("this expression has type Int"));
         assert!(rendered.contains("Help: compare the value to produce a Bool"));
+    }
+
+    #[test]
+    fn plain_rendering_does_not_emit_ansi_sequences() {
+        let mut sources = SourceMap::new();
+        let id = sources.insert("sample.hks", "invalid");
+        let diagnostic =
+            Diagnostic::error("invalid expression").with_label(DiagnosticLabel::primary(id, 0..7));
+        let rendered = render_diagnostics(&[diagnostic], &sources, RenderOptions::plain());
+        assert!(!rendered.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn direct_diagnostic_output_preserves_ansi_sequences() {
+        let mut output = Vec::new();
+        write_rendered_diagnostic(
+            &mut output,
+            "failed to compile script:",
+            "\u{1b}[31merror\u{1b}[0m",
+        )
+        .expect("writing a diagnostic to memory succeeds");
+
+        let output = String::from_utf8(output).expect("diagnostic output is UTF-8");
+        assert_eq!(
+            output,
+            "failed to compile script:\n\u{1b}[31merror\u{1b}[0m\n"
+        );
     }
 }

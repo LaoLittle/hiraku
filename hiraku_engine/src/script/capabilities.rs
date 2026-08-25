@@ -81,6 +81,14 @@ pub fn story_manifest() -> BuiltinManifest {
 }
 
 pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, String> {
+    compile_story_bytecode_with_options(path, source, RenderOptions::plain())
+}
+
+pub fn compile_story_bytecode_with_options(
+    path: &str,
+    source: &str,
+    render_options: RenderOptions,
+) -> Result<Bytecode, String> {
     let mut sources = SourceMap::new();
     let source_id = sources.insert(path, source);
     let program = parse_program(source).map_err(|errors| {
@@ -88,7 +96,7 @@ pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, Stri
             .into_iter()
             .map(|error| error.diagnostic(source_id.clone()))
             .collect::<Vec<_>>();
-        render_diagnostics(&diagnostics, &sources, RenderOptions::default())
+        render_diagnostics(&diagnostics, &sources, render_options)
     })?;
     compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
         |errors| {
@@ -96,7 +104,7 @@ pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, Stri
                 .into_iter()
                 .map(|error| error.diagnostic(source_id.clone()))
                 .collect::<Vec<_>>();
-            render_diagnostics(&diagnostics, &sources, RenderOptions::default())
+            render_diagnostics(&diagnostics, &sources, render_options)
         },
     )
 }

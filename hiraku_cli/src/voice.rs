@@ -119,7 +119,7 @@ pub fn scaffold_story_named(path: &str, source: &str) -> Result<VoiceScaffold, V
         VoiceScaffoldError::Parse(hiraku_script::render_diagnostics(
             &diagnostics,
             &sources,
-            hiraku_script::RenderOptions::default(),
+            hiraku_script::RenderOptions::terminal(),
         ))
     })?;
 

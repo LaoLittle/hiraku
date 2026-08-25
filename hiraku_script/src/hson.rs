@@ -266,13 +266,13 @@ impl HsonError {
     }
 
     pub fn render(&self, path: &str, source: &str) -> String {
+        self.render_with_options(path, source, RenderOptions::plain())
+    }
+
+    pub fn render_with_options(&self, path: &str, source: &str, options: RenderOptions) -> String {
         let mut sources = SourceMap::new();
         let source_id = sources.insert(path, source);
-        render_diagnostics(
-            &self.diagnostics(source_id),
-            &sources,
-            RenderOptions::default(),
-        )
+        render_diagnostics(&self.diagnostics(source_id), &sources, options)
     }
 }
 
