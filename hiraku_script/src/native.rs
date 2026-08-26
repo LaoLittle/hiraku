@@ -957,11 +957,11 @@ mod tests {
             &registry.manifest(),
         )
         .expect("selector call must compile");
-        assert!(matches!(
-            bytecode.instructions.first(),
-            Some(crate::vm::Instruction::Constant(Value::Selector(selector)))
-                if selector == "camera"
-        ));
+        let Some(crate::vm::Instruction::MakeSelector(selector)) = bytecode.instructions.first()
+        else {
+            panic!("expected an interned selector instruction")
+        };
+        assert_eq!(bytecode.symbols.resolve(*selector), Some("camera"));
         let mut vm = crate::vm::Vm::new(bytecode).expect("selector VM must initialize");
         let Some(crate::vm::VmEvent::Call(call)) =
             vm.step().expect("selector VM step must succeed")
@@ -971,6 +971,43 @@ mod tests {
         registry
             .call(&mut Context::default(), &call)
             .expect("selector call must dispatch with its receiver");
+    }
+
+    #[test]
+    fn nested_selector_names_are_interned_as_one_receiver() {
+        let mut registry = NativeRegistry::<Context>::new();
+        registry
+            .register_selector_raw_fn("camera.effects", "blur", |_context, call| {
+                assert_eq!(
+                    call.receiver,
+                    Some(Value::Selector("camera.effects".to_string()))
+                );
+                Ok(Value::Null)
+            })
+            .expect("nested selector method registration must succeed");
+        let bytecode = compile_with_manifest(
+            &parse_program("camera.effects.blur()").expect("nested selector call must parse"),
+            44,
+            &registry.manifest(),
+        )
+        .expect("nested selector call must compile");
+        let selector = bytecode
+            .symbols
+            .find("camera.effects")
+            .expect("nested selector is interned");
+        assert!(matches!(
+            bytecode.instructions.first(),
+            Some(crate::vm::Instruction::MakeSelector(actual)) if *actual == selector
+        ));
+        let mut vm = crate::vm::Vm::new(bytecode).expect("selector VM must initialize");
+        let Some(crate::vm::VmEvent::Call(call)) =
+            vm.step().expect("selector VM step must succeed")
+        else {
+            panic!("expected selector builtin call")
+        };
+        registry
+            .call(&mut Context::default(), &call)
+            .expect("nested selector call must dispatch");
     }
 
     #[test]

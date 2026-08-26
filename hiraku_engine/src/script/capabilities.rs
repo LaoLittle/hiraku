@@ -77,7 +77,11 @@ const ACTOR_HANDLE_TYPE: u32 = 1;
 /// Manifest used by the direct whole-story HKS runtime. Async capabilities are
 /// registered here so the generic compiler can resolve them without engine AST lowering.
 pub fn story_manifest() -> BuiltinManifest {
-    story_registry().manifest()
+    let manifest = story_registry().manifest();
+    let builtin = manifest
+        .resolve("__presentChoice")
+        .expect("choice presentation builtin must be registered");
+    manifest.with_choice_syntax("choice", "option", builtin)
 }
 
 pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, String> {
@@ -188,6 +192,9 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
     registry
         .register_raw_fn("wait", async_capability_placeholder)
         .expect("built-in `wait` registration must be unique");
+    registry
+        .register_raw_fn("__presentChoice", async_capability_placeholder)
+        .expect("built-in choice presenter registration must be unique");
     registry
 }
 

@@ -499,6 +499,24 @@ pub fn bridge_story_events(
                     .items
                     .push_back(ScriptCommand::AwaitDialogueAdvance { done: request });
             }
+            StoryRuntimeEvent::Choice { prompt, options } => {
+                let request = runtime.allocate_request();
+                runtime.wait_request = Some(request);
+                pending_script_commands
+                    .items
+                    .push_back(ScriptCommand::Choose {
+                        prompt,
+                        options: options
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, text)| ChoiceOption {
+                                text,
+                                value: StoredValue::Int(index as i64),
+                            })
+                            .collect(),
+                        done: request,
+                    });
+            }
             StoryRuntimeEvent::OpenUi { path } => {
                 let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
                 let mut story_values = runtime

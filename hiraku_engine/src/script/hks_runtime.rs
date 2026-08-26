@@ -48,8 +48,17 @@ pub struct StoryRuntime {
 pub enum StoryRuntimeEvent {
     Effect(StoryEffect),
     Wait(StoryWait),
-    OpenUi { path: String },
-    TaskEffect { task: u64, effect: StoryEffect },
+    OpenUi {
+        path: String,
+    },
+    Choice {
+        prompt: String,
+        options: Vec<String>,
+    },
+    TaskEffect {
+        task: u64,
+        effect: StoryEffect,
+    },
     Completed(Value),
 }
 
@@ -145,7 +154,9 @@ impl StoryRuntime {
         if let Some(event) = self.pending.pop_front() {
             if matches!(
                 event,
-                StoryRuntimeEvent::Wait(_) | StoryRuntimeEvent::OpenUi { .. }
+                StoryRuntimeEvent::Wait(_)
+                    | StoryRuntimeEvent::OpenUi { .. }
+                    | StoryRuntimeEvent::Choice { .. }
             ) {
                 self.blocked = true;
             }
@@ -199,6 +210,34 @@ impl StoryRuntime {
             };
             match event {
                 HksRuntimeEvent::Call(call) => {
+                    if call.builtin
+                        == story_manifest()
+                            .resolve("__presentChoice")
+                            .expect("choice presenter builtin")
+                    {
+                        let Some(Value::String(prompt)) =
+                            call.arguments.first().map(|argument| &argument.value)
+                        else {
+                            return Err(StoryRuntimeError::InvalidChoice);
+                        };
+                        let Some(Value::List(options)) =
+                            call.arguments.get(1).map(|argument| &argument.value)
+                        else {
+                            return Err(StoryRuntimeError::InvalidChoice);
+                        };
+                        let options = options
+                            .iter()
+                            .map(|option| match option {
+                                Value::String(option) => Ok(option.clone()),
+                                _ => Err(StoryRuntimeError::InvalidChoice),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        self.blocked = true;
+                        return Ok(Some(StoryRuntimeEvent::Choice {
+                            prompt: prompt.clone(),
+                            options,
+                        }));
+                    }
                     if call.builtin == story_manifest().resolve("openUi").expect("openUi builtin") {
                         let Some(Value::String(path)) =
                             call.arguments.first().map(|arg| &arg.value)
@@ -398,6 +437,8 @@ pub enum StoryRuntimeError {
     Capability(#[from] CharacterCapabilityError),
     #[error("openUi requires a string path")]
     InvalidOpenUi,
+    #[error("choice requires a string prompt and a list of string options")]
+    InvalidChoice,
     #[error("wait requires a task handle")]
     InvalidTaskHandle,
     #[error("story runtime is not waiting for a host response")]
@@ -606,6 +647,37 @@ mod tests {
             runtime.step().expect("second effect must run after resume"),
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
                 if text == "after"
+        ));
+    }
+
+    #[test]
+    fn choice_blocks_suspend_and_resume_into_the_selected_branch() {
+        let bytecode = compile_story_bytecode(
+            "choice.story.hks",
+            r#"
+                choice("Select") {
+                    option("Route A") { "selected A" }
+                    option("Route B") { "selected B" }
+                }
+            "#,
+        )
+        .expect("choice story must compile");
+        let mut runtime = StoryRuntime::new(bytecode).expect("story driver must initialize");
+        assert_eq!(
+            runtime.step().expect("choice must suspend"),
+            Some(StoryRuntimeEvent::Choice {
+                prompt: "Select".into(),
+                options: vec!["Route A".into(), "Route B".into()],
+            })
+        );
+        assert_eq!(runtime.step().expect("choice remains blocked"), None);
+        runtime
+            .resume(Value::Number(1.0))
+            .expect("choice response resumes the VM");
+        assert!(matches!(
+            runtime.step().expect("selected branch runs"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
+                if text == "selected B"
         ));
     }
 

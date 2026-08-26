@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ast::{BinaryOp, Block, Expr, ExprKind, NumberUnit, Program, Stmt},
-    hir::{StatementValue, lower_statement},
+    hir::{HirArena, StatementValue, lower_statement, lower_to_hir},
     span::Span,
-    symbol::{SymbolId, SymbolManifest},
+    symbol::{SymbolId, SymbolInterner, SymbolManifest},
 };
 
-pub const BYTECODE_VERSION: u16 = 9;
+pub const BYTECODE_VERSION: u16 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
@@ -22,42 +22,7 @@ pub struct BuiltinId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FunctionId(pub u32);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ScriptType {
-    Any,
-    Unit,
-    Bool,
-    Int,
-    Number,
-    Percent,
-    String,
-    Symbol,
-    Selector,
-    Task,
-    Named(SymbolId),
-    Union(Vec<ScriptType>),
-    Nullable(Box<ScriptType>),
-    Tuple,
-    List(Box<ScriptType>),
-    Record(BTreeMap<String, ScriptType>),
-    Map,
-}
-
-impl ScriptType {
-    fn accepts(&self, actual: &Self) -> bool {
-        self == &Self::Any
-            || actual == &Self::Any
-            || self == actual
-            || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))
-            || matches!(self, Self::Nullable(inner) if inner.accepts(actual))
-            || matches!((self, actual), (Self::List(expected), Self::List(actual)) if expected.accepts(actual))
-            || matches!((self, actual), (Self::Record(expected), Self::Record(actual))
-                if expected.len() == actual.len()
-                    && expected.iter().all(|(name, expected)|
-                        actual.get(name).is_some_and(|actual| expected.accepts(actual))))
-            || matches!((self, actual), (Self::Number, Self::Int))
-    }
-}
+pub use crate::hir::ScriptType;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionSignature {
@@ -82,6 +47,13 @@ pub struct StaticMember {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoiceSyntax {
+    pub choice: String,
+    pub option: String,
+    pub builtin: BuiltinId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuiltinManifest {
     hash: u64,
     names: BTreeMap<String, BuiltinId>,
@@ -93,6 +65,8 @@ pub struct BuiltinManifest {
     signatures: BTreeMap<BuiltinId, FunctionSignature>,
     #[serde(default)]
     static_members: Vec<StaticMember>,
+    #[serde(default)]
+    choice_syntax: Option<ChoiceSyntax>,
     /// Embedding-owned globals. Source code may read and mutate their fixed fields,
     /// but cannot redeclare the root object or change its schema.
     #[serde(default)]
@@ -157,6 +131,7 @@ impl BuiltinManifest {
             symbols: SymbolManifest::default(),
             signatures: BTreeMap::new(),
             static_members: Vec::new(),
+            choice_syntax: None,
             globals: BTreeMap::new(),
         }
     }
@@ -180,6 +155,25 @@ impl BuiltinManifest {
         self
     }
 
+    pub fn with_choice_syntax(
+        mut self,
+        choice: impl Into<String>,
+        option: impl Into<String>,
+        builtin: BuiltinId,
+    ) -> Self {
+        self.choice_syntax = Some(ChoiceSyntax {
+            choice: choice.into(),
+            option: option.into(),
+            builtin,
+        });
+        self.rehash();
+        self
+    }
+
+    pub fn choice_syntax(&self) -> Option<&ChoiceSyntax> {
+        self.choice_syntax.as_ref()
+    }
+
     pub fn globals(&self) -> &BTreeMap<String, ScriptType> {
         &self.globals
     }
@@ -196,6 +190,12 @@ impl BuiltinManifest {
         self.selectors
             .get(&(selector.to_string(), method.to_string()))
             .copied()
+    }
+
+    pub fn has_selector(&self, selector: &str) -> bool {
+        self.selectors
+            .keys()
+            .any(|(candidate, _)| candidate == selector)
     }
 
     pub fn resolve_operator(&self, operator: &str) -> Option<BuiltinId> {
@@ -257,6 +257,9 @@ impl BuiltinManifest {
         for member in &self.static_members {
             hash = format!("{member:?}").bytes().fold(hash, hash_byte);
         }
+        if let Some(choice) = &self.choice_syntax {
+            hash = format!("{choice:?}").bytes().fold(hash, hash_byte);
+        }
         for (name, ty) in &self.globals {
             hash = name.bytes().fold(hash, hash_byte);
             hash = hash_byte(hash, 0xfe);
@@ -300,14 +303,7 @@ enum MemberPathError {
     NotRecord,
 }
 
-fn set_member_path(
-    value: &mut Value,
-    path: &[String],
-    new_value: Value,
-) -> Result<(), MemberPathError> {
-    let Some((name, remainder)) = path.split_first() else {
-        return Err(MemberPathError::NotRecord);
-    };
+fn set_member(value: &mut Value, name: &str, new_value: Value) -> Result<(), MemberPathError> {
     let fields = match value {
         Value::Map(fields) => fields,
         Value::Typed { value, .. } => match value.as_mut() {
@@ -318,13 +314,9 @@ fn set_member_path(
     };
     let field = fields
         .get_mut(name)
-        .ok_or_else(|| MemberPathError::Unknown(name.clone()))?;
-    if remainder.is_empty() {
-        *field = new_value;
-        Ok(())
-    } else {
-        set_member_path(field, remainder, new_value)
-    }
+        .ok_or_else(|| MemberPathError::Unknown(name.to_string()))?;
+    *field = new_value;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -333,6 +325,8 @@ pub struct Bytecode {
     pub source_hash: u64,
     #[serde(default)]
     pub builtin_manifest_hash: u64,
+    #[serde(default)]
+    pub symbols: SymbolManifest,
     pub instructions: Vec<Instruction>,
     #[serde(default)]
     pub functions: Vec<FunctionTemplate>,
@@ -341,8 +335,8 @@ pub struct Bytecode {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FunctionTemplate {
-    pub name: String,
-    pub parameters: Vec<String>,
+    pub name: SymbolId,
+    pub parameters: Vec<SymbolId>,
     pub instructions: Vec<Instruction>,
 }
 
@@ -363,21 +357,16 @@ pub enum TaskMode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
     Constant(Value),
-    LoadLocal(String),
-    StoreLocal(String),
-    StoreLocalMember {
-        root: String,
-        path: Vec<String>,
-    },
-    LoadGlobal(String),
-    StoreGlobal(String),
-    StoreGlobalMember {
-        root: String,
-        path: Vec<String>,
-    },
+    MakeSymbol(SymbolId),
+    MakeSelector(SymbolId),
+    LoadLocal(SymbolId),
+    StoreLocal(SymbolId),
+    LoadGlobal(SymbolId),
+    StoreGlobal(SymbolId),
     MakeTuple(usize),
     MakeList(usize),
-    MakeMap(Vec<String>),
+    MakeMap(Vec<SymbolId>),
+    Dup,
     Negate,
     Add,
     Subtract,
@@ -390,13 +379,16 @@ pub enum Instruction {
     Greater,
     GreaterEqual,
     GetMember {
-        name: String,
+        name: SymbolId,
         safe: bool,
+    },
+    SetMember {
+        name: SymbolId,
     },
     AssertNonNull,
     CallBuiltin {
         builtin: BuiltinId,
-        labels: Vec<Option<String>>,
+        labels: Vec<Option<SymbolId>>,
         has_receiver: bool,
     },
     CallFunction {
@@ -454,6 +446,21 @@ fn compile_inner(
     source_hash: u64,
     manifest: Option<&BuiltinManifest>,
 ) -> Result<Bytecode, Vec<CompileError>> {
+    // Name resolution and structural lowering happen before either bytecode
+    // backend. The stack backend still reads syntax for emission during the
+    // migration, but consumes the canonical HIR symbol manifest.
+    let hir_arena = HirArena::new();
+    let hir = lower_to_hir(&hir_arena, program, manifest).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| CompileError {
+                message: error.message,
+                span: error.span,
+            })
+            .collect::<Vec<_>>()
+    })?;
+    let symbols =
+        SymbolInterner::from_manifest(hir.symbols.clone()).expect("lowered HIR symbols are unique");
     let mut function_names = BTreeMap::new();
     let mut function_signatures = BTreeMap::new();
     let mut type_aliases = BTreeMap::new();
@@ -583,6 +590,7 @@ fn compile_inner(
         }
     }
     let mut compiler = Compiler {
+        symbols,
         instructions: Vec::new(),
         functions: Vec::new(),
         tasks: Vec::new(),
@@ -603,10 +611,12 @@ fn compile_inner(
     }
     compiler.instructions.push(Instruction::Halt);
     if compiler.errors.is_empty() {
+        let symbols = compiler.symbols.manifest();
         Ok(Bytecode {
             version: BYTECODE_VERSION,
             source_hash,
             builtin_manifest_hash: manifest.map(BuiltinManifest::hash).unwrap_or_default(),
+            symbols,
             instructions: compiler.instructions,
             functions: compiler.functions,
             tasks: compiler.tasks,
@@ -617,6 +627,7 @@ fn compile_inner(
 }
 
 struct Compiler<'a> {
+    symbols: SymbolInterner,
     instructions: Vec<Instruction>,
     functions: Vec<FunctionTemplate>,
     tasks: Vec<TaskTemplate>,
@@ -631,6 +642,17 @@ struct Compiler<'a> {
 }
 
 impl Compiler<'_> {
+    fn symbol(&mut self, name: &str) -> SymbolId {
+        self.symbols.intern(name)
+    }
+
+    fn labels(&mut self, arguments: &[crate::Argument]) -> Vec<Option<SymbolId>> {
+        arguments
+            .iter()
+            .map(|argument| argument.label.as_deref().map(|label| self.symbol(label)))
+            .collect()
+    }
+
     fn infer_type(&self, expression: &Expr) -> ScriptType {
         if let ExprKind::Call { callee, .. } = &expression.kind
             && let ExprKind::Ident(name) = &callee.kind
@@ -781,12 +803,14 @@ impl Compiler<'_> {
             let instructions = std::mem::replace(&mut self.instructions, parent);
             self.local_types = parent_types;
             self.local_bindings = parent_bindings;
+            let name = self.symbol(&name);
+            let parameters = parameters
+                .into_iter()
+                .map(|parameter| self.symbol(&parameter.name))
+                .collect();
             self.functions.push(FunctionTemplate {
                 name,
-                parameters: parameters
-                    .into_iter()
-                    .map(|parameter| parameter.name)
-                    .collect(),
+                parameters,
                 instructions,
             });
         }
@@ -827,8 +851,8 @@ impl Compiler<'_> {
                     });
                 }
                 self.expression(value);
-                self.instructions
-                    .push(Instruction::StoreLocal(name.clone()));
+                let name_symbol = self.symbol(name);
+                self.instructions.push(Instruction::StoreLocal(name_symbol));
                 self.local_types
                     .insert(name.clone(), declared_type.unwrap_or(value_type));
                 self.local_bindings.insert(name.clone());
@@ -864,8 +888,9 @@ impl Compiler<'_> {
                     self.instructions
                         .push(Instruction::Constant(Value::Uninitialized));
                 }
+                let name_symbol = self.symbol(name);
                 self.instructions
-                    .push(Instruction::StoreGlobal(name.clone()));
+                    .push(Instruction::StoreGlobal(name_symbol));
                 self.instructions
                     .push(Instruction::Statement(StatementValue::Commit));
                 let _ = span;
@@ -902,13 +927,28 @@ impl Compiler<'_> {
                             span: value.span,
                         });
                     }
-                    self.expression(value);
+                    let root_symbol = self.symbol(&root);
                     if is_local {
+                        self.instructions.push(Instruction::LoadLocal(root_symbol));
+                    } else {
+                        self.instructions.push(Instruction::LoadGlobal(root_symbol));
+                    }
+                    for name in path.iter().take(path.len().saturating_sub(1)) {
+                        self.instructions.push(Instruction::Dup);
+                        let name = self.symbol(name);
                         self.instructions
-                            .push(Instruction::StoreLocalMember { root, path });
+                            .push(Instruction::GetMember { name, safe: false });
+                    }
+                    self.expression(value);
+                    for name in path.iter().rev() {
+                        let name = self.symbol(name);
+                        self.instructions.push(Instruction::SetMember { name });
+                    }
+                    if is_local {
+                        self.instructions.push(Instruction::StoreLocal(root_symbol));
                     } else {
                         self.instructions
-                            .push(Instruction::StoreGlobalMember { root, path });
+                            .push(Instruction::StoreGlobal(root_symbol));
                     }
                     self.instructions
                         .push(Instruction::Statement(StatementValue::Commit));
@@ -937,12 +977,12 @@ impl Compiler<'_> {
                     });
                 }
                 self.expression(value);
+                let name_symbol = self.symbol(name);
                 if is_local {
-                    self.instructions
-                        .push(Instruction::StoreLocal(name.clone()));
+                    self.instructions.push(Instruction::StoreLocal(name_symbol));
                 } else {
                     self.instructions
-                        .push(Instruction::StoreGlobal(name.clone()));
+                        .push(Instruction::StoreGlobal(name_symbol));
                 }
                 self.instructions
                     .push(Instruction::Statement(StatementValue::Commit));
@@ -1019,11 +1059,17 @@ impl Compiler<'_> {
                 .instructions
                 .push(Instruction::Constant(Value::Ellipsis)),
             ExprKind::Ident(name) => {
+                let name_symbol = self.symbol(name);
                 if self.global_types.contains_key(name) {
+                    self.instructions.push(Instruction::LoadGlobal(name_symbol));
+                } else if self
+                    .manifest
+                    .is_some_and(|manifest| manifest.has_selector(name))
+                {
                     self.instructions
-                        .push(Instruction::LoadGlobal(name.clone()));
+                        .push(Instruction::MakeSelector(name_symbol));
                 } else {
-                    self.instructions.push(Instruction::LoadLocal(name.clone()));
+                    self.instructions.push(Instruction::LoadLocal(name_symbol));
                 }
             }
             ExprKind::Symbol(name) => {
@@ -1047,8 +1093,8 @@ impl Compiler<'_> {
                         Err(_) => {}
                     }
                 }
-                self.instructions
-                    .push(Instruction::Constant(Value::Symbol(name.clone())));
+                let name = self.symbol(name);
+                self.instructions.push(Instruction::MakeSymbol(name));
             }
             ExprKind::Bool(value) => self
                 .instructions
@@ -1082,9 +1128,11 @@ impl Compiler<'_> {
                 for field in fields {
                     self.expression(&field.value);
                 }
-                self.instructions.push(Instruction::MakeMap(
-                    fields.iter().map(|field| field.name.clone()).collect(),
-                ));
+                let names = fields
+                    .iter()
+                    .map(|field| self.symbol(&field.name))
+                    .collect();
+                self.instructions.push(Instruction::MakeMap(names));
             }
             ExprKind::TypedMap { type_name, fields } => {
                 match self.type_aliases.get(type_name).cloned() {
@@ -1135,9 +1183,11 @@ impl Compiler<'_> {
                 for field in fields {
                     self.expression(&field.value);
                 }
-                self.instructions.push(Instruction::MakeMap(
-                    fields.iter().map(|field| field.name.clone()).collect(),
-                ));
+                let names = fields
+                    .iter()
+                    .map(|field| self.symbol(&field.name))
+                    .collect();
+                self.instructions.push(Instruction::MakeMap(names));
             }
             ExprKind::Call {
                 callee,
@@ -1145,6 +1195,16 @@ impl Compiler<'_> {
                 trailing_block,
             } => {
                 if let Some(block) = trailing_block {
+                    if let (Some(ExprKind::Ident(name)), Some(syntax)) = (
+                        Some(&callee.kind),
+                        self.manifest
+                            .and_then(BuiltinManifest::choice_syntax)
+                            .cloned(),
+                    ) && name == &syntax.choice
+                    {
+                        self.compile_choice(arguments, block, &syntax, expression.span);
+                        return;
+                    }
                     let Some(callee) = flatten_callee(callee) else {
                         self.errors.push(CompileError {
                             message: "task call target must be an identifier".to_string(),
@@ -1223,12 +1283,10 @@ impl Compiler<'_> {
                                 for argument in arguments {
                                     self.expression(&argument.value);
                                 }
+                                let labels = self.labels(arguments);
                                 self.instructions.push(Instruction::CallBuiltin {
                                     builtin: member.builtin,
-                                    labels: arguments
-                                        .iter()
-                                        .map(|argument| argument.label.clone())
-                                        .collect(),
+                                    labels,
                                     has_receiver: false,
                                 });
                                 return;
@@ -1250,43 +1308,28 @@ impl Compiler<'_> {
                         for argument in arguments {
                             self.expression(&argument.value);
                         }
+                        let labels = self.labels(arguments);
                         self.instructions.push(Instruction::CallBuiltin {
                             builtin,
-                            labels: arguments
-                                .iter()
-                                .map(|argument| argument.label.clone())
-                                .collect(),
+                            labels,
                             has_receiver: false,
                         });
                         return;
                     }
                     if let ExprKind::Member { object, name } = &callee.kind {
-                        let selector = match &object.kind {
-                            ExprKind::Ident(selector) => manifest
-                                .resolve_selector(selector, name)
-                                .map(|builtin| (builtin, Some(selector.clone()))),
-                            _ => None,
-                        };
-                        let method = selector
-                            .map(|(builtin, selector)| (builtin, selector))
-                            .or_else(|| manifest.resolve(name).map(|builtin| (builtin, None)));
-                        if let Some((builtin, selector)) = method {
+                        let builtin = flatten_callee(object)
+                            .and_then(|selector| manifest.resolve_selector(&selector, name))
+                            .or_else(|| manifest.resolve(name));
+                        if let Some(builtin) = builtin {
                             self.check_method_signature(builtin, object, arguments, callee.span);
-                            if let Some(selector) = selector {
-                                self.instructions
-                                    .push(Instruction::Constant(Value::Selector(selector)));
-                            } else {
-                                self.expression(object);
-                            }
+                            self.expression(object);
                             for argument in arguments {
                                 self.expression(&argument.value);
                             }
+                            let labels = self.labels(arguments);
                             self.instructions.push(Instruction::CallBuiltin {
                                 builtin,
-                                labels: arguments
-                                    .iter()
-                                    .map(|argument| argument.label.clone())
-                                    .collect(),
+                                labels,
                                 has_receiver: true,
                             });
                             return;
@@ -1304,18 +1347,25 @@ impl Compiler<'_> {
                 });
             }
             ExprKind::Member { object, name } => {
+                if let Some(selector) = flatten_callee(expression)
+                    && self
+                        .manifest
+                        .is_some_and(|manifest| manifest.has_selector(&selector))
+                {
+                    let selector = self.symbol(&selector);
+                    self.instructions.push(Instruction::MakeSelector(selector));
+                    return;
+                }
                 self.expression(object);
-                self.instructions.push(Instruction::GetMember {
-                    name: name.clone(),
-                    safe: false,
-                });
+                let name = self.symbol(name);
+                self.instructions
+                    .push(Instruction::GetMember { name, safe: false });
             }
             ExprKind::SafeMember { object, name } => {
                 self.expression(object);
-                self.instructions.push(Instruction::GetMember {
-                    name: name.clone(),
-                    safe: true,
-                });
+                let name = self.symbol(name);
+                self.instructions
+                    .push(Instruction::GetMember { name, safe: true });
             }
             ExprKind::NonNull(value) => {
                 self.expression(value);
@@ -1414,6 +1464,115 @@ impl Compiler<'_> {
             children: Vec::new(),
         });
         task
+    }
+
+    fn compile_choice(
+        &mut self,
+        arguments: &[crate::Argument],
+        body: &Block,
+        syntax: &ChoiceSyntax,
+        span: Span,
+    ) {
+        if arguments.len() > 1 {
+            self.errors.push(CompileError {
+                message: format!("`{}` accepts at most one prompt", syntax.choice),
+                span,
+            });
+            return;
+        }
+        if let Some(prompt) = arguments.first() {
+            if !self.expression_matches(&ScriptType::String, &prompt.value) {
+                self.errors.push(CompileError {
+                    message: "choice prompt expects String".to_string(),
+                    span: prompt.value.span,
+                });
+            }
+            self.expression(&prompt.value);
+        } else {
+            self.instructions
+                .push(Instruction::Constant(Value::String(String::new())));
+        }
+
+        let mut options = Vec::<(Expr, Block)>::new();
+        for statement in &body.statements {
+            let Stmt::Expr(Expr {
+                kind:
+                    ExprKind::Call {
+                        callee,
+                        arguments,
+                        trailing_block: Some(option_body),
+                    },
+                span: option_span,
+            }) = statement
+            else {
+                self.errors.push(CompileError {
+                    message: format!(
+                        "`{}` blocks may contain only `{}(label) {{ ... }}` entries",
+                        syntax.choice, syntax.option
+                    ),
+                    span: statement_span(statement),
+                });
+                continue;
+            };
+            if !matches!(&callee.kind, ExprKind::Ident(name) if name == &syntax.option)
+                || arguments.len() != 1
+                || arguments[0].label.is_some()
+            {
+                self.errors.push(CompileError {
+                    message: format!("choice entry must be `{}(label) {{ ... }}`", syntax.option),
+                    span: *option_span,
+                });
+                continue;
+            }
+            let label = &arguments[0].value;
+            if !self.expression_matches(&ScriptType::String, label) {
+                self.errors.push(CompileError {
+                    message: "choice option label expects String".to_string(),
+                    span: label.span,
+                });
+            }
+            options.push((label.clone(), option_body.clone()));
+        }
+        if options.is_empty() {
+            self.errors.push(CompileError {
+                message: "choice requires at least one option".to_string(),
+                span,
+            });
+            self.instructions.push(Instruction::MakeList(0));
+            return;
+        }
+        for (label, _) in &options {
+            self.expression(label);
+        }
+        self.instructions.push(Instruction::MakeList(options.len()));
+        self.instructions.push(Instruction::CallBuiltin {
+            builtin: syntax.builtin,
+            labels: vec![None, None],
+            has_receiver: false,
+        });
+
+        let mut end_jumps = Vec::new();
+        for (index, (_, option_body)) in options.iter().enumerate() {
+            self.instructions.push(Instruction::Dup);
+            self.instructions
+                .push(Instruction::Constant(Value::Number(index as f64)));
+            self.instructions.push(Instruction::Equal);
+            let next = self.instructions.len();
+            self.instructions.push(Instruction::JumpIfFalse(usize::MAX));
+            self.instructions.push(Instruction::Pop);
+            for statement in &option_body.statements {
+                self.statement(statement);
+            }
+            end_jumps.push(self.instructions.len());
+            self.instructions.push(Instruction::Jump(usize::MAX));
+            let next_target = self.instructions.len();
+            self.instructions[next] = Instruction::JumpIfFalse(next_target);
+        }
+        self.instructions.push(Instruction::Pop);
+        let end = self.instructions.len();
+        for jump in end_jumps {
+            self.instructions[jump] = Instruction::Jump(end);
+        }
     }
 
     fn check_condition(&mut self, condition: &Expr) {
@@ -1647,8 +1806,19 @@ fn infer_expression_type(
                 .map(|signature| signature.result.clone())
                 .unwrap_or(ScriptType::Any)
         }
-        ExprKind::Ident(name) => locals.get(name).cloned().unwrap_or(ScriptType::Any),
+        ExprKind::Ident(name) => locals.get(name).cloned().unwrap_or_else(|| {
+            if manifest.is_some_and(|manifest| manifest.has_selector(name)) {
+                ScriptType::Selector
+            } else {
+                ScriptType::Any
+            }
+        }),
         ExprKind::Member { object, name } => {
+            if let Some(selector) = flatten_callee(expression)
+                && manifest.is_some_and(|manifest| manifest.has_selector(&selector))
+            {
+                return ScriptType::Selector;
+            }
             match infer_expression_type(manifest, type_aliases, locals, object) {
                 ScriptType::Record(fields) => fields.get(name).cloned().unwrap_or(ScriptType::Any),
                 ScriptType::Nullable(inner) => match *inner {
@@ -1779,6 +1949,19 @@ fn assignment_member_path(expression: &Expr) -> Option<(String, Vec<String>)> {
     let mut path = Vec::new();
     let root = collect(expression, &mut path)?;
     (!path.is_empty()).then_some((root, path))
+}
+
+fn statement_span(statement: &Stmt) -> Span {
+    match statement {
+        Stmt::TypeAlias { span, .. }
+        | Stmt::Function { span, .. }
+        | Stmt::Let { span, .. }
+        | Stmt::Global { span, .. }
+        | Stmt::Assign { span, .. }
+        | Stmt::If { span, .. }
+        | Stmt::While { span, .. } => *span,
+        Stmt::Expr(expression) => expression.span,
+    }
 }
 
 fn record_path_type<'a>(mut ty: &'a ScriptType, path: &[String]) -> Option<&'a ScriptType> {
@@ -1963,30 +2146,30 @@ impl Vm {
             self.pc += 1;
             match instruction {
                 Instruction::Constant(value) => self.stack.push(value),
-                Instruction::LoadLocal(name) => self.stack.push(
-                    self.locals
-                        .get(&name)
-                        .cloned()
-                        .ok_or(VmError::UnknownLocal(name))?,
-                ),
+                Instruction::MakeSymbol(symbol) => {
+                    let name = self.symbol_name(symbol)?;
+                    self.stack.push(Value::Symbol(name));
+                }
+                Instruction::MakeSelector(symbol) => {
+                    let name = self.symbol_name(symbol)?;
+                    self.stack.push(Value::Selector(name));
+                }
+                Instruction::LoadLocal(name) => {
+                    let name = self.symbol_name(name)?;
+                    self.stack.push(
+                        self.locals
+                            .get(&name)
+                            .cloned()
+                            .ok_or(VmError::UnknownLocal(name))?,
+                    )
+                }
                 Instruction::StoreLocal(name) => {
+                    let name = self.symbol_name(name)?;
                     let value = self.pop()?;
                     self.locals.insert(name, value);
                 }
-                Instruction::StoreLocalMember { root, path } => {
-                    let new_value = self.pop()?;
-                    let value = self
-                        .locals
-                        .get_mut(&root)
-                        .ok_or_else(|| VmError::UnknownLocal(root.clone()))?;
-                    set_member_path(value, &path, new_value).map_err(|error| match error {
-                        MemberPathError::Unknown(name) => VmError::UnknownMember(name),
-                        MemberPathError::NotRecord => {
-                            VmError::TypeMismatch("member receiver is not a record")
-                        }
-                    })?;
-                }
                 Instruction::LoadGlobal(name) => {
+                    let name = self.symbol_name(name)?;
                     let value = self
                         .globals
                         .get(&name)
@@ -1998,21 +2181,9 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Instruction::StoreGlobal(name) => {
+                    let name = self.symbol_name(name)?;
                     let value = self.pop()?;
                     self.globals.insert(name, value);
-                }
-                Instruction::StoreGlobalMember { root, path } => {
-                    let new_value = self.pop()?;
-                    let value = self
-                        .globals
-                        .get_mut(&root)
-                        .ok_or_else(|| VmError::UnknownGlobal(root.clone()))?;
-                    set_member_path(value, &path, new_value).map_err(|error| match error {
-                        MemberPathError::Unknown(name) => VmError::UnknownMember(name),
-                        MemberPathError::NotRecord => {
-                            VmError::TypeMismatch("member receiver is not a record")
-                        }
-                    })?;
                 }
                 Instruction::MakeTuple(count) => {
                     let values = self.pop_count(count)?;
@@ -2024,8 +2195,16 @@ impl Vm {
                 }
                 Instruction::MakeMap(keys) => {
                     let values = self.pop_count(keys.len())?;
+                    let keys = keys
+                        .into_iter()
+                        .map(|key| self.symbol_name(key))
+                        .collect::<Result<Vec<_>, _>>()?;
                     self.stack
                         .push(Value::Map(keys.into_iter().zip(values).collect()));
+                }
+                Instruction::Dup => {
+                    let value = self.stack.last().cloned().ok_or(VmError::StackUnderflow)?;
+                    self.stack.push(value);
                 }
                 Instruction::Negate => {
                     let Value::Number(value) = self.pop()? else {
@@ -2073,6 +2252,7 @@ impl Vm {
                     self.stack.push(Value::Bool(left != right));
                 }
                 Instruction::GetMember { name, safe } => {
+                    let name = self.symbol_name(name)?;
                     let value = self.pop()?;
                     if value == Value::Null && safe {
                         self.stack.push(Value::Null);
@@ -2097,6 +2277,18 @@ impl Vm {
                     };
                     self.stack.push(value);
                 }
+                Instruction::SetMember { name } => {
+                    let name = self.symbol_name(name)?;
+                    let new_value = self.pop()?;
+                    let mut object = self.pop()?;
+                    set_member(&mut object, &name, new_value).map_err(|error| match error {
+                        MemberPathError::Unknown(name) => VmError::UnknownMember(name),
+                        MemberPathError::NotRecord => {
+                            VmError::TypeMismatch("member receiver is not a record")
+                        }
+                    })?;
+                    self.stack.push(object);
+                }
                 Instruction::AssertNonNull => {
                     if self.stack.last() == Some(&Value::Null) {
                         return Err(VmError::NullAssertion);
@@ -2114,6 +2306,10 @@ impl Vm {
                         None
                     };
                     self.status = VmStatus::WaitingForHost;
+                    let labels = labels
+                        .into_iter()
+                        .map(|label| label.map(|label| self.symbol_name(label)).transpose())
+                        .collect::<Result<Vec<_>, _>>()?;
                     return Ok(Some(VmEvent::Call(BuiltinCall {
                         builtin,
                         receiver,
@@ -2142,6 +2338,10 @@ impl Vm {
                     }
                     let parameters = template.parameters.clone();
                     let values = self.pop_count(argument_count)?;
+                    let parameters = parameters
+                        .into_iter()
+                        .map(|parameter| self.symbol_name(parameter))
+                        .collect::<Result<Vec<_>, _>>()?;
                     self.call_frames.push(CallFrame {
                         function: self.current_function,
                         pc: self.pc,
@@ -2266,6 +2466,14 @@ impl Vm {
 
     fn pop(&mut self) -> Result<Value, VmError> {
         self.stack.pop().ok_or(VmError::StackUnderflow)
+    }
+
+    fn symbol_name(&self, symbol: SymbolId) -> Result<String, VmError> {
+        self.bytecode
+            .symbols
+            .resolve(symbol)
+            .map(str::to_owned)
+            .ok_or(VmError::UnknownSymbol(symbol))
     }
 
     fn current_instructions(&self) -> Result<&[Instruction], VmError> {
@@ -2575,7 +2783,16 @@ impl TaskScheduler {
         };
         match instruction {
             Instruction::Constant(value) => self.task_mut(task_id)?.stack.push(value),
+            Instruction::MakeSymbol(symbol) => {
+                let name = self.symbol_name(symbol)?;
+                self.task_mut(task_id)?.stack.push(Value::Symbol(name));
+            }
+            Instruction::MakeSelector(symbol) => {
+                let name = self.symbol_name(symbol)?;
+                self.task_mut(task_id)?.stack.push(Value::Selector(name));
+            }
             Instruction::LoadLocal(name) => {
+                let name = self.symbol_name(name)?;
                 let value = self
                     .task_mut(task_id)?
                     .locals
@@ -2585,24 +2802,12 @@ impl TaskScheduler {
                 self.task_mut(task_id)?.stack.push(value);
             }
             Instruction::StoreLocal(name) => {
+                let name = self.symbol_name(name)?;
                 let value = self.pop_task(task_id)?;
                 self.task_mut(task_id)?.locals.insert(name, value);
             }
-            Instruction::StoreLocalMember { root, path } => {
-                let new_value = self.pop_task(task_id)?;
-                let value = self
-                    .task_mut(task_id)?
-                    .locals
-                    .get_mut(&root)
-                    .ok_or_else(|| TaskSchedulerError::UnknownLocal(root.clone()))?;
-                set_member_path(value, &path, new_value).map_err(|error| match error {
-                    MemberPathError::Unknown(name) => TaskSchedulerError::UnknownMember(name),
-                    MemberPathError::NotRecord => {
-                        TaskSchedulerError::TypeMismatch("member receiver is not a record")
-                    }
-                })?;
-            }
             Instruction::LoadGlobal(name) => {
+                let name = self.symbol_name(name)?;
                 let value = self
                     .globals
                     .get(&name)
@@ -2614,21 +2819,9 @@ impl TaskScheduler {
                 self.task_mut(task_id)?.stack.push(value);
             }
             Instruction::StoreGlobal(name) => {
+                let name = self.symbol_name(name)?;
                 let value = self.pop_task(task_id)?;
                 self.globals.insert(name, value);
-            }
-            Instruction::StoreGlobalMember { root, path } => {
-                let new_value = self.pop_task(task_id)?;
-                let value = self
-                    .globals
-                    .get_mut(&root)
-                    .ok_or_else(|| TaskSchedulerError::UnknownGlobal(root.clone()))?;
-                set_member_path(value, &path, new_value).map_err(|error| match error {
-                    MemberPathError::Unknown(name) => TaskSchedulerError::UnknownMember(name),
-                    MemberPathError::NotRecord => {
-                        TaskSchedulerError::TypeMismatch("member receiver is not a record")
-                    }
-                })?;
             }
             Instruction::MakeTuple(count) => {
                 let values = self.pop_task_count(task_id, count)?;
@@ -2640,9 +2833,22 @@ impl TaskScheduler {
             }
             Instruction::MakeMap(keys) => {
                 let values = self.pop_task_count(task_id, keys.len())?;
+                let keys = keys
+                    .into_iter()
+                    .map(|key| self.symbol_name(key))
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.task_mut(task_id)?
                     .stack
                     .push(Value::Map(keys.into_iter().zip(values).collect()));
+            }
+            Instruction::Dup => {
+                let value = self
+                    .task_mut(task_id)?
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or(TaskSchedulerError::StackUnderflow)?;
+                self.task_mut(task_id)?.stack.push(value);
             }
             Instruction::Negate => {
                 let Value::Number(value) = self.pop_task(task_id)? else {
@@ -2698,6 +2904,7 @@ impl TaskScheduler {
                     .push(Value::Bool(left != right));
             }
             Instruction::GetMember { name, safe } => {
+                let name = self.symbol_name(name)?;
                 let value = self.pop_task(task_id)?;
                 if value == Value::Null && safe {
                     self.task_mut(task_id)?.stack.push(Value::Null);
@@ -2726,6 +2933,18 @@ impl TaskScheduler {
                 };
                 self.task_mut(task_id)?.stack.push(value);
             }
+            Instruction::SetMember { name } => {
+                let name = self.symbol_name(name)?;
+                let new_value = self.pop_task(task_id)?;
+                let mut object = self.pop_task(task_id)?;
+                set_member(&mut object, &name, new_value).map_err(|error| match error {
+                    MemberPathError::Unknown(name) => TaskSchedulerError::UnknownMember(name),
+                    MemberPathError::NotRecord => {
+                        TaskSchedulerError::TypeMismatch("member receiver is not a record")
+                    }
+                })?;
+                self.task_mut(task_id)?.stack.push(object);
+            }
             Instruction::AssertNonNull => {
                 if self.task_mut(task_id)?.stack.last() == Some(&Value::Null) {
                     return Err(TaskSchedulerError::NullAssertion);
@@ -2743,6 +2962,10 @@ impl TaskScheduler {
                 } else {
                     None
                 };
+                let labels = labels
+                    .into_iter()
+                    .map(|label| label.map(|label| self.symbol_name(label)).transpose())
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.task_mut(task_id)?.status = TaskStatus::WaitingForHost;
                 return Ok(Some(TaskEvent::Call {
                     task: task_id,
@@ -2776,6 +2999,10 @@ impl TaskScheduler {
                     });
                 }
                 let values = self.pop_task_count(task_id, argument_count)?;
+                let parameters = parameters
+                    .into_iter()
+                    .map(|parameter| self.symbol_name(parameter))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let task = self.task_mut(task_id)?;
                 task.call_frames.push(CallFrame {
                     function: task.current_function,
@@ -2885,6 +3112,14 @@ impl TaskScheduler {
             .ok_or(TaskSchedulerError::UnknownTemplate(id))
     }
 
+    fn symbol_name(&self, symbol: SymbolId) -> Result<String, TaskSchedulerError> {
+        self.bytecode
+            .symbols
+            .resolve(symbol)
+            .map(str::to_owned)
+            .ok_or(TaskSchedulerError::UnknownSymbol(symbol))
+    }
+
     fn task_mut(&mut self, id: u64) -> Result<&mut ScheduledTask, TaskSchedulerError> {
         self.tasks
             .get_mut(&id)
@@ -2915,6 +3150,7 @@ pub enum TaskSchedulerError {
     BuiltinManifestMismatch,
     InvalidProgramCounter(usize),
     StackUnderflow,
+    UnknownSymbol(SymbolId),
     UnknownLocal(String),
     UnknownGlobal(String),
     UninitializedGlobal(String),
@@ -2942,6 +3178,7 @@ pub enum VmError {
     SourceHashMismatch,
     BuiltinManifestMismatch,
     StackUnderflow,
+    UnknownSymbol(SymbolId),
     UnknownLocal(String),
     UnknownGlobal(String),
     UninitializedGlobal(String),
@@ -2971,6 +3208,48 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::from([(("camera".to_string(), "zoom".to_string()), BuiltinId(10))]),
         )
+    }
+
+    #[test]
+    fn manifest_registered_choice_blocks_branch_on_the_host_result() {
+        let program = parse_program(
+            r#"
+                choice("Choose a route") {
+                    option("Route A") { "selected A" }
+                    option("Route B") { "selected B" }
+                }
+            "#,
+        )
+        .expect("choice syntax parses as nested trailing blocks");
+        let builtin = BuiltinId(41);
+        let manifest = BuiltinManifest::new([("__presentChoice", builtin)])
+            .with_choice_syntax("choice", "option", builtin);
+        let bytecode = compile_with_manifest(&program, 1, &manifest)
+            .expect("registered choice syntax compiles");
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        let Some(VmEvent::Call(call)) = vm.step().expect("choice call executes") else {
+            panic!("choice must yield a builtin call")
+        };
+        assert_eq!(call.builtin, builtin);
+        assert_eq!(
+            call.arguments[0].value,
+            Value::String("Choose a route".into())
+        );
+        assert_eq!(
+            call.arguments[1].value,
+            Value::List(vec![
+                Value::String("Route A".into()),
+                Value::String("Route B".into())
+            ])
+        );
+        vm.resume(Value::Number(1.0))
+            .expect("host selection resumes the VM");
+        assert_eq!(
+            vm.step().expect("selected branch executes"),
+            Some(VmEvent::Statement(StatementValue::String(
+                "selected B".into()
+            )))
+        );
     }
 
     #[test]
@@ -3523,10 +3802,15 @@ mod tests {
         )
         .expect("local member assignments must parse");
         let bytecode = compile(&program, 75).expect("local member assignments must compile");
+        let stats = bytecode.symbols.find("stats").expect("stats is interned");
+        let health = bytecode.symbols.find("health").expect("health is interned");
         assert!(bytecode.instructions.iter().any(|instruction| matches!(
             instruction,
-            Instruction::StoreLocalMember { root, path }
-                if root == "player" && path == &["stats", "health"]
+            Instruction::GetMember { name, safe: false } if *name == stats
+        )));
+        assert!(bytecode.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::SetMember { name } if *name == health
         )));
         let mut vm = Vm::new(bytecode).expect("VM must initialize");
         for _ in 0..3 {

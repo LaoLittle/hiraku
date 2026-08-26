@@ -10,5 +10,6 @@ unic-emoji-char = "0.9.0"
 serde.workspace = true
 rustc-hash.workspace = true
 indexmap = "2.14.0"
+bumpalo.workspace = true
 hiraku-errors.workspace = true
 hiraku-script-derive = { path = "../hiraku_script_derive" }
