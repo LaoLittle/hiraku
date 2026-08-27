@@ -1,4 +1,4 @@
-//! The executable register-based HKS bytecode compiler, VM and task scheduler.
+//! The executable register-based HKS bytecode compiler and VM.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +11,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const REGISTER_BYTECODE_VERSION: u16 = 2;
+pub const REGISTER_BYTECODE_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -62,7 +62,6 @@ pub enum RegisterInstruction {
     MakeClosure {
         dst: Register,
         region: u32,
-        statements: Vec<u32>,
     },
     LoadLocal {
         dst: Register,
@@ -124,6 +123,12 @@ pub enum RegisterInstruction {
         labels: Vec<Option<SymbolId>>,
         arguments: RegisterSlice,
     },
+    CallValue {
+        dst: Register,
+        callee: Register,
+        labels: Vec<Option<SymbolId>>,
+        arguments: RegisterSlice,
+    },
     AssertNonNull {
         dst: Register,
         value: Register,
@@ -157,6 +162,7 @@ pub enum RegisterConstant {
     String(String),
     Symbol(SymbolId),
     Selector(SymbolId),
+    Function(SymbolId),
     Unit,
 }
 
@@ -314,11 +320,7 @@ fn emit_function(
         let mut emitted = Vec::new();
         for instruction in &block.instructions {
             let scalar = match instruction {
-                MirInstruction::MakeClosure {
-                    dst,
-                    region,
-                    statements,
-                } => RegisterInstruction::MakeClosure {
+                MirInstruction::MakeClosure { dst, region } => RegisterInstruction::MakeClosure {
                     dst: register(*dst),
                     region: *region_ids.get(*region as usize).ok_or_else(|| {
                         vec![RegisterCompileError {
@@ -326,22 +328,46 @@ fn emit_function(
                             span: None,
                         }]
                     })?,
-                    statements: statements
-                        .iter()
-                        .map(|statement| {
-                            region_ids.get(*statement as usize).copied().ok_or_else(|| {
+                },
+                MirInstruction::Constant { dst, value } => {
+                    let value = match value {
+                        MirConstant::Function(ResolvedFunction::Builtin(builtin)) => {
+                            let name = manifest.callable_name(*builtin).ok_or_else(|| {
                                 vec![RegisterCompileError {
-                                    message: format!("unknown statement region {statement}"),
+                                    message: format!(
+                                        "native callable {builtin:?} has no public symbol"
+                                    ),
                                     span: None,
                                 }]
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                },
-                MirInstruction::Constant { dst, value } => RegisterInstruction::Constant {
-                    dst: register(*dst),
-                    value: constant(value.clone()),
-                },
+                            })?;
+                            RegisterConstant::Function(symbols.intern(name))
+                        }
+                        MirConstant::Function(ResolvedFunction::User(function)) => {
+                            RegisterConstant::Function(
+                                *function_symbols.get(function.0 as usize).ok_or_else(|| {
+                                    vec![RegisterCompileError {
+                                        message: format!("unknown script function {function:?}"),
+                                        span: None,
+                                    }]
+                                })?,
+                            )
+                        }
+                        MirConstant::Function(ResolvedFunction::External(symbol)) => {
+                            RegisterConstant::Function(*symbol)
+                        }
+                        MirConstant::Function(ResolvedFunction::Dynamic) => {
+                            return Err(vec![RegisterCompileError {
+                                message: "a dynamic function cannot be used as a constant".into(),
+                                span: None,
+                            }]);
+                        }
+                        value => constant(value.clone()),
+                    };
+                    RegisterInstruction::Constant {
+                        dst: register(*dst),
+                        value,
+                    }
+                }
                 MirInstruction::LoadLocal { dst, local } => RegisterInstruction::LoadLocal {
                     dst: register(*dst),
                     local: local.0,
@@ -508,6 +534,26 @@ fn emit_function(
                         arguments: slice,
                     }
                 }
+                MirInstruction::Call {
+                    dst,
+                    function: ResolvedFunction::Dynamic,
+                    receiver: None,
+                    dynamic_callee: Some(callee),
+                    arguments,
+                } => {
+                    let slice = emit_register_window(
+                        &mut emitted,
+                        allocation.register_count,
+                        arguments.iter().map(|(_, value)| register(*value)),
+                    )?;
+                    max_window = max_window.max(arguments.len());
+                    RegisterInstruction::CallValue {
+                        dst: register(*dst),
+                        callee: register(*callee),
+                        labels: arguments.iter().map(|(label, _)| *label).collect(),
+                        arguments: slice,
+                    }
+                }
                 MirInstruction::Call { .. } => {
                     return Err(vec![RegisterCompileError {
                         message: "dynamic and user calls are not implemented in register bytecode"
@@ -618,6 +664,7 @@ fn constant(value: MirConstant) -> RegisterConstant {
         MirConstant::String(value) => RegisterConstant::String(value),
         MirConstant::Symbol(value) => RegisterConstant::Symbol(value),
         MirConstant::Selector(value) => RegisterConstant::Selector(value),
+        MirConstant::Function(_) => unreachable!("function constants require symbol resolution"),
     }
 }
 
@@ -707,7 +754,7 @@ impl RegisterVm {
         bytecode: RegisterBytecode,
         closure: &Value,
     ) -> Result<Self, RegisterVmError> {
-        let Value::RegisterClosure {
+        let Value::Closure {
             region, captures, ..
         } = closure
         else {
@@ -731,6 +778,30 @@ impl RegisterVm {
             location: RegisterCodeLocation::Region(*region),
             call_stack: Vec::new(),
         })
+    }
+
+    /// Creates an independent VM invocation from a save-safe function value.
+    pub fn from_callable(
+        bytecode: RegisterBytecode,
+        callable: &Value,
+        arguments: Vec<Value>,
+    ) -> Result<Self, RegisterVmError> {
+        match callable {
+            Value::Closure { .. } if arguments.is_empty() => Self::from_closure(bytecode, callable),
+            Value::Closure { .. } => Err(RegisterVmError::FunctionArity {
+                expected: 0,
+                actual: arguments.len(),
+            }),
+            Value::Function(symbol) => {
+                let index = bytecode
+                    .functions
+                    .iter()
+                    .position(|function| function.name == *symbol)
+                    .ok_or(RegisterVmError::UnknownSymbol(*symbol))?;
+                Self::from_function(bytecode, index as u32, arguments)
+            }
+            _ => Err(RegisterVmError::TypeMismatch("expected Function")),
+        }
     }
 
     pub fn from_function(
@@ -787,19 +858,14 @@ impl RegisterVm {
                     let value = self.read(src)?.clone();
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::MakeClosure {
-                    dst,
-                    region,
-                    statements,
-                } => {
+                RegisterInstruction::MakeClosure { dst, region } => {
                     if self.bytecode.regions.get(region as usize).is_none() {
                         return Err(RegisterVmError::UnknownRegion(region));
                     }
                     self.write(
                         dst,
-                        Value::RegisterClosure {
+                        Value::Closure {
                             region,
-                            statements,
                             captures: self.locals.to_vec(),
                         },
                     )?;
@@ -924,6 +990,65 @@ impl RegisterVm {
                         receiver,
                         arguments,
                     })));
+                }
+                RegisterInstruction::CallValue {
+                    dst,
+                    callee,
+                    labels,
+                    arguments,
+                } => {
+                    let callee = self.read(callee)?.clone();
+                    let values = self.read_slice(arguments)?;
+                    let arguments = labels
+                        .into_iter()
+                        .zip(values)
+                        .map(|(label, value)| {
+                            Ok(CallArgument {
+                                label: label
+                                    .map(|label| self.symbol(label).map(str::to_string))
+                                    .transpose()?,
+                                value,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, RegisterVmError>>()?;
+                    match callee {
+                        Value::Function(function) => {
+                            if let Some(function_index) = self
+                                .bytecode
+                                .functions
+                                .iter()
+                                .position(|candidate| candidate.name == function)
+                            {
+                                self.call_script(
+                                    function_index,
+                                    dst,
+                                    arguments
+                                        .into_iter()
+                                        .map(|argument| argument.value)
+                                        .collect(),
+                                )?;
+                                continue;
+                            }
+                            self.status = RegisterVmStatus::WaitingForHost;
+                            self.waiting_destination = Some(dst);
+                            return Ok(Some(RegisterVmEvent::Call(SymbolCall {
+                                function,
+                                receiver: None,
+                                arguments,
+                            })));
+                        }
+                        Value::Closure { region, captures } => {
+                            if !arguments.is_empty() {
+                                return Err(RegisterVmError::FunctionArity {
+                                    expected: 0,
+                                    actual: arguments.len(),
+                                });
+                            }
+                            self.call_closure(region, captures, dst)?;
+                            continue;
+                        }
+                        _ => return Err(RegisterVmError::TypeMismatch("callee expects Function")),
+                    }
                 }
                 RegisterInstruction::AssertNonNull { dst, value } => {
                     let value = self.read(value)?.clone();
@@ -1112,6 +1237,7 @@ impl RegisterVm {
             RegisterConstant::String(value) => Value::String(value),
             RegisterConstant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
             RegisterConstant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
+            RegisterConstant::Function(symbol) => Value::Function(symbol),
         })
     }
 
@@ -1168,6 +1294,35 @@ impl RegisterVm {
         for (local, value) in parameters.into_iter().zip(arguments) {
             *self.local_mut(local)? = value;
         }
+        Ok(())
+    }
+
+    fn call_closure(
+        &mut self,
+        region: u32,
+        captures: Vec<Value>,
+        destination: Register,
+    ) -> Result<(), RegisterVmError> {
+        let code = self
+            .bytecode
+            .regions
+            .get(region as usize)
+            .ok_or(RegisterVmError::UnknownRegion(region))?;
+        if captures.len() != self.bytecode.local_count as usize {
+            return Err(RegisterVmError::FrameShapeMismatch);
+        }
+        self.call_stack.push(RegisterCallFrameSnapshot {
+            location: self.location,
+            pc: self.pc,
+            registers: self.registers.values().to_vec(),
+            locals: self.locals.to_vec(),
+            destination,
+        });
+        let register_count = code.register_count;
+        self.location = RegisterCodeLocation::Region(region);
+        self.pc = 0;
+        self.registers = RegisterFrame::new(register_count);
+        self.locals = captures.into_boxed_slice();
         Ok(())
     }
 
@@ -1342,213 +1497,8 @@ pub enum RegisterVmError {
     FrameShapeMismatch,
     UnknownFunction(u32),
     UnknownRegion(u32),
-    UnknownTask(u64),
     FunctionArity { expected: usize, actual: usize },
     ReturnOutsideFunction,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RegisterTaskMode {
-    Sequence,
-    Parallel,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum RegisterTaskEvent {
-    Call { task: u64, call: SymbolCall },
-    Statement { task: u64, value: StatementValue },
-    Completed { task: u64, value: Value },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct RegisterTaskSnapshot {
-    vm: Option<RegisterVmSnapshot>,
-    children: Vec<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RegisterTaskSchedulerSnapshot {
-    next_task: u64,
-    tasks: BTreeMap<u64, RegisterTaskSnapshot>,
-    globals: Vec<Value>,
-}
-
-pub struct RegisterTaskScheduler {
-    bytecode: RegisterBytecode,
-    next_task: u64,
-    tasks: BTreeMap<u64, (Option<RegisterVm>, Vec<u64>)>,
-    globals: Vec<Value>,
-}
-
-impl RegisterTaskScheduler {
-    pub fn new(bytecode: RegisterBytecode) -> Self {
-        Self {
-            globals: vec![Value::Uninitialized; bytecode.globals.len()],
-            bytecode,
-            next_task: 1,
-            tasks: BTreeMap::new(),
-        }
-    }
-
-    pub fn set_global_values(&mut self, globals: Vec<Value>) -> Result<(), RegisterVmError> {
-        if globals.len() != self.bytecode.globals.len() {
-            return Err(RegisterVmError::FrameShapeMismatch);
-        }
-        self.globals = globals;
-        Ok(())
-    }
-
-    pub fn global_values(&self) -> &[Value] {
-        &self.globals
-    }
-
-    pub fn spawn_closure(
-        &mut self,
-        closure: &Value,
-        mode: RegisterTaskMode,
-    ) -> Result<u64, RegisterVmError> {
-        let Value::RegisterClosure {
-            region,
-            statements,
-            captures,
-        } = closure
-        else {
-            return Err(RegisterVmError::TypeMismatch("expected Function"));
-        };
-        match mode {
-            RegisterTaskMode::Sequence => self.spawn_region(*region, captures.clone()),
-            RegisterTaskMode::Parallel => {
-                let parent = self.allocate_task();
-                let mut children = Vec::with_capacity(statements.len());
-                for region in statements {
-                    children.push(self.spawn_region(*region, captures.clone())?);
-                }
-                self.tasks.insert(parent, (None, children));
-                Ok(parent)
-            }
-        }
-    }
-
-    pub fn step(&mut self) -> Result<Option<RegisterTaskEvent>, RegisterVmError> {
-        let ids = self.tasks.keys().copied().collect::<Vec<_>>();
-        for task in ids {
-            let completed_parent = self
-                .tasks
-                .get(&task)
-                .filter(|(vm, _)| vm.is_none())
-                .is_some_and(|(_, children)| {
-                    children.iter().all(|child| !self.tasks.contains_key(child))
-                });
-            if completed_parent {
-                self.tasks.remove(&task);
-                return Ok(Some(RegisterTaskEvent::Completed {
-                    task,
-                    value: Value::Null,
-                }));
-            }
-            let Some((vm, children)) = self.tasks.get_mut(&task) else {
-                continue;
-            };
-            if let Some(vm) = vm {
-                match vm.step()? {
-                    Some(RegisterVmEvent::Call(call)) => {
-                        return Ok(Some(RegisterTaskEvent::Call { task, call }));
-                    }
-                    Some(RegisterVmEvent::Statement(value)) => {
-                        return Ok(Some(RegisterTaskEvent::Statement { task, value }));
-                    }
-                    Some(RegisterVmEvent::Completed(value)) => {
-                        self.globals = vm.globals().to_vec();
-                        self.tasks.remove(&task);
-                        return Ok(Some(RegisterTaskEvent::Completed { task, value }));
-                    }
-                    None => {}
-                }
-            } else {
-                let _ = children;
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn resume(&mut self, task: u64, value: Value) -> Result<(), RegisterVmError> {
-        let vm = self
-            .tasks
-            .get_mut(&task)
-            .and_then(|(vm, _)| vm.as_mut())
-            .ok_or(RegisterVmError::UnknownTask(task))?;
-        vm.resume(value)
-    }
-
-    pub fn eval_template(&self, task: u64, template: &str) -> Result<String, crate::TemplateError> {
-        self.tasks
-            .get(&task)
-            .and_then(|(vm, _)| vm.as_ref())
-            .ok_or_else(|| crate::TemplateError::UnknownPath(format!("task {task}")))?
-            .eval_template(template)
-    }
-
-    pub fn snapshot(&self) -> RegisterTaskSchedulerSnapshot {
-        RegisterTaskSchedulerSnapshot {
-            next_task: self.next_task,
-            globals: self.globals.clone(),
-            tasks: self
-                .tasks
-                .iter()
-                .map(|(id, (vm, children))| {
-                    (
-                        *id,
-                        RegisterTaskSnapshot {
-                            vm: vm.as_ref().map(RegisterVm::snapshot),
-                            children: children.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    pub fn restore(
-        bytecode: RegisterBytecode,
-        snapshot: RegisterTaskSchedulerSnapshot,
-    ) -> Result<Self, RegisterVmError> {
-        let tasks = snapshot
-            .tasks
-            .into_iter()
-            .map(|(id, task)| {
-                let vm = task
-                    .vm
-                    .map(|snapshot| RegisterVm::restore(bytecode.clone(), snapshot))
-                    .transpose()?;
-                Ok((id, (vm, task.children)))
-            })
-            .collect::<Result<_, RegisterVmError>>()?;
-        Ok(Self {
-            bytecode,
-            next_task: snapshot.next_task,
-            tasks,
-            globals: snapshot.globals,
-        })
-    }
-
-    fn allocate_task(&mut self) -> u64 {
-        let task = self.next_task;
-        self.next_task += 1;
-        task
-    }
-
-    fn spawn_region(&mut self, region: u32, captures: Vec<Value>) -> Result<u64, RegisterVmError> {
-        let task = self.allocate_task();
-        let closure = Value::RegisterClosure {
-            region,
-            statements: Vec::new(),
-            captures,
-        };
-        let mut vm = RegisterVm::from_closure(self.bytecode.clone(), &closure)?;
-        vm.set_global_values(self.globals.clone())?;
-        self.tasks.insert(task, (Some(vm), Vec::new()));
-        Ok(task)
-    }
 }
 
 #[cfg(test)]
@@ -1695,7 +1645,7 @@ mod tests {
             Vec::new(),
         );
         let bytecode = compile("let value = 4\ninvoke { value + 1 }", &manifest);
-        assert_eq!(bytecode.regions.len(), 2);
+        assert_eq!(bytecode.regions.len(), 1);
         let mut vm = RegisterVm::new(bytecode).expect("VM initializes");
         let Some(RegisterVmEvent::Statement(_)) = vm.step().expect("let executes") else {
             panic!("expected let statement")
@@ -1705,55 +1655,47 @@ mod tests {
         };
         assert!(matches!(
             call.arguments[0].value,
-            Value::RegisterClosure { region: 0, ref statements, ref captures }
-                if statements == &[1] && captures.contains(&Value::Number(4.0))
+            Value::Closure { region: 0, ref captures }
+                if captures.contains(&Value::Number(4.0))
         ));
     }
 
     #[test]
-    fn register_task_scheduler_restores_parallel_closure_children() {
-        let manifest = BuiltinManifest::new([
-            ("par", BuiltinId(1)),
-            ("first", BuiltinId(2)),
-            ("second", BuiltinId(3)),
-        ]);
-        let bytecode = compile("par { first(); second() }", &manifest);
-        let mut main = RegisterVm::new(bytecode.clone()).expect("VM initializes");
-        let Some(RegisterVmEvent::Call(call)) = main.step().expect("par yields") else {
-            panic!("expected par call")
-        };
-        let closure = call.arguments[0].value.clone();
-        let mut scheduler = RegisterTaskScheduler::new(bytecode.clone());
-        let parent = scheduler
-            .spawn_closure(&closure, RegisterTaskMode::Parallel)
-            .expect("parallel closure spawns");
-        let Some(RegisterTaskEvent::Call { task: first, call }) =
-            scheduler.step().expect("first child yields")
-        else {
-            panic!("expected first child call")
-        };
-        assert_eq!(bytecode.symbols.resolve(call.function), Some("first"));
+    fn named_functions_are_first_class_and_dynamically_callable() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            "fn increment(value: Int) -> Int { value + 1 }\nlet callable = increment\nglobal result = callable(2)",
+            &manifest,
+        );
+        let mut vm = RegisterVm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("function value executes"),
+            Some(RegisterVmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(3.0)));
+    }
 
-        let snapshot = scheduler.snapshot();
-        let mut restored = RegisterTaskScheduler::restore(bytecode.clone(), snapshot)
-            .expect("parallel scheduler restores");
-        restored.resume(first, Value::Null).expect("first resumes");
-        while !matches!(
-            restored.step().expect("first completes"),
-            Some(RegisterTaskEvent::Completed { task, .. }) if task == first
-        ) {}
-        let Some(RegisterTaskEvent::Call { task: second, call }) =
-            restored.step().expect("second child yields")
-        else {
-            panic!("expected second child call")
+    #[test]
+    fn named_functions_can_cross_the_native_call_boundary() {
+        let builtin = BuiltinId(12);
+        let manifest = BuiltinManifest::new([("schedule", builtin)]).with_type_metadata(
+            crate::SymbolManifest::default(),
+            BTreeMap::from([(
+                builtin,
+                crate::FunctionSignature {
+                    receiver: None,
+                    parameters: vec![crate::ScriptType::Function],
+                    result: crate::ScriptType::Task,
+                },
+            )]),
+            Vec::new(),
+        );
+        let bytecode = compile("fn work() { 1 }\nschedule(work)", &manifest);
+        let function_symbol = bytecode.functions[0].name;
+        let mut vm = RegisterVm::new(bytecode).expect("VM initializes");
+        let Some(RegisterVmEvent::Call(call)) = vm.step().expect("schedule yields") else {
+            panic!("expected native call")
         };
-        assert_eq!(bytecode.symbols.resolve(call.function), Some("second"));
-        restored
-            .resume(second, Value::Null)
-            .expect("second resumes");
-        while !matches!(
-            restored.step().expect("tasks advance"),
-            Some(RegisterTaskEvent::Completed { task, .. }) if task == parent
-        ) {}
+        assert_eq!(call.arguments[0].value, Value::Function(function_symbol));
     }
 }

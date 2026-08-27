@@ -39,7 +39,6 @@ pub enum MirInstruction {
     MakeClosure {
         dst: VirtualRegister,
         region: u32,
-        statements: Vec<u32>,
     },
     LoadLocal {
         dst: VirtualRegister,
@@ -176,6 +175,7 @@ pub enum MirConstant {
     String(String),
     Symbol(SymbolId),
     Selector(SymbolId),
+    Function(ResolvedFunction),
     Unit,
 }
 
@@ -521,51 +521,22 @@ impl MirBuilder {
                 let region = Self::lower(block, true, errors);
                 let region_id = self.regions.len() as u32;
                 self.regions.push(region);
-                let mut statements = Vec::with_capacity(block.statements.len());
-                for statement in block.statements {
-                    let statement_region = Self::lower_statement_region(statement, errors);
-                    statements.push(self.regions.len() as u32);
-                    self.regions.push(statement_region);
-                }
                 let dst = self.register();
                 self.push(MirInstruction::MakeClosure {
                     dst,
                     region: region_id,
-                    statements,
                 });
                 Some(dst)
             }
-            HirExprKind::Function(_) | HirExprKind::Builtin(_) | HirExprKind::Unresolved(_) => {
-                errors.push(MirLoweringError {
-                    message: "function values are not implemented in register MIR yet".into(),
-                    span: expression.span,
-                });
-                None
+            HirExprKind::Function(function) => {
+                Some(self.constant(MirConstant::Function(ResolvedFunction::User(function))))
             }
-        }
-    }
-
-    fn lower_statement_region(
-        statement: &crate::HirStmt<'_>,
-        errors: &mut Vec<MirLoweringError>,
-    ) -> MirFunction {
-        let mut builder = Self {
-            blocks: vec![MirBasicBlock {
-                instructions: Vec::new(),
-                terminator: MirTerminator::Unset,
-            }],
-            regions: Vec::new(),
-            current: MirBlockId(0),
-            next_register: 0,
-        };
-        let result = builder.lower_statement(statement, errors);
-        if matches!(builder.current_block().terminator, MirTerminator::Unset) {
-            builder.current_block_mut().terminator = MirTerminator::Return(result);
-        }
-        MirFunction {
-            blocks: builder.blocks,
-            regions: builder.regions,
-            virtual_register_count: builder.next_register,
+            HirExprKind::Builtin(builtin) => {
+                Some(self.constant(MirConstant::Function(ResolvedFunction::Builtin(builtin))))
+            }
+            HirExprKind::Unresolved(symbol) => {
+                Some(self.constant(MirConstant::Function(ResolvedFunction::External(symbol))))
+            }
         }
     }
 

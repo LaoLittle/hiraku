@@ -9,11 +9,11 @@ pub mod mir;
 pub mod native;
 pub mod parse;
 pub mod register;
-pub mod vm;
 pub mod runtime;
 pub mod span;
 pub mod symbol;
 pub mod template;
+pub mod vm;
 
 pub use ast::{
     Argument, BinaryOp, Block, Expr, ExprKind, FunctionParameter, MapField, NumberUnit, Program,
@@ -47,12 +47,6 @@ pub use register::{
     InvalidRegister, Register, RegisterAllocation, RegisterAllocationError, RegisterFrame,
     allocate_registers,
 };
-pub use vm::{
-    REGISTER_BYTECODE_VERSION, RegisterBytecode, RegisterCompileError, RegisterConstant,
-    RegisterInstruction, RegisterTaskEvent, RegisterTaskMode, RegisterTaskScheduler,
-    RegisterTaskSchedulerSnapshot, RegisterVm, RegisterVmError, RegisterVmEvent,
-    RegisterVmSnapshot, RegisterVmStatus, SymbolCall, compile_register_with_manifest,
-};
 pub use runtime::{
     BuiltinCall, BuiltinId, BuiltinManifest, CallArgument, FunctionSignature, StaticMember,
     StaticMemberKind, Value,
@@ -60,4 +54,9 @@ pub use runtime::{
 pub use span::Span;
 pub use symbol::{SymbolId, SymbolInterner, SymbolManifest};
 pub use template::{TemplateCallArgument, TemplateContext, TemplateError, eval_template};
+pub use vm::{
+    REGISTER_BYTECODE_VERSION, RegisterBytecode, RegisterCompileError, RegisterConstant,
+    RegisterInstruction, RegisterVm, RegisterVmError, RegisterVmEvent, RegisterVmSnapshot,
+    RegisterVmStatus, SymbolCall, compile_register_with_manifest,
+};
 extern crate self as hiraku_script;

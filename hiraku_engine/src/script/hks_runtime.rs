@@ -7,14 +7,15 @@ use std::collections::{BTreeMap, VecDeque};
 use hiraku_script::StatementValue;
 use hiraku_script::TemplateError;
 use hiraku_script::{
-    BuiltinCall, LinkedBytecode, LinkedFunction, RegisterBytecode, RegisterTaskEvent,
-    RegisterTaskMode, RegisterTaskScheduler, RegisterTaskSchedulerSnapshot, RegisterVm,
-    RegisterVmError, RegisterVmEvent, RegisterVmSnapshot, SymbolCall, Value,
-    link_register_bytecode,
+    BuiltinCall, LinkedBytecode, LinkedFunction, RegisterBytecode, RegisterVm, RegisterVmError,
+    RegisterVmEvent, RegisterVmSnapshot, SymbolCall, Value, link_register_bytecode,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::task_runtime::{
+    ExecutionMode, TaskEvent, TaskScheduler, TaskSchedulerError, TaskSchedulerSnapshot,
+};
 use crate::script::capabilities::{
     CharacterCapabilityError, StoryEffect, StoryNativeHost, StoryNativeHostSnapshot, StoryWait,
     story_manifest,
@@ -32,7 +33,7 @@ pub enum HksRuntimeEvent {
 
 pub struct HksRuntime {
     vm: RegisterVm,
-    scheduler: RegisterTaskScheduler,
+    scheduler: TaskScheduler,
     linked: LinkedBytecode,
     globals: BTreeMap<String, Value>,
 }
@@ -43,18 +44,16 @@ pub struct StoryRuntime {
     bytecode: HksRuntime,
     host: StoryNativeHost,
     pending: VecDeque<StoryRuntimeEvent>,
-    active_task_effects: BTreeMap<u64, (StoryEffect, Value)>,
+    active_task_effects: BTreeMap<u64, Vec<(StoryEffect, Value)>>,
+    task_modes: BTreeMap<u64, ExecutionMode>,
+    deferred_task_completions: BTreeMap<u64, Value>,
     waiting_task: Option<u64>,
     choice: Option<ChoiceState>,
     blocked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct ClosureValue {
-    region: u32,
-    statements: Vec<u32>,
-    captures: Vec<Value>,
-}
+struct ClosureValue(Value);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ChoiceOption {
@@ -101,7 +100,9 @@ pub enum StoryRuntimeEvent {
 pub struct StoryRuntimeSnapshot {
     bytecode: HksRuntimeSnapshot,
     host: StoryNativeHostSnapshot,
-    active_task_effects: BTreeMap<u64, (StoryEffect, Value)>,
+    active_task_effects: BTreeMap<u64, Vec<(StoryEffect, Value)>>,
+    task_modes: BTreeMap<u64, ExecutionMode>,
+    deferred_task_completions: BTreeMap<u64, Value>,
     waiting_task: Option<u64>,
     choice: Option<ChoiceState>,
     blocked: bool,
@@ -114,6 +115,8 @@ impl StoryRuntime {
             host: StoryNativeHost::new(),
             pending: VecDeque::new(),
             active_task_effects: BTreeMap::new(),
+            task_modes: BTreeMap::new(),
+            deferred_task_completions: BTreeMap::new(),
             waiting_task: None,
             choice: None,
             blocked: false,
@@ -128,6 +131,8 @@ impl StoryRuntime {
             bytecode: self.bytecode.snapshot(),
             host: self.host.snapshot(),
             active_task_effects: self.active_task_effects.clone(),
+            task_modes: self.task_modes.clone(),
+            deferred_task_completions: self.deferred_task_completions.clone(),
             waiting_task: self.waiting_task,
             choice: self.choice.clone(),
             blocked: self.blocked,
@@ -141,9 +146,13 @@ impl StoryRuntime {
         let pending = snapshot
             .active_task_effects
             .iter()
-            .map(|(task, (effect, _))| StoryRuntimeEvent::TaskEffect {
-                task: *task,
-                effect: effect.clone(),
+            .flat_map(|(task, effects)| {
+                effects
+                    .iter()
+                    .map(|(effect, _)| StoryRuntimeEvent::TaskEffect {
+                        task: *task,
+                        effect: effect.clone(),
+                    })
             })
             .collect();
         Ok(Self {
@@ -151,6 +160,8 @@ impl StoryRuntime {
             host: StoryNativeHost::restore(snapshot.host),
             pending,
             active_task_effects: snapshot.active_task_effects,
+            task_modes: snapshot.task_modes,
+            deferred_task_completions: snapshot.deferred_task_completions,
             waiting_task: snapshot.waiting_task,
             choice: snapshot.choice,
             blocked: snapshot.blocked,
@@ -185,7 +196,8 @@ impl StoryRuntime {
                 .clone();
             let task = self
                 .bytecode
-                .spawn_closure(&option, RegisterTaskMode::Sequence)?;
+                .spawn_closure(&option, ExecutionMode::Sequence)?;
+            self.task_modes.insert(task, ExecutionMode::Sequence);
             self.choice = Some(ChoiceState::RunningBranch { task, selected });
             self.blocked = false;
             return Ok(());
@@ -198,11 +210,26 @@ impl StoryRuntime {
     }
 
     pub fn resume_task(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
-        let (_, value) = self
+        let effects = self
             .active_task_effects
-            .remove(&task)
+            .get_mut(&task)
             .ok_or(StoryRuntimeError::UnknownTaskEffect(task))?;
-        self.bytecode.resume_task(task, value)?;
+        effects
+            .pop()
+            .ok_or(StoryRuntimeError::UnknownTaskEffect(task))?;
+        if effects.is_empty() {
+            self.active_task_effects.remove(&task);
+            if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence) {
+                let _ = self.bytecode.unpause_task(task);
+            }
+            if let Some(value) = self.deferred_task_completions.remove(&task) {
+                self.task_modes.remove(&task);
+                if self.waiting_task == Some(task) {
+                    self.waiting_task = None;
+                    self.bytecode.resume_main(value)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -235,27 +262,44 @@ impl StoryRuntime {
                                 return Err(StoryRuntimeError::AmbiguousTaskEffect);
                             }
                             self.active_task_effects
-                                .insert(task, (effect.clone(), value));
+                                .entry(task)
+                                .or_default()
+                                .push((effect.clone(), value.clone()));
+                            self.bytecode.resume_task(task, value)?;
                             return Ok(Some(StoryRuntimeEvent::TaskEffect { task, effect }));
                         }
                         self.bytecode.resume_task(task, value)?;
                     }
-                    HksRuntimeEvent::TaskStatement { value, .. } => {
+                    HksRuntimeEvent::TaskStatement { task, value } => {
                         self.host.handle_statement(&value)?;
-                        self.enqueue_host_boundaries();
-                        if self.host.take_wait().is_some()
-                            || self
-                                .pending
-                                .iter()
-                                .any(|event| matches!(event, StoryRuntimeEvent::Wait(_)))
+                        self.pending.extend(
+                            self.host
+                                .drain_effects()
+                                .into_iter()
+                                .map(StoryRuntimeEvent::Effect),
+                        );
+                        let automatic_dialogue = self.host.take_wait().is_some();
+                        if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence)
+                            && automatic_dialogue
+                            && self.active_task_effects.contains_key(&task)
                         {
-                            return Err(StoryRuntimeError::SuspendingTaskCapability);
+                            self.bytecode.pause_task(task)?;
                         }
                         if let Some(event) = self.pending.pop_front() {
                             return Ok(Some(event));
                         }
                     }
-                    HksRuntimeEvent::TaskCompleted { .. } => {}
+                    HksRuntimeEvent::TaskCompleted { task, value } => {
+                        if self.active_task_effects.contains_key(&task) {
+                            self.deferred_task_completions.insert(task, value);
+                        } else {
+                            self.task_modes.remove(&task);
+                            if self.waiting_task == Some(task) {
+                                self.waiting_task = None;
+                                self.bytecode.resume_main(value)?;
+                            }
+                        }
+                    }
                     _ => unreachable!("task-only stepping cannot yield a main VM event"),
                 }
             }
@@ -269,10 +313,10 @@ impl StoryRuntime {
                     let task_mode = if call.builtin
                         == story_manifest().resolve("seq").expect("seq builtin")
                     {
-                        Some(RegisterTaskMode::Sequence)
+                        Some(ExecutionMode::Sequence)
                     } else if call.builtin == story_manifest().resolve("par").expect("par builtin")
                     {
-                        Some(RegisterTaskMode::Parallel)
+                        Some(ExecutionMode::Parallel)
                     } else {
                         None
                     };
@@ -285,6 +329,7 @@ impl StoryRuntime {
                             return Err(StoryRuntimeError::InvalidTaskClosure);
                         };
                         let task = self.bytecode.spawn_closure(&closure, mode)?;
+                        self.task_modes.insert(task, mode);
                         self.bytecode.resume_main(Value::Task(task))?;
                         continue;
                     }
@@ -301,7 +346,9 @@ impl StoryRuntime {
                             .unwrap_or_default();
                         let builder_task = self
                             .bytecode
-                            .spawn_closure(&closure, RegisterTaskMode::Sequence)?;
+                            .spawn_closure(&closure, ExecutionMode::Sequence)?;
+                        self.task_modes
+                            .insert(builder_task, ExecutionMode::Sequence);
                         self.choice = Some(ChoiceState::Collecting {
                             builder_task,
                             prompt,
@@ -366,19 +413,39 @@ impl StoryRuntime {
                             return Err(StoryRuntimeError::AmbiguousTaskEffect);
                         }
                         self.active_task_effects
-                            .insert(task, (effect.clone(), value));
+                            .entry(task)
+                            .or_default()
+                            .push((effect.clone(), value.clone()));
+                        self.bytecode.resume_task(task, value)?;
                         return Ok(Some(StoryRuntimeEvent::TaskEffect { task, effect }));
                     }
                     self.bytecode.resume_task(task, value)?;
                 }
-                HksRuntimeEvent::TaskStatement { value, .. } => {
+                HksRuntimeEvent::TaskStatement { task, value } => {
                     self.host.handle_statement(&value)?;
-                    self.enqueue_host_boundaries();
+                    self.pending.extend(
+                        self.host
+                            .drain_effects()
+                            .into_iter()
+                            .map(StoryRuntimeEvent::Effect),
+                    );
+                    let automatic_dialogue = self.host.take_wait().is_some();
+                    if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence)
+                        && automatic_dialogue
+                        && self.active_task_effects.contains_key(&task)
+                    {
+                        self.bytecode.pause_task(task)?;
+                    }
                     if let Some(event) = self.pending.pop_front() {
                         return Ok(Some(event));
                     }
                 }
                 HksRuntimeEvent::TaskCompleted { task, value } => {
+                    if self.active_task_effects.contains_key(&task) {
+                        self.deferred_task_completions.insert(task, value);
+                        continue;
+                    }
+                    self.task_modes.remove(&task);
                     if let Some(ChoiceState::Collecting {
                         builder_task,
                         prompt,
@@ -442,15 +509,7 @@ fn closure_argument(call: &BuiltinCall) -> Option<ClosureValue> {
 
 fn closure_value(value: &Value) -> Option<ClosureValue> {
     match value {
-        Value::RegisterClosure {
-            region,
-            statements,
-            captures,
-        } => Some(ClosureValue {
-            region: *region,
-            statements: statements.clone(),
-            captures: captures.clone(),
-        }),
+        Value::Closure { .. } | Value::Function(_) => Some(ClosureValue(value.clone())),
         _ => None,
     }
 }
@@ -461,7 +520,7 @@ pub struct HksRuntimeSnapshot {
     /// native registry instead of relying on source recompilation offsets.
     pub program: RegisterBytecode,
     pub vm: RegisterVmSnapshot,
-    pub scheduler: RegisterTaskSchedulerSnapshot,
+    pub scheduler: TaskSchedulerSnapshot,
 }
 
 impl HksRuntime {
@@ -470,7 +529,7 @@ impl HksRuntime {
             .map_err(HksRuntimeError::Link)?;
         Ok(Self {
             vm: RegisterVm::new(bytecode.clone())?,
-            scheduler: RegisterTaskScheduler::new(bytecode),
+            scheduler: TaskScheduler::new(bytecode),
             linked,
             globals: BTreeMap::new(),
         })
@@ -487,18 +546,11 @@ impl HksRuntime {
     fn spawn_closure(
         &mut self,
         closure: &ClosureValue,
-        mode: RegisterTaskMode,
+        mode: ExecutionMode,
     ) -> Result<u64, HksRuntimeError> {
         self.scheduler
             .set_global_values(self.vm.globals().to_vec())?;
-        Ok(self.scheduler.spawn_closure(
-            &Value::RegisterClosure {
-                region: closure.region,
-                statements: closure.statements.clone(),
-                captures: closure.captures.clone(),
-            },
-            mode,
-        )?)
+        Ok(self.scheduler.spawn(&closure.0, mode)?)
     }
 
     pub fn restore(
@@ -512,7 +564,7 @@ impl HksRuntime {
         let globals = globals_from_values(&bytecode, vm.globals());
         Ok(Self {
             vm,
-            scheduler: RegisterTaskScheduler::restore(bytecode, snapshot.scheduler)?,
+            scheduler: TaskScheduler::restore(bytecode, snapshot.scheduler)?,
             linked,
             globals,
         })
@@ -544,21 +596,21 @@ impl HksRuntime {
     /// Advances only scheduled child tasks, leaving the main VM untouched.
     pub fn step_task(&mut self) -> Result<Option<HksRuntimeEvent>, HksRuntimeError> {
         match self.scheduler.step()? {
-            Some(RegisterTaskEvent::Call { task, call }) => {
+            Some(TaskEvent::Call { task, call }) => {
                 let mut call = self.link_call(call)?;
                 evaluate_call_templates(&mut call, |text| {
                     self.scheduler.eval_template(task, text)
                 })?;
                 Ok(Some(HksRuntimeEvent::TaskCall { task, call }))
             }
-            Some(RegisterTaskEvent::Statement { task, value }) => {
+            Some(TaskEvent::Statement { task, value }) => {
                 let value = evaluate_task_statement_template(&mut self.scheduler, task, value)?;
                 self.vm
                     .set_global_values(self.scheduler.global_values().to_vec())?;
                 self.refresh_globals();
                 Ok(Some(HksRuntimeEvent::TaskStatement { task, value }))
             }
-            Some(RegisterTaskEvent::Completed { task, value }) => {
+            Some(TaskEvent::Completed { task, value }) => {
                 Ok(Some(HksRuntimeEvent::TaskCompleted { task, value }))
             }
             None => Ok(None),
@@ -597,6 +649,16 @@ impl HksRuntime {
         Ok(())
     }
 
+    pub fn pause_task(&mut self, task: u64) -> Result<(), HksRuntimeError> {
+        self.scheduler.pause(task)?;
+        Ok(())
+    }
+
+    pub fn unpause_task(&mut self, task: u64) -> Result<(), HksRuntimeError> {
+        self.scheduler.unpause(task)?;
+        Ok(())
+    }
+
     fn link_call(&self, call: SymbolCall) -> Result<BuiltinCall, HksRuntimeError> {
         let Some(LinkedFunction::Native(builtin)) = self.linked.resolve(call.function) else {
             return Err(HksRuntimeError::UnlinkedCall(call.function));
@@ -617,6 +679,8 @@ impl HksRuntime {
 pub enum HksRuntimeError {
     #[error("HKS VM failed: {0:?}")]
     Vm(RegisterVmError),
+    #[error("HKS task scheduler failed: {0}")]
+    Task(#[from] TaskSchedulerError),
     #[error("HKS bytecode link failed: {0:?}")]
     Link(Vec<hiraku_script::LinkError>),
     #[error("HKS call references an unlinked symbol {0:?}")]
@@ -643,8 +707,6 @@ pub enum StoryRuntimeError {
     NotBlocked,
     #[error("story runtime snapshot requires an empty effect queue")]
     NotAtSnapshotBoundary,
-    #[error("capabilities which suspend for host input are not supported inside seq/par")]
-    SuspendingTaskCapability,
     #[error("task {0} has no pending host effect")]
     UnknownTaskEffect(u64),
     #[error("task native call did not produce an effect")]
@@ -664,7 +726,7 @@ fn evaluate_statement_template(
 }
 
 fn evaluate_task_statement_template(
-    scheduler: &mut RegisterTaskScheduler,
+    scheduler: &mut TaskScheduler,
     task: u64,
     value: StatementValue,
 ) -> Result<StatementValue, TemplateError> {
@@ -948,7 +1010,10 @@ mod tests {
         let bytecode = compile_story_bytecode(
             "parallel.story.hks",
             r#"
-                par { voice("voice/first") }
+                par {
+                    voice("voice/first")
+                    voice("voice/second")
+                }
                 "dialogue"
             "#,
         )
@@ -969,9 +1034,19 @@ mod tests {
             }) if path == "voice/first" => task,
             event => panic!("unexpected task event: {event:?}"),
         };
+        assert!(matches!(
+            runtime.step().expect("second parallel voice must start without waiting"),
+            Some(StoryRuntimeEvent::TaskEffect {
+                task: second_task,
+                effect: StoryEffect::PlayVoice { ref path, .. },
+            }) if second_task == task && path == "voice/second"
+        ));
         runtime
             .resume_task(task)
-            .expect("audio completion must resume its task");
+            .expect("one parallel audio completion must be recorded");
+        runtime
+            .resume_task(task)
+            .expect("the other parallel audio completion must be recorded");
         assert_eq!(
             runtime.step().expect("finished task must become idle"),
             None
@@ -985,7 +1060,9 @@ mod tests {
             r#"
                 seq {
                     voice("voice/first")
+                    "first line"
                     voice("voice/second")
+                    "second line"
                 }
                 "dialogue"
             "#,
@@ -1007,6 +1084,10 @@ mod tests {
             }) if path == "voice/first" => task,
             event => panic!("unexpected first sequence event: {event:?}"),
         };
+        assert!(matches!(
+            runtime.step().expect("the first line must be displayed immediately"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. })) if text == "first line"
+        ));
         assert_eq!(
             runtime.step().expect("sequence must remain suspended"),
             None

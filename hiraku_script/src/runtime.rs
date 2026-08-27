@@ -227,9 +227,9 @@ pub enum Value {
     String(String),
     Symbol(String),
     Selector(String),
-    RegisterClosure {
+    Function(SymbolId),
+    Closure {
         region: u32,
-        statements: Vec<u32>,
         captures: Vec<Value>,
     },
     Typed {

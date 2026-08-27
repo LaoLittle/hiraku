@@ -17,6 +17,7 @@ use crate::{
 pub(crate) mod capabilities;
 mod hks_runtime;
 mod runtime;
+mod task_runtime;
 pub mod ui_runtime;
 
 pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};

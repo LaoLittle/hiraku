@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use crate::{
     SymbolId,
-    vm::{RegisterBytecode, RegisterInstruction},
     runtime::{BuiltinId, BuiltinManifest},
+    vm::{RegisterBytecode, RegisterInstruction},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

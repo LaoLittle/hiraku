@@ -525,20 +525,14 @@ impl FromHksValue for SelectorValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HksClosure {
     pub region: u32,
-    pub statements: Vec<u32>,
     pub captures: Vec<Value>,
 }
 
 impl FromHksValue for HksClosure {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
-            Value::RegisterClosure {
-                region,
-                statements,
-                captures,
-            } => Ok(Self {
+            Value::Closure { region, captures } => Ok(Self {
                 region: *region,
-                statements: statements.clone(),
                 captures: captures.clone(),
             }),
             _ => Err(NativeError::TypeMismatch("function")),
@@ -548,9 +542,8 @@ impl FromHksValue for HksClosure {
 
 impl IntoHksValue for HksClosure {
     fn into_hks_value(self) -> Value {
-        Value::RegisterClosure {
+        Value::Closure {
             region: self.region,
-            statements: self.statements,
             captures: self.captures,
         }
     }
