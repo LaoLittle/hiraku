@@ -27,7 +27,7 @@ pub(crate) use runtime::{
 pub(crate) fn compile_story_bytecode(
     path: &str,
     source: &str,
-) -> Result<hiraku_script::vm::Bytecode, String> {
+) -> Result<hiraku_script::RegisterBytecode, String> {
     if !path.ends_with(".hks") {
         return Err(format!(
             "executable scripts must use the `.hks` extension: `{path}`"
@@ -547,16 +547,16 @@ pub fn save_runtime_slot(
     write_save_data_to_root(&save_root_path(), slot, &data)
 }
 
-fn stored_value_to_hks(value: StoredValue) -> hiraku_script::vm::Value {
+fn stored_value_to_hks(value: StoredValue) -> hiraku_script::Value {
     match value {
-        StoredValue::Bool(value) => hiraku_script::vm::Value::Bool(value),
-        StoredValue::Int(value) => hiraku_script::vm::Value::Number(value as f64),
-        StoredValue::Float(value) => hiraku_script::vm::Value::Number(value),
-        StoredValue::String(value) => hiraku_script::vm::Value::String(value),
+        StoredValue::Bool(value) => hiraku_script::Value::Bool(value),
+        StoredValue::Int(value) => hiraku_script::Value::Number(value as f64),
+        StoredValue::Float(value) => hiraku_script::Value::Number(value),
+        StoredValue::String(value) => hiraku_script::Value::String(value),
         StoredValue::Array(values) => {
-            hiraku_script::vm::Value::List(values.into_iter().map(stored_value_to_hks).collect())
+            hiraku_script::Value::List(values.into_iter().map(stored_value_to_hks).collect())
         }
-        StoredValue::Map(values) => hiraku_script::vm::Value::Map(
+        StoredValue::Map(values) => hiraku_script::Value::Map(
             values
                 .into_iter()
                 .map(|(name, value)| (name, stored_value_to_hks(value)))
@@ -566,7 +566,7 @@ fn stored_value_to_hks(value: StoredValue) -> hiraku_script::vm::Value {
 }
 
 fn hks_globals_to_stored(
-    globals: &BTreeMap<String, hiraku_script::vm::Value>,
+    globals: &BTreeMap<String, hiraku_script::Value>,
 ) -> BTreeMap<String, StoredValue> {
     globals
         .iter()
@@ -574,17 +574,17 @@ fn hks_globals_to_stored(
         .collect()
 }
 
-fn hks_value_to_stored(value: &hiraku_script::vm::Value) -> Option<StoredValue> {
+fn hks_value_to_stored(value: &hiraku_script::Value) -> Option<StoredValue> {
     match value {
-        hiraku_script::vm::Value::Bool(value) => Some(StoredValue::Bool(*value)),
-        hiraku_script::vm::Value::Number(value) => Some(StoredValue::Float(*value)),
-        hiraku_script::vm::Value::String(value) | hiraku_script::vm::Value::Symbol(value) => {
+        hiraku_script::Value::Bool(value) => Some(StoredValue::Bool(*value)),
+        hiraku_script::Value::Number(value) => Some(StoredValue::Float(*value)),
+        hiraku_script::Value::String(value) | hiraku_script::Value::Symbol(value) => {
             Some(StoredValue::String(value.clone()))
         }
-        hiraku_script::vm::Value::List(values) | hiraku_script::vm::Value::Tuple(values) => Some(
+        hiraku_script::Value::List(values) | hiraku_script::Value::Tuple(values) => Some(
             StoredValue::Array(values.iter().filter_map(hks_value_to_stored).collect()),
         ),
-        hiraku_script::vm::Value::Map(values) => Some(StoredValue::Map(
+        hiraku_script::Value::Map(values) => Some(StoredValue::Map(
             values
                 .iter()
                 .filter_map(|(name, value)| {
@@ -592,7 +592,7 @@ fn hks_value_to_stored(value: &hiraku_script::vm::Value) -> Option<StoredValue> 
                 })
                 .collect(),
         )),
-        hiraku_script::vm::Value::Typed { value, .. } => hks_value_to_stored(value),
+        hiraku_script::Value::Typed { value, .. } => hks_value_to_stored(value),
         _ => None,
     }
 }

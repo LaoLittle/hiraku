@@ -5,7 +5,7 @@ use bumpalo::Bump;
 use crate::{
     BinaryOp, Block, Expr, ExprKind, NumberUnit, Program, Span, Stmt, SymbolId, SymbolInterner,
     SymbolManifest, TypeExpr, TypeExprKind,
-    vm::{BuiltinId, BuiltinManifest},
+    runtime::{BuiltinId, BuiltinManifest},
 };
 
 use super::{ScriptType, TypeId, TypeTable, normalize_program_symbols};
@@ -94,7 +94,6 @@ pub enum HirExprKind<'hir> {
     Call {
         callee: &'hir HirExpr<'hir>,
         arguments: &'hir [HirArgument<'hir>],
-        trailing_block: Option<&'hir HirBlock<'hir>>,
         function: ResolvedFunction,
     },
     Tuple(&'hir [&'hir HirExpr<'hir>]),
@@ -124,7 +123,9 @@ pub enum HirLiteral<'hir> {
 pub enum ResolvedFunction {
     User(HirFunctionId),
     Builtin(BuiltinId),
-    Syntax(SymbolId),
+    /// A symbol intentionally left for the runtime linker (for example a
+    /// `global fn` exported by another script module).
+    External(SymbolId),
     Dynamic,
 }
 
@@ -205,6 +206,7 @@ pub struct HirGlobal {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HirFunction<'hir> {
     pub name: SymbolId,
+    pub exported: bool,
     pub parameters: &'hir [HirLocalId],
     pub result: TypeId,
     pub body: &'hir HirBlock<'hir>,
@@ -229,6 +231,7 @@ pub fn lower_to_hir<'hir>(
 
 struct FunctionDeclaration {
     name: SymbolId,
+    exported: bool,
     result: ScriptType,
     span: Span,
 }
@@ -381,6 +384,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     fn declare_functions(&mut self, program: &Program) {
         for statement in &program.statements {
             let Stmt::Function {
+                exported,
                 name,
                 return_type,
                 span,
@@ -404,6 +408,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .unwrap_or(ScriptType::Any);
             self.functions.push(FunctionDeclaration {
                 name: symbol,
+                exported: *exported,
                 result,
                 span: *span,
             });
@@ -449,6 +454,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             let result = self.types.intern(declaration.result.clone());
             self.lowered_functions.push(HirFunction {
                 name: declaration.name,
+                exported: declaration.exported,
                 parameters,
                 result,
                 body,
@@ -542,6 +548,15 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 span,
             } => {
                 let condition = self.lower_expression(condition);
+                if !ScriptType::Bool.accepts(self.expression_type(condition)) {
+                    self.error(
+                        format!(
+                            "condition expects Bool, got {:?}",
+                            self.expression_type(condition)
+                        ),
+                        condition.span,
+                    );
+                }
                 let then_block = self.lower_block(then_block, true);
                 let else_block = else_block
                     .as_ref()
@@ -561,6 +576,15 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 span,
             } => {
                 let condition = self.lower_expression(condition);
+                if !ScriptType::Bool.accepts(self.expression_type(condition)) {
+                    self.error(
+                        format!(
+                            "condition expects Bool, got {:?}",
+                            self.expression_type(condition)
+                        ),
+                        condition.span,
+                    );
+                }
                 let body = self.lower_block(body, true);
                 (HirStmtKind::While { condition, body }, *span)
             }
@@ -594,15 +618,31 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             ExprKind::Ident(name) => return self.lower_identifier(name, expression.span),
             ExprKind::Symbol(name) => {
                 let symbol = self.symbol(name);
-                let ty = self
+                if let Some(member) = self
                     .manifest
                     .and_then(|manifest| manifest.resolve_getter(name).ok())
-                    .and_then(|member| {
-                        self.manifest
-                            .and_then(|manifest| manifest.signature(member.builtin))
-                    })
-                    .map(|signature| signature.result.clone())
-                    .unwrap_or(ScriptType::Symbol);
+                {
+                    let ty = self
+                        .manifest
+                        .and_then(|manifest| manifest.signature(member.builtin))
+                        .map(|signature| signature.result.clone())
+                        .unwrap_or(ScriptType::Any);
+                    let callee = self.alloc_expression(
+                        HirExprKind::Symbol(symbol),
+                        ScriptType::Symbol,
+                        expression.span,
+                    );
+                    return self.alloc_expression(
+                        HirExprKind::Call {
+                            callee,
+                            arguments: &[],
+                            function: ResolvedFunction::Builtin(member.builtin),
+                        },
+                        ty,
+                        expression.span,
+                    );
+                }
+                let ty = ScriptType::Symbol;
                 (HirExprKind::Symbol(symbol), ty)
             }
             ExprKind::UnaryMinus(value) => {
@@ -667,7 +707,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             } => {
                 let callee = self.lower_expression(callee);
                 let function = self.resolve_call(expression);
-                let arguments = arguments
+                let mut arguments = arguments
                     .iter()
                     .map(|argument| HirArgument {
                         label: argument.label.as_deref().map(|label| self.symbol(label)),
@@ -675,16 +715,26 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         span: argument.span,
                     })
                     .collect::<Vec<_>>();
+                if let Some(block) = trailing_block {
+                    let block = self.lower_block(block, true);
+                    let closure = self.alloc_expression(
+                        HirExprKind::Block(block),
+                        ScriptType::Function,
+                        block.span,
+                    );
+                    arguments.push(HirArgument {
+                        label: None,
+                        value: closure,
+                        span: block.span,
+                    });
+                }
                 let arguments = self.arena.alloc_slice_copy(&arguments);
-                let trailing_block = trailing_block
-                    .as_ref()
-                    .map(|block| self.lower_block(block, true));
+                self.check_call(function, callee, arguments, expression.span);
                 let ty = self.call_result(function);
                 (
                     HirExprKind::Call {
                         callee,
                         arguments,
-                        trailing_block,
                         function,
                     },
                     ty,
@@ -752,6 +802,39 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             ExprKind::Binary { left, op, right } => {
                 let left = self.lower_expression(left);
                 let right = self.lower_expression(right);
+                if let Some(builtin) = self.manifest.and_then(|manifest| {
+                    manifest.resolve_operator(match op {
+                        crate::BinaryOp::Colon => ":",
+                        _ => "",
+                    })
+                }) {
+                    let arguments = self.arena.alloc_slice_copy(&[
+                        HirArgument {
+                            label: None,
+                            value: left,
+                            span: left.span,
+                        },
+                        HirArgument {
+                            label: None,
+                            value: right,
+                            span: right.span,
+                        },
+                    ]);
+                    let callee = self.alloc_expression(
+                        HirExprKind::Builtin(builtin),
+                        ScriptType::Any,
+                        expression.span,
+                    );
+                    return self.alloc_expression(
+                        HirExprKind::Call {
+                            callee,
+                            arguments,
+                            function: ResolvedFunction::Builtin(builtin),
+                        },
+                        self.call_result(ResolvedFunction::Builtin(builtin)),
+                        expression.span,
+                    );
+                }
                 let ty = binary_type(*op, self.expression_type(left), self.expression_type(right));
                 (
                     HirExprKind::Binary {
@@ -764,6 +847,58 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
         };
         self.alloc_expression(kind, ty, expression.span)
+    }
+
+    fn check_call(
+        &mut self,
+        function: ResolvedFunction,
+        callee: &HirExpr<'_>,
+        arguments: &[HirArgument<'_>],
+        span: Span,
+    ) {
+        let ResolvedFunction::Builtin(builtin) = function else {
+            return;
+        };
+        let Some(signature) = self
+            .manifest
+            .and_then(|manifest| manifest.signature(builtin))
+        else {
+            return;
+        };
+        if signature.parameters.len() != arguments.len() {
+            self.error(
+                format!(
+                    "function expects {} arguments, got {}",
+                    signature.parameters.len(),
+                    arguments.len()
+                ),
+                span,
+            );
+            return;
+        }
+        if let Some(expected) = &signature.receiver
+            && let HirExprKind::Member { object, .. } = callee.kind
+            && !expected.accepts(self.expression_type(object))
+        {
+            self.error(
+                format!(
+                    "receiver expects {expected:?}, got {:?}",
+                    self.expression_type(object)
+                ),
+                callee.span,
+            );
+        }
+        for (expected, actual) in signature.parameters.iter().zip(arguments) {
+            if !expected.accepts(self.expression_type(actual.value)) {
+                self.error(
+                    format!(
+                        "argument expects {expected:?}, got {:?}",
+                        self.expression_type(actual.value)
+                    ),
+                    actual.span,
+                );
+            }
+        }
     }
 
     fn lower_identifier(&mut self, name: &str, span: Span) -> &'hir HirExpr<'hir> {
@@ -841,12 +976,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             if let Some(builtin) = self.manifest.and_then(|manifest| manifest.resolve(name)) {
                 return ResolvedFunction::Builtin(builtin);
             }
-            if self
-                .manifest
-                .and_then(BuiltinManifest::choice_syntax)
-                .is_some_and(|syntax| syntax.choice == *name)
-            {
-                return ResolvedFunction::Syntax(symbol);
+            if self.resolve_local(symbol).is_none() {
+                return ResolvedFunction::External(symbol);
             }
         }
         if let ExprKind::Symbol(name) = &callee.kind
@@ -881,7 +1012,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .and_then(|manifest| manifest.signature(builtin))
                 .map(|signature| signature.result.clone())
                 .unwrap_or(ScriptType::Any),
-            ResolvedFunction::Syntax(_) | ResolvedFunction::Dynamic => ScriptType::Any,
+            ResolvedFunction::External(_) | ResolvedFunction::Dynamic => ScriptType::Any,
         }
     }
 

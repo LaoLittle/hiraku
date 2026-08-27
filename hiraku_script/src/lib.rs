@@ -3,15 +3,17 @@ pub mod blocks;
 pub mod hir;
 pub mod hson;
 pub mod lex;
+pub mod linked_vm;
+pub mod linker;
 pub mod mir;
 pub mod native;
 pub mod parse;
 pub mod register;
-pub mod register_vm;
+pub mod vm;
+pub mod runtime;
 pub mod span;
 pub mod symbol;
 pub mod template;
-pub mod vm;
 
 pub use ast::{
     Argument, BinaryOp, Block, Expr, ExprKind, FunctionParameter, MapField, NumberUnit, Program,
@@ -29,6 +31,13 @@ pub use hiraku_errors::{
     emit_rendered_diagnostic, render_diagnostics, write_diagnostics, write_rendered_diagnostic,
 };
 pub use hiraku_script_derive::{HksHandle, hks_define, hks_module};
+pub use linked_vm::{
+    LinkedVm, LinkedVmError, LinkedVmEvent, LinkedVmFrameSnapshot, LinkedVmSnapshot,
+};
+pub use linker::{
+    LinkError, LinkedBytecode, LinkedFunction, LinkedModule, LinkedProgram, ModuleId,
+    link_register_bytecode, link_register_modules,
+};
 pub use mir::{
     MirBasicBlock, MirBlockId, MirConstant, MirFunction, MirInstruction, MirLoweringError,
     MirProgram, MirTerminator, VirtualRegister, lower_hir_to_mir,
@@ -38,10 +47,15 @@ pub use register::{
     InvalidRegister, Register, RegisterAllocation, RegisterAllocationError, RegisterFrame,
     allocate_registers,
 };
-pub use register_vm::{
+pub use vm::{
     REGISTER_BYTECODE_VERSION, RegisterBytecode, RegisterCompileError, RegisterConstant,
-    RegisterInstruction, RegisterVm, RegisterVmError, RegisterVmEvent, RegisterVmSnapshot,
-    RegisterVmStatus, compile_register_with_manifest,
+    RegisterInstruction, RegisterTaskEvent, RegisterTaskMode, RegisterTaskScheduler,
+    RegisterTaskSchedulerSnapshot, RegisterVm, RegisterVmError, RegisterVmEvent,
+    RegisterVmSnapshot, RegisterVmStatus, SymbolCall, compile_register_with_manifest,
+};
+pub use runtime::{
+    BuiltinCall, BuiltinId, BuiltinManifest, CallArgument, FunctionSignature, StaticMember,
+    StaticMemberKind, Value,
 };
 pub use span::Span;
 pub use symbol::{SymbolId, SymbolInterner, SymbolManifest};

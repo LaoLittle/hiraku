@@ -20,6 +20,7 @@ pub struct MirProgram {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MirFunction {
     pub blocks: Vec<MirBasicBlock>,
+    pub regions: Vec<MirFunction>,
     pub virtual_register_count: u32,
 }
 
@@ -34,6 +35,11 @@ pub enum MirInstruction {
     Constant {
         dst: VirtualRegister,
         value: MirConstant,
+    },
+    MakeClosure {
+        dst: VirtualRegister,
+        region: u32,
+        statements: Vec<u32>,
     },
     LoadLocal {
         dst: VirtualRegister,
@@ -103,6 +109,7 @@ pub enum MirInstruction {
     },
     Statement {
         value: VirtualRegister,
+        string: bool,
     },
 }
 
@@ -110,6 +117,7 @@ impl MirInstruction {
     pub fn defined_register(&self) -> Option<VirtualRegister> {
         match self {
             Self::Constant { dst, .. }
+            | Self::MakeClosure { dst, .. }
             | Self::LoadLocal { dst, .. }
             | Self::LoadGlobal { dst, .. }
             | Self::GetMember { dst, .. }
@@ -128,7 +136,10 @@ impl MirInstruction {
 
     pub fn used_registers(&self) -> Vec<VirtualRegister> {
         match self {
-            Self::Constant { .. } | Self::LoadLocal { .. } | Self::LoadGlobal { .. } => Vec::new(),
+            Self::Constant { .. }
+            | Self::MakeClosure { .. }
+            | Self::LoadLocal { .. }
+            | Self::LoadGlobal { .. } => Vec::new(),
             Self::StoreLocal { src, .. } | Self::StoreGlobal { src, .. } => vec![*src],
             Self::GetMember { object, .. } => vec![*object],
             Self::SetMember { object, value, .. } => vec![*object, *value],
@@ -150,7 +161,7 @@ impl MirInstruction {
             Self::SelectNonNull {
                 value, fallback, ..
             } => vec![*value, *fallback],
-            Self::Statement { value } => vec![*value],
+            Self::Statement { value, .. } => vec![*value],
         }
     }
 }
@@ -226,6 +237,7 @@ pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLower
 
 struct MirBuilder {
     blocks: Vec<MirBasicBlock>,
+    regions: Vec<MirFunction>,
     current: MirBlockId,
     next_register: u32,
 }
@@ -241,6 +253,7 @@ impl MirBuilder {
                 instructions: Vec::new(),
                 terminator: MirTerminator::Unset,
             }],
+            regions: Vec::new(),
             current: MirBlockId(0),
             next_register: 0,
         };
@@ -254,6 +267,7 @@ impl MirBuilder {
         }
         MirFunction {
             blocks: builder.blocks,
+            regions: builder.regions,
             virtual_register_count: builder.next_register,
         }
     }
@@ -279,7 +293,10 @@ impl MirBuilder {
             HirStmtKind::Let { local, value } => {
                 let value = self.lower_expression(value, errors)?;
                 self.push(MirInstruction::StoreLocal { local, src: value });
-                self.push(MirInstruction::Statement { value });
+                self.push(MirInstruction::Statement {
+                    value,
+                    string: false,
+                });
                 Some(value)
             }
             HirStmtKind::Global { global, value } => {
@@ -288,18 +305,27 @@ impl MirBuilder {
                     None => self.constant(MirConstant::Null),
                 };
                 self.push(MirInstruction::StoreGlobal { global, src: value });
-                self.push(MirInstruction::Statement { value });
+                self.push(MirInstruction::Statement {
+                    value,
+                    string: false,
+                });
                 Some(value)
             }
             HirStmtKind::Assign { target, value } => {
                 let value = self.lower_expression(value, errors)?;
                 self.store_place(target, value);
-                self.push(MirInstruction::Statement { value });
+                self.push(MirInstruction::Statement {
+                    value,
+                    string: false,
+                });
                 Some(value)
             }
             HirStmtKind::Expr(expression) => {
                 let value = self.lower_expression(expression, errors)?;
-                self.push(MirInstruction::Statement { value });
+                self.push(MirInstruction::Statement {
+                    value,
+                    string: matches!(expression.kind, HirExprKind::Literal(HirLiteral::String(_))),
+                });
                 Some(value)
             }
             HirStmtKind::If {
@@ -421,24 +447,17 @@ impl MirBuilder {
             HirExprKind::Call {
                 callee,
                 arguments,
-                trailing_block,
                 function,
             } => {
-                if trailing_block.is_some() {
-                    errors.push(MirLoweringError {
-                        message:
-                            "register MIR task/structured-call regions are not implemented yet"
-                                .into(),
-                        span: expression.span,
-                    });
-                    return None;
-                }
                 let dynamic_callee = matches!(function, ResolvedFunction::Dynamic)
                     .then(|| self.lower_expression(callee, errors))
                     .flatten();
                 let receiver = match callee.kind {
                     HirExprKind::Member { object, .. }
-                        if matches!(function, ResolvedFunction::Builtin(_)) =>
+                        if matches!(
+                            function,
+                            ResolvedFunction::Builtin(_) | ResolvedFunction::External(_)
+                        ) =>
                     {
                         self.lower_expression(object, errors)
                     }
@@ -498,7 +517,24 @@ impl MirBuilder {
                 });
                 Some(dst)
             }
-            HirExprKind::Block(block) => self.lower_block(block, errors),
+            HirExprKind::Block(block) => {
+                let region = Self::lower(block, true, errors);
+                let region_id = self.regions.len() as u32;
+                self.regions.push(region);
+                let mut statements = Vec::with_capacity(block.statements.len());
+                for statement in block.statements {
+                    let statement_region = Self::lower_statement_region(statement, errors);
+                    statements.push(self.regions.len() as u32);
+                    self.regions.push(statement_region);
+                }
+                let dst = self.register();
+                self.push(MirInstruction::MakeClosure {
+                    dst,
+                    region: region_id,
+                    statements,
+                });
+                Some(dst)
+            }
             HirExprKind::Function(_) | HirExprKind::Builtin(_) | HirExprKind::Unresolved(_) => {
                 errors.push(MirLoweringError {
                     message: "function values are not implemented in register MIR yet".into(),
@@ -506,6 +542,30 @@ impl MirBuilder {
                 });
                 None
             }
+        }
+    }
+
+    fn lower_statement_region(
+        statement: &crate::HirStmt<'_>,
+        errors: &mut Vec<MirLoweringError>,
+    ) -> MirFunction {
+        let mut builder = Self {
+            blocks: vec![MirBasicBlock {
+                instructions: Vec::new(),
+                terminator: MirTerminator::Unset,
+            }],
+            regions: Vec::new(),
+            current: MirBlockId(0),
+            next_register: 0,
+        };
+        let result = builder.lower_statement(statement, errors);
+        if matches!(builder.current_block().terminator, MirTerminator::Unset) {
+            builder.current_block_mut().terminator = MirTerminator::Return(result);
+        }
+        MirFunction {
+            blocks: builder.blocks,
+            regions: builder.regions,
+            virtual_register_count: builder.next_register,
         }
     }
 

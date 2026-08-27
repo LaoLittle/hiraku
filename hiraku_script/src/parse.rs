@@ -365,7 +365,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Stmt {
         if let TokenKind::Ident(name) = &self.current().kind {
             match name.as_str() {
-                "fn" => return self.parse_function(),
+                "fn" => return self.parse_function(false),
                 "type" => return self.parse_type_alias(),
                 "let" | "var" => return self.parse_let(),
                 "global" => return self.parse_global(),
@@ -409,7 +409,7 @@ impl Parser {
         }
     }
 
-    fn parse_function(&mut self) -> Stmt {
+    fn parse_function(&mut self, exported: bool) -> Stmt {
         let start = self.advance();
         let name = match self.advance().kind {
             TokenKind::Ident(name) => name,
@@ -464,6 +464,7 @@ impl Parser {
         let body = self.parse_block();
         let span = Span::join(&start.span, &body.span);
         Stmt::Function {
+            exported,
             name,
             parameters,
             return_type,
@@ -553,6 +554,9 @@ impl Parser {
 
     fn parse_global(&mut self) -> Stmt {
         let start = self.advance();
+        if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
+            return self.parse_function(true);
+        }
         let name = match self.advance().kind {
             TokenKind::Ident(name) => name,
             _ => {
@@ -1251,6 +1255,16 @@ mod tests {
             ["actor", "emotion"]
         );
         assert_eq!(body.statements.len(), 1);
+    }
+
+    #[test]
+    fn parses_exported_global_functions() {
+        let program = parse_program("global fn greet(name: String) { name }")
+            .expect("global function must parse");
+        assert!(matches!(
+            &program.statements[0],
+            Stmt::Function { exported: true, name, .. } if name == "greet"
+        ));
     }
 
     #[test]

@@ -87,10 +87,10 @@ fn expand_hks_handle(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     Ok(quote! {
         impl ::hiraku_script::native::FromHksValue for #name {
             fn from_hks_value(
-                value: &::hiraku_script::vm::Value,
+                value: &::hiraku_script::Value,
             ) -> Result<Self, ::hiraku_script::native::NativeError> {
                 match value {
-                    ::hiraku_script::vm::Value::Handle { type_id, id }
+                    ::hiraku_script::Value::Handle { type_id, id }
                         if *type_id == (#handle_type) as u32 => Ok(Self(*id)),
                     _ => Err(::hiraku_script::native::NativeError::TypeMismatch(#public_name)),
                 }
@@ -98,8 +98,8 @@ fn expand_hks_handle(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
 
         impl ::hiraku_script::native::IntoHksValue for #name {
-            fn into_hks_value(self) -> ::hiraku_script::vm::Value {
-                ::hiraku_script::vm::Value::Handle {
+            fn into_hks_value(self) -> ::hiraku_script::Value {
+                ::hiraku_script::Value::Handle {
                     type_id: (#handle_type) as u32,
                     id: self.0,
                 }
@@ -109,8 +109,8 @@ fn expand_hks_handle(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         impl ::hiraku_script::native::HksScriptType for #name {
             fn hks_script_type<C>(
                 registry: &mut ::hiraku_script::native::NativeRegistry<C>,
-            ) -> ::hiraku_script::vm::ScriptType {
-                ::hiraku_script::vm::ScriptType::Named(registry.define_type(#public_name))
+            ) -> ::hiraku_script::ScriptType {
+                ::hiraku_script::ScriptType::Named(registry.define_type(#public_name))
             }
         }
     })
@@ -315,7 +315,7 @@ fn register_module_function(
     let result = module_script_type(result_type, options.result.as_deref())?;
     Ok(quote! {
         let builtin = registry.register_fn(#public_name, #rust_name)?;
-        let signature = ::hiraku_script::vm::FunctionSignature {
+        let signature = ::hiraku_script::FunctionSignature {
             receiver: #receiver,
             parameters: vec![ #( #parameters ),* ],
             result: #result,
@@ -370,7 +370,7 @@ fn module_script_type(
 }
 
 fn named_script_type(name: &str) -> proc_macro2::TokenStream {
-    quote!(::hiraku_script::vm::ScriptType::Named(registry.define_type(#name)))
+    quote!(::hiraku_script::ScriptType::Named(registry.define_type(#name)))
 }
 
 fn camel_case(name: &str) -> String {
@@ -462,21 +462,21 @@ fn expand(item: ItemEnum, implementation: &mut ItemImpl) -> syn::Result<proc_mac
         impl ::hiraku_script::native::HksNativeType for #type_name {
             const HKS_TYPE_NAME: &'static str = stringify!(#type_name);
 
-            fn encode_hks_payload(self) -> ::hiraku_script::vm::Value {
+            fn encode_hks_payload(self) -> ::hiraku_script::Value {
                 match self {
                     #( #encode_arms ),*
                 }
             }
 
             fn decode_hks_payload(
-                value: &::hiraku_script::vm::Value,
+                value: &::hiraku_script::Value,
             ) -> Result<Self, ::hiraku_script::native::NativeError> {
-                let ::hiraku_script::vm::Value::Tuple(fields) = value else {
+                let ::hiraku_script::Value::Tuple(fields) = value else {
                     return Err(::hiraku_script::native::NativeError::TypeMismatch(
                         stringify!(#type_name),
                     ));
                 };
-                let Some(::hiraku_script::vm::Value::Symbol(variant)) = fields.first() else {
+                let Some(::hiraku_script::Value::Symbol(variant)) = fields.first() else {
                     return Err(::hiraku_script::native::NativeError::TypeMismatch(
                         stringify!(#type_name),
                     ));
@@ -493,9 +493,9 @@ fn expand(item: ItemEnum, implementation: &mut ItemImpl) -> syn::Result<proc_mac
 
         impl ::hiraku_script::native::FromHksValue for #type_name {
             fn from_hks_value(
-                value: &::hiraku_script::vm::Value,
+                value: &::hiraku_script::Value,
             ) -> Result<Self, ::hiraku_script::native::NativeError> {
-                let ::hiraku_script::vm::Value::Typed { value, .. } = value else {
+                let ::hiraku_script::Value::Typed { value, .. } = value else {
                     return Err(::hiraku_script::native::NativeError::TypeMismatch(
                         stringify!(#type_name),
                     ));
@@ -507,8 +507,8 @@ fn expand(item: ItemEnum, implementation: &mut ItemImpl) -> syn::Result<proc_mac
         impl ::hiraku_script::native::HksScriptType for #type_name {
             fn hks_script_type<C>(
                 registry: &mut ::hiraku_script::native::NativeRegistry<C>,
-            ) -> ::hiraku_script::vm::ScriptType {
-                ::hiraku_script::vm::ScriptType::Named(
+            ) -> ::hiraku_script::ScriptType {
+                ::hiraku_script::ScriptType::Named(
                     registry.define_type(stringify!(#type_name)),
                 )
             }
@@ -593,9 +593,9 @@ fn register_method(
     }
     let expected_arity = parameter_types.len();
     let kind = if getter {
-        quote!(::hiraku_script::vm::StaticMemberKind::Getter)
+        quote!(::hiraku_script::StaticMemberKind::Getter)
     } else {
-        quote!(::hiraku_script::vm::StaticMemberKind::Method)
+        quote!(::hiraku_script::StaticMemberKind::Method)
     };
 
     let invoke = if fallible {
@@ -608,10 +608,10 @@ fn register_method(
         registry.register_static_raw_fn(
             type_id,
             #public_name,
-            ::hiraku_script::vm::FunctionSignature {
+            ::hiraku_script::FunctionSignature {
                 receiver: None,
                 parameters: vec![ #( #parameter_types ),* ],
-                result: ::hiraku_script::vm::ScriptType::Named(type_id),
+                result: ::hiraku_script::ScriptType::Named(type_id),
             },
             #kind,
             move |_context, call| {
@@ -677,12 +677,10 @@ fn script_type(ty: &Type) -> syn::Result<proc_macro2::TokenStream> {
         ));
     };
     match name.as_str() {
-        "f32" | "f64" => Ok(quote!(::hiraku_script::vm::ScriptType::Number)),
-        "u8" | "u16" | "u32" | "i8" | "i16" | "i32" => {
-            Ok(quote!(::hiraku_script::vm::ScriptType::Int))
-        }
-        "String" => Ok(quote!(::hiraku_script::vm::ScriptType::String)),
-        "bool" => Ok(quote!(::hiraku_script::vm::ScriptType::Bool)),
+        "f32" | "f64" => Ok(quote!(::hiraku_script::ScriptType::Number)),
+        "u8" | "u16" | "u32" | "i8" | "i16" | "i32" => Ok(quote!(::hiraku_script::ScriptType::Int)),
+        "String" => Ok(quote!(::hiraku_script::ScriptType::String)),
+        "bool" => Ok(quote!(::hiraku_script::ScriptType::Bool)),
         _ => Err(syn::Error::new_spanned(
             ty,
             "the first hks_define! version supports numeric, String and bool parameters",
@@ -698,8 +696,8 @@ fn encode_variant(
     let public_name = variant_name.to_string();
     match &variant.fields {
         syn::Fields::Unit => Ok(quote! {
-            #type_name::#variant_name => ::hiraku_script::vm::Value::Tuple(vec![
-                ::hiraku_script::vm::Value::Symbol(#public_name.to_string()),
+            #type_name::#variant_name => ::hiraku_script::Value::Tuple(vec![
+                ::hiraku_script::Value::Symbol(#public_name.to_string()),
             ])
         }),
         syn::Fields::Unnamed(fields) => {
@@ -708,8 +706,8 @@ fn encode_variant(
                 .collect::<Vec<_>>();
             Ok(quote! {
                 #type_name::#variant_name( #( #bindings ),* ) =>
-                    ::hiraku_script::vm::Value::Tuple(vec![
-                        ::hiraku_script::vm::Value::Symbol(#public_name.to_string()),
+                    ::hiraku_script::Value::Tuple(vec![
+                        ::hiraku_script::Value::Symbol(#public_name.to_string()),
                         #( ::hiraku_script::native::IntoHksValue::into_hks_value(#bindings) ),*
                     ])
             })

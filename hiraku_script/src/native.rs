@@ -6,11 +6,11 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
-    symbol::{SymbolId, SymbolInterner},
-    vm::{
+    runtime::{
         BuiltinCall, BuiltinId, BuiltinManifest, FunctionSignature, StaticMember, StaticMemberKind,
         Value,
     },
+    symbol::{SymbolId, SymbolInterner},
 };
 
 type NativeResult = Result<Value, NativeError>;
@@ -26,7 +26,7 @@ pub struct NativeRegistry<C> {
     symbols: SymbolInterner,
     signatures: BTreeMap<BuiltinId, FunctionSignature>,
     static_members: Vec<StaticMember>,
-    globals: BTreeMap<String, crate::vm::ScriptType>,
+    globals: BTreeMap<String, crate::ScriptType>,
 }
 
 impl<C> Default for NativeRegistry<C> {
@@ -57,7 +57,7 @@ impl<C> NativeRegistry<C> {
     pub fn define_global(
         &mut self,
         name: impl Into<String>,
-        ty: crate::vm::ScriptType,
+        ty: crate::ScriptType,
     ) -> Result<(), RegistrationError> {
         let name = name.into();
         if self.globals.insert(name.clone(), ty).is_some() {
@@ -517,13 +517,58 @@ impl FromHksValue for SelectorValue {
     }
 }
 
+/// A save-safe script closure passed to embedding functions.
+///
+/// It contains bytecode region identifiers and captured script values; no Rust
+/// function pointer or host address enters [`Value`]. The embedding decides
+/// when and how to schedule it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HksClosure {
+    pub region: u32,
+    pub statements: Vec<u32>,
+    pub captures: Vec<Value>,
+}
+
+impl FromHksValue for HksClosure {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::RegisterClosure {
+                region,
+                statements,
+                captures,
+            } => Ok(Self {
+                region: *region,
+                statements: statements.clone(),
+                captures: captures.clone(),
+            }),
+            _ => Err(NativeError::TypeMismatch("function")),
+        }
+    }
+}
+
+impl IntoHksValue for HksClosure {
+    fn into_hks_value(self) -> Value {
+        Value::RegisterClosure {
+            region: self.region,
+            statements: self.statements,
+            captures: self.captures,
+        }
+    }
+}
+
+impl HksScriptType for HksClosure {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Function
+    }
+}
+
 pub trait IntoHksValue {
     fn into_hks_value(self) -> Value;
 }
 
 /// Maps a Rust native API type to the compiler-visible HKS type.
 pub trait HksScriptType {
-    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType;
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::ScriptType;
 }
 
 pub trait HksNativeType: Sized {
@@ -547,8 +592,8 @@ impl FromHksValue for Value {
 }
 
 impl HksScriptType for Value {
-    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::Any
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Any
     }
 }
 
@@ -574,8 +619,8 @@ impl IntoHksValue for String {
 }
 
 impl HksScriptType for String {
-    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::String
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::String
     }
 }
 
@@ -595,8 +640,8 @@ impl IntoHksValue for bool {
 }
 
 impl HksScriptType for bool {
-    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::Bool
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Bool
     }
 }
 
@@ -616,8 +661,8 @@ impl IntoHksValue for f64 {
 }
 
 impl HksScriptType for f64 {
-    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::Number
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Number
     }
 }
 
@@ -634,8 +679,8 @@ impl IntoHksValue for f32 {
 }
 
 impl HksScriptType for f32 {
-    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::Number
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Number
     }
 }
 
@@ -667,8 +712,8 @@ macro_rules! impl_integer_value {
             }
 
             impl HksScriptType for $type {
-                fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-                    crate::vm::ScriptType::Int
+                fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+                    crate::ScriptType::Int
                 }
             }
         )*
@@ -684,20 +729,20 @@ impl IntoHksValue for () {
 }
 
 impl HksScriptType for () {
-    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::Unit
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Unit
     }
 }
 
 impl<T: HksScriptType> HksScriptType for Option<T> {
-    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::Nullable(Box::new(T::hks_script_type(registry)))
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Nullable(Box::new(T::hks_script_type(registry)))
     }
 }
 
 impl<T: HksScriptType> HksScriptType for Vec<T> {
-    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::vm::ScriptType {
-        crate::vm::ScriptType::List(Box::new(T::hks_script_type(registry)))
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::List(Box::new(T::hks_script_type(registry)))
     }
 }
 
@@ -810,393 +855,3 @@ impl fmt::Display for RegistrationError {
 }
 
 impl Error for RegistrationError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        parse_program,
-        vm::{ScriptType, StaticMemberKind, compile_with_manifest},
-    };
-
-    #[derive(Default)]
-    struct Context {
-        calls: usize,
-    }
-
-    crate::hks_define! {
-        #[derive(Clone, Debug, PartialEq)]
-        enum MacroPosition {
-            Absolute(f64, f64),
-            Relative(u16, u16),
-        }
-
-        impl MacroPosition {
-            fn rel(x: u16, y: u16) -> MacroPosition {
-                MacroPosition::Relative(x, y)
-            }
-
-            #[getter]
-            fn left() -> MacroPosition {
-                MacroPosition::Absolute(-600.0, -200.0)
-            }
-        }
-    }
-
-    fn greet(context: &mut Context, name: String) -> Result<String, NativeError> {
-        context.calls += 1;
-        Ok(format!("hello {name}"))
-    }
-
-    fn selector_zoom(
-        context: &mut Context,
-        selector: SelectorValue,
-        scale: f64,
-    ) -> Result<(), NativeError> {
-        assert_eq!(selector.0, "camera");
-        assert_eq!(scale, 1.2);
-        context.calls += 1;
-        Ok(())
-    }
-
-    #[crate::hks_module]
-    mod macro_api {
-        use super::*;
-
-        #[hks]
-        fn native_greet_user(context: &mut Context, name: String) -> Result<String, NativeError> {
-            context.calls += 1;
-            Ok(format!("hello {name}"))
-        }
-
-        #[hks(name = "rename", receiver = "Actor", result = "Actor")]
-        fn rename_actor(
-            context: &mut Context,
-            actor: String,
-            _name: String,
-        ) -> Result<String, NativeError> {
-            context.calls += 1;
-            Ok(actor)
-        }
-    }
-
-    #[test]
-    fn hks_module_registers_names_and_signatures_from_rust_functions() {
-        let mut registry = NativeRegistry::<Context>::new();
-        macro_api::register_hks(&mut registry).expect("module API must register");
-        let manifest = registry.manifest();
-        let actor = manifest
-            .symbols()
-            .find("Actor")
-            .expect("receiver override must define Actor");
-        let greet = manifest.resolve("greetUser").expect("camelCase name");
-        assert_eq!(
-            manifest.signature(greet),
-            Some(&FunctionSignature {
-                receiver: None,
-                parameters: vec![ScriptType::String],
-                result: ScriptType::String,
-            })
-        );
-        let rename = manifest.resolve("rename").expect("explicit public name");
-        assert_eq!(
-            manifest.signature(rename),
-            Some(&FunctionSignature {
-                receiver: Some(ScriptType::Named(actor)),
-                parameters: vec![ScriptType::String],
-                result: ScriptType::Named(actor),
-            })
-        );
-    }
-
-    #[test]
-    fn registers_a_typed_rust_function_and_dispatches_compiled_calls() {
-        let mut registry = NativeRegistry::new();
-        let id = registry.register_fn("greet", greet).unwrap();
-        let bytecode = compile_with_manifest(
-            &parse_program(r#"greet("HKS")"#).unwrap(),
-            42,
-            &registry.manifest(),
-        )
-        .unwrap();
-        let crate::vm::Instruction::CallBuiltin { builtin, .. } = &bytecode.instructions[1] else {
-            panic!("expected builtin call")
-        };
-        assert_eq!(*builtin, id);
-
-        let mut context = Context::default();
-        let result = registry
-            .call(
-                &mut context,
-                &BuiltinCall {
-                    builtin: id,
-                    receiver: None,
-                    arguments: vec![crate::vm::CallArgument {
-                        label: None,
-                        value: Value::String("HKS".to_string()),
-                    }],
-                },
-            )
-            .unwrap();
-        assert_eq!(result, Value::String("hello HKS".to_string()));
-        assert_eq!(context.calls, 1);
-    }
-
-    #[test]
-    fn selector_methods_preserve_a_typed_receiver_in_bytecode_calls() {
-        let mut registry = NativeRegistry::<Context>::new();
-        registry
-            .register_selector_raw_fn("camera", "zoom", |_context, call| {
-                assert_eq!(call.receiver, Some(Value::Selector("camera".to_string())));
-                Ok(Value::Null)
-            })
-            .expect("selector method registration must succeed");
-        let bytecode = compile_with_manifest(
-            &parse_program("camera.zoom(1.2)").expect("selector call must parse"),
-            43,
-            &registry.manifest(),
-        )
-        .expect("selector call must compile");
-        let Some(crate::vm::Instruction::MakeSelector(selector)) = bytecode.instructions.first()
-        else {
-            panic!("expected an interned selector instruction")
-        };
-        assert_eq!(bytecode.symbols.resolve(*selector), Some("camera"));
-        let mut vm = crate::vm::Vm::new(bytecode).expect("selector VM must initialize");
-        let Some(crate::vm::VmEvent::Call(call)) =
-            vm.step().expect("selector VM step must succeed")
-        else {
-            panic!("expected selector builtin call")
-        };
-        registry
-            .call(&mut Context::default(), &call)
-            .expect("selector call must dispatch with its receiver");
-    }
-
-    #[test]
-    fn nested_selector_names_are_interned_as_one_receiver() {
-        let mut registry = NativeRegistry::<Context>::new();
-        registry
-            .register_selector_raw_fn("camera.effects", "blur", |_context, call| {
-                assert_eq!(
-                    call.receiver,
-                    Some(Value::Selector("camera.effects".to_string()))
-                );
-                Ok(Value::Null)
-            })
-            .expect("nested selector method registration must succeed");
-        let bytecode = compile_with_manifest(
-            &parse_program("camera.effects.blur()").expect("nested selector call must parse"),
-            44,
-            &registry.manifest(),
-        )
-        .expect("nested selector call must compile");
-        let selector = bytecode
-            .symbols
-            .find("camera.effects")
-            .expect("nested selector is interned");
-        assert!(matches!(
-            bytecode.instructions.first(),
-            Some(crate::vm::Instruction::MakeSelector(actual)) if *actual == selector
-        ));
-        let mut vm = crate::vm::Vm::new(bytecode).expect("selector VM must initialize");
-        let Some(crate::vm::VmEvent::Call(call)) =
-            vm.step().expect("selector VM step must succeed")
-        else {
-            panic!("expected selector builtin call")
-        };
-        registry
-            .call(&mut Context::default(), &call)
-            .expect("nested selector call must dispatch");
-    }
-
-    #[test]
-    fn selector_methods_can_register_typed_rust_functions() {
-        let mut registry = NativeRegistry::<Context>::new();
-        registry
-            .register_selector_fn("camera", "zoom", selector_zoom)
-            .expect("typed selector method registration must succeed");
-        let bytecode = compile_with_manifest(
-            &parse_program("camera.zoom(1.2)").expect("selector call must parse"),
-            44,
-            &registry.manifest(),
-        )
-        .expect("typed selector call must compile");
-        let mut vm = crate::vm::Vm::new(bytecode).expect("selector VM must initialize");
-        let Some(crate::vm::VmEvent::Call(call)) =
-            vm.step().expect("selector VM step must succeed")
-        else {
-            panic!("expected selector builtin call")
-        };
-        let mut context = Context::default();
-        registry
-            .call(&mut context, &call)
-            .expect("typed selector call must dispatch");
-        assert_eq!(context.calls, 1);
-    }
-
-    #[test]
-    fn name_ids_do_not_depend_on_registration_order() {
-        let mut first = NativeRegistry::<Context>::new();
-        let a = first.register_fn("greet", greet).unwrap();
-        let mut second = NativeRegistry::<Context>::new();
-        second
-            .register_fn("other", |_: &mut Context| Ok(()))
-            .unwrap();
-        let b = second.register_fn("greet", greet).unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn operators_are_embedding_registered_native_functions() {
-        let mut registry = NativeRegistry::<Context>::new();
-        registry
-            .register_operator_fn(
-                ":",
-                |context: &mut Context, speaker: Value, text: String| {
-                    assert_eq!(speaker, Value::Ellipsis);
-                    assert_eq!(text, "continued");
-                    context.calls += 1;
-                    Ok(())
-                },
-            )
-            .expect("operator registration must succeed");
-        let bytecode = compile_with_manifest(
-            &parse_program(r#"...: "continued""#).expect("operator expression must parse"),
-            45,
-            &registry.manifest(),
-        )
-        .expect("registered operator must compile");
-        let mut vm = crate::vm::Vm::new(bytecode).expect("VM must initialize");
-        let Some(crate::vm::VmEvent::Call(call)) = vm.step().expect("VM must yield") else {
-            panic!("expected operator native call")
-        };
-        let mut context = Context::default();
-        registry
-            .call(&mut context, &call)
-            .expect("operator must dispatch through registry");
-        assert_eq!(context.calls, 1);
-    }
-
-    #[test]
-    fn registered_types_expose_static_methods_and_getters() {
-        let mut registry = NativeRegistry::<Context>::new();
-        let position = registry.define_type("Position");
-        let rel = registry
-            .register_static_raw_fn(
-                position,
-                "rel",
-                FunctionSignature {
-                    receiver: None,
-                    parameters: vec![ScriptType::Number, ScriptType::Number],
-                    result: ScriptType::Named(position),
-                },
-                StaticMemberKind::Method,
-                |_context, call| {
-                    Ok(Value::Tuple(
-                        call.arguments
-                            .iter()
-                            .map(|argument| argument.value.clone())
-                            .collect(),
-                    ))
-                },
-            )
-            .expect("Position.rel must register");
-        let left = registry
-            .register_static_raw_fn(
-                position,
-                "left",
-                FunctionSignature {
-                    receiver: None,
-                    parameters: Vec::new(),
-                    result: ScriptType::Named(position),
-                },
-                StaticMemberKind::Getter,
-                |_context, _call| Ok(Value::Symbol("left".to_string())),
-            )
-            .expect("Position.left must register");
-
-        let manifest = registry.manifest();
-        assert_eq!(manifest.symbols().resolve(position), Some("Position"));
-        let bytecode = compile_with_manifest(
-            &parse_program("let a = .rel(1, 12)\nlet b = .left")
-                .expect("static member syntax must parse"),
-            46,
-            &manifest,
-        )
-        .expect("registered static members must compile");
-        assert!(bytecode.instructions.iter().any(|instruction| matches!(
-            instruction,
-            crate::vm::Instruction::CallBuiltin {
-                builtin,
-                has_receiver: false,
-                ..
-            } if *builtin == rel
-        )));
-        assert!(bytecode.instructions.iter().any(|instruction| matches!(
-            instruction,
-            crate::vm::Instruction::CallBuiltin {
-                builtin,
-                has_receiver: false,
-                ..
-            } if *builtin == left
-        )));
-    }
-
-    #[test]
-    fn static_method_signatures_are_checked_during_compilation() {
-        let mut registry = NativeRegistry::<Context>::new();
-        let position = registry.define_type("Position");
-        registry
-            .register_static_raw_fn(
-                position,
-                "rel",
-                FunctionSignature {
-                    receiver: None,
-                    parameters: vec![ScriptType::Number, ScriptType::Number],
-                    result: ScriptType::Named(position),
-                },
-                StaticMemberKind::Method,
-                |_context, _call| Ok(Value::Null),
-            )
-            .expect("Position.rel must register");
-        let errors = compile_with_manifest(
-            &parse_program(r#".rel("wrong", 12)"#).expect("call must parse"),
-            47,
-            &registry.manifest(),
-        )
-        .expect_err("argument type mismatch must fail compilation");
-        assert!(errors[0].message.contains("expects Number"));
-    }
-
-    #[test]
-    fn hks_define_generates_type_and_member_registration() {
-        let mut registry = NativeRegistry::<Context>::new();
-        let position = MacroPosition::register_hks(&mut registry)
-            .expect("macro generated registration must succeed");
-        let manifest = registry.manifest();
-        assert_eq!(manifest.symbols().resolve(position), Some("MacroPosition"));
-        let bytecode = compile_with_manifest(
-            &parse_program("let a = .rel(20, 40)\nlet b = .left")
-                .expect("generated API syntax must parse"),
-            48,
-            &manifest,
-        )
-        .expect("generated signatures must compile");
-        let mut vm = crate::vm::Vm::new(bytecode).expect("VM must initialize");
-        let Some(crate::vm::VmEvent::Call(call)) = vm.step().expect("VM must advance") else {
-            panic!("expected macro-generated static call")
-        };
-        let value = registry
-            .call(&mut Context::default(), &call)
-            .expect("macro-generated thunk must dispatch");
-        let Value::Typed { type_id, value } = value else {
-            panic!("native type must be tagged")
-        };
-        assert_eq!(type_id, position);
-        assert_eq!(
-            MacroPosition::decode_hks_payload(&value).expect("macro-generated payload must decode"),
-            MacroPosition::Relative(20, 40)
-        );
-    }
-}

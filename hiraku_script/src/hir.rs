@@ -201,16 +201,6 @@ pub enum StatementValue {
     String(String),
 }
 
-pub(crate) fn lower_statement(statement: &Stmt) -> StatementValue {
-    match statement {
-        Stmt::Expr(expression) => match &expression.kind {
-            ExprKind::String(value) => StatementValue::String(value.clone()),
-            _ => StatementValue::Commit,
-        },
-        _ => StatementValue::Commit,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

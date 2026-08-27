@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use hiraku_script::native::{NativeError, NativeRegistry};
-use hiraku_script::vm::{
-    BuiltinCall, BuiltinManifest, Bytecode, ScriptType, Value, compile_with_manifest,
+use hiraku_script::{
+    BuiltinCall, BuiltinManifest, RegisterBytecode, ScriptType, Value,
+    compile_register_with_manifest,
 };
 use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, render_diagnostics};
 use serde::{Deserialize, Serialize};
@@ -77,14 +78,10 @@ const ACTOR_HANDLE_TYPE: u32 = 1;
 /// Manifest used by the direct whole-story HKS runtime. Async capabilities are
 /// registered here so the generic compiler can resolve them without engine AST lowering.
 pub fn story_manifest() -> BuiltinManifest {
-    let manifest = story_registry().manifest();
-    let builtin = manifest
-        .resolve("__presentChoice")
-        .expect("choice presentation builtin must be registered");
-    manifest.with_choice_syntax("choice", "option", builtin)
+    story_registry().manifest()
 }
 
-pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, String> {
+pub fn compile_story_bytecode(path: &str, source: &str) -> Result<RegisterBytecode, String> {
     compile_story_bytecode_with_options(path, source, RenderOptions::plain())
 }
 
@@ -92,7 +89,7 @@ pub fn compile_story_bytecode_with_options(
     path: &str,
     source: &str,
     render_options: RenderOptions,
-) -> Result<Bytecode, String> {
+) -> Result<RegisterBytecode, String> {
     let mut sources = SourceMap::new();
     let source_id = sources.insert(path, source);
     let program = parse_program(source).map_err(|errors| {
@@ -102,7 +99,7 @@ pub fn compile_story_bytecode_with_options(
             .collect::<Vec<_>>();
         render_diagnostics(&diagnostics, &sources, render_options)
     })?;
-    compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
+    compile_register_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
         |errors| {
             let diagnostics = errors
                 .into_iter()
@@ -192,9 +189,37 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
     registry
         .register_raw_fn("wait", async_capability_placeholder)
         .expect("built-in `wait` registration must be unique");
+    for name in ["seq", "par"] {
+        let builtin = registry
+            .register_raw_fn(name, async_capability_placeholder)
+            .expect("task closure builtin registration must be unique");
+        registry
+            .set_signature(
+                builtin,
+                hiraku_script::FunctionSignature {
+                    receiver: None,
+                    parameters: vec![ScriptType::Function],
+                    result: ScriptType::Task,
+                },
+            )
+            .expect("task closure signature must target its registered builtin");
+    }
     registry
-        .register_raw_fn("__presentChoice", async_capability_placeholder)
-        .expect("built-in choice presenter registration must be unique");
+        .register_raw_fn("choice", async_capability_placeholder)
+        .expect("built-in `choice` registration must be unique");
+    let option = registry
+        .register_raw_fn("option", async_capability_placeholder)
+        .expect("built-in `option` registration must be unique");
+    registry
+        .set_signature(
+            option,
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: vec![ScriptType::String, ScriptType::Function],
+                result: ScriptType::Unit,
+            },
+        )
+        .expect("option signature must target its registered builtin");
     registry
 }
 
@@ -236,6 +261,7 @@ impl StoryNativeHost {
             .map_err(|error| CharacterCapabilityError::Native(error.to_string()))
     }
 
+    #[cfg(test)]
     pub fn commit_statement(&mut self) -> Result<(), CharacterCapabilityError> {
         self.context.commit()
     }
@@ -679,7 +705,7 @@ mod native_api {
     #[hks(raw, selector = "camera", name = "blur")]
     fn native_camera_blur(
         context: &mut CharacterContext,
-        call: &hiraku_script::vm::BuiltinCall,
+        call: &hiraku_script::BuiltinCall,
     ) -> Result<Value, NativeError> {
         require_selector(call, "camera")?;
         let mut intensity = None;
@@ -715,7 +741,7 @@ mod native_api {
     #[hks(raw, selector = "camera", name = "zoom")]
     fn native_camera_zoom(
         context: &mut CharacterContext,
-        call: &hiraku_script::vm::BuiltinCall,
+        call: &hiraku_script::BuiltinCall,
     ) -> Result<Value, NativeError> {
         require_selector(call, "camera")?;
         let mut scale = None;
@@ -750,10 +776,7 @@ mod native_api {
     }
 }
 
-fn require_selector(
-    call: &hiraku_script::vm::BuiltinCall,
-    expected: &str,
-) -> Result<(), NativeError> {
+fn require_selector(call: &hiraku_script::BuiltinCall, expected: &str) -> Result<(), NativeError> {
     match &call.receiver {
         Some(Value::Selector(selector)) if selector == expected => Ok(()),
         Some(_) => Err(NativeError::message(format!(

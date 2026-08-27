@@ -15,6 +15,8 @@ pub enum Stmt {
         span: Span,
     },
     Function {
+        /// Exported functions participate in runtime linking across scripts.
+        exported: bool,
         name: String,
         parameters: Vec<FunctionParameter>,
         return_type: Option<TypeExpr>,

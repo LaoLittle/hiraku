@@ -1,0 +1,210 @@
+//! Execution of runtime-linked native and cross-module script calls.
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    BuiltinCall, BuiltinManifest, LinkedFunction, LinkedProgram, ModuleId, RegisterBytecode,
+    RegisterVm, RegisterVmError, RegisterVmEvent, RegisterVmSnapshot, StatementValue, Value,
+    link_register_modules,
+};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkedVmEvent {
+    Call(BuiltinCall),
+    Statement(StatementValue),
+    Completed(Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LinkedVmFrameSnapshot {
+    pub module: ModuleId,
+    pub vm: RegisterVmSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LinkedVmSnapshot {
+    pub modules: Vec<RegisterBytecode>,
+    pub frames: Vec<LinkedVmFrameSnapshot>,
+}
+
+pub struct LinkedVm {
+    program: LinkedProgram,
+    frames: Vec<(ModuleId, RegisterVm)>,
+}
+
+impl LinkedVm {
+    pub fn new(program: LinkedProgram, entry: ModuleId) -> Result<Self, LinkedVmError> {
+        let module = program
+            .modules
+            .get(entry.0 as usize)
+            .ok_or(LinkedVmError::UnknownModule(entry))?;
+        let vm = RegisterVm::new(module.bytecode.clone())?;
+        Ok(Self {
+            program,
+            frames: vec![(entry, vm)],
+        })
+    }
+
+    pub fn step(&mut self) -> Result<Option<LinkedVmEvent>, LinkedVmError> {
+        loop {
+            let (module_id, vm) = self.frames.last_mut().ok_or(LinkedVmError::NoFrame)?;
+            let Some(event) = vm.step()? else {
+                return Ok(None);
+            };
+            match event {
+                RegisterVmEvent::Statement(value) => {
+                    return Ok(Some(LinkedVmEvent::Statement(value)));
+                }
+                RegisterVmEvent::Completed(value) => {
+                    self.frames.pop();
+                    if let Some((_, caller)) = self.frames.last_mut() {
+                        caller.resume(value)?;
+                        continue;
+                    }
+                    return Ok(Some(LinkedVmEvent::Completed(value)));
+                }
+                RegisterVmEvent::Call(call) => {
+                    let module = &self.program.modules[module_id.0 as usize];
+                    match module.resolve(call.function) {
+                        Some(LinkedFunction::Native(builtin)) => {
+                            return Ok(Some(LinkedVmEvent::Call(BuiltinCall {
+                                builtin,
+                                receiver: call.receiver,
+                                arguments: call.arguments,
+                            })));
+                        }
+                        Some(LinkedFunction::Script { module, function }) => {
+                            if call.receiver.is_some() {
+                                return Err(LinkedVmError::ScriptReceiver);
+                            }
+                            let bytecode = self
+                                .program
+                                .modules
+                                .get(module.0 as usize)
+                                .ok_or(LinkedVmError::UnknownModule(module))?
+                                .bytecode
+                                .clone();
+                            let arguments = call
+                                .arguments
+                                .into_iter()
+                                .map(|argument| argument.value)
+                                .collect();
+                            let callee = RegisterVm::from_function(bytecode, function, arguments)?;
+                            self.frames.push((module, callee));
+                        }
+                        None => return Err(LinkedVmError::UnlinkedCall(call.function)),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn resume(&mut self, value: Value) -> Result<(), LinkedVmError> {
+        self.frames
+            .last_mut()
+            .ok_or(LinkedVmError::NoFrame)?
+            .1
+            .resume(value)?;
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> LinkedVmSnapshot {
+        LinkedVmSnapshot {
+            modules: self
+                .program
+                .modules
+                .iter()
+                .map(|module| module.bytecode.clone())
+                .collect(),
+            frames: self
+                .frames
+                .iter()
+                .map(|(module, vm)| LinkedVmFrameSnapshot {
+                    module: *module,
+                    vm: vm.snapshot(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn restore(
+        snapshot: LinkedVmSnapshot,
+        natives: &BuiltinManifest,
+    ) -> Result<Self, LinkedVmError> {
+        let program =
+            link_register_modules(snapshot.modules, natives).map_err(LinkedVmError::Link)?;
+        let frames = snapshot
+            .frames
+            .into_iter()
+            .map(|frame| {
+                let bytecode = program
+                    .modules
+                    .get(frame.module.0 as usize)
+                    .ok_or(LinkedVmError::UnknownModule(frame.module))?
+                    .bytecode
+                    .clone();
+                Ok((frame.module, RegisterVm::restore(bytecode, frame.vm)?))
+            })
+            .collect::<Result<_, LinkedVmError>>()?;
+        Ok(Self { program, frames })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkedVmError {
+    Vm(RegisterVmError),
+    Link(Vec<crate::LinkError>),
+    UnknownModule(ModuleId),
+    UnlinkedCall(crate::SymbolId),
+    ScriptReceiver,
+    NoFrame,
+}
+
+impl From<RegisterVmError> for LinkedVmError {
+    fn from(value: RegisterVmError) -> Self {
+        Self::Vm(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{BuiltinId, compile_register_with_manifest, parse_program};
+
+    use super::*;
+
+    fn compile(source: &str, manifest: &BuiltinManifest) -> RegisterBytecode {
+        compile_register_with_manifest(&parse_program(source).expect("source parses"), 31, manifest)
+            .expect("source compiles")
+    }
+
+    #[test]
+    fn executes_and_restores_cross_module_global_calls() {
+        let natives = BuiltinManifest::new([("nativeEcho", BuiltinId(4))]);
+        let provider = compile(
+            "global fn greet(name: String) { nativeEcho(name) }",
+            &natives,
+        );
+        let consumer = compile("greet(\"alice\")", &natives);
+        let program =
+            link_register_modules(vec![provider, consumer], &natives).expect("modules link");
+        let mut vm = LinkedVm::new(program, ModuleId(1)).expect("entry starts");
+        let Some(LinkedVmEvent::Call(call)) = vm.step().expect("native call yields") else {
+            panic!("expected native call")
+        };
+        assert_eq!(call.builtin, BuiltinId(4));
+        assert_eq!(call.arguments[0].value, Value::String("alice".into()));
+
+        let snapshot = vm.snapshot();
+        let mut restored = LinkedVm::restore(snapshot, &natives).expect("linked frames restore");
+        restored
+            .resume(Value::String("hello".into()))
+            .expect("call resumes");
+        loop {
+            if matches!(
+                restored.step().expect("execution succeeds"),
+                Some(LinkedVmEvent::Completed(_))
+            ) {
+                break;
+            }
+        }
+    }
+}

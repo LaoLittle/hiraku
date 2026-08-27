@@ -17,6 +17,7 @@ pub enum ScriptType {
     String,
     Symbol,
     Selector,
+    Function,
     Task,
     Named(SymbolId),
     Union(Vec<ScriptType>),

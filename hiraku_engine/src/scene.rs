@@ -306,16 +306,16 @@ pub struct PendingScriptCommands {
     pub items: VecDeque<ScriptCommand>,
 }
 
-fn stored_to_hks(value: StoredValue) -> hiraku_script::vm::Value {
+fn stored_to_hks(value: StoredValue) -> hiraku_script::Value {
     match value {
-        StoredValue::Bool(value) => hiraku_script::vm::Value::Bool(value),
-        StoredValue::Int(value) => hiraku_script::vm::Value::Number(value as f64),
-        StoredValue::Float(value) => hiraku_script::vm::Value::Number(value),
-        StoredValue::String(value) => hiraku_script::vm::Value::String(value),
+        StoredValue::Bool(value) => hiraku_script::Value::Bool(value),
+        StoredValue::Int(value) => hiraku_script::Value::Number(value as f64),
+        StoredValue::Float(value) => hiraku_script::Value::Number(value),
+        StoredValue::String(value) => hiraku_script::Value::String(value),
         StoredValue::Array(values) => {
-            hiraku_script::vm::Value::List(values.into_iter().map(stored_to_hks).collect())
+            hiraku_script::Value::List(values.into_iter().map(stored_to_hks).collect())
         }
-        StoredValue::Map(values) => hiraku_script::vm::Value::Map(
+        StoredValue::Map(values) => hiraku_script::Value::Map(
             values
                 .into_iter()
                 .map(|(name, value)| (name, stored_to_hks(value)))
@@ -325,7 +325,7 @@ fn stored_to_hks(value: StoredValue) -> hiraku_script::vm::Value {
 }
 
 fn hks_globals_to_stored(
-    globals: &BTreeMap<String, hiraku_script::vm::Value>,
+    globals: &BTreeMap<String, hiraku_script::Value>,
 ) -> BTreeMap<String, StoredValue> {
     globals
         .iter()
@@ -333,23 +333,23 @@ fn hks_globals_to_stored(
         .collect()
 }
 
-fn hks_to_stored(value: &hiraku_script::vm::Value) -> Option<StoredValue> {
+fn hks_to_stored(value: &hiraku_script::Value) -> Option<StoredValue> {
     match value {
-        hiraku_script::vm::Value::Bool(value) => Some(StoredValue::Bool(*value)),
-        hiraku_script::vm::Value::Number(value) => Some(StoredValue::Float(*value)),
-        hiraku_script::vm::Value::String(value) | hiraku_script::vm::Value::Symbol(value) => {
+        hiraku_script::Value::Bool(value) => Some(StoredValue::Bool(*value)),
+        hiraku_script::Value::Number(value) => Some(StoredValue::Float(*value)),
+        hiraku_script::Value::String(value) | hiraku_script::Value::Symbol(value) => {
             Some(StoredValue::String(value.clone()))
         }
-        hiraku_script::vm::Value::List(values) | hiraku_script::vm::Value::Tuple(values) => Some(
+        hiraku_script::Value::List(values) | hiraku_script::Value::Tuple(values) => Some(
             StoredValue::Array(values.iter().filter_map(hks_to_stored).collect()),
         ),
-        hiraku_script::vm::Value::Map(values) => Some(StoredValue::Map(
+        hiraku_script::Value::Map(values) => Some(StoredValue::Map(
             values
                 .iter()
                 .filter_map(|(name, value)| hks_to_stored(value).map(|value| (name.clone(), value)))
                 .collect(),
         )),
-        hiraku_script::vm::Value::Typed { value, .. } => hks_to_stored(value),
+        hiraku_script::Value::Typed { value, .. } => hks_to_stored(value),
         _ => None,
     }
 }
@@ -381,7 +381,7 @@ pub fn bridge_story_events(
     {
         let direct_value = match &response {
             ScriptResponse::Choice(value) => stored_to_hks(value.clone()),
-            ScriptResponse::Continue => hiraku_script::vm::Value::Null,
+            ScriptResponse::Continue => hiraku_script::Value::Null,
         };
         runtime.pending_ui_screen = None;
         runtime.wait_request = None;
