@@ -36,7 +36,7 @@ pub use linked_vm::{
 };
 pub use linker::{
     LinkError, LinkedBytecode, LinkedFunction, LinkedModule, LinkedProgram, ModuleId,
-    link_register_bytecode, link_register_modules,
+    link_bytecode, link_register_modules,
 };
 pub use mir::{
     MirBasicBlock, MirBlockId, MirConstant, MirFunction, MirInstruction, MirLoweringError,
@@ -55,8 +55,7 @@ pub use span::Span;
 pub use symbol::{SymbolId, SymbolInterner, SymbolManifest};
 pub use template::{TemplateCallArgument, TemplateContext, TemplateError, eval_template};
 pub use vm::{
-    REGISTER_BYTECODE_VERSION, RegisterBytecode, RegisterCompileError, RegisterConstant,
-    RegisterInstruction, RegisterVm, RegisterVmError, RegisterVmEvent, RegisterVmSnapshot,
-    RegisterVmStatus, SymbolCall, compile_register_with_manifest,
+    BYTECODE_VERSION, Bytecode, CompileError, Constant, Instruction, SymbolCall, Vm, VmError,
+    VmEvent, VmSnapshot, VmStatus, compile_with_manifest,
 };
 extern crate self as hiraku_script;

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::{
     SymbolId,
     runtime::{BuiltinId, BuiltinManifest},
-    vm::{RegisterBytecode, RegisterInstruction},
+    vm::{Bytecode, Instruction},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub enum LinkedFunction {
 #[derive(Clone, Debug)]
 pub struct LinkedModule {
     pub id: ModuleId,
-    pub bytecode: RegisterBytecode,
+    pub bytecode: Bytecode,
     calls: BTreeMap<SymbolId, LinkedFunction>,
 }
 
@@ -48,15 +48,15 @@ pub struct LinkError {
     pub message: String,
 }
 
-pub fn link_register_bytecode(
-    bytecode: RegisterBytecode,
+pub fn link_bytecode(
+    bytecode: Bytecode,
     natives: &BuiltinManifest,
 ) -> Result<LinkedBytecode, Vec<LinkError>> {
     link_register_modules(vec![bytecode], natives).map(|mut program| program.modules.remove(0))
 }
 
 pub fn link_register_modules(
-    modules: Vec<RegisterBytecode>,
+    modules: Vec<Bytecode>,
     natives: &BuiltinManifest,
 ) -> Result<LinkedProgram, Vec<LinkError>> {
     let mut exports = BTreeMap::<String, LinkedFunction>::new();
@@ -125,7 +125,7 @@ pub fn link_register_modules(
                     .flat_map(|region| &region.instructions),
             )
         {
-            let RegisterInstruction::Call { function, .. } = instruction else {
+            let Instruction::Call { function, .. } = instruction else {
                 continue;
             };
             if calls.contains_key(function) {
@@ -178,13 +178,13 @@ pub fn link_register_modules(
 
 #[cfg(test)]
 mod tests {
-    use crate::{BuiltinManifest, compile_register_with_manifest, parse_program};
+    use crate::{BuiltinManifest, compile_with_manifest, parse_program};
 
     use super::*;
 
-    fn compile(source: &str) -> RegisterBytecode {
+    fn compile(source: &str) -> Bytecode {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
-        compile_register_with_manifest(
+        compile_with_manifest(
             &parse_program(source).expect("source parses"),
             17,
             &manifest,

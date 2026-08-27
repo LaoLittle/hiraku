@@ -28,7 +28,7 @@ pub(crate) use runtime::{
 pub(crate) fn compile_story_bytecode(
     path: &str,
     source: &str,
-) -> Result<hiraku_script::RegisterBytecode, String> {
+) -> Result<hiraku_script::Bytecode, String> {
     if !path.ends_with(".hks") {
         return Err(format!(
             "executable scripts must use the `.hks` extension: `{path}`"

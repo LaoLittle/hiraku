@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 
 use hiraku_script::native::{NativeError, NativeRegistry};
 use hiraku_script::{
-    BuiltinCall, BuiltinManifest, RegisterBytecode, ScriptType, Value,
-    compile_register_with_manifest,
+    BuiltinCall, BuiltinManifest, Bytecode, ScriptType, Value, compile_with_manifest,
 };
 use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, render_diagnostics};
 use serde::{Deserialize, Serialize};
@@ -81,7 +80,7 @@ pub fn story_manifest() -> BuiltinManifest {
     story_registry().manifest()
 }
 
-pub fn compile_story_bytecode(path: &str, source: &str) -> Result<RegisterBytecode, String> {
+pub fn compile_story_bytecode(path: &str, source: &str) -> Result<Bytecode, String> {
     compile_story_bytecode_with_options(path, source, RenderOptions::plain())
 }
 
@@ -89,7 +88,7 @@ pub fn compile_story_bytecode_with_options(
     path: &str,
     source: &str,
     render_options: RenderOptions,
-) -> Result<RegisterBytecode, String> {
+) -> Result<Bytecode, String> {
     let mut sources = SourceMap::new();
     let source_id = sources.insert(path, source);
     let program = parse_program(source).map_err(|errors| {
@@ -99,7 +98,7 @@ pub fn compile_story_bytecode_with_options(
             .collect::<Vec<_>>();
         render_diagnostics(&diagnostics, &sources, render_options)
     })?;
-    compile_register_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
+    compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
         |errors| {
             let diagnostics = errors
                 .into_iter()

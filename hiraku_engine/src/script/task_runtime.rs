@@ -5,8 +5,7 @@
 use std::collections::BTreeMap;
 
 use hiraku_script::{
-    RegisterBytecode, RegisterVm, RegisterVmError, RegisterVmEvent, RegisterVmSnapshot,
-    StatementValue, SymbolCall, TemplateError, Value,
+    Bytecode, StatementValue, SymbolCall, TemplateError, Value, Vm, VmError, VmEvent, VmSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,13 +20,13 @@ pub enum ExecutionMode {
 #[derive(Debug, Error)]
 pub enum TaskSchedulerError {
     #[error("VM failed: {0:?}")]
-    Vm(RegisterVmError),
+    Vm(VmError),
     #[error("unknown story task {0}")]
     UnknownTask(u64),
 }
 
-impl From<RegisterVmError> for TaskSchedulerError {
-    fn from(value: RegisterVmError) -> Self {
+impl From<VmError> for TaskSchedulerError {
+    fn from(value: VmError) -> Self {
         Self::Vm(value)
     }
 }
@@ -41,13 +40,13 @@ pub enum TaskEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct TaskSnapshot {
-    vm: RegisterVmSnapshot,
+    vm: VmSnapshot,
     mode: ExecutionMode,
     paused: bool,
 }
 
 struct TaskState {
-    vm: RegisterVm,
+    vm: Vm,
     mode: ExecutionMode,
     paused: bool,
 }
@@ -60,14 +59,14 @@ pub struct TaskSchedulerSnapshot {
 }
 
 pub struct TaskScheduler {
-    bytecode: RegisterBytecode,
+    bytecode: Bytecode,
     next_task: u64,
     tasks: BTreeMap<u64, TaskState>,
     globals: Vec<Value>,
 }
 
 impl TaskScheduler {
-    pub fn new(bytecode: RegisterBytecode) -> Self {
+    pub fn new(bytecode: Bytecode) -> Self {
         Self {
             globals: vec![Value::Uninitialized; bytecode.globals.len()],
             bytecode,
@@ -83,7 +82,7 @@ impl TaskScheduler {
     ) -> Result<u64, TaskSchedulerError> {
         let task = self.next_task;
         self.next_task += 1;
-        let mut vm = RegisterVm::from_callable(self.bytecode.clone(), closure, Vec::new())?;
+        let mut vm = Vm::from_callable(self.bytecode.clone(), closure, Vec::new())?;
         vm.set_global_values(self.globals.clone())?;
         self.tasks.insert(
             task,
@@ -105,13 +104,13 @@ impl TaskScheduler {
                 continue;
             }
             match state.vm.step()? {
-                Some(RegisterVmEvent::Call(call)) => {
+                Some(VmEvent::Call(call)) => {
                     return Ok(Some(TaskEvent::Call { task, call }));
                 }
-                Some(RegisterVmEvent::Statement(value)) => {
+                Some(VmEvent::Statement(value)) => {
                     return Ok(Some(TaskEvent::Statement { task, value }));
                 }
-                Some(RegisterVmEvent::Completed(value)) => {
+                Some(VmEvent::Completed(value)) => {
                     self.globals = state.vm.globals().to_vec();
                     self.tasks.remove(&task);
                     return Ok(Some(TaskEvent::Completed { task, value }));
@@ -155,9 +154,9 @@ impl TaskScheduler {
             .eval_template(template)
     }
 
-    pub fn set_global_values(&mut self, globals: Vec<Value>) -> Result<(), RegisterVmError> {
+    pub fn set_global_values(&mut self, globals: Vec<Value>) -> Result<(), VmError> {
         if globals.len() != self.bytecode.globals.len() {
-            return Err(RegisterVmError::FrameShapeMismatch);
+            return Err(VmError::FrameShapeMismatch);
         }
         self.globals = globals;
         Ok(())
@@ -189,14 +188,14 @@ impl TaskScheduler {
     }
 
     pub fn restore(
-        bytecode: RegisterBytecode,
+        bytecode: Bytecode,
         snapshot: TaskSchedulerSnapshot,
     ) -> Result<Self, TaskSchedulerError> {
         let tasks = snapshot
             .tasks
             .into_iter()
             .map(|(id, task)| {
-                RegisterVm::restore(bytecode.clone(), task.vm).map(|vm| {
+                Vm::restore(bytecode.clone(), task.vm).map(|vm| {
                     (
                         id,
                         TaskState {

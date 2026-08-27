@@ -2,9 +2,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BuiltinCall, BuiltinManifest, LinkedFunction, LinkedProgram, ModuleId, RegisterBytecode,
-    RegisterVm, RegisterVmError, RegisterVmEvent, RegisterVmSnapshot, StatementValue, Value,
-    link_register_modules,
+    BuiltinCall, BuiltinManifest, Bytecode, LinkedFunction, LinkedProgram, ModuleId,
+    StatementValue, Value, Vm, VmError, VmEvent, VmSnapshot, link_register_modules,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -17,18 +16,18 @@ pub enum LinkedVmEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedVmFrameSnapshot {
     pub module: ModuleId,
-    pub vm: RegisterVmSnapshot,
+    pub vm: VmSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedVmSnapshot {
-    pub modules: Vec<RegisterBytecode>,
+    pub modules: Vec<Bytecode>,
     pub frames: Vec<LinkedVmFrameSnapshot>,
 }
 
 pub struct LinkedVm {
     program: LinkedProgram,
-    frames: Vec<(ModuleId, RegisterVm)>,
+    frames: Vec<(ModuleId, Vm)>,
 }
 
 impl LinkedVm {
@@ -37,7 +36,7 @@ impl LinkedVm {
             .modules
             .get(entry.0 as usize)
             .ok_or(LinkedVmError::UnknownModule(entry))?;
-        let vm = RegisterVm::new(module.bytecode.clone())?;
+        let vm = Vm::new(module.bytecode.clone())?;
         Ok(Self {
             program,
             frames: vec![(entry, vm)],
@@ -51,10 +50,10 @@ impl LinkedVm {
                 return Ok(None);
             };
             match event {
-                RegisterVmEvent::Statement(value) => {
+                VmEvent::Statement(value) => {
                     return Ok(Some(LinkedVmEvent::Statement(value)));
                 }
-                RegisterVmEvent::Completed(value) => {
+                VmEvent::Completed(value) => {
                     self.frames.pop();
                     if let Some((_, caller)) = self.frames.last_mut() {
                         caller.resume(value)?;
@@ -62,7 +61,7 @@ impl LinkedVm {
                     }
                     return Ok(Some(LinkedVmEvent::Completed(value)));
                 }
-                RegisterVmEvent::Call(call) => {
+                VmEvent::Call(call) => {
                     let module = &self.program.modules[module_id.0 as usize];
                     match module.resolve(call.function) {
                         Some(LinkedFunction::Native(builtin)) => {
@@ -88,7 +87,7 @@ impl LinkedVm {
                                 .into_iter()
                                 .map(|argument| argument.value)
                                 .collect();
-                            let callee = RegisterVm::from_function(bytecode, function, arguments)?;
+                            let callee = Vm::from_function(bytecode, function, arguments)?;
                             self.frames.push((module, callee));
                         }
                         None => return Err(LinkedVmError::UnlinkedCall(call.function)),
@@ -142,7 +141,7 @@ impl LinkedVm {
                     .ok_or(LinkedVmError::UnknownModule(frame.module))?
                     .bytecode
                     .clone();
-                Ok((frame.module, RegisterVm::restore(bytecode, frame.vm)?))
+                Ok((frame.module, Vm::restore(bytecode, frame.vm)?))
             })
             .collect::<Result<_, LinkedVmError>>()?;
         Ok(Self { program, frames })
@@ -151,7 +150,7 @@ impl LinkedVm {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkedVmError {
-    Vm(RegisterVmError),
+    Vm(VmError),
     Link(Vec<crate::LinkError>),
     UnknownModule(ModuleId),
     UnlinkedCall(crate::SymbolId),
@@ -159,20 +158,20 @@ pub enum LinkedVmError {
     NoFrame,
 }
 
-impl From<RegisterVmError> for LinkedVmError {
-    fn from(value: RegisterVmError) -> Self {
+impl From<VmError> for LinkedVmError {
+    fn from(value: VmError) -> Self {
         Self::Vm(value)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{BuiltinId, compile_register_with_manifest, parse_program};
+    use crate::{BuiltinId, compile_with_manifest, parse_program};
 
     use super::*;
 
-    fn compile(source: &str, manifest: &BuiltinManifest) -> RegisterBytecode {
-        compile_register_with_manifest(&parse_program(source).expect("source parses"), 31, manifest)
+    fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
+        compile_with_manifest(&parse_program(source).expect("source parses"), 31, manifest)
             .expect("source compiles")
     }
 

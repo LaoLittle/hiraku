@@ -11,7 +11,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const REGISTER_BYTECODE_VERSION: u16 = 3;
+pub const BYTECODE_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -20,7 +20,7 @@ pub struct RegisterSlice {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RegisterBytecode {
+pub struct Bytecode {
     pub version: u16,
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
@@ -29,31 +29,31 @@ pub struct RegisterBytecode {
     pub locals: Vec<SymbolId>,
     pub local_count: u32,
     pub register_count: u16,
-    pub instructions: Vec<RegisterInstruction>,
-    pub functions: Vec<RegisterFunction>,
-    pub regions: Vec<RegisterRegion>,
+    pub instructions: Vec<Instruction>,
+    pub functions: Vec<BytecodeFunction>,
+    pub regions: Vec<BytecodeRegion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RegisterFunction {
+pub struct BytecodeFunction {
     pub name: SymbolId,
     pub exported: bool,
     pub parameters: Vec<u32>,
     pub register_count: u16,
-    pub instructions: Vec<RegisterInstruction>,
+    pub instructions: Vec<Instruction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RegisterRegion {
+pub struct BytecodeRegion {
     pub register_count: u16,
-    pub instructions: Vec<RegisterInstruction>,
+    pub instructions: Vec<Instruction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum RegisterInstruction {
+pub enum Instruction {
     Constant {
         dst: Register,
-        value: RegisterConstant,
+        value: Constant,
     },
     Move {
         dst: Register,
@@ -153,7 +153,7 @@ pub enum RegisterInstruction {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum RegisterConstant {
+pub enum Constant {
     Null,
     Ellipsis,
     Bool(bool),
@@ -167,12 +167,12 @@ pub enum RegisterConstant {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegisterCompileError {
+pub struct CompileError {
     pub message: String,
     pub span: Option<Span>,
 }
 
-impl RegisterCompileError {
+impl CompileError {
     pub fn diagnostic(&self, source: crate::SourceId) -> crate::Diagnostic {
         let mut diagnostic = crate::Diagnostic::error(&self.message).with_code("HKS-COMPILE");
         if let Some(span) = self.span {
@@ -187,16 +187,16 @@ impl RegisterCompileError {
     }
 }
 
-pub fn compile_register_with_manifest(
+pub fn compile_with_manifest(
     program: &Program,
     source_hash: u64,
     manifest: &BuiltinManifest,
-) -> Result<RegisterBytecode, Vec<RegisterCompileError>> {
+) -> Result<Bytecode, Vec<CompileError>> {
     let arena = HirArena::new();
     let hir = lower_to_hir(&arena, program, Some(manifest)).map_err(|errors| {
         errors
             .into_iter()
-            .map(|error| RegisterCompileError {
+            .map(|error| CompileError {
                 message: error.message,
                 span: Some(error.span),
             })
@@ -205,7 +205,7 @@ pub fn compile_register_with_manifest(
     let mir = lower_hir_to_mir(&hir).map_err(|errors| {
         errors
             .into_iter()
-            .map(|error| RegisterCompileError {
+            .map(|error| CompileError {
                 message: error.message,
                 span: Some(error.span),
             })
@@ -213,7 +213,7 @@ pub fn compile_register_with_manifest(
     })?;
     let mut symbols =
         crate::SymbolInterner::from_manifest(hir.symbols.clone()).map_err(|error| {
-            vec![RegisterCompileError {
+            vec![CompileError {
                 message: format!("invalid symbol manifest: {error}"),
                 span: None,
             }]
@@ -240,7 +240,7 @@ pub fn compile_register_with_manifest(
             &mut symbols,
             &mut regions,
         )?;
-        functions.push(RegisterFunction {
+        functions.push(BytecodeFunction {
             name: hir_function.name,
             exported: hir_function.exported,
             parameters: hir_function
@@ -252,8 +252,8 @@ pub fn compile_register_with_manifest(
             instructions: code.instructions,
         });
     }
-    Ok(RegisterBytecode {
-        version: REGISTER_BYTECODE_VERSION,
+    Ok(Bytecode {
+        version: BYTECODE_VERSION,
         source_hash,
         builtin_manifest_hash: manifest.hash(),
         symbols: symbols.manifest(),
@@ -272,8 +272,8 @@ fn compile_register_code(
     manifest: &BuiltinManifest,
     function_symbols: &[SymbolId],
     symbols: &mut crate::SymbolInterner,
-    regions: &mut Vec<RegisterRegion>,
-) -> Result<RegisterRegion, Vec<RegisterCompileError>> {
+    regions: &mut Vec<BytecodeRegion>,
+) -> Result<BytecodeRegion, Vec<CompileError>> {
     let mut region_ids = Vec::with_capacity(function.regions.len());
     for region in &function.regions {
         let compiled = compile_register_code(region, manifest, function_symbols, symbols, regions)?;
@@ -282,7 +282,7 @@ fn compile_register_code(
         region_ids.push(id);
     }
     let allocation = allocate_registers(function).map_err(|error| {
-        vec![RegisterCompileError {
+        vec![CompileError {
             message: format!("register allocation failed: {error:?}"),
             span: None,
         }]
@@ -295,7 +295,7 @@ fn compile_register_code(
         &region_ids,
         symbols,
     )?;
-    Ok(RegisterRegion {
+    Ok(BytecodeRegion {
         register_count,
         instructions,
     })
@@ -308,7 +308,7 @@ fn emit_function(
     function_symbols: &[SymbolId],
     region_ids: &[u32],
     symbols: &mut crate::SymbolInterner,
-) -> Result<(Vec<RegisterInstruction>, u16), Vec<RegisterCompileError>> {
+) -> Result<(Vec<Instruction>, u16), Vec<CompileError>> {
     let register = |virtual_register| {
         allocation
             .register_for(virtual_register)
@@ -320,10 +320,10 @@ fn emit_function(
         let mut emitted = Vec::new();
         for instruction in &block.instructions {
             let scalar = match instruction {
-                MirInstruction::MakeClosure { dst, region } => RegisterInstruction::MakeClosure {
+                MirInstruction::MakeClosure { dst, region } => Instruction::MakeClosure {
                     dst: register(*dst),
                     region: *region_ids.get(*region as usize).ok_or_else(|| {
-                        vec![RegisterCompileError {
+                        vec![CompileError {
                             message: format!("unknown closure region {region}"),
                             span: None,
                         }]
@@ -333,19 +333,19 @@ fn emit_function(
                     let value = match value {
                         MirConstant::Function(ResolvedFunction::Builtin(builtin)) => {
                             let name = manifest.callable_name(*builtin).ok_or_else(|| {
-                                vec![RegisterCompileError {
+                                vec![CompileError {
                                     message: format!(
                                         "native callable {builtin:?} has no public symbol"
                                     ),
                                     span: None,
                                 }]
                             })?;
-                            RegisterConstant::Function(symbols.intern(name))
+                            Constant::Function(symbols.intern(name))
                         }
                         MirConstant::Function(ResolvedFunction::User(function)) => {
-                            RegisterConstant::Function(
+                            Constant::Function(
                                 *function_symbols.get(function.0 as usize).ok_or_else(|| {
-                                    vec![RegisterCompileError {
+                                    vec![CompileError {
                                         message: format!("unknown script function {function:?}"),
                                         span: None,
                                     }]
@@ -353,34 +353,34 @@ fn emit_function(
                             )
                         }
                         MirConstant::Function(ResolvedFunction::External(symbol)) => {
-                            RegisterConstant::Function(*symbol)
+                            Constant::Function(*symbol)
                         }
                         MirConstant::Function(ResolvedFunction::Dynamic) => {
-                            return Err(vec![RegisterCompileError {
+                            return Err(vec![CompileError {
                                 message: "a dynamic function cannot be used as a constant".into(),
                                 span: None,
                             }]);
                         }
                         value => constant(value.clone()),
                     };
-                    RegisterInstruction::Constant {
+                    Instruction::Constant {
                         dst: register(*dst),
                         value,
                     }
                 }
-                MirInstruction::LoadLocal { dst, local } => RegisterInstruction::LoadLocal {
+                MirInstruction::LoadLocal { dst, local } => Instruction::LoadLocal {
                     dst: register(*dst),
                     local: local.0,
                 },
-                MirInstruction::StoreLocal { local, src } => RegisterInstruction::StoreLocal {
+                MirInstruction::StoreLocal { local, src } => Instruction::StoreLocal {
                     local: local.0,
                     src: register(*src),
                 },
-                MirInstruction::LoadGlobal { dst, global } => RegisterInstruction::LoadGlobal {
+                MirInstruction::LoadGlobal { dst, global } => Instruction::LoadGlobal {
                     dst: register(*dst),
                     global: global.0,
                 },
-                MirInstruction::StoreGlobal { global, src } => RegisterInstruction::StoreGlobal {
+                MirInstruction::StoreGlobal { global, src } => Instruction::StoreGlobal {
                     global: global.0,
                     src: register(*src),
                 },
@@ -389,7 +389,7 @@ fn emit_function(
                     object,
                     member,
                     safe,
-                } => RegisterInstruction::GetMember {
+                } => Instruction::GetMember {
                     dst: register(*dst),
                     object: register(*object),
                     member: *member,
@@ -400,13 +400,13 @@ fn emit_function(
                     object,
                     member,
                     value,
-                } => RegisterInstruction::SetMember {
+                } => Instruction::SetMember {
                     dst: register(*dst),
                     object: register(*object),
                     member: *member,
                     value: register(*value),
                 },
-                MirInstruction::UnaryMinus { dst, value } => RegisterInstruction::UnaryMinus {
+                MirInstruction::UnaryMinus { dst, value } => Instruction::UnaryMinus {
                     dst: register(*dst),
                     value: register(*value),
                 },
@@ -415,7 +415,7 @@ fn emit_function(
                     op,
                     left,
                     right,
-                } => RegisterInstruction::Binary {
+                } => Instruction::Binary {
                     dst: register(*dst),
                     op: *op,
                     left: register(*left),
@@ -428,7 +428,7 @@ fn emit_function(
                         values.iter().map(|value| register(*value)),
                     )?;
                     max_window = max_window.max(values.len());
-                    RegisterInstruction::MakeTuple {
+                    Instruction::MakeTuple {
                         dst: register(*dst),
                         values: slice,
                     }
@@ -440,7 +440,7 @@ fn emit_function(
                         values.iter().map(|value| register(*value)),
                     )?;
                     max_window = max_window.max(values.len());
-                    RegisterInstruction::MakeList {
+                    Instruction::MakeList {
                         dst: register(*dst),
                         values: slice,
                     }
@@ -452,7 +452,7 @@ fn emit_function(
                         fields.iter().map(|(_, value)| register(*value)),
                     )?;
                     max_window = max_window.max(fields.len());
-                    RegisterInstruction::MakeMap {
+                    Instruction::MakeMap {
                         dst: register(*dst),
                         names: fields.iter().map(|(name, _)| *name).collect(),
                         values: slice,
@@ -466,7 +466,7 @@ fn emit_function(
                     arguments,
                 } => {
                     let name = manifest.callable_name(*builtin).ok_or_else(|| {
-                        vec![RegisterCompileError {
+                        vec![CompileError {
                             message: format!("native callable {:?} has no public symbol", builtin),
                             span: None,
                         }]
@@ -478,7 +478,7 @@ fn emit_function(
                         arguments.iter().map(|(_, value)| register(*value)),
                     )?;
                     max_window = max_window.max(arguments.len());
-                    RegisterInstruction::Call {
+                    Instruction::Call {
                         dst: register(*dst),
                         function,
                         receiver: receiver.map(register),
@@ -499,7 +499,7 @@ fn emit_function(
                         arguments.iter().map(|(_, value)| register(*value)),
                     )?;
                     max_window = max_window.max(arguments.len());
-                    RegisterInstruction::Call {
+                    Instruction::Call {
                         dst: register(*dst),
                         function: *function,
                         receiver: receiver.map(register),
@@ -515,7 +515,7 @@ fn emit_function(
                     arguments,
                 } => {
                     let function = *function_symbols.get(function.0 as usize).ok_or_else(|| {
-                        vec![RegisterCompileError {
+                        vec![CompileError {
                             message: format!("unknown script function {:?}", function),
                             span: None,
                         }]
@@ -526,7 +526,7 @@ fn emit_function(
                         arguments.iter().map(|(_, value)| register(*value)),
                     )?;
                     max_window = max_window.max(arguments.len());
-                    RegisterInstruction::Call {
+                    Instruction::Call {
                         dst: register(*dst),
                         function,
                         receiver: None,
@@ -547,7 +547,7 @@ fn emit_function(
                         arguments.iter().map(|(_, value)| register(*value)),
                     )?;
                     max_window = max_window.max(arguments.len());
-                    RegisterInstruction::CallValue {
+                    Instruction::CallValue {
                         dst: register(*dst),
                         callee: register(*callee),
                         labels: arguments.iter().map(|(label, _)| *label).collect(),
@@ -555,28 +555,26 @@ fn emit_function(
                     }
                 }
                 MirInstruction::Call { .. } => {
-                    return Err(vec![RegisterCompileError {
+                    return Err(vec![CompileError {
                         message: "dynamic and user calls are not implemented in register bytecode"
                             .into(),
                         span: None,
                     }]);
                 }
-                MirInstruction::AssertNonNull { dst, value } => {
-                    RegisterInstruction::AssertNonNull {
-                        dst: register(*dst),
-                        value: register(*value),
-                    }
-                }
+                MirInstruction::AssertNonNull { dst, value } => Instruction::AssertNonNull {
+                    dst: register(*dst),
+                    value: register(*value),
+                },
                 MirInstruction::SelectNonNull {
                     dst,
                     value,
                     fallback,
-                } => RegisterInstruction::SelectNonNull {
+                } => Instruction::SelectNonNull {
                     dst: register(*dst),
                     value: register(*value),
                     fallback: register(*fallback),
                 },
-                MirInstruction::Statement { value, string } => RegisterInstruction::Statement {
+                MirInstruction::Statement { value, string } => Instruction::Statement {
                     value: register(*value),
                     string: *string,
                 },
@@ -595,20 +593,20 @@ fn emit_function(
     for (mut instructions, terminator) in blocks {
         output.append(&mut instructions);
         output.push(match terminator {
-            MirTerminator::Jump(target) => RegisterInstruction::Jump(starts[target.0 as usize]),
+            MirTerminator::Jump(target) => Instruction::Jump(starts[target.0 as usize]),
             MirTerminator::Branch {
                 condition,
                 then_block,
                 else_block,
-            } => RegisterInstruction::Branch {
+            } => Instruction::Branch {
                 condition: register(condition),
                 then_target: starts[then_block.0 as usize],
                 else_target: starts[else_block.0 as usize],
             },
-            MirTerminator::Return(value) => RegisterInstruction::Return(value.map(register)),
-            MirTerminator::Halt => RegisterInstruction::Halt,
+            MirTerminator::Return(value) => Instruction::Return(value.map(register)),
+            MirTerminator::Halt => Instruction::Halt,
             MirTerminator::Unset => {
-                return Err(vec![RegisterCompileError {
+                return Err(vec![CompileError {
                     message: "MIR block has no terminator".into(),
                     span: None,
                 }]);
@@ -619,7 +617,7 @@ fn emit_function(
         .checked_add(max_window)
         .and_then(|count| u16::try_from(count).ok())
         .ok_or_else(|| {
-            vec![RegisterCompileError {
+            vec![CompileError {
                 message: "register frame exceeds u16 capacity".into(),
                 span: None,
             }]
@@ -628,25 +626,25 @@ fn emit_function(
 }
 
 fn emit_register_window(
-    output: &mut Vec<RegisterInstruction>,
+    output: &mut Vec<Instruction>,
     start: u16,
     values: impl IntoIterator<Item = Register>,
-) -> Result<RegisterSlice, Vec<RegisterCompileError>> {
+) -> Result<RegisterSlice, Vec<CompileError>> {
     let values = values.into_iter().collect::<Vec<_>>();
     for (offset, src) in values.iter().copied().enumerate() {
         let offset = u16::try_from(offset).map_err(|_| {
-            vec![RegisterCompileError {
+            vec![CompileError {
                 message: "argument window exceeds u16 capacity".into(),
                 span: None,
             }]
         })?;
         let dst = Register(start.checked_add(offset).ok_or_else(|| {
-            vec![RegisterCompileError {
+            vec![CompileError {
                 message: "argument window exceeds u16 capacity".into(),
                 span: None,
             }]
         })?);
-        output.push(RegisterInstruction::Move { dst, src });
+        output.push(Instruction::Move { dst, src });
     }
     Ok(RegisterSlice {
         start: Register(start),
@@ -654,36 +652,36 @@ fn emit_register_window(
     })
 }
 
-fn constant(value: MirConstant) -> RegisterConstant {
+fn constant(value: MirConstant) -> Constant {
     match value {
-        MirConstant::Null | MirConstant::Unit => RegisterConstant::Null,
-        MirConstant::Ellipsis => RegisterConstant::Ellipsis,
-        MirConstant::Bool(value) => RegisterConstant::Bool(value),
-        MirConstant::Number(value) => RegisterConstant::Number(value),
-        MirConstant::Percent(value) => RegisterConstant::Percent(value),
-        MirConstant::String(value) => RegisterConstant::String(value),
-        MirConstant::Symbol(value) => RegisterConstant::Symbol(value),
-        MirConstant::Selector(value) => RegisterConstant::Selector(value),
+        MirConstant::Null | MirConstant::Unit => Constant::Null,
+        MirConstant::Ellipsis => Constant::Ellipsis,
+        MirConstant::Bool(value) => Constant::Bool(value),
+        MirConstant::Number(value) => Constant::Number(value),
+        MirConstant::Percent(value) => Constant::Percent(value),
+        MirConstant::String(value) => Constant::String(value),
+        MirConstant::Symbol(value) => Constant::Symbol(value),
+        MirConstant::Selector(value) => Constant::Selector(value),
         MirConstant::Function(_) => unreachable!("function constants require symbol resolution"),
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RegisterVmStatus {
+pub enum VmStatus {
     Ready,
     WaitingForHost,
     Completed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RegisterCodeLocation {
+pub enum CodeLocation {
     Entry,
     Function(u32),
     Region(u32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum RegisterVmEvent {
+pub enum VmEvent {
     Call(SymbolCall),
     Statement(StatementValue),
     Completed(Value),
@@ -697,7 +695,7 @@ pub struct SymbolCall {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RegisterVmSnapshot {
+pub struct VmSnapshot {
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
     pub pc: usize,
@@ -705,14 +703,14 @@ pub struct RegisterVmSnapshot {
     pub locals: Vec<Value>,
     pub globals: Vec<Value>,
     pub waiting_destination: Option<Register>,
-    pub status: RegisterVmStatus,
-    pub location: RegisterCodeLocation,
-    pub call_stack: Vec<RegisterCallFrameSnapshot>,
+    pub status: VmStatus,
+    pub location: CodeLocation,
+    pub call_stack: Vec<CallFrameSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RegisterCallFrameSnapshot {
-    pub location: RegisterCodeLocation,
+pub struct CallFrameSnapshot {
+    pub location: CodeLocation,
     pub pc: usize,
     pub registers: Vec<Value>,
     pub locals: Vec<Value>,
@@ -720,22 +718,22 @@ pub struct RegisterCallFrameSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RegisterVm {
-    bytecode: RegisterBytecode,
+pub struct Vm {
+    bytecode: Bytecode,
     pc: usize,
     registers: RegisterFrame,
     locals: Box<[Value]>,
     globals: Box<[Value]>,
     waiting_destination: Option<Register>,
-    status: RegisterVmStatus,
-    location: RegisterCodeLocation,
-    call_stack: Vec<RegisterCallFrameSnapshot>,
+    status: VmStatus,
+    location: CodeLocation,
+    call_stack: Vec<CallFrameSnapshot>,
 }
 
-impl RegisterVm {
-    pub fn new(bytecode: RegisterBytecode) -> Result<Self, RegisterVmError> {
-        if bytecode.version != REGISTER_BYTECODE_VERSION {
-            return Err(RegisterVmError::UnsupportedBytecode(bytecode.version));
+impl Vm {
+    pub fn new(bytecode: Bytecode) -> Result<Self, VmError> {
+        if bytecode.version != BYTECODE_VERSION {
+            return Err(VmError::UnsupportedBytecode(bytecode.version));
         }
         Ok(Self {
             registers: RegisterFrame::new(bytecode.register_count),
@@ -744,28 +742,25 @@ impl RegisterVm {
             bytecode,
             pc: 0,
             waiting_destination: None,
-            status: RegisterVmStatus::Ready,
-            location: RegisterCodeLocation::Entry,
+            status: VmStatus::Ready,
+            location: CodeLocation::Entry,
             call_stack: Vec::new(),
         })
     }
 
-    pub fn from_closure(
-        bytecode: RegisterBytecode,
-        closure: &Value,
-    ) -> Result<Self, RegisterVmError> {
+    pub fn from_closure(bytecode: Bytecode, closure: &Value) -> Result<Self, VmError> {
         let Value::Closure {
             region, captures, ..
         } = closure
         else {
-            return Err(RegisterVmError::TypeMismatch("expected Function"));
+            return Err(VmError::TypeMismatch("expected Function"));
         };
         let code = bytecode
             .regions
             .get(*region as usize)
-            .ok_or(RegisterVmError::UnknownRegion(*region))?;
+            .ok_or(VmError::UnknownRegion(*region))?;
         if captures.len() != bytecode.local_count as usize {
-            return Err(RegisterVmError::FrameShapeMismatch);
+            return Err(VmError::FrameShapeMismatch);
         }
         Ok(Self {
             registers: RegisterFrame::new(code.register_count),
@@ -774,21 +769,21 @@ impl RegisterVm {
             bytecode,
             pc: 0,
             waiting_destination: None,
-            status: RegisterVmStatus::Ready,
-            location: RegisterCodeLocation::Region(*region),
+            status: VmStatus::Ready,
+            location: CodeLocation::Region(*region),
             call_stack: Vec::new(),
         })
     }
 
     /// Creates an independent VM invocation from a save-safe function value.
     pub fn from_callable(
-        bytecode: RegisterBytecode,
+        bytecode: Bytecode,
         callable: &Value,
         arguments: Vec<Value>,
-    ) -> Result<Self, RegisterVmError> {
+    ) -> Result<Self, VmError> {
         match callable {
             Value::Closure { .. } if arguments.is_empty() => Self::from_closure(bytecode, callable),
-            Value::Closure { .. } => Err(RegisterVmError::FunctionArity {
+            Value::Closure { .. } => Err(VmError::FunctionArity {
                 expected: 0,
                 actual: arguments.len(),
             }),
@@ -797,24 +792,24 @@ impl RegisterVm {
                     .functions
                     .iter()
                     .position(|function| function.name == *symbol)
-                    .ok_or(RegisterVmError::UnknownSymbol(*symbol))?;
+                    .ok_or(VmError::UnknownSymbol(*symbol))?;
                 Self::from_function(bytecode, index as u32, arguments)
             }
-            _ => Err(RegisterVmError::TypeMismatch("expected Function")),
+            _ => Err(VmError::TypeMismatch("expected Function")),
         }
     }
 
     pub fn from_function(
-        bytecode: RegisterBytecode,
+        bytecode: Bytecode,
         function: u32,
         arguments: Vec<Value>,
-    ) -> Result<Self, RegisterVmError> {
+    ) -> Result<Self, VmError> {
         let metadata = bytecode
             .functions
             .get(function as usize)
-            .ok_or(RegisterVmError::UnknownFunction(function))?;
+            .ok_or(VmError::UnknownFunction(function))?;
         if metadata.parameters.len() != arguments.len() {
-            return Err(RegisterVmError::FunctionArity {
+            return Err(VmError::FunctionArity {
                 expected: metadata.parameters.len(),
                 actual: arguments.len(),
             });
@@ -828,8 +823,8 @@ impl RegisterVm {
             bytecode,
             pc: 0,
             waiting_destination: None,
-            status: RegisterVmStatus::Ready,
-            location: RegisterCodeLocation::Function(function),
+            status: VmStatus::Ready,
+            location: CodeLocation::Function(function),
             call_stack: Vec::new(),
         };
         for (local, value) in parameters.into_iter().zip(arguments) {
@@ -838,8 +833,8 @@ impl RegisterVm {
         Ok(vm)
     }
 
-    pub fn step(&mut self) -> Result<Option<RegisterVmEvent>, RegisterVmError> {
-        if self.status != RegisterVmStatus::Ready {
+    pub fn step(&mut self) -> Result<Option<VmEvent>, VmError> {
+        if self.status != VmStatus::Ready {
             return Ok(None);
         }
         loop {
@@ -847,20 +842,20 @@ impl RegisterVm {
                 .current_instructions()
                 .get(self.pc)
                 .cloned()
-                .ok_or(RegisterVmError::InvalidProgramCounter(self.pc))?;
+                .ok_or(VmError::InvalidProgramCounter(self.pc))?;
             self.pc += 1;
             match instruction {
-                RegisterInstruction::Constant { dst, value } => {
+                Instruction::Constant { dst, value } => {
                     let value = self.constant_value(value)?;
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::Move { dst, src } => {
+                Instruction::Move { dst, src } => {
                     let value = self.read(src)?.clone();
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::MakeClosure { dst, region } => {
+                Instruction::MakeClosure { dst, region } => {
                     if self.bytecode.regions.get(region as usize).is_none() {
-                        return Err(RegisterVmError::UnknownRegion(region));
+                        return Err(VmError::UnknownRegion(region));
                     }
                     self.write(
                         dst,
@@ -870,29 +865,29 @@ impl RegisterVm {
                         },
                     )?;
                 }
-                RegisterInstruction::LoadLocal { dst, local } => {
+                Instruction::LoadLocal { dst, local } => {
                     let value = self.local(local)?.clone();
                     if value == Value::Uninitialized {
-                        return Err(RegisterVmError::UninitializedLocal(local));
+                        return Err(VmError::UninitializedLocal(local));
                     }
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::StoreLocal { local, src } => {
+                Instruction::StoreLocal { local, src } => {
                     let value = self.read(src)?.clone();
                     *self.local_mut(local)? = value;
                 }
-                RegisterInstruction::LoadGlobal { dst, global } => {
+                Instruction::LoadGlobal { dst, global } => {
                     let value = self.global_slot(global)?.clone();
                     if value == Value::Uninitialized {
-                        return Err(RegisterVmError::UninitializedGlobal(global));
+                        return Err(VmError::UninitializedGlobal(global));
                     }
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::StoreGlobal { global, src } => {
+                Instruction::StoreGlobal { global, src } => {
                     let value = self.read(src)?.clone();
                     *self.global_mut(global)? = value;
                 }
-                RegisterInstruction::GetMember {
+                Instruction::GetMember {
                     dst,
                     object,
                     member,
@@ -902,7 +897,7 @@ impl RegisterVm {
                     let value = get_member(self.read(object)?, &name, safe)?;
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::SetMember {
+                Instruction::SetMember {
                     dst,
                     object,
                     member,
@@ -914,13 +909,13 @@ impl RegisterVm {
                     set_member(&mut object, &name, value)?;
                     self.write(dst, object)?;
                 }
-                RegisterInstruction::UnaryMinus { dst, value } => {
+                Instruction::UnaryMinus { dst, value } => {
                     let Value::Number(value) = self.read(value)? else {
-                        return Err(RegisterVmError::TypeMismatch("unary minus expects Number"));
+                        return Err(VmError::TypeMismatch("unary minus expects Number"));
                     };
                     self.write(dst, Value::Number(-value))?;
                 }
-                RegisterInstruction::Binary {
+                Instruction::Binary {
                     dst,
                     op,
                     left,
@@ -929,24 +924,24 @@ impl RegisterVm {
                     let value = binary(op, self.read(left)?, self.read(right)?)?;
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::MakeTuple { dst, values } => {
+                Instruction::MakeTuple { dst, values } => {
                     let values = self.read_slice(values)?;
                     self.write(dst, Value::Tuple(values))?;
                 }
-                RegisterInstruction::MakeList { dst, values } => {
+                Instruction::MakeList { dst, values } => {
                     let values = self.read_slice(values)?;
                     self.write(dst, Value::List(values))?;
                 }
-                RegisterInstruction::MakeMap { dst, names, values } => {
+                Instruction::MakeMap { dst, names, values } => {
                     let values = self.read_slice(values)?;
                     let fields = names
                         .into_iter()
                         .zip(values)
                         .map(|(name, value)| Ok((self.symbol(name)?.to_string(), value)))
-                        .collect::<Result<BTreeMap<_, _>, RegisterVmError>>()?;
+                        .collect::<Result<BTreeMap<_, _>, VmError>>()?;
                     self.write(dst, Value::Map(fields))?;
                 }
-                RegisterInstruction::Call {
+                Instruction::Call {
                     dst,
                     function,
                     receiver,
@@ -968,7 +963,7 @@ impl RegisterVm {
                                 value,
                             })
                         })
-                        .collect::<Result<Vec<_>, RegisterVmError>>()?;
+                        .collect::<Result<Vec<_>, VmError>>()?;
                     if receiver.is_none()
                         && let Some(function_index) = self
                             .bytecode
@@ -983,15 +978,15 @@ impl RegisterVm {
                         self.call_script(function_index, dst, values)?;
                         continue;
                     }
-                    self.status = RegisterVmStatus::WaitingForHost;
+                    self.status = VmStatus::WaitingForHost;
                     self.waiting_destination = Some(dst);
-                    return Ok(Some(RegisterVmEvent::Call(SymbolCall {
+                    return Ok(Some(VmEvent::Call(SymbolCall {
                         function,
                         receiver,
                         arguments,
                     })));
                 }
-                RegisterInstruction::CallValue {
+                Instruction::CallValue {
                     dst,
                     callee,
                     labels,
@@ -1010,7 +1005,7 @@ impl RegisterVm {
                                 value,
                             })
                         })
-                        .collect::<Result<Vec<_>, RegisterVmError>>()?;
+                        .collect::<Result<Vec<_>, VmError>>()?;
                     match callee {
                         Value::Function(function) => {
                             if let Some(function_index) = self
@@ -1029,9 +1024,9 @@ impl RegisterVm {
                                 )?;
                                 continue;
                             }
-                            self.status = RegisterVmStatus::WaitingForHost;
+                            self.status = VmStatus::WaitingForHost;
                             self.waiting_destination = Some(dst);
-                            return Ok(Some(RegisterVmEvent::Call(SymbolCall {
+                            return Ok(Some(VmEvent::Call(SymbolCall {
                                 function,
                                 receiver: None,
                                 arguments,
@@ -1039,7 +1034,7 @@ impl RegisterVm {
                         }
                         Value::Closure { region, captures } => {
                             if !arguments.is_empty() {
-                                return Err(RegisterVmError::FunctionArity {
+                                return Err(VmError::FunctionArity {
                                     expected: 0,
                                     actual: arguments.len(),
                                 });
@@ -1047,17 +1042,17 @@ impl RegisterVm {
                             self.call_closure(region, captures, dst)?;
                             continue;
                         }
-                        _ => return Err(RegisterVmError::TypeMismatch("callee expects Function")),
+                        _ => return Err(VmError::TypeMismatch("callee expects Function")),
                     }
                 }
-                RegisterInstruction::AssertNonNull { dst, value } => {
+                Instruction::AssertNonNull { dst, value } => {
                     let value = self.read(value)?.clone();
                     if value == Value::Null {
-                        return Err(RegisterVmError::NullAssertion);
+                        return Err(VmError::NullAssertion);
                     }
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::SelectNonNull {
+                Instruction::SelectNonNull {
                     dst,
                     value,
                     fallback,
@@ -1070,59 +1065,59 @@ impl RegisterVm {
                     };
                     self.write(dst, value)?;
                 }
-                RegisterInstruction::Statement { value, string } => {
+                Instruction::Statement { value, string } => {
                     let value = self.read(value)?;
                     let statement = match (string, value) {
                         (true, Value::String(value)) => StatementValue::String(value.clone()),
                         _ => StatementValue::Commit,
                     };
-                    return Ok(Some(RegisterVmEvent::Statement(statement)));
+                    return Ok(Some(VmEvent::Statement(statement)));
                 }
-                RegisterInstruction::Jump(target) => self.pc = target,
-                RegisterInstruction::Branch {
+                Instruction::Jump(target) => self.pc = target,
+                Instruction::Branch {
                     condition,
                     then_target,
                     else_target,
                 } => {
                     let Value::Bool(condition) = self.read(condition)? else {
-                        return Err(RegisterVmError::TypeMismatch("branch expects Bool"));
+                        return Err(VmError::TypeMismatch("branch expects Bool"));
                     };
                     self.pc = if *condition { then_target } else { else_target };
                 }
-                RegisterInstruction::Return(value) => {
+                Instruction::Return(value) => {
                     let value = value
                         .map(|register| self.read(register).cloned())
                         .transpose()?
                         .unwrap_or(Value::Null);
                     if self.call_stack.is_empty() {
-                        self.status = RegisterVmStatus::Completed;
-                        return Ok(Some(RegisterVmEvent::Completed(value)));
+                        self.status = VmStatus::Completed;
+                        return Ok(Some(VmEvent::Completed(value)));
                     }
                     self.return_from_script(value)?;
                 }
-                RegisterInstruction::Halt => {
-                    self.status = RegisterVmStatus::Completed;
-                    return Ok(Some(RegisterVmEvent::Completed(Value::Null)));
+                Instruction::Halt => {
+                    self.status = VmStatus::Completed;
+                    return Ok(Some(VmEvent::Completed(Value::Null)));
                 }
             }
         }
     }
 
-    pub fn resume(&mut self, value: Value) -> Result<(), RegisterVmError> {
-        if self.status != RegisterVmStatus::WaitingForHost {
-            return Err(RegisterVmError::NotWaitingForHost);
+    pub fn resume(&mut self, value: Value) -> Result<(), VmError> {
+        if self.status != VmStatus::WaitingForHost {
+            return Err(VmError::NotWaitingForHost);
         }
         let destination = self
             .waiting_destination
             .take()
-            .ok_or(RegisterVmError::NotWaitingForHost)?;
+            .ok_or(VmError::NotWaitingForHost)?;
         self.write(destination, value)?;
-        self.status = RegisterVmStatus::Ready;
+        self.status = VmStatus::Ready;
         Ok(())
     }
 
-    pub fn snapshot(&self) -> RegisterVmSnapshot {
-        RegisterVmSnapshot {
+    pub fn snapshot(&self) -> VmSnapshot {
+        VmSnapshot {
             source_hash: self.bytecode.source_hash,
             builtin_manifest_hash: self.bytecode.builtin_manifest_hash,
             pc: self.pc,
@@ -1136,40 +1131,37 @@ impl RegisterVm {
         }
     }
 
-    pub fn restore(
-        bytecode: RegisterBytecode,
-        snapshot: RegisterVmSnapshot,
-    ) -> Result<Self, RegisterVmError> {
+    pub fn restore(bytecode: Bytecode, snapshot: VmSnapshot) -> Result<Self, VmError> {
         if bytecode.source_hash != snapshot.source_hash {
-            return Err(RegisterVmError::SourceHashMismatch);
+            return Err(VmError::SourceHashMismatch);
         }
         if bytecode.builtin_manifest_hash != snapshot.builtin_manifest_hash {
-            return Err(RegisterVmError::BuiltinManifestMismatch);
+            return Err(VmError::BuiltinManifestMismatch);
         }
         let register_count = match snapshot.location {
-            RegisterCodeLocation::Entry => bytecode.register_count,
-            RegisterCodeLocation::Function(function) => bytecode
+            CodeLocation::Entry => bytecode.register_count,
+            CodeLocation::Function(function) => bytecode
                 .functions
                 .get(function as usize)
                 .map(|function| function.register_count)
-                .ok_or(RegisterVmError::UnknownFunction(function))?,
-            RegisterCodeLocation::Region(region) => bytecode
+                .ok_or(VmError::UnknownFunction(function))?,
+            CodeLocation::Region(region) => bytecode
                 .regions
                 .get(region as usize)
                 .map(|region| region.register_count)
-                .ok_or(RegisterVmError::UnknownRegion(region))?,
+                .ok_or(VmError::UnknownRegion(region))?,
         };
         if snapshot.registers.len() != usize::from(register_count)
             || snapshot.locals.len() != bytecode.local_count as usize
             || snapshot.globals.len() != bytecode.globals.len()
         {
-            return Err(RegisterVmError::FrameShapeMismatch);
+            return Err(VmError::FrameShapeMismatch);
         }
         let mut registers = RegisterFrame::new(register_count);
         for (index, value) in snapshot.registers.into_iter().enumerate() {
             registers
                 .write(Register(index as u16), value)
-                .map_err(|_| RegisterVmError::InvalidRegister(Register(index as u16)))?;
+                .map_err(|_| VmError::InvalidRegister(Register(index as u16)))?;
         }
         Ok(Self {
             bytecode,
@@ -1184,7 +1176,7 @@ impl RegisterVm {
         })
     }
 
-    pub fn status(&self) -> RegisterVmStatus {
+    pub fn status(&self) -> VmStatus {
         self.status
     }
 
@@ -1200,9 +1192,9 @@ impl RegisterVm {
         &self.globals
     }
 
-    pub fn set_global_values(&mut self, values: Vec<Value>) -> Result<(), RegisterVmError> {
+    pub fn set_global_values(&mut self, values: Vec<Value>) -> Result<(), VmError> {
         if values.len() != self.bytecode.globals.len() {
-            return Err(RegisterVmError::FrameShapeMismatch);
+            return Err(VmError::FrameShapeMismatch);
         }
         self.globals = values.into_boxed_slice();
         Ok(())
@@ -1227,36 +1219,34 @@ impl RegisterVm {
         crate::eval_template(template, &mut context)
     }
 
-    fn constant_value(&self, value: RegisterConstant) -> Result<Value, RegisterVmError> {
+    fn constant_value(&self, value: Constant) -> Result<Value, VmError> {
         Ok(match value {
-            RegisterConstant::Null | RegisterConstant::Unit => Value::Null,
-            RegisterConstant::Ellipsis => Value::Ellipsis,
-            RegisterConstant::Bool(value) => Value::Bool(value),
-            RegisterConstant::Number(value) => Value::Number(value),
-            RegisterConstant::Percent(value) => Value::Percent(value),
-            RegisterConstant::String(value) => Value::String(value),
-            RegisterConstant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
-            RegisterConstant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
-            RegisterConstant::Function(symbol) => Value::Function(symbol),
+            Constant::Null | Constant::Unit => Value::Null,
+            Constant::Ellipsis => Value::Ellipsis,
+            Constant::Bool(value) => Value::Bool(value),
+            Constant::Number(value) => Value::Number(value),
+            Constant::Percent(value) => Value::Percent(value),
+            Constant::String(value) => Value::String(value),
+            Constant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
+            Constant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
+            Constant::Function(symbol) => Value::Function(symbol),
         })
     }
 
-    fn symbol(&self, symbol: SymbolId) -> Result<&str, RegisterVmError> {
+    fn symbol(&self, symbol: SymbolId) -> Result<&str, VmError> {
         self.bytecode
             .symbols
             .resolve(symbol)
-            .ok_or(RegisterVmError::UnknownSymbol(symbol))
+            .ok_or(VmError::UnknownSymbol(symbol))
     }
 
-    fn current_instructions(&self) -> &[RegisterInstruction] {
+    fn current_instructions(&self) -> &[Instruction] {
         match self.location {
-            RegisterCodeLocation::Entry => &self.bytecode.instructions,
-            RegisterCodeLocation::Function(function) => {
+            CodeLocation::Entry => &self.bytecode.instructions,
+            CodeLocation::Function(function) => {
                 &self.bytecode.functions[function as usize].instructions
             }
-            RegisterCodeLocation::Region(region) => {
-                &self.bytecode.regions[region as usize].instructions
-            }
+            CodeLocation::Region(region) => &self.bytecode.regions[region as usize].instructions,
         }
     }
 
@@ -1265,19 +1255,19 @@ impl RegisterVm {
         function_index: usize,
         destination: Register,
         arguments: Vec<Value>,
-    ) -> Result<(), RegisterVmError> {
+    ) -> Result<(), VmError> {
         let function = self
             .bytecode
             .functions
             .get(function_index)
-            .ok_or(RegisterVmError::UnknownFunction(function_index as u32))?;
+            .ok_or(VmError::UnknownFunction(function_index as u32))?;
         if function.parameters.len() != arguments.len() {
-            return Err(RegisterVmError::FunctionArity {
+            return Err(VmError::FunctionArity {
                 expected: function.parameters.len(),
                 actual: arguments.len(),
             });
         }
-        self.call_stack.push(RegisterCallFrameSnapshot {
+        self.call_stack.push(CallFrameSnapshot {
             location: self.location,
             pc: self.pc,
             registers: self.registers.values().to_vec(),
@@ -1286,7 +1276,7 @@ impl RegisterVm {
         });
         let register_count = function.register_count;
         let parameters = function.parameters.clone();
-        self.location = RegisterCodeLocation::Function(function_index as u32);
+        self.location = CodeLocation::Function(function_index as u32);
         self.pc = 0;
         self.registers = RegisterFrame::new(register_count);
         self.locals =
@@ -1302,16 +1292,16 @@ impl RegisterVm {
         region: u32,
         captures: Vec<Value>,
         destination: Register,
-    ) -> Result<(), RegisterVmError> {
+    ) -> Result<(), VmError> {
         let code = self
             .bytecode
             .regions
             .get(region as usize)
-            .ok_or(RegisterVmError::UnknownRegion(region))?;
+            .ok_or(VmError::UnknownRegion(region))?;
         if captures.len() != self.bytecode.local_count as usize {
-            return Err(RegisterVmError::FrameShapeMismatch);
+            return Err(VmError::FrameShapeMismatch);
         }
-        self.call_stack.push(RegisterCallFrameSnapshot {
+        self.call_stack.push(CallFrameSnapshot {
             location: self.location,
             pc: self.pc,
             registers: self.registers.values().to_vec(),
@@ -1319,81 +1309,81 @@ impl RegisterVm {
             destination,
         });
         let register_count = code.register_count;
-        self.location = RegisterCodeLocation::Region(region);
+        self.location = CodeLocation::Region(region);
         self.pc = 0;
         self.registers = RegisterFrame::new(register_count);
         self.locals = captures.into_boxed_slice();
         Ok(())
     }
 
-    fn return_from_script(&mut self, value: Value) -> Result<(), RegisterVmError> {
+    fn return_from_script(&mut self, value: Value) -> Result<(), VmError> {
         let frame = self
             .call_stack
             .pop()
-            .ok_or(RegisterVmError::ReturnOutsideFunction)?;
+            .ok_or(VmError::ReturnOutsideFunction)?;
         self.location = frame.location;
         self.pc = frame.pc;
         let mut registers = RegisterFrame::new(frame.registers.len() as u16);
         for (index, value) in frame.registers.into_iter().enumerate() {
             registers
                 .write(Register(index as u16), value)
-                .map_err(|_| RegisterVmError::InvalidRegister(Register(index as u16)))?;
+                .map_err(|_| VmError::InvalidRegister(Register(index as u16)))?;
         }
         self.registers = registers;
         self.locals = frame.locals.into_boxed_slice();
         self.write(frame.destination, value)
     }
 
-    fn read(&self, register: Register) -> Result<&Value, RegisterVmError> {
+    fn read(&self, register: Register) -> Result<&Value, VmError> {
         self.registers
             .read(register)
-            .ok_or(RegisterVmError::InvalidRegister(register))
+            .ok_or(VmError::InvalidRegister(register))
     }
 
-    fn write(&mut self, register: Register, value: Value) -> Result<(), RegisterVmError> {
+    fn write(&mut self, register: Register, value: Value) -> Result<(), VmError> {
         self.registers
             .write(register, value)
-            .map_err(|_| RegisterVmError::InvalidRegister(register))
+            .map_err(|_| VmError::InvalidRegister(register))
     }
 
-    fn read_slice(&self, registers: RegisterSlice) -> Result<Vec<Value>, RegisterVmError> {
+    fn read_slice(&self, registers: RegisterSlice) -> Result<Vec<Value>, VmError> {
         (0..registers.count)
             .map(|offset| {
                 let index = u32::from(registers.start.0)
                     .checked_add(offset)
                     .and_then(|index| u16::try_from(index).ok())
-                    .ok_or(RegisterVmError::InvalidRegister(registers.start))?;
+                    .ok_or(VmError::InvalidRegister(registers.start))?;
                 self.read(Register(index)).cloned()
             })
             .collect()
     }
 
-    fn local(&self, local: u32) -> Result<&Value, RegisterVmError> {
+    fn local(&self, local: u32) -> Result<&Value, VmError> {
         self.locals
             .get(local as usize)
-            .ok_or(RegisterVmError::InvalidLocal(local))
+            .ok_or(VmError::InvalidLocal(local))
     }
 
-    fn local_mut(&mut self, local: u32) -> Result<&mut Value, RegisterVmError> {
+    fn local_mut(&mut self, local: u32) -> Result<&mut Value, VmError> {
         self.locals
             .get_mut(local as usize)
-            .ok_or(RegisterVmError::InvalidLocal(local))
+            .ok_or(VmError::InvalidLocal(local))
     }
 
-    fn global_slot(&self, global: u32) -> Result<&Value, RegisterVmError> {
+    fn global_slot(&self, global: u32) -> Result<&Value, VmError> {
         self.globals
             .get(global as usize)
-            .ok_or(RegisterVmError::InvalidGlobal(global))
+            .ok_or(VmError::InvalidGlobal(global))
     }
 
-    fn global_mut(&mut self, global: u32) -> Result<&mut Value, RegisterVmError> {
+    fn global_mut(&mut self, global: u32) -> Result<&mut Value, VmError> {
         self.globals
             .get_mut(global as usize)
-            .ok_or(RegisterVmError::InvalidGlobal(global))
+            .ok_or(VmError::InvalidGlobal(global))
     }
 }
 
-fn get_member(value: &Value, name: &str, safe: bool) -> Result<Value, RegisterVmError> {
+fn get_member(value: &Value, name: &str, safe: bool) -> Result<Value, VmError> {
     if value == &Value::Null && safe {
         return Ok(Value::Null);
     }
@@ -1401,52 +1391,44 @@ fn get_member(value: &Value, name: &str, safe: bool) -> Result<Value, RegisterVm
         Value::Map(fields) => fields
             .get(name)
             .cloned()
-            .ok_or_else(|| RegisterVmError::UnknownMember(name.to_string())),
+            .ok_or_else(|| VmError::UnknownMember(name.to_string())),
         Value::Typed { value, .. } => get_member(value, name, safe),
-        Value::Null => Err(RegisterVmError::NullMemberAccess(name.to_string())),
-        _ => Err(RegisterVmError::TypeMismatch(
-            "member receiver is not a record",
-        )),
+        Value::Null => Err(VmError::NullMemberAccess(name.to_string())),
+        _ => Err(VmError::TypeMismatch("member receiver is not a record")),
     }
 }
 
-fn set_member(value: &mut Value, name: &str, new_value: Value) -> Result<(), RegisterVmError> {
+fn set_member(value: &mut Value, name: &str, new_value: Value) -> Result<(), VmError> {
     let fields = match value {
         Value::Map(fields) => fields,
         Value::Typed { value, .. } => match value.as_mut() {
             Value::Map(fields) => fields,
             _ => {
-                return Err(RegisterVmError::TypeMismatch(
-                    "member receiver is not a record",
-                ));
+                return Err(VmError::TypeMismatch("member receiver is not a record"));
             }
         },
         _ => {
-            return Err(RegisterVmError::TypeMismatch(
-                "member receiver is not a record",
-            ));
+            return Err(VmError::TypeMismatch("member receiver is not a record"));
         }
     };
     let field = fields
         .get_mut(name)
-        .ok_or_else(|| RegisterVmError::UnknownMember(name.to_string()))?;
+        .ok_or_else(|| VmError::UnknownMember(name.to_string()))?;
     *field = new_value;
     Ok(())
 }
 
-fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, RegisterVmError> {
+fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmError> {
     use crate::BinaryOp;
     match op {
         BinaryOp::Equal => Ok(Value::Bool(left == right)),
         BinaryOp::NotEqual => Ok(Value::Bool(left != right)),
         BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
             let (Value::Number(left), Value::Number(right)) = (left, right) else {
-                return Err(RegisterVmError::TypeMismatch(
-                    "arithmetic expects Number operands",
-                ));
+                return Err(VmError::TypeMismatch("arithmetic expects Number operands"));
             };
             if op == BinaryOp::Divide && *right == 0.0 {
-                return Err(RegisterVmError::DivisionByZero);
+                return Err(VmError::DivisionByZero);
             }
             Ok(Value::Number(match op {
                 BinaryOp::Add => left + right,
@@ -1458,9 +1440,7 @@ fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, Reg
         }
         BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
             let (Value::Number(left), Value::Number(right)) = (left, right) else {
-                return Err(RegisterVmError::TypeMismatch(
-                    "comparison expects Number operands",
-                ));
+                return Err(VmError::TypeMismatch("comparison expects Number operands"));
             };
             Ok(Value::Bool(match op {
                 BinaryOp::Less => left < right,
@@ -1470,14 +1450,14 @@ fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, Reg
                 _ => unreachable!(),
             }))
         }
-        BinaryOp::Colon => Err(RegisterVmError::TypeMismatch(
+        BinaryOp::Colon => Err(VmError::TypeMismatch(
             "dialogue operator must resolve to a registered builtin",
         )),
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RegisterVmError {
+pub enum VmError {
     UnsupportedBytecode(u16),
     InvalidProgramCounter(usize),
     InvalidRegister(Register),
@@ -1507,8 +1487,8 @@ mod tests {
 
     use super::*;
 
-    fn compile(source: &str, manifest: &BuiltinManifest) -> RegisterBytecode {
-        compile_register_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
+    fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
+        compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
     }
 
@@ -1526,12 +1506,9 @@ mod tests {
             "#,
             &manifest,
         );
-        let mut vm = RegisterVm::new(bytecode).expect("VM initializes");
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
         loop {
-            if matches!(
-                vm.step().expect("VM executes"),
-                Some(RegisterVmEvent::Completed(_))
-            ) {
+            if matches!(vm.step().expect("VM executes"), Some(VmEvent::Completed(_))) {
                 break;
             }
         }
@@ -1549,30 +1526,29 @@ mod tests {
         let builtin = BuiltinId(8);
         let manifest = BuiltinManifest::new([("nativeValue", builtin)]);
         let bytecode = compile("let value = nativeValue()\nvalue += 1", &manifest);
-        let mut vm = RegisterVm::new(bytecode.clone()).expect("VM initializes");
-        let Some(RegisterVmEvent::Call(call)) = vm.step().expect("call yields") else {
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        let Some(VmEvent::Call(call)) = vm.step().expect("call yields") else {
             panic!("expected native call")
         };
         assert_eq!(bytecode.symbols.resolve(call.function), Some("nativeValue"));
-        let linked = crate::link_register_bytecode(bytecode.clone(), &manifest)
-            .expect("symbolic call must link");
+        let linked =
+            crate::link_bytecode(bytecode.clone(), &manifest).expect("symbolic call must link");
         assert_eq!(
             linked.resolve(call.function),
             Some(crate::LinkedFunction::Native(builtin))
         );
         let snapshot = vm.snapshot();
-        let mut restored =
-            RegisterVm::restore(bytecode, snapshot).expect("waiting VM snapshot restores");
+        let mut restored = Vm::restore(bytecode, snapshot).expect("waiting VM snapshot restores");
         restored
             .resume(Value::Number(4.0))
             .expect("host value resumes VM");
         assert_eq!(
             restored.step().expect("statement executes"),
-            Some(RegisterVmEvent::Statement(StatementValue::Commit))
+            Some(VmEvent::Statement(StatementValue::Commit))
         );
         assert_eq!(
             restored.step().expect("assignment executes"),
-            Some(RegisterVmEvent::Statement(StatementValue::Commit))
+            Some(VmEvent::Statement(StatementValue::Commit))
         );
     }
 
@@ -1584,7 +1560,7 @@ mod tests {
             .instructions
             .iter()
             .find_map(|instruction| match instruction {
-                RegisterInstruction::Call { arguments, .. } => Some(*arguments),
+                Instruction::Call { arguments, .. } => Some(*arguments),
                 _ => None,
             })
             .expect("call instruction exists");
@@ -1594,7 +1570,7 @@ mod tests {
             bytecode
                 .instructions
                 .iter()
-                .filter(|instruction| matches!(instruction, RegisterInstruction::Move { .. }))
+                .filter(|instruction| matches!(instruction, Instruction::Move { .. }))
                 .count(),
             3
         );
@@ -1610,8 +1586,8 @@ mod tests {
             "#,
             &manifest,
         );
-        let mut vm = RegisterVm::new(bytecode.clone()).expect("VM initializes");
-        let Some(RegisterVmEvent::Call(call)) = vm.step().expect("native call yields") else {
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        let Some(VmEvent::Call(call)) = vm.step().expect("native call yields") else {
             panic!("expected native call")
         };
         assert_eq!(bytecode.symbols.resolve(call.function), Some("nativeValue"));
@@ -1619,13 +1595,13 @@ mod tests {
         let snapshot = vm.snapshot();
         assert_eq!(snapshot.call_stack.len(), 1);
 
-        let mut restored = RegisterVm::restore(bytecode, snapshot).expect("call stack restores");
+        let mut restored = Vm::restore(bytecode, snapshot).expect("call stack restores");
         restored
             .resume(Value::Number(4.0))
             .expect("native result resumes function");
         while !matches!(
             restored.step().expect("execution succeeds"),
-            Some(RegisterVmEvent::Completed(_))
+            Some(VmEvent::Completed(_))
         ) {}
     }
 
@@ -1646,11 +1622,11 @@ mod tests {
         );
         let bytecode = compile("let value = 4\ninvoke { value + 1 }", &manifest);
         assert_eq!(bytecode.regions.len(), 1);
-        let mut vm = RegisterVm::new(bytecode).expect("VM initializes");
-        let Some(RegisterVmEvent::Statement(_)) = vm.step().expect("let executes") else {
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        let Some(VmEvent::Statement(_)) = vm.step().expect("let executes") else {
             panic!("expected let statement")
         };
-        let Some(RegisterVmEvent::Call(call)) = vm.step().expect("invoke yields") else {
+        let Some(VmEvent::Call(call)) = vm.step().expect("invoke yields") else {
             panic!("expected invoke call")
         };
         assert!(matches!(
@@ -1667,10 +1643,10 @@ mod tests {
             "fn increment(value: Int) -> Int { value + 1 }\nlet callable = increment\nglobal result = callable(2)",
             &manifest,
         );
-        let mut vm = RegisterVm::new(bytecode).expect("VM initializes");
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
         while !matches!(
             vm.step().expect("function value executes"),
-            Some(RegisterVmEvent::Completed(_))
+            Some(VmEvent::Completed(_))
         ) {}
         assert_eq!(vm.global("result"), Some(&Value::Number(3.0)));
     }
@@ -1692,8 +1668,8 @@ mod tests {
         );
         let bytecode = compile("fn work() { 1 }\nschedule(work)", &manifest);
         let function_symbol = bytecode.functions[0].name;
-        let mut vm = RegisterVm::new(bytecode).expect("VM initializes");
-        let Some(RegisterVmEvent::Call(call)) = vm.step().expect("schedule yields") else {
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        let Some(VmEvent::Call(call)) = vm.step().expect("schedule yields") else {
             panic!("expected native call")
         };
         assert_eq!(call.arguments[0].value, Value::Function(function_symbol));

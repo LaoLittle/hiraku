@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, VecDeque};
 use hiraku_script::StatementValue;
 use hiraku_script::TemplateError;
 use hiraku_script::{
-    BuiltinCall, LinkedBytecode, LinkedFunction, RegisterBytecode, RegisterVm, RegisterVmError,
-    RegisterVmEvent, RegisterVmSnapshot, SymbolCall, Value, link_register_bytecode,
+    BuiltinCall, Bytecode, LinkedBytecode, LinkedFunction, SymbolCall, Value, Vm, VmError, VmEvent,
+    VmSnapshot, link_bytecode,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,7 +32,7 @@ pub enum HksRuntimeEvent {
 }
 
 pub struct HksRuntime {
-    vm: RegisterVm,
+    vm: Vm,
     scheduler: TaskScheduler,
     linked: LinkedBytecode,
     globals: BTreeMap<String, Value>,
@@ -111,7 +111,7 @@ pub struct StoryRuntimeSnapshot {
 }
 
 impl StoryRuntime {
-    pub fn new(bytecode: RegisterBytecode) -> Result<Self, StoryRuntimeError> {
+    pub fn new(bytecode: Bytecode) -> Result<Self, StoryRuntimeError> {
         Ok(Self {
             bytecode: HksRuntime::new(bytecode)?,
             host: StoryNativeHost::new(),
@@ -144,7 +144,7 @@ impl StoryRuntime {
     }
 
     pub fn restore(
-        bytecode: RegisterBytecode,
+        bytecode: Bytecode,
         snapshot: StoryRuntimeSnapshot,
     ) -> Result<Self, StoryRuntimeError> {
         let pending = snapshot
@@ -544,17 +544,17 @@ fn closure_value(value: &Value) -> Option<ClosureValue> {
 pub struct HksRuntimeSnapshot {
     /// Exact executing bytecode. Restore relinks this against the current
     /// native registry instead of relying on source recompilation offsets.
-    pub program: RegisterBytecode,
-    pub vm: RegisterVmSnapshot,
+    pub program: Bytecode,
+    pub vm: VmSnapshot,
     pub scheduler: TaskSchedulerSnapshot,
 }
 
 impl HksRuntime {
-    pub fn new(bytecode: RegisterBytecode) -> Result<Self, HksRuntimeError> {
-        let linked = link_register_bytecode(bytecode.clone(), &story_manifest())
-            .map_err(HksRuntimeError::Link)?;
+    pub fn new(bytecode: Bytecode) -> Result<Self, HksRuntimeError> {
+        let linked =
+            link_bytecode(bytecode.clone(), &story_manifest()).map_err(HksRuntimeError::Link)?;
         Ok(Self {
-            vm: RegisterVm::new(bytecode.clone())?,
+            vm: Vm::new(bytecode.clone())?,
             scheduler: TaskScheduler::new(bytecode),
             linked,
             globals: BTreeMap::new(),
@@ -580,13 +580,13 @@ impl HksRuntime {
     }
 
     pub fn restore(
-        _bytecode: RegisterBytecode,
+        _bytecode: Bytecode,
         snapshot: HksRuntimeSnapshot,
     ) -> Result<Self, HksRuntimeError> {
         let bytecode = snapshot.program;
-        let linked = link_register_bytecode(bytecode.clone(), &story_manifest())
-            .map_err(HksRuntimeError::Link)?;
-        let vm = RegisterVm::restore(bytecode.clone(), snapshot.vm)?;
+        let linked =
+            link_bytecode(bytecode.clone(), &story_manifest()).map_err(HksRuntimeError::Link)?;
+        let vm = Vm::restore(bytecode.clone(), snapshot.vm)?;
         let globals = globals_from_values(&bytecode, vm.globals());
         Ok(Self {
             vm,
@@ -600,19 +600,19 @@ impl HksRuntime {
     pub fn step(&mut self) -> Result<Option<HksRuntimeEvent>, HksRuntimeError> {
         if let Some(event) = self.vm.step()? {
             return match event {
-                RegisterVmEvent::Call(call) => {
+                VmEvent::Call(call) => {
                     let mut call = self.link_call(call)?;
                     evaluate_call_templates(&mut call, |text| self.vm.eval_template(text))?;
                     Ok(Some(HksRuntimeEvent::Call(call)))
                 }
-                RegisterVmEvent::Statement(value) => {
+                VmEvent::Statement(value) => {
                     let value = evaluate_statement_template(&mut self.vm, value)?;
                     self.refresh_globals();
                     self.scheduler
                         .set_global_values(self.vm.globals().to_vec())?;
                     Ok(Some(HksRuntimeEvent::Statement(value)))
                 }
-                RegisterVmEvent::Completed(value) => Ok(Some(HksRuntimeEvent::Completed(value))),
+                VmEvent::Completed(value) => Ok(Some(HksRuntimeEvent::Completed(value))),
             };
         }
 
@@ -664,10 +664,7 @@ impl HksRuntime {
     }
 
     fn main_waiting_for_host(&self) -> bool {
-        matches!(
-            self.vm.status(),
-            hiraku_script::RegisterVmStatus::WaitingForHost
-        )
+        matches!(self.vm.status(), hiraku_script::VmStatus::WaitingForHost)
     }
 
     pub fn resume_task(&mut self, task: u64, value: Value) -> Result<(), HksRuntimeError> {
@@ -704,7 +701,7 @@ impl HksRuntime {
 #[derive(Debug, Error)]
 pub enum HksRuntimeError {
     #[error("HKS VM failed: {0:?}")]
-    Vm(RegisterVmError),
+    Vm(VmError),
     #[error("HKS task scheduler failed: {0}")]
     Task(#[from] TaskSchedulerError),
     #[error("HKS bytecode link failed: {0:?}")]
@@ -742,7 +739,7 @@ pub enum StoryRuntimeError {
 }
 
 fn evaluate_statement_template(
-    vm: &mut RegisterVm,
+    vm: &mut Vm,
     value: StatementValue,
 ) -> Result<StatementValue, TemplateError> {
     match value {
@@ -779,10 +776,7 @@ fn evaluate_call_templates(
     Ok(())
 }
 
-fn values_from_globals(
-    bytecode: &RegisterBytecode,
-    globals: &BTreeMap<String, Value>,
-) -> Vec<Value> {
+fn values_from_globals(bytecode: &Bytecode, globals: &BTreeMap<String, Value>) -> Vec<Value> {
     bytecode
         .globals
         .iter()
@@ -797,7 +791,7 @@ fn values_from_globals(
         .collect()
 }
 
-fn globals_from_values(bytecode: &RegisterBytecode, values: &[Value]) -> BTreeMap<String, Value> {
+fn globals_from_values(bytecode: &Bytecode, values: &[Value]) -> BTreeMap<String, Value> {
     bytecode
         .globals
         .iter()
@@ -813,8 +807,8 @@ fn globals_from_values(bytecode: &RegisterBytecode, values: &[Value]) -> BTreeMa
         .collect()
 }
 
-impl From<RegisterVmError> for HksRuntimeError {
-    fn from(error: RegisterVmError) -> Self {
+impl From<VmError> for HksRuntimeError {
+    fn from(error: VmError) -> Self {
         Self::Vm(error)
     }
 }
