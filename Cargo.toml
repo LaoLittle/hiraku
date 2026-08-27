@@ -14,6 +14,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 rustc-hash = "2.1.3"
 bumpalo = "3.20.3"
+uuid = "1"
 
 hiraku-engine = { path = "hiraku_engine" }
 hiraku-errors = { path = "hiraku_errors" }

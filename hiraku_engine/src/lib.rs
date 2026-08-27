@@ -3,6 +3,7 @@ mod audio;
 mod character;
 mod data;
 mod effect;
+pub mod input;
 mod proto;
 pub mod render;
 mod scene;
@@ -37,12 +38,11 @@ use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_character_motion_effects,
     animate_custom_effects, animate_dialogue_text_reveal, animate_rule_transitions,
     animate_visual_tweens, apply_animation_cancellations, apply_live_audio_settings,
-    bridge_story_events, cleanup_stale_screen_ui, handle_choice_buttons, handle_choice_keyboard,
-    handle_runtime_menu_buttons, handle_screen_buttons, handle_screen_image_buttons,
-    poll_pending_character_shows, poll_voice_playback, prepare_bgm_preludes,
-    process_script_commands, setup_frontend, setup_stage, sync_scene_snapshot,
-    tick_animation_waits, tick_pending_waits, tick_script_batches,
-    update_offscreen_ui_interactions,
+    bridge_story_events, cleanup_stale_screen_ui, handle_choice_action_input,
+    handle_choice_buttons, handle_runtime_menu_buttons, handle_screen_buttons,
+    handle_screen_image_buttons, poll_pending_character_shows, poll_voice_playback,
+    prepare_bgm_preludes, process_script_commands, setup_frontend, setup_stage,
+    sync_scene_snapshot, tick_animation_waits, tick_pending_waits, tick_script_batches,
 };
 use script::{
     ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
@@ -73,6 +73,9 @@ pub struct HirakuCanvas {
     pub image: Handle<Image>,
     pub size: UVec2,
 }
+
+#[derive(Clone, Debug, Resource)]
+pub(crate) struct HirakuInputTarget(pub Handle<Image>);
 
 impl Default for RuntimeLaunchConfig {
     fn default() -> Self {
@@ -143,6 +146,12 @@ impl Plugin for HirakuPlugin {
             .add_audio_source::<audio::PreludeLoopAudio>()
             .init_resource::<HdpVolumeLoads>()
             .init_resource::<texture::TextureAtlasCatalog>()
+            .add_message::<input::HirakuPointerInput>()
+            .add_message::<input::HirakuActionInput>()
+            .add_systems(
+                First,
+                input::bridge_virtual_pointers.before(bevy::picking::PickingSystems::Input),
+            )
             .init_resource::<ScriptRuntimeState>()
             .add_message::<ScriptResponseMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
@@ -204,35 +213,32 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
-                update_offscreen_ui_interactions
+                handle_screen_buttons
                     .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
-                handle_screen_buttons
-                    .after(update_offscreen_ui_interactions)
-                    .in_set(HirakuRuntimeSystems),
-            )
-            .add_systems(
-                Update,
                 handle_screen_image_buttons
-                    .after(update_offscreen_ui_interactions)
+                    .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
                 handle_choice_buttons
-                    .after(update_offscreen_ui_interactions)
+                    .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
                 handle_runtime_menu_buttons
-                    .after(update_offscreen_ui_interactions)
+                    .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
             )
-            .add_systems(Update, handle_choice_keyboard.in_set(HirakuRuntimeSystems))
+            .add_systems(
+                Update,
+                handle_choice_action_input.in_set(HirakuRuntimeSystems),
+            )
             .add_systems(
                 Update,
                 animate_dialogue_text_reveal.in_set(HirakuRuntimeSystems),
@@ -240,7 +246,7 @@ impl Plugin for HirakuPlugin {
             .add_systems(
                 Update,
                 advance_dialogue_on_input
-                    .after(update_offscreen_ui_interactions)
+                    .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, tick_pending_waits.in_set(HirakuRuntimeSystems))

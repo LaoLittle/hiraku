@@ -6,9 +6,8 @@ use bevy::{
     ecs::system::SystemParam,
     log::{info, warn},
     math::Rect,
+    picking::hover::PickingInteraction,
     prelude::*,
-    ui::{ComputedStackIndex, UiGlobalTransform},
-    window::PrimaryWindow,
 };
 
 use crate::{
@@ -21,7 +20,7 @@ use crate::{
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     render::camera::{
         CameraShake, CameraShakeState, CameraState, CameraTweenState, WorldCamera, focus_layer,
-        setup_stage_cameras, start_camera_tween,
+        setup_stage_cameras, start_camera_tween, ui_layer,
     },
     render::character_part::{AlphaMaskMaterial, CharacterPartVisual, MultiplyMaterial},
     script::{
@@ -58,12 +57,7 @@ use character::{
     apply_character_motion, apply_character_timeline, array_to_rect, despawn_character_actor,
     queue_character_show, rect_to_array,
 };
-#[cfg(test)]
-use screen_ui::window_cursor_to_canvas;
-pub use screen_ui::{
-    cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons,
-    update_offscreen_ui_interactions,
-};
+pub use screen_ui::{cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons};
 use screen_ui::{
     clear_overlay_ui, clear_screen_ui, screen_images_ready,
     should_clear_stale_screen_before_command, spawn_screen_ui,
@@ -717,6 +711,11 @@ pub struct HintText;
 #[derive(Component)]
 pub struct DialogueRoot;
 
+/// Lowest UI picking layer. It makes blank canvas clicks available for dialogue advancement
+/// without teaching the host application about story state.
+#[derive(Component)]
+pub struct DialogueAdvanceSurface;
+
 #[derive(Component)]
 pub struct ChoiceUi;
 
@@ -933,11 +932,11 @@ pub struct RuntimeMenuContext<'w, 's> {
         'w,
         's,
         (
-            &'static Interaction,
+            &'static PickingInteraction,
             &'static mut BackgroundColor,
             &'static RuntimeMenuButton,
         ),
-        Changed<Interaction>,
+        Changed<PickingInteraction>,
     >,
 }
 
@@ -979,6 +978,21 @@ pub fn setup_stage(
     commands.insert_resource(VoiceState::default());
     commands.insert_resource(PendingCharacterShows::default());
     commands.insert_resource(ScreenUiState::default());
+
+    commands.spawn((
+        DialogueAdvanceSurface,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0.0),
+            right: px(0.0),
+            top: px(0.0),
+            bottom: px(0.0),
+            ..default()
+        },
+        GlobalZIndex(-10_000),
+        Pickable::default(),
+        ui_layer(),
+    ));
 
     let dialogue_root = commands
         .spawn((
@@ -1642,8 +1656,8 @@ pub fn handle_frontend_buttons(
     mut choice_state: ResMut<ChoiceState>,
     mut script_runtime: ResMut<ScriptRuntimeState>,
     mut interaction_query: Query<
-        (&Interaction, &mut BackgroundColor, &FrontendButton),
-        Changed<Interaction>,
+        (&PickingInteraction, &mut BackgroundColor, &FrontendButton),
+        Changed<PickingInteraction>,
     >,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
     mut dialogue_root: Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
@@ -1656,7 +1670,7 @@ pub fn handle_frontend_buttons(
 
     for (interaction, mut color, button) in &mut interaction_query {
         match *interaction {
-            Interaction::Pressed => {
+            PickingInteraction::Pressed => {
                 *color = FRONTEND_BUTTON_PRESSED.into();
                 let action = button.action.clone();
                 match action {
@@ -1806,10 +1820,10 @@ pub fn handle_frontend_buttons(
                     }
                 }
             }
-            Interaction::Hovered => {
+            PickingInteraction::Hovered => {
                 *color = FRONTEND_BUTTON_HOVERED.into();
             }
-            Interaction::None => {
+            PickingInteraction::None => {
                 *color = FRONTEND_BUTTON.into();
             }
         }
@@ -3091,34 +3105,29 @@ pub fn handle_choice_buttons(
     mut choice_state: ResMut<ChoiceState>,
     ui_style: Res<UiStyle>,
     mut interaction_query: Query<
-        (&Interaction, &mut BackgroundColor, &ChoiceButton),
-        Changed<Interaction>,
+        (&PickingInteraction, &mut BackgroundColor, &ChoiceButton),
+        Changed<PickingInteraction>,
     >,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
 ) {
     for (interaction, mut color, button) in &mut interaction_query {
         match *interaction {
-            Interaction::Pressed => {
+            PickingInteraction::Pressed => {
                 *color = ui_style.choice_button_pressed.into();
                 resolve_choice(&mut commands, &mut choice_state, &choice_ui, button.index);
             }
-            Interaction::Hovered => {
+            PickingInteraction::Hovered => {
                 *color = ui_style.choice_button_hovered.into();
             }
-            Interaction::None => {
+            PickingInteraction::None => {
                 *color = ui_style.choice_button_bg.into();
             }
         }
     }
 }
 
-/// Maps primary-window pointer input into Hiraku's fixed offscreen canvas.
-///
-/// Bevy's built-in UI focus system only produces [`Interaction`] for cameras targeting a window.
-/// Hiraku renders UI into an image, so the engine performs the equivalent topmost-node hit test in
-/// canvas coordinates before the existing semantic button handlers run.
-pub fn handle_choice_keyboard(
-    keys: Res<ButtonInput<KeyCode>>,
+pub fn handle_choice_action_input(
+    mut actions: MessageReader<crate::input::HirakuActionInput>,
     mut commands: Commands,
     mut choice_state: ResMut<ChoiceState>,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
@@ -3127,44 +3136,9 @@ pub fn handle_choice_keyboard(
         return;
     }
 
-    let selected = [
-        KeyCode::Digit1,
-        KeyCode::Digit2,
-        KeyCode::Digit3,
-        KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
-        KeyCode::Digit7,
-        KeyCode::Digit8,
-        KeyCode::Digit9,
-        KeyCode::Numpad1,
-        KeyCode::Numpad2,
-        KeyCode::Numpad3,
-        KeyCode::Numpad4,
-        KeyCode::Numpad5,
-        KeyCode::Numpad6,
-        KeyCode::Numpad7,
-        KeyCode::Numpad8,
-        KeyCode::Numpad9,
-    ]
-    .into_iter()
-    .find_map(|key| {
-        if keys.just_pressed(key) {
-            Some(match key {
-                KeyCode::Digit1 | KeyCode::Numpad1 => 0,
-                KeyCode::Digit2 | KeyCode::Numpad2 => 1,
-                KeyCode::Digit3 | KeyCode::Numpad3 => 2,
-                KeyCode::Digit4 | KeyCode::Numpad4 => 3,
-                KeyCode::Digit5 | KeyCode::Numpad5 => 4,
-                KeyCode::Digit6 | KeyCode::Numpad6 => 5,
-                KeyCode::Digit7 | KeyCode::Numpad7 => 6,
-                KeyCode::Digit8 | KeyCode::Numpad8 => 7,
-                KeyCode::Digit9 | KeyCode::Numpad9 => 8,
-                _ => unreachable!(),
-            })
-        } else {
-            None
-        }
+    let selected = actions.read().find_map(|action| match action.0 {
+        crate::input::HirakuAction::Choice(index) => Some(index),
+        _ => None,
     });
 
     if let Some(index) = selected {
@@ -3173,9 +3147,8 @@ pub fn handle_choice_keyboard(
 }
 
 pub fn advance_dialogue_on_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    touches: Res<Touches>,
+    mut actions: MessageReader<crate::input::HirakuActionInput>,
+    mut clicks: MessageReader<Pointer<Click>>,
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
@@ -3183,7 +3156,7 @@ pub fn advance_dialogue_on_input(
     choice_state: Res<ChoiceState>,
     runtime_menu: Res<RuntimeMenuState>,
     ui_interactions: Query<
-        &Interaction,
+        &PickingInteraction,
         Or<(
             With<ScreenUiButton>,
             With<ScreenUiImageButton>,
@@ -3200,19 +3173,22 @@ pub fn advance_dialogue_on_input(
         return;
     }
 
-    let advance = keys.just_pressed(KeyCode::Enter)
-        || keys.just_pressed(KeyCode::Space)
-        || mouse.just_pressed(MouseButton::Left)
-        || touches.any_just_pressed();
+    let action_advance = actions
+        .read()
+        .any(|action| action.0 == crate::input::HirakuAction::NextDialogue);
+    let pointer_advance = clicks
+        .read()
+        .any(|click| click.pointer_id.is_custom() && !ui_interactions.contains(click.entity));
+    let advance = action_advance || pointer_advance;
 
     if !advance {
         return;
     }
 
-    if (mouse.just_pressed(MouseButton::Left) || touches.any_just_pressed())
+    if action_advance
         && ui_interactions
             .iter()
-            .any(|interaction| !matches!(*interaction, Interaction::None))
+            .any(|interaction| !matches!(*interaction, PickingInteraction::None))
     {
         return;
     }
@@ -4487,7 +4463,7 @@ fn resolve_choice(
 pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
     for (interaction, mut color, button) in &mut ctx.interaction_query {
         match *interaction {
-            Interaction::Pressed => {
+            PickingInteraction::Pressed => {
                 *color = ctx.ui_style.quick_button_pressed.into();
                 match button.action {
                     RuntimeMenuButtonAction::QuickSave => {
@@ -4583,10 +4559,10 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     }
                 }
             }
-            Interaction::Hovered => {
+            PickingInteraction::Hovered => {
                 *color = ctx.ui_style.quick_button_hovered.into();
             }
-            Interaction::None => {
+            PickingInteraction::None => {
                 *color = ctx.ui_style.quick_button_bg.into();
             }
         }
@@ -4922,33 +4898,5 @@ pub(crate) fn tween_fraction(timer: &Timer) -> f32 {
         1.0
     } else {
         (timer.elapsed_secs() / duration).clamp(0.0, 1.0)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::window_cursor_to_canvas;
-    use bevy::prelude::Vec2;
-
-    #[test]
-    fn maps_pointer_through_letterboxing() {
-        let canvas = Vec2::new(1280.0, 720.0);
-        let mapped =
-            window_cursor_to_canvas(Vec2::new(1000.0, 1000.0), Vec2::new(500.0, 500.0), canvas);
-        assert_eq!(mapped, Some(Vec2::new(640.0, 360.0)));
-        assert_eq!(
-            window_cursor_to_canvas(Vec2::new(1000.0, 1000.0), Vec2::new(500.0, 100.0), canvas,),
-            None
-        );
-    }
-
-    #[test]
-    fn maps_pointer_through_pillarboxing() {
-        let mapped = window_cursor_to_canvas(
-            Vec2::new(2000.0, 720.0),
-            Vec2::new(1000.0, 360.0),
-            Vec2::new(1280.0, 720.0),
-        );
-        assert_eq!(mapped, Some(Vec2::new(640.0, 360.0)));
     }
 }

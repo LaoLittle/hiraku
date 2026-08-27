@@ -158,6 +158,7 @@ pub fn setup_stage_cameras(
         image: canvas_image.clone(),
         size: canvas_size,
     });
+    commands.insert_resource(crate::HirakuInputTarget(ui_image.clone()));
 
     spawn_world_camera(
         commands,

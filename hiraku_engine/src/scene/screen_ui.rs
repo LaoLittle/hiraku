@@ -781,110 +781,12 @@ fn align_items_from_option(value: &Option<String>) -> AlignItems {
         _ => AlignItems::Default,
     }
 }
-pub fn update_offscreen_ui_interactions(
-    canvas: Res<crate::HirakuCanvas>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    touches: Res<Touches>,
-    screen_state: Res<ScreenUiState>,
-    mut buttons: Query<
-        (
-            Entity,
-            &ComputedNode,
-            &UiGlobalTransform,
-            &ComputedStackIndex,
-            &InheritedVisibility,
-            &mut Interaction,
-            Option<&ScreenUiButton>,
-            Option<&ScreenUiImageButton>,
-        ),
-        Or<(
-            With<ScreenUiButton>,
-            With<ScreenUiImageButton>,
-            With<ChoiceButton>,
-            With<RuntimeMenuButton>,
-        )>,
-    >,
-) {
-    let pointer = windows.single().ok().and_then(|window| {
-        let touch = touches
-            .iter_just_pressed()
-            .next()
-            .map(|touch| (touch.position(), true))
-            .or_else(|| touches.iter().next().map(|touch| (touch.position(), false)));
-        let (position, pressed) = touch.or_else(|| {
-            window
-                .cursor_position()
-                .map(|position| (position, mouse.just_pressed(MouseButton::Left)))
-        })?;
-        let canvas_position = window_cursor_to_canvas(
-            Vec2::new(window.width(), window.height()),
-            position,
-            canvas.size.as_vec2(),
-        )?;
-        Some((canvas_position, pressed))
-    });
-
-    let mut topmost = None::<(u32, Entity)>;
-    if let Some((pointer, _)) = pointer {
-        for (entity, computed, transform, stack, visibility, _, screen_button, image_button) in
-            &mut buttons
-        {
-            let belongs_to_active_screen = screen_button
-                .map(|button| Some(button.root) == screen_state.active_root)
-                .or_else(|| {
-                    image_button.map(|button| Some(button.root) == screen_state.active_root)
-                })
-                .unwrap_or(true);
-            if !belongs_to_active_screen
-                || !visibility.get()
-                || !computed.contains_point(*transform, pointer)
-            {
-                continue;
-            }
-            if topmost.is_none_or(|(index, _)| stack.0 >= index) {
-                topmost = Some((stack.0, entity));
-            }
-        }
-    }
-
-    let topmost = topmost.map(|(_, entity)| entity);
-    let pressed = pointer.is_some_and(|(_, pressed)| pressed);
-    for (entity, _, _, _, _, mut interaction, _, _) in &mut buttons {
-        let next = if Some(entity) == topmost {
-            if pressed {
-                Interaction::Pressed
-            } else {
-                Interaction::Hovered
-            }
-        } else {
-            Interaction::None
-        };
-        interaction.set_if_neq(next);
-    }
-}
-
-pub(super) fn window_cursor_to_canvas(
-    window_size: Vec2,
-    cursor: Vec2,
-    canvas_size: Vec2,
-) -> Option<Vec2> {
-    let scale = (window_size.x / canvas_size.x).min(window_size.y / canvas_size.y);
-    if !scale.is_finite() || scale <= 0.0 {
-        return None;
-    }
-    let displayed_size = canvas_size * scale;
-    let origin = (window_size - displayed_size) * 0.5;
-    let cursor = (cursor - origin) / scale;
-    (cursor.cmpge(Vec2::ZERO).all() && cursor.cmplt(canvas_size).all()).then_some(cursor)
-}
-
 pub fn handle_screen_buttons(
     mut screen_state: ResMut<ScreenUiState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut interaction_query: Query<
-        (&Interaction, &mut BackgroundColor, &ScreenUiButton),
-        Changed<Interaction>,
+        (&PickingInteraction, &mut BackgroundColor, &ScreenUiButton),
+        Changed<PickingInteraction>,
     >,
     mut text_query: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
@@ -902,7 +804,7 @@ pub fn handle_screen_buttons(
         }
 
         match *interaction {
-            Interaction::Pressed => {
+            PickingInteraction::Pressed => {
                 *color = button.pressed_background.into();
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.pressed_text_color.into();
@@ -915,13 +817,13 @@ pub fn handle_screen_buttons(
                     response: ScriptResponse::Choice(button.value.clone()),
                 });
             }
-            Interaction::Hovered => {
+            PickingInteraction::Hovered => {
                 *color = button.hovered_background.into();
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.hovered_text_color.into();
                 }
             }
-            Interaction::None => {
+            PickingInteraction::None => {
                 *color = button.normal_background.into();
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.normal_text_color.into();
@@ -936,12 +838,12 @@ pub fn handle_screen_image_buttons(
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut interaction_query: Query<
         (
-            &Interaction,
+            &PickingInteraction,
             &mut ImageNode,
             &mut Node,
             &ScreenUiImageButton,
         ),
-        Changed<Interaction>,
+        Changed<PickingInteraction>,
     >,
 ) {
     for (interaction, mut image, mut node, button) in &mut interaction_query {
@@ -950,7 +852,7 @@ pub fn handle_screen_image_buttons(
         }
 
         match *interaction {
-            Interaction::Pressed if button.enabled => {
+            PickingInteraction::Pressed if button.enabled => {
                 image.image = button
                     .hovered_texture
                     .clone()
@@ -972,7 +874,7 @@ pub fn handle_screen_image_buttons(
                     response: ScriptResponse::Choice(button.value.clone()),
                 });
             }
-            Interaction::Hovered if button.enabled || button.hovered_when_disabled => {
+            PickingInteraction::Hovered if button.enabled || button.hovered_when_disabled => {
                 image.image = button
                     .hovered_texture
                     .clone()
@@ -987,7 +889,7 @@ pub fn handle_screen_image_buttons(
                     .clone()
                     .unwrap_or_else(|| button.normal_node.clone());
             }
-            Interaction::None => {
+            PickingInteraction::None => {
                 image.image = button.normal_texture.clone();
                 image.texture_atlas = button.normal_atlas.clone();
                 image.rect = button.normal_rect;
