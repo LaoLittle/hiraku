@@ -13,6 +13,7 @@ use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionMode {
+    Interactive,
     Sequence,
     Parallel,
 }

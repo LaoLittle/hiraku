@@ -48,6 +48,7 @@ pub struct StoryRuntime {
     task_modes: BTreeMap<u64, ExecutionMode>,
     deferred_task_completions: BTreeMap<u64, Value>,
     waiting_task: Option<u64>,
+    waiting_interactive_task: Option<u64>,
     choice: Option<ChoiceState>,
     blocked: bool,
 }
@@ -104,6 +105,7 @@ pub struct StoryRuntimeSnapshot {
     task_modes: BTreeMap<u64, ExecutionMode>,
     deferred_task_completions: BTreeMap<u64, Value>,
     waiting_task: Option<u64>,
+    waiting_interactive_task: Option<u64>,
     choice: Option<ChoiceState>,
     blocked: bool,
 }
@@ -118,6 +120,7 @@ impl StoryRuntime {
             task_modes: BTreeMap::new(),
             deferred_task_completions: BTreeMap::new(),
             waiting_task: None,
+            waiting_interactive_task: None,
             choice: None,
             blocked: false,
         })
@@ -134,6 +137,7 @@ impl StoryRuntime {
             task_modes: self.task_modes.clone(),
             deferred_task_completions: self.deferred_task_completions.clone(),
             waiting_task: self.waiting_task,
+            waiting_interactive_task: self.waiting_interactive_task,
             choice: self.choice.clone(),
             blocked: self.blocked,
         })
@@ -163,6 +167,7 @@ impl StoryRuntime {
             task_modes: snapshot.task_modes,
             deferred_task_completions: snapshot.deferred_task_completions,
             waiting_task: snapshot.waiting_task,
+            waiting_interactive_task: snapshot.waiting_interactive_task,
             choice: snapshot.choice,
             blocked: snapshot.blocked,
         })
@@ -196,10 +201,15 @@ impl StoryRuntime {
                 .clone();
             let task = self
                 .bytecode
-                .spawn_closure(&option, ExecutionMode::Sequence)?;
-            self.task_modes.insert(task, ExecutionMode::Sequence);
+                .spawn_closure(&option, ExecutionMode::Interactive)?;
+            self.task_modes.insert(task, ExecutionMode::Interactive);
             self.choice = Some(ChoiceState::RunningBranch { task, selected });
             self.blocked = false;
+            return Ok(());
+        }
+        if let Some(task) = self.waiting_interactive_task.take() {
+            self.blocked = false;
+            self.bytecode.unpause_task(task)?;
             return Ok(());
         }
         self.blocked = false;
@@ -279,6 +289,14 @@ impl StoryRuntime {
                                 .map(StoryRuntimeEvent::Effect),
                         );
                         let automatic_dialogue = self.host.take_wait().is_some();
+                        if automatic_dialogue
+                            && self.task_modes.get(&task) == Some(&ExecutionMode::Interactive)
+                        {
+                            self.bytecode.pause_task(task)?;
+                            self.waiting_interactive_task = Some(task);
+                            self.pending
+                                .push_back(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance));
+                        }
                         if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence)
                             && automatic_dialogue
                             && self.active_task_effects.contains_key(&task)
@@ -346,9 +364,9 @@ impl StoryRuntime {
                             .unwrap_or_default();
                         let builder_task = self
                             .bytecode
-                            .spawn_closure(&closure, ExecutionMode::Sequence)?;
+                            .spawn_closure(&closure, ExecutionMode::Interactive)?;
                         self.task_modes
-                            .insert(builder_task, ExecutionMode::Sequence);
+                            .insert(builder_task, ExecutionMode::Interactive);
                         self.choice = Some(ChoiceState::Collecting {
                             builder_task,
                             prompt,
@@ -430,6 +448,14 @@ impl StoryRuntime {
                             .map(StoryRuntimeEvent::Effect),
                     );
                     let automatic_dialogue = self.host.take_wait().is_some();
+                    if automatic_dialogue
+                        && self.task_modes.get(&task) == Some(&ExecutionMode::Interactive)
+                    {
+                        self.bytecode.pause_task(task)?;
+                        self.waiting_interactive_task = Some(task);
+                        self.pending
+                            .push_back(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance));
+                    }
                     if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence)
                         && automatic_dialogue
                         && self.active_task_effects.contains_key(&task)
@@ -947,6 +973,7 @@ mod tests {
                     option("Route A") { "selected A" }
                     option("Route B") { "selected B" }
                 }
+                "after choice"
             "#,
         )
         .expect("choice story must compile");
@@ -966,6 +993,18 @@ mod tests {
             runtime.step().expect("selected branch runs"),
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
                 if text == "selected B"
+        ));
+        assert_eq!(
+            runtime.step().expect("selected branch must wait for input"),
+            Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+        );
+        runtime
+            .resume(Value::Null)
+            .expect("branch dialogue must resume independently of the main VM");
+        assert!(matches!(
+            runtime.step().expect("main story continues after the branch"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
+                if text == "after choice"
         ));
     }
 
