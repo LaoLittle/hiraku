@@ -5,7 +5,6 @@ use bevy::{
     audio::{AudioSink, AudioSinkPlayback, Volume},
     ecs::system::SystemParam,
     log::{info, warn},
-    math::Rect,
     picking::hover::PickingInteraction,
     prelude::*,
 };
@@ -20,9 +19,10 @@ use crate::{
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     render::camera::{
         CameraShake, CameraShakeState, CameraState, CameraTweenState, WorldCamera, focus_layer,
-        setup_stage_cameras, start_camera_tween, ui_layer,
+        scene_layer, setup_stage_cameras, start_camera_tween, ui_layer,
     },
     render::character_part::{AlphaMaskMaterial, CharacterPartVisual, MultiplyMaterial},
+    render::world_sprite::{WorldSprite, WorldSpriteMaterial, world_sprite_render_components},
     script::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, ResolvedCharacterKeyframe,
         ScriptBootstrap, ScriptCommand, ScriptRequestId, ScriptResponse, ScriptResponseMessage,
@@ -54,8 +54,8 @@ mod screen_ui;
 pub(crate) use character::apply_character_ease;
 pub use character::{animate_character_motion_effects, poll_pending_character_shows};
 use character::{
-    apply_character_motion, apply_character_timeline, array_to_rect, despawn_character_actor,
-    queue_character_show, rect_to_array,
+    apply_character_motion, apply_character_timeline, despawn_character_actor,
+    queue_character_show, source_rect_from_corners, source_rect_to_corners,
 };
 pub use screen_ui::{cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons};
 use screen_ui::{
@@ -659,6 +659,8 @@ pub struct PendingCharacterShow {
     pub entity_ids: Vec<String>,
     pub entities: Vec<Entity>,
     pub handles: Vec<Handle<Image>>,
+    /// Previously visible parts retained until all replacements are renderable.
+    pub outgoing: Vec<(String, Entity)>,
     pub fade: Option<std::time::Duration>,
     pub animation_id: Option<String>,
 }
@@ -774,6 +776,9 @@ pub struct SpriteActor {
     pub path: String,
 }
 
+#[derive(Component, Clone, Copy)]
+pub struct FocusedActorPart;
+
 #[derive(Component, Clone)]
 pub struct BackgroundLayer {
     pub path: String,
@@ -859,6 +864,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub meshes: ResMut<'w, Assets<Mesh>>,
     pub alpha_mask_materials: ResMut<'w, Assets<AlphaMaskMaterial>>,
     pub multiply_materials: ResMut<'w, Assets<MultiplyMaterial>>,
+    pub world_sprite_materials: ResMut<'w, Assets<WorldSpriteMaterial>>,
     pub custom_effect_materials: ResMut<'w, Assets<CustomScreenEffectMaterial>>,
     pub rule_materials: ResMut<'w, Assets<RuleTransitionMaterial>>,
     pub choice_ui_roots: Query<'w, 's, Entity, (With<ChoiceUi>, Without<ChildOf>)>,
@@ -946,16 +952,22 @@ pub fn setup_stage(
     ui_style: Res<UiStyle>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
+    mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
     config: Res<crate::RuntimeLaunchConfig>,
     mut shared_state: ResMut<SceneSharedState>,
 ) {
     setup_stage_cameras(&mut commands, &mut images, &config);
     commands.insert_resource(RuleTransitionMesh(meshes.add(Rectangle::default())));
 
+    let overlay_sprite =
+        WorldSprite::from_color(Color::BLACK.with_alpha(0.0), Vec2::new(6000.0, 6000.0));
+    let overlay_render =
+        world_sprite_render_components(&overlay_sprite, &mut meshes, &mut world_sprite_materials);
     let overlay = commands
         .spawn((
             OverlayMarker,
-            Sprite::from_color(Color::BLACK.with_alpha(0.0), Vec2::new(6000.0, 6000.0)),
+            overlay_sprite,
+            overlay_render,
             Transform::from_xyz(0.0, 0.0, STAGE_Z_OVERLAY),
             focus_layer(),
         ))
@@ -1862,6 +1874,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut meshes = ctx.meshes;
     let mut alpha_mask_materials = ctx.alpha_mask_materials;
     let mut multiply_materials = ctx.multiply_materials;
+    let mut world_sprite_materials = ctx.world_sprite_materials;
     let mut custom_effect_materials = ctx.custom_effect_materials;
     let mut rule_materials = ctx.rule_materials;
     let choice_ui_roots = ctx.choice_ui_roots;
@@ -1914,13 +1927,19 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     commands.entity(transition).try_despawn();
                 }
                 let image = asset_server.load(path.clone());
-                let mut sprite = Sprite::from_image(image);
+                let mut sprite = WorldSprite::from_image(image);
                 let background = if let Some(duration) = fade {
                     sprite.color = sprite.color.with_alpha(0.0);
+                    let render = world_sprite_render_components(
+                        &sprite,
+                        &mut meshes,
+                        &mut world_sprite_materials,
+                    );
                     commands
                         .spawn((
                             BackgroundLayer { path: path.clone() },
                             sprite,
+                            render,
                             Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                             VisualTween {
                                 from_alpha: Some(0.0),
@@ -1936,10 +1955,16 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         ))
                         .id()
                 } else {
+                    let render = world_sprite_render_components(
+                        &sprite,
+                        &mut meshes,
+                        &mut world_sprite_materials,
+                    );
                     let entity = commands
                         .spawn((
                             BackgroundLayer { path: path.clone() },
                             sprite,
+                            render,
                             Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                         ))
                         .id();
@@ -1985,10 +2010,17 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
 
                 let Some(previous_background) = stage.background else {
                     let image = asset_server.load(path.clone());
+                    let sprite = WorldSprite::from_image(image);
+                    let render = world_sprite_render_components(
+                        &sprite,
+                        &mut meshes,
+                        &mut world_sprite_materials,
+                    );
                     let entity = commands
                         .spawn((
                             BackgroundLayer { path: path.clone() },
-                            Sprite::from_image(image),
+                            sprite,
+                            render,
                             Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                         ))
                         .id();
@@ -2007,10 +2039,17 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     .map(|background| background.path.clone())
                 else {
                     let image = asset_server.load(path.clone());
+                    let sprite = WorldSprite::from_image(image);
+                    let render = world_sprite_render_components(
+                        &sprite,
+                        &mut meshes,
+                        &mut world_sprite_materials,
+                    );
                     let entity = commands
                         .spawn((
                             BackgroundLayer { path: path.clone() },
-                            Sprite::from_image(image),
+                            sprite,
+                            render,
                             Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                         ))
                         .id();
@@ -2033,8 +2072,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 });
                 let transition_entity = commands
                     .spawn((
-                        Mesh2d(transition_mesh.0.clone()),
-                        MeshMaterial2d(material.clone()),
+                        Mesh3d(transition_mesh.0.clone()),
+                        MeshMaterial3d(material.clone()),
                         Transform {
                             translation: Vec3::new(0.0, 0.0, STAGE_Z_BACKGROUND + 1.0),
                             scale: Vec3::new(6000.0, 6000.0, 1.0),
@@ -2090,8 +2129,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
 
                 let effect_entity = commands
                     .spawn((
-                        Mesh2d(transition_mesh.0.clone()),
-                        MeshMaterial2d(material.clone()),
+                        Mesh3d(transition_mesh.0.clone()),
+                        MeshMaterial3d(material.clone()),
                         Transform {
                             translation: Vec3::new(0.0, 0.0, STAGE_Z_OVERLAY - 0.5),
                             scale: Vec3::new(6000.0, 6000.0, 1.0),
@@ -2121,8 +2160,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             } => {
                 let handle = asset_server.load(path.clone());
                 let entity = if let Some(entity) = stage.sprites.get(&id).copied() {
-                    let mut sprite = Sprite::from_image(handle);
-                    sprite.rect = rect.map(array_to_rect);
+                    let mut sprite = WorldSprite::from_image(handle)
+                        .with_rect(rect.map(source_rect_from_corners));
                     if fade.is_some() {
                         sprite.color = sprite.color.with_alpha(0.0);
                     }
@@ -2140,11 +2179,16 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     ));
                     entity
                 } else {
-                    let mut sprite = Sprite::from_image(handle);
-                    sprite.rect = rect.map(array_to_rect);
+                    let mut sprite = WorldSprite::from_image(handle)
+                        .with_rect(rect.map(source_rect_from_corners));
                     if fade.is_some() {
                         sprite.color = sprite.color.with_alpha(0.0);
                     }
+                    let render = world_sprite_render_components(
+                        &sprite,
+                        &mut meshes,
+                        &mut world_sprite_materials,
+                    );
                     let entity = commands
                         .spawn((
                             SpriteActor {
@@ -2152,6 +2196,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                                 path: path.clone(),
                             },
                             sprite,
+                            render,
                             Transform {
                                 translation: Vec3::new(
                                     position.x,
@@ -2229,7 +2274,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             despawn_on_finish: false,
                         });
                     } else {
-                        commands.entity(overlay).insert(Sprite::from_color(
+                        commands.entity(overlay).insert(WorldSprite::from_color(
                             Color::BLACK.with_alpha(alpha),
                             Vec2::new(6000.0, 6000.0),
                         ));
@@ -2383,23 +2428,53 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::SetCamera {
                 blur_intensity,
                 zoom,
+                offset,
+                rotation,
+                projection,
                 scope,
-                center,
                 duration,
                 ease,
                 animation_id,
-            } => start_camera_tween(
-                &mut camera_state,
-                &mut camera_tweens,
-                blur_intensity,
-                zoom,
-                scope,
-                center,
-                duration,
-                ease,
-                animation_id,
-                &mut animations,
-            ),
+            } => {
+                if let Some(blur) = blur_intensity {
+                    shared_state.0.camera.blur = blur;
+                }
+                if let Some(zoom) = zoom {
+                    shared_state.0.camera.zoom = zoom;
+                }
+                if let Some(offset) = offset {
+                    shared_state.0.camera.offset = offset.to_array();
+                }
+                if let Some(rotation) = rotation {
+                    shared_state.0.camera.rotation = rotation.to_array();
+                }
+                if let Some(projection) = projection {
+                    shared_state.0.camera.projection = match projection {
+                        crate::script::CameraProjectionMode::Orthographic => "orthographic",
+                        crate::script::CameraProjectionMode::Perspective => "perspective",
+                    }
+                    .to_string();
+                }
+                shared_state.0.camera.scope = match scope {
+                    crate::script::CameraEffectScope::World => "world",
+                    crate::script::CameraEffectScope::Canvas => "canvas",
+                }
+                .to_string();
+                start_camera_tween(
+                    &mut camera_state,
+                    &mut camera_tweens,
+                    blur_intensity,
+                    zoom,
+                    offset,
+                    rotation,
+                    projection,
+                    scope,
+                    duration,
+                    ease,
+                    animation_id,
+                    &mut animations,
+                );
+            }
             ScriptCommand::ApplyUserSettings(settings) => *user_settings = settings,
             ScriptCommand::AdjustUserSetting { name, delta } => {
                 let volume = match name.as_str() {
@@ -2530,6 +2605,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 expressions,
                 position,
                 scale,
+                focused,
                 fade,
                 animation_id,
             } => {
@@ -2562,6 +2638,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     parts,
                     position,
                     scale,
+                    focused,
                     fade,
                     animation_id,
                 );
@@ -2631,6 +2708,21 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 commands.insert_resource(CameraShakeState::default());
                 commands.insert_resource(AnimationState::default());
                 pending_characters.items.clear();
+                camera_state.blur_intensity = snapshot.camera.blur;
+                camera_state.zoom = snapshot.camera.zoom.max(0.01);
+                camera_state.offset = Vec3::from_array(snapshot.camera.offset);
+                camera_state.rotation = Vec3::from_array(snapshot.camera.rotation);
+                camera_state.projection = if snapshot.camera.projection == "perspective" {
+                    crate::script::CameraProjectionMode::Perspective
+                } else {
+                    crate::script::CameraProjectionMode::Orthographic
+                };
+                camera_state.effect_scope = if snapshot.camera.scope == "canvas" {
+                    crate::script::CameraEffectScope::Canvas
+                } else {
+                    crate::script::CameraEffectScope::World
+                };
+                *camera_tweens = CameraTweenState::default();
                 restore_scene_snapshot(
                     &mut commands,
                     &asset_server,
@@ -3521,9 +3613,9 @@ pub fn animate_visual_tweens(
     mut multiply_materials: ResMut<Assets<MultiplyMaterial>>,
     mut visuals: Query<(
         Entity,
-        Option<&mut Sprite>,
-        Option<&MeshMaterial2d<AlphaMaskMaterial>>,
-        Option<&MeshMaterial2d<MultiplyMaterial>>,
+        Option<&mut WorldSprite>,
+        Option<&MeshMaterial3d<AlphaMaskMaterial>>,
+        Option<&MeshMaterial3d<MultiplyMaterial>>,
         Option<&CharacterPartVisual>,
         &mut Transform,
         &mut VisualTween,
@@ -3584,9 +3676,9 @@ pub fn animate_visual_tweens(
 }
 
 fn set_visual_alpha(
-    sprite: Option<&mut Sprite>,
-    alpha_mask: Option<&MeshMaterial2d<AlphaMaskMaterial>>,
-    multiply: Option<&MeshMaterial2d<MultiplyMaterial>>,
+    sprite: Option<&mut WorldSprite>,
+    alpha_mask: Option<&MeshMaterial3d<AlphaMaskMaterial>>,
+    multiply: Option<&MeshMaterial3d<MultiplyMaterial>>,
     part_visual: Option<&CharacterPartVisual>,
     alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
     multiply_materials: &mut Assets<MultiplyMaterial>,
@@ -3617,6 +3709,8 @@ pub fn animate_rule_transitions(
     mut stage: ResMut<StageState>,
     mut animations: ResMut<AnimationState>,
     mut rule_materials: ResMut<Assets<RuleTransitionMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
     mut transitions: Query<(Entity, &mut RuleTransitionPlayer)>,
 ) {
     for (entity, mut transition) in &mut transitions {
@@ -3628,12 +3722,16 @@ pub fn animate_rule_transitions(
         }
 
         if transition.timer.is_finished() {
+            let sprite = WorldSprite::from_image(transition.target_image.clone());
+            let render =
+                world_sprite_render_components(&sprite, &mut meshes, &mut world_sprite_materials);
             let new_background = commands
                 .spawn((
                     BackgroundLayer {
                         path: transition.target_path.clone(),
                     },
-                    Sprite::from_image(transition.target_image.clone()),
+                    sprite,
+                    render,
                     Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                 ))
                 .id();
@@ -3661,6 +3759,8 @@ pub fn animate_custom_effects(
     mut stage: ResMut<StageState>,
     mut animations: ResMut<AnimationState>,
     mut materials: ResMut<Assets<CustomScreenEffectMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
     mut effects: Query<(Entity, &mut CustomScreenEffectPlayer)>,
 ) {
     for (entity, mut effect) in &mut effects {
@@ -3676,10 +3776,17 @@ pub fn animate_custom_effects(
             if let Some(target_path) = effect.target_path.take()
                 && let Some(target_image) = effect.target_image.take()
             {
+                let sprite = WorldSprite::from_image(target_image);
+                let render = world_sprite_render_components(
+                    &sprite,
+                    &mut meshes,
+                    &mut world_sprite_materials,
+                );
                 let new_background = commands
                     .spawn((
                         BackgroundLayer { path: target_path },
-                        Sprite::from_image(target_image),
+                        sprite,
+                        render,
                         Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                     ))
                     .id();
@@ -3787,13 +3894,14 @@ pub fn sync_scene_snapshot(
     dialogue_state: Res<DialogueState>,
     background_layers: Query<&BackgroundLayer>,
     bgms: Query<&BgmChannel>,
-    overlay: Query<&Sprite, With<OverlayMarker>>,
+    overlay: Query<&WorldSprite, With<OverlayMarker>>,
     sprites: Query<(
         &SpriteActor,
-        Option<&Sprite>,
-        Option<&MeshMaterial2d<AlphaMaskMaterial>>,
-        Option<&MeshMaterial2d<MultiplyMaterial>>,
+        Option<&WorldSprite>,
+        Option<&MeshMaterial3d<AlphaMaskMaterial>>,
+        Option<&MeshMaterial3d<MultiplyMaterial>>,
         Option<&CharacterPartVisual>,
+        Option<&FocusedActorPart>,
         &Transform,
     )>,
 ) {
@@ -3809,7 +3917,7 @@ pub fn sync_scene_snapshot(
     let mut sprite_snapshots = sprites
         .iter()
         .map(
-            |(actor, sprite, alpha_mask, multiply, visual, transform)| SpriteSnapshot {
+            |(actor, sprite, alpha_mask, multiply, visual, focused, transform)| SpriteSnapshot {
                 id: actor.id.clone(),
                 path: actor.path.clone(),
                 x: transform.translation.x,
@@ -3830,8 +3938,9 @@ pub fn sync_scene_snapshot(
                             .unwrap_or(1.0)
                     }),
                 rect: sprite
-                    .and_then(|sprite| sprite.rect.map(rect_to_array))
+                    .and_then(|sprite| sprite.rect.map(source_rect_to_corners))
                     .or_else(|| visual.and_then(|visual| visual.rect)),
+                focused: focused.is_some(),
             },
         )
         .collect::<Vec<_>>();
@@ -4748,7 +4857,7 @@ fn restore_scene_snapshot(
                     BackgroundLayer {
                         path: background.path.clone(),
                     },
-                    Sprite::from_image(asset_server.load(background.path.clone())),
+                    WorldSprite::from_image(asset_server.load(background.path.clone())),
                     Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                 ))
                 .id(),
@@ -4756,9 +4865,9 @@ fn restore_scene_snapshot(
     }
 
     for sprite in &snapshot.sprites {
-        let mut entity_sprite = Sprite::from_image(asset_server.load(sprite.path.clone()));
+        let mut entity_sprite = WorldSprite::from_image(asset_server.load(sprite.path.clone()));
         entity_sprite.color.set_alpha(sprite.alpha);
-        entity_sprite.rect = sprite.rect.map(array_to_rect);
+        entity_sprite.rect = sprite.rect.map(source_rect_from_corners);
         let entity = commands
             .spawn((
                 SpriteActor {
@@ -4773,6 +4882,13 @@ fn restore_scene_snapshot(
                 },
             ))
             .id();
+        if sprite.focused {
+            commands
+                .entity(entity)
+                .try_insert((FocusedActorPart, focus_layer()));
+        } else {
+            commands.entity(entity).try_insert(scene_layer());
+        }
         stage.sprites.insert(sprite.id.clone(), entity);
     }
 
@@ -4799,7 +4915,7 @@ fn restore_scene_snapshot(
     }
 
     if let Some(overlay) = stage.overlay {
-        commands.entity(overlay).insert(Sprite::from_color(
+        commands.entity(overlay).insert(WorldSprite::from_color(
             Color::BLACK.with_alpha(snapshot.overlay_alpha),
             Vec2::new(6000.0, 6000.0),
         ));

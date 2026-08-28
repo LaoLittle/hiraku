@@ -922,6 +922,82 @@ mod tests {
     }
 
     #[test]
+    fn fluent_bgm_and_actor_focus_commit_as_typed_effects() {
+        let bytecode = compile_story_bytecode(
+            "fluent.story.hks",
+            r#"
+                bgm("music/theme").volume(0.75).fadeIn(600)
+                char("alice").focus()
+                char("bob").focus(false)
+                camera().blur(2)
+                camera(.canvas)
+                    .offset(10, 20, 30)
+                    .rotation(1, 2, 3)
+                    .zoom(1.25)
+                    .projection(.perspective)
+                    .time(0.5)
+                    .easing(.easeOut)
+            "#,
+        )
+        .expect("fluent engine APIs must compile");
+        let mut runtime = HksRuntime::new(bytecode).expect("script runtime must initialize");
+        let mut host = StoryNativeHost::new();
+
+        loop {
+            match runtime.step().expect("runtime must advance") {
+                Some(HksRuntimeEvent::Call(call)) => {
+                    let value = host.call(&call).expect("native call must succeed");
+                    runtime
+                        .resume_main(value)
+                        .expect("native result must resume the VM");
+                }
+                Some(HksRuntimeEvent::Statement(value)) => host
+                    .handle_statement(&value)
+                    .expect("statement commit must succeed"),
+                Some(HksRuntimeEvent::Completed(_)) => break,
+                Some(event) => panic!("unexpected runtime event: {event:?}"),
+                None => panic!("runtime stopped before completion"),
+            }
+        }
+
+        let effects = host.drain_effects();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::PlayBgm { path, volume, fade_in_ms: Some(600) }
+                if path == "music/theme" && (*volume - 0.75).abs() < f32::EPSILON
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::ShowCharacter { actor_id, focused: true, .. } if actor_id == "alice"
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::ShowCharacter { actor_id, focused: false, .. } if actor_id == "bob"
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::SetCamera {
+                blur: Some(blur),
+                scope: crate::script::CameraEffectScope::World,
+                ..
+            } if (*blur - 2.0).abs() < f32::EPSILON
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::SetCamera {
+                zoom: Some(zoom),
+                offset: Some([10.0, 20.0, 30.0]),
+                rotation: Some([1.0, 2.0, 3.0]),
+                projection: Some(crate::script::CameraProjectionMode::Perspective),
+                duration_ms: 500,
+                ease,
+                scope: crate::script::CameraEffectScope::Canvas,
+                ..
+            } if (*zoom - 1.25).abs() < f32::EPSILON && ease == "easeOut"
+        )));
+    }
+
+    #[test]
     fn story_driver_does_not_prefetch_past_dialogue_waits() {
         let bytecode = compile_story_bytecode(
             "driver.story.hks",

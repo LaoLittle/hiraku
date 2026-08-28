@@ -1,5 +1,7 @@
 struct BlurSettings {
     intensity: f32,
+    include_ui: u32,
+    _padding: vec2<f32>,
 };
 
 @group(0) @binding(0) var screen_texture: texture_2d<f32>;

@@ -1,5 +1,5 @@
 use bevy::{
-    core_pipeline::{FullscreenShader, schedule::Core2d, upscaling::upscaling},
+    core_pipeline::{Core3dSystems, FullscreenShader, schedule::Core3d, upscaling::upscaling},
     prelude::*,
     render::{
         RenderApp, RenderStartup,
@@ -32,8 +32,15 @@ impl Plugin for BlurEffectPlugin {
 
         render_app.add_systems(RenderStartup, init_blur_pipeline);
         render_app.add_systems(
-            Core2d,
-            blur_pass.after(bevy::ui_render::ui_pass).before(upscaling),
+            Core3d,
+            (
+                blur_world_pass
+                    .after(Core3dSystems::PostProcess)
+                    .before(bevy::ui_render::ui_pass),
+                blur_canvas_pass
+                    .after(bevy::ui_render::ui_pass)
+                    .before(upscaling),
+            ),
         );
     }
 }
@@ -41,6 +48,8 @@ impl Plugin for BlurEffectPlugin {
 #[derive(Component, Clone, Copy, ExtractComponent, ShaderType)]
 pub struct BlurSettings {
     intensity: f32,
+    include_ui: u32,
+    _padding: Vec2,
 }
 
 impl BlurSettings {
@@ -53,11 +62,19 @@ impl BlurSettings {
     pub fn set_radius(&mut self, radius: f32) {
         self.intensity = radius.max(0.0);
     }
+
+    pub fn set_include_ui(&mut self, include_ui: bool) {
+        self.include_ui = u32::from(include_ui);
+    }
 }
 
 impl Default for BlurSettings {
     fn default() -> Self {
-        Self { intensity: 0.0 }
+        Self {
+            intensity: 0.0,
+            include_ui: 0,
+            _padding: Vec2::ZERO,
+        }
     }
 }
 
@@ -66,7 +83,7 @@ struct BlurBindGroupCache {
     cached: Option<(TextureViewId, BindGroup)>,
 }
 
-fn blur_pass(
+fn blur_world_pass(
     view: ViewQuery<(
         &ViewTarget,
         &BlurSettings,
@@ -78,6 +95,53 @@ fn blur_pass(
     mut bind_group_cache: Local<BlurBindGroupCache>,
     mut render_context: RenderContext,
 ) {
+    run_blur_pass(
+        view,
+        pipeline,
+        pipeline_cache,
+        settings_uniforms,
+        &mut bind_group_cache,
+        &mut render_context,
+        false,
+    );
+}
+
+fn blur_canvas_pass(
+    view: ViewQuery<(
+        &ViewTarget,
+        &BlurSettings,
+        &DynamicUniformIndex<BlurSettings>,
+    )>,
+    pipeline: Option<Res<BlurPipeline>>,
+    pipeline_cache: Res<PipelineCache>,
+    settings_uniforms: Res<ComponentUniforms<BlurSettings>>,
+    mut bind_group_cache: Local<BlurBindGroupCache>,
+    mut render_context: RenderContext,
+) {
+    run_blur_pass(
+        view,
+        pipeline,
+        pipeline_cache,
+        settings_uniforms,
+        &mut bind_group_cache,
+        &mut render_context,
+        true,
+    );
+}
+
+fn run_blur_pass(
+    view: ViewQuery<(
+        &ViewTarget,
+        &BlurSettings,
+        &DynamicUniformIndex<BlurSettings>,
+    )>,
+    pipeline: Option<Res<BlurPipeline>>,
+    pipeline_cache: Res<PipelineCache>,
+    settings_uniforms: Res<ComponentUniforms<BlurSettings>>,
+    bind_group_cache: &mut BlurBindGroupCache,
+    render_context: &mut RenderContext,
+    include_ui: bool,
+) {
     let Some(pipeline) = pipeline else {
         return;
     };
@@ -88,7 +152,10 @@ fn blur_pass(
         return;
     };
 
-    let (view_target, _, settings_index) = view.into_inner();
+    let (view_target, settings, settings_index) = view.into_inner();
+    if settings.intensity <= f32::EPSILON || (settings.include_ui != 0) != include_ui {
+        return;
+    }
     let post_process = view_target.post_process_write();
     let bind_group = match &mut bind_group_cache.cached {
         Some((texture_id, bind_group)) if *texture_id == post_process.source.id() => bind_group,

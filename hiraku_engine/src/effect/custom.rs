@@ -1,10 +1,10 @@
 use bevy::{
     asset::Handle,
+    pbr::Material,
     prelude::*,
     reflect::TypePath,
     render::render_resource::{AsBindGroup, ShaderType},
     shader::ShaderRef,
-    sprite_render::{AlphaMode2d, Material2d},
 };
 
 pub fn load_internal_shaders(app: &mut App) {
@@ -82,13 +82,17 @@ impl From<&CustomScreenEffectMaterial> for CustomScreenEffectUniform {
     }
 }
 
-impl Material2d for CustomScreenEffectMaterial {
+impl Material for CustomScreenEffectMaterial {
     fn fragment_shader() -> ShaderRef {
         "embedded://hiraku_engine/effect/shaders/custom_screen_effect.wgsl".into()
     }
 
-    fn alpha_mode(&self) -> AlphaMode2d {
-        AlphaMode2d::Blend
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+
+    fn enable_shadows() -> bool {
+        false
     }
 }
 

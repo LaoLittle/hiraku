@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use bevy::math::Vec2;
+use bevy::math::{Vec2, Vec3};
 use serde::Deserialize;
 
 use crate::{
@@ -22,7 +22,8 @@ pub mod ui_runtime;
 
 pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
 pub(crate) use runtime::{
-    CameraEffectScope, ScriptCallFrame, ScriptRuntimeState, tick_script_runtime,
+    CameraEffectScope, CameraProjectionMode, ScriptCallFrame, ScriptRuntimeState,
+    tick_script_runtime,
 };
 
 pub(crate) fn compile_story_bytecode(
@@ -101,8 +102,10 @@ pub enum ScriptCommand {
     SetCamera {
         blur_intensity: Option<f32>,
         zoom: Option<f32>,
+        offset: Option<Vec3>,
+        rotation: Option<Vec3>,
+        projection: Option<CameraProjectionMode>,
         scope: CameraEffectScope,
-        center: Option<Vec2>,
         duration: Duration,
         ease: CharacterEase,
         animation_id: Option<String>,
@@ -139,6 +142,7 @@ pub enum ScriptCommand {
         expressions: Vec<String>,
         position: Vec2,
         scale: f32,
+        focused: bool,
         fade: Option<Duration>,
         animation_id: Option<String>,
     },
@@ -273,14 +277,19 @@ pub(crate) fn script_command_from_effect(
         StoryEffect::SetCamera {
             blur,
             zoom,
+            offset,
+            rotation,
+            projection,
             scope,
             duration_ms,
             ease,
         } => ScriptCommand::SetCamera {
             blur_intensity: blur,
             zoom,
+            offset: offset.map(Vec3::from_array),
+            rotation: rotation.map(Vec3::from_array),
+            projection,
             scope,
-            center: None,
             duration: Duration::from_millis(duration_ms),
             ease: parse_camera_ease(&ease)?,
             animation_id: None,
@@ -301,12 +310,14 @@ pub(crate) fn script_command_from_effect(
             expressions,
             position,
             scale,
+            focused,
         } => ScriptCommand::ShowCharacter {
             actor_id,
             character_name,
             expressions,
             position: Vec2::new(position[0], position[1]),
             scale,
+            focused,
             fade: None,
             animation_id: None,
         },

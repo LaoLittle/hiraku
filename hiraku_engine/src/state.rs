@@ -73,6 +73,8 @@ pub struct SpriteSnapshot {
     pub alpha: f32,
     #[serde(default)]
     pub rect: Option<[f32; 4]>,
+    #[serde(default)]
+    pub focused: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -94,6 +96,29 @@ pub struct TextEffectSnapshot {
     pub fade_seconds: f32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CameraSnapshot {
+    pub blur: f32,
+    pub zoom: f32,
+    pub offset: [f32; 3],
+    pub rotation: [f32; 3],
+    pub projection: String,
+    pub scope: String,
+}
+
+impl Default for CameraSnapshot {
+    fn default() -> Self {
+        Self {
+            blur: 0.0,
+            zoom: 1.0,
+            offset: [0.0; 3],
+            rotation: [0.0; 3],
+            projection: "orthographic".to_string(),
+            scope: "world".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
     pub background: Option<ImageLayerSnapshot>,
@@ -106,6 +131,8 @@ pub struct SceneSnapshot {
     pub dialogue: Option<DialogueSnapshot>,
     #[serde(default)]
     pub text_effect: TextEffectSnapshot,
+    #[serde(default)]
+    pub camera: CameraSnapshot,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

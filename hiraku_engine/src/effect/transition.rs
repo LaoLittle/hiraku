@@ -1,10 +1,10 @@
 use bevy::{
     asset::Handle,
+    pbr::Material,
     prelude::*,
     reflect::TypePath,
     render::render_resource::{AsBindGroup, ShaderType},
     shader::ShaderRef,
-    sprite_render::{AlphaMode2d, Material2d},
 };
 
 pub fn load_internal_shaders(app: &mut App) {
@@ -47,13 +47,17 @@ impl From<&RuleTransitionMaterial> for RuleTransitionUniform {
     }
 }
 
-impl Material2d for RuleTransitionMaterial {
+impl Material for RuleTransitionMaterial {
     fn fragment_shader() -> ShaderRef {
         "embedded://hiraku_engine/effect/shaders/rule_transition_2d.wgsl".into()
     }
 
-    fn alpha_mode(&self) -> AlphaMode2d {
-        AlphaMode2d::Blend
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+
+    fn enable_shadows() -> bool {
+        false
     }
 }
 

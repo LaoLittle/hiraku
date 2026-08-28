@@ -776,6 +776,7 @@ impl Parser {
     fn parse_postfix(&mut self, allow_trailing_block: bool) -> Expr {
         let mut expression = self.parse_primary();
         loop {
+            self.skip_member_continuation_newlines();
             if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::LBrace) {
                 let ExprKind::Ident(type_name) = &expression.kind else {
                     self.error_here("typed record constructor must start with a type name");
@@ -1080,6 +1081,18 @@ impl Parser {
         }
     }
 
+    /// A leading `.` makes the following physical line an unambiguous continuation
+    /// of the previous expression. Semicolons remain hard statement boundaries.
+    fn skip_member_continuation_newlines(&mut self) {
+        let mut next = self.index;
+        while matches!(self.tokens[next].kind, TokenKind::Newline) {
+            next += 1;
+        }
+        if next > self.index && matches!(self.tokens[next].kind, TokenKind::Dot) {
+            self.index = next;
+        }
+    }
+
     fn at(&self, kind: TokenKind) -> bool {
         std::mem::discriminant(&self.current().kind) == std::mem::discriminant(&kind)
     }
@@ -1160,6 +1173,23 @@ mod tests {
             arguments[3].value.kind,
             ExprKind::Symbol("easeOut".to_string())
         );
+    }
+
+    #[test]
+    fn parses_member_call_chains_across_lines() {
+        let expression = expression(
+            r#"camera()
+                .offset(10, 20, 30)
+                .projection(.perspective)
+                .time(0.5)"#,
+        );
+        let ExprKind::Call { callee, .. } = expression.kind else {
+            panic!("expected final call");
+        };
+        assert!(matches!(
+            callee.kind,
+            ExprKind::Member { ref name, .. } if name == "time"
+        ));
     }
 
     #[test]

@@ -24,7 +24,7 @@ hiraku-script = { path = "hiraku_script" }
 [workspace.dependencies.bevy]
 version = "0.19.1"
 default-features = false
-features = ["2d", "audio", "ui"]
+features = ["2d", "3d", "audio", "ui"]
 
 [profile.app-release]
 inherits = "release"

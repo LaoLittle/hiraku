@@ -80,59 +80,79 @@ pub fn poll_pending_character_shows(
     mut stage: ResMut<StageState>,
     mut animations: ResMut<AnimationState>,
     mut pending: ResMut<PendingCharacterShows>,
-    visual_entities: Query<(), (With<CharacterPartVisual>, With<Visibility>)>,
-    mut visuals: Query<(
-        &CharacterPartVisual,
-        Option<&mut Sprite>,
-        Option<&MeshMaterial2d<AlphaMaskMaterial>>,
-        Option<&MeshMaterial2d<MultiplyMaterial>>,
-        &mut Visibility,
+    mut visual_queries: ParamSet<(
+        Query<
+            (
+                Option<&WorldSprite>,
+                Option<&Mesh3d>,
+                Option<&MeshMaterial3d<WorldSpriteMaterial>>,
+            ),
+            (With<CharacterPartVisual>, With<Visibility>),
+        >,
+        Query<(
+            &CharacterPartVisual,
+            Option<&mut WorldSprite>,
+            Option<&MeshMaterial3d<AlphaMaskMaterial>>,
+            Option<&MeshMaterial3d<MultiplyMaterial>>,
+            &mut Visibility,
+        )>,
     )>,
 ) {
     let mut completed = Vec::new();
-    pending.items.retain_mut(|item| {
-        let has_failed = item.handles.iter().any(|handle| {
-            matches!(
-                asset_server.load_state(handle.id()),
-                bevy::asset::LoadState::Failed(_)
-            )
+    {
+        let visual_entities = visual_queries.p0();
+        pending.items.retain_mut(|item| {
+            let has_failed = item.handles.iter().any(|handle| {
+                matches!(
+                    asset_server.load_state(handle.id()),
+                    bevy::asset::LoadState::Failed(_)
+                )
+            });
+            if has_failed {
+                warn!(
+                    "failed to load one or more parts for character `{}`",
+                    item.actor_id
+                );
+                for entity in item.entities.drain(..) {
+                    commands.entity(entity).try_despawn();
+                }
+                for id in item.entity_ids.drain(..) {
+                    stage.sprites.remove(&id);
+                }
+                complete_missing_animation(&mut animations, item.animation_id.take());
+                return false;
+            }
+
+            if !item
+                .handles
+                .iter()
+                .all(|handle| asset_server.is_loaded_with_dependencies(handle.id()))
+            {
+                return true;
+            }
+
+            if !item.entities.iter().all(|entity| {
+                visual_entities
+                    .get(*entity)
+                    .is_ok_and(|(sprite, mesh, material)| {
+                        sprite.is_none() || (mesh.is_some() && material.is_some())
+                    })
+            }) {
+                return true;
+            }
+
+            completed.push((
+                item.entities.clone(),
+                std::mem::take(&mut item.outgoing),
+                item.fade,
+                item.animation_id.take(),
+            ));
+            false
         });
-        if has_failed {
-            warn!(
-                "failed to load one or more parts for character `{}`",
-                item.actor_id
-            );
-            for entity in item.entities.drain(..) {
-                commands.entity(entity).try_despawn();
-            }
-            for id in item.entity_ids.drain(..) {
-                stage.sprites.remove(&id);
-            }
-            complete_missing_animation(&mut animations, item.animation_id.take());
-            return false;
-        }
+    }
 
-        if !item
-            .handles
-            .iter()
-            .all(|handle| asset_server.is_loaded_with_dependencies(handle.id()))
-        {
-            return true;
-        }
-
-        if !item
-            .entities
-            .iter()
-            .all(|entity| visual_entities.get(*entity).is_ok())
-        {
-            return true;
-        }
-
-        completed.push((item.entities.clone(), item.fade, item.animation_id.take()));
-        false
-    });
-
-    for (entities, fade, animation_id) in completed {
+    let mut visuals = visual_queries.p1();
+    for (entities, outgoing, fade, animation_id) in completed {
         let mut pending_animation = animation_id;
         for (index, entity) in entities.into_iter().enumerate() {
             if let Ok((visual, sprite, alpha_mask, multiply, mut visibility)) =
@@ -164,6 +184,27 @@ pub fn poll_pending_character_shows(
             }
         }
 
+        for (id, entity) in outgoing {
+            if stage.sprites.get(&id) == Some(&entity) {
+                stage.sprites.remove(&id);
+            }
+            if let Some(fade) = fade {
+                commands.entity(entity).try_insert(VisualTween {
+                    from_alpha: Some(1.0),
+                    to_alpha: Some(0.0),
+                    from_translation: None,
+                    to_translation: None,
+                    from_scale: None,
+                    to_scale: None,
+                    timer: Timer::new(fade, TimerMode::Once),
+                    animation_id: None,
+                    despawn_on_finish: true,
+                });
+            } else {
+                commands.entity(entity).try_despawn();
+            }
+        }
+
         if fade.is_none() {
             complete_missing_animation(&mut animations, pending_animation);
         }
@@ -172,9 +213,9 @@ pub fn poll_pending_character_shows(
 
 fn set_character_part_alpha(
     visual: &CharacterPartVisual,
-    sprite: Option<Mut<Sprite>>,
-    alpha_mask: Option<&MeshMaterial2d<AlphaMaskMaterial>>,
-    multiply: Option<&MeshMaterial2d<MultiplyMaterial>>,
+    sprite: Option<Mut<WorldSprite>>,
+    alpha_mask: Option<&MeshMaterial3d<AlphaMaskMaterial>>,
+    multiply: Option<&MeshMaterial3d<MultiplyMaterial>>,
     alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
     multiply_materials: &mut Assets<MultiplyMaterial>,
     alpha: f32,
@@ -197,7 +238,7 @@ fn set_character_part_alpha(
 pub(super) fn queue_character_show(
     commands: &mut Commands,
     asset_server: &AssetServer,
-    texture_atlases: &TextureAtlasCatalog,
+    _texture_atlases: &TextureAtlasCatalog,
     meshes: &mut Assets<Mesh>,
     alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
     multiply_materials: &mut Assets<MultiplyMaterial>,
@@ -208,6 +249,7 @@ pub(super) fn queue_character_show(
     parts: Vec<CharacterPartDefinition>,
     position: Vec2,
     scale: f32,
+    focused: bool,
     fade: Option<std::time::Duration>,
     animation_id: Option<String>,
 ) {
@@ -261,6 +303,7 @@ pub(super) fn queue_character_show(
         })
         .count();
     let mut pending_animation = animation_id;
+    let mut outgoing = Vec::new();
 
     // Slots absent from the committed state fade out. Stable part IDs remain
     // alive, retaining texture/visibility/tween state across expression changes.
@@ -268,9 +311,14 @@ pub(super) fn queue_character_show(
         if desired_ids.contains(&id) {
             continue;
         }
-        let Some(entity) = stage.sprites.remove(&id) else {
+        let Some(entity) = stage.sprites.get(&id).copied() else {
             continue;
         };
+        if new_part_count > 0 {
+            outgoing.push((id, entity));
+            continue;
+        }
+        stage.sprites.remove(&id);
         commands.entity(entity).try_insert(VisualTween {
             from_alpha: Some(1.0),
             to_alpha: Some(0.0),
@@ -293,7 +341,8 @@ pub(super) fn queue_character_show(
     for part in &parts {
         let sprite_id = character_part_id(&actor_id, part);
         if let Some(entity) = stage.sprites.get(&sprite_id).copied() {
-            commands.entity(entity).try_insert(Transform {
+            let mut entity_commands = commands.entity(entity);
+            entity_commands.try_insert(Transform {
                 translation: Vec3::new(
                     position.x + part.offset.x * scale,
                     position.y + part.offset.y * scale,
@@ -302,6 +351,12 @@ pub(super) fn queue_character_show(
                 scale: Vec3::splat(scale),
                 ..default()
             });
+            if focused {
+                entity_commands.try_insert((FocusedActorPart, focus_layer()));
+            } else {
+                entity_commands.try_remove::<FocusedActorPart>();
+                entity_commands.try_insert(scene_layer());
+            }
             continue;
         }
         let transform = Transform {
@@ -332,11 +387,7 @@ pub(super) fn queue_character_show(
                         "character part `{}` requires an atlas rect for mask/blend rendering; using a normal sprite",
                         part.id
                     );
-                    let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
-                    let fallback_handle = atlas
-                        .map(|texture| texture.image.clone())
-                        .unwrap_or_else(|| handle.clone());
-                    let mut sprite = character_part_sprite(fallback_handle, part, atlas);
+                    let mut sprite = character_part_sprite(handle.clone(), part);
                     sprite.color = color;
                     commands
                         .spawn((
@@ -395,8 +446,8 @@ pub(super) fn queue_character_show(
                                     id: sprite_id.clone(),
                                     path: part.path.clone(),
                                 },
-                                Mesh2d(mesh),
-                                MeshMaterial2d(material),
+                                Mesh3d(mesh),
+                                MeshMaterial3d(material),
                                 visual,
                                 Visibility::Hidden,
                                 transform,
@@ -415,8 +466,8 @@ pub(super) fn queue_character_show(
                                     id: sprite_id.clone(),
                                     path: part.path.clone(),
                                 },
-                                Mesh2d(mesh),
-                                MeshMaterial2d(material),
+                                Mesh3d(mesh),
+                                MeshMaterial3d(material),
                                 visual,
                                 Visibility::Hidden,
                                 transform,
@@ -426,11 +477,7 @@ pub(super) fn queue_character_show(
                 }
             }
         } else {
-            let atlas = texture_atlases.resolve(&part.path, part.atlas_rect);
-            let sprite_handle = atlas
-                .map(|texture| texture.image.clone())
-                .unwrap_or_else(|| handle.clone());
-            let mut sprite = character_part_sprite(sprite_handle, part, atlas);
+            let mut sprite = character_part_sprite(handle.clone(), part);
             sprite.color = color;
             commands
                 .spawn((
@@ -447,6 +494,13 @@ pub(super) fn queue_character_show(
         };
 
         stage.sprites.insert(sprite_id.clone(), entity);
+        if focused {
+            commands
+                .entity(entity)
+                .try_insert((FocusedActorPart, focus_layer()));
+        } else {
+            commands.entity(entity).try_insert(scene_layer());
+        }
         entities.push(entity);
         entity_ids.push(sprite_id);
         handles.push(handle);
@@ -462,6 +516,7 @@ pub(super) fn queue_character_show(
         entity_ids,
         entities,
         handles,
+        outgoing,
         fade,
         animation_id: pending_animation,
     });
@@ -722,24 +777,14 @@ fn character_part_id(actor_id: &str, part: &CharacterPartDefinition) -> String {
     }
 }
 
-fn character_part_sprite(
-    image: Handle<Image>,
-    part: &CharacterPartDefinition,
-    atlas: Option<&crate::texture::AtlasTexture>,
-) -> Sprite {
-    let mut sprite = atlas
-        .map(|atlas| Sprite::from_atlas_image(image.clone(), atlas.atlas.clone()))
-        .unwrap_or_else(|| Sprite::from_image(image));
-    if atlas.is_none() {
-        sprite.rect = part.rect.map(array_to_rect);
-    }
-    sprite
+fn character_part_sprite(image: Handle<Image>, part: &CharacterPartDefinition) -> WorldSprite {
+    WorldSprite::from_image(image).with_rect(part.rect.map(source_rect_from_corners))
 }
 
-pub(super) fn array_to_rect(rect: [f32; 4]) -> Rect {
-    Rect::from_corners(Vec2::new(rect[0], rect[1]), Vec2::new(rect[2], rect[3]))
+pub(super) fn source_rect_from_corners(rect: [f32; 4]) -> [f32; 4] {
+    [rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]]
 }
 
-pub(super) fn rect_to_array(rect: Rect) -> [f32; 4] {
-    [rect.min.x, rect.min.y, rect.max.x, rect.max.y]
+pub(super) fn source_rect_to_corners(rect: [f32; 4]) -> [f32; 4] {
+    [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]]
 }

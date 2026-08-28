@@ -134,6 +134,24 @@ pub struct SceneSnapshot {
     pub dialogue: Option<DialogueSnapshot>,
     #[prost(message, optional, tag = "7")]
     pub text_effect: Option<TextEffectSnapshot>,
+    #[prost(message, optional, tag = "8")]
+    pub camera: Option<CameraSnapshot>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CameraSnapshot {
+    #[prost(float, tag = "1")]
+    pub blur: f32,
+    #[prost(float, tag = "2")]
+    pub zoom: f32,
+    #[prost(float, repeated, tag = "3")]
+    pub offset: Vec<f32>,
+    #[prost(float, repeated, tag = "4")]
+    pub rotation: Vec<f32>,
+    #[prost(string, tag = "5")]
+    pub projection: String,
+    #[prost(string, tag = "6")]
+    pub scope: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -160,6 +178,8 @@ pub struct SpriteSnapshot {
     pub alpha: f32,
     #[prost(float, repeated, tag = "8")]
     pub rect: Vec<f32>,
+    #[prost(bool, tag = "9")]
+    pub focused: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]

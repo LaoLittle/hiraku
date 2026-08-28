@@ -27,8 +27,8 @@ use bevy::{
     asset::{AssetApp, io::AssetSourceId},
     audio::AddAudioSource,
     camera::ClearColorConfig,
+    pbr::MaterialPlugin,
     prelude::*,
-    sprite_render::Material2dPlugin,
 };
 use effect::transition::RuleTransitionMaterial;
 use effect::{blur::BlurEffectPlugin, custom::CustomScreenEffectMaterial};
@@ -127,15 +127,16 @@ struct HirakuRuntimeSystems;
 impl Plugin for HirakuPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
-            Material2dPlugin::<CustomScreenEffectMaterial>::default(),
-            Material2dPlugin::<RuleTransitionMaterial>::default(),
-            Material2dPlugin::<AlphaMaskMaterial>::default(),
-            Material2dPlugin::<MultiplyMaterial>::default(),
+            MaterialPlugin::<CustomScreenEffectMaterial>::default(),
+            MaterialPlugin::<RuleTransitionMaterial>::default(),
+            MaterialPlugin::<AlphaMaskMaterial>::default(),
+            MaterialPlugin::<MultiplyMaterial>::default(),
             BlurEffectPlugin,
         ));
         effect::custom::load_internal_shaders(app);
         effect::transition::load_internal_shaders(app);
         render::character_part::load_internal_shaders(app);
+        render::world_sprite::install(app);
 
         let archive_path = archive_path_from_config(app.world().resource::<RuntimeLaunchConfig>());
         let archive_store = app.world().resource::<HdpArchiveStore>().clone();
@@ -165,7 +166,7 @@ impl Plugin for HirakuPlugin {
                     .run_if(runtime_not_initialized),
             )
             .add_systems(Update, build_texture_atlases)
-            .add_systems(Update, assign_render_layers)
+            .add_systems(Update, assign_render_layers.after(process_script_commands))
             .configure_sets(Update, HirakuRuntimeSystems.run_if(runtime_initialized))
             .add_systems(
                 Update,

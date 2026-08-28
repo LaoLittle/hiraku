@@ -11,8 +11,9 @@ use thiserror::Error;
 use crate::{
     proto,
     state::{
-        AudioSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint, SaveGameData,
-        SavedInput, SceneSnapshot, ScriptPosition, SpriteSnapshot, StoredValue, TextEffectSnapshot,
+        AudioSnapshot, CameraSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint,
+        SaveGameData, SavedInput, SceneSnapshot, ScriptPosition, SpriteSnapshot, StoredValue,
+        TextEffectSnapshot,
     },
     vfs::workspace_base_path,
 };
@@ -349,6 +350,7 @@ impl From<&SceneSnapshot> for proto::SceneSnapshot {
             bgm: scene.bgm.as_ref().map(Into::into),
             dialogue: scene.dialogue.as_ref().map(Into::into),
             text_effect: Some((&scene.text_effect).into()),
+            camera: Some((&scene.camera).into()),
         }
     }
 }
@@ -369,7 +371,47 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
             bgm: scene.bgm.map(Into::into),
             dialogue: scene.dialogue.map(Into::into),
             text_effect: scene.text_effect.map(Into::into).unwrap_or_default(),
+            camera: scene.camera.map(Into::into).unwrap_or_default(),
         })
+    }
+}
+
+impl From<&CameraSnapshot> for proto::CameraSnapshot {
+    fn from(snapshot: &CameraSnapshot) -> Self {
+        Self {
+            blur: snapshot.blur,
+            zoom: snapshot.zoom,
+            offset: snapshot.offset.to_vec(),
+            rotation: snapshot.rotation.to_vec(),
+            projection: snapshot.projection.clone(),
+            scope: snapshot.scope.clone(),
+        }
+    }
+}
+
+impl From<proto::CameraSnapshot> for CameraSnapshot {
+    fn from(snapshot: proto::CameraSnapshot) -> Self {
+        let component = |values: &[f32], index| values.get(index).copied().unwrap_or(0.0);
+        Self {
+            blur: snapshot.blur,
+            zoom: if snapshot.zoom > 0.0 {
+                snapshot.zoom
+            } else {
+                1.0
+            },
+            offset: [
+                component(&snapshot.offset, 0),
+                component(&snapshot.offset, 1),
+                component(&snapshot.offset, 2),
+            ],
+            rotation: [
+                component(&snapshot.rotation, 0),
+                component(&snapshot.rotation, 1),
+                component(&snapshot.rotation, 2),
+            ],
+            projection: snapshot.projection,
+            scope: snapshot.scope,
+        }
     }
 }
 
@@ -400,6 +442,7 @@ impl From<&SpriteSnapshot> for proto::SpriteSnapshot {
             scale: snapshot.scale,
             alpha: snapshot.alpha,
             rect: snapshot.rect.map(Vec::from).unwrap_or_default(),
+            focused: snapshot.focused,
         }
     }
 }
@@ -422,6 +465,7 @@ impl From<proto::SpriteSnapshot> for SpriteSnapshot {
                     snapshot.rect[3],
                 ]
             }),
+            focused: snapshot.focused,
         }
     }
 }

@@ -865,10 +865,16 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         else {
             return;
         };
-        if signature.parameters.len() != arguments.len() {
+        let required = signature
+            .parameters
+            .iter()
+            .rposition(|parameter| !matches!(parameter, ScriptType::Nullable(_)))
+            .map_or(0, |index| index + 1);
+        if arguments.len() < required || arguments.len() > signature.parameters.len() {
             self.error(
                 format!(
-                    "function expects {} arguments, got {}",
+                    "function expects {} to {} arguments, got {}",
+                    required,
                     signature.parameters.len(),
                     arguments.len()
                 ),

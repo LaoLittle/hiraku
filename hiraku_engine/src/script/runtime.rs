@@ -18,6 +18,13 @@ pub enum CameraEffectScope {
     Canvas,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CameraProjectionMode {
+    #[default]
+    Orthographic,
+    Perspective,
+}
+
 /// ECS-facing state for the currently running HKS story.
 ///
 /// The bytecode VM and native host own script execution state. This resource only

@@ -1,4 +1,4 @@
-#import bevy_sprite::mesh2d_vertex_output::VertexOutput
+#import bevy_pbr::forward_io::VertexOutput
 
 struct MultiplyMaterial {
     tint: vec4<f32>,

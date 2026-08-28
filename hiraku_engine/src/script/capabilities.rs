@@ -10,7 +10,7 @@ use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, ren
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::script::CameraEffectScope;
+use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
 /// Engine-facing effects produced by HKS native functions.
@@ -55,6 +55,9 @@ pub enum StoryEffect {
     SetCamera {
         blur: Option<f32>,
         zoom: Option<f32>,
+        offset: Option<[f32; 3]>,
+        rotation: Option<[f32; 3]>,
+        projection: Option<CameraProjectionMode>,
         scope: CameraEffectScope,
         duration_ms: u64,
         ease: String,
@@ -65,6 +68,7 @@ pub enum StoryEffect {
         expressions: Vec<String>,
         position: [f32; 2],
         scale: f32,
+        focused: bool,
     },
 }
 
@@ -74,6 +78,8 @@ pub enum StoryWait {
 }
 
 const ACTOR_HANDLE_TYPE: u32 = 1;
+const BGM_HANDLE_TYPE: u32 = 2;
+const CAMERA_HANDLE_TYPE: u32 = 3;
 /// Manifest used by the direct whole-story HKS runtime. Async capabilities are
 /// registered here so the generic compiler can resolve them without engine AST lowering.
 pub fn story_manifest() -> BuiltinManifest {
@@ -165,6 +171,12 @@ fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
     Position::register_hks(&mut registry)
         .expect("Position API registration must be internally consistent");
+    CameraScope::register_hks(&mut registry)
+        .expect("CameraScope API registration must be internally consistent");
+    CameraEase::register_hks(&mut registry)
+        .expect("CameraEase API registration must be internally consistent");
+    CameraProjection::register_hks(&mut registry)
+        .expect("CameraProjection API registration must be internally consistent");
     registry
         .define_global(
             "settings",
@@ -287,6 +299,10 @@ impl StoryNativeHost {
             handles_by_name: self.context.handles_by_name.clone(),
             last_speaker: self.context.last_speaker.clone(),
             dialogue_buffer: self.context.dialogue_buffer.clone(),
+            next_bgm_handle: self.context.next_bgm_handle,
+            pending_bgm: self.context.pending_bgm.clone(),
+            next_camera_handle: self.context.next_camera_handle,
+            pending_cameras: self.context.pending_cameras.clone(),
         }
     }
 
@@ -300,6 +316,10 @@ impl StoryNativeHost {
                 wait: None,
                 last_speaker: snapshot.last_speaker,
                 dialogue_buffer: snapshot.dialogue_buffer,
+                next_bgm_handle: snapshot.next_bgm_handle,
+                pending_bgm: snapshot.pending_bgm,
+                next_camera_handle: snapshot.next_camera_handle,
+                pending_cameras: snapshot.pending_cameras,
             },
             registry: story_registry(),
         }
@@ -313,6 +333,10 @@ pub struct StoryNativeHostSnapshot {
     handles_by_name: BTreeMap<String, u64>,
     last_speaker: Option<String>,
     dialogue_buffer: Option<String>,
+    next_bgm_handle: u64,
+    pending_bgm: BTreeMap<u64, PendingBgm>,
+    next_camera_handle: u64,
+    pending_cameras: BTreeMap<u64, PendingCamera>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -322,6 +346,27 @@ struct PendingActor {
     position: [f32; 2],
     scale: f32,
     dirty: bool,
+    focused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PendingBgm {
+    path: String,
+    volume: f32,
+    fade_in_ms: Option<u64>,
+    dirty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PendingCamera {
+    blur: Option<f32>,
+    zoom: Option<f32>,
+    offset: Option<[f32; 3]>,
+    rotation: Option<[f32; 3]>,
+    projection: Option<CameraProjectionMode>,
+    scope: CameraEffectScope,
+    duration_ms: u64,
+    ease: String,
 }
 
 #[derive(Default)]
@@ -333,6 +378,10 @@ struct CharacterContext {
     wait: Option<StoryWait>,
     last_speaker: Option<String>,
     dialogue_buffer: Option<String>,
+    next_bgm_handle: u64,
+    pending_bgm: BTreeMap<u64, PendingBgm>,
+    next_camera_handle: u64,
+    pending_cameras: BTreeMap<u64, PendingCamera>,
 }
 
 impl CharacterContext {
@@ -397,6 +446,68 @@ impl CharacterContext {
         Ok(ActorHandle(handle))
     }
 
+    fn focus(
+        &mut self,
+        ActorHandle(handle): ActorHandle,
+        focused: bool,
+    ) -> Result<ActorHandle, CharacterCapabilityError> {
+        self.actor_mut(handle)?.focused = focused;
+        self.actor_mut(handle)?.dirty = true;
+        Ok(ActorHandle(handle))
+    }
+
+    fn bgm(&mut self, path: String) -> Result<BgmHandle, NativeError> {
+        if path.trim().is_empty() {
+            return Err(NativeError::message("bgm path must not be empty"));
+        }
+        self.next_bgm_handle += 1;
+        let handle = self.next_bgm_handle;
+        self.pending_bgm.insert(
+            handle,
+            PendingBgm {
+                path,
+                volume: 1.0,
+                fade_in_ms: None,
+                dirty: true,
+            },
+        );
+        Ok(BgmHandle(handle))
+    }
+
+    fn bgm_mut(&mut self, handle: u64) -> Result<&mut PendingBgm, NativeError> {
+        self.pending_bgm
+            .get_mut(&handle)
+            .ok_or_else(|| NativeError::message(format!("unknown bgm handle {handle}")))
+    }
+
+    fn camera(&mut self, scope: CameraScope) -> CameraHandle {
+        self.next_camera_handle += 1;
+        let handle = self.next_camera_handle;
+        self.pending_cameras.insert(
+            handle,
+            PendingCamera {
+                blur: None,
+                zoom: None,
+                offset: None,
+                rotation: None,
+                projection: None,
+                scope: match scope {
+                    CameraScope::Scene => CameraEffectScope::World,
+                    CameraScope::Canvas => CameraEffectScope::Canvas,
+                },
+                duration_ms: 0,
+                ease: "linear".to_string(),
+            },
+        );
+        CameraHandle(handle)
+    }
+
+    fn camera_mut(&mut self, handle: u64) -> Result<&mut PendingCamera, NativeError> {
+        self.pending_cameras
+            .get_mut(&handle)
+            .ok_or_else(|| NativeError::message(format!("unknown camera handle {handle}")))
+    }
+
     fn actor_mut(&mut self, handle: u64) -> Result<&mut PendingActor, CharacterCapabilityError> {
         self.actors
             .get_mut(&handle)
@@ -416,6 +527,7 @@ impl CharacterContext {
                 expressions: pending.expressions.clone(),
                 position: pending.position,
                 scale: pending.scale,
+                focused: pending.focused,
             }
         };
         self.commands.push(command);
@@ -427,6 +539,36 @@ impl CharacterContext {
         for handle in handles {
             self.flush(handle)?;
         }
+        let bgm = std::mem::take(&mut self.pending_bgm);
+        for (_, pending) in bgm {
+            if pending.dirty {
+                self.commands.push(StoryEffect::PlayBgm {
+                    path: pending.path,
+                    volume: pending.volume,
+                    fade_in_ms: pending.fade_in_ms,
+                });
+            }
+        }
+        let cameras = std::mem::take(&mut self.pending_cameras);
+        for (_, pending) in cameras {
+            if pending.blur.is_some()
+                || pending.zoom.is_some()
+                || pending.offset.is_some()
+                || pending.rotation.is_some()
+                || pending.projection.is_some()
+            {
+                self.commands.push(StoryEffect::SetCamera {
+                    blur: pending.blur,
+                    zoom: pending.zoom,
+                    offset: pending.offset,
+                    rotation: pending.rotation,
+                    projection: pending.projection,
+                    scope: pending.scope,
+                    duration_ms: pending.duration_ms,
+                    ease: pending.ease,
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -434,6 +576,14 @@ impl CharacterContext {
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "Actor", handle_type = ACTOR_HANDLE_TYPE)]
 struct ActorHandle(u64);
+
+#[derive(Clone, Copy, hiraku_script::HksHandle)]
+#[hks(name = "Bgm", handle_type = BGM_HANDLE_TYPE)]
+struct BgmHandle(u64);
+
+#[derive(Clone, Copy, hiraku_script::HksHandle)]
+#[hks(name = "Camera", handle_type = CAMERA_HANDLE_TYPE)]
+struct CameraHandle(u64);
 
 hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -473,6 +623,65 @@ impl Position {
     fn right() -> Position {
         Self::Absolute(600.0, -200.0)
     }
+}
+}
+
+hiraku_script::hks_define! {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CameraScope {
+    Scene,
+    Canvas,
+}
+
+impl CameraScope {
+    #[getter]
+    fn scene() -> CameraScope { Self::Scene }
+
+    #[getter]
+    fn canvas() -> CameraScope { Self::Canvas }
+}
+}
+
+hiraku_script::hks_define! {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CameraEase {
+    Linear,
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    Bounce,
+}
+
+#[allow(non_snake_case)]
+impl CameraEase {
+    #[getter]
+    fn linear() -> CameraEase { Self::Linear }
+    #[getter]
+    fn ease() -> CameraEase { Self::Ease }
+    #[getter]
+    fn easeIn() -> CameraEase { Self::EaseIn }
+    #[getter]
+    fn easeOut() -> CameraEase { Self::EaseOut }
+    #[getter]
+    fn easeInOut() -> CameraEase { Self::EaseInOut }
+    #[getter]
+    fn bounce() -> CameraEase { Self::Bounce }
+}
+}
+
+hiraku_script::hks_define! {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CameraProjection {
+    Orthographic,
+    Perspective,
+}
+
+impl CameraProjection {
+    #[getter]
+    fn orthographic() -> CameraProjection { Self::Orthographic }
+    #[getter]
+    fn perspective() -> CameraProjection { Self::Perspective }
 }
 }
 
@@ -533,6 +742,17 @@ mod native_api {
     ) -> Result<ActorHandle, NativeError> {
         context
             .scale(actor, scale)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
+
+    #[hks(name = "focus", receiver)]
+    fn native_focus(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        focused: Option<bool>,
+    ) -> Result<ActorHandle, NativeError> {
+        context
+            .focus(actor, focused.unwrap_or(true))
             .map_err(|error| NativeError::message(error.to_string()))
     }
 
@@ -601,24 +821,165 @@ mod native_api {
         Ok(())
     }
 
-    #[hks]
-    fn native_play_bgm(
+    #[hks(name = "bgm")]
+    fn native_bgm(context: &mut CharacterContext, path: String) -> Result<BgmHandle, NativeError> {
+        context.bgm(path)
+    }
+
+    #[hks(name = "volume", receiver)]
+    fn native_bgm_volume(
         context: &mut CharacterContext,
-        path: String,
+        BgmHandle(handle): BgmHandle,
         volume: f64,
+    ) -> Result<BgmHandle, NativeError> {
+        if !(0.0..=1.0).contains(&volume) {
+            return Err(NativeError::message("bgm volume must be between 0 and 1"));
+        }
+        context.bgm_mut(handle)?.volume = volume as f32;
+        Ok(BgmHandle(handle))
+    }
+
+    #[hks(name = "fadeIn", receiver)]
+    fn native_bgm_fade_in(
+        context: &mut CharacterContext,
+        BgmHandle(handle): BgmHandle,
         fade_ms: f64,
-    ) -> Result<(), NativeError> {
-        if !(0.0..=1.0).contains(&volume) || fade_ms < 0.0 {
+    ) -> Result<BgmHandle, NativeError> {
+        if !fade_ms.is_finite() || fade_ms < 0.0 {
             return Err(NativeError::message(
-                "playBgm volume must be between 0 and 1 and fade must be non-negative",
+                "bgm fade-in duration must be a non-negative number of milliseconds",
             ));
         }
-        context.commands.push(StoryEffect::PlayBgm {
-            path,
-            volume: volume as f32,
-            fade_in_ms: Some(fade_ms.round() as u64),
+        context.bgm_mut(handle)?.fade_in_ms = Some(fade_ms.round() as u64);
+        Ok(BgmHandle(handle))
+    }
+
+    #[hks(name = "camera")]
+    fn native_camera(
+        context: &mut CharacterContext,
+        scope: Option<CameraScope>,
+    ) -> Result<CameraHandle, NativeError> {
+        Ok(context.camera(scope.unwrap_or(CameraScope::Scene)))
+    }
+
+    #[hks(name = "blur", receiver)]
+    fn native_camera_blur(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        intensity: f64,
+    ) -> Result<CameraHandle, NativeError> {
+        if !intensity.is_finite() || intensity < 0.0 {
+            return Err(NativeError::message(
+                "camera blur intensity must be non-negative",
+            ));
+        }
+        context.camera_mut(handle)?.blur = Some(intensity as f32);
+        Ok(CameraHandle(handle))
+    }
+
+    #[hks(name = "zoom", receiver)]
+    fn native_camera_zoom(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        zoom: f64,
+    ) -> Result<CameraHandle, NativeError> {
+        if !zoom.is_finite() || zoom <= 0.0 {
+            return Err(NativeError::message("camera zoom must be positive"));
+        }
+        context.camera_mut(handle)?.zoom = Some(zoom as f32);
+        Ok(CameraHandle(handle))
+    }
+
+    #[hks(name = "offset", receiver)]
+    fn native_camera_offset(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Result<CameraHandle, NativeError> {
+        if ![x, y, z].into_iter().all(f64::is_finite) {
+            return Err(NativeError::message("camera offset must be finite"));
+        }
+        context.camera_mut(handle)?.offset = Some([x as f32, y as f32, z as f32]);
+        Ok(CameraHandle(handle))
+    }
+
+    #[hks(name = "rotation", receiver)]
+    fn native_camera_rotation(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Result<CameraHandle, NativeError> {
+        if ![x, y, z].into_iter().all(f64::is_finite) {
+            return Err(NativeError::message("camera rotation must be finite"));
+        }
+        context.camera_mut(handle)?.rotation = Some([x as f32, y as f32, z as f32]);
+        Ok(CameraHandle(handle))
+    }
+
+    #[hks(name = "roll", receiver)]
+    fn native_camera_roll(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        degrees: f64,
+    ) -> Result<CameraHandle, NativeError> {
+        if !degrees.is_finite() {
+            return Err(NativeError::message("camera roll must be finite"));
+        }
+        let pending = context.camera_mut(handle)?;
+        let mut rotation = pending.rotation.unwrap_or([0.0; 3]);
+        rotation[2] = degrees as f32;
+        pending.rotation = Some(rotation);
+        Ok(CameraHandle(handle))
+    }
+
+    #[hks(name = "projection", receiver)]
+    fn native_camera_projection(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        projection: CameraProjection,
+    ) -> Result<CameraHandle, NativeError> {
+        context.camera_mut(handle)?.projection = Some(match projection {
+            CameraProjection::Orthographic => CameraProjectionMode::Orthographic,
+            CameraProjection::Perspective => CameraProjectionMode::Perspective,
         });
-        Ok(())
+        Ok(CameraHandle(handle))
+    }
+
+    #[hks(name = "time", receiver)]
+    fn native_camera_time(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        seconds: f64,
+    ) -> Result<CameraHandle, NativeError> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(NativeError::message(
+                "camera animation time must be non-negative",
+            ));
+        }
+        context.camera_mut(handle)?.duration_ms = (seconds * 1000.0).round() as u64;
+        Ok(CameraHandle(handle))
+    }
+
+    #[hks(name = "easing", receiver)]
+    fn native_camera_easing(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        easing: CameraEase,
+    ) -> Result<CameraHandle, NativeError> {
+        context.camera_mut(handle)?.ease = match easing {
+            CameraEase::Linear => "linear",
+            CameraEase::Ease => "ease",
+            CameraEase::EaseIn => "easeIn",
+            CameraEase::EaseOut => "easeOut",
+            CameraEase::EaseInOut => "easeInOut",
+            CameraEase::Bounce => "bounce",
+        }
+        .to_string();
+        Ok(CameraHandle(handle))
     }
 
     #[hks]
@@ -700,126 +1061,6 @@ mod native_api {
             .push(StoryEffect::PlayVoice { path, volume: 1.0 });
         Ok(())
     }
-
-    #[hks(raw, selector = "camera", name = "blur")]
-    fn native_camera_blur(
-        context: &mut CharacterContext,
-        call: &hiraku_script::BuiltinCall,
-    ) -> Result<Value, NativeError> {
-        require_selector(call, "camera")?;
-        let mut intensity = None;
-        let mut duration = 0.0;
-        let mut ease = "linear".to_string();
-        let mut scope = CameraEffectScope::World;
-        for argument in &call.arguments {
-            match argument.label.as_deref() {
-                None if intensity.is_none() => intensity = Some(number_value(&argument.value)?),
-                Some("duration") => duration = number_value(&argument.value)?,
-                Some("ease") => ease = symbol_value(&argument.value)?,
-                Some("scope") => scope = camera_scope_value(&argument.value)?,
-                _ => return Err(NativeError::message("invalid camera.blur arguments")),
-            }
-        }
-        let intensity =
-            intensity.ok_or_else(|| NativeError::message("blur intensity is required"))?;
-        if intensity < 0.0 || duration < 0.0 {
-            return Err(NativeError::message(
-                "blur intensity and duration must be non-negative",
-            ));
-        }
-        context.commands.push(StoryEffect::SetCamera {
-            blur: Some(intensity as f32),
-            zoom: None,
-            scope,
-            duration_ms: (duration * 1000.0).round() as u64,
-            ease: normalize_ease(&ease)?,
-        });
-        Ok(Value::Null)
-    }
-
-    #[hks(raw, selector = "camera", name = "zoom")]
-    fn native_camera_zoom(
-        context: &mut CharacterContext,
-        call: &hiraku_script::BuiltinCall,
-    ) -> Result<Value, NativeError> {
-        require_selector(call, "camera")?;
-        let mut scale = None;
-        let mut duration = 0.0;
-        let mut ease = "linear".to_string();
-        let mut scope = CameraEffectScope::World;
-        for argument in &call.arguments {
-            match argument.label.as_deref() {
-                None if scale.is_none() => scale = Some(number_value(&argument.value)?),
-                Some("duration") => duration = number_value(&argument.value)?,
-                Some("ease") => ease = symbol_value(&argument.value)?,
-                Some("scope") => scope = camera_scope_value(&argument.value)?,
-                Some("at") if matches!(argument.value, Value::Symbol(ref value) if value == "center") =>
-                    {}
-                _ => return Err(NativeError::message("invalid camera.zoom arguments")),
-            }
-        }
-        let scale = scale.ok_or_else(|| NativeError::message("zoom scale is required"))?;
-        if scale <= 0.0 || duration < 0.0 {
-            return Err(NativeError::message(
-                "zoom scale must be positive and duration non-negative",
-            ));
-        }
-        context.commands.push(StoryEffect::SetCamera {
-            blur: None,
-            zoom: Some(scale as f32),
-            scope,
-            duration_ms: (duration * 1000.0).round() as u64,
-            ease: normalize_ease(&ease)?,
-        });
-        Ok(Value::Null)
-    }
-}
-
-fn require_selector(call: &hiraku_script::BuiltinCall, expected: &str) -> Result<(), NativeError> {
-    match &call.receiver {
-        Some(Value::Selector(selector)) if selector == expected => Ok(()),
-        Some(_) => Err(NativeError::message(format!(
-            "expected `{expected}` selector receiver"
-        ))),
-        None => Err(NativeError::message(format!(
-            "selector method requires `{expected}` receiver"
-        ))),
-    }
-}
-
-fn number_value(value: &Value) -> Result<f64, NativeError> {
-    match value {
-        Value::Number(value) => Ok(*value),
-        _ => Err(NativeError::TypeMismatch("number")),
-    }
-}
-
-fn symbol_value(value: &Value) -> Result<String, NativeError> {
-    match value {
-        Value::Symbol(value) => Ok(value.clone()),
-        _ => Err(NativeError::TypeMismatch("symbol")),
-    }
-}
-
-fn camera_scope_value(value: &Value) -> Result<CameraEffectScope, NativeError> {
-    match value {
-        Value::Symbol(value) if value == "world" => Ok(CameraEffectScope::World),
-        Value::Symbol(value) if value == "canvas" => Ok(CameraEffectScope::Canvas),
-        Value::Symbol(_) => Err(NativeError::message(
-            "camera scope must be .world or .canvas",
-        )),
-        _ => Err(NativeError::TypeMismatch("symbol")),
-    }
-}
-
-fn normalize_ease(ease: &str) -> Result<String, NativeError> {
-    match ease {
-        "linear" => Ok("linear".to_string()),
-        "easeIn" => Ok("ease_in".to_string()),
-        "easeOut" => Ok("ease_out".to_string()),
-        "easeInOut" => Ok("ease_in_out".to_string()),
-        _ => Err(NativeError::message(format!("unsupported easing `{ease}`"))),
-    }
 }
 
 fn pending_actor(name: &str) -> PendingActor {
@@ -829,6 +1070,7 @@ fn pending_actor(name: &str) -> PendingActor {
         position: [0.0, 0.0],
         scale: 1.0,
         dirty: true,
+        focused: false,
     }
 }
 

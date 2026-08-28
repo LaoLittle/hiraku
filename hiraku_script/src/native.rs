@@ -454,12 +454,18 @@ impl<C> NativeRegistry<C> {
             .functions
             .get(&call.builtin)
             .ok_or(NativeError::UnknownBuiltin(call.builtin))?;
-        let values = call
+        let mut values = call
             .receiver
             .iter()
             .cloned()
             .chain(call.arguments.iter().map(|argument| argument.value.clone()))
             .collect::<Vec<_>>();
+        if let Some(signature) = self.signatures.get(&call.builtin) {
+            let expected = signature.parameters.len() + usize::from(signature.receiver.is_some());
+            while values.len() < expected {
+                values.push(Value::Null);
+            }
+        }
         function(context, &values)
     }
 
@@ -730,6 +736,15 @@ impl HksScriptType for () {
 impl<T: HksScriptType> HksScriptType for Option<T> {
     fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::ScriptType {
         crate::ScriptType::Nullable(Box::new(T::hks_script_type(registry)))
+    }
+}
+
+impl<T: FromHksValue> FromHksValue for Option<T> {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::Null => Ok(None),
+            value => T::from_hks_value(value).map(Some),
+        }
     }
 }
 

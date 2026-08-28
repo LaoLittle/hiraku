@@ -1,6 +1,7 @@
 use bevy::{
     asset::Handle,
     mesh::MeshVertexBufferLayoutRef,
+    pbr::{Material, MaterialPipeline, MaterialPipelineKey},
     prelude::*,
     reflect::TypePath,
     render::render_resource::{
@@ -8,7 +9,6 @@ use bevy::{
         RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
     },
     shader::ShaderRef,
-    sprite_render::{AlphaMode2d, Material2d, Material2dKey},
 };
 
 pub fn load_internal_shaders(app: &mut App) {
@@ -59,13 +59,17 @@ impl From<&AlphaMaskMaterial> for AlphaMaskUniform {
     }
 }
 
-impl Material2d for AlphaMaskMaterial {
+impl Material for AlphaMaskMaterial {
     fn fragment_shader() -> ShaderRef {
         "embedded://hiraku_engine/render/shaders/alpha_mask.wgsl".into()
     }
 
-    fn alpha_mode(&self) -> AlphaMode2d {
-        AlphaMode2d::Blend
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+
+    fn enable_shadows() -> bool {
+        false
     }
 }
 
@@ -99,19 +103,24 @@ impl From<&MultiplyMaterial> for MultiplyUniform {
     }
 }
 
-impl Material2d for MultiplyMaterial {
+impl Material for MultiplyMaterial {
     fn fragment_shader() -> ShaderRef {
         "embedded://hiraku_engine/render/shaders/multiply.wgsl".into()
     }
 
-    fn alpha_mode(&self) -> AlphaMode2d {
-        AlphaMode2d::Blend
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+
+    fn enable_shadows() -> bool {
+        false
     }
 
     fn specialize(
+        _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
-        _key: Material2dKey<Self>,
+        _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         let target = descriptor
             .fragment
