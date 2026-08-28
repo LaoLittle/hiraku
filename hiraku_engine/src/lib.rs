@@ -336,7 +336,6 @@ fn boot_runtime(
                 });
             match result {
                 Ok(mut story) => {
-                    info!("starting startup script in direct HKS runtime");
                     story.set_globals(script::capabilities::engine_globals(&user_settings));
                     script_runtime.story = Some(story);
                     script_runtime.current_script = Some(startup_script);

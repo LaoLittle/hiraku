@@ -824,7 +824,7 @@ mod tests {
     fn whole_program_runtime_yields_native_calls_without_ir() {
         let bytecode = compile_story_bytecode("test.story.hks", "log(\"hello\")")
             .expect("whole HKS story must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("direct HKS runtime must initialize");
+        let mut runtime = HksRuntime::new(bytecode).expect("script runtime must initialize");
         let Some(HksRuntimeEvent::Call(call)) = runtime.step().expect("runtime must advance")
         else {
             panic!("expected a native call")
@@ -889,7 +889,7 @@ mod tests {
         let bytecode =
             compile_story_bytecode("test.story.hks", r#"char("alice").e("happy").at(.right)"#)
                 .expect("character story must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("direct HKS runtime must initialize");
+        let mut runtime = HksRuntime::new(bytecode).expect("script runtime must initialize");
         let mut host = StoryNativeHost::new();
 
         loop {

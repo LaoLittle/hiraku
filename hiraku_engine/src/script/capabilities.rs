@@ -231,7 +231,7 @@ fn async_capability_placeholder(
     ))
 }
 
-/// Stateful native-function host for the direct HKS runtime.
+/// Stateful native-function host for the HKS runtime.
 ///
 /// It owns statement-scoped actor builders and exposes effects as plain data so
 /// an ECS system can dispatch them without giving native functions world access.

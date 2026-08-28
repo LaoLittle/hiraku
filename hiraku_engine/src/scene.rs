@@ -382,7 +382,7 @@ pub fn bridge_story_events(
         if let Some(story) = runtime.story.as_mut()
             && let Err(error) = story.resume(direct_value)
         {
-            warn!("failed to resume direct HKS runtime: {error}");
+            warn!("failed to resume script runtime: {error}");
             runtime.story = None;
         }
     }
