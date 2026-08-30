@@ -78,6 +78,7 @@ pub enum TypeExprKind {
     Named(String),
     Nullable(Box<TypeExpr>),
     List(Box<TypeExpr>),
+    Binding(Box<TypeExpr>),
     Record(Vec<TypeField>),
 }
 
@@ -102,6 +103,7 @@ pub struct Expr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
+    Unit,
     Null,
     Ellipsis,
     Ident(String),
@@ -112,6 +114,8 @@ pub enum ExprKind {
         unit: NumberUnit,
     },
     String(String),
+    /// An explicitly captured reactive expression, written `$name` or `${expr}`.
+    Binding(Box<Expr>),
     UnaryMinus(Box<Expr>),
     Member {
         object: Box<Expr>,

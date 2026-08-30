@@ -44,7 +44,9 @@ use crate::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
         ScreenUiImageButton, ScreenUiNode, ScreenUiRoot, ScreenUiState, SpacerNode,
-        StaleScreenRoot, TextNode, UiSignals, UiTextBinding,
+        StaleScreenRoot, TextNode, UiAnimationPlayer, UiEnabledBinding, UiProgressBinding,
+        UiReactiveEnabledBinding, UiReactiveProgressBinding, UiReactiveTextBinding,
+        UiReactiveVisibilityBinding, UiSignalValue, UiSignals, UiTextBinding, UiVisibilityBinding,
     },
     vfs::VfsResource,
 };
@@ -59,8 +61,8 @@ use character::{
     queue_character_show, source_rect_from_corners, source_rect_to_corners,
 };
 pub use screen_ui::{
-    cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons,
-    update_builtin_ui_signals, update_ui_text_bindings,
+    animate_screen_ui, cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons,
+    update_builtin_ui_signals, update_ui_reactive_bindings, update_ui_text_bindings,
 };
 use screen_ui::{
     clear_overlay_ui, clear_screen_ui, screen_images_ready,
@@ -210,6 +212,8 @@ pub struct StageState {
     pub transition: Option<Entity>,
     pub screen_effect: Option<Entity>,
     pub sprites: HashMap<String, Entity>,
+    pub character_roots: HashMap<String, Entity>,
+    pub character_active_parts: HashMap<String, HashSet<String>>,
     pub character_positions: HashMap<String, Vec2>,
     pub bgm: Option<Entity>,
 }
@@ -412,7 +416,7 @@ pub fn bridge_story_events(
     {
         let direct_value = match &response {
             ScriptResponse::Choice(value) => stored_to_hks(value.clone()),
-            ScriptResponse::Continue => hiraku_script::Value::Null,
+            ScriptResponse::Continue => hiraku_script::Value::Unit,
         };
         runtime.pending_ui_screen = None;
         runtime.wait_request = None;
@@ -721,11 +725,22 @@ pub struct PendingCharacterShow {
     pub entity_ids: Vec<String>,
     pub entities: Vec<Entity>,
     pub handles: Vec<Handle<Image>>,
+    /// Tracks whether each pending entity was instantiated by this commit.
+    /// Reused hidden children stay cached when a load or animation is cancelled.
+    pub newly_spawned: Vec<bool>,
     /// Previously visible parts retained until all replacements are renderable.
     pub outgoing: Vec<(String, Entity)>,
     pub fade: Option<std::time::Duration>,
     pub animation_id: Option<String>,
 }
+
+#[derive(Component, Clone, Debug)]
+pub struct CharacterRoot {
+    pub actor_id: String,
+}
+
+#[derive(Component)]
+pub struct HideAfterTween;
 
 #[derive(Component)]
 pub struct CharacterJumpEffect {
@@ -1003,6 +1018,7 @@ pub struct RuntimeMenuContext<'w, 's> {
             &'static PickingInteraction,
             &'static mut BackgroundColor,
             &'static RuntimeMenuButton,
+            Option<&'static ScreenUiButton>,
         ),
         Changed<PickingInteraction>,
     >,
@@ -3552,11 +3568,20 @@ pub fn apply_animation_cancellations(
             .as_ref()
             .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
-            for entity in item.entities.drain(..) {
-                commands.entity(entity).try_despawn();
-            }
-            for id in item.entity_ids.drain(..) {
-                stage.sprites.remove(&id);
+            for ((id, entity), newly_spawned) in item
+                .entity_ids
+                .drain(..)
+                .zip(item.entities.drain(..))
+                .zip(item.newly_spawned.drain(..))
+            {
+                if newly_spawned {
+                    if stage.sprites.get(&id) == Some(&entity) {
+                        stage.sprites.remove(&id);
+                    }
+                    commands.entity(entity).try_despawn();
+                } else {
+                    commands.entity(entity).try_insert(Visibility::Hidden);
+                }
             }
             complete_missing_animation(&mut animations, item.animation_id.take());
             false
@@ -3690,10 +3715,21 @@ pub fn animate_visual_tweens(
         Option<&CharacterPartVisual>,
         &mut Transform,
         &mut VisualTween,
+        Option<&HideAfterTween>,
+        Option<&mut Visibility>,
     )>,
 ) {
-    for (entity, mut sprite, alpha_mask, multiply, part_visual, mut transform, mut tween) in
-        &mut visuals
+    for (
+        entity,
+        mut sprite,
+        alpha_mask,
+        multiply,
+        part_visual,
+        mut transform,
+        mut tween,
+        hide_after,
+        visibility,
+    ) in &mut visuals
     {
         tween.timer.tick(time.delta());
         let fraction = tween_fraction(&tween.timer);
@@ -3740,6 +3776,12 @@ pub fn animate_visual_tweens(
             if tween.despawn_on_finish {
                 commands.entity(entity).try_despawn();
             } else {
+                if hide_after.is_some() {
+                    if let Some(mut visibility) = visibility {
+                        *visibility = Visibility::Hidden;
+                    }
+                    commands.entity(entity).try_remove::<HideAfterTween>();
+                }
                 commands.entity(entity).try_remove::<VisualTween>();
             }
         }
@@ -3974,6 +4016,7 @@ pub fn sync_scene_snapshot(
         Option<&CharacterPartVisual>,
         Option<&FocusedActorPart>,
         &Transform,
+        &Visibility,
     )>,
 ) {
     let snapshot = &mut shared_state.0;
@@ -3987,8 +4030,9 @@ pub fn sync_scene_snapshot(
 
     let mut sprite_snapshots = sprites
         .iter()
+        .filter(|(_, _, _, _, _, _, _, visibility)| **visibility != Visibility::Hidden)
         .map(
-            |(actor, sprite, alpha_mask, multiply, visual, focused, transform)| SpriteSnapshot {
+            |(actor, sprite, alpha_mask, multiply, visual, focused, transform, _)| SpriteSnapshot {
                 id: actor.id.clone(),
                 path: actor.path.clone(),
                 x: transform.translation.x,
@@ -4641,7 +4685,10 @@ fn resolve_choice(
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
-    for (interaction, mut color, button) in &mut ctx.interaction_query {
+    for (interaction, mut color, button, screen_button) in &mut ctx.interaction_query {
+        if screen_button.is_some_and(|button| !button.enabled) {
+            continue;
+        }
         match *interaction {
             PickingInteraction::Pressed => {
                 *color = ctx.ui_style.quick_button_pressed.into();
@@ -4913,10 +4960,14 @@ fn restore_scene_snapshot(
     if let Some(transition) = stage.transition.take() {
         commands.entity(transition).try_despawn();
     }
+    for (_, root) in stage.character_roots.drain() {
+        commands.entity(root).try_despawn();
+    }
     for (_, entity) in stage.sprites.drain() {
         commands.entity(entity).try_despawn();
     }
     stage.character_positions.clear();
+    stage.character_active_parts.clear();
     if let Some(bgm) = stage.bgm.take() {
         commands.entity(bgm).try_despawn();
     }

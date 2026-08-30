@@ -424,7 +424,7 @@ impl StoryRuntime {
                             label: label.clone(),
                             body,
                         });
-                        self.bytecode.resume_task(task, Value::Null)?;
+                        self.bytecode.resume_task(task, Value::Unit)?;
                         continue;
                     }
                     let value = self.host.call(&call)?;
@@ -842,7 +842,7 @@ mod tests {
             story_manifest().resolve("log").expect("log registration")
         );
         runtime
-            .resume_main(Value::Null)
+            .resume_main(Value::Unit)
             .expect("host result must resume the main VM");
     }
 
@@ -899,7 +899,7 @@ mod tests {
         let snapshot = runtime.snapshot();
         let mut restored = HksRuntime::restore(bytecode, snapshot).expect("snapshot must restore");
         restored
-            .resume_main(Value::Null)
+            .resume_main(Value::Unit)
             .expect("restored host call must resume");
         assert_eq!(
             restored.step().expect("runtime must reach statement"),
@@ -1074,7 +1074,7 @@ mod tests {
             None
         );
         runtime
-            .resume(Value::Null)
+            .resume(Value::Unit)
             .expect("dialogue wait must resume");
         assert!(matches!(
             runtime.step().expect("second effect must run after resume"),
@@ -1118,7 +1118,7 @@ mod tests {
             Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
         );
         runtime
-            .resume(Value::Null)
+            .resume(Value::Unit)
             .expect("branch dialogue must resume independently of the main VM");
         assert!(matches!(
             runtime.step().expect("main story continues after the branch"),

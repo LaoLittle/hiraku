@@ -126,7 +126,9 @@ fn intern_type(ty: &TypeExpr, symbols: &mut SymbolInterner) {
         TypeExprKind::Named(name) => {
             symbols.intern(name);
         }
-        TypeExprKind::Nullable(inner) | TypeExprKind::List(inner) => intern_type(inner, symbols),
+        TypeExprKind::Nullable(inner)
+        | TypeExprKind::List(inner)
+        | TypeExprKind::Binding(inner) => intern_type(inner, symbols),
         TypeExprKind::Record(fields) => {
             for field in fields {
                 symbols.intern(&field.name);
@@ -145,7 +147,9 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
             intern_expression(object, symbols);
             symbols.intern(name);
         }
-        ExprKind::UnaryMinus(value) | ExprKind::NonNull(value) => intern_expression(value, symbols),
+        ExprKind::Binding(value) | ExprKind::UnaryMinus(value) | ExprKind::NonNull(value) => {
+            intern_expression(value, symbols)
+        }
         ExprKind::Elvis { value, fallback } => {
             intern_expression(value, symbols);
             intern_expression(fallback, symbols);
@@ -189,7 +193,8 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
             intern_expression(left, symbols);
             intern_expression(right, symbols);
         }
-        ExprKind::Null
+        ExprKind::Unit
+        | ExprKind::Null
         | ExprKind::Ellipsis
         | ExprKind::Bool(_)
         | ExprKind::Number { .. }

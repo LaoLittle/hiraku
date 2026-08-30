@@ -3,7 +3,7 @@
 //! Registries contain Rust functions and deliberately are not serializable. Bytecode and
 //! snapshots only retain [`BuiltinId`] values plus the manifest hash.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt, marker::PhantomData};
 
 use crate::{
     runtime::{
@@ -573,6 +573,70 @@ impl HksScriptType for HksClosure {
     }
 }
 
+/// A statically typed expression captured for lazy evaluation by an embedding.
+///
+/// Its payload is ordinary save-safe closure bytecode. The generic VM does not
+/// know what "reactive" means; the embedding decides when to evaluate it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HksBinding<T> {
+    closure: HksClosure,
+    marker: PhantomData<fn() -> T>,
+}
+
+/// A native parameter which accepts either an immediate `T` or an explicit
+/// HKS `Binding<T>`. This keeps static builder calls concise while making live
+/// reevaluation visible at the call site through `$name` / `${expr}`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HksBindable<T> {
+    Value(T),
+    Binding(HksBinding<T>),
+}
+
+impl<T: FromHksValue> FromHksValue for HksBindable<T> {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        if matches!(value, Value::Closure { .. }) {
+            HksBinding::from_hks_value(value).map(Self::Binding)
+        } else {
+            T::from_hks_value(value).map(Self::Value)
+        }
+    }
+}
+
+impl<T: HksScriptType> HksScriptType for HksBindable<T> {
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        let value = T::hks_script_type(registry);
+        crate::ScriptType::Union(vec![
+            value.clone(),
+            crate::ScriptType::Binding(Box::new(value)),
+        ])
+    }
+}
+
+impl<T> HksBinding<T> {
+    pub fn closure(&self) -> &HksClosure {
+        &self.closure
+    }
+
+    pub fn into_closure(self) -> HksClosure {
+        self.closure
+    }
+}
+
+impl<T> FromHksValue for HksBinding<T> {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        Ok(Self {
+            closure: HksClosure::from_hks_value(value)?,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl<T: HksScriptType> HksScriptType for HksBinding<T> {
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Binding(Box::new(T::hks_script_type(registry)))
+    }
+}
+
 pub trait IntoHksValue {
     fn into_hks_value(self) -> Value;
 }
@@ -735,7 +799,16 @@ impl_integer_value!(u8, u16, u32, i8, i16, i32);
 
 impl IntoHksValue for () {
     fn into_hks_value(self) -> Value {
-        Value::Null
+        Value::Unit
+    }
+}
+
+impl FromHksValue for () {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::Unit => Ok(()),
+            _ => Err(NativeError::TypeMismatch("Unit")),
+        }
     }
 }
 

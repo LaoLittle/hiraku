@@ -386,6 +386,7 @@ impl MirBuilder {
     ) -> Option<VirtualRegister> {
         match expression.kind {
             HirExprKind::Literal(literal) => Some(self.constant(match literal {
+                HirLiteral::Unit => MirConstant::Unit,
                 HirLiteral::Null => MirConstant::Null,
                 HirLiteral::Ellipsis => MirConstant::Ellipsis,
                 HirLiteral::Bool(value) => MirConstant::Bool(value),

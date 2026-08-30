@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::StoredValue;
 
+/// Runtime metadata for an ordinary HKS expression captured by a declarative
+/// UI property. It is skipped by serialization; UI authors never manipulate
+/// this type or a signal handle directly.
+#[derive(Clone, Debug)]
+pub struct UiReactiveBinding {
+    pub(crate) program: hiraku_script::LinkedProgram,
+    pub(crate) closure: hiraku_script::native::HksClosure,
+    pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
+}
+
 /// A rendered declarative HKS UI root produced by `screen { ... }` or
 /// `canvas { ... }`. Whether the root is modal is decided by its mount API:
 /// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
@@ -77,6 +87,17 @@ pub enum ScreenNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    /// Static visibility used before or instead of a live visibility binding.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Optional live Bool signal controlling whether this node participates in rendering/layout.
+    #[serde(default)]
+    pub visible_binding: Option<String>,
+    #[serde(skip)]
+    pub reactive_visibility: Option<UiReactiveBinding>,
+    /// Optional engine-owned entrance/timeline animation specification.
+    #[serde(default)]
+    pub animation: Option<crate::script::AnimationSpec>,
     /// Fixed width in logical pixels.
     #[serde(default)]
     pub width: Option<f32>,
@@ -127,6 +148,8 @@ pub struct TextNode {
     /// during component evaluation; unresolved fields are read from UiSignals.
     #[serde(default)]
     pub binding: Option<String>,
+    #[serde(skip)]
+    pub reactive_text: Option<UiReactiveBinding>,
     /// Font size in logical pixels.
     #[serde(default = "default_text_size")]
     pub size: f32,
@@ -141,20 +164,82 @@ pub struct TextNode {
     pub layout: ScreenLayout,
 }
 
-/// Engine- and game-provided string signals consumed by live HKS UI bindings.
+/// A typed value published to declarative HKS UI.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiSignalValue {
+    Bool(bool),
+    Number(f64),
+    String(String),
+}
+
+impl From<bool> for UiSignalValue {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
+    }
+}
+
+macro_rules! impl_number_signal {
+    ($($type:ty),* $(,)?) => {$(
+        impl From<$type> for UiSignalValue {
+            fn from(value: $type) -> Self {
+                Self::Number(value as f64)
+            }
+        }
+    )*};
+}
+
+impl_number_signal!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+
+impl From<String> for UiSignalValue {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for UiSignalValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl UiSignalValue {
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Number(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn display(&self) -> String {
+        match self {
+            Self::Bool(value) => value.to_string(),
+            Self::Number(value) => value.to_string(),
+            Self::String(value) => value.clone(),
+        }
+    }
+}
+
+/// Engine- and game-provided typed signals consumed by live HKS UI bindings.
 ///
 /// This resource is intentionally generic: embedding applications can publish
 /// values without registering new UI native functions or exposing ECS to HKS.
 #[derive(Resource, Default)]
 pub struct UiSignals {
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, UiSignalValue>,
     revision: u64,
 }
 
 impl UiSignals {
-    pub fn set(&mut self, name: impl Into<String>, value: impl ToString) {
+    pub fn set(&mut self, name: impl Into<String>, value: impl Into<UiSignalValue>) {
         let name = name.into();
-        let value = value.to_string();
+        let value = value.into();
         if self.values.get(&name) == Some(&value) {
             return;
         }
@@ -174,12 +259,18 @@ impl UiSignals {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.values.get(name).map(String::as_str)
+    pub fn get(&self, name: &str) -> Option<&UiSignalValue> {
+        self.values.get(name)
     }
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = (&str, &UiSignalValue)> {
+        self.values
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
     }
 }
 
@@ -188,6 +279,58 @@ impl UiSignals {
 pub(crate) struct UiTextBinding {
     pub(crate) template: String,
     pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiVisibilityBinding {
+    pub(crate) signal: String,
+    pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiEnabledBinding {
+    pub(crate) signal: String,
+    pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiProgressBinding {
+    pub(crate) signal: String,
+    pub(crate) min: f32,
+    pub(crate) max: f32,
+    pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiReactiveTextBinding {
+    pub(crate) expression: UiReactiveBinding,
+    pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiReactiveVisibilityBinding {
+    pub(crate) expression: UiReactiveBinding,
+    pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiReactiveEnabledBinding {
+    pub(crate) expression: UiReactiveBinding,
+    pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiReactiveProgressBinding {
+    pub(crate) expression: UiReactiveBinding,
+    pub(crate) min: f32,
+    pub(crate) max: f32,
+    pub(crate) rendered_revision: u64,
+}
+
+#[derive(Component)]
+pub(crate) struct UiAnimationPlayer {
+    pub(crate) spec: crate::script::AnimationSpec,
+    pub(crate) elapsed: f32,
 }
 
 /// A clickable text button in an HKS screen.
@@ -218,6 +361,10 @@ pub struct ButtonNode {
     /// Ren'Py's `insensitive` state.
     #[serde(default = "default_button_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub enabled_binding: Option<String>,
+    #[serde(skip)]
+    pub reactive_enabled: Option<UiReactiveBinding>,
     /// Label font size in logical pixels.
     #[serde(default = "default_button_size")]
     pub size: f32,
@@ -297,6 +444,10 @@ pub struct ScreenImageButtonNode {
     /// Whether the button can be pressed.
     #[serde(default = "default_button_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub enabled_binding: Option<String>,
+    #[serde(skip)]
+    pub reactive_enabled: Option<UiReactiveBinding>,
     /// Whether a disabled button still displays its hover artwork.
     #[serde(default)]
     pub hovered_when_disabled: bool,
@@ -310,6 +461,10 @@ pub struct ScreenImageButtonNode {
 pub struct BarNode {
     /// Current value.
     pub value: f32,
+    #[serde(default)]
+    pub binding: Option<String>,
+    #[serde(skip)]
+    pub reactive_value: Option<UiReactiveBinding>,
     /// Minimum value.
     #[serde(default)]
     pub min: f32,
@@ -331,6 +486,8 @@ pub struct BarNode {
     /// Border color.
     #[serde(default)]
     pub border: Option<[f32; 4]>,
+    #[serde(default)]
+    pub layout: ScreenLayout,
 }
 
 /// A flex container used by `vbox`, `hbox`, and `frame` HKS nodes.
@@ -371,6 +528,8 @@ pub struct SpacerNode {
     /// Height in logical pixels.
     #[serde(default)]
     pub height: f32,
+    #[serde(default)]
+    pub layout: ScreenLayout,
 }
 
 /// Runtime state for modal declarative HKS screens.

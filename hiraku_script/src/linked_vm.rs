@@ -157,6 +157,30 @@ impl LinkedVm {
         Ok(())
     }
 
+    /// Replaces the globals of the currently executing frame by symbol name.
+    /// Embeddings use this to evaluate a saved closure against a newer model.
+    pub fn set_current_globals(
+        &mut self,
+        values: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<(), LinkedVmError> {
+        let (_, vm) = self.frames.last_mut().ok_or(LinkedVmError::NoFrame)?;
+        let globals = vm
+            .bytecode()
+            .globals
+            .iter()
+            .map(|symbol| {
+                vm.bytecode()
+                    .symbols
+                    .resolve(*symbol)
+                    .and_then(|name| values.get(name))
+                    .cloned()
+                    .unwrap_or(Value::Uninitialized)
+            })
+            .collect();
+        vm.set_global_values(globals)?;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> LinkedVmSnapshot {
         LinkedVmSnapshot {
             modules: self

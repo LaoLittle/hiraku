@@ -16,7 +16,19 @@ impl UiContext {
     }
 
     pub fn story_value(&self, key: &str) -> Option<&StoredValue> {
-        self.story.get(key)
+        let mut segments = key.split('.');
+        let mut value = self.story.get(segments.next()?)?;
+        for segment in segments {
+            let StoredValue::Map(fields) = value else {
+                return None;
+            };
+            value = fields.get(segment)?;
+        }
+        Some(value)
+    }
+
+    pub(crate) fn story_values(&self) -> &BTreeMap<String, StoredValue> {
+        &self.story
     }
 
     pub(crate) fn expand(&self, input: &str) -> Result<String, UiContextError> {

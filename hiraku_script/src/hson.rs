@@ -1125,6 +1125,17 @@ mod tests {
     }
 
     #[test]
+    fn runtime_unit_and_null_remain_distinct_when_serialized() {
+        for value in [crate::Value::Unit, crate::Value::Null] {
+            let source = to_string(&value).expect("runtime value should serialize");
+            assert_eq!(
+                from_str::<crate::Value>(&source).expect("runtime value should deserialize"),
+                value
+            );
+        }
+    }
+
+    #[test]
     fn square_brackets_are_hson_lists() {
         assert_eq!(
             parse("[1, 2, 3]").expect("list must parse"),

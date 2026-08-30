@@ -10,6 +10,7 @@ use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, ren
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::script::animation::{AnimationSpec, register_animation_api};
 use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
@@ -188,6 +189,8 @@ fn registry() -> NativeRegistry<CharacterContext> {
         .expect("CameraEase API registration must be internally consistent");
     CameraProjection::register_hks(&mut registry)
         .expect("CameraProjection API registration must be internally consistent");
+    register_animation_api(&mut registry)
+        .expect("animation API registration must be internally consistent");
     registry
         .define_global(
             "settings",
@@ -1039,6 +1042,29 @@ mod native_api {
         Ok(CameraHandle(handle))
     }
 
+    #[hks(name = "animation", receiver)]
+    fn native_camera_animation(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        animation: AnimationSpec,
+    ) -> Result<CameraHandle, NativeError> {
+        if animation.repeats() {
+            return Err(NativeError::message(
+                "camera command animations must complete; repeatForever is only valid for persistent timelines",
+            ));
+        }
+        let pending = context.camera_mut(handle)?;
+        pending.duration_ms = (animation.duration() * 1000.0).round() as u64;
+        pending.ease = match animation {
+            AnimationSpec::Linear(..) => "linear",
+            AnimationSpec::EaseIn(..) => "easeIn",
+            AnimationSpec::EaseOut(..) => "easeOut",
+            AnimationSpec::EaseInOut(..) => "easeInOut",
+        }
+        .to_string();
+        Ok(CameraHandle(handle))
+    }
+
     #[hks]
     pub(super) fn native_narrate(
         context: &mut CharacterContext,
@@ -1105,7 +1131,7 @@ mod native_api {
         } else {
             native_say(context, speaker, text.clone())?;
         }
-        Ok(Value::Null)
+        Ok(Value::Unit)
     }
 
     #[hks]
@@ -1278,5 +1304,14 @@ not_actor.at(.left)"#,
                 text: "orphan".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn camera_consumes_the_shared_animation_spec() {
+        compile_story_bytecode(
+            "animation.hks",
+            "camera().zoom(1.2).animation(.easeInOut(0.5))",
+        )
+        .expect("camera animation spec should type-check");
     }
 }

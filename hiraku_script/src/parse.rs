@@ -56,6 +56,7 @@ enum TokenKind {
     Minus,
     Star,
     Slash,
+    Dollar,
     LParen,
     RParen,
     LBrace,
@@ -133,6 +134,7 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Plus => TokenKind::Plus,
                 RawToken::Star => TokenKind::Star,
                 RawToken::Slash => TokenKind::Slash,
+                RawToken::Dollar => TokenKind::Dollar,
                 RawToken::Question => TokenKind::Question,
                 RawToken::Bang => TokenKind::Bang,
                 RawToken::Lt => TokenKind::Lt,
@@ -680,12 +682,16 @@ impl Parser {
                     span: token.span,
                 };
             };
-            if name == "List" && self.at(TokenKind::Lt) {
+            if (name == "List" || name == "Binding") && self.at(TokenKind::Lt) {
                 self.advance();
                 let element = self.parse_type();
-                let end = self.expect(TokenKind::Gt, "expected `>` after List element type");
+                let end = self.expect(TokenKind::Gt, "expected `>` after generic element type");
                 TypeExpr {
-                    kind: TypeExprKind::List(Box::new(element)),
+                    kind: if name == "List" {
+                        TypeExprKind::List(Box::new(element))
+                    } else {
+                        TypeExprKind::Binding(Box::new(element))
+                    },
                     span: Span::join(&token.span, &end.span),
                 }
             } else {
@@ -944,6 +950,39 @@ impl Parser {
                 kind: ExprKind::String(value),
                 span: token.span,
             },
+            TokenKind::Dollar => {
+                let value = if self.at(TokenKind::LBrace) {
+                    self.advance();
+                    let value = self.parse_expression();
+                    let end = self
+                        .expect(TokenKind::RBrace, "expected `}` after binding expression")
+                        .span;
+                    let span = Span::join(&token.span, &end);
+                    return Expr {
+                        kind: ExprKind::Binding(Box::new(value)),
+                        span,
+                    };
+                } else {
+                    let ident = self.advance();
+                    match ident.kind {
+                        TokenKind::Ident(name) => Expr {
+                            kind: ExprKind::Ident(name),
+                            span: ident.span,
+                        },
+                        _ => {
+                            return self.bad_expression(
+                                ident.span,
+                                "expected an identifier or `{` after `$`",
+                            );
+                        }
+                    }
+                };
+                let span = Span::join(&token.span, &value.span);
+                Expr {
+                    kind: ExprKind::Binding(Box::new(value)),
+                    span,
+                }
+            }
             TokenKind::Minus => {
                 let value = self.parse_primary();
                 let span = Span::join(&token.span, &value.span);
@@ -1010,7 +1049,7 @@ impl Parser {
         if self.at(TokenKind::RParen) {
             let end = self.advance().span.end;
             return Expr {
-                kind: ExprKind::Tuple(values),
+                kind: ExprKind::Unit,
                 span: Span { start, end },
             };
         }
@@ -1198,6 +1237,12 @@ mod tests {
             panic!("expected one expression");
         };
         expression.clone()
+    }
+
+    #[test]
+    fn parses_unit_literal_separately_from_tuples() {
+        assert_eq!(expression("()").kind, ExprKind::Unit);
+        assert!(matches!(expression("(1, 2)").kind, ExprKind::Tuple(values) if values.len() == 2));
     }
 
     #[test]
@@ -1566,5 +1611,22 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_explicit_binding_shorthand_and_expression_forms() {
+        let program =
+            parse_program("let name = \"alice\"\nobserve($name)\nobserve(${name == \"alice\"})")
+                .expect("binding syntax parses");
+        for statement in &program.statements[1..] {
+            let Stmt::Expr(Expr {
+                kind: ExprKind::Call { arguments, .. },
+                ..
+            }) = statement
+            else {
+                panic!("expected call statement")
+            };
+            assert!(matches!(arguments[0].value.kind, ExprKind::Binding(_)));
+        }
     }
 }

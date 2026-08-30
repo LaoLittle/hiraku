@@ -660,7 +660,8 @@ fn emit_register_window(
 
 fn constant(value: MirConstant) -> Constant {
     match value {
-        MirConstant::Null | MirConstant::Unit => Constant::Null,
+        MirConstant::Null => Constant::Null,
+        MirConstant::Unit => Constant::Unit,
         MirConstant::Ellipsis => Constant::Ellipsis,
         MirConstant::Bool(value) => Constant::Bool(value),
         MirConstant::Number(value) => Constant::Number(value),
@@ -1082,7 +1083,7 @@ impl Vm {
                     let value = self.read(value)?;
                     let statement = match (string, emit_value, value) {
                         (true, _, Value::String(value)) => StatementValue::String(value.clone()),
-                        (_, true, Value::Null) | (_, false, _) => StatementValue::Commit,
+                        (_, true, Value::Unit) | (_, false, _) => StatementValue::Commit,
                         (_, true, _) => StatementValue::Value(value.clone()),
                     };
                     return Ok(Some(VmEvent::Statement(statement)));
@@ -1102,7 +1103,7 @@ impl Vm {
                     let value = value
                         .map(|register| self.read(register).cloned())
                         .transpose()?
-                        .unwrap_or(Value::Null);
+                        .unwrap_or(Value::Unit);
                     if self.call_stack.is_empty() {
                         self.status = VmStatus::Completed;
                         return Ok(Some(VmEvent::Completed(value)));
@@ -1111,7 +1112,7 @@ impl Vm {
                 }
                 Instruction::Halt => {
                     self.status = VmStatus::Completed;
-                    return Ok(Some(VmEvent::Completed(Value::Null)));
+                    return Ok(Some(VmEvent::Completed(Value::Unit)));
                 }
             }
         }
@@ -1194,6 +1195,10 @@ impl Vm {
         self.status
     }
 
+    pub fn bytecode(&self) -> &Bytecode {
+        &self.bytecode
+    }
+
     pub fn global(&self, name: &str) -> Option<&Value> {
         self.bytecode
             .globals
@@ -1235,7 +1240,8 @@ impl Vm {
 
     fn constant_value(&self, value: Constant) -> Result<Value, VmError> {
         Ok(match value {
-            Constant::Null | Constant::Unit => Value::Null,
+            Constant::Null => Value::Null,
+            Constant::Unit => Value::Unit,
             Constant::Ellipsis => Value::Ellipsis,
             Constant::Bool(value) => Value::Bool(value),
             Constant::Number(value) => Value::Number(value),
@@ -1507,6 +1513,41 @@ mod tests {
     }
 
     #[test]
+    fn unit_literal_remains_distinct_from_null_through_snapshot_restore() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile("fn noop() -> Unit { () }\nnoop()", &manifest);
+        assert!(
+            bytecode.functions[0]
+                .instructions
+                .iter()
+                .any(|instruction| {
+                    matches!(
+                        instruction,
+                        Instruction::Constant {
+                            value: Constant::Unit,
+                            ..
+                        }
+                    )
+                })
+        );
+
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        assert_eq!(
+            vm.step().expect("unit statement executes"),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        );
+        let snapshot = vm.snapshot();
+        let mut restored = Vm::restore(bytecode, snapshot).expect("unit snapshot restores");
+        loop {
+            if let Some(VmEvent::Completed(value)) = restored.step().expect("restored VM executes")
+            {
+                assert_eq!(value, Value::Unit);
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn executes_control_flow_and_recursive_member_updates() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
@@ -1652,6 +1693,47 @@ mod tests {
             }
                 if captures.contains(&Value::Number(4.0))
         ));
+    }
+
+    #[test]
+    fn embedding_reactive_parameters_capture_typed_expressions_as_closures() {
+        let builtin = BuiltinId(10);
+        let manifest = BuiltinManifest::new([("observe", builtin)]).with_type_metadata(
+            crate::SymbolManifest::default(),
+            BTreeMap::from([(
+                builtin,
+                crate::FunctionSignature {
+                    receiver: None,
+                    parameters: vec![crate::ScriptType::Binding(Box::new(
+                        crate::ScriptType::Bool,
+                    ))],
+                    result: crate::ScriptType::Unit,
+                },
+            )]),
+            Vec::new(),
+        );
+        let bytecode = compile("let health = 2\nobserve(${health > 0})", &manifest);
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        assert!(matches!(
+            vm.step().expect("local declaration executes"),
+            Some(VmEvent::Statement(StatementValue::Commit))
+        ));
+        let Some(VmEvent::Call(call)) = vm.step().expect("reactive call yields") else {
+            panic!("expected reactive native call")
+        };
+        let closure = call.arguments[0].value.clone();
+        assert!(matches!(closure, Value::Closure { .. }));
+
+        let mut binding = Vm::from_callable(bytecode, &closure, Vec::new())
+            .expect("reactive closure should be independently callable");
+        assert_eq!(
+            binding.step().expect("binding expression evaluates"),
+            Some(VmEvent::Statement(StatementValue::Value(Value::Bool(true))))
+        );
+        assert_eq!(
+            binding.step().expect("binding expression returns"),
+            Some(VmEvent::Completed(Value::Bool(true)))
+        );
     }
 
     #[test]

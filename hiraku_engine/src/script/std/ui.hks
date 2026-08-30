@@ -25,10 +25,6 @@ global fn image(path: String) -> UiNode {
     __uiImage(path)
 }
 
-global fn text(value: Any) -> UiNode {
-    __uiText(value)
-}
-
 // IDs are project-owned strings, validated and interned from glossary.hson.
 global fn term(id: String) -> UiNode {
     __uiTerm(id)

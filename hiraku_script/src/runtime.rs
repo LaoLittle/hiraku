@@ -235,6 +235,7 @@ fn hash_byte(hash: u64, byte: u8) -> u64 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    Unit,
     Null,
     Uninitialized,
     Ellipsis,

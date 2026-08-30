@@ -113,11 +113,20 @@ pub fn poll_pending_character_shows(
                     "failed to load one or more parts for character `{}`",
                     item.actor_id
                 );
-                for entity in item.entities.drain(..) {
-                    commands.entity(entity).try_despawn();
-                }
-                for id in item.entity_ids.drain(..) {
-                    stage.sprites.remove(&id);
+                for ((id, entity), newly_spawned) in item
+                    .entity_ids
+                    .drain(..)
+                    .zip(item.entities.drain(..))
+                    .zip(item.newly_spawned.drain(..))
+                {
+                    if newly_spawned {
+                        if stage.sprites.get(&id) == Some(&entity) {
+                            stage.sprites.remove(&id);
+                        }
+                        commands.entity(entity).try_despawn();
+                    } else {
+                        commands.entity(entity).try_insert(Visibility::Hidden);
+                    }
                 }
                 complete_missing_animation(&mut animations, item.animation_id.take());
                 return false;
@@ -184,24 +193,27 @@ pub fn poll_pending_character_shows(
             }
         }
 
-        for (id, entity) in outgoing {
-            if stage.sprites.get(&id) == Some(&entity) {
-                stage.sprites.remove(&id);
-            }
+        for (_id, entity) in outgoing {
             if let Some(fade) = fade {
-                commands.entity(entity).try_insert(VisualTween {
-                    from_alpha: Some(1.0),
-                    to_alpha: Some(0.0),
-                    from_translation: None,
-                    to_translation: None,
-                    from_scale: None,
-                    to_scale: None,
-                    timer: Timer::new(fade, TimerMode::Once),
-                    animation_id: None,
-                    despawn_on_finish: true,
-                });
+                commands.entity(entity).try_insert((
+                    HideAfterTween,
+                    VisualTween {
+                        from_alpha: Some(1.0),
+                        to_alpha: Some(0.0),
+                        from_translation: None,
+                        to_translation: None,
+                        from_scale: None,
+                        to_scale: None,
+                        timer: Timer::new(fade, TimerMode::Once),
+                        animation_id: None,
+                        despawn_on_finish: false,
+                    },
+                ));
             } else {
-                commands.entity(entity).try_despawn();
+                commands
+                    .entity(entity)
+                    .try_insert(Visibility::Hidden)
+                    .try_remove::<HideAfterTween>();
             }
         }
 
@@ -256,11 +268,32 @@ pub(super) fn queue_character_show(
     const DEFAULT_CHARACTER_FADE: std::time::Duration = std::time::Duration::from_millis(120);
 
     let fade = fade.or(Some(DEFAULT_CHARACTER_FADE));
-    let prefix = character_part_prefix(&actor_id);
+    let root = stage
+        .character_roots
+        .get(&actor_id)
+        .copied()
+        .unwrap_or_else(|| {
+            let root = commands
+                .spawn((
+                    CharacterRoot {
+                        actor_id: actor_id.clone(),
+                    },
+                    Transform::default(),
+                    Visibility::Inherited,
+                ))
+                .id();
+            stage.character_roots.insert(actor_id.clone(), root);
+            root
+        });
     let desired_ids = parts
         .iter()
         .map(|part| character_part_id(&actor_id, part))
         .collect::<HashSet<_>>();
+    let active_ids = stage
+        .character_active_parts
+        .get(&actor_id)
+        .cloned()
+        .unwrap_or_default();
 
     // A previous statement can still be waiting for its images. Retain only
     // parts that are also present in the newly committed actor state.
@@ -275,10 +308,15 @@ pub(super) fn queue_character_show(
             let id = item.entity_ids.remove(index);
             let entity = item.entities.remove(index);
             item.handles.remove(index);
-            if stage.sprites.get(&id) == Some(&entity) {
-                stage.sprites.remove(&id);
+            let newly_spawned = item.newly_spawned.remove(index);
+            if newly_spawned {
+                if stage.sprites.get(&id) == Some(&entity) {
+                    stage.sprites.remove(&id);
+                }
+                commands.entity(entity).try_despawn();
+            } else {
+                commands.entity(entity).try_insert(Visibility::Hidden);
             }
-            commands.entity(entity).try_despawn();
         }
         if item.entities.is_empty() {
             complete_missing_animation(animations, item.animation_id.take());
@@ -288,12 +326,7 @@ pub(super) fn queue_character_show(
         }
     });
 
-    let existing_ids = stage
-        .sprites
-        .keys()
-        .filter(|id| id.starts_with(&prefix))
-        .cloned()
-        .collect::<Vec<_>>();
+    let existing_ids = active_ids.iter().cloned().collect::<Vec<_>>();
     let new_part_count = parts
         .iter()
         .filter(|part| {
@@ -318,29 +351,33 @@ pub(super) fn queue_character_show(
             outgoing.push((id, entity));
             continue;
         }
-        stage.sprites.remove(&id);
-        commands.entity(entity).try_insert(VisualTween {
-            from_alpha: Some(1.0),
-            to_alpha: Some(0.0),
-            from_translation: None,
-            to_translation: None,
-            from_scale: None,
-            to_scale: None,
-            timer: Timer::new(fade.expect("character fade is always set"), TimerMode::Once),
-            animation_id: (new_part_count == 0)
-                .then(|| pending_animation.take())
-                .flatten(),
-            despawn_on_finish: true,
-        });
+        commands.entity(entity).try_insert((
+            HideAfterTween,
+            VisualTween {
+                from_alpha: Some(1.0),
+                to_alpha: Some(0.0),
+                from_translation: None,
+                to_translation: None,
+                from_scale: None,
+                to_scale: None,
+                timer: Timer::new(fade.expect("character fade is always set"), TimerMode::Once),
+                animation_id: (new_part_count == 0)
+                    .then(|| pending_animation.take())
+                    .flatten(),
+                despawn_on_finish: false,
+            },
+        ));
     }
 
     let mut entities = Vec::new();
     let mut entity_ids = Vec::new();
     let mut handles = Vec::new();
+    let mut newly_spawned = Vec::new();
 
     for part in &parts {
         let sprite_id = character_part_id(&actor_id, part);
         if let Some(entity) = stage.sprites.get(&sprite_id).copied() {
+            commands.entity(root).add_child(entity);
             let mut entity_commands = commands.entity(entity);
             entity_commands.try_insert(Transform {
                 translation: Vec3::new(
@@ -357,6 +394,14 @@ pub(super) fn queue_character_show(
                 entity_commands.try_remove::<FocusedActorPart>();
                 entity_commands.try_insert(scene_layer());
             }
+            if active_ids.contains(&sprite_id) {
+                continue;
+            }
+            entity_commands.try_remove::<HideAfterTween>();
+            entities.push(entity);
+            entity_ids.push(sprite_id);
+            handles.push(asset_server.load(part.path.clone()));
+            newly_spawned.push(false);
             continue;
         }
         let transform = Transform {
@@ -494,6 +539,7 @@ pub(super) fn queue_character_show(
         };
 
         stage.sprites.insert(sprite_id.clone(), entity);
+        commands.entity(root).add_child(entity);
         if focused {
             commands
                 .entity(entity)
@@ -504,18 +550,24 @@ pub(super) fn queue_character_show(
         entities.push(entity);
         entity_ids.push(sprite_id);
         handles.push(handle);
+        newly_spawned.push(true);
     }
 
     if entities.is_empty() {
+        stage.character_active_parts.insert(actor_id, desired_ids);
         complete_missing_animation(animations, pending_animation);
         return;
     }
 
+    stage
+        .character_active_parts
+        .insert(actor_id.clone(), desired_ids);
     pending.items.push(PendingCharacterShow {
         actor_id,
         entity_ids,
         entities,
         handles,
+        newly_spawned,
         outgoing,
         fade,
         animation_id: pending_animation,
@@ -756,10 +808,12 @@ pub(super) fn despawn_character_actor(
         .cloned()
         .collect::<Vec<_>>();
     for id in ids {
-        if let Some(entity) = stage.sprites.remove(&id) {
-            commands.entity(entity).try_despawn();
-        }
+        stage.sprites.remove(&id);
     }
+    if let Some(root) = stage.character_roots.remove(actor_id) {
+        commands.entity(root).try_despawn();
+    }
+    stage.character_active_parts.remove(actor_id);
 }
 
 pub(super) fn character_part_prefix(actor_id: &str) -> String {
@@ -787,4 +841,48 @@ pub(super) fn source_rect_from_corners(rect: [f32; 4]) -> [f32; 4] {
 
 pub(super) fn source_rect_to_corners(rect: [f32; 4]) -> [f32; 4] {
     [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faded_character_parts_are_hidden_and_retained_for_reuse() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .init_resource::<AnimationState>()
+            .init_resource::<Assets<AlphaMaskMaterial>>()
+            .init_resource::<Assets<MultiplyMaterial>>()
+            .add_systems(Update, animate_visual_tweens);
+        let entity = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                Visibility::Visible,
+                HideAfterTween,
+                VisualTween {
+                    from_alpha: None,
+                    to_alpha: None,
+                    from_translation: None,
+                    to_translation: None,
+                    from_scale: None,
+                    to_scale: None,
+                    timer: Timer::from_seconds(0.0, TimerMode::Once),
+                    animation_id: None,
+                    despawn_on_finish: false,
+                },
+            ))
+            .id();
+
+        app.update();
+
+        assert!(app.world().get_entity(entity).is_ok());
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Hidden)
+        );
+        assert!(app.world().get::<VisualTween>(entity).is_none());
+        assert!(app.world().get::<HideAfterTween>(entity).is_none());
+    }
 }

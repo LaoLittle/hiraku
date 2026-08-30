@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use hiraku_script::native::{FromHksValue, HksClosure, IntoHksValue, NativeError, NativeRegistry};
+use hiraku_script::native::{
+    FromHksValue, HksBindable, HksBinding, HksClosure, IntoHksValue, NativeError, NativeRegistry,
+};
 use hiraku_script::{
-    BuiltinManifest, LinkedVm, LinkedVmEvent, ModuleId, RenderOptions, SourceMap, StatementValue,
-    Value, compile_with_manifest, link_named_modules, parse_program, render_diagnostics,
+    BuiltinManifest, LinkedVm, LinkedVmEvent, ModuleId, RenderOptions, ScriptType, SourceMap,
+    StatementValue, Value, compile_with_manifest, link_named_modules, parse_program,
+    render_diagnostics,
 };
 use thiserror::Error;
 
@@ -12,25 +15,23 @@ use crate::{
     state::StoredValue,
     texture::TextureCatalog,
     ui::{
-        ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
-        ScreenNode, ScreenSpec, ScreenTexture, SpacerNode, TextNode,
+        BarNode, ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
+        ScreenNode, ScreenSpec, ScreenTexture, SpacerNode, TextNode, UiReactiveBinding,
     },
 };
 
-use super::ui_runtime::UiContext;
+use super::{
+    animation::{AnimationSpec, register_animation_api},
+    ui_runtime::UiContext,
+};
 
 const UI_NODE_HANDLE_TYPE: u32 = 0x5549_4e4f;
-const UI_TEXT_BINDING_HANDLE_TYPE: u32 = 0x5549_424e;
 const UI_STDLIB_PATH: &str = "hiraku://std/ui.hks";
 const UI_STDLIB_SOURCE: &str = include_str!("std/ui.hks");
 
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "UiNode", handle_type = UI_NODE_HANDLE_TYPE)]
 struct UiNodeHandle(u64);
-
-#[derive(Clone, Copy, hiraku_script::HksHandle)]
-#[hks(name = "UiTextBinding", handle_type = UI_TEXT_BINDING_HANDLE_TYPE)]
-struct UiTextBindingHandle(u64);
 
 hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,12 +65,14 @@ enum UiDraftKind {
     Column,
     Row,
     Image(String),
-    Text {
-        text: String,
-        binding: Option<String>,
-    },
+    Text(HksBindable<String>),
     Term(TermId),
     Button(Value),
+    Progress {
+        value: HksBindable<f64>,
+        min: f32,
+        max: f32,
+    },
     Spacer,
 }
 
@@ -81,10 +84,14 @@ struct UiDraft {
     layout: ScreenLayout,
     panel: bool,
     enabled: bool,
+    enabled_binding: Option<HksBinding<bool>>,
+    visible: bool,
+    visible_binding: Option<HksBinding<bool>>,
     hovered_when_disabled: bool,
     gap: f32,
     background_texture: Option<String>,
     overlay: Option<[f32; 4]>,
+    animation: Option<AnimationSpec>,
 }
 
 impl UiDraft {
@@ -96,10 +103,14 @@ impl UiDraft {
             layout: ScreenLayout::default(),
             panel: true,
             enabled: true,
+            enabled_binding: None,
+            visible: true,
+            visible_binding: None,
             hovered_when_disabled: false,
             gap: 12.0,
             background_texture: None,
             overlay: None,
+            animation: None,
         }
     }
 }
@@ -109,7 +120,6 @@ struct UiVmContext {
     terms: TermCatalog,
     next_node: u64,
     nodes: BTreeMap<u64, UiDraft>,
-    bindings: BTreeMap<u64, String>,
 }
 
 impl UiVmContext {
@@ -119,7 +129,6 @@ impl UiVmContext {
             terms,
             next_node: 0,
             nodes: BTreeMap::new(),
-            bindings: BTreeMap::new(),
         }
     }
 
@@ -133,29 +142,6 @@ impl UiVmContext {
         self.nodes
             .get_mut(&handle.0)
             .ok_or_else(|| NativeError::message(format!("unknown UiNode handle {}", handle.0)))
-    }
-
-    fn insert_binding(&mut self, template: String) -> UiTextBindingHandle {
-        self.next_node += 1;
-        self.bindings.insert(self.next_node, template);
-        UiTextBindingHandle(self.next_node)
-    }
-}
-
-#[hiraku_script::hks_module("ui")]
-mod reactive_ui {
-    use super::*;
-
-    #[hks]
-    fn native_bind(
-        context: &mut UiVmContext,
-        template: String,
-    ) -> Result<UiTextBindingHandle, NativeError> {
-        let template = context
-            .values
-            .expand_binding(&template)
-            .map_err(|error| NativeError::message(error.to_string()))?;
-        Ok(context.insert_binding(template))
     }
 }
 
@@ -189,25 +175,12 @@ mod native_ui {
         Ok(context.insert(UiDraft::new(UiDraftKind::Image(path), None)))
     }
 
-    #[hks(name = "__uiText")]
-    fn ui_text(context: &mut UiVmContext, value: Value) -> Result<UiNodeHandle, NativeError> {
-        let (text, binding) = match value {
-            Value::String(value) => (
-                context
-                    .values
-                    .expand(&value)
-                    .map_err(|error| NativeError::message(error.to_string()))?,
-                None,
-            ),
-            value => {
-                let binding = UiTextBindingHandle::from_hks_value(&value)?;
-                let template = context.bindings.get(&binding.0).cloned().ok_or_else(|| {
-                    NativeError::message(format!("unknown UI text binding {}", binding.0))
-                })?;
-                (template.clone(), Some(template))
-            }
-        };
-        Ok(context.insert(UiDraft::new(UiDraftKind::Text { text, binding }, None)))
+    #[hks(name = "text")]
+    fn ui_text(
+        context: &mut UiVmContext,
+        value: HksBindable<String>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        Ok(context.insert(UiDraft::new(UiDraftKind::Text(value), None)))
     }
 
     #[hks(name = "__uiTerm")]
@@ -231,6 +204,21 @@ mod native_ui {
     #[hks(name = "__uiSpacer")]
     fn ui_spacer(context: &mut UiVmContext) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Spacer, None)))
+    }
+
+    #[hks(name = "progress")]
+    fn ui_progress(
+        context: &mut UiVmContext,
+        value: HksBindable<f64>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        Ok(context.insert(UiDraft::new(
+            UiDraftKind::Progress {
+                value,
+                min: 0.0,
+                max: 1.0,
+            },
+            None,
+        )))
     }
 
     #[hks(name = "at", receiver)]
@@ -325,9 +313,58 @@ mod native_ui {
     fn ui_enabled(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        enabled: bool,
+        enabled: HksBindable<bool>,
     ) -> Result<UiNodeHandle, NativeError> {
-        context.node_mut(node)?.enabled = enabled;
+        match enabled {
+            HksBindable::Value(enabled) => context.node_mut(node)?.enabled = enabled,
+            HksBindable::Binding(enabled) => {
+                context.node_mut(node)?.enabled_binding = Some(enabled)
+            }
+        }
+        Ok(node)
+    }
+
+    #[hks(name = "visible", receiver)]
+    fn ui_visible(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        visible: HksBindable<bool>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        match visible {
+            HksBindable::Value(visible) => context.node_mut(node)?.visible = visible,
+            HksBindable::Binding(visible) => {
+                context.node_mut(node)?.visible_binding = Some(visible)
+            }
+        }
+        Ok(node)
+    }
+
+    #[hks(name = "range", receiver)]
+    fn ui_range(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        min: f64,
+        max: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let min = finite_f32(min, "progress minimum")?;
+        let max = finite_f32(max, "progress maximum")?;
+        if max <= min {
+            return Err(NativeError::message(
+                "progress maximum must be greater than its minimum",
+            ));
+        }
+        let UiDraftKind::Progress {
+            min: draft_min,
+            max: draft_max,
+            ..
+        } = &mut context.node_mut(node)?.kind
+        else {
+            return Err(NativeError::message(
+                "range is only valid on progress nodes",
+            ));
+        };
+        *draft_min = min;
+        *draft_max = max;
         Ok(node)
     }
 
@@ -348,6 +385,21 @@ mod native_ui {
         content: HksClosure,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.hovered = Some(content);
+        Ok(node)
+    }
+
+    #[hks(name = "animation", receiver)]
+    fn ui_animation(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        animation: AnimationSpec,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if !animation.duration().is_finite() || animation.duration() <= 0.0 {
+            return Err(NativeError::message(
+                "UI animation duration must be greater than zero",
+            ));
+        }
+        context.node_mut(node)?.animation = Some(animation);
         Ok(node)
     }
 }
@@ -386,18 +438,59 @@ fn color_component(value: f64) -> Result<f32, NativeError> {
     Ok(value as f32)
 }
 
-fn ui_registry() -> NativeRegistry<UiVmContext> {
+fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     let mut registry = NativeRegistry::new();
     UiPosition::register_hks(&mut registry)
         .expect("UiPosition registration must be internally consistent");
     UiSize::register_hks(&mut registry).expect("UiSize registration must be internally consistent");
+    register_animation_api(&mut registry)
+        .expect("animation API registration must be internally consistent");
     // Register the nominal result type before compiling the HKS standard library.
     registry.define_type("UiNode");
     native_ui::register_hks(&mut registry)
         .expect("UI native primitives must be internally consistent");
-    reactive_ui::register_hks(&mut registry)
-        .expect("reactive UI API registration must be internally consistent");
     registry
+        .define_global(
+            "time",
+            ScriptType::Record(BTreeMap::from([
+                ("elapsedSeconds".to_string(), ScriptType::Number),
+                ("unixSeconds".to_string(), ScriptType::Number),
+            ])),
+        )
+        .expect("built-in UI time model must be defined once");
+    for (name, value) in values.story_values() {
+        if name == "time" {
+            continue;
+        }
+        registry
+            .define_global(name, stored_value_type(value))
+            .expect("UI context keys must be unique");
+    }
+    registry
+}
+
+fn stored_value_type(value: &StoredValue) -> ScriptType {
+    match value {
+        StoredValue::Bool(_) => ScriptType::Bool,
+        StoredValue::Int(_) | StoredValue::Float(_) => ScriptType::Number,
+        StoredValue::String(_) => ScriptType::String,
+        StoredValue::Array(values) => {
+            let mut types = values.iter().map(stored_value_type);
+            let first = types.next().unwrap_or(ScriptType::Any);
+            let element = if types.all(|ty| ty == first) {
+                first
+            } else {
+                ScriptType::Any
+            };
+            ScriptType::List(Box::new(element))
+        }
+        StoredValue::Map(values) => ScriptType::Record(
+            values
+                .iter()
+                .map(|(name, value)| (name.clone(), stored_value_type(value)))
+                .collect(),
+        ),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -419,7 +512,7 @@ pub fn evaluate_ui_component_named(
     textures: &TextureCatalog,
     terms: &TermCatalog,
 ) -> Result<ScreenSpec, UiVmError> {
-    let registry = ui_registry();
+    let registry = ui_registry(&values);
     let manifest = registry.manifest();
     let standard = compile_module(UI_STDLIB_PATH, UI_STDLIB_SOURCE, &manifest)?;
     let document = compile_module(path, source, &manifest)?;
@@ -568,6 +661,133 @@ fn closure_children(
     collect_nodes(vm, registry, context)
 }
 
+fn context_globals(context: &UiVmContext) -> BTreeMap<String, Value> {
+    let mut globals = context
+        .values
+        .story_values()
+        .iter()
+        .map(|(name, value)| (name.clone(), stored_to_hks(value)))
+        .collect::<BTreeMap<_, _>>();
+    globals.insert(
+        "time".to_string(),
+        Value::Map(BTreeMap::from([
+            ("elapsedSeconds".to_string(), Value::Number(0.0)),
+            ("unixSeconds".to_string(), Value::Number(0.0)),
+        ])),
+    );
+    globals
+}
+
+fn stored_to_hks(value: &StoredValue) -> Value {
+    match value {
+        StoredValue::Bool(value) => Value::Bool(*value),
+        StoredValue::Int(value) => Value::Number(*value as f64),
+        StoredValue::Float(value) => Value::Number(*value),
+        StoredValue::String(value) => Value::String(value.clone()),
+        StoredValue::Array(values) => Value::List(values.iter().map(stored_to_hks).collect()),
+        StoredValue::Map(values) => Value::Map(
+            values
+                .iter()
+                .map(|(name, value)| (name.clone(), stored_to_hks(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn reactive_binding<T>(
+    binding: &HksBinding<T>,
+    program: &hiraku_script::LinkedProgram,
+    context: &UiVmContext,
+) -> UiReactiveBinding {
+    UiReactiveBinding {
+        program: program.clone(),
+        closure: binding.closure().clone(),
+        globals: context_globals(context),
+    }
+}
+
+fn evaluate_binding_value(
+    binding: &UiReactiveBinding,
+    registry: &NativeRegistry<UiVmContext>,
+    context: &mut UiVmContext,
+) -> Result<Value, UiVmError> {
+    let callable = binding.closure.clone().into_hks_value();
+    let mut vm = LinkedVm::from_callable(binding.program.clone(), &callable, Vec::new())
+        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    vm.set_current_globals(&binding.globals)
+        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    loop {
+        match vm
+            .step()
+            .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?
+        {
+            Some(LinkedVmEvent::Call(call)) => {
+                let value = registry
+                    .call(context, &call)
+                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+                vm.resume(value)
+                    .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+            }
+            Some(LinkedVmEvent::Completed(value)) => return Ok(value),
+            Some(LinkedVmEvent::Statement(_)) => {}
+            None => {
+                return Err(UiVmError::Runtime(
+                    "reactive UI expression stopped without returning a value".into(),
+                ));
+            }
+        }
+    }
+}
+
+pub(crate) fn evaluate_ui_reactive_binding(
+    binding: &UiReactiveBinding,
+    signals: &crate::ui::UiSignals,
+) -> Result<Value, UiVmError> {
+    let mut binding = binding.clone();
+    for (path, value) in signals.values() {
+        let value = match value {
+            crate::ui::UiSignalValue::Bool(value) => Value::Bool(*value),
+            crate::ui::UiSignalValue::Number(value) => Value::Number(*value),
+            crate::ui::UiSignalValue::String(value) => Value::String(value.clone()),
+        };
+        insert_global_path(&mut binding.globals, path, value);
+    }
+    let values = UiContext::default();
+    let registry = ui_registry(&values);
+    let mut context = UiVmContext::new(values, TermCatalog::default());
+    evaluate_binding_value(&binding, &registry, &mut context)
+}
+
+fn insert_global_path(globals: &mut BTreeMap<String, Value>, path: &str, value: Value) {
+    let mut segments = path.split('.');
+    let Some(root) = segments.next() else {
+        return;
+    };
+    let rest = segments.collect::<Vec<_>>();
+    if rest.is_empty() {
+        globals.insert(root.to_string(), value);
+        return;
+    }
+    let root_value = globals
+        .entry(root.to_string())
+        .or_insert_with(|| Value::Map(BTreeMap::new()));
+    insert_member_path(root_value, &rest, value);
+}
+
+fn insert_member_path(target: &mut Value, path: &[&str], value: Value) {
+    let Value::Map(fields) = target else {
+        return;
+    };
+    if path.len() == 1 {
+        fields.insert(path[0].to_string(), value);
+        return;
+    }
+    let child = fields
+        .entry(path[0].to_string())
+        .or_insert_with(|| Value::Map(BTreeMap::new()));
+    insert_member_path(child, &path[1..], value);
+}
+
 fn materialize_screen(
     root: UiNodeHandle,
     program: &hiraku_script::LinkedProgram,
@@ -618,11 +838,21 @@ fn materialize_node(
     context: &mut UiVmContext,
     textures: &TextureCatalog,
 ) -> Result<ScreenNode, UiVmError> {
-    let draft = context
+    let mut draft = context
         .nodes
         .get(&handle.0)
         .cloned()
         .ok_or_else(|| UiVmError::Invalid(format!("unknown UiNode handle {}", handle.0)))?;
+    draft.layout.hidden = !draft.visible;
+    draft.layout.animation = draft.animation;
+    draft.layout.visible_binding = None;
+    if let Some(binding) = &draft.visible_binding {
+        let reactive = reactive_binding(binding, program, context);
+        let value = evaluate_binding_value(&reactive, registry, context)?;
+        draft.layout.hidden =
+            !bool::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?;
+        draft.layout.reactive_visibility = Some(reactive);
+    }
     match draft.kind {
         UiDraftKind::Screen => Err(UiVmError::Invalid(
             "screen nodes may only appear at the document root".into(),
@@ -631,14 +861,32 @@ fn materialize_node(
             texture: resolve_texture(textures, &path)?,
             layout: draft.layout,
         })),
-        UiDraftKind::Text { text, binding } => Ok(ScreenNode::Text(TextNode {
-            text,
-            binding,
-            size: 28.0,
-            color: None,
-            align: None,
-            layout: draft.layout,
-        })),
+        UiDraftKind::Text(binding) => {
+            let (text, reactive) = match binding {
+                HksBindable::Value(value) => (value, None),
+                HksBindable::Binding(binding) => {
+                    let reactive = reactive_binding(&binding, program, context);
+                    let value = evaluate_binding_value(&reactive, registry, context)?;
+                    let value = String::from_hks_value(&value)
+                        .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+                    (value, Some(reactive))
+                }
+            };
+            let is_template = text.contains("${");
+            let text = context
+                .values
+                .expand_binding(&text)
+                .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+            Ok(ScreenNode::Text(TextNode {
+                binding: is_template.then(|| text.clone()),
+                reactive_text: if is_template { None } else { reactive },
+                text,
+                size: 28.0,
+                color: None,
+                align: None,
+                layout: draft.layout,
+            }))
+        }
         UiDraftKind::Term(term) => {
             let definition = context
                 .terms
@@ -647,6 +895,7 @@ fn materialize_node(
             Ok(ScreenNode::Text(TextNode {
                 text: definition.name.clone(),
                 binding: None,
+                reactive_text: None,
                 size: 28.0,
                 color: None,
                 align: None,
@@ -656,7 +905,34 @@ fn materialize_node(
         UiDraftKind::Spacer => Ok(ScreenNode::Spacer(SpacerNode {
             width: draft.layout.width.unwrap_or(0.0),
             height: draft.layout.height.unwrap_or(0.0),
+            layout: draft.layout,
         })),
+        UiDraftKind::Progress { value, min, max } => {
+            let (value, reactive) = match value {
+                HksBindable::Value(value) => (value, None),
+                HksBindable::Binding(binding) => {
+                    let reactive = reactive_binding(&binding, program, context);
+                    let value = evaluate_binding_value(&reactive, registry, context)?;
+                    let value = f64::from_hks_value(&value)
+                        .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+                    (value, Some(reactive))
+                }
+            };
+            Ok(ScreenNode::Bar(BarNode {
+                value: finite_f32(value, "progress value")
+                    .map_err(|error| UiVmError::Invalid(error.to_string()))?,
+                binding: None,
+                reactive_value: reactive,
+                min,
+                max,
+                width: draft.layout.width.unwrap_or(320.0),
+                height: draft.layout.height.unwrap_or(18.0),
+                background: None,
+                fill: None,
+                border: None,
+                layout: draft.layout,
+            }))
+        }
         UiDraftKind::Column | UiDraftKind::Row => {
             let row = matches!(draft.kind, UiDraftKind::Row);
             let child_handles = closure_children(draft.content, program, registry, context)?;
@@ -681,6 +957,15 @@ fn materialize_node(
             })
         }
         UiDraftKind::Button(value) => {
+            let (enabled, reactive_enabled) = if let Some(binding) = &draft.enabled_binding {
+                let reactive = reactive_binding(binding, program, context);
+                let value = evaluate_binding_value(&reactive, registry, context)?;
+                let enabled = bool::from_hks_value(&value)
+                    .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+                (enabled, Some(reactive))
+            } else {
+                (draft.enabled, None)
+            };
             let normal_handles = closure_children(draft.content, program, registry, context)?;
             if normal_handles.len() != 1 {
                 return Err(UiVmError::Invalid(format!(
@@ -695,7 +980,9 @@ fn materialize_node(
                     text: text.text,
                     value: Some(value),
                     action: None,
-                    enabled: draft.enabled,
+                    enabled,
+                    enabled_binding: None,
+                    reactive_enabled,
                     size: text.size,
                     color: None,
                     hovered_color: None,
@@ -739,7 +1026,9 @@ fn materialize_node(
                         hovered_texture,
                         hovered_layout,
                         value,
-                        enabled: draft.enabled,
+                        enabled,
+                        enabled_binding: None,
+                        reactive_enabled,
                         hovered_when_disabled: draft.hovered_when_disabled,
                         layout: image.layout,
                     }))
@@ -802,6 +1091,14 @@ mod tests {
         ) -> Result<String, NativeError> {
             Ok(value)
         }
+
+        #[hks]
+        fn native_visible(
+            _context: &mut NamespaceTestContext,
+            _value: hiraku_script::native::HksBinding<bool>,
+        ) -> Result<(), NativeError> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -821,6 +1118,18 @@ mod tests {
             vec![hiraku_script::ScriptType::String]
         );
         assert_eq!(signature.result, hiraku_script::ScriptType::String);
+        let visible = manifest
+            .resolve_selector("ui.widgets", "visible")
+            .expect("reactive function should be namespaced");
+        assert_eq!(
+            manifest
+                .signature(visible)
+                .expect("reactive signature exists")
+                .parameters,
+            vec![hiraku_script::ScriptType::Binding(Box::new(
+                hiraku_script::ScriptType::Bool,
+            ))]
+        );
     }
 
     #[test]
@@ -884,12 +1193,34 @@ screen {
     }
 
     #[test]
+    fn ui_animation_uses_a_shared_fluent_animation_spec() {
+        let screen = evaluate_ui_component_named(
+            "memory://animated.ui.hks",
+            concat!(
+                "import ui.widgets.*\n",
+                "canvas { text(\"Pulse\").animation(.linear(2.0).repeatForever()) }",
+            ),
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("animated UI should evaluate");
+
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("canvas child should be text")
+        };
+        let animation = text.layout.animation.expect("animation is retained");
+        assert_eq!(animation.duration(), 2.0);
+        assert!(animation.repeats());
+    }
+
+    #[test]
     fn live_text_bindings_capture_story_values_and_preserve_signals() {
         let screen = evaluate_ui_component_named(
             "memory://live_overlay.ui.hks",
             concat!(
                 "import ui.widgets.*\n",
-                "canvas { text(ui.bind(\"Player ${playerName}, ${time.elapsedSeconds}s\")) }",
+                "canvas { text(\"Player ${playerName}, ${time.elapsedSeconds}s\") }",
             ),
             UiContext::new(BTreeMap::from([(
                 "playerName".to_string(),
@@ -906,6 +1237,73 @@ screen {
         assert_eq!(
             text.binding.as_deref(),
             Some("Player alice, ${time.elapsedSeconds}s")
+        );
+    }
+
+    #[test]
+    fn typed_signals_bind_visibility_buttons_and_progress() {
+        let screen = evaluate_ui_component_named(
+            "memory://typed_live.ui.hks",
+            r#"import ui.widgets.*
+canvas {
+    text(${hud.label}).visible(${hud.visible})
+    button("continue") { text("Continue") }.enabled(${hud.canContinue})
+    progress(${player.health}).range(0, 100)
+}"#,
+            UiContext::new(BTreeMap::from([
+                (
+                    "hud".to_string(),
+                    StoredValue::Map(BTreeMap::from([
+                        (
+                            "label".to_string(),
+                            StoredValue::String("Status".to_string()),
+                        ),
+                        ("visible".to_string(), StoredValue::Bool(true)),
+                        ("canContinue".to_string(), StoredValue::Bool(false)),
+                    ])),
+                ),
+                (
+                    "player".to_string(),
+                    StoredValue::Map(BTreeMap::from([(
+                        "health".to_string(),
+                        StoredValue::Float(75.0),
+                    )])),
+                ),
+            ])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("typed live bindings should evaluate");
+
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("first child should be text")
+        };
+        assert_eq!(text.text, "Status");
+        assert!(text.layout.reactive_visibility.is_some());
+        let ScreenNode::Button(button) = &screen.children[1] else {
+            panic!("second child should be a button")
+        };
+        assert!(!button.enabled);
+        assert!(button.reactive_enabled.is_some());
+        let ScreenNode::Bar(progress) = &screen.children[2] else {
+            panic!("third child should be progress")
+        };
+        assert_eq!(progress.value, 75.0);
+        assert!(progress.reactive_value.is_some());
+        assert_eq!((progress.min, progress.max), (0.0, 100.0));
+
+        let mut signals = crate::ui::UiSignals::default();
+        signals.set("player.health", 25.0);
+        assert_eq!(
+            evaluate_ui_reactive_binding(
+                progress
+                    .reactive_value
+                    .as_ref()
+                    .expect("progress expression is retained"),
+                &signals,
+            )
+            .expect("updated model should evaluate"),
+            Value::Number(25.0)
         );
     }
 

@@ -112,6 +112,7 @@ pub enum HirExprKind<'hir> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HirLiteral<'hir> {
+    Unit,
     Null,
     Ellipsis,
     Bool(bool),
@@ -642,6 +643,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn lower_expression(&mut self, expression: &Expr) -> &'hir HirExpr<'hir> {
         let (kind, ty) = match &expression.kind {
+            ExprKind::Unit => (HirExprKind::Literal(HirLiteral::Unit), ScriptType::Unit),
             ExprKind::Null => (HirExprKind::Literal(HirLiteral::Null), ScriptType::Any),
             ExprKind::Ellipsis => (HirExprKind::Literal(HirLiteral::Ellipsis), ScriptType::Any),
             ExprKind::Bool(value) => (
@@ -663,6 +665,23 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 HirExprKind::Literal(HirLiteral::String(self.arena.alloc_str(value))),
                 ScriptType::String,
             ),
+            ExprKind::Binding(value) => {
+                let value = self.lower_expression(value);
+                let result = self.expression_type(value).clone();
+                let statement = self.arena.alloc(HirStmt {
+                    kind: HirStmtKind::Expr(value),
+                    span: value.span,
+                });
+                let statements = self.arena.alloc_slice_copy(&[statement]);
+                let block = self.arena.alloc(HirBlock {
+                    statements,
+                    span: expression.span,
+                });
+                (
+                    HirExprKind::Block(block),
+                    ScriptType::Binding(Box::new(result)),
+                )
+            }
             ExprKind::Ident(name) => return self.lower_identifier(name, expression.span),
             ExprKind::Symbol(name) => {
                 let symbol = self.symbol(name);
@@ -1250,6 +1269,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             TypeExprKind::List(inner) => {
                 Some(ScriptType::List(Box::new(self.type_from_ast(inner)?)))
+            }
+            TypeExprKind::Binding(inner) => {
+                Some(ScriptType::Binding(Box::new(self.type_from_ast(inner)?)))
             }
             TypeExprKind::Record(fields) => Some(ScriptType::Record(
                 fields

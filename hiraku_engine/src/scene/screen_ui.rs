@@ -326,6 +326,7 @@ fn spawn_screen_node_entity(
         ScreenNode::Text(TextNode {
             text,
             binding,
+            reactive_text,
             size,
             color,
             align,
@@ -353,6 +354,13 @@ fn spawn_screen_node_entity(
                     rendered_revision: u64::MAX,
                 });
             }
+            if let Some(expression) = reactive_text {
+                commands.entity(entity).insert(UiReactiveTextBinding {
+                    expression: expression.clone(),
+                    rendered_revision: u64::MAX,
+                });
+            }
+            apply_live_layout_bindings(commands, entity, layout);
             entity
         }
         ScreenNode::Button(ButtonNode {
@@ -360,6 +368,8 @@ fn spawn_screen_node_entity(
             value,
             action,
             enabled,
+            enabled_binding,
+            reactive_enabled,
             size,
             color,
             hovered_color,
@@ -460,6 +470,18 @@ fn spawn_screen_node_entity(
                     insensitive_text_color,
                 });
             }
+            if let Some(signal) = enabled_binding {
+                commands.entity(button).insert(UiEnabledBinding {
+                    signal: signal.clone(),
+                    rendered_revision: u64::MAX,
+                });
+            }
+            if let Some(expression) = reactive_enabled {
+                commands.entity(button).insert(UiReactiveEnabledBinding {
+                    expression: expression.clone(),
+                    rendered_revision: u64::MAX,
+                });
+            }
             if *enabled
                 && let Some(action) = action
                     .as_ref()
@@ -468,6 +490,7 @@ fn spawn_screen_node_entity(
                 commands.entity(button).insert(RuntimeMenuButton { action });
             }
             commands.entity(button).add_child(text);
+            apply_live_layout_bindings(commands, button, layout);
             button
         }
         ScreenNode::Image(ScreenImageNode { texture, layout }) => {
@@ -478,14 +501,16 @@ fn spawn_screen_node_entity(
             image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
-            commands
+            let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Pickable::IGNORE,
                     image_node(image, resolved),
                     node,
                 ))
-                .id()
+                .id();
+            apply_live_layout_bindings(commands, entity, layout);
+            entity
         }
         ScreenNode::ImageButton(ScreenImageButtonNode {
             texture,
@@ -493,6 +518,8 @@ fn spawn_screen_node_entity(
             hovered_layout,
             value,
             enabled,
+            enabled_binding,
+            reactive_enabled,
             hovered_when_disabled,
             layout,
         }) => {
@@ -523,7 +550,7 @@ fn spawn_screen_node_entity(
                 .is_none()
                 .then(|| texture.rect.map(texture_rect))
                 .flatten();
-            commands
+            let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Button,
@@ -552,10 +579,26 @@ fn spawn_screen_node_entity(
                         normal_node,
                     },
                 ))
-                .id()
+                .id();
+            if let Some(signal) = enabled_binding {
+                commands.entity(entity).insert(UiEnabledBinding {
+                    signal: signal.clone(),
+                    rendered_revision: u64::MAX,
+                });
+            }
+            if let Some(expression) = reactive_enabled {
+                commands.entity(entity).insert(UiReactiveEnabledBinding {
+                    expression: expression.clone(),
+                    rendered_revision: u64::MAX,
+                });
+            }
+            apply_live_layout_bindings(commands, entity, layout);
+            entity
         }
         ScreenNode::Bar(BarNode {
             value,
+            binding,
+            reactive_value,
             min,
             max,
             width,
@@ -563,21 +606,24 @@ fn spawn_screen_node_entity(
             background,
             fill,
             border,
+            layout,
         }) => {
             let span = (*max - *min).max(f32::EPSILON);
             let progress = ((*value - *min) / span).clamp(0.0, 1.0);
 
+            let mut bar_node = Node {
+                width: px(*width),
+                height: px(*height),
+                border: UiRect::all(px(1.0)),
+                align_items: AlignItems::Stretch,
+                ..default()
+            };
+            apply_screen_layout(&mut bar_node, layout);
             let bar = commands
                 .spawn((
                     ScreenUiNode,
                     Pickable::IGNORE,
-                    Node {
-                        width: px(*width),
-                        height: px(*height),
-                        border: UiRect::all(px(1.0)),
-                        align_items: AlignItems::Stretch,
-                        ..default()
-                    },
+                    bar_node,
                     BackgroundColor(
                         background
                             .map(color_from_rgba)
@@ -606,6 +652,23 @@ fn spawn_screen_node_entity(
                 ))
                 .id();
             commands.entity(bar).add_child(fill);
+            if let Some(signal) = binding {
+                commands.entity(fill).insert(UiProgressBinding {
+                    signal: signal.clone(),
+                    min: *min,
+                    max: *max,
+                    rendered_revision: u64::MAX,
+                });
+            }
+            if let Some(expression) = reactive_value {
+                commands.entity(fill).insert(UiReactiveProgressBinding {
+                    expression: expression.clone(),
+                    min: *min,
+                    max: *max,
+                    rendered_revision: u64::MAX,
+                });
+            }
+            apply_live_layout_bindings(commands, bar, layout);
             bar
         }
         ScreenNode::Row(ContainerNode {
@@ -661,6 +724,7 @@ fn spawn_screen_node_entity(
                 })
                 .collect::<Vec<_>>();
             commands.entity(container).add_children(&children);
+            apply_live_layout_bindings(commands, container, layout);
             container
         }
         ScreenNode::Column(ContainerNode {
@@ -717,19 +781,77 @@ fn spawn_screen_node_entity(
                 })
                 .collect::<Vec<_>>();
             commands.entity(container).add_children(&children);
+            apply_live_layout_bindings(commands, container, layout);
             container
         }
-        ScreenNode::Spacer(SpacerNode { width, height }) => commands
-            .spawn((
-                ScreenUiNode,
-                Pickable::IGNORE,
-                Node {
-                    width: px(*width),
-                    height: px(*height),
-                    ..default()
-                },
-            ))
-            .id(),
+        ScreenNode::Spacer(SpacerNode {
+            width,
+            height,
+            layout,
+        }) => {
+            let mut node = Node {
+                width: px(*width),
+                height: px(*height),
+                ..default()
+            };
+            apply_screen_layout(&mut node, layout);
+            let entity = commands.spawn((ScreenUiNode, Pickable::IGNORE, node)).id();
+            apply_live_layout_bindings(commands, entity, layout);
+            entity
+        }
+    }
+}
+
+fn apply_live_layout_bindings(commands: &mut Commands, entity: Entity, layout: &ScreenLayout) {
+    commands.entity(entity).insert(if layout.hidden {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    });
+    if let Some(signal) = &layout.visible_binding {
+        commands.entity(entity).insert(UiVisibilityBinding {
+            signal: signal.clone(),
+            rendered_revision: u64::MAX,
+        });
+    }
+    if let Some(expression) = &layout.reactive_visibility {
+        commands.entity(entity).insert(UiReactiveVisibilityBinding {
+            expression: expression.clone(),
+            rendered_revision: u64::MAX,
+        });
+    }
+    if let Some(spec) = layout.animation {
+        commands.entity(entity).insert((
+            UiTransform::IDENTITY,
+            UiAnimationPlayer { spec, elapsed: 0.0 },
+        ));
+    }
+}
+
+/// Advances embedding-owned UI timelines. The HKS VM only constructs the
+/// serializable spec; Bevy owns clocks and presentation state.
+pub fn animate_screen_ui(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut players: Query<(Entity, &mut UiAnimationPlayer, &mut UiTransform)>,
+) {
+    for (entity, mut player, mut transform) in &mut players {
+        player.elapsed += time.delta_secs();
+        let duration = player.spec.duration().max(f32::EPSILON);
+        let raw = player.elapsed / duration;
+        let progress = if player.spec.repeats() {
+            let cycle = raw.rem_euclid(2.0);
+            if cycle <= 1.0 { cycle } else { 2.0 - cycle }
+        } else {
+            raw.min(1.0)
+        };
+        let progress = player.spec.sample(progress);
+        let scale = 0.96 + progress * 0.04;
+        transform.scale = Vec2::splat(scale);
+        if !player.spec.repeats() && raw >= 1.0 {
+            transform.scale = Vec2::ONE;
+            commands.entity(entity).try_remove::<UiAnimationPlayer>();
+        }
     }
 }
 
@@ -933,16 +1055,202 @@ pub fn update_builtin_ui_signals(
 
 pub fn update_ui_text_bindings(
     signals: Res<UiSignals>,
-    mut bindings: Query<(&mut UiTextBinding, &mut Text)>,
+    mut text_bindings: Query<(&mut UiTextBinding, &mut Text)>,
+    mut visibility_bindings: Query<(&mut UiVisibilityBinding, &mut Visibility)>,
+    mut button_bindings: Query<
+        (
+            &mut UiEnabledBinding,
+            &mut ScreenUiButton,
+            &mut BackgroundColor,
+        ),
+        Without<ScreenUiImageButton>,
+    >,
+    mut image_button_bindings: Query<
+        (&mut UiEnabledBinding, &mut ScreenUiImageButton),
+        Without<ScreenUiButton>,
+    >,
+    mut progress_bindings: Query<(&mut UiProgressBinding, &mut Node)>,
+    mut button_texts: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
     let revision = signals.revision();
-    for (mut binding, mut text) in &mut bindings {
+    for (mut binding, mut text) in &mut text_bindings {
         if binding.rendered_revision == revision {
             continue;
         }
         let rendered = expand_signal_template(&binding.template, &signals);
         if text.0 != rendered {
             text.0 = rendered;
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut visibility) in &mut visibility_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        if let Some(visible) = signals
+            .get(&binding.signal)
+            .and_then(UiSignalValue::as_bool)
+        {
+            *visibility = if visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut button, mut background) in &mut button_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        if let Some(enabled) = signals
+            .get(&binding.signal)
+            .and_then(UiSignalValue::as_bool)
+        {
+            button.enabled = enabled;
+            *background = if enabled {
+                button.normal_background
+            } else {
+                button.insensitive_background
+            }
+            .into();
+            if let Ok(mut color) = button_texts.get_mut(button.text_entity) {
+                *color = if enabled {
+                    button.normal_text_color
+                } else {
+                    button.insensitive_text_color
+                }
+                .into();
+            }
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut button) in &mut image_button_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        if let Some(enabled) = signals
+            .get(&binding.signal)
+            .and_then(UiSignalValue::as_bool)
+        {
+            button.enabled = enabled;
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut node) in &mut progress_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        if let Some(value) = signals
+            .get(&binding.signal)
+            .and_then(UiSignalValue::as_number)
+        {
+            let span = (binding.max - binding.min).max(f32::EPSILON);
+            let progress = ((value as f32 - binding.min) / span).clamp(0.0, 1.0);
+            node.width = percent(progress * 100.0);
+        }
+        binding.rendered_revision = revision;
+    }
+}
+
+pub fn update_ui_reactive_bindings(
+    signals: Res<UiSignals>,
+    mut text_bindings: Query<(&mut UiReactiveTextBinding, &mut Text)>,
+    mut visibility_bindings: Query<(&mut UiReactiveVisibilityBinding, &mut Visibility)>,
+    mut button_bindings: Query<
+        (
+            &mut UiReactiveEnabledBinding,
+            &mut ScreenUiButton,
+            &mut BackgroundColor,
+        ),
+        Without<ScreenUiImageButton>,
+    >,
+    mut image_button_bindings: Query<
+        (&mut UiReactiveEnabledBinding, &mut ScreenUiImageButton),
+        Without<ScreenUiButton>,
+    >,
+    mut progress_bindings: Query<(&mut UiReactiveProgressBinding, &mut Node)>,
+    mut button_texts: Query<&mut TextColor, With<ScreenUiButtonText>>,
+) {
+    let revision = signals.revision();
+    for (mut binding, mut text) in &mut text_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+            Ok(hiraku_script::Value::String(value)) => text.0 = value,
+            Ok(value) => warn!("reactive UI text returned {value:?}, expected String"),
+            Err(error) => warn!("reactive UI text failed: {error}"),
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut visibility) in &mut visibility_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+            Ok(hiraku_script::Value::Bool(visible)) => {
+                *visibility = if visible {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
+            Ok(value) => warn!("reactive UI visibility returned {value:?}, expected Bool"),
+            Err(error) => warn!("reactive UI visibility failed: {error}"),
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut button, mut background) in &mut button_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+            Ok(hiraku_script::Value::Bool(enabled)) => {
+                button.enabled = enabled;
+                *background = if enabled {
+                    button.normal_background
+                } else {
+                    button.insensitive_background
+                }
+                .into();
+                if let Ok(mut color) = button_texts.get_mut(button.text_entity) {
+                    *color = if enabled {
+                        button.normal_text_color
+                    } else {
+                        button.insensitive_text_color
+                    }
+                    .into();
+                }
+            }
+            Ok(value) => warn!("reactive UI enabled expression returned {value:?}, expected Bool"),
+            Err(error) => warn!("reactive UI enabled expression failed: {error}"),
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut button) in &mut image_button_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+            Ok(hiraku_script::Value::Bool(enabled)) => button.enabled = enabled,
+            Ok(value) => warn!("reactive UI enabled expression returned {value:?}, expected Bool"),
+            Err(error) => warn!("reactive UI enabled expression failed: {error}"),
+        }
+        binding.rendered_revision = revision;
+    }
+    for (mut binding, mut node) in &mut progress_bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+            Ok(hiraku_script::Value::Number(value)) => {
+                let span = (binding.max - binding.min).max(f32::EPSILON);
+                let progress = ((value as f32 - binding.min) / span).clamp(0.0, 1.0);
+                node.width = percent(progress * 100.0);
+            }
+            Ok(value) => warn!("reactive UI progress returned {value:?}, expected Float"),
+            Err(error) => warn!("reactive UI progress failed: {error}"),
         }
         binding.rendered_revision = revision;
     }
@@ -960,7 +1268,7 @@ fn expand_signal_template(template: &str, signals: &UiSignals) -> String {
         };
         let key = &after[..end];
         if let Some(value) = signals.get(key) {
-            output.push_str(value);
+            output.push_str(&value.display());
         } else {
             output.push_str("${");
             output.push_str(key);
@@ -1011,6 +1319,68 @@ mod tests {
                 &signals,
             ),
             "elapsed=12, custom=${game.weather}",
+        );
+    }
+
+    #[test]
+    fn typed_binding_system_updates_components_without_rebuilding_entities() {
+        let mut app = App::new();
+        app.init_resource::<UiSignals>()
+            .add_systems(Update, update_ui_text_bindings);
+        let text = app
+            .world_mut()
+            .spawn((
+                Text::new("pending"),
+                UiTextBinding {
+                    template: "HP ${player.health}".into(),
+                    rendered_revision: u64::MAX,
+                },
+            ))
+            .id();
+        let visible = app
+            .world_mut()
+            .spawn((
+                Visibility::Inherited,
+                UiVisibilityBinding {
+                    signal: "hud.visible".into(),
+                    rendered_revision: u64::MAX,
+                },
+            ))
+            .id();
+        let progress = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                UiProgressBinding {
+                    signal: "player.health".into(),
+                    min: 0.0,
+                    max: 100.0,
+                    rendered_revision: u64::MAX,
+                },
+            ))
+            .id();
+        {
+            let mut signals = app.world_mut().resource_mut::<UiSignals>();
+            signals.set("player.health", 25);
+            signals.set("hud.visible", false);
+        }
+
+        app.update();
+
+        assert_eq!(
+            app.world().get::<Text>(text).expect("text exists").0,
+            "HP 25"
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(visible),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(progress)
+                .expect("progress exists")
+                .width,
+            percent(25.0)
         );
     }
 }

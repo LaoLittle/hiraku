@@ -16,7 +16,7 @@ mod ui;
 mod vfs;
 
 pub use script::{UiContext, UiIntent};
-pub use ui::UiSignals;
+pub use ui::{UiSignalValue, UiSignals};
 
 use std::sync::Arc;
 
@@ -39,13 +39,14 @@ use render::character_part::{AlphaMaskMaterial, MultiplyMaterial};
 use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_character_motion_effects,
     animate_custom_effects, animate_dialogue_text_reveal, animate_rule_transitions,
-    animate_visual_tweens, apply_animation_cancellations, apply_live_audio_settings,
-    bridge_story_events, cleanup_stale_screen_ui, handle_choice_action_input,
-    handle_choice_buttons, handle_runtime_menu_buttons, handle_screen_buttons,
-    handle_screen_image_buttons, poll_pending_character_shows, poll_voice_playback,
-    prepare_bgm_preludes, process_script_commands, setup_frontend, setup_stage,
-    sync_scene_snapshot, tick_animation_waits, tick_pending_waits, tick_script_batches,
-    update_builtin_ui_signals, update_ui_text_bindings,
+    animate_screen_ui, animate_visual_tweens, apply_animation_cancellations,
+    apply_live_audio_settings, bridge_story_events, cleanup_stale_screen_ui,
+    handle_choice_action_input, handle_choice_buttons, handle_runtime_menu_buttons,
+    handle_screen_buttons, handle_screen_image_buttons, poll_pending_character_shows,
+    poll_voice_playback, prepare_bgm_preludes, process_script_commands, setup_frontend,
+    setup_stage, sync_scene_snapshot, tick_animation_waits, tick_pending_waits,
+    tick_script_batches, update_builtin_ui_signals, update_ui_reactive_bindings,
+    update_ui_text_bindings,
 };
 use script::{
     ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
@@ -193,7 +194,12 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
-                (update_builtin_ui_signals, update_ui_text_bindings)
+                (
+                    update_builtin_ui_signals,
+                    update_ui_text_bindings,
+                    update_ui_reactive_bindings,
+                    animate_screen_ui,
+                )
                     .chain()
                     .after(process_script_commands)
                     .in_set(HirakuRuntimeSystems),

@@ -14,6 +14,7 @@ use crate::{
     vfs::VfsResource,
 };
 
+mod animation;
 pub(crate) mod capabilities;
 mod hks_runtime;
 mod runtime;
@@ -21,6 +22,7 @@ mod task_runtime;
 pub mod ui_runtime;
 mod ui_vm;
 
+pub use animation::AnimationSpec;
 pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
 pub(crate) use runtime::{
     CameraEffectScope, CameraProjectionMode, ScriptCallFrame, ScriptRuntimeState,
@@ -51,6 +53,7 @@ pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
 
 pub use ui_runtime::{UiContext, UiIntent};
 pub use ui_vm::evaluate_ui_component_named;
+pub(crate) use ui_vm::evaluate_ui_reactive_binding;
 
 #[derive(Debug)]
 pub enum ScriptCommand {

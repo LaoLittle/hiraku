@@ -18,6 +18,8 @@ pub enum ScriptType {
     Symbol,
     Selector,
     Function,
+    /// An explicitly captured expression whose scheduling is owned by the embedding.
+    Binding(Box<ScriptType>),
     Task,
     Named(SymbolId),
     Union(Vec<ScriptType>),
@@ -36,6 +38,7 @@ impl ScriptType {
             || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))
             || matches!(self, Self::Nullable(inner) if inner.accepts(actual))
             || matches!((self, actual), (Self::List(expected), Self::List(actual)) if expected.accepts(actual))
+            || matches!((self, actual), (Self::Binding(expected), Self::Binding(actual)) if expected.accepts(actual))
             || matches!((self, actual), (Self::Record(expected), Self::Record(actual))
                 if expected.len() == actual.len()
                     && expected.iter().all(|(name, expected)|
