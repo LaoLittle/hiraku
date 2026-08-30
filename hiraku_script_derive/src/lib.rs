@@ -117,9 +117,14 @@ fn expand_hks_handle(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 }
 
 #[proc_macro_attribute]
-pub fn hks_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+pub fn hks_module(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let namespace = if attribute.is_empty() {
+        None
+    } else {
+        Some(parse_macro_input!(attribute as syn::LitStr).value())
+    };
     let mut module = parse_macro_input!(item as ItemMod);
-    match expand_module(&mut module) {
+    match expand_module(&mut module, namespace.as_deref()) {
         Ok(registration) => {
             let (_, items) = module
                 .content
@@ -142,7 +147,10 @@ struct FunctionOptions {
     raw: bool,
 }
 
-fn expand_module(module: &mut ItemMod) -> syn::Result<proc_macro2::TokenStream> {
+fn expand_module(
+    module: &mut ItemMod,
+    namespace: Option<&str>,
+) -> syn::Result<proc_macro2::TokenStream> {
     let Some((_, items)) = module.content.as_mut() else {
         return Err(syn::Error::new_spanned(
             module,
@@ -173,7 +181,7 @@ fn expand_module(module: &mut ItemMod) -> syn::Result<proc_macro2::TokenStream> 
         } else {
             context_type = Some(context.clone());
         }
-        registrations.push(register_module_function(function, &options)?);
+        registrations.push(register_module_function(function, &options, namespace)?);
     }
     let context = context_type.ok_or_else(|| {
         syn::Error::new_spanned(module, "#[hks_module] contains no #[hks] functions")
@@ -260,6 +268,7 @@ fn function_context_type(signature: &syn::Signature) -> syn::Result<Type> {
 fn register_module_function(
     function: &syn::ItemFn,
     options: &FunctionOptions,
+    namespace: Option<&str>,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let rust_name = &function.sig.ident;
     let rust_name_string = rust_name.to_string();
@@ -273,7 +282,13 @@ fn register_module_function(
     if options.raw {
         return Ok(if let Some(operator) = &options.operator {
             quote!(registry.register_operator_raw_fn(#operator, #rust_name)?;)
-        } else if let Some(selector) = &options.selector {
+        } else if let Some(selector) = options.selector.as_deref().or_else(|| {
+            if options.receiver.is_none() {
+                namespace
+            } else {
+                None
+            }
+        }) {
             quote!(registry.register_selector_raw_fn(#selector, #public_name, #rust_name)?;)
         } else {
             quote!(registry.register_raw_fn(#public_name, #rust_name)?;)
@@ -313,8 +328,19 @@ fn register_module_function(
     };
     let result_type = return_ok_type(&function.sig.output)?;
     let result = module_script_type(result_type, options.result.as_deref())?;
+    let registration = if let Some(selector) = options.selector.as_deref().or_else(|| {
+        if options.receiver.is_none() {
+            namespace
+        } else {
+            None
+        }
+    }) {
+        quote!(registry.register_selector_fn(#selector, #public_name, #rust_name)?)
+    } else {
+        quote!(registry.register_fn(#public_name, #rust_name)?)
+    };
     Ok(quote! {
-        let builtin = registry.register_fn(#public_name, #rust_name)?;
+        let builtin = #registration;
         let signature = ::hiraku_script::FunctionSignature {
             receiver: #receiver,
             parameters: vec![ #( #parameters ),* ],

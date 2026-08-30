@@ -1,15 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::state::StoredValue;
 
-/// A modal screen described by declarative HKS UI.
-///
-/// `ScreenSpec` is the engine-side form of the map passed to `screen(#{ ... })`.
-/// It intentionally mirrors common Ren'Py screen-language concepts: a full-screen
-/// root, an optional default panel, background imagery, and a list of child nodes.
+/// A rendered declarative HKS UI root produced by `screen { ... }` or
+/// `canvas { ... }`. Whether the root is modal is decided by its mount API:
+/// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSpec {
     /// Optional title rendered by the default panel mode.
@@ -125,6 +123,10 @@ pub struct ScreenLayout {
 pub struct TextNode {
     /// Text content.
     pub text: String,
+    /// Optional normalized live template. Static story values are captured
+    /// during component evaluation; unresolved fields are read from UiSignals.
+    #[serde(default)]
+    pub binding: Option<String>,
     /// Font size in logical pixels.
     #[serde(default = "default_text_size")]
     pub size: f32,
@@ -137,6 +139,55 @@ pub struct TextNode {
     /// Size and absolute positioning.
     #[serde(default)]
     pub layout: ScreenLayout,
+}
+
+/// Engine- and game-provided string signals consumed by live HKS UI bindings.
+///
+/// This resource is intentionally generic: embedding applications can publish
+/// values without registering new UI native functions or exposing ECS to HKS.
+#[derive(Resource, Default)]
+pub struct UiSignals {
+    values: BTreeMap<String, String>,
+    revision: u64,
+}
+
+impl UiSignals {
+    pub fn set(&mut self, name: impl Into<String>, value: impl ToString) {
+        let name = name.into();
+        let value = value.to_string();
+        if self.values.get(&name) == Some(&value) {
+            return;
+        }
+        self.values.insert(name, value);
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("UI signal revision must not be exhausted");
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        if self.values.remove(name).is_some() {
+            self.revision = self
+                .revision
+                .checked_add(1)
+                .expect("UI signal revision must not be exhausted");
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+/// Runtime binding attached only to text entities which read live signals.
+#[derive(Component)]
+pub(crate) struct UiTextBinding {
+    pub(crate) template: String,
+    pub(crate) rendered_revision: u64,
 }
 
 /// A clickable text button in an HKS screen.
@@ -334,7 +385,7 @@ pub struct ScreenUiState {
     pub pending_root: Option<PendingScreenRoot>,
     /// Old roots kept under the active screen for flicker-free replacement.
     pub stale_roots: Vec<StaleScreenRoot>,
-    /// Stable request currently blocked in `openUi(...)`.
+    /// Stable request currently blocked in `ui.open(...)`.
     pub waiting: Option<crate::script::ScriptRequestId>,
 }
 

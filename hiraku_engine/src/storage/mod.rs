@@ -150,6 +150,10 @@ impl From<&SaveGameData> for proto::SaveGameData {
             pending_ui_screen: data.pending_ui_screen.clone(),
             script_call_stack_hson: hson::to_vec(&data.script_call_stack)
                 .expect("script call stack snapshots must serialize to HSON"),
+            ui_registry_hson: hson::to_vec(&data.ui_registry)
+                .expect("UI registry must serialize to HSON"),
+            mounted_ui_overlays_hson: hson::to_vec(&data.mounted_ui_overlays)
+                .expect("mounted UI overlays must serialize to HSON"),
         }
     }
 }
@@ -191,6 +195,20 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
             } else {
                 hson::from_slice(&data.script_call_stack_hson).map_err(|error| {
                     StorageError::InvalidSave(format!("invalid HSON script call stack: {error}"))
+                })?
+            },
+            ui_registry: if data.ui_registry_hson.is_empty() {
+                BTreeMap::new()
+            } else {
+                hson::from_slice(&data.ui_registry_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid HSON UI registry: {error}"))
+                })?
+            },
+            mounted_ui_overlays: if data.mounted_ui_overlays_hson.is_empty() {
+                BTreeMap::new()
+            } else {
+                hson::from_slice(&data.mounted_ui_overlays_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid HSON mounted UI overlays: {error}"))
                 })?
             },
         })
@@ -598,6 +616,11 @@ mod tests {
             resume_script: "system.hks".to_string(),
             vm_snapshot: Some(snapshot.clone()),
             pending_ui_screen: Some("ui/title.ui.hks".to_string()),
+            ui_registry: BTreeMap::from([(
+                "dialogue".to_string(),
+                "hdp://main.hdp/ui/dialogue.ui.hks".to_string(),
+            )]),
+            mounted_ui_overlays: BTreeMap::from([("clock".to_string(), "clockHud".to_string())]),
             ..Default::default()
         };
 
@@ -607,5 +630,7 @@ mod tests {
             restored.pending_ui_screen.as_deref(),
             Some("ui/title.ui.hks")
         );
+        assert_eq!(restored.ui_registry, data.ui_registry);
+        assert_eq!(restored.mounted_ui_overlays, data.mounted_ui_overlays);
     }
 }

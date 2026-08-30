@@ -141,6 +141,7 @@ pub enum Instruction {
     Statement {
         value: Register,
         string: bool,
+        emit_value: bool,
     },
     Jump(usize),
     Branch {
@@ -574,9 +575,14 @@ fn emit_function(
                     value: register(*value),
                     fallback: register(*fallback),
                 },
-                MirInstruction::Statement { value, string } => Instruction::Statement {
+                MirInstruction::Statement {
+                    value,
+                    string,
+                    emit_value,
+                } => Instruction::Statement {
                     value: register(*value),
                     string: *string,
+                    emit_value: *emit_value,
                 },
             };
             emitted.push(scalar);
@@ -860,6 +866,7 @@ impl Vm {
                     self.write(
                         dst,
                         Value::Closure {
+                            module: None,
                             region,
                             captures: self.locals.to_vec(),
                         },
@@ -1032,7 +1039,9 @@ impl Vm {
                                 arguments,
                             })));
                         }
-                        Value::Closure { region, captures } => {
+                        Value::Closure {
+                            region, captures, ..
+                        } => {
                             if !arguments.is_empty() {
                                 return Err(VmError::FunctionArity {
                                     expected: 0,
@@ -1065,11 +1074,16 @@ impl Vm {
                     };
                     self.write(dst, value)?;
                 }
-                Instruction::Statement { value, string } => {
+                Instruction::Statement {
+                    value,
+                    string,
+                    emit_value,
+                } => {
                     let value = self.read(value)?;
-                    let statement = match (string, value) {
-                        (true, Value::String(value)) => StatementValue::String(value.clone()),
-                        _ => StatementValue::Commit,
+                    let statement = match (string, emit_value, value) {
+                        (true, _, Value::String(value)) => StatementValue::String(value.clone()),
+                        (_, true, Value::Null) | (_, false, _) => StatementValue::Commit,
+                        (_, true, _) => StatementValue::Value(value.clone()),
                     };
                     return Ok(Some(VmEvent::Statement(statement)));
                 }
@@ -1631,7 +1645,11 @@ mod tests {
         };
         assert!(matches!(
             call.arguments[0].value,
-            Value::Closure { region: 0, ref captures }
+            Value::Closure {
+                module: None,
+                region: 0,
+                ref captures,
+            }
                 if captures.contains(&Value::Number(4.0))
         ));
     }

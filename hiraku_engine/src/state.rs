@@ -164,6 +164,12 @@ pub struct SaveGameData {
     pub script_call_stack: Vec<ScriptCallFrameSnapshot>,
     #[serde(default)]
     pub pending_ui_screen: Option<String>,
+    /// Runtime UI roles selected by scripts (for example `dialogue` or `title`).
+    /// This is state, not part of the bytecode/native ABI manifest.
+    #[serde(default)]
+    pub ui_registry: BTreeMap<String, String>,
+    #[serde(default)]
+    pub mounted_ui_overlays: BTreeMap<String, String>,
 }
 
 fn default_save_version() -> u32 {

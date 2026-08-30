@@ -325,6 +325,7 @@ fn spawn_screen_node_entity(
     match node {
         ScreenNode::Text(TextNode {
             text,
+            binding,
             size,
             color,
             align,
@@ -332,7 +333,7 @@ fn spawn_screen_node_entity(
         }) => {
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
-            commands
+            let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Pickable::IGNORE,
@@ -345,7 +346,14 @@ fn spawn_screen_node_entity(
                     ),
                     TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
                 ))
-                .id()
+                .id();
+            if let Some(template) = binding {
+                commands.entity(entity).insert(UiTextBinding {
+                    template: template.clone(),
+                    rendered_revision: u64::MAX,
+                });
+            }
+            entity
         }
         ScreenNode::Button(ButtonNode {
             text,
@@ -905,6 +913,65 @@ pub fn handle_screen_image_buttons(
     }
 }
 
+pub fn update_builtin_ui_signals(
+    time: Res<Time>,
+    mut signals: ResMut<UiSignals>,
+    mut last_second: Local<Option<u64>>,
+) {
+    let elapsed = time.elapsed_secs_f64().floor().max(0.0) as u64;
+    if *last_second == Some(elapsed) {
+        return;
+    }
+    *last_second = Some(elapsed);
+    signals.set("time.elapsedSeconds", elapsed);
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    signals.set("time.unixSeconds", unix);
+}
+
+pub fn update_ui_text_bindings(
+    signals: Res<UiSignals>,
+    mut bindings: Query<(&mut UiTextBinding, &mut Text)>,
+) {
+    let revision = signals.revision();
+    for (mut binding, mut text) in &mut bindings {
+        if binding.rendered_revision == revision {
+            continue;
+        }
+        let rendered = expand_signal_template(&binding.template, &signals);
+        if text.0 != rendered {
+            text.0 = rendered;
+        }
+        binding.rendered_revision = revision;
+    }
+}
+
+fn expand_signal_template(template: &str, signals: &UiSignals) -> String {
+    let mut output = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let key = &after[..end];
+        if let Some(value) = signals.get(key) {
+            output.push_str(value);
+        } else {
+            output.push_str("${");
+            output.push_str(key);
+            output.push('}');
+        }
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
 pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) -> bool {
     matches!(
         command,
@@ -928,4 +995,22 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
             | ScriptCommand::Exit
             | ScriptCommand::ReturnToTitle
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_templates_update_known_values_without_erasing_unknown_values() {
+        let mut signals = UiSignals::default();
+        signals.set("time.elapsedSeconds", 12);
+        assert_eq!(
+            expand_signal_template(
+                "elapsed=${time.elapsedSeconds}, custom=${game.weather}",
+                &signals,
+            ),
+            "elapsed=12, custom=${game.weather}",
+        );
+    }
 }

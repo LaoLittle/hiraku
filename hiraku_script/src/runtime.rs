@@ -136,6 +136,23 @@ impl BuiltinManifest {
     pub fn resolve_getter(&self, name: &str) -> Result<&StaticMember, &'static str> {
         self.resolve_static(name, StaticMemberKind::Getter)
     }
+    pub fn resolve_static_method_for(&self, owner: SymbolId, name: &str) -> Option<&StaticMember> {
+        self.resolve_static_for(owner, name, StaticMemberKind::Method)
+    }
+    pub fn resolve_getter_for(&self, owner: SymbolId, name: &str) -> Option<&StaticMember> {
+        self.resolve_static_for(owner, name, StaticMemberKind::Getter)
+    }
+    fn resolve_static_for(
+        &self,
+        owner: SymbolId,
+        name: &str,
+        kind: StaticMemberKind,
+    ) -> Option<&StaticMember> {
+        let name = self.symbols.find(name)?;
+        self.static_members
+            .iter()
+            .find(|member| member.owner == owner && member.name == name && member.kind == kind)
+    }
     fn resolve_static(
         &self,
         name: &str,
@@ -229,6 +246,11 @@ pub enum Value {
     Selector(String),
     Function(SymbolId),
     Closure {
+        /// Runtime linker module owning `region`. Generic single-module VMs
+        /// leave this unset; `LinkedVm` binds it before a closure crosses a
+        /// module or native boundary.
+        #[serde(default)]
+        module: Option<u32>,
         region: u32,
         captures: Vec<Value>,
     },

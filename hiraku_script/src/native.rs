@@ -454,9 +454,14 @@ impl<C> NativeRegistry<C> {
             .functions
             .get(&call.builtin)
             .ok_or(NativeError::UnknownBuiltin(call.builtin))?;
+        let include_receiver = self
+            .signatures
+            .get(&call.builtin)
+            .is_none_or(|signature| signature.receiver.is_some());
         let mut values = call
             .receiver
             .iter()
+            .filter(|_| include_receiver)
             .cloned()
             .chain(call.arguments.iter().map(|argument| argument.value.clone()))
             .collect::<Vec<_>>();
@@ -530,6 +535,7 @@ impl FromHksValue for SelectorValue {
 /// when and how to schedule it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HksClosure {
+    pub module: Option<u32>,
     pub region: u32,
     pub captures: Vec<Value>,
 }
@@ -537,7 +543,12 @@ pub struct HksClosure {
 impl FromHksValue for HksClosure {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
-            Value::Closure { region, captures } => Ok(Self {
+            Value::Closure {
+                module,
+                region,
+                captures,
+            } => Ok(Self {
+                module: *module,
                 region: *region,
                 captures: captures.clone(),
             }),
@@ -549,6 +560,7 @@ impl FromHksValue for HksClosure {
 impl IntoHksValue for HksClosure {
     fn into_hks_value(self) -> Value {
         Value::Closure {
+            module: self.module,
             region: self.region,
             captures: self.captures,
         }
@@ -794,6 +806,10 @@ impl_native_function!(1; A a);
 impl_native_function!(2; A a, B b);
 impl_native_function!(3; A a, B b, D d);
 impl_native_function!(4; A a, B b, D d, E e);
+impl_native_function!(5; A a, B b, D d, E e, J j);
+impl_native_function!(6; A a, B b, D d, E e, J j, K k);
+impl_native_function!(7; A a, B b, D d, E e, J j, K k, L l);
+impl_native_function!(8; A a, B b, D d, E e, J j, K k, L l, M m);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeError {

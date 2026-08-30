@@ -37,6 +37,12 @@ pub struct ScriptRuntimeState {
     pub current_script: Option<String>,
     pub call_stack: Vec<ScriptCallFrame>,
     pub pending_ui_screen: Option<String>,
+    /// Script-defined semantic UI role mappings. Values are normalized VFS paths.
+    pub ui_registry: BTreeMap<String, String>,
+    /// Non-modal UI mounts keyed by their stable script-provided mount name.
+    /// Values retain the role or path used to mount so the component can be
+    /// reconstructed after restoring a save.
+    pub mounted_ui_overlays: BTreeMap<String, String>,
     pub response_inbox: BTreeMap<ScriptRequestId, ScriptResponse>,
     pub task_requests: BTreeMap<ScriptRequestId, u64>,
     next_request_id: u64,

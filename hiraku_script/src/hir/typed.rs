@@ -249,6 +249,8 @@ struct Lowerer<'hir, 'manifest> {
     global_names: BTreeMap<SymbolId, HirGlobalId>,
     function_names: BTreeMap<SymbolId, HirFunctionId>,
     aliases: BTreeMap<String, ScriptType>,
+    named_imports: BTreeMap<String, String>,
+    wildcard_import: Option<String>,
     current_function: Option<HirFunctionId>,
     errors: Vec<LoweringError>,
 }
@@ -260,6 +262,43 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         manifest: Option<&'manifest BuiltinManifest>,
     ) -> Self {
         let symbols = normalize_program_symbols(program, manifest.map(BuiltinManifest::symbols));
+        let mut named_imports = BTreeMap::new();
+        let mut wildcard_import = None;
+        let mut import_errors = Vec::new();
+        for statement in &program.statements {
+            let Stmt::Import {
+                path,
+                wildcard,
+                span,
+            } = statement
+            else {
+                continue;
+            };
+            let qualified = path.join(".");
+            if *wildcard {
+                if let Some(existing) = &wildcard_import {
+                    import_errors.push(LoweringError {
+                        message: format!(
+                            "wildcard import `{qualified}.*` conflicts with `{existing}.*`; import the required names explicitly"
+                        ),
+                        span: *span,
+                    });
+                } else {
+                    wildcard_import = Some(qualified);
+                }
+            } else if let Some(local) = path.last() {
+                if let Some(existing) = named_imports.insert(local.clone(), qualified.clone())
+                    && existing != qualified
+                {
+                    import_errors.push(LoweringError {
+                        message: format!(
+                            "imported name `{local}` refers to both `{existing}` and `{qualified}`"
+                        ),
+                        span: *span,
+                    });
+                }
+            }
+        }
         Self {
             arena,
             manifest,
@@ -274,8 +313,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             global_names: BTreeMap::new(),
             function_names: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            named_imports,
+            wildcard_import,
             current_function: None,
-            errors: Vec::new(),
+            errors: import_errors,
         }
     }
 
@@ -289,7 +330,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         self.scopes.push(BTreeMap::new());
         let entry = self.lower_statements(
             source.statements.iter().filter(|statement| {
-                !matches!(statement, Stmt::TypeAlias { .. } | Stmt::Function { .. })
+                !matches!(
+                    statement,
+                    Stmt::Import { .. } | Stmt::TypeAlias { .. } | Stmt::Function { .. }
+                )
             }),
             Span::new(
                 0,
@@ -489,6 +533,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn lower_statement(&mut self, statement: &Stmt) -> Option<&'hir HirStmt<'hir>> {
         let (kind, span) = match statement {
+            Stmt::Import { span, .. } => {
+                self.error("imports are only allowed at module scope", *span);
+                return None;
+            }
             Stmt::TypeAlias { .. } => return None,
             Stmt::Function { span, .. } => {
                 self.error("nested function definitions are not supported", *span);
@@ -707,11 +755,24 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             } => {
                 let callee = self.lower_expression(callee);
                 let function = self.resolve_call(expression);
+                let expected_parameters = match function {
+                    ResolvedFunction::Builtin(builtin) => self
+                        .manifest
+                        .and_then(|manifest| manifest.signature(builtin))
+                        .map(|signature| signature.parameters.clone()),
+                    _ => None,
+                };
                 let mut arguments = arguments
                     .iter()
-                    .map(|argument| HirArgument {
+                    .enumerate()
+                    .map(|(index, argument)| HirArgument {
                         label: argument.label.as_deref().map(|label| self.symbol(label)),
-                        value: self.lower_expression(&argument.value),
+                        value: self.lower_expression_expected(
+                            &argument.value,
+                            expected_parameters
+                                .as_ref()
+                                .and_then(|parameters| parameters.get(index)),
+                        ),
                         span: argument.span,
                     })
                     .collect::<Vec<_>>();
@@ -849,6 +910,103 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         self.alloc_expression(kind, ty, expression.span)
     }
 
+    /// Lowers expressions whose abbreviated static member is determined by
+    /// the surrounding parameter type. For example, when `at` expects
+    /// `UiPosition`, `.rel(50, 50)` is resolved as `UiPosition.rel(50, 50)`.
+    /// This keeps selector syntax concise without making static member names
+    /// globally unique.
+    fn lower_expression_expected(
+        &mut self,
+        expression: &Expr,
+        expected: Option<&ScriptType>,
+    ) -> &'hir HirExpr<'hir> {
+        let Some(ScriptType::Named(owner)) = expected else {
+            return self.lower_expression(expression);
+        };
+        if let ExprKind::Symbol(name) = &expression.kind
+            && let Some(member) = self
+                .manifest
+                .and_then(|manifest| manifest.resolve_getter_for(*owner, name))
+        {
+            let builtin = member.builtin;
+            let name = self.symbol(name);
+            let callee = self.alloc_expression(
+                HirExprKind::Symbol(name),
+                ScriptType::Symbol,
+                expression.span,
+            );
+            return self.alloc_expression(
+                HirExprKind::Call {
+                    callee,
+                    arguments: &[],
+                    function: ResolvedFunction::Builtin(builtin),
+                },
+                self.call_result(ResolvedFunction::Builtin(builtin)),
+                expression.span,
+            );
+        }
+        let ExprKind::Call {
+            callee,
+            arguments,
+            trailing_block,
+        } = &expression.kind
+        else {
+            return self.lower_expression(expression);
+        };
+        let ExprKind::Symbol(name) = &callee.kind else {
+            return self.lower_expression(expression);
+        };
+        let Some(builtin) = self
+            .manifest
+            .and_then(|manifest| manifest.resolve_static_method_for(*owner, name))
+            .map(|member| member.builtin)
+        else {
+            return self.lower_expression(expression);
+        };
+        let expected_parameters = self
+            .manifest
+            .and_then(|manifest| manifest.signature(builtin))
+            .map(|signature| signature.parameters.clone())
+            .unwrap_or_default();
+        let name = self.symbol(name);
+        let callee =
+            self.alloc_expression(HirExprKind::Symbol(name), ScriptType::Symbol, callee.span);
+        let mut lowered_arguments = arguments
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| HirArgument {
+                label: argument.label.as_deref().map(|label| self.symbol(label)),
+                value: self
+                    .lower_expression_expected(&argument.value, expected_parameters.get(index)),
+                span: argument.span,
+            })
+            .collect::<Vec<_>>();
+        if let Some(block) = trailing_block {
+            let block = self.lower_block(block, true);
+            lowered_arguments.push(HirArgument {
+                label: None,
+                value: self.alloc_expression(
+                    HirExprKind::Block(block),
+                    ScriptType::Function,
+                    block.span,
+                ),
+                span: block.span,
+            });
+        }
+        let lowered_arguments = self.arena.alloc_slice_copy(&lowered_arguments);
+        let function = ResolvedFunction::Builtin(builtin);
+        self.check_call(function, callee, lowered_arguments, expression.span);
+        self.alloc_expression(
+            HirExprKind::Call {
+                callee,
+                arguments: lowered_arguments,
+                function,
+            },
+            self.call_result(function),
+            expression.span,
+        )
+    }
+
     fn check_call(
         &mut self,
         function: ResolvedFunction,
@@ -939,6 +1097,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 span,
             );
         }
+        let imported = self.imported_name(name);
+        let symbol = self.symbol(&imported);
         self.alloc_expression(HirExprKind::Unresolved(symbol), ScriptType::Any, span)
     }
 
@@ -983,7 +1143,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 return ResolvedFunction::Builtin(builtin);
             }
             if self.resolve_local(symbol).is_none() {
-                return ResolvedFunction::External(symbol);
+                let imported = self.imported_name(name);
+                return ResolvedFunction::External(self.symbol(&imported));
             }
         }
         if let ExprKind::Symbol(name) = &callee.kind
@@ -1020,6 +1181,18 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .unwrap_or(ScriptType::Any),
             ResolvedFunction::External(_) | ResolvedFunction::Dynamic => ScriptType::Any,
         }
+    }
+
+    fn imported_name(&self, name: &str) -> String {
+        self.named_imports
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.wildcard_import
+                    .as_ref()
+                    .map(|namespace| format!("{namespace}.{name}"))
+            })
+            .unwrap_or_else(|| name.to_string())
     }
 
     fn declare_local(
@@ -1062,6 +1235,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 "Int" => Some(ScriptType::Int),
                 "Float" | "Number" => Some(ScriptType::Number),
                 "String" => Some(ScriptType::String),
+                "Symbol" => Some(ScriptType::Symbol),
+                "Selector" => Some(ScriptType::Selector),
+                "Function" => Some(ScriptType::Function),
+                "Task" => Some(ScriptType::Task),
                 _ => self.aliases.get(name).cloned().or_else(|| {
                     self.manifest
                         .and_then(|manifest| manifest.symbols().find(name))
@@ -1168,7 +1345,8 @@ fn source_end(program: &Program) -> usize {
 
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
-        Stmt::TypeAlias { span, .. }
+        Stmt::Import { span, .. }
+        | Stmt::TypeAlias { span, .. }
         | Stmt::Function { span, .. }
         | Stmt::Let { span, .. }
         | Stmt::Global { span, .. }

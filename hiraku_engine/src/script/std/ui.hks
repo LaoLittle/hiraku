@@ -1,0 +1,43 @@
+// Hiraku's declarative UI surface is ordinary HKS. The underscored functions
+// are embedding primitives; projects build and replace components using these
+// public wrappers without depending on Bevy or Rust UI types.
+
+global fn screen(content: Function) -> UiNode {
+    __uiScreen(content)
+}
+
+// A transparent, unpanelled full-root layout suitable for HUDs and overlays.
+global fn canvas(content: Function) -> UiNode {
+    __uiScreen(content)
+        .panel(false)
+        .overlay(0.0, 0.0, 0.0, 0.0)
+}
+
+global fn column(content: Function) -> UiNode {
+    __uiColumn(content)
+}
+
+global fn row(content: Function) -> UiNode {
+    __uiRow(content)
+}
+
+global fn image(path: String) -> UiNode {
+    __uiImage(path)
+}
+
+global fn text(value: Any) -> UiNode {
+    __uiText(value)
+}
+
+// IDs are project-owned strings, validated and interned from glossary.hson.
+global fn term(id: String) -> UiNode {
+    __uiTerm(id)
+}
+
+global fn button(value: Any, content: Function) -> UiNode {
+    __uiButton(value, content)
+}
+
+global fn spacer() -> UiNode {
+    __uiSpacer()
+}

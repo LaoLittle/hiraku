@@ -365,6 +365,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Stmt {
         if let TokenKind::Ident(name) = &self.current().kind {
             match name.as_str() {
+                "import" => return self.parse_import(),
                 "fn" => return self.parse_function(false),
                 "type" => return self.parse_type_alias(),
                 "let" | "var" => return self.parse_let(),
@@ -406,6 +407,48 @@ impl Parser {
             }
         } else {
             Stmt::Expr(target)
+        }
+    }
+
+    fn parse_import(&mut self) -> Stmt {
+        let start = self.advance();
+        let mut path = Vec::new();
+        let mut wildcard = false;
+        let mut end = start.span;
+        loop {
+            match self.advance() {
+                Token {
+                    kind: TokenKind::Ident(name),
+                    span,
+                } => {
+                    path.push(name);
+                    end = span;
+                }
+                token => {
+                    self.errors.push(ParseError {
+                        message: "expected an identifier in import path".to_string(),
+                        span: token.span,
+                    });
+                    break;
+                }
+            }
+            if !self.at(TokenKind::Dot) {
+                break;
+            }
+            self.advance();
+            if self.at(TokenKind::Star) {
+                end = self.advance().span;
+                wildcard = true;
+                break;
+            }
+        }
+        if path.is_empty() {
+            self.error_here("import path cannot be empty");
+        }
+        Stmt::Import {
+            path,
+            wildcard,
+            span: Span::join(&start.span, &end),
         }
     }
 
@@ -1294,6 +1337,17 @@ mod tests {
         assert!(matches!(
             &program.statements[0],
             Stmt::Function { exported: true, name, .. } if name == "greet"
+        ));
+    }
+
+    #[test]
+    fn parses_wildcard_module_imports() {
+        let program = parse_program("import ui.widgets.*\nbutton(\"Continue\")")
+            .expect("module import must parse");
+        assert!(matches!(
+            &program.statements[0],
+            Stmt::Import { path, wildcard: true, .. }
+                if path == &["ui".to_string(), "widgets".to_string()]
         ));
     }
 

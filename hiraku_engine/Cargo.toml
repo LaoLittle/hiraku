@@ -15,3 +15,5 @@ prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+time.workspace = true
+rand_pcg.workspace = true

@@ -17,6 +17,7 @@ use crate::{
     },
     effect::custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
+    glossary::{TermCatalog, load_term_catalog},
     render::camera::{
         CameraShake, CameraShakeState, CameraState, CameraTweenState, WorldCamera, focus_layer,
         scene_layer, setup_stage_cameras, start_camera_tween, ui_layer,
@@ -27,7 +28,7 @@ use crate::{
         BatchSubmissionItem, BatchSubmitMode, CharacterEase, ResolvedCharacterKeyframe,
         ScriptBootstrap, ScriptCommand, ScriptRequestId, ScriptResponse, ScriptResponseMessage,
         ScriptRuntimeState, StoryRuntime, StoryRuntimeEvent, UiContext, VoicePlaybackMode,
-        compile_story_bytecode, evaluate_ui_script_named, save_runtime_slot,
+        compile_story_bytecode, evaluate_ui_component_named, save_runtime_slot,
         script_command_from_effect, start_hks_runtime,
     },
     state::{
@@ -43,7 +44,7 @@ use crate::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
         ScreenUiImageButton, ScreenUiNode, ScreenUiRoot, ScreenUiState, SpacerNode,
-        StaleScreenRoot, TextNode,
+        StaleScreenRoot, TextNode, UiSignals, UiTextBinding,
     },
     vfs::VfsResource,
 };
@@ -57,7 +58,10 @@ use character::{
     apply_character_motion, apply_character_timeline, despawn_character_actor,
     queue_character_show, source_rect_from_corners, source_rect_to_corners,
 };
-pub use screen_ui::{cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons};
+pub use screen_ui::{
+    cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons,
+    update_builtin_ui_signals, update_ui_text_bindings,
+};
 use screen_ui::{
     clear_overlay_ui, clear_screen_ui, screen_images_ready,
     should_clear_stale_screen_before_command, spawn_screen_ui,
@@ -348,11 +352,44 @@ fn hks_to_stored(value: &hiraku_script::Value) -> Option<StoredValue> {
     }
 }
 
+fn evaluate_ui_at(
+    target: &str,
+    runtime: &ScriptRuntimeState,
+    vfs: &VfsResource,
+    user_settings: &UserSettings,
+    textures: Option<&TextureCatalog>,
+    terms: Option<&TermCatalog>,
+) -> Result<ScreenSpec, String> {
+    let mut values = runtime
+        .story
+        .as_ref()
+        .map(|story| hks_globals_to_stored(story.globals()))
+        .unwrap_or_default();
+    values.insert(
+        "bgmVolume".to_string(),
+        StoredValue::Float(user_settings.bgm_volume as f64),
+    );
+    values.insert(
+        "voiceVolume".to_string(),
+        StoredValue::Float(user_settings.voice_volume as f64),
+    );
+    values.insert(
+        "sfxVolume".to_string(),
+        StoredValue::Float(user_settings.sfx_volume as f64),
+    );
+    let source = vfs.0.read_text(target).map_err(|error| error.to_string())?;
+    let textures = textures.ok_or_else(|| "texture catalog is unavailable".to_string())?;
+    let terms = terms.ok_or_else(|| "term catalog is unavailable".to_string())?;
+    evaluate_ui_component_named(target, &source, UiContext::new(values), textures, terms)
+        .map_err(|error| error.to_string())
+}
+
 pub fn bridge_story_events(
     mut runtime: ResMut<ScriptRuntimeState>,
     mut response_messages: MessageReader<ScriptResponseMessage>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
     textures: Option<Res<TextureCatalog>>,
+    terms: Option<Res<TermCatalog>>,
     audio: Option<Res<AudioCatalog>>,
     vfs: Res<VfsResource>,
     user_settings: Res<UserSettings>,
@@ -480,6 +517,54 @@ pub fn bridge_story_events(
                 }
                 None => warn!("voice `{path}` is not defined"),
             },
+            StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::SetUiRole {
+                role,
+                component,
+            }) => {
+                let target = vfs
+                    .0
+                    .resolve_path(runtime.current_script.as_deref(), &component);
+                runtime.ui_registry.insert(role, target);
+            }
+            StoryRuntimeEvent::Effect(
+                crate::script::capabilities::StoryEffect::MountUiOverlay { name, component },
+            ) => {
+                let target = runtime
+                    .ui_registry
+                    .get(&component)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        vfs.0
+                            .resolve_path(runtime.current_script.as_deref(), &component)
+                    });
+                let overlay = evaluate_ui_at(
+                    &target,
+                    &runtime,
+                    &vfs,
+                    &user_settings,
+                    textures.as_deref(),
+                    terms.as_deref(),
+                );
+                match overlay {
+                    Ok(screen) => {
+                        runtime.mounted_ui_overlays.insert(name.clone(), component);
+                        pending_script_commands
+                            .items
+                            .push_back(ScriptCommand::ShowOverlay { name, screen });
+                    }
+                    Err(error) => {
+                        warn!("failed to mount UI overlay `{name}` from `{target}`: {error}")
+                    }
+                }
+            }
+            StoryRuntimeEvent::Effect(
+                crate::script::capabilities::StoryEffect::UnmountUiOverlay { name },
+            ) => {
+                runtime.mounted_ui_overlays.remove(&name);
+                pending_script_commands
+                    .items
+                    .push_back(ScriptCommand::HideOverlay { name });
+            }
             StoryRuntimeEvent::Effect(effect) => {
                 match script_command_from_effect(effect, textures.as_deref()) {
                     Ok(command) => pending_script_commands.items.push_back(command),
@@ -512,40 +597,17 @@ pub fn bridge_story_events(
                     });
             }
             StoryRuntimeEvent::OpenUi { path } => {
-                let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
-                let mut story_values = runtime
-                    .story
-                    .as_ref()
-                    .map(|story| hks_globals_to_stored(story.globals()))
-                    .unwrap_or_default();
-                story_values.insert(
-                    "bgmVolume".to_string(),
-                    StoredValue::Float(user_settings.bgm_volume as f64),
+                let target = runtime.ui_registry.get(&path).cloned().unwrap_or_else(|| {
+                    vfs.0.resolve_path(runtime.current_script.as_deref(), &path)
+                });
+                let screen = evaluate_ui_at(
+                    &target,
+                    &runtime,
+                    &vfs,
+                    &user_settings,
+                    textures.as_deref(),
+                    terms.as_deref(),
                 );
-                story_values.insert(
-                    "voiceVolume".to_string(),
-                    StoredValue::Float(user_settings.voice_volume as f64),
-                );
-                story_values.insert(
-                    "sfxVolume".to_string(),
-                    StoredValue::Float(user_settings.sfx_volume as f64),
-                );
-                let screen = vfs
-                    .0
-                    .read_text(&target)
-                    .map_err(|error| error.to_string())
-                    .and_then(|source| {
-                        let textures = textures
-                            .as_deref()
-                            .ok_or_else(|| "texture catalog is unavailable".to_string())?;
-                        evaluate_ui_script_named(
-                            &target,
-                            &source,
-                            &UiContext::new(story_values),
-                            textures,
-                        )
-                        .map_err(|error| error.to_string())
-                    });
                 let request = runtime.allocate_request();
                 runtime.pending_ui_screen = Some(target.clone());
                 runtime.wait_request = Some(request);
@@ -1076,6 +1138,13 @@ pub fn setup_frontend(
         Err(error) => {
             warn!("failed to load audio catalog: {error}");
             commands.insert_resource(AudioCatalog::default());
+        }
+    }
+    match load_term_catalog(&vfs.0) {
+        Ok(catalog) => commands.insert_resource(catalog),
+        Err(error) => {
+            warn!("failed to load glossary: {error}");
+            commands.insert_resource(TermCatalog::default());
         }
     }
     let startup_script = match vfs.0.load_startup_script_path() {
@@ -3055,6 +3124,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 clear_choice_ui(&mut commands, &choice_ui_roots);
                 clear_screen_ui(&mut commands, &mut screen_state);
                 clear_overlay_ui(&mut commands, &mut overlay_state);
+                script_runtime.mounted_ui_overlays.clear();
+                script_runtime.ui_registry.clear();
                 pending_characters.items.clear();
                 shared_state.0 = SceneSnapshot::default();
                 restore_scene_snapshot(

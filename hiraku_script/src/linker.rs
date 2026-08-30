@@ -59,9 +59,22 @@ pub fn link_register_modules(
     modules: Vec<Bytecode>,
     natives: &BuiltinManifest,
 ) -> Result<LinkedProgram, Vec<LinkError>> {
+    link_named_modules(
+        modules.into_iter().map(|module| (None, module)).collect(),
+        natives,
+    )
+}
+
+/// Links modules whose exported functions live under explicit namespaces.
+/// Local calls inside a provider remain unqualified, while consumers address
+/// exports through names such as `ui.widgets.button`.
+pub fn link_named_modules(
+    modules: Vec<(Option<String>, Bytecode)>,
+    natives: &BuiltinManifest,
+) -> Result<LinkedProgram, Vec<LinkError>> {
     let mut exports = BTreeMap::<String, LinkedFunction>::new();
     let mut errors = Vec::new();
-    for (module_index, module) in modules.iter().enumerate() {
+    for (module_index, (namespace, module)) in modules.iter().enumerate() {
         let module_id = ModuleId(module_index as u32);
         for (function_index, function) in module.functions.iter().enumerate() {
             if !function.exported {
@@ -79,18 +92,22 @@ pub fn link_register_modules(
                 module: module_id,
                 function: function_index as u32,
             };
-            if exports.insert(name.to_string(), target).is_some() {
+            let export_name = namespace
+                .as_ref()
+                .map(|namespace| format!("{namespace}.{name}"))
+                .unwrap_or_else(|| name.to_string());
+            if exports.insert(export_name.clone(), target).is_some() {
                 errors.push(LinkError {
                     module: module_id,
                     symbol: Some(function.name),
-                    message: format!("global function `{name}` is exported more than once"),
+                    message: format!("global function `{export_name}` is exported more than once"),
                 });
             }
         }
     }
 
     let mut linked_modules = Vec::with_capacity(modules.len());
-    for (module_index, bytecode) in modules.into_iter().enumerate() {
+    for (module_index, (_, bytecode)) in modules.into_iter().enumerate() {
         let module_id = ModuleId(module_index as u32);
         let local_functions = bytecode
             .functions
@@ -221,5 +238,30 @@ mod tests {
         let errors = link_register_modules(vec![module], &manifest)
             .expect_err("missing implementation must fail linking");
         assert!(errors[0].message.contains("missingFunction"));
+    }
+
+    #[test]
+    fn wildcard_imports_resolve_namespaced_exports() {
+        let provider = compile("global fn button(label: String) { label }");
+        let consumer = compile("import ui.widgets.*\nbutton(\"Continue\")");
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let linked = link_named_modules(
+            vec![(Some("ui.widgets".to_string()), provider), (None, consumer)],
+            &manifest,
+        )
+        .expect("wildcard import must link to the namespaced export");
+        let consumer = &linked.modules[1];
+        let symbol = consumer
+            .bytecode
+            .symbols
+            .find("ui.widgets.button")
+            .expect("import must normalize the function to its qualified symbol");
+        assert_eq!(
+            consumer.resolve(symbol),
+            Some(LinkedFunction::Script {
+                module: ModuleId(0),
+                function: 0,
+            })
+        );
     }
 }

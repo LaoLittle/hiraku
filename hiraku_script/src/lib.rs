@@ -36,7 +36,7 @@ pub use linked_vm::{
 };
 pub use linker::{
     LinkError, LinkedBytecode, LinkedFunction, LinkedModule, LinkedProgram, ModuleId,
-    link_bytecode, link_register_modules,
+    link_bytecode, link_named_modules, link_register_modules,
 };
 pub use mir::{
     MirBasicBlock, MirBlockId, MirConstant, MirFunction, MirInstruction, MirLoweringError,

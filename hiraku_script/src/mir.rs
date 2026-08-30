@@ -109,6 +109,7 @@ pub enum MirInstruction {
     Statement {
         value: VirtualRegister,
         string: bool,
+        emit_value: bool,
     },
 }
 
@@ -296,6 +297,7 @@ impl MirBuilder {
                 self.push(MirInstruction::Statement {
                     value,
                     string: false,
+                    emit_value: false,
                 });
                 Some(value)
             }
@@ -308,6 +310,7 @@ impl MirBuilder {
                 self.push(MirInstruction::Statement {
                     value,
                     string: false,
+                    emit_value: false,
                 });
                 Some(value)
             }
@@ -317,6 +320,7 @@ impl MirBuilder {
                 self.push(MirInstruction::Statement {
                     value,
                     string: false,
+                    emit_value: false,
                 });
                 Some(value)
             }
@@ -325,6 +329,7 @@ impl MirBuilder {
                 self.push(MirInstruction::Statement {
                     value,
                     string: matches!(expression.kind, HirExprKind::Literal(HirLiteral::String(_))),
+                    emit_value: true,
                 });
                 Some(value)
             }

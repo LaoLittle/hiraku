@@ -374,7 +374,11 @@ impl StoryRuntime {
                         });
                         continue;
                     }
-                    if call.builtin == story_manifest().resolve("openUi").expect("openUi builtin") {
+                    if call.builtin
+                        == story_manifest()
+                            .resolve_selector("ui", "open")
+                            .expect("ui.open builtin")
+                    {
                         let Some(Value::String(path)) =
                             call.arguments.first().map(|arg| &arg.value)
                         else {
@@ -718,7 +722,7 @@ pub enum StoryRuntimeError {
     Bytecode(#[from] HksRuntimeError),
     #[error(transparent)]
     Capability(#[from] CharacterCapabilityError),
-    #[error("openUi requires a string path")]
+    #[error("ui.open requires a string role or component path")]
     InvalidOpenUi,
     #[error("choice requires a string prompt and a list of string options")]
     InvalidChoice,
@@ -744,6 +748,9 @@ fn evaluate_statement_template(
 ) -> Result<StatementValue, TemplateError> {
     match value {
         StatementValue::String(text) => Ok(StatementValue::String(vm.eval_template(&text)?)),
+        // Story expression values are implementation details (for example an
+        // Actor handle). At the public statement boundary they mean commit.
+        StatementValue::Value(_) => Ok(StatementValue::Commit),
         value => Ok(value),
     }
 }
@@ -757,6 +764,7 @@ fn evaluate_task_statement_template(
         StatementValue::String(text) => Ok(StatementValue::String(
             scheduler.eval_template(task, &text)?,
         )),
+        StatementValue::Value(_) => Ok(StatementValue::Commit),
         value => Ok(value),
     }
 }
@@ -836,6 +844,47 @@ mod tests {
         runtime
             .resume_main(Value::Null)
             .expect("host result must resume the main VM");
+    }
+
+    #[test]
+    fn ui_roles_are_engine_effects_and_ui_open_is_a_selector_call() {
+        let bytecode = compile_story_bytecode(
+            "ui_roles.hks",
+            concat!(
+                "ui.set(\"dialogue\", \"ui/dialogue.ui.hks\")\n",
+                "ui.mount(\"clock\", \"ui/clock.ui.hks\")\n",
+                "ui.unmount(\"clock\")\n",
+                "ui.open(\"dialogue\")",
+            ),
+        )
+        .expect("UI role APIs must compile");
+        let mut runtime = StoryRuntime::new(bytecode).expect("story runtime must initialize");
+        assert_eq!(
+            runtime.step().expect("ui.set must run"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::SetUiRole {
+                role: "dialogue".to_string(),
+                component: "ui/dialogue.ui.hks".to_string(),
+            }))
+        );
+        assert_eq!(
+            runtime.step().expect("ui.mount must run"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
+                name: "clock".to_string(),
+                component: "ui/clock.ui.hks".to_string(),
+            }))
+        );
+        assert_eq!(
+            runtime.step().expect("ui.unmount must run"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::UnmountUiOverlay {
+                name: "clock".to_string(),
+            }))
+        );
+        assert_eq!(
+            runtime.step().expect("ui.open must run"),
+            Some(StoryRuntimeEvent::OpenUi {
+                path: "dialogue".to_string(),
+            })
+        );
     }
 
     #[test]

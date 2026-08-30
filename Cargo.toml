@@ -24,7 +24,15 @@ hiraku-script = { path = "hiraku_script" }
 [workspace.dependencies.bevy]
 version = "0.19.1"
 default-features = false
-features = ["2d", "3d", "audio", "ui"]
+features = ["3d", "audio", "ui"]
+
+[workspace.dependencies.time]
+version = "0.3.55"
+features = ["wasm-bindgen"]
+
+[workspace.dependencies.rand_pcg]
+version = "0.10.2"
+default-features = false
 
 [profile.app-release]
 inherits = "release"

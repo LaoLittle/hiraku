@@ -3,6 +3,7 @@ mod audio;
 mod character;
 mod data;
 mod effect;
+mod glossary;
 pub mod input;
 mod proto;
 pub mod render;
@@ -15,6 +16,7 @@ mod ui;
 mod vfs;
 
 pub use script::{UiContext, UiIntent};
+pub use ui::UiSignals;
 
 use std::sync::Arc;
 
@@ -43,6 +45,7 @@ use scene::{
     handle_screen_image_buttons, poll_pending_character_shows, poll_voice_playback,
     prepare_bgm_preludes, process_script_commands, setup_frontend, setup_stage,
     sync_scene_snapshot, tick_animation_waits, tick_pending_waits, tick_script_batches,
+    update_builtin_ui_signals, update_ui_text_bindings,
 };
 use script::{
     ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
@@ -154,6 +157,7 @@ impl Plugin for HirakuPlugin {
                 input::bridge_virtual_pointers.before(bevy::picking::PickingSystems::Input),
             )
             .init_resource::<ScriptRuntimeState>()
+            .init_resource::<UiSignals>()
             .add_message::<ScriptResponseMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<BytesAssetLoader>()
@@ -185,6 +189,13 @@ impl Plugin for HirakuPlugin {
                 Update,
                 process_script_commands
                     .after(bridge_story_events)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                (update_builtin_ui_signals, update_ui_text_bindings)
+                    .chain()
+                    .after(process_script_commands)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(

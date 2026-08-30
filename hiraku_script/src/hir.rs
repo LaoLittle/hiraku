@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ast::{Block, Expr, ExprKind, Stmt, TypeExpr, TypeExprKind},
+    runtime::Value,
     symbol::{SymbolInterner, SymbolManifest},
 };
 
@@ -34,6 +35,11 @@ pub fn normalize_program_symbols(
 
 fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
     match statement {
+        Stmt::Import { path, .. } => {
+            if !path.is_empty() {
+                symbols.intern(path.join("."));
+            }
+        }
         Stmt::TypeAlias { name, ty, .. } => {
             symbols.intern(name);
             intern_type(ty, symbols);
@@ -195,10 +201,15 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
 ///
 /// This is deliberately engine-agnostic. An embedding may interpret a string as
 /// narration, a console line, or something else entirely.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StatementValue {
     Commit,
     String(String),
+    /// A non-string expression statement exposed to the embedding host.
+    ///
+    /// Story embeddings may treat this exactly like [`Commit`](Self::Commit),
+    /// while declarative embeddings can collect typed values such as UI nodes.
+    Value(Value),
 }
 
 #[cfg(test)]

@@ -43,6 +43,45 @@ impl LinkedVm {
         })
     }
 
+    /// Starts an independent invocation of a save-safe callable while sharing
+    /// the same linked module set. This is used by embeddings which evaluate a
+    /// trailing closure after a native builder has inspected it.
+    pub fn from_callable(
+        program: LinkedProgram,
+        callable: &Value,
+        arguments: Vec<Value>,
+    ) -> Result<Self, LinkedVmError> {
+        let module = match callable {
+            Value::Closure {
+                module: Some(module),
+                ..
+            } => ModuleId(*module),
+            Value::Closure { module: None, .. } => {
+                return Err(LinkedVmError::UnboundClosureModule);
+            }
+            _ => {
+                return Err(LinkedVmError::Vm(VmError::TypeMismatch(
+                    "expected Function",
+                )));
+            }
+        };
+        let bytecode = program
+            .modules
+            .get(module.0 as usize)
+            .ok_or(LinkedVmError::UnknownModule(module))?
+            .bytecode
+            .clone();
+        let vm = Vm::from_callable(bytecode, callable, arguments)?;
+        Ok(Self {
+            program,
+            frames: vec![(module, vm)],
+        })
+    }
+
+    pub fn program(&self) -> &LinkedProgram {
+        &self.program
+    }
+
     pub fn step(&mut self) -> Result<Option<LinkedVmEvent>, LinkedVmError> {
         loop {
             let (module_id, vm) = self.frames.last_mut().ok_or(LinkedVmError::NoFrame)?;
@@ -54,6 +93,7 @@ impl LinkedVm {
                     return Ok(Some(LinkedVmEvent::Statement(value)));
                 }
                 VmEvent::Completed(value) => {
+                    let value = bind_value_module(value, *module_id);
                     self.frames.pop();
                     if let Some((_, caller)) = self.frames.last_mut() {
                         caller.resume(value)?;
@@ -65,10 +105,21 @@ impl LinkedVm {
                     let module = &self.program.modules[module_id.0 as usize];
                     match module.resolve(call.function) {
                         Some(LinkedFunction::Native(builtin)) => {
+                            let receiver = call
+                                .receiver
+                                .map(|value| bind_value_module(value, *module_id));
+                            let arguments = call
+                                .arguments
+                                .into_iter()
+                                .map(|mut argument| {
+                                    argument.value = bind_value_module(argument.value, *module_id);
+                                    argument
+                                })
+                                .collect();
                             return Ok(Some(LinkedVmEvent::Call(BuiltinCall {
                                 builtin,
-                                receiver: call.receiver,
-                                arguments: call.arguments,
+                                receiver,
+                                arguments,
                             })));
                         }
                         Some(LinkedFunction::Script { module, function }) => {
@@ -85,7 +136,7 @@ impl LinkedVm {
                             let arguments = call
                                 .arguments
                                 .into_iter()
-                                .map(|argument| argument.value)
+                                .map(|argument| bind_value_module(argument.value, *module_id))
                                 .collect();
                             let callee = Vm::from_function(bytecode, function, arguments)?;
                             self.frames.push((module, callee));
@@ -156,6 +207,47 @@ pub enum LinkedVmError {
     UnlinkedCall(crate::SymbolId),
     ScriptReceiver,
     NoFrame,
+    UnboundClosureModule,
+}
+
+fn bind_value_module(value: Value, module: ModuleId) -> Value {
+    match value {
+        Value::Closure {
+            module: owner,
+            region,
+            captures,
+        } => Value::Closure {
+            module: owner.or(Some(module.0)),
+            region,
+            captures: captures
+                .into_iter()
+                .map(|value| bind_value_module(value, module))
+                .collect(),
+        },
+        Value::Typed { type_id, value } => Value::Typed {
+            type_id,
+            value: Box::new(bind_value_module(*value, module)),
+        },
+        Value::Tuple(values) => Value::Tuple(
+            values
+                .into_iter()
+                .map(|value| bind_value_module(value, module))
+                .collect(),
+        ),
+        Value::List(values) => Value::List(
+            values
+                .into_iter()
+                .map(|value| bind_value_module(value, module))
+                .collect(),
+        ),
+        Value::Map(values) => Value::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, bind_value_module(value, module)))
+                .collect(),
+        ),
+        value => value,
+    }
 }
 
 impl From<VmError> for LinkedVmError {
@@ -205,5 +297,33 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn closures_keep_their_module_when_crossing_a_native_boundary() {
+        let natives = BuiltinManifest::new([("capture", BuiltinId(9))]);
+        let module = compile("capture { \"child\" }", &natives);
+        let program = link_register_modules(vec![module], &natives).expect("module links");
+        let mut vm = LinkedVm::new(program, ModuleId(0)).expect("entry starts");
+        let Some(LinkedVmEvent::Call(call)) = vm.step().expect("capture yields") else {
+            panic!("expected native capture call")
+        };
+        let closure = call.arguments[0].value.clone();
+        assert!(matches!(
+            closure,
+            Value::Closure {
+                module: Some(0),
+                ..
+            }
+        ));
+
+        let mut child = LinkedVm::from_callable(vm.program().clone(), &closure, Vec::new())
+            .expect("bound closure invokes");
+        assert_eq!(
+            child.step().expect("closure executes"),
+            Some(LinkedVmEvent::Statement(StatementValue::String(
+                "child".into()
+            )))
+        );
     }
 }

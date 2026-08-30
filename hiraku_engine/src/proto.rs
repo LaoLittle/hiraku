@@ -30,6 +30,10 @@ pub struct SaveGameData {
     pub pending_ui_screen: Option<String>,
     #[prost(bytes = "vec", tag = "15")]
     pub script_call_stack_hson: Vec<u8>,
+    #[prost(bytes = "vec", tag = "16")]
+    pub ui_registry_hson: Vec<u8>,
+    #[prost(bytes = "vec", tag = "17")]
+    pub mounted_ui_overlays_hson: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]

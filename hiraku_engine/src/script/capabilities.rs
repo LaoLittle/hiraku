@@ -32,6 +32,17 @@ pub enum StoryEffect {
     CallScript {
         path: String,
     },
+    SetUiRole {
+        role: String,
+        component: String,
+    },
+    MountUiOverlay {
+        name: String,
+        component: String,
+    },
+    UnmountUiOverlay {
+        name: String,
+    },
     AdjustSetting {
         name: String,
         delta: f32,
@@ -194,9 +205,8 @@ fn registry() -> NativeRegistry<CharacterContext> {
 
 fn story_registry() -> NativeRegistry<CharacterContext> {
     let mut registry = registry();
-    registry
-        .register_raw_fn("openUi", async_capability_placeholder)
-        .expect("built-in `openUi` registration must be unique");
+    ui_api::register_hks(&mut registry)
+        .expect("story UI API registration must be internally consistent");
     registry
         .register_raw_fn("wait", async_capability_placeholder)
         .expect("built-in `wait` registration must be unique");
@@ -241,6 +251,53 @@ fn async_capability_placeholder(
     Err(NativeError::message(
         "async capability requires the direct engine HKS runtime",
     ))
+}
+
+#[hiraku_script::hks_module("ui")]
+mod ui_api {
+    use super::*;
+
+    #[hks]
+    fn native_open(
+        _context: &mut CharacterContext,
+        _role_or_component: String,
+    ) -> Result<Value, NativeError> {
+        Err(NativeError::message(
+            "ui.open requires the direct engine HKS runtime",
+        ))
+    }
+
+    #[hks]
+    fn native_set(
+        context: &mut CharacterContext,
+        role: String,
+        component: String,
+    ) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::SetUiRole { role, component });
+        Ok(())
+    }
+
+    #[hks]
+    fn native_mount(
+        context: &mut CharacterContext,
+        name: String,
+        component: String,
+    ) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::MountUiOverlay { name, component });
+        Ok(())
+    }
+
+    #[hks]
+    fn native_unmount(context: &mut CharacterContext, name: String) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::UnmountUiOverlay { name });
+        Ok(())
+    }
 }
 
 /// Stateful native-function host for the HKS runtime.

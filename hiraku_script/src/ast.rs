@@ -9,6 +9,11 @@ pub struct Program {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
+    Import {
+        path: Vec<String>,
+        wildcard: bool,
+        span: Span,
+    },
     TypeAlias {
         name: String,
         ty: TypeExpr,

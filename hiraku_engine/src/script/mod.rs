@@ -19,6 +19,7 @@ mod hks_runtime;
 mod runtime;
 mod task_runtime;
 pub mod ui_runtime;
+mod ui_vm;
 
 pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
 pub(crate) use runtime::{
@@ -48,7 +49,8 @@ pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
     }
 }
 
-pub use ui_runtime::{UiContext, UiIntent, evaluate_ui_script_named};
+pub use ui_runtime::{UiContext, UiIntent};
+pub use ui_vm::evaluate_ui_component_named;
 
 #[derive(Debug)]
 pub enum ScriptCommand {
@@ -323,6 +325,9 @@ pub(crate) fn script_command_from_effect(
         },
         StoryEffect::GotoScript { .. }
         | StoryEffect::CallScript { .. }
+        | StoryEffect::SetUiRole { .. }
+        | StoryEffect::MountUiOverlay { .. }
+        | StoryEffect::UnmountUiOverlay { .. }
         | StoryEffect::PlayBgm { .. }
         | StoryEffect::PlayVoice { .. } => {
             return Err("effect requires script runtime asset resolution".to_string());
@@ -417,6 +422,8 @@ pub struct ScriptBootstrap {
     pub snapshot: Option<StoryRuntimeSnapshot>,
     pub call_stack: Vec<crate::state::ScriptCallFrameSnapshot>,
     pub pending_ui_screen: Option<String>,
+    pub ui_registry: BTreeMap<String, String>,
+    pub mounted_ui_overlays: BTreeMap<String, String>,
 }
 
 impl ScriptBootstrap {
@@ -427,6 +434,8 @@ impl ScriptBootstrap {
             snapshot: None,
             call_stack: Vec::new(),
             pending_ui_screen: None,
+            ui_registry: BTreeMap::new(),
+            mounted_ui_overlays: BTreeMap::new(),
         }
     }
 
@@ -439,6 +448,8 @@ impl ScriptBootstrap {
             snapshot: data.vm_snapshot.clone(),
             call_stack: data.script_call_stack.clone(),
             pending_ui_screen: data.pending_ui_screen.clone(),
+            ui_registry: data.ui_registry.clone(),
+            mounted_ui_overlays: data.mounted_ui_overlays.clone(),
         }
     }
 }
@@ -455,6 +466,8 @@ pub fn start_hks_runtime(
         snapshot,
         call_stack,
         pending_ui_screen,
+        ui_registry,
+        mounted_ui_overlays,
     } = bootstrap;
     let source = vfs
         .0
@@ -495,8 +508,15 @@ pub fn start_hks_runtime(
     runtime.story_events.clear();
     runtime.wait_request = None;
     runtime.pending_ui_screen = pending_ui_screen;
+    runtime.ui_registry = ui_registry;
+    runtime.mounted_ui_overlays = mounted_ui_overlays.clone();
     runtime.response_inbox.clear();
     runtime.task_requests.clear();
+    for (name, component) in mounted_ui_overlays {
+        runtime.story_events.push_back(StoryRuntimeEvent::Effect(
+            capabilities::StoryEffect::MountUiOverlay { name, component },
+        ));
+    }
     if restored_blocked {
         if let Some(path) = runtime.pending_ui_screen.clone() {
             runtime
@@ -554,6 +574,8 @@ pub fn save_runtime_slot(
         vm_snapshot: snapshot,
         script_call_stack,
         pending_ui_screen: runtime.pending_ui_screen.clone(),
+        ui_registry: runtime.ui_registry.clone(),
+        mounted_ui_overlays: runtime.mounted_ui_overlays.clone(),
         ..Default::default()
     };
     write_save_data_to_root(&save_root_path(), slot, &data)
