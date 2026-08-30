@@ -22,6 +22,32 @@ impl AnimationSpec {
 }
 }
 
+hiraku_script::hks_define! {
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AnimationPhase {
+    Transform(f64, f64, f64, f64),
+}
+
+impl AnimationPhase {
+    fn rotation(degrees: f64) -> AnimationPhase { Self::Transform(degrees, 1.0, 0.0, 0.0) }
+    fn scale(value: f64) -> AnimationPhase { Self::Transform(0.0, value, 0.0, 0.0) }
+    fn offset(x: f64, y: f64) -> AnimationPhase { Self::Transform(0.0, 1.0, x, y) }
+    fn transform(rotation: f64, scale: f64, x: f64, y: f64) -> AnimationPhase {
+        Self::Transform(rotation, scale, x, y)
+    }
+}
+}
+
+impl AnimationPhase {
+    pub fn values(self) -> (f32, f32, f32, f32) {
+        match self {
+            Self::Transform(rotation, scale, x, y) => {
+                (rotation as f32, scale as f32, x as f32, y as f32)
+            }
+        }
+    }
+}
+
 impl AnimationSpec {
     pub fn duration(self) -> f32 {
         match self {
@@ -57,7 +83,7 @@ impl AnimationSpec {
         }
     }
 
-    fn repeat_forever(self) -> Self {
+    pub(crate) fn repeat_forever(self) -> Self {
         match self {
             Self::Linear(value, _) => Self::Linear(value, true),
             Self::EaseIn(value, _) => Self::EaseIn(value, true),
@@ -71,6 +97,7 @@ pub fn register_animation_api<C: 'static>(
     registry: &mut NativeRegistry<C>,
 ) -> Result<(), RegistrationError> {
     let owner = AnimationSpec::register_hks(registry)?;
+    AnimationPhase::register_hks(registry)?;
     let builtin = registry.register_raw_fn("repeatForever", move |_context, call| {
         let value = call
             .receiver

@@ -839,6 +839,21 @@ impl<T: HksScriptType> HksScriptType for Vec<T> {
     }
 }
 
+impl<T: FromHksValue> FromHksValue for Vec<T> {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        let Value::List(values) = value else {
+            return Err(NativeError::TypeMismatch("List"));
+        };
+        values.iter().map(T::from_hks_value).collect()
+    }
+}
+
+impl<T: IntoHksValue> IntoHksValue for Vec<T> {
+    fn into_hks_value(self) -> Value {
+        Value::List(self.into_iter().map(IntoHksValue::into_hks_value).collect())
+    }
+}
+
 pub trait IntoNativeFunction<C, Args>: Send + Sync + 'static {
     fn into_native_function(self) -> Box<NativeThunk<C>>;
 }

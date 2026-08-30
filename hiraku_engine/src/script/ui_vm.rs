@@ -16,12 +16,13 @@ use crate::{
     texture::TextureCatalog,
     ui::{
         BarNode, ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
-        ScreenNode, ScreenSpec, ScreenTexture, SpacerNode, TextNode, UiReactiveBinding,
+        ScreenNode, ScreenSpec, ScreenTexture, SpacerNode, TextNode, UiPhaseAnimation,
+        UiReactiveBinding,
     },
 };
 
 use super::{
-    animation::{AnimationSpec, register_animation_api},
+    animation::{AnimationPhase, AnimationSpec, register_animation_api},
     ui_runtime::UiContext,
 };
 
@@ -92,6 +93,7 @@ struct UiDraft {
     background_texture: Option<String>,
     overlay: Option<[f32; 4]>,
     animation: Option<AnimationSpec>,
+    phase_animation: Option<UiPhaseAnimation>,
 }
 
 impl UiDraft {
@@ -111,6 +113,7 @@ impl UiDraft {
             background_texture: None,
             overlay: None,
             animation: None,
+            phase_animation: None,
         }
     }
 }
@@ -402,6 +405,117 @@ mod native_ui {
         context.node_mut(node)?.animation = Some(animation);
         Ok(node)
     }
+
+    #[allow(non_snake_case)]
+    #[hks(name = "phaseAnimator", receiver)]
+    fn ui_phase_animator(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        phases: Vec<AnimationPhase>,
+        animation: AnimationSpec,
+    ) -> Result<UiNodeHandle, NativeError> {
+        validate_phase_animation(&phases, animation)?;
+        context.node_mut(node)?.phase_animation = Some(UiPhaseAnimation {
+            phases,
+            spec: animation,
+            continuous_rotation: false,
+        });
+        Ok(node)
+    }
+
+    #[hks(name = "spin", receiver)]
+    fn ui_spin(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        seconds: Option<f64>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let seconds = animation_seconds(seconds, 1.0)?;
+        context.node_mut(node)?.phase_animation = Some(UiPhaseAnimation {
+            phases: vec![
+                AnimationPhase::Transform(0.0, 1.0, 0.0, 0.0),
+                AnimationPhase::Transform(360.0, 1.0, 0.0, 0.0),
+            ],
+            spec: AnimationSpec::Linear(seconds, true),
+            continuous_rotation: true,
+        });
+        Ok(node)
+    }
+
+    #[hks(name = "pulse", receiver)]
+    fn ui_pulse(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        seconds: Option<f64>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let seconds = animation_seconds(seconds, 1.0)?;
+        context.node_mut(node)?.phase_animation = Some(UiPhaseAnimation {
+            phases: vec![
+                AnimationPhase::Transform(0.0, 1.0, 0.0, 0.0),
+                AnimationPhase::Transform(0.0, 1.06, 0.0, 0.0),
+            ],
+            spec: AnimationSpec::EaseInOut(seconds, true),
+            continuous_rotation: false,
+        });
+        Ok(node)
+    }
+
+    #[hks(name = "bob", receiver)]
+    fn ui_bob(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        distance: Option<f64>,
+        seconds: Option<f64>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let seconds = animation_seconds(seconds, 1.0)?;
+        let distance = distance.unwrap_or(8.0);
+        if !distance.is_finite() {
+            return Err(NativeError::message("bob distance must be finite"));
+        }
+        context.node_mut(node)?.phase_animation = Some(UiPhaseAnimation {
+            phases: vec![
+                AnimationPhase::Transform(0.0, 1.0, 0.0, 0.0),
+                AnimationPhase::Transform(0.0, 1.0, 0.0, distance),
+            ],
+            spec: AnimationSpec::EaseInOut(seconds, true),
+            continuous_rotation: false,
+        });
+        Ok(node)
+    }
+}
+
+fn animation_seconds(value: Option<f64>, default: f64) -> Result<f64, NativeError> {
+    let value = value.unwrap_or(default);
+    if !value.is_finite() || value <= 0.0 {
+        return Err(NativeError::message(
+            "animation duration must be greater than zero",
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_phase_animation(
+    phases: &[AnimationPhase],
+    animation: AnimationSpec,
+) -> Result<(), NativeError> {
+    if phases.len() < 2 {
+        return Err(NativeError::message(
+            "phaseAnimator requires at least two phases",
+        ));
+    }
+    animation_seconds(Some(animation.duration() as f64), 1.0)?;
+    if phases.iter().any(|phase| {
+        let (rotation, scale, x, y) = phase.values();
+        !rotation.is_finite()
+            || !scale.is_finite()
+            || scale < 0.0
+            || !x.is_finite()
+            || !y.is_finite()
+    }) {
+        return Err(NativeError::message(
+            "animation phases require finite rotation/offset and non-negative finite scale",
+        ));
+    }
+    Ok(())
 }
 
 fn finite_f32(value: f64, label: &str) -> Result<f32, NativeError> {
@@ -845,6 +959,7 @@ fn materialize_node(
         .ok_or_else(|| UiVmError::Invalid(format!("unknown UiNode handle {}", handle.0)))?;
     draft.layout.hidden = !draft.visible;
     draft.layout.animation = draft.animation;
+    draft.layout.phase_animation = draft.phase_animation;
     draft.layout.visible_binding = None;
     if let Some(binding) = &draft.visible_binding {
         let reactive = reactive_binding(binding, program, context);
@@ -1198,7 +1313,13 @@ screen {
             "memory://animated.ui.hks",
             concat!(
                 "import ui.widgets.*\n",
-                "canvas { text(\"Pulse\").animation(.linear(2.0).repeatForever()) }",
+                "canvas {\n",
+                "  text(\"Pulse\").animation(.linear(2.0).repeatForever())\n",
+                "  text(\"Spinner\").spin(1.5)\n",
+                "  text(\"Phases\").phaseAnimator([.rotation(0), .rotation(90)], .easeInOut(0.4).repeatForever())\n",
+                "  text(\"Pulse\").pulse()\n",
+                "  text(\"Bob\").bob()\n",
+                "}",
             ),
             UiContext::default(),
             &TextureCatalog::default(),
@@ -1212,6 +1333,37 @@ screen {
         let animation = text.layout.animation.expect("animation is retained");
         assert_eq!(animation.duration(), 2.0);
         assert!(animation.repeats());
+        let ScreenNode::Text(spinner) = &screen.children[1] else {
+            panic!("second child should be text")
+        };
+        let spin = spinner
+            .layout
+            .phase_animation
+            .as_ref()
+            .expect("spin creates a phase timeline");
+        assert!(spin.continuous_rotation);
+        assert_eq!(spin.spec.duration(), 1.5);
+        let ScreenNode::Text(phases) = &screen.children[2] else {
+            panic!("third child should be text")
+        };
+        assert_eq!(
+            phases
+                .layout
+                .phase_animation
+                .as_ref()
+                .expect("phase animator is retained")
+                .phases
+                .len(),
+            2
+        );
+        assert!(matches!(
+            &screen.children[3],
+            ScreenNode::Text(node) if node.layout.phase_animation.is_some()
+        ));
+        assert!(matches!(
+            &screen.children[4],
+            ScreenNode::Text(node) if node.layout.phase_animation.is_some()
+        ));
     }
 
     #[test]

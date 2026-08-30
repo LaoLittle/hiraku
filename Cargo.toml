@@ -28,6 +28,7 @@ features = ["3d", "audio", "ui"]
 
 [workspace.dependencies.time]
 version = "0.3.55"
+default-features = false
 features = ["wasm-bindgen"]
 
 [workspace.dependencies.rand_pcg]

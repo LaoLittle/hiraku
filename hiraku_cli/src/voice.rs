@@ -176,7 +176,7 @@ impl Collector<'_> {
 
     fn nested(&mut self, statement: &Stmt) {
         match statement {
-            Stmt::TypeAlias { .. } => {}
+            Stmt::Import { .. } | Stmt::TypeAlias { .. } => {}
             Stmt::Function { body, .. } | Stmt::While { body, .. } => self.block(body),
             Stmt::If {
                 then_block,
@@ -223,7 +223,8 @@ impl Collector<'_> {
             ExprKind::Member { object, .. }
             | ExprKind::SafeMember { object, .. }
             | ExprKind::UnaryMinus(object)
-            | ExprKind::NonNull(object) => self.expression(object),
+            | ExprKind::NonNull(object)
+            | ExprKind::Binding(object) => self.expression(object),
             ExprKind::Tuple(values) | ExprKind::List(values) => {
                 for value in values {
                     self.expression(value);
@@ -243,7 +244,8 @@ impl Collector<'_> {
                 self.expression(value);
                 self.expression(fallback);
             }
-            ExprKind::Null
+            ExprKind::Unit
+            | ExprKind::Null
             | ExprKind::Ellipsis
             | ExprKind::Ident(_)
             | ExprKind::Symbol(_)
@@ -345,7 +347,7 @@ fn string_argument(argument: &hiraku_script::Argument) -> Option<String> {
 
 fn statement_span(statement: &Stmt) -> &Span {
     match statement {
-        Stmt::TypeAlias { span, .. } => span,
+        Stmt::Import { span, .. } | Stmt::TypeAlias { span, .. } => span,
         Stmt::Function { span, .. }
         | Stmt::Let { span, .. }
         | Stmt::Global { span, .. }

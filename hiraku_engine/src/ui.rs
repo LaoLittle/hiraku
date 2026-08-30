@@ -15,6 +15,16 @@ pub struct UiReactiveBinding {
     pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiPhaseAnimation {
+    pub phases: Vec<crate::script::AnimationPhase>,
+    pub spec: crate::script::AnimationSpec,
+    /// Continuous rotation treats the last rotation as the equivalent of the
+    /// first plus one turn, avoiding a backwards interpolation at the seam.
+    #[serde(default)]
+    pub continuous_rotation: bool,
+}
+
 /// A rendered declarative HKS UI root produced by `screen { ... }` or
 /// `canvas { ... }`. Whether the root is modal is decided by its mount API:
 /// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
@@ -98,6 +108,8 @@ pub struct ScreenLayout {
     /// Optional engine-owned entrance/timeline animation specification.
     #[serde(default)]
     pub animation: Option<crate::script::AnimationSpec>,
+    #[serde(default)]
+    pub phase_animation: Option<UiPhaseAnimation>,
     /// Fixed width in logical pixels.
     #[serde(default)]
     pub width: Option<f32>,
@@ -331,6 +343,8 @@ pub(crate) struct UiReactiveProgressBinding {
 pub(crate) struct UiAnimationPlayer {
     pub(crate) spec: crate::script::AnimationSpec,
     pub(crate) elapsed: f32,
+    pub(crate) phases: Option<Vec<crate::script::AnimationPhase>>,
+    pub(crate) continuous_rotation: bool,
 }
 
 /// A clickable text button in an HKS screen.

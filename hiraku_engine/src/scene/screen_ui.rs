@@ -820,10 +820,25 @@ fn apply_live_layout_bindings(commands: &mut Commands, entity: Entity, layout: &
             rendered_revision: u64::MAX,
         });
     }
-    if let Some(spec) = layout.animation {
+    if let Some(timeline) = &layout.phase_animation {
         commands.entity(entity).insert((
             UiTransform::IDENTITY,
-            UiAnimationPlayer { spec, elapsed: 0.0 },
+            UiAnimationPlayer {
+                spec: timeline.spec,
+                elapsed: 0.0,
+                phases: Some(timeline.phases.clone()),
+                continuous_rotation: timeline.continuous_rotation,
+            },
+        ));
+    } else if let Some(spec) = layout.animation {
+        commands.entity(entity).insert((
+            UiTransform::IDENTITY,
+            UiAnimationPlayer {
+                spec,
+                elapsed: 0.0,
+                phases: None,
+                continuous_rotation: false,
+            },
         ));
     }
 }
@@ -839,6 +854,31 @@ pub fn animate_screen_ui(
         player.elapsed += time.delta_secs();
         let duration = player.spec.duration().max(f32::EPSILON);
         let raw = player.elapsed / duration;
+        if let Some(phases) = &player.phases {
+            let last_segment = phases.len().saturating_sub(1);
+            let (from_index, to_index, local, finished) = if player.continuous_rotation {
+                (0, 1, raw.fract(), false)
+            } else if player.spec.repeats() {
+                let segment = raw.floor() as usize % phases.len();
+                (segment, (segment + 1) % phases.len(), raw.fract(), false)
+            } else if raw >= last_segment as f32 {
+                (last_segment, last_segment, 1.0, true)
+            } else {
+                let segment = raw.floor() as usize;
+                (segment, segment + 1, raw.fract(), false)
+            };
+            let local = player.spec.sample(local);
+            let (from_rotation, from_scale, from_x, from_y) = phases[from_index].values();
+            let (to_rotation, to_scale, to_x, to_y) = phases[to_index].values();
+            transform.rotation = Rot2::degrees(from_rotation.lerp(to_rotation, local));
+            transform.scale = Vec2::splat(from_scale.lerp(to_scale, local));
+            transform.translation =
+                Val2::new(px(from_x.lerp(to_x, local)), px(from_y.lerp(to_y, local)));
+            if finished {
+                commands.entity(entity).try_remove::<UiAnimationPlayer>();
+            }
+            continue;
+        }
         let progress = if player.spec.repeats() {
             let cycle = raw.rem_euclid(2.0);
             if cycle <= 1.0 { cycle } else { 2.0 - cycle }
@@ -1307,6 +1347,8 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -1382,5 +1424,39 @@ mod tests {
                 .width,
             percent(25.0)
         );
+    }
+
+    #[test]
+    fn spin_animates_ui_rotation_without_rebuilding_the_node() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_systems(Update, animate_screen_ui);
+        let node = app
+            .world_mut()
+            .spawn((
+                UiTransform::IDENTITY,
+                UiAnimationPlayer {
+                    spec: crate::script::AnimationSpec::Linear(1.0, true),
+                    elapsed: 0.0,
+                    phases: Some(vec![
+                        crate::script::AnimationPhase::Transform(0.0, 1.0, 0.0, 0.0),
+                        crate::script::AnimationPhase::Transform(360.0, 1.0, 0.0, 0.0),
+                    ]),
+                    continuous_rotation: true,
+                },
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(250));
+
+        app.update();
+
+        let transform = app
+            .world()
+            .get::<UiTransform>(node)
+            .expect("animated UI node remains alive");
+        assert!(transform.rotation.cos.abs() < 0.0001);
+        assert!((transform.rotation.sin - 1.0).abs() < 0.0001);
     }
 }

@@ -22,7 +22,7 @@ mod task_runtime;
 pub mod ui_runtime;
 mod ui_vm;
 
-pub use animation::AnimationSpec;
+pub use animation::{AnimationPhase, AnimationSpec};
 pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
 pub(crate) use runtime::{
     CameraEffectScope, CameraProjectionMode, ScriptCallFrame, ScriptRuntimeState,

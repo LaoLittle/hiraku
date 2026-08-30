@@ -939,6 +939,20 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if let Some(ScriptType::List(element)) = expected
+            && let ExprKind::List(values) = &expression.kind
+        {
+            let values = values
+                .iter()
+                .map(|value| self.lower_expression_expected(value, Some(element)))
+                .collect::<Vec<_>>();
+            let values = self.arena.alloc_slice_copy(&values);
+            return self.alloc_expression(
+                HirExprKind::List(values),
+                ScriptType::List(element.clone()),
+                expression.span,
+            );
+        }
         let Some(ScriptType::Named(owner)) = expected else {
             return self.lower_expression(expression);
         };
