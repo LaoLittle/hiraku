@@ -145,8 +145,25 @@ impl StoryRuntime {
 
     pub fn restore(
         bytecode: Bytecode,
-        snapshot: StoryRuntimeSnapshot,
+        mut snapshot: StoryRuntimeSnapshot,
     ) -> Result<Self, StoryRuntimeError> {
+        // Voice playback is transient output rather than durable story state.
+        // The scheduler has already consumed the native call and only keeps an
+        // active effect so seq/wait can observe its completion. Loading must
+        // complete that effect without emitting PlayVoice again.
+        let mut completed_voice_tasks = Vec::new();
+        for (task, effects) in &mut snapshot.active_task_effects {
+            let had_voice = effects
+                .iter()
+                .any(|(effect, _)| matches!(effect, StoryEffect::PlayVoice { .. }));
+            effects.retain(|(effect, _)| !matches!(effect, StoryEffect::PlayVoice { .. }));
+            if had_voice && effects.is_empty() {
+                completed_voice_tasks.push(*task);
+            }
+        }
+        snapshot
+            .active_task_effects
+            .retain(|_, effects| !effects.is_empty());
         let pending = snapshot
             .active_task_effects
             .iter()
@@ -159,7 +176,7 @@ impl StoryRuntime {
                     })
             })
             .collect();
-        Ok(Self {
+        let mut runtime = Self {
             bytecode: HksRuntime::restore(bytecode, snapshot.bytecode)?,
             host: StoryNativeHost::restore(snapshot.host),
             pending,
@@ -170,7 +187,11 @@ impl StoryRuntime {
             waiting_interactive_task: snapshot.waiting_interactive_task,
             choice: snapshot.choice,
             blocked: snapshot.blocked,
-        })
+        };
+        for task in completed_voice_tasks {
+            runtime.finish_task_effects(task)?;
+        }
+        Ok(runtime)
     }
 
     pub fn set_globals(&mut self, globals: std::collections::BTreeMap<String, Value>) {
@@ -181,8 +202,22 @@ impl StoryRuntime {
         self.bytecode.globals()
     }
 
-    pub fn is_blocked(&self) -> bool {
-        self.blocked
+    /// Reconstructs the host-visible boundary represented by a restored VM.
+    /// The engine must not infer every blocked state as dialogue input: a
+    /// waiting choice needs its prompt and options mounted again.
+    pub fn restored_boundary_event(&self) -> Option<StoryRuntimeEvent> {
+        if !self.blocked {
+            return None;
+        }
+        match &self.choice {
+            Some(ChoiceState::AwaitingSelection { prompt, options }) => {
+                Some(StoryRuntimeEvent::Choice {
+                    prompt: prompt.clone(),
+                    options: options.iter().map(|option| option.label.clone()).collect(),
+                })
+            }
+            _ => Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance)),
+        }
     }
 
     pub fn resume(&mut self, value: Value) -> Result<(), StoryRuntimeError> {
@@ -229,15 +264,20 @@ impl StoryRuntime {
             .ok_or(StoryRuntimeError::UnknownTaskEffect(task))?;
         if effects.is_empty() {
             self.active_task_effects.remove(&task);
-            if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence) {
-                let _ = self.bytecode.unpause_task(task);
-            }
-            if let Some(value) = self.deferred_task_completions.remove(&task) {
-                self.task_modes.remove(&task);
-                if self.waiting_task == Some(task) {
-                    self.waiting_task = None;
-                    self.bytecode.resume_main(value)?;
-                }
+            self.finish_task_effects(task)?;
+        }
+        Ok(())
+    }
+
+    fn finish_task_effects(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
+        if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence) {
+            let _ = self.bytecode.unpause_task(task);
+        }
+        if let Some(value) = self.deferred_task_completions.remove(&task) {
+            self.task_modes.remove(&task);
+            if self.waiting_task == Some(task) {
+                self.waiting_task = None;
+                self.bytecode.resume_main(value)?;
             }
         }
         Ok(())
@@ -1153,6 +1193,13 @@ mod tests {
 
         let snapshot = runtime.snapshot().expect("waiting choice must be saveable");
         let mut restored = StoryRuntime::restore(bytecode, snapshot).expect("choice must restore");
+        assert_eq!(
+            restored.restored_boundary_event(),
+            Some(StoryRuntimeEvent::Choice {
+                prompt: String::new(),
+                options: vec!["Route A".into(), "Route B".into()],
+            })
+        );
         restored
             .resume(Value::Number(1.0))
             .expect("restored selection must start its branch");
@@ -1297,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_replays_an_in_flight_task_effect() {
+    fn snapshot_completes_an_in_flight_voice_without_replaying_it() {
         let bytecode = compile_story_bytecode(
             "task-save.story.hks",
             r#"
@@ -1316,13 +1363,17 @@ mod tests {
             .expect("an externally waiting task must be saveable");
         let mut restored =
             StoryRuntime::restore(bytecode, snapshot).expect("snapshot must restore");
-        assert!(matches!(
-            restored.step().expect("restored effect must be replayed"),
-            Some(StoryRuntimeEvent::TaskEffect {
-                effect: StoryEffect::PlayVoice { ref path, .. },
-                ..
-            }) if path == "voice/saved"
-        ));
+        loop {
+            match restored.step().expect("restored story must continue") {
+                Some(StoryRuntimeEvent::TaskEffect {
+                    effect: StoryEffect::PlayVoice { .. },
+                    ..
+                }) => panic!("loading must not replay an in-flight voice"),
+                Some(StoryRuntimeEvent::Completed(_)) => break,
+                Some(_) => {}
+                None => panic!("restored story stopped before completing"),
+            }
+        }
     }
 
     #[test]

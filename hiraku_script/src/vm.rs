@@ -11,7 +11,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 3;
+pub const BYTECODE_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -45,6 +45,7 @@ pub struct BytecodeFunction {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BytecodeRegion {
+    pub parameters: Vec<u32>,
     pub register_count: u16,
     pub instructions: Vec<Instruction>,
 }
@@ -297,6 +298,11 @@ fn compile_register_code(
         symbols,
     )?;
     Ok(BytecodeRegion {
+        parameters: function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.0)
+            .collect(),
         register_count,
         instructions,
     })
@@ -789,11 +795,24 @@ impl Vm {
         arguments: Vec<Value>,
     ) -> Result<Self, VmError> {
         match callable {
-            Value::Closure { .. } if arguments.is_empty() => Self::from_closure(bytecode, callable),
-            Value::Closure { .. } => Err(VmError::FunctionArity {
-                expected: 0,
-                actual: arguments.len(),
-            }),
+            Value::Closure { region, .. } => {
+                let metadata = bytecode
+                    .regions
+                    .get(*region as usize)
+                    .ok_or(VmError::UnknownRegion(*region))?;
+                if metadata.parameters.len() != arguments.len() {
+                    return Err(VmError::FunctionArity {
+                        expected: metadata.parameters.len(),
+                        actual: arguments.len(),
+                    });
+                }
+                let parameters = metadata.parameters.clone();
+                let mut vm = Self::from_closure(bytecode, callable)?;
+                for (local, value) in parameters.into_iter().zip(arguments) {
+                    *vm.local_mut(local)? = value;
+                }
+                Ok(vm)
+            }
             Value::Function { symbol, .. } => {
                 let index = bytecode
                     .functions
@@ -1046,13 +1065,29 @@ impl Vm {
                         Value::Closure {
                             region, captures, ..
                         } => {
-                            if !arguments.is_empty() {
+                            let parameters = self
+                                .bytecode
+                                .regions
+                                .get(region as usize)
+                                .ok_or(VmError::UnknownRegion(region))?
+                                .parameters
+                                .clone();
+                            if parameters.len() != arguments.len() {
                                 return Err(VmError::FunctionArity {
-                                    expected: 0,
+                                    expected: parameters.len(),
                                     actual: arguments.len(),
                                 });
                             }
-                            self.call_closure(region, captures, dst)?;
+                            self.call_closure(
+                                region,
+                                captures,
+                                parameters,
+                                arguments
+                                    .into_iter()
+                                    .map(|argument| argument.value)
+                                    .collect(),
+                                dst,
+                            )?;
                             continue;
                         }
                         _ => return Err(VmError::TypeMismatch("callee expects Function")),
@@ -1317,6 +1352,8 @@ impl Vm {
         &mut self,
         region: u32,
         captures: Vec<Value>,
+        parameters: Vec<u32>,
+        arguments: Vec<Value>,
         destination: Register,
     ) -> Result<(), VmError> {
         let code = self
@@ -1339,6 +1376,9 @@ impl Vm {
         self.pc = 0;
         self.registers = RegisterFrame::new(register_count);
         self.locals = captures.into_boxed_slice();
+        for (local, value) in parameters.into_iter().zip(arguments) {
+            *self.local_mut(local)? = value;
+        }
         Ok(())
     }
 
@@ -1699,6 +1739,23 @@ mod tests {
             }
                 if captures.contains(&Value::Number(4.0))
         ));
+    }
+
+    #[test]
+    fn typed_lambda_parameters_execute_through_dynamic_calls() {
+        let bytecode = compile(
+            "let add = { left: Int, right: Int -> left + right }\nlet result = add(2, 3)",
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        assert_eq!(bytecode.regions.len(), 1);
+        assert_eq!(bytecode.regions[0].parameters.len(), 2);
+
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("typed lambda executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert!(vm.snapshot().locals.contains(&Value::Number(5.0)));
     }
 
     #[test]

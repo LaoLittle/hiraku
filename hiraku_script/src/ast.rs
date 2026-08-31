@@ -142,6 +142,10 @@ pub enum ExprKind {
         type_name: String,
         fields: Vec<MapField>,
     },
+    Lambda {
+        parameters: Vec<FunctionParameter>,
+        body: Block,
+    },
     Block(Block),
     Binary {
         left: Box<Expr>,

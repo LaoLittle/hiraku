@@ -1,4 +1,9 @@
 use super::*;
+use bevy::{
+    input::mouse::MouseScrollUnit,
+    picking::events::Scroll,
+    ui::{VisualBox, widget::NodeImageMode},
+};
 
 pub(super) fn clear_screen_ui(commands: &mut Commands, screen_state: &mut ScreenUiState) {
     if let Some(root) = screen_state.active_root.take() {
@@ -31,11 +36,11 @@ pub fn cleanup_stale_screen_ui(
         {
             commands
                 .entity(pending.entity)
-                .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z)));
+                .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z)));
             if let Some(previous) = pending.previous {
                 commands
                     .entity(previous)
-                    .insert(GlobalZIndex(SCREEN_STALE_Z));
+                    .insert(GlobalZIndex(SCREEN_MODAL_STALE_Z));
                 screen_state.stale_roots.push(StaleScreenRoot {
                     entity: previous,
                     frames_remaining: 2,
@@ -48,7 +53,7 @@ pub fn cleanup_stale_screen_ui(
             if screen_images_ready(&images, &pending.wait_images) {
                 commands
                     .entity(pending.entity)
-                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_PENDING_Z)));
+                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_PENDING_Z)));
                 pending.ready_frames_remaining = pending.ready_frames_remaining.saturating_sub(1);
             }
             screen_state.pending_root = Some(pending);
@@ -381,6 +386,8 @@ fn spawn_screen_node_entity(
             border,
             hovered_background,
             pressed_background,
+            background_texture,
+            hovered_background_texture,
             hover_scale,
             press_scale,
             align,
@@ -390,15 +397,49 @@ fn spawn_screen_node_entity(
             radius,
             layout,
         }) => {
-            let normal_background = background
-                .map(color_from_rgba)
-                .unwrap_or(ui_style.choice_button_bg);
-            let hovered_background = hovered_background
-                .map(color_from_rgba)
-                .unwrap_or(ui_style.choice_button_hovered);
-            let pressed_background = pressed_background
-                .map(color_from_rgba)
-                .unwrap_or(ui_style.choice_button_pressed);
+            let normal_texture_resolved = background_texture
+                .as_ref()
+                .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
+            let normal_texture = background_texture.as_ref().map(|texture| {
+                normal_texture_resolved
+                    .map(|texture| texture.image.clone())
+                    .unwrap_or_else(|| asset_server.load(texture.path.clone()))
+            });
+            let hovered_texture_resolved = hovered_background_texture
+                .as_ref()
+                .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
+            let hovered_texture = hovered_background_texture.as_ref().map(|texture| {
+                hovered_texture_resolved
+                    .map(|texture| texture.image.clone())
+                    .unwrap_or_else(|| asset_server.load(texture.path.clone()))
+            });
+            image_handles.extend(normal_texture.iter().cloned());
+            image_handles.extend(hovered_texture.iter().cloned());
+            // A textured button uses its image as the complete visual surface.
+            // Keep the Bevy UI background transparent unless the script
+            // explicitly layers a color behind it.
+            let textured = background_texture.is_some();
+            let normal_background = background.map(color_from_rgba).unwrap_or_else(|| {
+                if textured {
+                    Color::NONE
+                } else {
+                    ui_style.choice_button_bg
+                }
+            });
+            let hovered_background = hovered_background.map(color_from_rgba).unwrap_or_else(|| {
+                if textured {
+                    Color::NONE
+                } else {
+                    ui_style.choice_button_hovered
+                }
+            });
+            let pressed_background = pressed_background.map(color_from_rgba).unwrap_or_else(|| {
+                if textured {
+                    Color::NONE
+                } else {
+                    ui_style.choice_button_pressed
+                }
+            });
             let insensitive_background = normal_background;
             let normal_text_color = color
                 .map(color_from_rgba)
@@ -453,13 +494,20 @@ fn spawn_screen_node_entity(
                     button_node,
                     UiTransform::IDENTITY,
                     BackgroundColor(initial_background),
-                    BorderColor::all(
-                        border
-                            .map(color_from_rgba)
-                            .unwrap_or(ui_style.choice_button_border),
-                    ),
+                    BorderColor::all(border.map(color_from_rgba).unwrap_or_else(|| {
+                        if textured {
+                            Color::NONE
+                        } else {
+                            ui_style.choice_button_border
+                        }
+                    })),
                 ))
                 .id();
+            if let Some(image) = normal_texture.clone() {
+                commands
+                    .entity(button)
+                    .insert(stretched_image_node(image, normal_texture_resolved));
+            }
             commands.entity(button).insert(ScreenUiButton {
                 root,
                 value: value.clone(),
@@ -475,6 +523,28 @@ fn spawn_screen_node_entity(
                 insensitive_text_color,
                 hover_scale: *hover_scale,
                 press_scale: *press_scale,
+                normal_texture: normal_texture.clone(),
+                normal_atlas: normal_texture_resolved.map(|texture| texture.atlas.clone()),
+                normal_rect: normal_texture_resolved
+                    .is_none()
+                    .then(|| {
+                        background_texture
+                            .as_ref()
+                            .and_then(|texture| texture.rect)
+                            .map(texture_rect)
+                    })
+                    .flatten(),
+                hovered_texture,
+                hovered_atlas: hovered_texture_resolved.map(|texture| texture.atlas.clone()),
+                hovered_rect: hovered_texture_resolved
+                    .is_none()
+                    .then(|| {
+                        hovered_background_texture
+                            .as_ref()
+                            .and_then(|texture| texture.rect)
+                            .map(texture_rect)
+                    })
+                    .flatten(),
             });
             if let Some(signal) = enabled_binding {
                 commands.entity(button).insert(UiEnabledBinding {
@@ -567,7 +637,7 @@ fn spawn_screen_node_entity(
                     ScreenUiNode,
                     Button,
                     BackgroundColor(Color::NONE),
-                    image_node(image.clone(), resolved),
+                    stretched_image_node(image.clone(), resolved),
                     node,
                     UiTransform::IDENTITY,
                     ScreenUiImageButton {
@@ -806,6 +876,91 @@ fn spawn_screen_node_entity(
             apply_live_layout_bindings(commands, container, layout);
             container
         }
+        ScreenNode::Scrollable(scrollable) => {
+            let mut node = Node {
+                width: percent(100.0),
+                flex_direction: FlexDirection::Column,
+                overflow: Overflow::scroll_y(),
+                ..default()
+            };
+            apply_screen_layout(&mut node, &scrollable.layout);
+            let container = commands
+                .spawn((
+                    ScreenUiNode,
+                    ScreenUiScrollable {
+                        speed: scrollable.speed,
+                    },
+                    ScrollPosition::default(),
+                    node,
+                ))
+                .id();
+            let children = scrollable
+                .children
+                .iter()
+                .map(|child| {
+                    spawn_screen_node_entity(
+                        commands,
+                        root,
+                        asset_server,
+                        texture_atlases,
+                        ui_fonts,
+                        ui_style,
+                        child,
+                        image_handles,
+                    )
+                })
+                .collect::<Vec<_>>();
+            commands.entity(container).add_children(&children);
+            apply_live_layout_bindings(commands, container, &scrollable.layout);
+            container
+        }
+        ScreenNode::Toggle(toggle) => {
+            let unchecked = &toggle.unchecked.texture;
+            let checked = &toggle.checked.texture;
+            let unchecked_resolved = texture_atlases.resolve(&unchecked.path, unchecked.rect);
+            let checked_resolved = texture_atlases.resolve(&checked.path, checked.rect);
+            let unchecked_image = unchecked_resolved
+                .map(|texture| texture.image.clone())
+                .unwrap_or_else(|| asset_server.load(unchecked.path.clone()));
+            let checked_image = checked_resolved
+                .map(|texture| texture.image.clone())
+                .unwrap_or_else(|| asset_server.load(checked.path.clone()));
+            image_handles.extend([unchecked_image.clone(), checked_image.clone()]);
+
+            let mut node = Node::default();
+            apply_screen_layout(&mut node, &toggle.unchecked.layout);
+            let (initial_image, initial_resolved) = if toggle.value {
+                (checked_image.clone(), checked_resolved)
+            } else {
+                (unchecked_image.clone(), unchecked_resolved)
+            };
+            let entity = commands
+                .spawn((
+                    ScreenUiNode,
+                    Button,
+                    BackgroundColor(Color::NONE),
+                    stretched_image_node(initial_image, initial_resolved),
+                    node,
+                    ScreenUiToggle {
+                        checked: toggle.value,
+                        unchecked_texture: unchecked_image,
+                        unchecked_atlas: unchecked_resolved.map(|texture| texture.atlas.clone()),
+                        unchecked_rect: unchecked_resolved
+                            .is_none()
+                            .then(|| unchecked.rect.map(texture_rect))
+                            .flatten(),
+                        checked_texture: checked_image,
+                        checked_atlas: checked_resolved.map(|texture| texture.atlas.clone()),
+                        checked_rect: checked_resolved
+                            .is_none()
+                            .then(|| checked.rect.map(texture_rect))
+                            .flatten(),
+                    },
+                ))
+                .id();
+            apply_live_layout_bindings(commands, entity, &toggle.unchecked.layout);
+            entity
+        }
         ScreenNode::Spacer(SpacerNode {
             width,
             height,
@@ -925,6 +1080,15 @@ fn image_node(image: Handle<Image>, atlas: Option<&crate::texture::AtlasTexture>
     }
 }
 
+fn stretched_image_node(
+    image: Handle<Image>,
+    atlas: Option<&crate::texture::AtlasTexture>,
+) -> ImageNode {
+    let mut node = image_node(image, atlas).with_mode(NodeImageMode::Stretch);
+    node.visual_box = VisualBox::BorderBox;
+    node
+}
+
 fn texture_rect(rect: [f32; 4]) -> Rect {
     Rect::from_corners(
         Vec2::new(rect[0], rect[1]),
@@ -992,6 +1156,7 @@ pub fn handle_screen_buttons(
             &PickingInteraction,
             &mut BackgroundColor,
             &mut UiTransform,
+            Option<&mut ImageNode>,
             &ScreenUiButton,
         ),
         Changed<PickingInteraction>,
@@ -999,7 +1164,7 @@ pub fn handle_screen_buttons(
     button_query: Query<&ScreenUiButton>,
     mut text_query: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
-    for (interaction, mut color, mut transform, button) in &mut interaction_query {
+    for (interaction, mut color, mut transform, image, button) in &mut interaction_query {
         if Some(button.root) != screen_state.active_root {
             continue;
         }
@@ -1010,6 +1175,7 @@ pub fn handle_screen_buttons(
             if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                 *text_color = button.insensitive_text_color.into();
             }
+            apply_screen_button_image(image, button, false);
             continue;
         }
 
@@ -1020,6 +1186,7 @@ pub fn handle_screen_buttons(
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.pressed_text_color.into();
                 }
+                apply_screen_button_image(image, button, true);
             }
             PickingInteraction::Hovered => {
                 transform.scale = Vec2::splat(button.hover_scale);
@@ -1027,6 +1194,7 @@ pub fn handle_screen_buttons(
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.hovered_text_color.into();
                 }
+                apply_screen_button_image(image, button, true);
             }
             PickingInteraction::None => {
                 transform.scale = Vec2::ONE;
@@ -1034,6 +1202,7 @@ pub fn handle_screen_buttons(
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.normal_text_color.into();
                 }
+                apply_screen_button_image(image, button, false);
             }
         }
     }
@@ -1058,6 +1227,25 @@ pub fn handle_screen_buttons(
             request: done,
             response: ScriptResponse::Choice(value),
         });
+    }
+}
+
+fn apply_screen_button_image(
+    mut image: Option<Mut<ImageNode>>,
+    button: &ScreenUiButton,
+    hovered: bool,
+) {
+    let Some(image) = image.as_deref_mut() else {
+        return;
+    };
+    if hovered && let Some(texture) = button.hovered_texture.as_ref() {
+        image.image = texture.clone();
+        image.texture_atlas = button.hovered_atlas.clone();
+        image.rect = button.hovered_rect;
+    } else if let Some(texture) = button.normal_texture.as_ref() {
+        image.image = texture.clone();
+        image.texture_atlas = button.normal_atlas.clone();
+        image.rect = button.normal_rect;
     }
 }
 
@@ -1154,6 +1342,63 @@ pub fn handle_screen_image_buttons(
             request: done,
             response: ScriptResponse::Choice(value),
         });
+    }
+}
+
+pub fn handle_screen_scroll(
+    mut scrolls: MessageReader<Pointer<Scroll>>,
+    mut scrollables: Query<(&ScreenUiScrollable, &mut ScrollPosition)>,
+    parents: Query<&ChildOf>,
+) {
+    for scroll in scrolls.read() {
+        let mut entity = scroll.entity;
+        loop {
+            if let Ok((scrollable, mut position)) = scrollables.get_mut(entity) {
+                let unit = match scroll.unit {
+                    MouseScrollUnit::Line => scrollable.speed,
+                    MouseScrollUnit::Pixel => 1.0,
+                };
+                position.x = (position.x - scroll.x * unit).max(0.0);
+                position.y = (position.y - scroll.y * unit).max(0.0);
+                break;
+            }
+            let Ok(parent) = parents.get(entity) else {
+                break;
+            };
+            entity = parent.parent();
+        }
+    }
+}
+
+pub fn handle_screen_toggles(
+    mut clicks: MessageReader<Pointer<Click>>,
+    mut toggles: Query<(&mut ScreenUiToggle, &mut ImageNode)>,
+    parents: Query<&ChildOf>,
+) {
+    for click in clicks.read() {
+        if click.button != PointerButton::Primary {
+            continue;
+        }
+        let mut entity = click.entity;
+        loop {
+            if let Ok((mut toggle, mut image)) = toggles.get_mut(entity) {
+                toggle.checked = !toggle.checked;
+                if toggle.checked {
+                    image.image = toggle.checked_texture.clone();
+                    image.texture_atlas = toggle.checked_atlas.clone();
+                    image.rect = toggle.checked_rect;
+                } else {
+                    image.image = toggle.unchecked_texture.clone();
+                    image.texture_atlas = toggle.unchecked_atlas.clone();
+                    image.rect = toggle.unchecked_rect;
+                }
+                break;
+            }
+            let Ok(parent) = parents.get(entity) else {
+                break;
+            };
+            entity = parent.parent();
+        }
     }
 }
 
@@ -1584,6 +1829,12 @@ mod tests {
                     insensitive_text_color: Color::WHITE,
                     hover_scale: 1.0,
                     press_scale: 1.0,
+                    normal_texture: None,
+                    normal_atlas: None,
+                    normal_rect: None,
+                    hovered_texture: None,
+                    hovered_atlas: None,
+                    hovered_rect: None,
                 },
             ))
             .id();

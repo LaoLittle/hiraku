@@ -504,7 +504,7 @@ pub fn start_hks_runtime(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let restored_blocked = story.is_blocked();
+    let restored_boundary = story.restored_boundary_event();
     runtime.story = Some(story);
     runtime.current_script = Some(startup_script);
     runtime.call_stack = call_stack;
@@ -520,15 +520,13 @@ pub fn start_hks_runtime(
             capabilities::StoryEffect::MountUiOverlay { name, component },
         ));
     }
-    if restored_blocked {
+    if let Some(boundary) = restored_boundary {
         if let Some(path) = runtime.pending_ui_screen.clone() {
             runtime
                 .story_events
                 .push_back(StoryRuntimeEvent::OpenUi { path });
         } else {
-            runtime.story_events.push_back(StoryRuntimeEvent::Wait(
-                capabilities::StoryWait::DialogueAdvance,
-            ));
+            runtime.story_events.push_back(boundary);
         }
     }
     Ok(())

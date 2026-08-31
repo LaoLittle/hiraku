@@ -924,12 +924,34 @@ impl Parser {
                 continue;
             }
             if self.at(TokenKind::LParen) {
-                let arguments = self.parse_arguments();
-                let trailing_block = self.parse_optional_trailing_block();
-                let end = trailing_block
+                let mut arguments = self.parse_arguments();
+                let trailing = self.parse_optional_trailing_callable();
+                let end = trailing
                     .as_ref()
-                    .map(|block| block.span.clone())
+                    .map(|expression| expression.span.clone())
                     .unwrap_or_else(|| self.previous().span.clone());
+                let trailing_block = match trailing {
+                    Some(Expr {
+                        kind: ExprKind::Block(block),
+                        ..
+                    }) => Some(block),
+                    Some(
+                        lambda @ Expr {
+                            kind: ExprKind::Lambda { .. },
+                            ..
+                        },
+                    ) => {
+                        let span = lambda.span;
+                        arguments.push(Argument {
+                            label: None,
+                            value: lambda,
+                            span,
+                        });
+                        None
+                    }
+                    Some(_) => unreachable!("a trailing callable is a block or lambda"),
+                    None => None,
+                };
                 expression = Expr {
                     span: Span::join(&expression.span, &end),
                     kind: ExprKind::Call {
@@ -941,14 +963,37 @@ impl Parser {
                 continue;
             }
             if allow_trailing_block && self.at(TokenKind::LBrace) {
-                let block = self.parse_block();
-                let span = Span::join(&expression.span, &block.span);
+                let trailing = self
+                    .parse_optional_trailing_callable()
+                    .expect("the trailing brace was checked");
+                let span = Span::join(&expression.span, &trailing.span);
+                let (arguments, trailing_block) = match trailing {
+                    Expr {
+                        kind: ExprKind::Block(block),
+                        ..
+                    } => (Vec::new(), Some(block)),
+                    lambda @ Expr {
+                        kind: ExprKind::Lambda { .. },
+                        ..
+                    } => {
+                        let argument_span = lambda.span;
+                        (
+                            vec![Argument {
+                                label: None,
+                                value: lambda,
+                                span: argument_span,
+                            }],
+                            None,
+                        )
+                    }
+                    _ => unreachable!("a trailing callable is a block or lambda"),
+                };
                 expression = Expr {
                     span,
                     kind: ExprKind::Call {
                         callee: Box::new(expression),
-                        arguments: Vec::new(),
-                        trailing_block: Some(block),
+                        arguments,
+                        trailing_block,
                     },
                 };
                 continue;
@@ -1036,14 +1081,7 @@ impl Parser {
             },
             TokenKind::LParen => self.parse_tuple(token.span.start),
             TokenKind::LBracket => self.parse_list(token.span.start),
-            TokenKind::LBrace => {
-                self.index -= 1;
-                let block = self.parse_block();
-                Expr {
-                    span: block.span.clone(),
-                    kind: ExprKind::Block(block),
-                }
-            }
+            TokenKind::LBrace => self.parse_braced_expression(token.span.start),
             _ => self.bad_expression(token.span, "expected expression"),
         }
     }
@@ -1164,12 +1202,20 @@ impl Parser {
         }
     }
 
-    fn parse_optional_trailing_block(&mut self) -> Option<Block> {
-        self.at(TokenKind::LBrace).then(|| self.parse_block())
+    fn parse_optional_trailing_callable(&mut self) -> Option<Expr> {
+        if !self.at(TokenKind::LBrace) {
+            return None;
+        }
+        let start = self.advance().span.start;
+        Some(self.parse_braced_expression(start))
     }
 
     fn parse_block(&mut self) -> Block {
         let start = self.expect(TokenKind::LBrace, "expected `{`").span.start;
+        self.parse_block_contents(start)
+    }
+
+    fn parse_block_contents(&mut self, start: usize) -> Block {
         let mut statements = Vec::new();
         self.skip_separators();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -1183,6 +1229,56 @@ impl Parser {
         Block {
             statements,
             span: Span { start, end },
+        }
+    }
+
+    fn parse_braced_expression(&mut self, start: usize) -> Expr {
+        let checkpoint = self.index;
+        let error_checkpoint = self.errors.len();
+        self.skip_newlines();
+        let mut parameters = Vec::new();
+        let mut lambda = self.at(TokenKind::Minus) && self.peek().kind == TokenKind::Gt;
+        while !lambda
+            && matches!(self.current().kind, TokenKind::Ident(_))
+            && matches!(self.peek().kind, TokenKind::Colon)
+        {
+            let parameter_start = self.current().span.clone();
+            let TokenKind::Ident(name) = self.advance().kind else {
+                unreachable!("the lambda parameter lookahead requires an identifier")
+            };
+            self.advance();
+            let ty = self.parse_type();
+            let span = Span::join(&parameter_start, &ty.span);
+            parameters.push(FunctionParameter {
+                name,
+                ty: Some(ty),
+                span,
+            });
+            self.skip_newlines();
+            if self.at(TokenKind::Comma) {
+                self.advance();
+                self.skip_newlines();
+                continue;
+            }
+            lambda = self.at(TokenKind::Minus) && self.peek().kind == TokenKind::Gt;
+            break;
+        }
+        if lambda {
+            self.advance();
+            self.advance();
+            let body = self.parse_block_contents(start);
+            return Expr {
+                span: body.span,
+                kind: ExprKind::Lambda { parameters, body },
+            };
+        }
+
+        self.index = checkpoint;
+        self.errors.truncate(error_checkpoint);
+        let block = self.parse_block_contents(start);
+        Expr {
+            span: block.span,
+            kind: ExprKind::Block(block),
         }
     }
 
@@ -1291,6 +1387,44 @@ mod tests {
     fn parses_unit_literal_separately_from_tuples() {
         assert_eq!(expression("()").kind, ExprKind::Unit);
         assert!(matches!(expression("(1, 2)").kind, ExprKind::Tuple(values) if values.len() == 2));
+    }
+
+    #[test]
+    fn parses_typed_lambda_parameters_without_confusing_dialogue_colons() {
+        let lambda = expression("{ index: Int, label: String -> label }");
+        let ExprKind::Lambda { parameters, body } = lambda.kind else {
+            panic!("expected a typed lambda");
+        };
+        assert_eq!(parameters.len(), 2);
+        assert_eq!(parameters[0].name, "index");
+        assert_eq!(parameters[1].name, "label");
+        assert_eq!(body.statements.len(), 1);
+
+        assert!(matches!(
+            expression("{ speaker: \"line\" }").kind,
+            ExprKind::Block(_)
+        ));
+
+        let trailing = expression("render { index: Int, label: String -> label }");
+        let ExprKind::Call {
+            arguments,
+            trailing_block,
+            ..
+        } = trailing.kind
+        else {
+            panic!("expected a call with a trailing lambda");
+        };
+        assert!(trailing_block.is_none());
+        assert!(matches!(
+            arguments.as_slice(),
+            [Argument {
+                value: Expr {
+                    kind: ExprKind::Lambda { .. },
+                    ..
+                },
+                ..
+            }]
+        ));
     }
 
     #[test]

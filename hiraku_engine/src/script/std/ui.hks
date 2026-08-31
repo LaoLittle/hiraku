@@ -21,6 +21,14 @@ global fn row(content: Function) -> UiNode {
     __uiRow(content)
 }
 
+global fn scrollable(content: Function) -> UiNode {
+    __uiScrollable(content)
+}
+
+global fn toggle(value: Bool, content: Function) -> UiNode {
+    __uiToggle(value, content)
+}
+
 global fn image(path: String) -> UiNode {
     __uiImage(path)
 }

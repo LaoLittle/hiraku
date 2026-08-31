@@ -88,8 +88,27 @@ pub enum ScreenNode {
     Row(ContainerNode),
     /// A vertical flex container.
     Column(ContainerNode),
+    /// A clipped vertical viewport whose children can be scrolled.
+    Scrollable(ScrollableNode),
+    /// A locally stateful two-visual toggle.
+    Toggle(ToggleNode),
     /// Empty fixed-size space.
     Spacer(SpacerNode),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScrollableNode {
+    pub children: Vec<ScreenNode>,
+    pub speed: f32,
+    #[serde(default)]
+    pub layout: ScreenLayout,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToggleNode {
+    pub unchecked: ScreenImageNode,
+    pub checked: ScreenImageNode,
+    pub value: bool,
 }
 
 /// Shared layout options supported by most screen nodes.
@@ -382,6 +401,10 @@ pub struct ButtonNode {
     /// Pressed background color.
     #[serde(default)]
     pub pressed_background: Option<[f32; 4]>,
+    #[serde(default)]
+    pub background_texture: Option<ScreenTexture>,
+    #[serde(default)]
+    pub hovered_background_texture: Option<ScreenTexture>,
     /// Scale applied while hovering. Defaults to `1.0`.
     #[serde(default = "default_interaction_scale")]
     pub hover_scale: f32,
@@ -623,6 +646,12 @@ pub struct ScreenUiButton {
     pub insensitive_text_color: Color,
     pub hover_scale: f32,
     pub press_scale: f32,
+    pub normal_texture: Option<Handle<Image>>,
+    pub normal_atlas: Option<TextureAtlas>,
+    pub normal_rect: Option<Rect>,
+    pub hovered_texture: Option<Handle<Image>>,
+    pub hovered_atlas: Option<TextureAtlas>,
+    pub hovered_rect: Option<Rect>,
 }
 
 /// Marker component for the text child of a screen button.
@@ -660,6 +689,22 @@ pub struct ScreenUiImageButton {
     pub hover_scale: f32,
     /// Script-authored scale applied while pressed.
     pub press_scale: f32,
+}
+
+#[derive(Component)]
+pub struct ScreenUiScrollable {
+    pub speed: f32,
+}
+
+#[derive(Component)]
+pub struct ScreenUiToggle {
+    pub checked: bool,
+    pub unchecked_texture: Handle<Image>,
+    pub unchecked_atlas: Option<TextureAtlas>,
+    pub unchecked_rect: Option<Rect>,
+    pub checked_texture: Handle<Image>,
+    pub checked_atlas: Option<TextureAtlas>,
+    pub checked_rect: Option<Rect>,
 }
 
 fn default_interaction_scale() -> f32 {

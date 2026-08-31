@@ -46,9 +46,9 @@ use crate::{
     ui::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
-        ScreenUiImageButton, ScreenUiNode, ScreenUiRoot, ScreenUiState, SpacerNode,
-        StaleScreenRoot, TextNode, UiAnimationPlayer, UiEnabledBinding, UiModels,
-        UiProgressBinding, UiReactiveEnabledBinding, UiReactiveProgressBinding,
+        ScreenUiImageButton, ScreenUiNode, ScreenUiRoot, ScreenUiScrollable, ScreenUiState,
+        ScreenUiToggle, SpacerNode, StaleScreenRoot, TextNode, UiAnimationPlayer, UiEnabledBinding,
+        UiModels, UiProgressBinding, UiReactiveEnabledBinding, UiReactiveProgressBinding,
         UiReactiveTextBinding, UiReactiveVisibilityBinding, UiTextBinding, UiVisibilityBinding,
     },
     vfs::VfsResource,
@@ -67,7 +67,8 @@ use character::{
 };
 pub use screen_ui::{
     animate_screen_ui, cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons,
-    update_builtin_ui_models, update_ui_reactive_bindings, update_ui_text_bindings,
+    handle_screen_scroll, handle_screen_toggles, update_builtin_ui_models,
+    update_ui_reactive_bindings, update_ui_text_bindings,
 };
 use screen_ui::{
     clear_overlay_ui, clear_screen_ui, screen_images_ready,
@@ -78,9 +79,10 @@ const STAGE_Z_BACKGROUND: f32 = 0.0;
 const STAGE_Z_SPRITE: f32 = 10.0;
 const STAGE_Z_OVERLAY: f32 = 30.0;
 const SCREEN_READY_FRAMES: u8 = 0;
-const SCREEN_PENDING_Z: i32 = 90;
 const SCREEN_ACTIVE_Z: i32 = 100;
-const SCREEN_STALE_Z: i32 = 80;
+const SCREEN_MODAL_ACTIVE_Z: i32 = 120;
+const SCREEN_MODAL_PENDING_Z: i32 = 119;
+const SCREEN_MODAL_STALE_Z: i32 = 118;
 
 const BUTTON_NORMAL: Color = Color::srgb(0.13, 0.15, 0.19);
 const BUTTON_HOVERED: Color = Color::srgb(0.22, 0.26, 0.32);
@@ -223,6 +225,7 @@ pub struct StageState {
     /// Logical restored parts waiting to be reconciled into render entities.
     /// This keeps mask/blend metadata intact while their assets are loading.
     pub pending_character_restore: Vec<SpriteSnapshot>,
+    pub pending_bgm_restore: Option<AudioSnapshot>,
     pub bgm: Option<Entity>,
 }
 
@@ -379,6 +382,26 @@ fn evaluate_ui_at(
     textures: Option<&TextureCatalog>,
     terms: Option<&TermCatalog>,
 ) -> Result<ScreenSpec, String> {
+    evaluate_ui_at_with(
+        target,
+        runtime,
+        vfs,
+        user_settings,
+        textures,
+        terms,
+        BTreeMap::new(),
+    )
+}
+
+fn evaluate_ui_at_with(
+    target: &str,
+    runtime: &ScriptRuntimeState,
+    vfs: &VfsResource,
+    user_settings: &UserSettings,
+    textures: Option<&TextureCatalog>,
+    terms: Option<&TermCatalog>,
+    extra_values: BTreeMap<String, StoredValue>,
+) -> Result<ScreenSpec, String> {
     let mut values = runtime
         .story
         .as_ref()
@@ -398,6 +421,7 @@ fn evaluate_ui_at(
     );
     values.insert("dialogue".to_string(), default_dialogue_model());
     values.insert("history".to_string(), default_history_model());
+    values.extend(extra_values);
     let source = vfs.0.read_text(target).map_err(|error| error.to_string())?;
     let textures = textures.ok_or_else(|| "texture catalog is unavailable".to_string())?;
     let terms = terms.ok_or_else(|| "term catalog is unavailable".to_string())?;
@@ -690,20 +714,44 @@ pub fn bridge_story_events(
             StoryRuntimeEvent::Choice { prompt, options } => {
                 let request = runtime.allocate_request();
                 runtime.wait_request = Some(request);
-                pending_script_commands
-                    .items
-                    .push_back(ScriptCommand::Choose {
-                        prompt,
-                        options: options
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, text)| ChoiceOption {
-                                text,
-                                value: StoredValue::Int(index as i64),
+                let Some(target) = runtime.ui_registry.get("choice").cloned() else {
+                    warn!(
+                        "choice UI is not configured; call ui.set(\"choice\", \"path/to/choice.ui.hks\") before executing choice"
+                    );
+                    runtime.story = None;
+                    runtime.story_events.clear();
+                    return;
+                };
+                let choice_model = StoredValue::Map(BTreeMap::from([
+                    ("prompt".into(), StoredValue::String(prompt)),
+                    (
+                        "options".into(),
+                        StoredValue::Array(options.into_iter().map(StoredValue::String).collect()),
+                    ),
+                ]));
+                match evaluate_ui_at_with(
+                    &target,
+                    &runtime,
+                    &vfs,
+                    &user_settings,
+                    textures.as_deref(),
+                    terms.as_deref(),
+                    BTreeMap::from([("choice".into(), choice_model)]),
+                ) {
+                    Ok(screen) => {
+                        pending_script_commands
+                            .items
+                            .push_back(ScriptCommand::ShowScreen {
+                                screen,
+                                done: Some(request),
                             })
-                            .collect(),
-                        done: request,
-                    });
+                    }
+                    Err(error) => {
+                        warn!("failed to render choice UI `{target}`: {error}");
+                        runtime.story = None;
+                        runtime.story_events.clear();
+                    }
+                }
             }
             StoryRuntimeEvent::OpenUi { path } => {
                 let target = runtime.ui_registry.get(&path).cloned().unwrap_or_else(|| {
@@ -2746,13 +2794,13 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if previous.is_none() && images_ready {
                     commands
                         .entity(root)
-                        .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z)));
+                        .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z)));
                     screen_state.active_root = Some(root);
                     screen_state.waiting = done;
                 } else {
                     commands
                         .entity(root)
-                        .insert((Visibility::Hidden, GlobalZIndex(SCREEN_PENDING_Z)));
+                        .insert((Visibility::Hidden, GlobalZIndex(SCREEN_MODAL_PENDING_Z)));
                     screen_state.pending_root = Some(crate::ui::PendingScreenRoot {
                         entity: root,
                         previous,
@@ -3368,6 +3416,50 @@ pub fn prepare_bgm_preludes(
             ))
             .try_remove::<BgmPrelude>();
     }
+}
+
+pub fn reconcile_restored_bgm(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    audio: Res<AudioCatalog>,
+    user_settings: Res<UserSettings>,
+    mut stage: ResMut<StageState>,
+) {
+    let Some(snapshot) = stage.pending_bgm_restore.take() else {
+        return;
+    };
+    let playback_volume = apply_volume_setting(snapshot.volume, user_settings.bgm_volume);
+    let loop_audio = asset_server.load(snapshot.path.clone());
+    let entity = if let Some(prelude) = audio
+        .resolve_music_path(&snapshot.path)
+        .and_then(|definition| definition.prelude.as_ref())
+    {
+        commands
+            .spawn((
+                BgmChannel {
+                    path: snapshot.path,
+                    volume: snapshot.volume,
+                },
+                BgmPrelude {
+                    prelude_audio: asset_server.load(prelude.clone()),
+                    loop_audio,
+                    start_volume: playback_volume,
+                },
+            ))
+            .id()
+    } else {
+        commands
+            .spawn((
+                BgmChannel {
+                    path: snapshot.path,
+                    volume: snapshot.volume,
+                },
+                AudioPlayer::new(loop_audio),
+                PlaybackSettings::LOOP.with_volume(Volume::Linear(playback_volume)),
+            ))
+            .id()
+    };
+    stage.bgm = Some(entity);
 }
 
 pub fn apply_live_audio_settings(
@@ -4251,12 +4343,17 @@ pub fn sync_scene_snapshot(
             .collect();
     }
 
-    snapshot.bgm = stage.bgm.and_then(|entity| {
-        bgms.get(entity).ok().map(|bgm| AudioSnapshot {
-            path: bgm.path.clone(),
-            volume: bgm.volume,
-        })
-    });
+    // Restoring an intro + loop track is a two-phase operation: the snapshot is
+    // accepted first and the audio entity is spawned by `reconcile_restored_bgm`
+    // on the next runtime tick. Keep the saved track intact during that gap.
+    if stage.pending_bgm_restore.is_none() {
+        snapshot.bgm = stage.bgm.and_then(|entity| {
+            bgms.get(entity).ok().map(|bgm| AudioSnapshot {
+                path: bgm.path.clone(),
+                volume: bgm.volume,
+            })
+        });
+    }
 
     if let Ok(overlay_sprite) = overlay.single() {
         snapshot.overlay_alpha = overlay_sprite.color.alpha();
@@ -5026,6 +5123,12 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
             ctx.commands
                 .entity(screen_button.text_entity)
                 .insert(TextColor(screen_button.normal_text_color));
+            if let Some(texture) = screen_button.normal_texture.as_ref() {
+                let mut image = ImageNode::new(texture.clone());
+                image.texture_atlas = screen_button.normal_atlas.clone();
+                image.rect = screen_button.normal_rect;
+                ctx.commands.entity(button_entity).insert(image);
+            }
         } else {
             ctx.commands
                 .entity(button_entity)
@@ -5183,6 +5286,7 @@ fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiSt
     let root = commands
         .spawn((
             PauseMenuRoot,
+            GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + 10),
             Node {
                 position_type: PositionType::Absolute,
                 left: px(0.0),
@@ -5335,7 +5439,7 @@ fn restore_scene_snapshot(
     dialogue_root: &mut Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     speaker_text: &mut Query<&mut Text, (With<SpeakerText>, Without<LineText>)>,
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
-    user_settings: &UserSettings,
+    _user_settings: &UserSettings,
     snapshot: SceneSnapshot,
 ) {
     let text_effect = snapshot.text_effect.clone();
@@ -5366,6 +5470,7 @@ fn restore_scene_snapshot(
     if let Some(bgm) = stage.bgm.take() {
         commands.entity(bgm).try_despawn();
     }
+    stage.pending_bgm_restore = snapshot.bgm.clone();
 
     if let Some(background) = snapshot.background.as_ref() {
         stage.background = Some(
@@ -5420,22 +5525,6 @@ fn restore_scene_snapshot(
         .iter()
         .map(|(actor_id, position)| (actor_id.clone(), Vec2::new(position[0], position[1])))
         .collect();
-
-    if let Some(bgm) = snapshot.bgm.as_ref() {
-        let playback_volume = apply_volume_setting(bgm.volume, user_settings.bgm_volume);
-        stage.bgm = Some(
-            commands
-                .spawn((
-                    BgmChannel {
-                        path: bgm.path.clone(),
-                        volume: bgm.volume,
-                    },
-                    AudioPlayer::new(asset_server.load(bgm.path.clone())),
-                    PlaybackSettings::LOOP.with_volume(Volume::Linear(playback_volume)),
-                ))
-                .id(),
-        );
-    }
 
     if let Some(overlay) = stage.overlay {
         commands.entity(overlay).insert(WorldSprite::from_color(

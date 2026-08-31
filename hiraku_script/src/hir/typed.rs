@@ -102,6 +102,10 @@ pub enum HirExprKind<'hir> {
         type_name: Option<SymbolId>,
         fields: &'hir [(SymbolId, &'hir HirExpr<'hir>)],
     },
+    Lambda {
+        parameters: &'hir [HirLocalId],
+        body: &'hir HirBlock<'hir>,
+    },
     Block(&'hir HirBlock<'hir>),
     Binary {
         left: &'hir HirExpr<'hir>,
@@ -884,9 +888,32 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 };
                 (HirExprKind::Map { type_name, fields }, ty)
             }
+            ExprKind::Lambda { parameters, body } => {
+                self.scopes.push(BTreeMap::new());
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| {
+                        let ty = parameter
+                            .ty
+                            .as_ref()
+                            .and_then(|ty| self.type_from_ast(ty))
+                            .unwrap_or(ScriptType::Any);
+                        self.declare_local(&parameter.name, ty, false, parameter.span)
+                    })
+                    .collect::<Vec<_>>();
+                let body = self.lower_block(body, false);
+                self.scopes.pop();
+                (
+                    HirExprKind::Lambda {
+                        parameters: self.arena.alloc_slice_copy(&parameters),
+                        body,
+                    },
+                    ScriptType::Function,
+                )
+            }
             ExprKind::Block(block) => {
                 let block = self.lower_block(block, true);
-                (HirExprKind::Block(block), ScriptType::Any)
+                (HirExprKind::Block(block), ScriptType::Function)
             }
             ExprKind::Binary { left, op, right } => {
                 let left = self.lower_expression(left);

@@ -129,6 +129,12 @@ impl AudioCatalog {
     pub fn resolve_sfx(&self, name: &str) -> Option<&AudioDefinition> {
         self.sfx.get(name)
     }
+
+    pub fn resolve_music_path(&self, path: &str) -> Option<&AudioDefinition> {
+        self.music
+            .values()
+            .find(|definition| definition.path == path)
+    }
 }
 
 #[derive(Debug, Error)]

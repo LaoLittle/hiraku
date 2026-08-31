@@ -42,11 +42,12 @@ use scene::{
     animate_screen_ui, animate_visual_tweens, apply_animation_cancellations,
     apply_live_audio_settings, bridge_story_events, cleanup_stale_screen_ui,
     handle_choice_action_input, handle_choice_buttons, handle_runtime_menu_buttons,
-    handle_screen_buttons, handle_screen_image_buttons, poll_pending_character_shows,
-    poll_voice_playback, prepare_bgm_preludes, process_script_commands,
-    reconcile_restored_characters, setup_frontend, setup_stage, sync_scene_snapshot,
-    tick_animation_waits, tick_pending_waits, tick_script_batches, update_builtin_ui_models,
-    update_ui_reactive_bindings, update_ui_text_bindings,
+    handle_screen_buttons, handle_screen_image_buttons, handle_screen_scroll,
+    handle_screen_toggles, poll_pending_character_shows, poll_voice_playback, prepare_bgm_preludes,
+    process_script_commands, reconcile_restored_bgm, reconcile_restored_characters, setup_frontend,
+    setup_stage, sync_scene_snapshot, tick_animation_waits, tick_pending_waits,
+    tick_script_batches, update_builtin_ui_models, update_ui_reactive_bindings,
+    update_ui_text_bindings,
 };
 use script::{
     ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
@@ -213,6 +214,12 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
+                reconcile_restored_bgm
+                    .before(tick_script_runtime)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
                 bridge_story_events
                     .after(tick_script_runtime)
                     .in_set(HirakuRuntimeSystems),
@@ -274,6 +281,12 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
+                (handle_screen_scroll, handle_screen_toggles)
+                    .after(cleanup_stale_screen_ui)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
                 handle_choice_buttons
                     .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
@@ -321,6 +334,7 @@ impl Plugin for HirakuPlugin {
                     tick_script_batches.in_set(HirakuRuntimeSystems),
                     sync_scene_snapshot
                         .after(poll_pending_character_shows)
+                        .after(reconcile_restored_bgm)
                         .in_set(HirakuRuntimeSystems),
                 ),
             );

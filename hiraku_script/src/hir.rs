@@ -188,6 +188,15 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
                 intern_expression(&field.value, symbols);
             }
         }
+        ExprKind::Lambda { parameters, body } => {
+            for parameter in parameters {
+                symbols.intern(&parameter.name);
+                if let Some(ty) = &parameter.ty {
+                    intern_type(ty, symbols);
+                }
+            }
+            intern_block(body, symbols);
+        }
         ExprKind::Block(block) => intern_block(block, symbols),
         ExprKind::Binary { left, right, .. } => {
             intern_expression(left, symbols);

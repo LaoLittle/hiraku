@@ -21,6 +21,7 @@ pub struct MirProgram {
 pub struct MirFunction {
     pub blocks: Vec<MirBasicBlock>,
     pub regions: Vec<MirFunction>,
+    pub parameters: Vec<crate::HirLocalId>,
     pub virtual_register_count: u32,
 }
 
@@ -223,11 +224,11 @@ pub struct MirLoweringError {
 
 pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLoweringError>> {
     let mut errors = Vec::new();
-    let entry = MirBuilder::lower(hir.entry, false, &mut errors);
+    let entry = MirBuilder::lower(hir.entry, false, Vec::new(), &mut errors);
     let functions = hir
         .functions
         .iter()
-        .map(|function| MirBuilder::lower(function.body, true, &mut errors))
+        .map(|function| MirBuilder::lower(function.body, true, Vec::new(), &mut errors))
         .collect();
     if errors.is_empty() {
         Ok(MirProgram { entry, functions })
@@ -247,6 +248,7 @@ impl MirBuilder {
     fn lower(
         block: &HirBlock<'_>,
         function: bool,
+        parameters: Vec<crate::HirLocalId>,
         errors: &mut Vec<MirLoweringError>,
     ) -> MirFunction {
         let mut builder = Self {
@@ -269,6 +271,7 @@ impl MirBuilder {
         MirFunction {
             blocks: builder.blocks,
             regions: builder.regions,
+            parameters,
             virtual_register_count: builder.next_register,
         }
     }
@@ -524,7 +527,18 @@ impl MirBuilder {
                 Some(dst)
             }
             HirExprKind::Block(block) => {
-                let region = Self::lower(block, true, errors);
+                let region = Self::lower(block, true, Vec::new(), errors);
+                let region_id = self.regions.len() as u32;
+                self.regions.push(region);
+                let dst = self.register();
+                self.push(MirInstruction::MakeClosure {
+                    dst,
+                    region: region_id,
+                });
+                Some(dst)
+            }
+            HirExprKind::Lambda { parameters, body } => {
+                let region = Self::lower(body, true, parameters.to_vec(), errors);
                 let region_id = self.regions.len() as u32;
                 self.regions.push(region);
                 let dst = self.register();

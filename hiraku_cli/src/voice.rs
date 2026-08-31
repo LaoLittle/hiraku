@@ -235,7 +235,7 @@ impl Collector<'_> {
                     self.expression(&field.value);
                 }
             }
-            ExprKind::Block(block) => self.block(block),
+            ExprKind::Lambda { body, .. } | ExprKind::Block(body) => self.block(body),
             ExprKind::Binary { left, right, .. } => {
                 self.expression(left);
                 self.expression(right);

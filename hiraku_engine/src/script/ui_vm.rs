@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hiraku_script::native::{
-    FromHksValue, HksBindable, HksBinding, HksClosure, IntoHksValue, NativeError, NativeRegistry,
+    FromHksValue, HksBindable, HksBinding, HksCallable, HksClosure, IntoHksValue, NativeError,
+    NativeRegistry,
 };
 use hiraku_script::{
     BuiltinManifest, LinkedVm, LinkedVmEvent, ModuleId, RenderOptions, ScriptType, SourceMap,
@@ -16,8 +17,8 @@ use crate::{
     texture::TextureCatalog,
     ui::{
         BarNode, ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
-        ScreenNode, ScreenSpec, ScreenTexture, SpacerNode, TextNode, UiPhaseAnimation,
-        UiReactiveBinding,
+        ScreenNode, ScreenSpec, ScreenTexture, ScrollableNode, SpacerNode, TextNode, ToggleNode,
+        UiPhaseAnimation, UiReactiveBinding,
     },
 };
 
@@ -65,6 +66,9 @@ enum UiDraftKind {
     Screen,
     Column,
     Row,
+    Scrollable,
+    Toggle(bool),
+    ChoiceOptions(HksCallable),
     Image(String),
     Text(HksBindable<String>),
     Term(TermId),
@@ -82,6 +86,7 @@ struct UiDraft {
     kind: UiDraftKind,
     content: Option<HksClosure>,
     hovered: Option<HksClosure>,
+    checked: Option<HksClosure>,
     action: Option<String>,
     layout: ScreenLayout,
     panel: bool,
@@ -92,12 +97,15 @@ struct UiDraft {
     hovered_when_disabled: bool,
     hover_scale: f32,
     press_scale: f32,
+    scroll_speed: f32,
     gap: f32,
     padding: f32,
     surface: Option<[f32; 4]>,
     text_size: Option<f32>,
     text_color: Option<[f32; 4]>,
     background_texture: Option<String>,
+    button_background_texture: Option<String>,
+    button_hovered_background_texture: Option<String>,
     overlay: Option<[f32; 4]>,
     animation: Option<AnimationSpec>,
     phase_animation: Option<UiPhaseAnimation>,
@@ -109,6 +117,7 @@ impl UiDraft {
             kind,
             content,
             hovered: None,
+            checked: None,
             action: None,
             layout: ScreenLayout::default(),
             panel: true,
@@ -119,12 +128,15 @@ impl UiDraft {
             hovered_when_disabled: false,
             hover_scale: 1.0,
             press_scale: 1.0,
+            scroll_speed: 48.0,
             gap: 12.0,
             padding: 0.0,
             surface: None,
             text_size: None,
             text_color: None,
             background_texture: None,
+            button_background_texture: None,
+            button_hovered_background_texture: None,
             overlay: None,
             animation: None,
             phase_animation: None,
@@ -185,6 +197,31 @@ mod native_ui {
     #[hks(name = "__uiRow")]
     fn ui_row(context: &mut UiVmContext, content: HksClosure) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Row, Some(content))))
+    }
+
+    #[hks(name = "__uiScrollable")]
+    fn ui_scrollable(
+        context: &mut UiVmContext,
+        content: HksClosure,
+    ) -> Result<UiNodeHandle, NativeError> {
+        Ok(context.insert(UiDraft::new(UiDraftKind::Scrollable, Some(content))))
+    }
+
+    #[hks(name = "__uiToggle")]
+    fn ui_toggle(
+        context: &mut UiVmContext,
+        value: bool,
+        content: HksClosure,
+    ) -> Result<UiNodeHandle, NativeError> {
+        Ok(context.insert(UiDraft::new(UiDraftKind::Toggle(value), Some(content))))
+    }
+
+    #[hks(name = "choiceOptions")]
+    fn ui_choice_options(
+        context: &mut UiVmContext,
+        renderer: HksCallable,
+    ) -> Result<UiNodeHandle, NativeError> {
+        Ok(context.insert(UiDraft::new(UiDraftKind::ChoiceOptions(renderer), None)))
     }
 
     #[hks(name = "__uiImage")]
@@ -424,6 +461,26 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "buttonImage", receiver)]
+    fn ui_button_image(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        texture: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.button_background_texture = Some(texture);
+        Ok(node)
+    }
+
+    #[hks(name = "hoveredButtonImage", receiver)]
+    fn ui_hovered_button_image(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        texture: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.button_hovered_background_texture = Some(texture);
+        Ok(node)
+    }
+
     #[hks(name = "overlay", receiver)]
     fn ui_overlay(
         context: &mut UiVmContext,
@@ -528,6 +585,32 @@ mod native_ui {
         scale: f64,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.press_scale = positive(scale, "UI press scale")?;
+        Ok(node)
+    }
+
+    #[hks(name = "scrollSpeed", receiver)]
+    fn ui_scroll_speed(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        speed: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.scroll_speed = positive(speed, "UI scroll speed")?;
+        Ok(node)
+    }
+
+    #[hks(name = "checked", receiver)]
+    fn ui_checked(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        content: HksClosure,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Toggle(_)) {
+            return Err(NativeError::message(
+                "checked content is only valid on toggle nodes",
+            ));
+        }
+        draft.checked = Some(content);
         Ok(node)
     }
 
@@ -988,6 +1071,19 @@ fn closure_children(
     collect_nodes(vm, registry, context)
 }
 
+fn closure_children_with_args(
+    callable: HksCallable,
+    arguments: Vec<Value>,
+    program: &hiraku_script::LinkedProgram,
+    registry: &NativeRegistry<UiVmContext>,
+    context: &mut UiVmContext,
+) -> Result<Vec<UiNodeHandle>, UiVmError> {
+    let callable = callable.into_value();
+    let vm = LinkedVm::from_callable(program.clone(), &callable, arguments)
+        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    collect_nodes(vm, registry, context)
+}
+
 fn context_globals(context: &UiVmContext) -> BTreeMap<String, Value> {
     let mut globals = context
         .values
@@ -1261,6 +1357,111 @@ fn materialize_node(
                 layout: draft.layout,
             }))
         }
+        UiDraftKind::Scrollable => {
+            let child_handles = closure_children(draft.content, program, registry, context)?;
+            let children = child_handles
+                .into_iter()
+                .map(|child| materialize_node(child, program, registry, context, textures))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScreenNode::Scrollable(ScrollableNode {
+                children,
+                speed: draft.scroll_speed,
+                layout: draft.layout,
+            }))
+        }
+        UiDraftKind::Toggle(value) => {
+            let normal_handles = closure_children(draft.content, program, registry, context)?;
+            let checked_handles = closure_children(draft.checked, program, registry, context)?;
+            let [normal_handle] = normal_handles.as_slice() else {
+                return Err(UiVmError::Invalid(
+                    "toggle content must produce exactly one image node".into(),
+                ));
+            };
+            let normal = materialize_node(*normal_handle, program, registry, context, textures)?;
+            let ScreenNode::Image(unchecked) = normal else {
+                return Err(UiVmError::Invalid(
+                    "toggle content must produce image(...)".into(),
+                ));
+            };
+            let checked = match checked_handles.as_slice() {
+                [] => unchecked.clone(),
+                [handle] => {
+                    let checked = materialize_node(*handle, program, registry, context, textures)?;
+                    let ScreenNode::Image(checked) = checked else {
+                        return Err(UiVmError::Invalid(
+                            "checked content must produce image(...)".into(),
+                        ));
+                    };
+                    checked
+                }
+                _ => {
+                    return Err(UiVmError::Invalid(
+                        "checked content must produce at most one image node".into(),
+                    ));
+                }
+            };
+            Ok(ScreenNode::Toggle(ToggleNode {
+                unchecked,
+                checked,
+                value,
+            }))
+        }
+        UiDraftKind::ChoiceOptions(renderer) => {
+            let options = context
+                .values
+                .story_values()
+                .get("choice")
+                .and_then(|choice| match choice {
+                    StoredValue::Map(fields) => fields.get("options"),
+                    _ => None,
+                })
+                .and_then(|options| match options {
+                    StoredValue::Array(options) => Some(options.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    UiVmError::Invalid(
+                        "choiceOptions requires the engine-owned choice.options model".into(),
+                    )
+                })?;
+            let mut children = Vec::with_capacity(options.len());
+            for (index, option) in options.into_iter().enumerate() {
+                let StoredValue::String(label) = option else {
+                    return Err(UiVmError::Invalid(
+                        "choice.options entries must be strings".into(),
+                    ));
+                };
+                let rendered = closure_children_with_args(
+                    renderer.clone(),
+                    vec![Value::Number(index as f64), Value::String(label)],
+                    program,
+                    registry,
+                    context,
+                )?;
+                if rendered.len() != 1 {
+                    return Err(UiVmError::Invalid(
+                        "choice option renderer must return exactly one UiNode".into(),
+                    ));
+                }
+                children.push(materialize_node(
+                    rendered[0],
+                    program,
+                    registry,
+                    context,
+                    textures,
+                )?);
+            }
+            Ok(ScreenNode::Column(ContainerNode {
+                gap: draft.gap,
+                padding: draft.padding,
+                background: draft.surface,
+                border: None,
+                justify: Some("center".into()),
+                align_items: Some("stretch".into()),
+                layout: draft.layout,
+                children,
+            }))
+        }
         UiDraftKind::Column | UiDraftKind::Row => {
             let row = matches!(draft.kind, UiDraftKind::Row);
             let child_handles = closure_children(draft.content, program, registry, context)?;
@@ -1324,6 +1525,16 @@ fn materialize_node(
                     border: None,
                     hovered_background: None,
                     pressed_background: None,
+                    background_texture: draft
+                        .button_background_texture
+                        .as_deref()
+                        .map(|name| resolve_texture(textures, name))
+                        .transpose()?,
+                    hovered_background_texture: draft
+                        .button_hovered_background_texture
+                        .as_deref()
+                        .map(|name| resolve_texture(textures, name))
+                        .transpose()?,
                     hover_scale: draft.hover_scale,
                     press_scale: draft.press_scale,
                     align: text.align,
@@ -1512,6 +1723,92 @@ screen {
         };
         assert_eq!(button.text, "Continue");
         assert_eq!(button.value, Some(StoredValue::String("continue".into())));
+    }
+
+    #[test]
+    fn script_defined_choice_renderer_expands_the_engine_choice_model() {
+        let source = r#"
+import ui.widgets.*
+
+canvas {
+    scrollable {
+        choiceOptions { index: Int, label: String ->
+            button(index) { text(label) }
+        }.gap(9)
+    }.scrollSpeed(64)
+}
+"#;
+        let values = UiContext::new(BTreeMap::from([(
+            "choice".to_string(),
+            StoredValue::Map(BTreeMap::from([(
+                "options".to_string(),
+                StoredValue::Array(vec![
+                    StoredValue::String("Route A".to_string()),
+                    StoredValue::String("Route B".to_string()),
+                ]),
+            )])),
+        )]));
+
+        let screen = evaluate_ui_component_named(
+            "memory://choice.ui.hks",
+            source,
+            values,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("the project-defined choice renderer should evaluate");
+
+        let ScreenNode::Scrollable(scrollable) = &screen.children[0] else {
+            panic!("canvas child should be scrollable");
+        };
+        assert_eq!(scrollable.speed, 64.0);
+        let ScreenNode::Column(options) = &scrollable.children[0] else {
+            panic!("choiceOptions should materialize a column");
+        };
+        assert_eq!(options.gap, 9.0);
+        assert!(matches!(
+            &options.children[0],
+            ScreenNode::Button(button)
+                if button.text == "Route A"
+                    && button.value == Some(StoredValue::Int(0))
+        ));
+        assert!(matches!(
+            &options.children[1],
+            ScreenNode::Button(button)
+                if button.text == "Route B"
+                    && button.value == Some(StoredValue::Int(1))
+        ));
+    }
+
+    #[test]
+    fn choice_renderer_also_accepts_a_named_script_function() {
+        let source = r#"
+import ui.widgets.*
+fn renderOption(index: Int, label: String) -> UiNode {
+    button(index) { text(label) }
+}
+canvas { choiceOptions(renderOption) }
+"#;
+        let values = UiContext::new(BTreeMap::from([(
+            "choice".to_string(),
+            StoredValue::Map(BTreeMap::from([(
+                "options".to_string(),
+                StoredValue::Array(vec![StoredValue::String("Named".to_string())]),
+            )])),
+        )]));
+        let screen = evaluate_ui_component_named(
+            "memory://named-choice.ui.hks",
+            source,
+            values,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("a named function should remain a valid choice renderer");
+        assert!(matches!(
+            &screen.children[0],
+            ScreenNode::Column(options)
+                if matches!(&options.children[0], ScreenNode::Button(button) if button.text == "Named")
+        ));
     }
 
     #[test]
