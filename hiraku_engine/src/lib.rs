@@ -43,10 +43,10 @@ use scene::{
     apply_live_audio_settings, bridge_story_events, cleanup_stale_screen_ui,
     handle_choice_action_input, handle_choice_buttons, handle_runtime_menu_buttons,
     handle_screen_buttons, handle_screen_image_buttons, poll_pending_character_shows,
-    poll_voice_playback, prepare_bgm_preludes, process_script_commands, setup_frontend,
-    setup_stage, sync_scene_snapshot, tick_animation_waits, tick_pending_waits,
-    tick_script_batches, update_builtin_ui_models, update_ui_reactive_bindings,
-    update_ui_text_bindings,
+    poll_voice_playback, prepare_bgm_preludes, process_script_commands,
+    reconcile_restored_characters, setup_frontend, setup_stage, sync_scene_snapshot,
+    tick_animation_waits, tick_pending_waits, tick_script_batches, update_builtin_ui_models,
+    update_ui_reactive_bindings, update_ui_text_bindings,
 };
 use script::{
     ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
@@ -207,6 +207,12 @@ impl Plugin for HirakuPlugin {
             .add_systems(Update, tick_script_runtime.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
+                reconcile_restored_characters
+                    .before(tick_script_runtime)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
                 bridge_story_events
                     .after(tick_script_runtime)
                     .in_set(HirakuRuntimeSystems),
@@ -308,10 +314,14 @@ impl Plugin for HirakuPlugin {
                     animate_camera_shake.in_set(HirakuRuntimeSystems),
                     animate_character_motion_effects.in_set(HirakuRuntimeSystems),
                     poll_voice_playback.in_set(HirakuRuntimeSystems),
-                    poll_pending_character_shows.in_set(HirakuRuntimeSystems),
+                    poll_pending_character_shows
+                        .after(reconcile_restored_characters)
+                        .in_set(HirakuRuntimeSystems),
                     tick_animation_waits.in_set(HirakuRuntimeSystems),
                     tick_script_batches.in_set(HirakuRuntimeSystems),
-                    sync_scene_snapshot.in_set(HirakuRuntimeSystems),
+                    sync_scene_snapshot
+                        .after(poll_pending_character_shows)
+                        .in_set(HirakuRuntimeSystems),
                 ),
             );
 

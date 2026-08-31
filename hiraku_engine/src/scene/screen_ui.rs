@@ -381,6 +381,8 @@ fn spawn_screen_node_entity(
             border,
             hovered_background,
             pressed_background,
+            hover_scale,
+            press_scale,
             align,
             padding_x,
             padding_y,
@@ -449,6 +451,7 @@ fn spawn_screen_node_entity(
                     ScreenUiNode,
                     Button,
                     button_node,
+                    UiTransform::IDENTITY,
                     BackgroundColor(initial_background),
                     BorderColor::all(
                         border
@@ -457,22 +460,22 @@ fn spawn_screen_node_entity(
                     ),
                 ))
                 .id();
-            if let Some(value) = value.as_ref() {
-                commands.entity(button).insert(ScreenUiButton {
-                    root,
-                    value: value.clone(),
-                    enabled: *enabled,
-                    text_entity: text,
-                    normal_background,
-                    hovered_background,
-                    pressed_background,
-                    insensitive_background,
-                    normal_text_color,
-                    hovered_text_color,
-                    pressed_text_color,
-                    insensitive_text_color,
-                });
-            }
+            commands.entity(button).insert(ScreenUiButton {
+                root,
+                value: value.clone(),
+                enabled: *enabled,
+                text_entity: text,
+                normal_background,
+                hovered_background,
+                pressed_background,
+                insensitive_background,
+                normal_text_color,
+                hovered_text_color,
+                pressed_text_color,
+                insensitive_text_color,
+                hover_scale: *hover_scale,
+                press_scale: *press_scale,
+            });
             if let Some(signal) = enabled_binding {
                 commands.entity(button).insert(UiEnabledBinding {
                     signal: signal.clone(),
@@ -522,6 +525,8 @@ fn spawn_screen_node_entity(
             texture,
             hovered_texture,
             hovered_layout,
+            hover_scale,
+            press_scale,
             value,
             action,
             enabled,
@@ -561,8 +566,10 @@ fn spawn_screen_node_entity(
                 .spawn((
                     ScreenUiNode,
                     Button,
+                    BackgroundColor(Color::NONE),
                     image_node(image.clone(), resolved),
                     node,
+                    UiTransform::IDENTITY,
                     ScreenUiImageButton {
                         root,
                         value: value.clone(),
@@ -584,6 +591,8 @@ fn spawn_screen_node_entity(
                         hovered_atlas: hovered_resolved.map(|texture| texture.atlas.clone()),
                         hovered_node,
                         normal_node,
+                        hover_scale: *hover_scale,
+                        press_scale: *press_scale,
                     },
                 ))
                 .id();
@@ -979,18 +988,24 @@ pub fn handle_screen_buttons(
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
-        (&PickingInteraction, &mut BackgroundColor, &ScreenUiButton),
+        (
+            &PickingInteraction,
+            &mut BackgroundColor,
+            &mut UiTransform,
+            &ScreenUiButton,
+        ),
         Changed<PickingInteraction>,
     >,
     button_query: Query<&ScreenUiButton>,
     mut text_query: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
-    for (interaction, mut color, button) in &mut interaction_query {
+    for (interaction, mut color, mut transform, button) in &mut interaction_query {
         if Some(button.root) != screen_state.active_root {
             continue;
         }
 
         if !button.enabled {
+            transform.scale = Vec2::ONE;
             *color = button.insensitive_background.into();
             if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                 *text_color = button.insensitive_text_color.into();
@@ -1000,18 +1015,21 @@ pub fn handle_screen_buttons(
 
         match *interaction {
             PickingInteraction::Pressed => {
+                transform.scale = Vec2::splat(button.press_scale);
                 *color = button.pressed_background.into();
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.pressed_text_color.into();
                 }
             }
             PickingInteraction::Hovered => {
+                transform.scale = Vec2::splat(button.hover_scale);
                 *color = button.hovered_background.into();
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.hovered_text_color.into();
                 }
             }
             PickingInteraction::None => {
+                transform.scale = Vec2::ONE;
                 *color = button.normal_background.into();
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.normal_text_color.into();
@@ -1030,12 +1048,15 @@ pub fn handle_screen_buttons(
         if Some(button.root) != screen_state.active_root || !button.enabled {
             continue;
         }
+        let Some(value) = button.value.clone() else {
+            continue;
+        };
         let Some(done) = screen_state.waiting.take() else {
             continue;
         };
         responses.write(ScriptResponseMessage {
             request: done,
-            response: ScriptResponse::Choice(button.value.clone()),
+            response: ScriptResponse::Choice(value),
         });
     }
 }
@@ -1049,19 +1070,21 @@ pub fn handle_screen_image_buttons(
             &PickingInteraction,
             &mut ImageNode,
             &mut Node,
+            &mut UiTransform,
             &ScreenUiImageButton,
         ),
         Changed<PickingInteraction>,
     >,
     button_query: Query<&ScreenUiImageButton>,
 ) {
-    for (interaction, mut image, mut node, button) in &mut interaction_query {
+    for (interaction, mut image, mut node, mut transform, button) in &mut interaction_query {
         if Some(button.root) != screen_state.active_root && button.value.is_some() {
             continue;
         }
 
         match *interaction {
             PickingInteraction::Pressed if button.enabled => {
+                transform.scale = Vec2::splat(button.press_scale);
                 image.image = button
                     .hovered_texture
                     .clone()
@@ -1077,6 +1100,7 @@ pub fn handle_screen_image_buttons(
                     .unwrap_or_else(|| button.normal_node.clone());
             }
             PickingInteraction::Hovered if button.enabled || button.hovered_when_disabled => {
+                transform.scale = Vec2::splat(button.hover_scale);
                 image.image = button
                     .hovered_texture
                     .clone()
@@ -1092,12 +1116,14 @@ pub fn handle_screen_image_buttons(
                     .unwrap_or_else(|| button.normal_node.clone());
             }
             PickingInteraction::None => {
+                transform.scale = Vec2::ONE;
                 image.image = button.normal_texture.clone();
                 image.texture_atlas = button.normal_atlas.clone();
                 image.rect = button.normal_rect;
                 *node = button.normal_node.clone();
             }
             _ => {
+                transform.scale = Vec2::ONE;
                 image.image = button.normal_texture.clone();
                 image.texture_atlas = button.normal_atlas.clone();
                 image.rect = button.normal_rect;
@@ -1542,9 +1568,10 @@ mod tests {
             .spawn((
                 PickingInteraction::Pressed,
                 BackgroundColor(Color::BLACK),
+                UiTransform::IDENTITY,
                 ScreenUiButton {
                     root,
-                    value: StoredValue::String("continue".into()),
+                    value: Some(StoredValue::String("continue".into())),
                     enabled: true,
                     text_entity: text,
                     normal_background: Color::BLACK,
@@ -1555,6 +1582,8 @@ mod tests {
                     hovered_text_color: Color::WHITE,
                     pressed_text_color: Color::WHITE,
                     insensitive_text_color: Color::WHITE,
+                    hover_scale: 1.0,
+                    press_scale: 1.0,
                 },
             ))
             .id();

@@ -58,7 +58,9 @@ mod character;
 mod screen_ui;
 
 pub(crate) use character::apply_character_ease;
-pub use character::{animate_character_motion_effects, poll_pending_character_shows};
+pub use character::{
+    animate_character_motion_effects, poll_pending_character_shows, reconcile_restored_characters,
+};
 use character::{
     apply_character_motion, apply_character_timeline, despawn_character_actor,
     queue_character_show, source_rect_from_corners, source_rect_to_corners,
@@ -218,6 +220,9 @@ pub struct StageState {
     pub character_roots: HashMap<String, Entity>,
     pub character_active_parts: HashMap<String, HashSet<String>>,
     pub character_positions: HashMap<String, Vec2>,
+    /// Logical restored parts waiting to be reconciled into render entities.
+    /// This keeps mask/blend metadata intact while their assets are loading.
+    pub pending_character_restore: Vec<SpriteSnapshot>,
     pub bgm: Option<Entity>,
 }
 
@@ -1135,11 +1140,19 @@ pub struct RuntimeMenuContext<'w, 's> {
             &'static mut BackgroundColor,
             &'static RuntimeMenuButton,
             Option<&'static ScreenUiButton>,
+            Option<&'static ScreenUiImageButton>,
         ),
         Changed<PickingInteraction>,
     >,
-    pub action_query: Query<'w, 's, (&'static RuntimeMenuButton, Option<&'static ScreenUiButton>)>,
-    pub background_query: Query<'w, 's, (), With<BackgroundColor>>,
+    pub action_query: Query<
+        'w,
+        's,
+        (
+            &'static RuntimeMenuButton,
+            Option<&'static ScreenUiButton>,
+            Option<&'static ScreenUiImageButton>,
+        ),
+    >,
     pub parents: Query<'w, 's, &'static ChildOf>,
 }
 
@@ -4166,6 +4179,7 @@ pub fn poll_voice_playback(
 pub fn sync_scene_snapshot(
     mut shared_state: ResMut<SceneSharedState>,
     stage: Res<StageState>,
+    pending_characters: Res<PendingCharacterShows>,
     alpha_mask_materials: Res<Assets<AlphaMaskMaterial>>,
     multiply_materials: Res<Assets<MultiplyMaterial>>,
     dialogue_state: Res<DialogueState>,
@@ -4192,44 +4206,50 @@ pub fn sync_scene_snapshot(
             path: layer.path.clone(),
         });
 
-    let mut sprite_snapshots = sprites
-        .iter()
-        .filter(|(_, _, _, _, _, _, _, visibility)| **visibility != Visibility::Hidden)
-        .map(
-            |(actor, sprite, alpha_mask, multiply, visual, focused, transform, _)| SpriteSnapshot {
-                id: actor.id.clone(),
-                path: actor.path.clone(),
-                x: transform.translation.x,
-                y: transform.translation.y,
-                layer: transform.translation.z - STAGE_Z_SPRITE,
-                scale: transform.scale.x,
-                alpha: sprite
-                    .map(|sprite| sprite.color.alpha())
-                    .unwrap_or_else(|| {
-                        alpha_mask
-                            .and_then(|material| alpha_mask_materials.get(&material.0))
-                            .map(|material| material.tint.w * material.opacity)
-                            .or_else(|| {
-                                multiply
-                                    .and_then(|material| multiply_materials.get(&material.0))
+    if stage.pending_character_restore.is_empty() && pending_characters.items.is_empty() {
+        let mut sprite_snapshots = sprites
+            .iter()
+            .filter(|(_, _, _, _, _, _, _, visibility)| **visibility != Visibility::Hidden)
+            .map(
+                |(actor, sprite, alpha_mask, multiply, visual, focused, transform, _)| {
+                    SpriteSnapshot {
+                        id: actor.id.clone(),
+                        path: actor.path.clone(),
+                        x: transform.translation.x,
+                        y: transform.translation.y,
+                        layer: transform.translation.z - STAGE_Z_SPRITE,
+                        scale: transform.scale.x,
+                        alpha: sprite
+                            .map(|sprite| sprite.color.alpha())
+                            .unwrap_or_else(|| {
+                                alpha_mask
+                                    .and_then(|material| alpha_mask_materials.get(&material.0))
                                     .map(|material| material.tint.w * material.opacity)
-                            })
-                            .unwrap_or(1.0)
-                    }),
-                rect: sprite
-                    .and_then(|sprite| sprite.rect.map(source_rect_to_corners))
-                    .or_else(|| visual.and_then(|visual| visual.rect)),
-                focused: focused.is_some(),
-            },
-        )
-        .collect::<Vec<_>>();
-    sprite_snapshots.sort_by(|left, right| left.id.cmp(&right.id));
-    snapshot.sprites = sprite_snapshots;
-    snapshot.character_positions = stage
-        .character_positions
-        .iter()
-        .map(|(actor_id, position)| (actor_id.clone(), [position.x, position.y]))
-        .collect();
+                                    .or_else(|| {
+                                        multiply
+                                            .and_then(|material| {
+                                                multiply_materials.get(&material.0)
+                                            })
+                                            .map(|material| material.tint.w * material.opacity)
+                                    })
+                                    .unwrap_or(1.0)
+                            }),
+                        rect: sprite
+                            .and_then(|sprite| sprite.rect.map(source_rect_to_corners))
+                            .or_else(|| visual.and_then(|visual| visual.rect)),
+                        focused: focused.is_some(),
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        sprite_snapshots.sort_by(|left, right| left.id.cmp(&right.id));
+        snapshot.sprites = sprite_snapshots;
+        snapshot.character_positions = stage
+            .character_positions
+            .iter()
+            .map(|(actor_id, position)| (actor_id.clone(), [position.x, position.y]))
+            .collect();
+    }
 
     snapshot.bgm = stage.bgm.and_then(|entity| {
         bgms.get(entity).ok().map(|bgm| AudioSnapshot {
@@ -4917,7 +4937,8 @@ fn resolve_choice(
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
-    for (interaction, mut color, button, screen_button) in &mut ctx.interaction_query {
+    for (interaction, mut color, button, screen_button, image_button) in &mut ctx.interaction_query
+    {
         if let Some(root) = button.screen_root
             && Some(root) != ctx.screen_state.active_root
             && !ctx
@@ -4934,6 +4955,13 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
         // Declarative text buttons own their complete visual state through
         // `handle_screen_buttons`; this system only dispatches their route.
         if screen_button.is_some() {
+            continue;
+        }
+        // Texture-backed action buttons own their hover/press visuals through
+        // `handle_screen_image_buttons`. They must never inherit the opaque
+        // choice-button backgrounds used by the built-in text menu.
+        if image_button.is_some() {
+            *color = Color::NONE.into();
             continue;
         }
         match *interaction {
@@ -4958,7 +4986,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
         else {
             continue;
         };
-        let Ok((button, screen_button)) = ctx.action_query.get(button_entity) else {
+        let Ok((button, screen_button, image_button)) = ctx.action_query.get(button_entity) else {
             continue;
         };
         if let Some(root) = button.screen_root
@@ -4980,7 +5008,25 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
             .or_default() += 1;
         // The action may replace or cover this node before picking emits a
         // later interaction transition. Restore its release visual now.
-        if screen_button.is_none() && ctx.background_query.contains(button_entity) {
+        if let Some(image_button) = image_button {
+            let mut image = ImageNode::new(image_button.normal_texture.clone());
+            image.texture_atlas = image_button.normal_atlas.clone();
+            image.rect = image_button.normal_rect;
+            ctx.commands.entity(button_entity).insert((
+                BackgroundColor(Color::NONE),
+                UiTransform::IDENTITY,
+                image,
+                image_button.normal_node.clone(),
+            ));
+        } else if let Some(screen_button) = screen_button {
+            ctx.commands.entity(button_entity).insert((
+                BackgroundColor(screen_button.normal_background),
+                UiTransform::IDENTITY,
+            ));
+            ctx.commands
+                .entity(screen_button.text_entity)
+                .insert(TextColor(screen_button.normal_text_color));
+        } else {
             ctx.commands
                 .entity(button_entity)
                 .insert(BackgroundColor(ctx.ui_style.choice_button_bg));
@@ -5311,6 +5357,12 @@ fn restore_scene_snapshot(
     }
     stage.character_positions.clear();
     stage.character_active_parts.clear();
+    stage.pending_character_restore = snapshot
+        .sprites
+        .iter()
+        .filter(|sprite| sprite.id.starts_with("character::"))
+        .cloned()
+        .collect();
     if let Some(bgm) = stage.bgm.take() {
         commands.entity(bgm).try_despawn();
     }
@@ -5330,6 +5382,12 @@ fn restore_scene_snapshot(
     }
 
     for sprite in &snapshot.sprites {
+        // Character parts are logical scene state, not plain sprites. A
+        // dedicated reconciliation system rebuilds their child hierarchy and
+        // mask/blend materials from the catalog on the next update.
+        if sprite.id.starts_with("character::") {
+            continue;
+        }
         let mut entity_sprite = WorldSprite::from_image(asset_server.load(sprite.path.clone()));
         entity_sprite.color.set_alpha(sprite.alpha);
         entity_sprite.rect = sprite.rect.map(source_rect_from_corners);

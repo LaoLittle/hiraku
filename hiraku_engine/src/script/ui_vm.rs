@@ -90,6 +90,8 @@ struct UiDraft {
     visible: bool,
     visible_binding: Option<HksBinding<bool>>,
     hovered_when_disabled: bool,
+    hover_scale: f32,
+    press_scale: f32,
     gap: f32,
     padding: f32,
     surface: Option<[f32; 4]>,
@@ -115,6 +117,8 @@ impl UiDraft {
             visible: true,
             visible_binding: None,
             hovered_when_disabled: false,
+            hover_scale: 1.0,
+            press_scale: 1.0,
             gap: 12.0,
             padding: 0.0,
             surface: None,
@@ -507,6 +511,26 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "hoverScale", receiver)]
+    fn ui_hover_scale(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        scale: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.hover_scale = positive(scale, "UI hover scale")?;
+        Ok(node)
+    }
+
+    #[hks(name = "pressScale", receiver)]
+    fn ui_press_scale(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        scale: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.press_scale = positive(scale, "UI press scale")?;
+        Ok(node)
+    }
+
     #[hks(name = "hovered", receiver)]
     fn ui_hovered(
         context: &mut UiVmContext,
@@ -674,6 +698,15 @@ fn non_negative(value: f64, label: &str) -> Result<f32, NativeError> {
     if !value.is_finite() || value < 0.0 {
         return Err(NativeError::message(format!(
             "{label} must be a non-negative number"
+        )));
+    }
+    Ok(value as f32)
+}
+
+fn positive(value: f64, label: &str) -> Result<f32, NativeError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(NativeError::message(format!(
+            "{label} must be greater than zero"
         )));
     }
     Ok(value as f32)
@@ -1291,6 +1324,8 @@ fn materialize_node(
                     border: None,
                     hovered_background: None,
                     pressed_background: None,
+                    hover_scale: draft.hover_scale,
+                    press_scale: draft.press_scale,
                     align: text.align,
                     padding_x: None,
                     padding_y: None,
@@ -1324,6 +1359,8 @@ fn materialize_node(
                         texture: image.texture,
                         hovered_texture,
                         hovered_layout,
+                        hover_scale: draft.hover_scale,
+                        press_scale: draft.press_scale,
                         value,
                         action: draft.action,
                         enabled,
@@ -1559,7 +1596,7 @@ screen {
                 "import ui.widgets.*\n",
                 "canvas {\n",
                 "  button { text(\"Passive\") }\n",
-                "  button { text(\"Quick Save\") }.action(\"storage.save.quick\")\n",
+                "  button { text(\"Quick Save\") }.action(\"storage.save.quick\").hoverScale(1.08).pressScale(0.94)\n",
                 "}",
             ),
             UiContext::default(),
@@ -1577,6 +1614,8 @@ screen {
         };
         assert_eq!(button.action.as_deref(), Some("storage.save.quick"));
         assert_eq!(button.value, None);
+        assert_eq!(button.hover_scale, 1.08);
+        assert_eq!(button.press_scale, 0.94);
     }
 
     #[test]

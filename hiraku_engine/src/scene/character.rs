@@ -1,5 +1,97 @@
 use super::*;
 
+pub fn reconcile_restored_characters(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    texture_atlases: Res<TextureAtlasCatalog>,
+    characters: Res<CharacterCatalog>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut alpha_mask_materials: ResMut<Assets<AlphaMaskMaterial>>,
+    mut multiply_materials: ResMut<Assets<MultiplyMaterial>>,
+    mut stage: ResMut<StageState>,
+    mut pending: ResMut<PendingCharacterShows>,
+    mut animations: ResMut<AnimationState>,
+) {
+    if stage.pending_character_restore.is_empty() {
+        return;
+    }
+
+    let snapshots = std::mem::take(&mut stage.pending_character_restore);
+    let mut actors = BTreeMap::<String, Vec<SpriteSnapshot>>::new();
+    for snapshot in snapshots {
+        let Some(actor_id) = restored_character_actor_id(&snapshot.id) else {
+            continue;
+        };
+        actors
+            .entry(actor_id.to_string())
+            .or_default()
+            .push(snapshot);
+    }
+
+    for (actor_id, snapshots) in actors {
+        let Some(character) = characters.characters.get(&actor_id) else {
+            warn!("restored character `{actor_id}` is not present in the character catalog");
+            continue;
+        };
+        let parts = character
+            .parts
+            .iter()
+            .filter(|part| {
+                let id = character_part_id(&actor_id, part);
+                snapshots.iter().any(|snapshot| snapshot.id == id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            warn!("restored character `{actor_id}` contains no recognized parts");
+            continue;
+        }
+
+        let scale = snapshots.first().map_or(1.0, |snapshot| snapshot.scale);
+        let position = stage
+            .character_positions
+            .get(&actor_id)
+            .copied()
+            .unwrap_or_else(|| {
+                let snapshot = &snapshots[0];
+                let part = parts
+                    .iter()
+                    .find(|part| character_part_id(&actor_id, part) == snapshot.id)
+                    .expect("a restored snapshot must have a matching character part");
+                Vec2::new(
+                    snapshot.x - part.offset.x * scale,
+                    snapshot.y - part.offset.y * scale,
+                )
+            });
+        let focused = snapshots.iter().any(|snapshot| snapshot.focused);
+
+        queue_character_show(
+            &mut commands,
+            &asset_server,
+            &texture_atlases,
+            &mut meshes,
+            &mut alpha_mask_materials,
+            &mut multiply_materials,
+            &mut stage,
+            &mut pending,
+            &mut animations,
+            actor_id,
+            parts,
+            position,
+            scale,
+            focused,
+            Some(std::time::Duration::ZERO),
+            None,
+        );
+    }
+}
+
+fn restored_character_actor_id(id: &str) -> Option<&str> {
+    id.strip_prefix("character::")?
+        .split_once("::")
+        .map(|(actor, _)| actor)
+}
+
 pub fn animate_character_motion_effects(
     mut commands: Commands,
     time: Res<Time>,
@@ -846,6 +938,15 @@ pub(super) fn source_rect_to_corners(rect: [f32; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_character_ids_recover_the_logical_actor() {
+        assert_eq!(
+            restored_character_actor_id("character::alice::slot-001-eyes_open"),
+            Some("alice")
+        );
+        assert_eq!(restored_character_actor_id("sprite::alice"), None);
+    }
 
     #[test]
     fn faded_character_parts_are_hidden_and_retained_for_reuse() {

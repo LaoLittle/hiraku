@@ -382,6 +382,12 @@ pub struct ButtonNode {
     /// Pressed background color.
     #[serde(default)]
     pub pressed_background: Option<[f32; 4]>,
+    /// Scale applied while hovering. Defaults to `1.0`.
+    #[serde(default = "default_interaction_scale")]
+    pub hover_scale: f32,
+    /// Scale applied while pressed. Defaults to `1.0`.
+    #[serde(default = "default_interaction_scale")]
+    pub press_scale: f32,
     /// Label alignment inside the button: `0.0` left, `0.5` center, `1.0` right.
     #[serde(default)]
     pub align: Option<f32>,
@@ -429,6 +435,12 @@ pub struct ScreenImageButtonNode {
     /// Size and absolute positioning while the pointer hovers the button.
     #[serde(default)]
     pub hovered_layout: Option<ScreenLayout>,
+    /// Scale applied while hovering. Defaults to `1.0`.
+    #[serde(default = "default_interaction_scale")]
+    pub hover_scale: f32,
+    /// Scale applied while pressed. Defaults to `1.0`.
+    #[serde(default = "default_interaction_scale")]
+    pub press_scale: f32,
     /// Value returned from `screen(...)` when the button is released.
     #[serde(default)]
     pub value: Option<StoredValue>,
@@ -588,7 +600,7 @@ pub struct ScreenUiButton {
     /// Root this button belongs to; stale/pending roots are ignored.
     pub root: Entity,
     /// Intent value returned to the story runtime when the button is pressed.
-    pub value: StoredValue,
+    pub value: Option<StoredValue>,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
     /// Text child whose color changes with interaction state.
@@ -609,6 +621,8 @@ pub struct ScreenUiButton {
     pub pressed_text_color: Color,
     /// Disabled label color.
     pub insensitive_text_color: Color,
+    pub hover_scale: f32,
+    pub press_scale: f32,
 }
 
 /// Marker component for the text child of a screen button.
@@ -642,6 +656,14 @@ pub struct ScreenUiImageButton {
     pub hovered_node: Option<Node>,
     /// Layout restored while the idle artwork is displayed.
     pub normal_node: Node,
+    /// Script-authored scale applied while hovering.
+    pub hover_scale: f32,
+    /// Script-authored scale applied while pressed.
+    pub press_scale: f32,
+}
+
+fn default_interaction_scale() -> f32 {
+    1.0
 }
 
 fn default_screen_panel() -> bool {
