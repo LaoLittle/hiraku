@@ -540,6 +540,42 @@ pub struct HksClosure {
     pub captures: Vec<Value>,
 }
 
+/// A save-safe callable reference to either script bytecode or a captured
+/// closure. It never contains a Rust function pointer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HksCallable(Value);
+
+impl HksCallable {
+    pub fn value(&self) -> &Value {
+        &self.0
+    }
+
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl FromHksValue for HksCallable {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::Function { .. } | Value::Closure { .. } => Ok(Self(value.clone())),
+            _ => Err(NativeError::TypeMismatch("function")),
+        }
+    }
+}
+
+impl IntoHksValue for HksCallable {
+    fn into_hks_value(self) -> Value {
+        self.0
+    }
+}
+
+impl HksScriptType for HksCallable {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Function
+    }
+}
+
 impl FromHksValue for HksClosure {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
@@ -579,7 +615,8 @@ impl HksScriptType for HksClosure {
 /// know what "reactive" means; the embedding decides when to evaluate it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HksBinding<T> {
-    closure: HksClosure,
+    getter: HksCallable,
+    setter: Option<HksCallable>,
     marker: PhantomData<fn() -> T>,
 }
 
@@ -594,7 +631,10 @@ pub enum HksBindable<T> {
 
 impl<T: FromHksValue> FromHksValue for HksBindable<T> {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
-        if matches!(value, Value::Closure { .. }) {
+        if matches!(
+            value,
+            Value::Function { .. } | Value::Closure { .. } | Value::Tuple(_)
+        ) {
             HksBinding::from_hks_value(value).map(Self::Binding)
         } else {
             T::from_hks_value(value).map(Self::Value)
@@ -613,19 +653,30 @@ impl<T: HksScriptType> HksScriptType for HksBindable<T> {
 }
 
 impl<T> HksBinding<T> {
-    pub fn closure(&self) -> &HksClosure {
-        &self.closure
+    pub fn getter(&self) -> &HksCallable {
+        &self.getter
     }
 
-    pub fn into_closure(self) -> HksClosure {
-        self.closure
+    pub fn setter(&self) -> Option<&HksCallable> {
+        self.setter.as_ref()
     }
 }
 
 impl<T> FromHksValue for HksBinding<T> {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        let (getter, setter) = match value {
+            Value::Function { .. } | Value::Closure { .. } => {
+                (HksCallable::from_hks_value(value)?, None)
+            }
+            Value::Tuple(values) if values.len() == 2 => (
+                HksCallable::from_hks_value(&values[0])?,
+                Some(HksCallable::from_hks_value(&values[1])?),
+            ),
+            _ => return Err(NativeError::TypeMismatch("binding")),
+        };
         Ok(Self {
-            closure: HksClosure::from_hks_value(value)?,
+            getter,
+            setter,
             marker: PhantomData,
         })
     }

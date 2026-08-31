@@ -595,12 +595,14 @@ fn global_string(globals: &BTreeMap<String, StoredValue>, key: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::script::{StoryRuntime, StoryRuntimeEvent, compile_story_bytecode};
 
     #[test]
     fn save_roundtrip_preserves_exact_vm_wait_state() {
-        let bytecode = compile_story_bytecode("save.story.hks", "\"save here\"")
-            .expect("save story must compile");
+        let source = "let name = \"guest\"\n\"save ${name} 🚀\"";
+        let bytecode =
+            compile_story_bytecode("save.story.hks", source).expect("save story must compile");
         let mut runtime = StoryRuntime::new(bytecode).expect("runtime must initialize");
         assert!(matches!(
             runtime.step().expect("dialogue effect must run"),
@@ -632,5 +634,14 @@ mod tests {
         );
         assert_eq!(restored.ui_registry, data.ui_registry);
         assert_eq!(restored.mounted_ui_overlays, data.mounted_ui_overlays);
+        let restored_bytecode = compile_story_bytecode("save.story.hks", source)
+            .expect("saved Unicode story must compile again");
+        StoryRuntime::restore(
+            restored_bytecode,
+            restored
+                .vm_snapshot
+                .expect("roundtrip must retain the VM snapshot"),
+        )
+        .expect("Unicode byte offsets must remain valid while restoring");
     }
 }

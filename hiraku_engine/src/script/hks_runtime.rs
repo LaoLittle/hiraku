@@ -539,7 +539,7 @@ fn closure_argument(call: &BuiltinCall) -> Option<ClosureValue> {
 
 fn closure_value(value: &Value) -> Option<ClosureValue> {
     match value {
-        Value::Closure { .. } | Value::Function(_) => Some(ClosureValue(value.clone())),
+        Value::Closure { .. } | Value::Function { .. } => Some(ClosureValue(value.clone())),
         _ => None,
     }
 }

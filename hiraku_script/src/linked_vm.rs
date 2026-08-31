@@ -59,6 +59,13 @@ impl LinkedVm {
             Value::Closure { module: None, .. } => {
                 return Err(LinkedVmError::UnboundClosureModule);
             }
+            Value::Function {
+                module: Some(module),
+                ..
+            } => ModuleId(*module),
+            Value::Function { module: None, .. } => {
+                return Err(LinkedVmError::UnboundFunctionModule);
+            }
             _ => {
                 return Err(LinkedVmError::Vm(VmError::TypeMismatch(
                     "expected Function",
@@ -232,10 +239,18 @@ pub enum LinkedVmError {
     ScriptReceiver,
     NoFrame,
     UnboundClosureModule,
+    UnboundFunctionModule,
 }
 
 fn bind_value_module(value: Value, module: ModuleId) -> Value {
     match value {
+        Value::Function {
+            module: owner,
+            symbol,
+        } => Value::Function {
+            module: owner.or(Some(module.0)),
+            symbol,
+        },
         Value::Closure {
             module: owner,
             region,
@@ -347,6 +362,34 @@ mod tests {
             child.step().expect("closure executes"),
             Some(LinkedVmEvent::Statement(StatementValue::String(
                 "child".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn named_functions_keep_their_module_when_crossing_a_native_boundary() {
+        let natives = BuiltinManifest::new([("capture", BuiltinId(10))]);
+        let module = compile("fn read() -> String { \"value\" }\ncapture(read)", &natives);
+        let program = link_register_modules(vec![module], &natives).expect("module links");
+        let mut vm = LinkedVm::new(program, ModuleId(0)).expect("entry starts");
+        let Some(LinkedVmEvent::Call(call)) = vm.step().expect("capture yields") else {
+            panic!("expected native capture call")
+        };
+        let function = call.arguments[0].value.clone();
+        assert!(matches!(
+            function,
+            Value::Function {
+                module: Some(0),
+                ..
+            }
+        ));
+
+        let mut child = LinkedVm::from_callable(vm.program().clone(), &function, Vec::new())
+            .expect("bound function invokes");
+        assert_eq!(
+            child.step().expect("function executes"),
+            Some(LinkedVmEvent::Statement(StatementValue::String(
+                "value".into()
             )))
         );
     }

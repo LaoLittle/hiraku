@@ -245,7 +245,13 @@ pub enum Value {
     String(String),
     Symbol(String),
     Selector(String),
-    Function(SymbolId),
+    Function {
+        /// Linker module owning this function. Constants start unbound and are
+        /// qualified when they cross a linked VM/native boundary.
+        #[serde(default)]
+        module: Option<u32>,
+        symbol: SymbolId,
+    },
     Closure {
         /// Runtime linker module owning `region`. Generic single-module VMs
         /// leave this unset; `LinkedVm` binds it before a closure crosses a

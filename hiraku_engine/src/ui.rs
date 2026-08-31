@@ -11,7 +11,8 @@ use crate::state::StoredValue;
 #[derive(Clone, Debug)]
 pub struct UiReactiveBinding {
     pub(crate) program: hiraku_script::LinkedProgram,
-    pub(crate) closure: hiraku_script::native::HksClosure,
+    pub(crate) getter: hiraku_script::Value,
+    pub(crate) setter: Option<hiraku_script::Value>,
     pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
 }
 
@@ -157,7 +158,7 @@ pub struct TextNode {
     /// Text content.
     pub text: String,
     /// Optional normalized live template. Static story values are captured
-    /// during component evaluation; unresolved fields are read from UiSignals.
+    /// during component evaluation; unresolved fields are read from UiModels.
     #[serde(default)]
     pub binding: Option<String>,
     #[serde(skip)]
@@ -176,45 +177,7 @@ pub struct TextNode {
     pub layout: ScreenLayout,
 }
 
-/// A typed value published to declarative HKS UI.
-#[derive(Clone, Debug, PartialEq)]
-pub enum UiSignalValue {
-    Bool(bool),
-    Number(f64),
-    String(String),
-}
-
-impl From<bool> for UiSignalValue {
-    fn from(value: bool) -> Self {
-        Self::Bool(value)
-    }
-}
-
-macro_rules! impl_number_signal {
-    ($($type:ty),* $(,)?) => {$(
-        impl From<$type> for UiSignalValue {
-            fn from(value: $type) -> Self {
-                Self::Number(value as f64)
-            }
-        }
-    )*};
-}
-
-impl_number_signal!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
-
-impl From<String> for UiSignalValue {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<&str> for UiSignalValue {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_string())
-    }
-}
-
-impl UiSignalValue {
+impl StoredValue {
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
@@ -224,7 +187,8 @@ impl UiSignalValue {
 
     pub fn as_number(&self) -> Option<f64> {
         match self {
-            Self::Number(value) => Some(*value),
+            Self::Int(value) => Some(*value as f64),
+            Self::Float(value) => Some(*value),
             _ => None,
         }
     }
@@ -232,61 +196,74 @@ impl UiSignalValue {
     pub(crate) fn display(&self) -> String {
         match self {
             Self::Bool(value) => value.to_string(),
-            Self::Number(value) => value.to_string(),
+            Self::Int(value) => value.to_string(),
+            Self::Float(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Array(_) | Self::Map(_) => "<object>".to_string(),
         }
     }
 }
 
-/// Engine- and game-provided typed signals consumed by live HKS UI bindings.
+/// Engine- and game-provided typed model roots consumed by live HKS UI bindings.
 ///
-/// This resource is intentionally generic: embedding applications can publish
-/// values without registering new UI native functions or exposing ECS to HKS.
+/// HKS selectors traverse each root in the VM. The engine therefore never
+/// flattens a selector such as `dialogue.text` into an opaque string key.
 #[derive(Resource, Default)]
-pub struct UiSignals {
-    values: BTreeMap<String, UiSignalValue>,
+pub struct UiModels {
+    roots: BTreeMap<String, StoredValue>,
     revision: u64,
 }
 
-impl UiSignals {
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<UiSignalValue>) {
+impl UiModels {
+    pub fn set(&mut self, name: impl Into<String>, value: StoredValue) {
         let name = name.into();
-        let value = value.into();
-        if self.values.get(&name) == Some(&value) {
+        assert!(
+            !name.contains('.'),
+            "UI model names must be root identifiers"
+        );
+        if self.roots.get(&name) == Some(&value) {
             return;
         }
-        self.values.insert(name, value);
+        self.roots.insert(name, value);
         self.revision = self
             .revision
             .checked_add(1)
-            .expect("UI signal revision must not be exhausted");
+            .expect("UI model revision must not be exhausted");
     }
 
     pub fn remove(&mut self, name: &str) {
-        if self.values.remove(name).is_some() {
+        if self.roots.remove(name).is_some() {
             self.revision = self
                 .revision
                 .checked_add(1)
-                .expect("UI signal revision must not be exhausted");
+                .expect("UI model revision must not be exhausted");
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&UiSignalValue> {
-        self.values.get(name)
+    pub fn get(&self, path: &str) -> Option<&StoredValue> {
+        let mut segments = path.split('.');
+        let mut value = self.roots.get(segments.next()?)?;
+        for segment in segments {
+            let StoredValue::Map(fields) = value else {
+                return None;
+            };
+            value = fields.get(segment)?;
+        }
+        Some(value)
     }
 
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    pub(crate) fn values(&self) -> impl Iterator<Item = (&str, &UiSignalValue)> {
-        self.values
+    pub(crate) fn roots(&self) -> impl Iterator<Item = (&str, &StoredValue)> {
+        self.roots
             .iter()
             .map(|(name, value)| (name.as_str(), value))
     }
 }
 
-/// Runtime binding attached only to text entities which read live signals.
+/// Runtime binding attached only to text entities which read live models.
 #[derive(Component)]
 pub(crate) struct UiTextBinding {
     pub(crate) template: String,
@@ -364,9 +341,8 @@ pub struct ButtonNode {
     pub value: Option<StoredValue>,
     /// Built-in action for non-modal overlay buttons.
     ///
-    /// Current actions are `quick_save`, `quick_load`, `menu`, `return`, and
-    /// `main_menu`. This keeps common system UI script-defined while reusing
-    /// engine services such as save/load.
+    /// Routes are namespace-qualified, for example `ui.open.settings`,
+    /// `storage.save.quick`, `story.next`, and `app.returnToTitle`.
     #[serde(default)]
     pub action: Option<String>,
     /// Whether the button can be pressed.
@@ -453,8 +429,12 @@ pub struct ScreenImageButtonNode {
     /// Size and absolute positioning while the pointer hovers the button.
     #[serde(default)]
     pub hovered_layout: Option<ScreenLayout>,
-    /// Value returned from `screen(...)` when the button is pressed.
-    pub value: StoredValue,
+    /// Value returned from `screen(...)` when the button is released.
+    #[serde(default)]
+    pub value: Option<StoredValue>,
+    /// Namespace-qualified engine action route.
+    #[serde(default)]
+    pub action: Option<String>,
     /// Whether the button can be pressed.
     #[serde(default = "default_button_enabled")]
     pub enabled: bool,
@@ -641,7 +621,7 @@ pub struct ScreenUiImageButton {
     /// Root this button belongs to; stale and pending roots are ignored.
     pub root: Entity,
     /// Intent value returned to the story runtime when pressed.
-    pub value: StoredValue,
+    pub value: Option<StoredValue>,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
     /// Whether a disabled button still displays its hover artwork.

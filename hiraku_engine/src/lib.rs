@@ -16,7 +16,7 @@ mod ui;
 mod vfs;
 
 pub use script::{UiContext, UiIntent};
-pub use ui::{UiSignalValue, UiSignals};
+pub use ui::UiModels;
 
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ use scene::{
     handle_screen_buttons, handle_screen_image_buttons, poll_pending_character_shows,
     poll_voice_playback, prepare_bgm_preludes, process_script_commands, setup_frontend,
     setup_stage, sync_scene_snapshot, tick_animation_waits, tick_pending_waits,
-    tick_script_batches, update_builtin_ui_signals, update_ui_reactive_bindings,
+    tick_script_batches, update_builtin_ui_models, update_ui_reactive_bindings,
     update_ui_text_bindings,
 };
 use script::{
@@ -58,6 +58,9 @@ use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder}
 
 #[derive(Clone, Debug, Resource)]
 pub struct RuntimeLaunchConfig {
+    /// Where runtime content is loaded from. Packaged games normally use HDP,
+    /// while examples and development tools can read an ordinary directory.
+    pub asset_mode: RuntimeAssetMode,
     pub asset_root: String,
     pub settings_path: String,
     pub default_startup_script: String,
@@ -66,6 +69,13 @@ pub struct RuntimeLaunchConfig {
     pub canvas_size: UVec2,
     pub camera_order: isize,
     pub camera_clear_color: ClearColorConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuntimeAssetMode {
+    #[default]
+    Hdp,
+    Directory,
 }
 
 /// Fixed-resolution image produced by Hiraku's scene and UI camera.
@@ -84,6 +94,7 @@ pub(crate) struct HirakuInputTarget(pub Handle<Image>);
 impl Default for RuntimeLaunchConfig {
     fn default() -> Self {
         Self {
+            asset_mode: RuntimeAssetMode::Hdp,
             asset_root: vfs::DEFAULT_ASSET_ROOT.to_string(),
             settings_path: vfs::DEFAULT_SETTINGS_PATH.to_string(),
             default_startup_script: vfs::DEFAULT_STARTUP_SCRIPT.to_string(),
@@ -91,6 +102,20 @@ impl Default for RuntimeLaunchConfig {
             canvas_size: UVec2::new(1920, 1080),
             camera_order: -1,
             camera_clear_color: ClearColorConfig::Default,
+        }
+    }
+}
+
+impl RuntimeLaunchConfig {
+    /// Creates a development configuration that reads loose files directly
+    /// from `asset_root` instead of waiting for or loading an HDP archive.
+    pub fn directory(asset_root: impl Into<String>) -> Self {
+        Self {
+            asset_mode: RuntimeAssetMode::Directory,
+            asset_root: asset_root.into(),
+            settings_path: "settings.hson".to_string(),
+            default_startup_script: "startup.hks".to_string(),
+            ..Self::default()
         }
     }
 }
@@ -158,7 +183,7 @@ impl Plugin for HirakuPlugin {
                 input::bridge_virtual_pointers.before(bevy::picking::PickingSystems::Input),
             )
             .init_resource::<ScriptRuntimeState>()
-            .init_resource::<UiSignals>()
+            .init_resource::<UiModels>()
             .add_message::<ScriptResponseMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<BytesAssetLoader>()
@@ -167,7 +192,7 @@ impl Plugin for HirakuPlugin {
                 Update,
                 (setup_frontend, setup_stage)
                     .chain()
-                    .run_if(hdp_archive_ready)
+                    .run_if(runtime_content_ready)
                     .run_if(runtime_not_initialized),
             )
             .add_systems(Update, build_texture_atlases)
@@ -195,7 +220,7 @@ impl Plugin for HirakuPlugin {
             .add_systems(
                 Update,
                 (
-                    update_builtin_ui_signals,
+                    update_builtin_ui_models,
                     update_ui_text_bindings,
                     update_ui_reactive_bindings,
                     animate_screen_ui,
@@ -259,12 +284,16 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
-                animate_dialogue_text_reveal.in_set(HirakuRuntimeSystems),
+                animate_dialogue_text_reveal
+                    .after(process_script_commands)
+                    .before(update_builtin_ui_models)
+                    .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
                 advance_dialogue_on_input
                     .after(cleanup_stale_screen_ui)
+                    .after(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, tick_pending_waits.in_set(HirakuRuntimeSystems))
@@ -286,8 +315,10 @@ impl Plugin for HirakuPlugin {
                 ),
             );
 
-        let archive = app.world().resource::<AssetServer>().load(archive_path);
-        app.insert_resource(HdpArchiveHandle(archive));
+        if app.world().resource::<RuntimeLaunchConfig>().asset_mode == RuntimeAssetMode::Hdp {
+            let archive = app.world().resource::<AssetServer>().load(archive_path);
+            app.insert_resource(HdpArchiveHandle(archive));
+        }
     }
 }
 
@@ -298,6 +329,7 @@ impl Plugin for HirakuPlugin {
 /// [`HirakuPluginGroup`] to install Hiraku's materials and runtime systems.
 pub fn configure_runtime_app(app: &mut App, config: RuntimeLaunchConfig) {
     let asset_root_path = std::path::PathBuf::from(&config.asset_root);
+    let asset_mode = config.asset_mode;
     let archive_store = vfs::HdpArchiveStore::default();
     let vfs = Arc::new(vfs::HdpVfs::new_with_config_and_store(
         asset_root_path,
@@ -311,7 +343,9 @@ pub fn configure_runtime_app(app: &mut App, config: RuntimeLaunchConfig) {
     app.insert_resource(VfsResource(vfs));
     app.insert_resource(SceneSharedState::default());
     app.insert_resource(ClearColor(Color::BLACK));
-    app.add_plugins(HirakuAssetSourcePlugin);
+    if asset_mode == RuntimeAssetMode::Hdp {
+        app.add_plugins(HirakuAssetSourcePlugin);
+    }
 }
 
 fn archive_path_from_config(config: &RuntimeLaunchConfig) -> String {
@@ -322,6 +356,13 @@ fn archive_path_from_config(config: &RuntimeLaunchConfig) -> String {
 
 fn hdp_archive_ready(archive_store: Res<HdpArchiveStore>) -> bool {
     archive_store.is_ready()
+}
+
+fn runtime_content_ready(
+    config: Res<RuntimeLaunchConfig>,
+    archive_store: Res<HdpArchiveStore>,
+) -> bool {
+    config.asset_mode == RuntimeAssetMode::Directory || hdp_archive_ready(archive_store)
 }
 
 fn runtime_not_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool {
@@ -368,5 +409,19 @@ fn boot_runtime(
         Err(err) => {
             error!("failed to resolve startup script: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_config_uses_loose_default_document_paths() {
+        let config = RuntimeLaunchConfig::directory("example-assets");
+        assert_eq!(config.asset_mode, RuntimeAssetMode::Directory);
+        assert_eq!(config.asset_root, "example-assets");
+        assert_eq!(config.settings_path, "settings.hson");
+        assert_eq!(config.default_startup_script, "startup.hks");
     }
 }

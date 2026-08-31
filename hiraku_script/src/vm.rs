@@ -794,7 +794,7 @@ impl Vm {
                 expected: 0,
                 actual: arguments.len(),
             }),
-            Value::Function(symbol) => {
+            Value::Function { symbol, .. } => {
                 let index = bytecode
                     .functions
                     .iter()
@@ -1015,7 +1015,10 @@ impl Vm {
                         })
                         .collect::<Result<Vec<_>, VmError>>()?;
                     match callee {
-                        Value::Function(function) => {
+                        Value::Function {
+                            module: _,
+                            symbol: function,
+                        } => {
                             if let Some(function_index) = self
                                 .bytecode
                                 .functions
@@ -1249,7 +1252,10 @@ impl Vm {
             Constant::String(value) => Value::String(value),
             Constant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
             Constant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
-            Constant::Function(symbol) => Value::Function(symbol),
+            Constant::Function(symbol) => Value::Function {
+                module: None,
+                symbol,
+            },
         })
     }
 
@@ -1772,6 +1778,12 @@ mod tests {
         let Some(VmEvent::Call(call)) = vm.step().expect("schedule yields") else {
             panic!("expected native call")
         };
-        assert_eq!(call.arguments[0].value, Value::Function(function_symbol));
+        assert_eq!(
+            call.arguments[0].value,
+            Value::Function {
+                module: None,
+                symbol: function_symbol,
+            }
+        );
     }
 }

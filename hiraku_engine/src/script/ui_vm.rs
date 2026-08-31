@@ -82,6 +82,7 @@ struct UiDraft {
     kind: UiDraftKind,
     content: Option<HksClosure>,
     hovered: Option<HksClosure>,
+    action: Option<String>,
     layout: ScreenLayout,
     panel: bool,
     enabled: bool,
@@ -90,6 +91,10 @@ struct UiDraft {
     visible_binding: Option<HksBinding<bool>>,
     hovered_when_disabled: bool,
     gap: f32,
+    padding: f32,
+    surface: Option<[f32; 4]>,
+    text_size: Option<f32>,
+    text_color: Option<[f32; 4]>,
     background_texture: Option<String>,
     overlay: Option<[f32; 4]>,
     animation: Option<AnimationSpec>,
@@ -102,6 +107,7 @@ impl UiDraft {
             kind,
             content,
             hovered: None,
+            action: None,
             layout: ScreenLayout::default(),
             panel: true,
             enabled: true,
@@ -110,6 +116,10 @@ impl UiDraft {
             visible_binding: None,
             hovered_when_disabled: false,
             gap: 12.0,
+            padding: 0.0,
+            surface: None,
+            text_size: None,
+            text_color: None,
             background_texture: None,
             overlay: None,
             animation: None,
@@ -186,6 +196,52 @@ mod native_ui {
         Ok(context.insert(UiDraft::new(UiDraftKind::Text(value), None)))
     }
 
+    #[hks(name = "prefix", receiver)]
+    fn string_prefix(
+        _context: &mut UiVmContext,
+        value: String,
+        characters: f64,
+    ) -> Result<String, NativeError> {
+        if !characters.is_finite() || characters < 0.0 {
+            return Err(NativeError::message(
+                "String.prefix character count must be finite and non-negative",
+            ));
+        }
+        Ok(value.chars().take(characters.floor() as usize).collect())
+    }
+
+    /// Creates a writable binding from ordinary script functions. The getter
+    /// takes no arguments; the setter takes the new value. The tuple is a
+    /// save-safe pair of script callable IDs/closures, never native pointers.
+    #[hks(name = "binding", raw)]
+    fn ui_binding(
+        _context: &mut UiVmContext,
+        call: &hiraku_script::BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        let [getter, setter] = call.arguments.as_slice() else {
+            return Err(NativeError::Arity {
+                expected: 2,
+                actual: call.arguments.len(),
+            });
+        };
+        hiraku_script::native::HksCallable::from_hks_value(&getter.value).map_err(|_| {
+            NativeError::message(format!(
+                "binding getter must be a script function, got {:?}",
+                getter.value
+            ))
+        })?;
+        hiraku_script::native::HksCallable::from_hks_value(&setter.value).map_err(|_| {
+            NativeError::message(format!(
+                "binding setter must be a script function, got {:?}",
+                setter.value
+            ))
+        })?;
+        Ok(Value::Tuple(vec![
+            getter.value.clone(),
+            setter.value.clone(),
+        ]))
+    }
+
     #[hks(name = "__uiTerm")]
     fn ui_term(context: &mut UiVmContext, id: String) -> Result<UiNodeHandle, NativeError> {
         let term = context
@@ -195,13 +251,27 @@ mod native_ui {
         Ok(context.insert(UiDraft::new(UiDraftKind::Term(term), None)))
     }
 
-    #[hks(name = "__uiButton")]
+    #[hks(name = "button", raw)]
     fn ui_button(
         context: &mut UiVmContext,
-        value: Value,
-        content: HksClosure,
-    ) -> Result<UiNodeHandle, NativeError> {
-        Ok(context.insert(UiDraft::new(UiDraftKind::Button(value), Some(content))))
+        call: &hiraku_script::BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        let (value, content) = match call.arguments.as_slice() {
+            [content] => (Value::Unit, HksClosure::from_hks_value(&content.value)?),
+            [value, content] => (
+                value.value.clone(),
+                HksClosure::from_hks_value(&content.value)?,
+            ),
+            arguments => {
+                return Err(NativeError::Arity {
+                    expected: 2,
+                    actual: arguments.len(),
+                });
+            }
+        };
+        Ok(context
+            .insert(UiDraft::new(UiDraftKind::Button(value), Some(content)))
+            .into_hks_value())
     }
 
     #[hks(name = "__uiSpacer")]
@@ -271,6 +341,62 @@ mod native_ui {
         gap: f64,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.gap = non_negative(gap, "UI gap")?;
+        Ok(node)
+    }
+
+    #[hks(name = "padding", receiver)]
+    fn ui_padding(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        padding: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.padding = non_negative(padding, "UI padding")?;
+        Ok(node)
+    }
+
+    #[hks(name = "surface", receiver)]
+    fn ui_surface(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        red: f64,
+        green: f64,
+        blue: f64,
+        alpha: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.surface = Some([
+            color_component(red)?,
+            color_component(green)?,
+            color_component(blue)?,
+            color_component(alpha)?,
+        ]);
+        Ok(node)
+    }
+
+    #[hks(name = "fontSize", receiver)]
+    fn ui_font_size(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        size: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.text_size = Some(non_negative(size, "UI font size")?);
+        Ok(node)
+    }
+
+    #[hks(name = "color", receiver)]
+    fn ui_color(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        red: f64,
+        green: f64,
+        blue: f64,
+        alpha: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.text_color = Some([
+            color_component(red)?,
+            color_component(green)?,
+            color_component(blue)?,
+            color_component(alpha)?,
+        ]);
         Ok(node)
     }
 
@@ -388,6 +514,25 @@ mod native_ui {
         content: HksClosure,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.hovered = Some(content);
+        Ok(node)
+    }
+
+    #[hks(name = "action", receiver)]
+    fn ui_action(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        action: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if action.trim().is_empty() {
+            return Err(NativeError::message("UI action must not be empty"));
+        }
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Button(_)) {
+            return Err(NativeError::message(
+                "action can only be applied to button nodes",
+            ));
+        }
+        draft.action = Some(action);
         Ok(node)
     }
 
@@ -560,9 +705,32 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     register_animation_api(&mut registry)
         .expect("animation API registration must be internally consistent");
     // Register the nominal result type before compiling the HKS standard library.
-    registry.define_type("UiNode");
+    let ui_node = registry.define_type("UiNode");
     native_ui::register_hks(&mut registry)
         .expect("UI native primitives must be internally consistent");
+    registry
+        .set_signature(
+            hiraku_script::native::stable_builtin_id("binding"),
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: vec![ScriptType::Function, ScriptType::Function],
+                result: ScriptType::Binding(Box::new(ScriptType::Any)),
+            },
+        )
+        .expect("binding signature must target its raw native implementation");
+    registry
+        .set_signature(
+            hiraku_script::native::stable_builtin_id("button"),
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: vec![
+                    ScriptType::Any,
+                    ScriptType::Nullable(Box::new(ScriptType::Function)),
+                ],
+                result: ScriptType::Named(ui_node),
+            },
+        )
+        .expect("button signature must target its raw native implementation");
     registry
         .define_global(
             "time",
@@ -572,8 +740,20 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
             ])),
         )
         .expect("built-in UI time model must be defined once");
+    registry
+        .define_global(
+            "dialogue",
+            ScriptType::Record(BTreeMap::from([
+                ("speaker".to_string(), ScriptType::String),
+                ("text".to_string(), ScriptType::String),
+                ("visible".to_string(), ScriptType::Bool),
+                ("revealedCharacters".to_string(), ScriptType::Int),
+                ("canAdvance".to_string(), ScriptType::Bool),
+            ])),
+        )
+        .expect("built-in dialogue model must be defined once");
     for (name, value) in values.story_values() {
-        if name == "time" {
+        if name == "time" || name == "dialogue" {
             continue;
         }
         registry
@@ -815,7 +995,8 @@ fn reactive_binding<T>(
 ) -> UiReactiveBinding {
     UiReactiveBinding {
         program: program.clone(),
-        closure: binding.closure().clone(),
+        getter: binding.getter().value().clone(),
+        setter: binding.setter().map(|setter| setter.value().clone()),
         globals: context_globals(context),
     }
 }
@@ -825,8 +1006,17 @@ fn evaluate_binding_value(
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
 ) -> Result<Value, UiVmError> {
-    let callable = binding.closure.clone().into_hks_value();
-    let mut vm = LinkedVm::from_callable(binding.program.clone(), &callable, Vec::new())
+    evaluate_binding_callable(binding, &binding.getter, Vec::new(), registry, context)
+}
+
+fn evaluate_binding_callable(
+    binding: &UiReactiveBinding,
+    callable: &Value,
+    arguments: Vec<Value>,
+    registry: &NativeRegistry<UiVmContext>,
+    context: &mut UiVmContext,
+) -> Result<Value, UiVmError> {
+    let mut vm = LinkedVm::from_callable(binding.program.clone(), callable, arguments)
         .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
     vm.set_current_globals(&binding.globals)
         .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
@@ -853,53 +1043,43 @@ fn evaluate_binding_value(
     }
 }
 
+/// Invokes the script-defined setter of a writable UI binding. Controls call
+/// this at their commit boundary; pointer motion never mutates script state.
+pub(crate) fn evaluate_ui_binding_setter(
+    binding: &UiReactiveBinding,
+    models: &crate::ui::UiModels,
+    value: Value,
+) -> Result<Value, UiVmError> {
+    let setter = binding
+        .setter
+        .as_ref()
+        .ok_or_else(|| UiVmError::Invalid("the UI binding is read-only".into()))?;
+    let mut binding = binding.clone();
+    for (name, value) in models.roots() {
+        binding
+            .globals
+            .insert(name.to_string(), stored_to_hks(value));
+    }
+    let values = UiContext::default();
+    let registry = ui_registry(&values);
+    let mut context = UiVmContext::new(values, TermCatalog::default());
+    evaluate_binding_callable(&binding, setter, vec![value], &registry, &mut context)
+}
+
 pub(crate) fn evaluate_ui_reactive_binding(
     binding: &UiReactiveBinding,
-    signals: &crate::ui::UiSignals,
+    models: &crate::ui::UiModels,
 ) -> Result<Value, UiVmError> {
     let mut binding = binding.clone();
-    for (path, value) in signals.values() {
-        let value = match value {
-            crate::ui::UiSignalValue::Bool(value) => Value::Bool(*value),
-            crate::ui::UiSignalValue::Number(value) => Value::Number(*value),
-            crate::ui::UiSignalValue::String(value) => Value::String(value.clone()),
-        };
-        insert_global_path(&mut binding.globals, path, value);
+    for (name, value) in models.roots() {
+        binding
+            .globals
+            .insert(name.to_string(), stored_to_hks(value));
     }
     let values = UiContext::default();
     let registry = ui_registry(&values);
     let mut context = UiVmContext::new(values, TermCatalog::default());
     evaluate_binding_value(&binding, &registry, &mut context)
-}
-
-fn insert_global_path(globals: &mut BTreeMap<String, Value>, path: &str, value: Value) {
-    let mut segments = path.split('.');
-    let Some(root) = segments.next() else {
-        return;
-    };
-    let rest = segments.collect::<Vec<_>>();
-    if rest.is_empty() {
-        globals.insert(root.to_string(), value);
-        return;
-    }
-    let root_value = globals
-        .entry(root.to_string())
-        .or_insert_with(|| Value::Map(BTreeMap::new()));
-    insert_member_path(root_value, &rest, value);
-}
-
-fn insert_member_path(target: &mut Value, path: &[&str], value: Value) {
-    let Value::Map(fields) = target else {
-        return;
-    };
-    if path.len() == 1 {
-        fields.insert(path[0].to_string(), value);
-        return;
-    }
-    let child = fields
-        .entry(path[0].to_string())
-        .or_insert_with(|| Value::Map(BTreeMap::new()));
-    insert_member_path(child, &path[1..], value);
 }
 
 fn materialize_screen(
@@ -996,8 +1176,8 @@ fn materialize_node(
                 binding: is_template.then(|| text.clone()),
                 reactive_text: if is_template { None } else { reactive },
                 text,
-                size: 28.0,
-                color: None,
+                size: draft.text_size.unwrap_or(28.0),
+                color: draft.text_color,
                 align: None,
                 layout: draft.layout,
             }))
@@ -1057,8 +1237,8 @@ fn materialize_node(
                 .collect::<Result<Vec<_>, _>>()?;
             let container = ContainerNode {
                 gap: draft.gap,
-                padding: 0.0,
-                background: None,
+                padding: draft.padding,
+                background: draft.surface,
                 border: None,
                 justify: None,
                 align_items: None,
@@ -1089,12 +1269,16 @@ fn materialize_node(
                 )));
             }
             let normal = materialize_node(normal_handles[0], program, registry, context, textures)?;
-            let value = stored_value(value)?;
+            let value = if draft.action.is_some() || matches!(&value, Value::Unit) {
+                None
+            } else {
+                Some(stored_value(value)?)
+            };
             match normal {
                 ScreenNode::Text(text) => Ok(ScreenNode::Button(ButtonNode {
                     text: text.text,
-                    value: Some(value),
-                    action: None,
+                    value,
+                    action: draft.action,
                     enabled,
                     enabled_binding: None,
                     reactive_enabled,
@@ -1141,6 +1325,7 @@ fn materialize_node(
                         hovered_texture,
                         hovered_layout,
                         value,
+                        action: draft.action,
                         enabled,
                         enabled_binding: None,
                         reactive_enabled,
@@ -1367,7 +1552,35 @@ screen {
     }
 
     #[test]
-    fn live_text_bindings_capture_story_values_and_preserve_signals() {
+    fn text_buttons_can_dispatch_engine_actions_from_declarative_ui() {
+        let screen = evaluate_ui_component_named(
+            "memory://save-controls.ui.hks",
+            concat!(
+                "import ui.widgets.*\n",
+                "canvas {\n",
+                "  button { text(\"Passive\") }\n",
+                "  button { text(\"Quick Save\") }.action(\"storage.save.quick\")\n",
+                "}",
+            ),
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("action button should compile");
+        let ScreenNode::Button(passive) = &screen.children[0] else {
+            panic!("first child should be a closure-only button")
+        };
+        assert_eq!(passive.value, None);
+        assert_eq!(passive.action, None);
+        let ScreenNode::Button(button) = &screen.children[1] else {
+            panic!("second child should be an action button")
+        };
+        assert_eq!(button.action.as_deref(), Some("storage.save.quick"));
+        assert_eq!(button.value, None);
+    }
+
+    #[test]
+    fn live_text_bindings_capture_story_values_and_preserve_models() {
         let screen = evaluate_ui_component_named(
             "memory://live_overlay.ui.hks",
             concat!(
@@ -1393,7 +1606,7 @@ screen {
     }
 
     #[test]
-    fn typed_signals_bind_visibility_buttons_and_progress() {
+    fn typed_models_bind_visibility_buttons_and_progress() {
         let screen = evaluate_ui_component_named(
             "memory://typed_live.ui.hks",
             r#"import ui.widgets.*
@@ -1444,18 +1657,78 @@ canvas {
         assert!(progress.reactive_value.is_some());
         assert_eq!((progress.min, progress.max), (0.0, 100.0));
 
-        let mut signals = crate::ui::UiSignals::default();
-        signals.set("player.health", 25.0);
+        let mut models = crate::ui::UiModels::default();
+        models.set(
+            "player",
+            StoredValue::Map(BTreeMap::from([(
+                "health".to_string(),
+                StoredValue::Float(25.0),
+            )])),
+        );
         assert_eq!(
             evaluate_ui_reactive_binding(
                 progress
                     .reactive_value
                     .as_ref()
                     .expect("progress expression is retained"),
-                &signals,
+                &models,
             )
             .expect("updated model should evaluate"),
             Value::Number(25.0)
+        );
+    }
+
+    #[test]
+    fn script_functions_form_a_writable_binding_delegate() {
+        let screen = evaluate_ui_component_named(
+            "memory://delegate.ui.hks",
+            r#"import ui.widgets.*
+fn readHealth() -> Float { player.health }
+fn writeHealth(value: Float) { () }
+canvas {
+    progress(binding(readHealth, writeHealth)).range(0, 100)
+}"#,
+            UiContext::new(BTreeMap::from([(
+                "player".to_string(),
+                StoredValue::Map(BTreeMap::from([(
+                    "health".to_string(),
+                    StoredValue::Float(75.0),
+                )])),
+            )])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("script getter/setter functions should form a binding");
+
+        let ScreenNode::Bar(progress) = &screen.children[0] else {
+            panic!("binding consumer should be a progress bar")
+        };
+        let binding = progress
+            .reactive_value
+            .as_ref()
+            .expect("binding getter should be retained");
+        assert!(
+            binding.setter.is_some(),
+            "binding setter should be retained"
+        );
+
+        let mut models = crate::ui::UiModels::default();
+        models.set(
+            "player",
+            StoredValue::Map(BTreeMap::from([(
+                "health".to_string(),
+                StoredValue::Float(30.0),
+            )])),
+        );
+        assert_eq!(
+            evaluate_ui_reactive_binding(binding, &models)
+                .expect("script getter should evaluate against the latest model"),
+            Value::Number(30.0),
+        );
+        assert_eq!(
+            evaluate_ui_binding_setter(binding, &models, Value::Number(42.0))
+                .expect("script setter should be independently invokable"),
+            Value::Unit,
         );
     }
 

@@ -240,9 +240,16 @@ pub fn validate_raw_str(input: &str) -> Result<(), RawStrError> {
 
 /// Creates an iterator that produces tokens from the input string.
 pub fn tokenize<'a>(input: &'a str) -> impl Iterator<Item = Token> + 'a {
+    tokenize_with_template_expressions(input, true)
+}
+
+pub(crate) fn tokenize_with_template_expressions(
+    input: &str,
+    template_expressions: bool,
+) -> impl Iterator<Item = Token> + '_ {
     let mut cursor = Cursor::new(input);
     std::iter::from_fn(move || {
-        let token = cursor.advance_token();
+        let token = cursor.advance_token_with_template_expressions(template_expressions);
         if token.kind != Eof { Some(token) } else { None }
     })
 }
@@ -307,6 +314,13 @@ pub fn is_ident(string: &str) -> bool {
 impl Cursor<'_> {
     /// Parses a token from the input string.
     pub fn advance_token(&mut self) -> Token {
+        self.advance_token_with_template_expressions(true)
+    }
+
+    pub(crate) fn advance_token_with_template_expressions(
+        &mut self,
+        template_expressions: bool,
+    ) -> Token {
         let first_char = match self.bump() {
             Some(c) => c,
             None => return Token::new(Eof, 0),
@@ -435,7 +449,7 @@ impl Cursor<'_> {
                     Literal { kind, suffix_start }
                 }
                 _ => {
-                    let terminated = self.double_quoted_string();
+                    let terminated = self.double_quoted_string(template_expressions);
                     let suffix_start = self.pos_within_token();
                     if terminated {
                         self.eat_literal_suffix();
@@ -688,7 +702,7 @@ impl Cursor<'_> {
 
     /// Eats double-quoted string and returns true
     /// if string is terminated.
-    fn double_quoted_string(&mut self) -> bool {
+    fn double_quoted_string(&mut self, template_expressions: bool) -> bool {
         debug_assert!(self.prev() == '"');
         while let Some(c) = self.bump() {
             match c {
@@ -699,7 +713,7 @@ impl Cursor<'_> {
                     // Bump again to skip escaped character.
                     self.bump();
                 }
-                '$' if self.first() == '{' => {
+                '$' if template_expressions && self.first() == '{' => {
                     self.bump();
                     if !self.template_expression() {
                         return false;
@@ -719,7 +733,7 @@ impl Cursor<'_> {
         let mut braces = 1usize;
         while let Some(c) = self.bump() {
             match c {
-                '"' if !self.double_quoted_string() => return false,
+                '"' if !self.double_quoted_string(true) => return false,
                 '\'' if !self.single_quoted_string() => return false,
                 '{' => braces += 1,
                 '}' => {

@@ -5,7 +5,10 @@ use bevy::{
     audio::{AudioSink, AudioSinkPlayback, Volume},
     ecs::system::SystemParam,
     log::{info, warn},
-    picking::hover::PickingInteraction,
+    picking::{
+        hover::PickingInteraction,
+        pointer::{PointerButton, PointerId},
+    },
     prelude::*,
 };
 
@@ -44,9 +47,9 @@ use crate::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
         ScreenUiImageButton, ScreenUiNode, ScreenUiRoot, ScreenUiState, SpacerNode,
-        StaleScreenRoot, TextNode, UiAnimationPlayer, UiEnabledBinding, UiProgressBinding,
-        UiReactiveEnabledBinding, UiReactiveProgressBinding, UiReactiveTextBinding,
-        UiReactiveVisibilityBinding, UiSignalValue, UiSignals, UiTextBinding, UiVisibilityBinding,
+        StaleScreenRoot, TextNode, UiAnimationPlayer, UiEnabledBinding, UiModels,
+        UiProgressBinding, UiReactiveEnabledBinding, UiReactiveProgressBinding,
+        UiReactiveTextBinding, UiReactiveVisibilityBinding, UiTextBinding, UiVisibilityBinding,
     },
     vfs::VfsResource,
 };
@@ -62,7 +65,7 @@ use character::{
 };
 pub use screen_ui::{
     animate_screen_ui, cleanup_stale_screen_ui, handle_screen_buttons, handle_screen_image_buttons,
-    update_builtin_ui_signals, update_ui_reactive_bindings, update_ui_text_bindings,
+    update_builtin_ui_models, update_ui_reactive_bindings, update_ui_text_bindings,
 };
 use screen_ui::{
     clear_overlay_ui, clear_screen_ui, screen_images_ready,
@@ -226,6 +229,12 @@ pub struct DialogueState {
     pub effect: DialogueTextEffect,
 }
 
+#[derive(Resource, Default)]
+pub struct DialogueHistoryState {
+    pub entries: Vec<DialogueSnapshot>,
+    pub visible: bool,
+}
+
 pub struct PendingDialogueAdvance {
     pub animation_id: Option<String>,
     pub request: Option<ScriptRequestId>,
@@ -233,6 +242,7 @@ pub struct PendingDialogueAdvance {
 
 pub struct DialogueRevealState {
     pub spans: Vec<Entity>,
+    pub total_chars: usize,
     pub next_index: usize,
     pub accumulator: f32,
     pub interval: f32,
@@ -381,11 +391,54 @@ fn evaluate_ui_at(
         "sfxVolume".to_string(),
         StoredValue::Float(user_settings.sfx_volume as f64),
     );
+    values.insert("dialogue".to_string(), default_dialogue_model());
+    values.insert("history".to_string(), default_history_model());
     let source = vfs.0.read_text(target).map_err(|error| error.to_string())?;
     let textures = textures.ok_or_else(|| "texture catalog is unavailable".to_string())?;
     let terms = terms.ok_or_else(|| "term catalog is unavailable".to_string())?;
     evaluate_ui_component_named(target, &source, UiContext::new(values), textures, terms)
         .map_err(|error| error.to_string())
+}
+
+fn default_dialogue_model() -> StoredValue {
+    StoredValue::Map(BTreeMap::from([
+        ("speaker".to_string(), StoredValue::String(String::new())),
+        ("text".to_string(), StoredValue::String(String::new())),
+        ("visible".to_string(), StoredValue::Bool(false)),
+        ("revealedCharacters".to_string(), StoredValue::Int(0)),
+        ("canAdvance".to_string(), StoredValue::Bool(false)),
+    ]))
+}
+
+fn default_history_model() -> StoredValue {
+    StoredValue::Map(BTreeMap::from([
+        ("entries".to_string(), StoredValue::Array(Vec::new())),
+        ("text".to_string(), StoredValue::String(String::new())),
+        ("visible".to_string(), StoredValue::Bool(false)),
+    ]))
+}
+
+/// UI components under the conventional `ui/` directory are package-rooted.
+/// Other relative paths remain relative to the declaring script. Persisted
+/// canonical paths pass through unchanged, which also repairs older saves that
+/// retained `ui/...` and were restored from a script subdirectory.
+fn resolve_ui_component_path(
+    vfs: &VfsResource,
+    current_script: Option<&str>,
+    component: &str,
+) -> String {
+    if component.starts_with("ui/") {
+        if let Some((archive, _)) = current_script
+            .and_then(|path| path.strip_prefix("hdp://"))
+            .and_then(|path| path.split_once('/'))
+        {
+            return vfs
+                .0
+                .resolve_path(None, &format!("hdp://{archive}/{component}"));
+        }
+        return vfs.0.resolve_path(None, component);
+    }
+    vfs.0.resolve_path(current_script, component)
 }
 
 pub fn bridge_story_events(
@@ -525,10 +578,35 @@ pub fn bridge_story_events(
                 role,
                 component,
             }) => {
-                let target = vfs
-                    .0
-                    .resolve_path(runtime.current_script.as_deref(), &component);
-                runtime.ui_registry.insert(role, target);
+                let target =
+                    resolve_ui_component_path(&vfs, runtime.current_script.as_deref(), &component);
+                runtime.ui_registry.insert(role.clone(), target.clone());
+                if role == "dialogue" {
+                    match evaluate_ui_at(
+                        &target,
+                        &runtime,
+                        &vfs,
+                        &user_settings,
+                        textures.as_deref(),
+                        terms.as_deref(),
+                    ) {
+                        Ok(screen) => {
+                            runtime
+                                .mounted_ui_overlays
+                                .insert("__role.dialogue".into(), target);
+                            pending_script_commands
+                                .items
+                                .push_back(ScriptCommand::ShowOverlay {
+                                    name: "__role.dialogue".into(),
+                                    screen,
+                                });
+                        }
+                        Err(error) => {
+                            warn!("failed to enable dialogue UI `{component}`: {error}");
+                            runtime.story = None;
+                        }
+                    }
+                }
             }
             StoryRuntimeEvent::Effect(
                 crate::script::capabilities::StoryEffect::MountUiOverlay { name, component },
@@ -538,8 +616,11 @@ pub fn bridge_story_events(
                     .get(&component)
                     .cloned()
                     .unwrap_or_else(|| {
-                        vfs.0
-                            .resolve_path(runtime.current_script.as_deref(), &component)
+                        resolve_ui_component_path(
+                            &vfs,
+                            runtime.current_script.as_deref(),
+                            &component,
+                        )
                     });
                 let overlay = evaluate_ui_at(
                     &target,
@@ -551,7 +632,9 @@ pub fn bridge_story_events(
                 );
                 match overlay {
                     Ok(screen) => {
-                        runtime.mounted_ui_overlays.insert(name.clone(), component);
+                        runtime
+                            .mounted_ui_overlays
+                            .insert(name.clone(), target.clone());
                         pending_script_commands
                             .items
                             .push_back(ScriptCommand::ShowOverlay { name, screen });
@@ -568,6 +651,23 @@ pub fn bridge_story_events(
                 pending_script_commands
                     .items
                     .push_back(ScriptCommand::HideOverlay { name });
+            }
+            StoryRuntimeEvent::Effect(
+                effect @ (crate::script::capabilities::StoryEffect::Say { .. }
+                | crate::script::capabilities::StoryEffect::ContinueDialogue { .. }),
+            ) => {
+                if !runtime.ui_registry.contains_key("dialogue") {
+                    warn!(
+                        "dialogue UI is not configured; call ui.set(\"dialogue\", \"path/to/dialogue.ui.hks\") before executing dialogue"
+                    );
+                    runtime.story = None;
+                    runtime.story_events.clear();
+                } else {
+                    match script_command_from_effect(effect, textures.as_deref()) {
+                        Ok(command) => pending_script_commands.items.push_back(command),
+                        Err(error) => warn!("HKS dialogue command rejected: {error}"),
+                    }
+                }
             }
             StoryRuntimeEvent::Effect(effect) => {
                 match script_command_from_effect(effect, textures.as_deref()) {
@@ -809,21 +909,30 @@ pub struct PauseMenuRoot;
 #[derive(Component)]
 pub struct RuntimeMenuButton {
     pub action: RuntimeMenuButtonAction,
+    /// Modal screen which owns this action, or `None` for the built-in pause UI.
+    pub screen_root: Option<Entity>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum RuntimeMenuButtonAction {
-    QuickSave,
-    QuickLoad,
+    Save(String),
+    Load(String),
     OpenPauseMenu,
+    OpenUi(String),
+    CloseUi,
+    SetHistoryVisible(bool),
     Resume,
     ReturnToTitle,
+    AdvanceDialogue,
 }
 
 #[derive(Resource, Default)]
 pub struct RuntimeMenuState {
     pub pause_root: Option<Entity>,
     pub pause_open: bool,
+    /// Pointer clicks claimed by UI actions during this update. Keeping the
+    /// pointer identity makes consumption survive deferred modal despawning.
+    pub consumed_pointer_clicks: HashMap<PointerId, usize>,
 }
 
 #[derive(Component)]
@@ -931,6 +1040,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub script_runtime: ResMut<'w, ScriptRuntimeState>,
     pub active_batches: ResMut<'w, ActiveScriptBatches>,
     pub dialogue_state: ResMut<'w, DialogueState>,
+    pub dialogue_history: ResMut<'w, DialogueHistoryState>,
     pub choice_state: ResMut<'w, ChoiceState>,
     pub screen_state: ResMut<'w, ScreenUiState>,
     pub overlay_state: ResMut<'w, OverlayUiState>,
@@ -987,6 +1097,8 @@ pub struct SceneCommandContext<'w, 's> {
 pub struct RuntimeMenuContext<'w, 's> {
     pub commands: Commands<'w, 's>,
     pub asset_server: Res<'w, AssetServer>,
+    pub textures: Res<'w, TextureCatalog>,
+    pub terms: Res<'w, TermCatalog>,
     pub ui_fonts: Res<'w, UiFonts>,
     pub vfs: Res<'w, VfsResource>,
     pub shared_state: ResMut<'w, SceneSharedState>,
@@ -995,6 +1107,7 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub user_settings: Res<'w, UserSettings>,
     pub ui_style: Res<'w, UiStyle>,
     pub runtime_menu: ResMut<'w, RuntimeMenuState>,
+    pub dialogue_history: ResMut<'w, DialogueHistoryState>,
     pub stage: ResMut<'w, StageState>,
     pub waits: ResMut<'w, PendingWaits>,
     pub pending_script_commands: ResMut<'w, PendingScriptCommands>,
@@ -1006,11 +1119,14 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub animations: ResMut<'w, AnimationState>,
     pub voice_state: ResMut<'w, VoiceState>,
     pub pending_characters: ResMut<'w, PendingCharacterShows>,
+    pub dialogue_chars: Query<'w, 's, &'static mut DialogueCharSpan>,
+    pub responses: MessageWriter<'w, ScriptResponseMessage>,
     pub choice_ui_roots: Query<'w, 's, Entity, (With<ChoiceUi>, Without<ChildOf>)>,
     pub dialogue_root:
         Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     pub speaker_text: Query<'w, 's, &'static mut Text, (With<SpeakerText>, Without<LineText>)>,
     pub line_text: Query<'w, 's, &'static mut Text, (With<LineText>, Without<SpeakerText>)>,
+    pub clicks: MessageReader<'w, 's, Pointer<Click>>,
     pub interaction_query: Query<
         'w,
         's,
@@ -1022,12 +1138,13 @@ pub struct RuntimeMenuContext<'w, 's> {
         ),
         Changed<PickingInteraction>,
     >,
+    pub action_query: Query<'w, 's, (&'static RuntimeMenuButton, Option<&'static ScreenUiButton>)>,
+    pub background_query: Query<'w, 's, (), With<BackgroundColor>>,
+    pub parents: Query<'w, 's, &'static ChildOf>,
 }
 
 pub fn setup_stage(
     mut commands: Commands,
-    ui_fonts: Res<UiFonts>,
-    ui_style: Res<UiStyle>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
@@ -1056,6 +1173,7 @@ pub fn setup_stage(
         ..default()
     });
     commands.insert_resource(DialogueState::default());
+    commands.insert_resource(DialogueHistoryState::default());
     commands.insert_resource(ChoiceState::default());
     commands.insert_resource(PendingWaits::default());
     commands.insert_resource(CameraShakeState::default());
@@ -1083,57 +1201,6 @@ pub fn setup_stage(
         Pickable::default(),
         ui_layer(),
     ));
-
-    let dialogue_root = commands
-        .spawn((
-            DialogueRoot,
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(ui_style.dialogue_left),
-                right: px(ui_style.dialogue_right),
-                bottom: px(ui_style.dialogue_bottom),
-                min_height: px(ui_style.dialogue_min_height),
-                border: UiRect::all(px(1.0)),
-                padding: UiRect::axes(
-                    px(ui_style.dialogue_padding_x),
-                    px(ui_style.dialogue_padding_y),
-                ),
-                border_radius: BorderRadius::all(px(ui_style.dialogue_radius)),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(12.0),
-                ..default()
-            },
-            BackgroundColor(ui_style.dialogue_bg),
-            BorderColor::all(ui_style.dialogue_border),
-            Visibility::Hidden,
-        ))
-        .id();
-
-    commands.entity(dialogue_root).with_children(|parent| {
-        parent.spawn((
-            SpeakerText,
-            Text::new(""),
-            ui_text_font(&ui_fonts, ui_style.speaker_size),
-            TextColor(ui_style.speaker_color),
-        ));
-        parent.spawn((
-            LineText,
-            Text::new(""),
-            ui_text_font(&ui_fonts, ui_style.line_size),
-            TextColor(ui_style.line_color),
-        ));
-        parent.spawn((
-            HintText,
-            Text::new("click / enter / space"),
-            ui_text_font(&ui_fonts, ui_style.hint_size),
-            TextColor(ui_style.hint_color),
-            if ui_style.hint_visible {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            },
-        ));
-    });
 
     commands.insert_resource(RuntimeMenuState::default());
     commands.insert_resource(OverlayUiState::default());
@@ -1752,10 +1819,12 @@ pub fn handle_frontend_buttons(
     mut dialogue_state: ResMut<DialogueState>,
     mut choice_state: ResMut<ChoiceState>,
     mut script_runtime: ResMut<ScriptRuntimeState>,
+    mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
         (&PickingInteraction, &mut BackgroundColor, &FrontendButton),
         Changed<PickingInteraction>,
     >,
+    button_query: Query<&FrontendButton>,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
     mut dialogue_root: Query<&mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     mut speaker_text: Query<&mut Text, (With<SpeakerText>, Without<LineText>)>,
@@ -1765,163 +1834,168 @@ pub fn handle_frontend_buttons(
         return;
     }
 
-    for (interaction, mut color, button) in &mut interaction_query {
+    for (interaction, mut color, _) in &mut interaction_query {
         match *interaction {
             PickingInteraction::Pressed => {
                 *color = FRONTEND_BUTTON_PRESSED.into();
-                let action = button.action.clone();
-                match action {
-                    FrontendAction::StartNewGame => {
-                        if frontend.runtime_started {
-                            continue;
-                        }
-                        if frontend.startup_script.is_empty() {
-                            frontend.notice = Some(
-                                "No startup script is configured. Check hdp://main.hdp/settings.hson."
-                                    .to_string(),
-                            );
-                            frontend.dirty = true;
-                            continue;
-                        }
-
-                        let bootstrap = ScriptBootstrap::new(frontend.startup_script.clone());
-
-                        start_frontend_session(
-                            &mut commands,
-                            &asset_server,
-                            &vfs,
-                            &mut shared_state,
-                            &mut stage,
-                            &mut dialogue_state,
-                            &mut choice_state,
-                            &choice_ui,
-                            &mut dialogue_root,
-                            &mut speaker_text,
-                            &mut line_text,
-                            &user_settings,
-                            &mut frontend,
-                            &mut script_runtime,
-                            bootstrap,
-                            SceneSnapshot::default(),
-                        );
-                    }
-                    FrontendAction::StartCharacterGallery => {
-                        if frontend.runtime_started {
-                            continue;
-                        }
-                        if !vfs.0.exists(&frontend.gallery_script) {
-                            frontend.notice = Some(
-                                "Character gallery script is missing from main.hdp.".to_string(),
-                            );
-                            frontend.dirty = true;
-                            continue;
-                        }
-                        let mut bootstrap = ScriptBootstrap::new(frontend.gallery_script.clone());
-                        bootstrap.values.insert(
-                            "route".to_string(),
-                            StoredValue::String("gallery".to_string()),
-                        );
-
-                        start_frontend_session(
-                            &mut commands,
-                            &asset_server,
-                            &vfs,
-                            &mut shared_state,
-                            &mut stage,
-                            &mut dialogue_state,
-                            &mut choice_state,
-                            &choice_ui,
-                            &mut dialogue_root,
-                            &mut speaker_text,
-                            &mut line_text,
-                            &user_settings,
-                            &mut frontend,
-                            &mut script_runtime,
-                            bootstrap,
-                            SceneSnapshot::default(),
-                        );
-                    }
-                    FrontendAction::OpenLoad => {
-                        frontend.screen = FrontendScreen::Load;
-                        frontend.notice = None;
-                        match list_save_slots() {
-                            Ok(saves) => frontend.saves = saves,
-                            Err(err) => {
-                                frontend.notice = Some(format!("Failed to read save list: {err}"))
-                            }
-                        }
-                        frontend.dirty = true;
-                    }
-                    FrontendAction::OpenSettings => {
-                        frontend.screen = FrontendScreen::Settings;
-                        frontend.notice = None;
-                        frontend.dirty = true;
-                    }
-                    FrontendAction::BackToTitle => {
-                        frontend.screen = FrontendScreen::Title;
-                        frontend.notice = None;
-                        frontend.dirty = true;
-                    }
-                    FrontendAction::LoadSlot(slot) => match load_save_data(&slot) {
-                        Ok(save_data) => {
-                            if frontend.runtime_started {
-                                continue;
-                            }
-                            let snapshot = save_data.scene.clone();
-                            let bootstrap = ScriptBootstrap::from_save(&save_data);
-                            start_frontend_session(
-                                &mut commands,
-                                &asset_server,
-                                &vfs,
-                                &mut shared_state,
-                                &mut stage,
-                                &mut dialogue_state,
-                                &mut choice_state,
-                                &choice_ui,
-                                &mut dialogue_root,
-                                &mut speaker_text,
-                                &mut line_text,
-                                &user_settings,
-                                &mut frontend,
-                                &mut script_runtime,
-                                bootstrap,
-                                snapshot,
-                            );
-                        }
-                        Err(err) => {
-                            frontend.notice = Some(format!("Failed to load slot {slot}: {err}"));
-                            frontend.dirty = true;
-                        }
-                    },
-                    FrontendAction::AdjustBgm(delta) => {
-                        user_settings.bgm_volume = adjusted_volume(user_settings.bgm_volume, delta);
-                        frontend.notice = write_user_settings(user_settings.as_ref())
-                            .err()
-                            .map(format_storage_error);
-                        frontend.dirty = true;
-                    }
-                    FrontendAction::AdjustVoice(delta) => {
-                        user_settings.voice_volume =
-                            adjusted_volume(user_settings.voice_volume, delta);
-                        frontend.notice = write_user_settings(user_settings.as_ref())
-                            .err()
-                            .map(format_storage_error);
-                        frontend.dirty = true;
-                    }
-                    FrontendAction::AdjustSfx(delta) => {
-                        user_settings.sfx_volume = adjusted_volume(user_settings.sfx_volume, delta);
-                        frontend.notice = write_user_settings(user_settings.as_ref())
-                            .err()
-                            .map(format_storage_error);
-                        frontend.dirty = true;
-                    }
-                }
             }
             PickingInteraction::Hovered => {
                 *color = FRONTEND_BUTTON_HOVERED.into();
             }
             PickingInteraction::None => {
                 *color = FRONTEND_BUTTON.into();
+            }
+        }
+    }
+
+    for click in clicks.read() {
+        if click.button != PointerButton::Primary {
+            continue;
+        }
+        let Ok(button) = button_query.get(click.entity) else {
+            continue;
+        };
+        let action = button.action.clone();
+        match action {
+            FrontendAction::StartNewGame => {
+                if frontend.runtime_started {
+                    continue;
+                }
+                if frontend.startup_script.is_empty() {
+                    frontend.notice = Some(
+                        "No startup script is configured. Check hdp://main.hdp/settings.hson."
+                            .to_string(),
+                    );
+                    frontend.dirty = true;
+                    continue;
+                }
+
+                let bootstrap = ScriptBootstrap::new(frontend.startup_script.clone());
+
+                start_frontend_session(
+                    &mut commands,
+                    &asset_server,
+                    &vfs,
+                    &mut shared_state,
+                    &mut stage,
+                    &mut dialogue_state,
+                    &mut choice_state,
+                    &choice_ui,
+                    &mut dialogue_root,
+                    &mut speaker_text,
+                    &mut line_text,
+                    &user_settings,
+                    &mut frontend,
+                    &mut script_runtime,
+                    bootstrap,
+                    SceneSnapshot::default(),
+                );
+            }
+            FrontendAction::StartCharacterGallery => {
+                if frontend.runtime_started {
+                    continue;
+                }
+                if !vfs.0.exists(&frontend.gallery_script) {
+                    frontend.notice =
+                        Some("Character gallery script is missing from main.hdp.".to_string());
+                    frontend.dirty = true;
+                    continue;
+                }
+                let mut bootstrap = ScriptBootstrap::new(frontend.gallery_script.clone());
+                bootstrap.values.insert(
+                    "route".to_string(),
+                    StoredValue::String("gallery".to_string()),
+                );
+
+                start_frontend_session(
+                    &mut commands,
+                    &asset_server,
+                    &vfs,
+                    &mut shared_state,
+                    &mut stage,
+                    &mut dialogue_state,
+                    &mut choice_state,
+                    &choice_ui,
+                    &mut dialogue_root,
+                    &mut speaker_text,
+                    &mut line_text,
+                    &user_settings,
+                    &mut frontend,
+                    &mut script_runtime,
+                    bootstrap,
+                    SceneSnapshot::default(),
+                );
+            }
+            FrontendAction::OpenLoad => {
+                frontend.screen = FrontendScreen::Load;
+                frontend.notice = None;
+                match list_save_slots() {
+                    Ok(saves) => frontend.saves = saves,
+                    Err(err) => frontend.notice = Some(format!("Failed to read save list: {err}")),
+                }
+                frontend.dirty = true;
+            }
+            FrontendAction::OpenSettings => {
+                frontend.screen = FrontendScreen::Settings;
+                frontend.notice = None;
+                frontend.dirty = true;
+            }
+            FrontendAction::BackToTitle => {
+                frontend.screen = FrontendScreen::Title;
+                frontend.notice = None;
+                frontend.dirty = true;
+            }
+            FrontendAction::LoadSlot(slot) => match load_save_data(&slot) {
+                Ok(save_data) => {
+                    if frontend.runtime_started {
+                        continue;
+                    }
+                    let snapshot = save_data.scene.clone();
+                    let bootstrap = ScriptBootstrap::from_save(&save_data);
+                    start_frontend_session(
+                        &mut commands,
+                        &asset_server,
+                        &vfs,
+                        &mut shared_state,
+                        &mut stage,
+                        &mut dialogue_state,
+                        &mut choice_state,
+                        &choice_ui,
+                        &mut dialogue_root,
+                        &mut speaker_text,
+                        &mut line_text,
+                        &user_settings,
+                        &mut frontend,
+                        &mut script_runtime,
+                        bootstrap,
+                        snapshot,
+                    );
+                }
+                Err(err) => {
+                    frontend.notice = Some(format!("Failed to load slot {slot}: {err}"));
+                    frontend.dirty = true;
+                }
+            },
+            FrontendAction::AdjustBgm(delta) => {
+                user_settings.bgm_volume = adjusted_volume(user_settings.bgm_volume, delta);
+                frontend.notice = write_user_settings(user_settings.as_ref())
+                    .err()
+                    .map(format_storage_error);
+                frontend.dirty = true;
+            }
+            FrontendAction::AdjustVoice(delta) => {
+                user_settings.voice_volume = adjusted_volume(user_settings.voice_volume, delta);
+                frontend.notice = write_user_settings(user_settings.as_ref())
+                    .err()
+                    .map(format_storage_error);
+                frontend.dirty = true;
+            }
+            FrontendAction::AdjustSfx(delta) => {
+                user_settings.sfx_volume = adjusted_volume(user_settings.sfx_volume, delta);
+                frontend.notice = write_user_settings(user_settings.as_ref())
+                    .err()
+                    .map(format_storage_error);
+                frontend.dirty = true;
             }
         }
     }
@@ -1949,6 +2023,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut script_runtime = ctx.script_runtime;
     let mut active_batches = ctx.active_batches;
     let mut dialogue_state = ctx.dialogue_state;
+    let mut dialogue_history = ctx.dialogue_history;
     let mut choice_state = ctx.choice_state;
     let mut screen_state = ctx.screen_state;
     let mut overlay_state = ctx.overlay_state;
@@ -2396,12 +2471,17 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         0,
                         None,
                     );
+                } else {
+                    set_dialogue_model_reveal(&mut dialogue_state, &text, 0, None);
                 }
                 dialogue_state.waiting = Some(PendingDialogueAdvance {
                     animation_id,
                     request: None,
                 });
                 shared_state.0.dialogue = Some(DialogueSnapshot { speaker, text });
+                if let Some(dialogue) = shared_state.0.dialogue.clone() {
+                    dialogue_history.entries.push(dialogue);
+                }
             }
             ScriptCommand::ContinueDialogue { text, animation_id } => {
                 if let Some(waiting) = dialogue_state.waiting.take() {
@@ -2427,12 +2507,20 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             0,
                             None,
                         );
+                    } else {
+                        set_dialogue_model_reveal(&mut dialogue_state, &text, 0, None);
                     }
                     shared_state.0.dialogue = Some(DialogueSnapshot {
                         speaker: String::new(),
                         text,
                     });
                 } else {
+                    let previous_chars = shared_state
+                        .0
+                        .dialogue
+                        .as_ref()
+                        .map(|dialogue| dialogue.text.chars().count())
+                        .unwrap_or_default();
                     if let Ok(line_root) = line_text_entity.single() {
                         append_dialogue_line_text(
                             &mut commands,
@@ -2443,9 +2531,22 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                             &text,
                             None,
                         );
+                    } else {
+                        append_dialogue_model_reveal(
+                            &mut dialogue_state,
+                            previous_chars,
+                            text.chars().count(),
+                            None,
+                        );
                     }
                     if let Some(dialogue) = shared_state.0.dialogue.as_mut() {
                         dialogue.text.push_str(&text);
+                    }
+                    if let (Some(current), Some(last)) = (
+                        shared_state.0.dialogue.as_ref(),
+                        dialogue_history.entries.last_mut(),
+                    ) {
+                        *last = current.clone();
                     }
                 }
                 dialogue_state.waiting = Some(PendingDialogueAdvance {
@@ -2479,6 +2580,13 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         &mut line_text,
                         &ui_fonts,
                         &ui_style,
+                        &text,
+                        reveal_from.unwrap_or_else(|| text.chars().count()),
+                        animation_id,
+                    );
+                } else {
+                    set_dialogue_model_reveal(
+                        &mut dialogue_state,
                         &text,
                         reveal_from.unwrap_or_else(|| text.chars().count()),
                         animation_id,
@@ -3283,17 +3391,18 @@ pub fn handle_choice_buttons(
     mut commands: Commands,
     mut choice_state: ResMut<ChoiceState>,
     ui_style: Res<UiStyle>,
+    mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
         (&PickingInteraction, &mut BackgroundColor, &ChoiceButton),
         Changed<PickingInteraction>,
     >,
+    button_query: Query<&ChoiceButton>,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
 ) {
-    for (interaction, mut color, button) in &mut interaction_query {
+    for (interaction, mut color, _) in &mut interaction_query {
         match *interaction {
             PickingInteraction::Pressed => {
                 *color = ui_style.choice_button_pressed.into();
-                resolve_choice(&mut commands, &mut choice_state, &choice_ui, button.index);
             }
             PickingInteraction::Hovered => {
                 *color = ui_style.choice_button_hovered.into();
@@ -3302,6 +3411,15 @@ pub fn handle_choice_buttons(
                 *color = ui_style.choice_button_bg.into();
             }
         }
+    }
+    for click in clicks.read() {
+        if click.button != PointerButton::Primary {
+            continue;
+        }
+        let Ok(button) = button_query.get(click.entity) else {
+            continue;
+        };
+        resolve_choice(&mut commands, &mut choice_state, &choice_ui, button.index);
     }
 }
 
@@ -3333,31 +3451,46 @@ pub fn advance_dialogue_on_input(
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     choice_state: Res<ChoiceState>,
-    runtime_menu: Res<RuntimeMenuState>,
+    mut runtime_menu: ResMut<RuntimeMenuState>,
+    dialogue_history: Res<DialogueHistoryState>,
     ui_interactions: Query<
-        &PickingInteraction,
+        Option<&PickingInteraction>,
         Or<(
             With<ScreenUiButton>,
             With<ScreenUiImageButton>,
             With<RuntimeMenuButton>,
             With<ChoiceButton>,
+            With<PauseMenuRoot>,
         )>,
     >,
+    parents: Query<&ChildOf>,
 ) {
-    if runtime_menu.pause_open {
-        return;
-    }
-
-    if choice_state.waiting.is_some() {
-        return;
-    }
-
     let action_advance = actions
         .read()
         .any(|action| action.0 == crate::input::HirakuAction::NextDialogue);
-    let pointer_advance = clicks
-        .read()
-        .any(|click| click.pointer_id.is_custom() && !ui_interactions.contains(click.entity));
+    let mut pointer_advance = false;
+    for click in clicks.read() {
+        if let Some(count) = runtime_menu
+            .consumed_pointer_clicks
+            .get_mut(&click.pointer_id)
+        {
+            *count -= 1;
+            if *count == 0 {
+                runtime_menu
+                    .consumed_pointer_clicks
+                    .remove(&click.pointer_id);
+            }
+            continue;
+        }
+        pointer_advance |= click.pointer_id.is_custom()
+            && find_component_ancestor(click.entity, &ui_interactions, &parents).is_none()
+    }
+
+    // Always drain both readers above so input produced while a modal is open
+    // cannot be replayed after it closes.
+    if runtime_menu.pause_open || dialogue_history.visible || choice_state.waiting.is_some() {
+        return;
+    }
     let advance = action_advance || pointer_advance;
 
     if !advance {
@@ -3367,13 +3500,44 @@ pub fn advance_dialogue_on_input(
     if action_advance
         && ui_interactions
             .iter()
+            .flatten()
             .any(|interaction| !matches!(*interaction, PickingInteraction::None))
     {
         return;
     }
 
-    if dialogue_reveal_has_hidden_chars(&dialogue_state) {
-        reveal_all_dialogue_chars(&mut dialogue_state, &mut dialogue_chars);
+    advance_dialogue(
+        &mut dialogue_state,
+        &mut animations,
+        &mut dialogue_chars,
+        &mut responses,
+    );
+}
+
+/// Picking targets the deepest visible UI entity. Resolve through the hierarchy
+/// so labels and decorative children retain the interaction semantics of their
+/// owning button or modal root.
+fn find_component_ancestor<T: bevy::ecs::query::QueryData, F: bevy::ecs::query::QueryFilter>(
+    mut entity: Entity,
+    components: &Query<T, F>,
+    parents: &Query<&ChildOf>,
+) -> Option<Entity> {
+    loop {
+        if components.contains(entity) {
+            return Some(entity);
+        }
+        entity = parents.get(entity).ok()?.parent();
+    }
+}
+
+fn advance_dialogue(
+    dialogue_state: &mut DialogueState,
+    animations: &mut AnimationState,
+    dialogue_chars: &mut Query<&mut DialogueCharSpan>,
+    responses: &mut MessageWriter<ScriptResponseMessage>,
+) {
+    if dialogue_reveal_has_hidden_chars(dialogue_state) {
+        reveal_all_dialogue_chars(dialogue_state, dialogue_chars);
         return;
     }
 
@@ -3401,7 +3565,7 @@ pub fn animate_dialogue_text_reveal(
     };
 
     reveal.accumulator += time.delta_secs();
-    while reveal.next_index < reveal.spans.len() && reveal.accumulator >= reveal.interval {
+    while reveal.next_index < reveal.total_chars && reveal.accumulator >= reveal.interval {
         reveal.accumulator -= reveal.interval;
         if let Some(entity) = reveal.spans.get(reveal.next_index).copied()
             && let Ok((_, mut span)) = dialogue_chars.get_mut(entity)
@@ -3412,7 +3576,7 @@ pub fn animate_dialogue_text_reveal(
         reveal.next_index += 1;
     }
 
-    let mut fully_visible = reveal.next_index >= reveal.spans.len();
+    let mut fully_visible = reveal.next_index >= reveal.total_chars;
     for &entity in &reveal.spans {
         if let Ok((mut color, mut span)) = dialogue_chars.get_mut(entity) {
             if span.revealed {
@@ -4276,6 +4440,59 @@ fn clear_dialogue_spans(commands: &mut Commands, dialogue_state: &mut DialogueSt
     dialogue_state.reveal = None;
 }
 
+fn set_dialogue_model_reveal(
+    dialogue_state: &mut DialogueState,
+    text: &str,
+    visible_prefix_chars: usize,
+    animation_id: Option<String>,
+) {
+    let total_chars = text.chars().count();
+    let visible_prefix_chars = visible_prefix_chars.min(total_chars);
+    if dialogue_state.effect.mode == DialogueTextEffectMode::Instant
+        || visible_prefix_chars >= total_chars
+    {
+        dialogue_state.reveal = None;
+        return;
+    }
+    dialogue_state.reveal = Some(DialogueRevealState {
+        spans: Vec::new(),
+        total_chars,
+        next_index: visible_prefix_chars,
+        accumulator: 0.0,
+        interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+        fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
+        animation_id,
+    });
+}
+
+fn append_dialogue_model_reveal(
+    dialogue_state: &mut DialogueState,
+    previous_chars: usize,
+    appended_chars: usize,
+    animation_id: Option<String>,
+) {
+    if appended_chars == 0 || dialogue_state.effect.mode == DialogueTextEffectMode::Instant {
+        return;
+    }
+    let total_chars = previous_chars.saturating_add(appended_chars);
+    if let Some(reveal) = dialogue_state.reveal.as_mut() {
+        reveal.total_chars = total_chars;
+        if reveal.animation_id.is_none() {
+            reveal.animation_id = animation_id;
+        }
+    } else {
+        dialogue_state.reveal = Some(DialogueRevealState {
+            spans: Vec::new(),
+            total_chars,
+            next_index: previous_chars,
+            accumulator: 0.0,
+            interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+            fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
+            animation_id,
+        });
+    }
+}
+
 fn set_dialogue_line_text(
     commands: &mut Commands,
     dialogue_state: &mut DialogueState,
@@ -4324,6 +4541,7 @@ fn set_dialogue_line_text(
     if reveal_enabled && visible_prefix_chars < chars.len() {
         dialogue_state.reveal = Some(DialogueRevealState {
             spans: dialogue_state.span_entities.clone(),
+            total_chars: chars.len(),
             next_index: visible_prefix_chars,
             accumulator: 0.0,
             interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
@@ -4383,6 +4601,7 @@ fn append_dialogue_line_text(
         } else {
             dialogue_state.reveal = Some(DialogueRevealState {
                 spans: dialogue_state.span_entities.clone(),
+                total_chars: dialogue_state.span_entities.len(),
                 next_index: start_index,
                 accumulator: 0.0,
                 interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
@@ -4397,7 +4616,7 @@ fn dialogue_reveal_has_hidden_chars(dialogue_state: &DialogueState) -> bool {
     dialogue_state
         .reveal
         .as_ref()
-        .is_some_and(|reveal| reveal.next_index < reveal.spans.len())
+        .is_some_and(|reveal| reveal.next_index < reveal.total_chars)
 }
 
 fn reveal_all_dialogue_chars(
@@ -4414,7 +4633,7 @@ fn reveal_all_dialogue_chars(
             span.age = reveal.fade_seconds;
         }
     }
-    reveal.next_index = reveal.spans.len();
+    reveal.next_index = reveal.total_chars;
     reveal.accumulator = 0.0;
 }
 
@@ -4535,18 +4754,31 @@ fn color_from_rgba(rgba: [f32; 4]) -> Color {
     Color::srgba(rgba[0], rgba[1], rgba[2], rgba[3])
 }
 
-fn runtime_menu_action_from_str(value: &str) -> Option<RuntimeMenuButtonAction> {
-    match value {
-        "quick_save" | "quick-save" => Some(RuntimeMenuButtonAction::QuickSave),
-        "quick_load" | "quick-load" => Some(RuntimeMenuButtonAction::QuickLoad),
-        "menu" | "open_menu" | "open-menu" => Some(RuntimeMenuButtonAction::OpenPauseMenu),
-        "return" | "resume" => Some(RuntimeMenuButtonAction::Resume),
-        "main_menu" | "main-menu" => Some(RuntimeMenuButtonAction::ReturnToTitle),
-        other => {
-            warn!("unknown screen button action `{other}`");
-            None
+fn parse_ui_action_route(route: &str) -> Option<RuntimeMenuButtonAction> {
+    let segments = route.split('.').collect::<Vec<_>>();
+    let action = match segments.as_slice() {
+        ["ui", "open", "menu"] => RuntimeMenuButtonAction::OpenPauseMenu,
+        ["ui", "open", "history"] => RuntimeMenuButtonAction::SetHistoryVisible(true),
+        ["ui", "close", "history"] => RuntimeMenuButtonAction::SetHistoryVisible(false),
+        ["ui", "open", role] if !role.is_empty() => {
+            RuntimeMenuButtonAction::OpenUi((*role).to_string())
         }
-    }
+        ["ui", "close"] => RuntimeMenuButtonAction::CloseUi,
+        ["ui", "close", "menu"] => RuntimeMenuButtonAction::Resume,
+        ["storage", "save", slot] if !slot.is_empty() => {
+            RuntimeMenuButtonAction::Save((*slot).to_string())
+        }
+        ["storage", "load", slot] if !slot.is_empty() => {
+            RuntimeMenuButtonAction::Load((*slot).to_string())
+        }
+        ["story", "next"] => RuntimeMenuButtonAction::AdvanceDialogue,
+        ["app", "returnToTitle"] => RuntimeMenuButtonAction::ReturnToTitle,
+        _ => {
+            warn!("unknown UI action route `{route}`");
+            return None;
+        }
+    };
+    Some(action)
 }
 
 fn align_items_from_align(value: f32) -> AlignItems {
@@ -4686,111 +4918,216 @@ fn resolve_choice(
 #[allow(clippy::too_many_arguments)]
 pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
     for (interaction, mut color, button, screen_button) in &mut ctx.interaction_query {
+        if let Some(root) = button.screen_root
+            && Some(root) != ctx.screen_state.active_root
+            && !ctx
+                .overlay_state
+                .roots
+                .values()
+                .any(|overlay| *overlay == root)
+        {
+            continue;
+        }
         if screen_button.is_some_and(|button| !button.enabled) {
+            continue;
+        }
+        // Declarative text buttons own their complete visual state through
+        // `handle_screen_buttons`; this system only dispatches their route.
+        if screen_button.is_some() {
             continue;
         }
         match *interaction {
             PickingInteraction::Pressed => {
-                *color = ctx.ui_style.quick_button_pressed.into();
-                match button.action {
-                    RuntimeMenuButtonAction::QuickSave => {
-                        let _ = save_runtime_slot("quick", &ctx.script_runtime, &ctx.shared_state);
-                    }
-                    RuntimeMenuButtonAction::QuickLoad => {
-                        let Ok(save_data) = load_save_data("quick") else {
-                            continue;
-                        };
-                        abort_runtime_waiters(
-                            &mut ctx.commands,
-                            &mut ctx.waits,
-                            &mut ctx.dialogue_state,
-                            &mut ctx.choice_state,
-                            &mut ctx.screen_state,
-                            &mut ctx.pending_script_commands,
-                            &mut ctx.active_batches,
-                            &mut ctx.pending_characters,
-                            &mut ctx.animations,
-                            &mut ctx.voice_state,
-                            &ctx.choice_ui_roots,
-                        );
-                        close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
-                        clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                        start_frontend_session(
-                            &mut ctx.commands,
-                            &ctx.asset_server,
-                            &ctx.vfs,
-                            &mut ctx.shared_state,
-                            &mut ctx.stage,
-                            &mut ctx.dialogue_state,
-                            &mut ctx.choice_state,
-                            &ctx.choice_ui_roots,
-                            &mut ctx.dialogue_root,
-                            &mut ctx.speaker_text,
-                            &mut ctx.line_text,
-                            &ctx.user_settings,
-                            &mut ctx.frontend,
-                            &mut ctx.script_runtime,
-                            ScriptBootstrap::from_save(&save_data),
-                            save_data.scene.clone(),
-                        );
-                    }
-                    RuntimeMenuButtonAction::OpenPauseMenu => {
-                        if ctx.runtime_menu.pause_root.is_none() {
-                            ctx.runtime_menu.pause_root = Some(spawn_pause_menu(
-                                &mut ctx.commands,
-                                &ctx.ui_fonts,
-                                &ctx.ui_style,
-                            ));
-                        }
-                        ctx.runtime_menu.pause_open = true;
-                    }
-                    RuntimeMenuButtonAction::Resume => {
-                        close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
-                    }
-                    RuntimeMenuButtonAction::ReturnToTitle => {
-                        let startup_script = ctx.frontend.startup_script.clone();
-                        abort_runtime_waiters(
-                            &mut ctx.commands,
-                            &mut ctx.waits,
-                            &mut ctx.dialogue_state,
-                            &mut ctx.choice_state,
-                            &mut ctx.screen_state,
-                            &mut ctx.pending_script_commands,
-                            &mut ctx.active_batches,
-                            &mut ctx.pending_characters,
-                            &mut ctx.animations,
-                            &mut ctx.voice_state,
-                            &ctx.choice_ui_roots,
-                        );
-                        close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
-                        clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                        clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
-                        start_frontend_session(
-                            &mut ctx.commands,
-                            &ctx.asset_server,
-                            &ctx.vfs,
-                            &mut ctx.shared_state,
-                            &mut ctx.stage,
-                            &mut ctx.dialogue_state,
-                            &mut ctx.choice_state,
-                            &ctx.choice_ui_roots,
-                            &mut ctx.dialogue_root,
-                            &mut ctx.speaker_text,
-                            &mut ctx.line_text,
-                            &ctx.user_settings,
-                            &mut ctx.frontend,
-                            &mut ctx.script_runtime,
-                            ScriptBootstrap::new(startup_script),
-                            SceneSnapshot::default(),
-                        );
-                    }
-                }
+                *color = ctx.ui_style.choice_button_pressed.into();
             }
             PickingInteraction::Hovered => {
-                *color = ctx.ui_style.quick_button_hovered.into();
+                *color = ctx.ui_style.choice_button_hovered.into();
             }
             PickingInteraction::None => {
-                *color = ctx.ui_style.quick_button_bg.into();
+                *color = ctx.ui_style.choice_button_bg.into();
+            }
+        }
+    }
+
+    for click in ctx.clicks.read() {
+        if click.button != PointerButton::Primary {
+            continue;
+        }
+        let Some(button_entity) =
+            find_component_ancestor(click.entity, &ctx.action_query, &ctx.parents)
+        else {
+            continue;
+        };
+        let Ok((button, screen_button)) = ctx.action_query.get(button_entity) else {
+            continue;
+        };
+        if let Some(root) = button.screen_root
+            && Some(root) != ctx.screen_state.active_root
+            && !ctx
+                .overlay_state
+                .roots
+                .values()
+                .any(|overlay| *overlay == root)
+        {
+            continue;
+        }
+        if screen_button.is_some_and(|button| !button.enabled) {
+            continue;
+        }
+        *ctx.runtime_menu
+            .consumed_pointer_clicks
+            .entry(click.pointer_id)
+            .or_default() += 1;
+        // The action may replace or cover this node before picking emits a
+        // later interaction transition. Restore its release visual now.
+        if screen_button.is_none() && ctx.background_query.contains(button_entity) {
+            ctx.commands
+                .entity(button_entity)
+                .insert(BackgroundColor(ctx.ui_style.choice_button_bg));
+        }
+        let action = button.action.clone();
+        match &action {
+            RuntimeMenuButtonAction::Save(slot) => {
+                if let Err(error) = save_runtime_slot(slot, &ctx.script_runtime, &ctx.shared_state)
+                {
+                    warn!("failed to save slot `{slot}`: {error}");
+                }
+            }
+            RuntimeMenuButtonAction::Load(slot) => {
+                let save_data = match load_save_data(slot) {
+                    Ok(save_data) => save_data,
+                    Err(error) => {
+                        warn!("failed to load slot `{slot}`: {error}");
+                        ctx.frontend.notice = Some(format!("Failed to load slot {slot}: {error}"));
+                        continue;
+                    }
+                };
+                abort_runtime_waiters(
+                    &mut ctx.commands,
+                    &mut ctx.waits,
+                    &mut ctx.dialogue_state,
+                    &mut ctx.choice_state,
+                    &mut ctx.screen_state,
+                    &mut ctx.pending_script_commands,
+                    &mut ctx.active_batches,
+                    &mut ctx.pending_characters,
+                    &mut ctx.animations,
+                    &mut ctx.voice_state,
+                    &ctx.choice_ui_roots,
+                );
+                close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
+                ctx.dialogue_history.entries.clear();
+                ctx.dialogue_history.visible = false;
+                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                start_frontend_session(
+                    &mut ctx.commands,
+                    &ctx.asset_server,
+                    &ctx.vfs,
+                    &mut ctx.shared_state,
+                    &mut ctx.stage,
+                    &mut ctx.dialogue_state,
+                    &mut ctx.choice_state,
+                    &ctx.choice_ui_roots,
+                    &mut ctx.dialogue_root,
+                    &mut ctx.speaker_text,
+                    &mut ctx.line_text,
+                    &ctx.user_settings,
+                    &mut ctx.frontend,
+                    &mut ctx.script_runtime,
+                    ScriptBootstrap::from_save(&save_data),
+                    save_data.scene.clone(),
+                );
+                if let Some(error) = ctx.frontend.notice.as_deref() {
+                    warn!("failed to restore slot `{slot}`: {error}");
+                } else {
+                    info!("loaded save slot `{slot}`");
+                }
+            }
+            RuntimeMenuButtonAction::OpenPauseMenu => {
+                if ctx.runtime_menu.pause_root.is_none() {
+                    ctx.runtime_menu.pause_root = Some(spawn_pause_menu(
+                        &mut ctx.commands,
+                        &ctx.ui_fonts,
+                        &ctx.ui_style,
+                    ));
+                }
+                ctx.runtime_menu.pause_open = true;
+            }
+            RuntimeMenuButtonAction::OpenUi(role) => {
+                let Some(target) = ctx.script_runtime.ui_registry.get(role).cloned() else {
+                    warn!("UI action route references unregistered role `{role}`");
+                    continue;
+                };
+                match evaluate_ui_at(
+                    &target,
+                    &ctx.script_runtime,
+                    &ctx.vfs,
+                    &ctx.user_settings,
+                    Some(&ctx.textures),
+                    Some(&ctx.terms),
+                ) {
+                    Ok(screen) => ctx
+                        .pending_script_commands
+                        .items
+                        .push_back(ScriptCommand::ShowScreen { screen, done: None }),
+                    Err(error) => warn!("failed to open UI role `{role}`: {error}"),
+                }
+            }
+            RuntimeMenuButtonAction::CloseUi => {
+                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+            }
+            RuntimeMenuButtonAction::SetHistoryVisible(visible) => {
+                ctx.dialogue_history.visible = *visible;
+            }
+            RuntimeMenuButtonAction::Resume => {
+                close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
+            }
+            RuntimeMenuButtonAction::ReturnToTitle => {
+                let startup_script = ctx.frontend.startup_script.clone();
+                abort_runtime_waiters(
+                    &mut ctx.commands,
+                    &mut ctx.waits,
+                    &mut ctx.dialogue_state,
+                    &mut ctx.choice_state,
+                    &mut ctx.screen_state,
+                    &mut ctx.pending_script_commands,
+                    &mut ctx.active_batches,
+                    &mut ctx.pending_characters,
+                    &mut ctx.animations,
+                    &mut ctx.voice_state,
+                    &ctx.choice_ui_roots,
+                );
+                close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
+                ctx.dialogue_history.entries.clear();
+                ctx.dialogue_history.visible = false;
+                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
+                start_frontend_session(
+                    &mut ctx.commands,
+                    &ctx.asset_server,
+                    &ctx.vfs,
+                    &mut ctx.shared_state,
+                    &mut ctx.stage,
+                    &mut ctx.dialogue_state,
+                    &mut ctx.choice_state,
+                    &ctx.choice_ui_roots,
+                    &mut ctx.dialogue_root,
+                    &mut ctx.speaker_text,
+                    &mut ctx.line_text,
+                    &ctx.user_settings,
+                    &mut ctx.frontend,
+                    &mut ctx.script_runtime,
+                    ScriptBootstrap::new(startup_script),
+                    SceneSnapshot::default(),
+                );
+            }
+            RuntimeMenuButtonAction::AdvanceDialogue => {
+                advance_dialogue(
+                    &mut ctx.dialogue_state,
+                    &mut ctx.animations,
+                    &mut ctx.dialogue_chars,
+                    &mut ctx.responses,
+                );
             }
         }
     }
@@ -4819,12 +5156,13 @@ fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiSt
         parent
             .spawn((
                 Node {
-                    width: px(360.0),
-                    padding: UiRect::all(px(20.0)),
+                    width: percent(72.0),
+                    max_width: px(640.0),
+                    padding: UiRect::all(px(32.0)),
                     flex_direction: FlexDirection::Column,
-                    row_gap: px(10.0),
-                    border: UiRect::all(px(1.0)),
-                    border_radius: BorderRadius::all(px(18.0)),
+                    row_gap: px(18.0),
+                    border: UiRect::all(px(2.0)),
+                    border_radius: BorderRadius::all(px(24.0)),
                     ..default()
                 },
                 BackgroundColor(ui_style.choice_panel_bg),
@@ -4833,7 +5171,7 @@ fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiSt
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("Game Menu"),
-                    ui_text_font(ui_fonts, 30.0),
+                    ui_text_font(ui_fonts, 42.0),
                     TextColor(ui_style.speaker_color),
                 ));
                 spawn_runtime_menu_button(
@@ -4848,14 +5186,14 @@ fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiSt
                     ui_fonts,
                     ui_style,
                     "Quick Save",
-                    RuntimeMenuButtonAction::QuickSave,
+                    RuntimeMenuButtonAction::Save("quick".into()),
                 );
                 spawn_runtime_menu_button(
                     panel,
                     ui_fonts,
                     ui_style,
                     "Quick Load",
-                    RuntimeMenuButtonAction::QuickLoad,
+                    RuntimeMenuButtonAction::Load("quick".into()),
                 );
                 spawn_runtime_menu_button(
                     panel,
@@ -4879,25 +5217,30 @@ fn spawn_runtime_menu_button(
 ) {
     parent
         .spawn((
-            RuntimeMenuButton { action },
+            RuntimeMenuButton {
+                action,
+                screen_root: None,
+            },
             Button,
             Node {
-                width: Val::Auto,
-                border: UiRect::all(px(1.0)),
-                padding: UiRect::axes(px(10.0), px(4.0)),
+                width: percent(100.0),
+                min_height: px(68.0),
+                border: UiRect::all(px(2.0)),
+                padding: UiRect::axes(px(24.0), px(14.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(px(8.0)),
+                border_radius: BorderRadius::all(px(14.0)),
                 ..default()
             },
-            BackgroundColor(ui_style.quick_button_bg),
-            BorderColor::all(ui_style.quick_button_border),
+            BackgroundColor(ui_style.choice_button_bg),
+            BorderColor::all(ui_style.choice_button_border),
         ))
         .with_children(|button| {
             button.spawn((
+                Pickable::IGNORE,
                 Text::new(text),
-                ui_text_font(ui_fonts, ui_style.quick_button_size),
-                TextColor(ui_style.quick_text_color),
+                ui_text_font(ui_fonts, ui_style.quick_button_size.max(30.0)),
+                TextColor(ui_style.choice_text_color),
             ));
         });
 }

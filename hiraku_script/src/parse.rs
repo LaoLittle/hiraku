@@ -18,7 +18,18 @@ impl ParseError {
 }
 
 pub fn parse_program(source: &str) -> Result<Program, Vec<ParseError>> {
-    let tokens = TokenAdapter::new(source).collect()?;
+    parse_program_with_template_expressions(source, true)
+}
+
+pub(crate) fn parse_literal_program(source: &str) -> Result<Program, Vec<ParseError>> {
+    parse_program_with_template_expressions(source, false)
+}
+
+fn parse_program_with_template_expressions(
+    source: &str,
+    template_expressions: bool,
+) -> Result<Program, Vec<ParseError>> {
+    let tokens = TokenAdapter::new(source, template_expressions).collect()?;
     Parser::new(tokens).parse_program()
 }
 
@@ -70,18 +81,25 @@ enum TokenKind {
 struct TokenAdapter<'a> {
     source: &'a str,
     offset: usize,
+    template_expressions: bool,
 }
 
 impl<'a> TokenAdapter<'a> {
-    fn new(source: &'a str) -> Self {
-        Self { source, offset: 0 }
+    fn new(source: &'a str, template_expressions: bool) -> Self {
+        Self {
+            source,
+            offset: 0,
+            template_expressions,
+        }
     }
 
     fn collect(mut self) -> Result<Vec<Token>, Vec<ParseError>> {
         let mut tokens: Vec<Token> = Vec::new();
         let mut errors = Vec::new();
 
-        for raw in crate::lex::tokenize(self.source) {
+        for raw in
+            crate::lex::tokenize_with_template_expressions(self.source, self.template_expressions)
+        {
             let start = self.offset;
             self.offset += raw.len as usize;
             let span = Span {
@@ -218,10 +236,22 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Literal {
                     kind: LiteralKind::Str { terminated: true },
                     ..
-                } => match unescape_string(&lexeme[1..lexeme.len() - 1]) {
-                    Ok(value) => TokenKind::String(value),
-                    Err(message) => {
-                        errors.push(ParseError { message, span });
+                } => match lexeme
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                {
+                    Some(inner) => match unescape_string(inner, self.template_expressions) {
+                        Ok(value) => TokenKind::String(value),
+                        Err(message) => {
+                            errors.push(ParseError { message, span });
+                            continue;
+                        }
+                    },
+                    None => {
+                        errors.push(ParseError {
+                            message: "unterminated string literal".to_string(),
+                            span,
+                        });
                         continue;
                     }
                 },
@@ -261,7 +291,12 @@ impl<'a> TokenAdapter<'a> {
     }
 }
 
-fn unescape_string(source: &str) -> Result<String, String> {
+fn unescape_string(source: &str, template_expressions: bool) -> Result<String, String> {
+    if !template_expressions {
+        let mut value = String::new();
+        unescape_string_segment(source, &mut value)?;
+        return Ok(value);
+    }
     let mut value = String::new();
     let mut literal_start = 0;
     let mut cursor = 0;
@@ -1231,6 +1266,19 @@ impl Parser {
 mod tests {
     use super::*;
 
+    #[test]
+    fn truncated_unicode_source_reports_errors_without_panicking() {
+        let source = "narrate(\"welcome ${name ?: \"guest\"} 🚀\")";
+        let mut boundaries = source
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        boundaries.push(source.len());
+        for end in boundaries {
+            let _ = parse_program(&source[..end]);
+        }
+    }
+
     fn expression(source: &str) -> Expr {
         let program = parse_program(source).unwrap();
         let [Stmt::Expr(expression)] = program.statements.as_slice() else {
@@ -1628,5 +1676,26 @@ mod tests {
             };
             assert!(matches!(arguments[0].value.kind, ExprKind::Binding(_)));
         }
+    }
+
+    #[test]
+    fn binding_shorthand_consumes_only_one_identifier() {
+        let program = parse_program("observe($dialogue.text)").expect("binding syntax parses");
+        let Stmt::Expr(Expr {
+            kind: ExprKind::Call { arguments, .. },
+            ..
+        }) = &program.statements[0]
+        else {
+            panic!("expected call statement")
+        };
+        let ExprKind::Member { object, name } = &arguments[0].value.kind else {
+            panic!("member access must remain outside shorthand binding")
+        };
+        assert_eq!(name, "text");
+        assert!(matches!(
+            object.kind,
+            ExprKind::Binding(ref value)
+                if matches!(value.kind, ExprKind::Ident(ref name) if name == "dialogue")
+        ));
     }
 }

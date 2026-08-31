@@ -211,6 +211,7 @@ fn build_screen_ui_children(
                     Text::new(title.clone()),
                     ui_text_font(ui_fonts, 34.0),
                     TextColor(ui_style.speaker_color),
+                    default_text_outline(),
                 ))
                 .id(),
         );
@@ -346,6 +347,7 @@ fn spawn_screen_node_entity(
                         LineBreak::AnyCharacter,
                     ),
                     TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
+                    default_text_outline(),
                 ))
                 .id();
             if let Some(template) = binding {
@@ -439,6 +441,7 @@ fn spawn_screen_node_entity(
                     Text::new(text.clone()),
                     ui_text_font(ui_fonts, *size),
                     TextColor(initial_text_color),
+                    default_text_outline(),
                 ))
                 .id();
             let button = commands
@@ -485,9 +488,12 @@ fn spawn_screen_node_entity(
             if *enabled
                 && let Some(action) = action
                     .as_ref()
-                    .and_then(|action| runtime_menu_action_from_str(action))
+                    .and_then(|action| parse_ui_action_route(action))
             {
-                commands.entity(button).insert(RuntimeMenuButton { action });
+                commands.entity(button).insert(RuntimeMenuButton {
+                    action,
+                    screen_root: Some(root),
+                });
             }
             commands.entity(button).add_child(text);
             apply_live_layout_bindings(commands, button, layout);
@@ -517,6 +523,7 @@ fn spawn_screen_node_entity(
             hovered_texture,
             hovered_layout,
             value,
+            action,
             enabled,
             enabled_binding,
             reactive_enabled,
@@ -580,6 +587,12 @@ fn spawn_screen_node_entity(
                     },
                 ))
                 .id();
+            if let Some(action) = action.as_deref().and_then(parse_ui_action_route) {
+                commands.entity(entity).insert(RuntimeMenuButton {
+                    action,
+                    screen_root: Some(root),
+                });
+            }
             if let Some(signal) = enabled_binding {
                 commands.entity(entity).insert(UiEnabledBinding {
                     signal: signal.clone(),
@@ -930,6 +943,16 @@ fn justify_text_from_align(value: f32) -> Justify {
     }
 }
 
+/// Default contrast treatment for every screen-UI glyph, including text
+/// nodes, terms and button labels. Bevy renders this in the same text pass,
+/// avoiding extra UI entities and keeping reactive text updates atomic.
+fn default_text_outline() -> TextShadow {
+    TextShadow {
+        offset: Vec2::splat(1.5),
+        color: Color::srgba(0.0, 0.0, 0.0, 0.92),
+    }
+}
+
 fn justify_content_from_option(value: &Option<String>) -> JustifyContent {
     match value.as_deref() {
         Some("start") | Some("left") | Some("top") => JustifyContent::FlexStart,
@@ -954,10 +977,12 @@ fn align_items_from_option(value: &Option<String>) -> AlignItems {
 pub fn handle_screen_buttons(
     mut screen_state: ResMut<ScreenUiState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
+    mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
         (&PickingInteraction, &mut BackgroundColor, &ScreenUiButton),
         Changed<PickingInteraction>,
     >,
+    button_query: Query<&ScreenUiButton>,
     mut text_query: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
     for (interaction, mut color, button) in &mut interaction_query {
@@ -979,13 +1004,6 @@ pub fn handle_screen_buttons(
                 if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
                     *text_color = button.pressed_text_color.into();
                 }
-                let Some(done) = screen_state.waiting.take() else {
-                    continue;
-                };
-                responses.write(ScriptResponseMessage {
-                    request: done,
-                    response: ScriptResponse::Choice(button.value.clone()),
-                });
             }
             PickingInteraction::Hovered => {
                 *color = button.hovered_background.into();
@@ -1001,11 +1019,31 @@ pub fn handle_screen_buttons(
             }
         }
     }
+
+    for click in clicks.read() {
+        if click.button != PointerButton::Primary {
+            continue;
+        }
+        let Ok(button) = button_query.get(click.entity) else {
+            continue;
+        };
+        if Some(button.root) != screen_state.active_root || !button.enabled {
+            continue;
+        }
+        let Some(done) = screen_state.waiting.take() else {
+            continue;
+        };
+        responses.write(ScriptResponseMessage {
+            request: done,
+            response: ScriptResponse::Choice(button.value.clone()),
+        });
+    }
 }
 
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
+    mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
         (
             &PickingInteraction,
@@ -1015,9 +1053,10 @@ pub fn handle_screen_image_buttons(
         ),
         Changed<PickingInteraction>,
     >,
+    button_query: Query<&ScreenUiImageButton>,
 ) {
     for (interaction, mut image, mut node, button) in &mut interaction_query {
-        if Some(button.root) != screen_state.active_root {
+        if Some(button.root) != screen_state.active_root && button.value.is_some() {
             continue;
         }
 
@@ -1036,13 +1075,6 @@ pub fn handle_screen_image_buttons(
                     .hovered_node
                     .clone()
                     .unwrap_or_else(|| button.normal_node.clone());
-                let Some(done) = screen_state.waiting.take() else {
-                    continue;
-                };
-                responses.write(ScriptResponseMessage {
-                    request: done,
-                    response: ScriptResponse::Choice(button.value.clone()),
-                });
             }
             PickingInteraction::Hovered if button.enabled || button.hovered_when_disabled => {
                 image.image = button
@@ -1073,28 +1105,129 @@ pub fn handle_screen_image_buttons(
             }
         }
     }
+
+    for click in clicks.read() {
+        if click.button != PointerButton::Primary {
+            continue;
+        }
+        let Ok(button) = button_query.get(click.entity) else {
+            continue;
+        };
+        if (Some(button.root) != screen_state.active_root && button.value.is_some())
+            || !button.enabled
+        {
+            continue;
+        }
+        let Some(value) = button.value.clone() else {
+            continue;
+        };
+        let Some(done) = screen_state.waiting.take() else {
+            continue;
+        };
+        responses.write(ScriptResponseMessage {
+            request: done,
+            response: ScriptResponse::Choice(value),
+        });
+    }
 }
 
-pub fn update_builtin_ui_signals(
+pub fn update_builtin_ui_models(
     time: Res<Time>,
-    mut signals: ResMut<UiSignals>,
+    scene: Res<SceneSharedState>,
+    dialogue_state: Res<DialogueState>,
+    dialogue_history: Res<DialogueHistoryState>,
+    mut models: ResMut<UiModels>,
     mut last_second: Local<Option<u64>>,
 ) {
     let elapsed = time.elapsed_secs_f64().floor().max(0.0) as u64;
-    if *last_second == Some(elapsed) {
-        return;
+    if *last_second != Some(elapsed) {
+        *last_second = Some(elapsed);
+        let unix = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+        models.set(
+            "time",
+            StoredValue::Map(BTreeMap::from([
+                (
+                    "elapsedSeconds".to_string(),
+                    StoredValue::Int(elapsed as i64),
+                ),
+                ("unixSeconds".to_string(), StoredValue::Int(unix as i64)),
+            ])),
+        );
     }
-    *last_second = Some(elapsed);
-    signals.set("time.elapsedSeconds", elapsed);
-    let unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+
+    let dialogue = scene.0.dialogue.as_ref();
+    let text = dialogue
+        .map(|value| value.text.as_str())
         .unwrap_or_default();
-    signals.set("time.unixSeconds", unix);
+    let revealed = dialogue_state
+        .reveal
+        .as_ref()
+        .map(|reveal| reveal.next_index)
+        .unwrap_or_else(|| text.chars().count());
+    models.set(
+        "dialogue",
+        StoredValue::Map(BTreeMap::from([
+            (
+                "speaker".to_string(),
+                StoredValue::String(
+                    dialogue
+                        .map(|value| value.speaker.clone())
+                        .unwrap_or_default(),
+                ),
+            ),
+            ("text".to_string(), StoredValue::String(text.to_string())),
+            ("visible".to_string(), StoredValue::Bool(dialogue.is_some())),
+            (
+                "revealedCharacters".to_string(),
+                StoredValue::Int(revealed as i64),
+            ),
+            (
+                "canAdvance".to_string(),
+                StoredValue::Bool(dialogue_state.waiting.is_some()),
+            ),
+        ])),
+    );
+
+    let entries = dialogue_history
+        .entries
+        .iter()
+        .map(|entry| {
+            StoredValue::Map(BTreeMap::from([
+                (
+                    "speaker".to_string(),
+                    StoredValue::String(entry.speaker.clone()),
+                ),
+                ("text".to_string(), StoredValue::String(entry.text.clone())),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let text = dialogue_history
+        .entries
+        .iter()
+        .map(|entry| {
+            if entry.speaker.is_empty() {
+                entry.text.clone()
+            } else {
+                format!("{}\n{}", entry.speaker, entry.text)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    models.set(
+        "history",
+        StoredValue::Map(BTreeMap::from([
+            ("entries".to_string(), StoredValue::Array(entries)),
+            ("text".to_string(), StoredValue::String(text)),
+            (
+                "visible".to_string(),
+                StoredValue::Bool(dialogue_history.visible),
+            ),
+        ])),
+    );
 }
 
 pub fn update_ui_text_bindings(
-    signals: Res<UiSignals>,
+    models: Res<UiModels>,
     mut text_bindings: Query<(&mut UiTextBinding, &mut Text)>,
     mut visibility_bindings: Query<(&mut UiVisibilityBinding, &mut Visibility)>,
     mut button_bindings: Query<
@@ -1112,12 +1245,12 @@ pub fn update_ui_text_bindings(
     mut progress_bindings: Query<(&mut UiProgressBinding, &mut Node)>,
     mut button_texts: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
-    let revision = signals.revision();
+    let revision = models.revision();
     for (mut binding, mut text) in &mut text_bindings {
         if binding.rendered_revision == revision {
             continue;
         }
-        let rendered = expand_signal_template(&binding.template, &signals);
+        let rendered = expand_model_template(&binding.template, &models);
         if text.0 != rendered {
             text.0 = rendered;
         }
@@ -1127,10 +1260,7 @@ pub fn update_ui_text_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        if let Some(visible) = signals
-            .get(&binding.signal)
-            .and_then(UiSignalValue::as_bool)
-        {
+        if let Some(visible) = models.get(&binding.signal).and_then(StoredValue::as_bool) {
             *visibility = if visible {
                 Visibility::Inherited
             } else {
@@ -1143,10 +1273,7 @@ pub fn update_ui_text_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        if let Some(enabled) = signals
-            .get(&binding.signal)
-            .and_then(UiSignalValue::as_bool)
-        {
+        if let Some(enabled) = models.get(&binding.signal).and_then(StoredValue::as_bool) {
             button.enabled = enabled;
             *background = if enabled {
                 button.normal_background
@@ -1169,10 +1296,7 @@ pub fn update_ui_text_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        if let Some(enabled) = signals
-            .get(&binding.signal)
-            .and_then(UiSignalValue::as_bool)
-        {
+        if let Some(enabled) = models.get(&binding.signal).and_then(StoredValue::as_bool) {
             button.enabled = enabled;
         }
         binding.rendered_revision = revision;
@@ -1181,10 +1305,7 @@ pub fn update_ui_text_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        if let Some(value) = signals
-            .get(&binding.signal)
-            .and_then(UiSignalValue::as_number)
-        {
+        if let Some(value) = models.get(&binding.signal).and_then(StoredValue::as_number) {
             let span = (binding.max - binding.min).max(f32::EPSILON);
             let progress = ((value as f32 - binding.min) / span).clamp(0.0, 1.0);
             node.width = percent(progress * 100.0);
@@ -1194,7 +1315,7 @@ pub fn update_ui_text_bindings(
 }
 
 pub fn update_ui_reactive_bindings(
-    signals: Res<UiSignals>,
+    models: Res<UiModels>,
     mut text_bindings: Query<(&mut UiReactiveTextBinding, &mut Text)>,
     mut visibility_bindings: Query<(&mut UiReactiveVisibilityBinding, &mut Visibility)>,
     mut button_bindings: Query<
@@ -1212,12 +1333,12 @@ pub fn update_ui_reactive_bindings(
     mut progress_bindings: Query<(&mut UiReactiveProgressBinding, &mut Node)>,
     mut button_texts: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
-    let revision = signals.revision();
+    let revision = models.revision();
     for (mut binding, mut text) in &mut text_bindings {
         if binding.rendered_revision == revision {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::String(value)) => text.0 = value,
             Ok(value) => warn!("reactive UI text returned {value:?}, expected String"),
             Err(error) => warn!("reactive UI text failed: {error}"),
@@ -1228,7 +1349,7 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::Bool(visible)) => {
                 *visibility = if visible {
                     Visibility::Inherited
@@ -1245,7 +1366,7 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::Bool(enabled)) => {
                 button.enabled = enabled;
                 *background = if enabled {
@@ -1272,7 +1393,7 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::Bool(enabled)) => button.enabled = enabled,
             Ok(value) => warn!("reactive UI enabled expression returned {value:?}, expected Bool"),
             Err(error) => warn!("reactive UI enabled expression failed: {error}"),
@@ -1283,7 +1404,7 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &signals) {
+        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::Number(value)) => {
                 let span = (binding.max - binding.min).max(f32::EPSILON);
                 let progress = ((value as f32 - binding.min) / span).clamp(0.0, 1.0);
@@ -1296,7 +1417,7 @@ pub fn update_ui_reactive_bindings(
     }
 }
 
-fn expand_signal_template(template: &str, signals: &UiSignals) -> String {
+fn expand_model_template(template: &str, models: &UiModels) -> String {
     let mut output = String::new();
     let mut rest = template;
     while let Some(start) = rest.find("${") {
@@ -1307,7 +1428,7 @@ fn expand_signal_template(template: &str, signals: &UiSignals) -> String {
             return output;
         };
         let key = &after[..end];
-        if let Some(value) = signals.get(key) {
+        if let Some(value) = models.get(key) {
             output.push_str(&value.display());
         } else {
             output.push_str("${");
@@ -1347,27 +1468,248 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
+
+    use bevy::{
+        camera::NormalizedRenderTarget,
+        picking::{
+            backend::HitData,
+            pointer::{Location, PointerButton, PointerId},
+        },
+    };
 
     use super::*;
 
     #[test]
-    fn signal_templates_update_known_values_without_erasing_unknown_values() {
-        let mut signals = UiSignals::default();
-        signals.set("time.elapsedSeconds", 12);
+    fn ui_action_routes_are_namespace_qualified_and_structured() {
+        assert!(matches!(
+            parse_ui_action_route("ui.open.dialogue"),
+            Some(RuntimeMenuButtonAction::OpenUi(role)) if role == "dialogue"
+        ));
+        assert!(matches!(
+            parse_ui_action_route("storage.save.slot1"),
+            Some(RuntimeMenuButtonAction::Save(slot)) if slot == "slot1"
+        ));
+        assert!(matches!(
+            parse_ui_action_route("story.next"),
+            Some(RuntimeMenuButtonAction::AdvanceDialogue)
+        ));
+    }
+
+    #[test]
+    fn package_ui_paths_do_not_become_relative_to_the_restored_story() {
+        let vfs = VfsResource(Arc::new(crate::vfs::HdpVfs::new("assets")));
         assert_eq!(
-            expand_signal_template(
+            resolve_ui_component_path(
+                &vfs,
+                Some("hdp://example.hdp/scripts/chapter.hks"),
+                "ui/history.ui.hks",
+            ),
+            "hdp://example.hdp/ui/history.ui.hks"
+        );
+    }
+
+    #[test]
+    fn model_templates_update_known_values_without_erasing_unknown_values() {
+        let mut models = UiModels::default();
+        models.set(
+            "time",
+            StoredValue::Map(BTreeMap::from([(
+                "elapsedSeconds".to_string(),
+                StoredValue::Int(12),
+            )])),
+        );
+        assert_eq!(
+            expand_model_template(
                 "elapsed=${time.elapsedSeconds}, custom=${game.weather}",
-                &signals,
+                &models,
             ),
             "elapsed=12, custom=${game.weather}",
         );
     }
 
     #[test]
+    fn screen_button_activates_on_click_not_press() {
+        let mut app = App::new();
+        app.init_resource::<ScreenUiState>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, handle_screen_buttons);
+        let root = app.world_mut().spawn_empty().id();
+        let text = app.world_mut().spawn(TextColor(Color::WHITE)).id();
+        let button = app
+            .world_mut()
+            .spawn((
+                PickingInteraction::Pressed,
+                BackgroundColor(Color::BLACK),
+                ScreenUiButton {
+                    root,
+                    value: StoredValue::String("continue".into()),
+                    enabled: true,
+                    text_entity: text,
+                    normal_background: Color::BLACK,
+                    hovered_background: Color::BLACK,
+                    pressed_background: Color::BLACK,
+                    insensitive_background: Color::BLACK,
+                    normal_text_color: Color::WHITE,
+                    hovered_text_color: Color::WHITE,
+                    pressed_text_color: Color::WHITE,
+                    insensitive_text_color: Color::WHITE,
+                },
+            ))
+            .id();
+        {
+            let mut state = app.world_mut().resource_mut::<ScreenUiState>();
+            state.active_root = Some(root);
+            state.waiting = Some(ScriptRequestId(7));
+        }
+
+        app.update();
+        assert_eq!(
+            app.world().resource::<ScreenUiState>().waiting,
+            Some(ScriptRequestId(7)),
+            "pressing must not activate a button",
+        );
+
+        app.world_mut().write_message(Pointer::new(
+            PointerId::Mouse,
+            Location {
+                target: NormalizedRenderTarget::None {
+                    width: 1,
+                    height: 1,
+                },
+                position: Vec2::ZERO,
+            },
+            Click {
+                button: PointerButton::Primary,
+                hit: HitData {
+                    camera: root,
+                    depth: 0.0,
+                    position: None,
+                    normal: None,
+                    extra: None,
+                },
+                duration: Duration::ZERO,
+                count: 1,
+            },
+            button,
+        ));
+        app.update();
+
+        assert_eq!(app.world().resource::<ScreenUiState>().waiting, None);
+    }
+
+    #[test]
+    fn closing_a_modal_consumes_the_same_frame_dialogue_action() {
+        let mut app = App::new();
+        app.init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<ChoiceState>()
+            .init_resource::<RuntimeMenuState>()
+            .init_resource::<DialogueHistoryState>()
+            .add_message::<crate::input::HirakuActionInput>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, advance_dialogue_on_input);
+        app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
+            animation_id: None,
+            request: Some(ScriptRequestId(11)),
+        });
+        let modal = app.world_mut().spawn(PauseMenuRoot).id();
+        let label = app.world_mut().spawn_empty().id();
+        app.world_mut().entity_mut(modal).add_child(label);
+        app.world_mut().write_message(Pointer::new(
+            PointerId::Custom(uuid::Uuid::from_u128(1)),
+            Location {
+                target: NormalizedRenderTarget::None {
+                    width: 1,
+                    height: 1,
+                },
+                position: Vec2::ZERO,
+            },
+            Click {
+                button: PointerButton::Primary,
+                hit: HitData {
+                    camera: modal,
+                    depth: 0.0,
+                    position: None,
+                    normal: None,
+                    extra: None,
+                },
+                duration: Duration::ZERO,
+                count: 1,
+            },
+            label,
+        ));
+
+        app.update();
+
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+    }
+
+    #[test]
+    fn claimed_pointer_click_survives_modal_despawn_before_dialogue_input() {
+        let mut app = App::new();
+        app.init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<ChoiceState>()
+            .init_resource::<RuntimeMenuState>()
+            .init_resource::<DialogueHistoryState>()
+            .add_message::<crate::input::HirakuActionInput>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, advance_dialogue_on_input);
+        app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
+            animation_id: None,
+            request: Some(ScriptRequestId(12)),
+        });
+        let pointer = PointerId::Custom(uuid::Uuid::from_u128(2));
+        app.world_mut()
+            .resource_mut::<RuntimeMenuState>()
+            .consumed_pointer_clicks
+            .insert(pointer, 2);
+        let former_button = app.world_mut().spawn_empty().id();
+        for _ in 0..2 {
+            app.world_mut().write_message(Pointer::new(
+                pointer,
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
+                },
+                Click {
+                    button: PointerButton::Primary,
+                    hit: HitData {
+                        camera: former_button,
+                        depth: 0.0,
+                        position: None,
+                        normal: None,
+                        extra: None,
+                    },
+                    duration: Duration::ZERO,
+                    count: 1,
+                },
+                former_button,
+            ));
+        }
+
+        app.update();
+
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        assert!(
+            app.world()
+                .resource::<RuntimeMenuState>()
+                .consumed_pointer_clicks
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn typed_binding_system_updates_components_without_rebuilding_entities() {
         let mut app = App::new();
-        app.init_resource::<UiSignals>()
+        app.init_resource::<UiModels>()
             .add_systems(Update, update_ui_text_bindings);
         let text = app
             .world_mut()
@@ -1402,9 +1744,21 @@ mod tests {
             ))
             .id();
         {
-            let mut signals = app.world_mut().resource_mut::<UiSignals>();
-            signals.set("player.health", 25);
-            signals.set("hud.visible", false);
+            let mut models = app.world_mut().resource_mut::<UiModels>();
+            models.set(
+                "player",
+                StoredValue::Map(BTreeMap::from([(
+                    "health".to_string(),
+                    StoredValue::Int(25),
+                )])),
+            );
+            models.set(
+                "hud",
+                StoredValue::Map(BTreeMap::from([(
+                    "visible".to_string(),
+                    StoredValue::Bool(false),
+                )])),
+            );
         }
 
         app.update();

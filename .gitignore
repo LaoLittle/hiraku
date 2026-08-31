@@ -1,11 +1,4 @@
 /target
 .DS_Store
 Cargo.lock
-/renpy
-/assets
 /.vscode
-/config
-/examples
-/saves
-/docs
-book.toml

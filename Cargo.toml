@@ -14,7 +14,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 rustc-hash = "2.1.3"
 bumpalo = "3.20.3"
-uuid = "1"
+uuid = "1.26.0"
 
 hiraku-engine = { path = "hiraku_engine" }
 hiraku-errors = { path = "hiraku_errors" }
@@ -28,7 +28,6 @@ features = ["3d", "audio", "ui"]
 
 [workspace.dependencies.time]
 version = "0.3.55"
-default-features = false
 features = ["wasm-bindgen"]
 
 [workspace.dependencies.rand_pcg]

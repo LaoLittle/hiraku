@@ -720,6 +720,15 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 )
             }
             ExprKind::Member { object, name } | ExprKind::SafeMember { object, name } => {
+                if let ExprKind::Binding(bound) = &object.kind {
+                    let bound = flatten_selector(bound).unwrap_or_else(|| "expression".into());
+                    self.error(
+                        format!(
+                            "member access is outside the `$` binding; use `${{{bound}.{name}}}` to bind the complete selector"
+                        ),
+                        expression.span,
+                    );
+                }
                 if matches!(expression.kind, ExprKind::Member { .. })
                     && let Some(selector) = flatten_selector(expression)
                     && self
@@ -1435,5 +1444,24 @@ mod tests {
             panic!("expected string literal")
         };
         assert_eq!(*value, "hello");
+    }
+
+    #[test]
+    fn selector_bindings_require_braces() {
+        let shorthand = parse_program("let dialogue = .{ text: \"hello\" }\n$dialogue.text")
+            .expect("shorthand source parses");
+        let arena = HirArena::new();
+        let errors = lower_to_hir(&arena, &shorthand, None)
+            .expect_err("member access outside shorthand binding must be rejected");
+        assert!(errors.iter().any(|error| {
+            error
+                .message
+                .contains("use `${dialogue.text}` to bind the complete selector")
+        }));
+
+        let explicit = parse_program("let dialogue = .{ text: \"hello\" }\n${dialogue.text}")
+            .expect("explicit binding source parses");
+        let arena = HirArena::new();
+        lower_to_hir(&arena, &explicit, None).expect("explicit selector binding must lower");
     }
 }

@@ -17,7 +17,7 @@ use serde::{
     },
 };
 
-use crate::{Expr, ExprKind, NumberUnit, Stmt, parse_program};
+use crate::{Expr, ExprKind, NumberUnit, Stmt, parse::parse_literal_program};
 use hiraku_errors::{
     Diagnostic, DiagnosticLabel, RenderOptions, SourceId, SourceMap, render_diagnostics,
 };
@@ -306,7 +306,7 @@ impl ser::Error for HsonError {
 }
 
 pub fn parse(source: &str) -> Result<HsonValue, HsonError> {
-    let program = parse_program(source).map_err(HsonError::from_parse_errors)?;
+    let program = parse_literal_program(source).map_err(HsonError::from_parse_errors)?;
     let [Stmt::Expr(expression)] = program.statements.as_slice() else {
         return Err(HsonError::at(
             "an HSON document must contain exactly one value",
@@ -1120,6 +1120,16 @@ mod tests {
         assert!(source.contains("values: [1, 2.5]"));
         assert_eq!(
             from_str::<Document>(&source).expect("document should deserialize"),
+            value
+        );
+    }
+
+    #[test]
+    fn serde_strings_treat_template_syntax_as_plain_data() {
+        let value = "literal ${greet(\"guest\")} 🚀".to_string();
+        let source = to_string(&value).expect("string should serialize");
+        assert_eq!(
+            from_str::<String>(&source).expect("template-like data should deserialize"),
             value
         );
     }
