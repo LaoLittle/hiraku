@@ -12,16 +12,23 @@ use bevy::{
     audio::{ChannelCount, Decodable, SampleRate, Source},
     prelude::Asset,
     reflect::TypePath,
+    tasks::AsyncComputeTaskPool,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 use opus_rs::OpusDecoder;
 use rav1d::{Decoder as Av1Decoder, PixelLayout, PlanarImageComponent, Rav1dError, Settings};
-use rayon::prelude::*;
 use symphonia::core::codecs::{
     audio::well_known as audio_codecs, video::well_known as video_codecs,
 };
 
-use crate::{VideoAsset, VideoMetadata, asset::open_container};
+use crate::{
+    VideoAsset, VideoMetadata,
+    asset::open_container,
+    color::{
+        TRANSFER_BT709, TRANSFER_GAMMA_22, TRANSFER_GAMMA_28, TRANSFER_LINEAR, TRANSFER_SRGB,
+        YuvColorTransform,
+    },
+};
 
 const VIDEO_QUEUE_CAPACITY: usize = 3;
 const AUDIO_QUEUE_CAPACITY: usize = 24;
@@ -31,7 +38,12 @@ pub(crate) struct DecodedFrame {
     pub timestamp: Duration,
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub chroma_width: u32,
+    pub chroma_height: u32,
+    pub color_transform: YuvColorTransform,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -122,9 +134,8 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset) -> DecodeStream {
     let metadata = asset.metadata;
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = cancellation.clone();
-    std::thread::Builder::new()
-        .name("hiraku-video-decoder".into())
-        .spawn(move || {
+    AsyncComputeTaskPool::get()
+        .spawn(async move {
             if let Err(error) = decode_stream(
                 bytes,
                 metadata,
@@ -138,7 +149,7 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset) -> DecodeStream {
                 let _ = audio_sender.try_send(AudioEvent::End);
             }
         })
-        .expect("video decoder thread must be spawnable");
+        .detach();
     DecodeStream {
         video: video_receiver,
         audio: VideoAudio {
@@ -182,7 +193,10 @@ fn decode_stream(
     let audio_track = audio_track.ok_or_else(|| "Opus audio track disappeared".to_string())?;
 
     let mut settings = Settings::new();
-    settings.set_n_threads(u32::try_from(rayon::current_num_threads()).unwrap_or(u32::MAX));
+    let decoder_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    settings.set_n_threads(u32::try_from(decoder_threads).unwrap_or(u32::MAX));
     settings.set_max_frame_delay(VIDEO_QUEUE_CAPACITY as u32);
     let mut video_decoder =
         Av1Decoder::with_settings(&settings).map_err(|error| error.to_string())?;
@@ -258,7 +272,10 @@ fn drain_pictures(
         let first = *first_timestamp.get_or_insert(timestamp);
         send_cancellable(
             sender,
-            DecodeEvent::Frame(picture_to_rgba(&picture, timestamp.saturating_sub(first))?),
+            DecodeEvent::Frame(picture_to_yuv420(
+                &picture,
+                timestamp.saturating_sub(first),
+            )?),
             cancellation,
         )?;
     }
@@ -284,7 +301,10 @@ fn send_cancellable<T>(
     }
 }
 
-fn picture_to_rgba(picture: &rav1d::Picture, timestamp: Duration) -> Result<DecodedFrame, String> {
+fn picture_to_yuv420(
+    picture: &rav1d::Picture,
+    timestamp: Duration,
+) -> Result<DecodedFrame, String> {
     if picture.bit_depth() != 8 || picture.pixel_layout() != PixelLayout::I420 {
         return Err(format!(
             "unsupported AV1 pixel format: expected 8-bit 4:2:0, got {}-bit {:?}",
@@ -296,35 +316,76 @@ fn picture_to_rgba(picture: &rav1d::Picture, timestamp: Duration) -> Result<Deco
     let height = picture.height();
     let chroma_width = width.div_ceil(2);
     let chroma_height = height.div_ceil(2);
-    let y = picture.plane(PlanarImageComponent::Y).to_vec();
-    let u = picture.plane(PlanarImageComponent::U).to_vec();
-    let v = picture.plane(PlanarImageComponent::V).to_vec();
-    let y_stride = picture.stride(PlanarImageComponent::Y) as usize;
-    let u_stride = picture.stride(PlanarImageComponent::U) as usize;
-    let v_stride = picture.stride(PlanarImageComponent::V) as usize;
-    let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-    rgba.par_chunks_mut(width as usize * 4)
-        .enumerate()
-        .for_each(|(row, output)| {
-            for column in 0..width as usize {
-                let luminance = f32::from(y[row * y_stride + column]);
-                let chroma_row = (row / 2).min(chroma_height as usize - 1);
-                let chroma_column = (column / 2).min(chroma_width as usize - 1);
-                let blue = f32::from(u[chroma_row * u_stride + chroma_column]) - 128.0;
-                let red = f32::from(v[chroma_row * v_stride + chroma_column]) - 128.0;
-                let pixel = &mut output[column * 4..column * 4 + 4];
-                pixel[0] = (luminance + 1.5748 * red).clamp(0.0, 255.0) as u8;
-                pixel[1] = (luminance - 0.187_324 * blue - 0.468_124 * red).clamp(0.0, 255.0) as u8;
-                pixel[2] = (luminance + 1.8556 * blue).clamp(0.0, 255.0) as u8;
-                pixel[3] = 255;
-            }
-        });
+    let copy_plane = |component, plane_width: u32, plane_height: u32| {
+        let source = picture.plane(component);
+        let stride = picture.stride(component) as usize;
+        let row_width = plane_width as usize;
+        let mut output = Vec::with_capacity(row_width * plane_height as usize);
+        for row in 0..plane_height as usize {
+            let start = row * stride;
+            output.extend_from_slice(&source[start..start + row_width]);
+        }
+        output
+    };
     Ok(DecodedFrame {
         timestamp,
         width,
         height,
-        rgba,
+        chroma_width,
+        chroma_height,
+        color_transform: picture_color_transform(picture),
+        y: copy_plane(PlanarImageComponent::Y, width, height),
+        u: copy_plane(PlanarImageComponent::U, chroma_width, chroma_height),
+        v: copy_plane(PlanarImageComponent::V, chroma_width, chroma_height),
     })
+}
+
+fn picture_color_transform(picture: &rav1d::Picture) -> YuvColorTransform {
+    use rav1d::pixel::{MatrixCoefficients, TransferCharacteristic, YUVRange};
+
+    let (kr, kb) = match picture.matrix_coefficients() {
+        MatrixCoefficients::BT470M => (0.30, 0.11),
+        MatrixCoefficients::BT470BG | MatrixCoefficients::ST170M => (0.299, 0.114),
+        MatrixCoefficients::ST240M => (0.2122, 0.0865),
+        MatrixCoefficients::BT2020NonConstantLuminance
+        | MatrixCoefficients::BT2020ConstantLuminance => (0.2627, 0.0593),
+        MatrixCoefficients::BT709
+        | MatrixCoefficients::Identity
+        | MatrixCoefficients::Unspecified
+        | MatrixCoefficients::Reserved
+        | MatrixCoefficients::YCgCo
+        | MatrixCoefficients::ST2085
+        | MatrixCoefficients::ChromaticityDerivedNonConstantLuminance
+        | MatrixCoefficients::ChromaticityDerivedConstantLuminance
+        | MatrixCoefficients::ICtCp => (0.2126, 0.0722),
+    };
+    let transfer = match picture.transfer_characteristic() {
+        TransferCharacteristic::Linear => TRANSFER_LINEAR,
+        TransferCharacteristic::SRGB => TRANSFER_SRGB,
+        TransferCharacteristic::BT470M => TRANSFER_GAMMA_22,
+        TransferCharacteristic::BT470BG => TRANSFER_GAMMA_28,
+        TransferCharacteristic::BT1886
+        | TransferCharacteristic::Unspecified
+        | TransferCharacteristic::Reserved0
+        | TransferCharacteristic::Reserved
+        | TransferCharacteristic::ST170M
+        | TransferCharacteristic::ST240M
+        | TransferCharacteristic::XVYCC
+        | TransferCharacteristic::BT1361E
+        | TransferCharacteristic::BT2020Ten
+        | TransferCharacteristic::BT2020Twelve
+        | TransferCharacteristic::Logarithmic100
+        | TransferCharacteristic::Logarithmic316
+        | TransferCharacteristic::PerceptualQuantizer
+        | TransferCharacteristic::ST428
+        | TransferCharacteristic::HybridLogGamma => TRANSFER_BT709,
+    };
+    YuvColorTransform::from_luma_coefficients(
+        kr,
+        kb,
+        picture.color_range() == YUVRange::Limited,
+        transfer,
+    )
 }
 
 pub(crate) fn drain_ready_frames(

@@ -1,10 +1,10 @@
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
 };
 
 use hiraku_script::hson;
+use hiraku_storage::{ByteStorage, PlatformStorage};
 use prost::Message;
 use thiserror::Error;
 
@@ -20,13 +20,14 @@ use crate::{
 
 const SAVE_ROOT: &str = "saves";
 const SAVE_EXTENSION: &str = "sav";
+const SAVE_NAMESPACE: &str = "hiraku.save";
 mod user_settings;
 pub use user_settings::{UserSettings, read_user_settings, write_user_settings};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("failed to access storage: {0}")]
-    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Backend(#[from] hiraku_storage::StorageError),
     #[error("failed to load HSON data: {0}")]
     HsonData(String),
     #[error("failed to decode save protobuf: {0}")]
@@ -35,6 +36,8 @@ pub enum StorageError {
     InvalidSave(String),
     #[error("slot name can only contain letters, digits, '-' or '_'")]
     InvalidSlot,
+    #[error("save slot `{0}` does not exist")]
+    MissingSlot(String),
 }
 
 pub fn save_root_path() -> PathBuf {
@@ -46,8 +49,10 @@ pub fn load_save_data(slot: &str) -> Result<SaveGameData, StorageError> {
 }
 
 pub fn load_save_data_from_root(root: &Path, slot: &str) -> Result<SaveGameData, StorageError> {
-    let path = slot_path_in(root, slot)?;
-    let payload = fs::read(path)?;
+    let slot = sanitize_slot_name(slot)?;
+    let payload = save_storage(root)
+        .read(slot)?
+        .ok_or_else(|| StorageError::MissingSlot(slot.to_string()))?;
     decode_save_data(&payload)
 }
 
@@ -56,10 +61,13 @@ pub fn write_save_data_to_root(
     slot: &str,
     data: &SaveGameData,
 ) -> Result<(), StorageError> {
-    fs::create_dir_all(root)?;
-    let path = slot_path_in(root, slot)?;
-    fs::write(path, encode_save_data(data))?;
+    let slot = sanitize_slot_name(slot)?;
+    save_storage(root).write(slot, &encode_save_data(data))?;
     Ok(())
+}
+
+fn save_storage(root: &Path) -> PlatformStorage {
+    PlatformStorage::new(root, SAVE_NAMESPACE, SAVE_EXTENSION)
 }
 
 fn encode_save_data(data: &SaveGameData) -> Vec<u8> {
@@ -68,11 +76,6 @@ fn encode_save_data(data: &SaveGameData) -> Vec<u8> {
 
 fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
     proto::SaveGameData::decode(payload)?.try_into()
-}
-
-pub fn slot_path_in(root: &Path, slot: &str) -> Result<PathBuf, StorageError> {
-    let slot = sanitize_slot_name(slot)?;
-    Ok(root.join(format!("{slot}.{SAVE_EXTENSION}")))
 }
 
 impl From<&SaveGameData> for proto::SaveGameData {

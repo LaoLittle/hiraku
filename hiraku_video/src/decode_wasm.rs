@@ -12,14 +12,19 @@ use bevy::{
 };
 use crossbeam_channel::{Receiver, bounded};
 
-use crate::{VideoAsset, VideoMetadata};
+use crate::{VideoAsset, VideoMetadata, color::YuvColorTransform};
 
 #[derive(Debug)]
 pub(crate) struct DecodedFrame {
     pub timestamp: Duration,
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub chroma_width: u32,
+    pub chroma_height: u32,
+    pub color_transform: YuvColorTransform,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
 }
 
 #[derive(Debug)]

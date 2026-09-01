@@ -14,12 +14,12 @@ use bevy::{
     picking::Pickable,
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
-    ui::widget::NodeImageMode,
 };
 
 use crate::{
     VideoAsset, VideoAssetLoader,
     decode::{DecodeEvent, DecodedFrame, VideoAudio, drain_ready_frames, spawn_decoder},
+    render::{Yuv420Material, load_internal_shader},
 };
 
 const VIDEO_Z_INDEX: i32 = 30_000;
@@ -130,8 +130,7 @@ struct ActivePlayback {
     id: VideoPlaybackId,
     receiver: crossbeam_channel::Receiver<DecodeEvent>,
     frames: VecDeque<DecodedFrame>,
-    image: Handle<Image>,
-    image_entity: Entity,
+    surface: Option<VideoSurface>,
     root: Entity,
     audio_entity: Entity,
     position: Duration,
@@ -143,13 +142,22 @@ struct ActivePlayback {
     age: Duration,
 }
 
+struct VideoSurface {
+    y_image: Handle<Image>,
+    u_image: Handle<Image>,
+    v_image: Handle<Image>,
+    image_entity: Entity,
+}
+
 pub struct HirakuVideoPlugin;
 
 impl Plugin for HirakuVideoPlugin {
     fn build(&self, app: &mut App) {
+        load_internal_shader(app);
         app.init_asset::<VideoAsset>()
             .init_asset_loader::<VideoAssetLoader>()
             .add_audio_source::<VideoAudio>()
+            .add_plugins(UiMaterialPlugin::<Yuv420Material>::default())
             .init_resource::<VideoPlayer>()
             .init_resource::<ActiveVideo>()
             .add_message::<VideoEvent>()
@@ -164,7 +172,6 @@ fn start_pending_video(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     videos: Res<Assets<VideoAsset>>,
-    mut images: ResMut<Assets<Image>>,
     mut audio_assets: ResMut<Assets<VideoAudio>>,
     mut player: ResMut<VideoPlayer>,
     mut active: ResMut<ActiveVideo>,
@@ -200,19 +207,6 @@ fn start_pending_video(
         Some(VideoPlaybackState::Paused)
     );
     let stream = spawn_decoder(asset);
-    let image = images.add(frame_image(1, 1, vec![0, 0, 0, 255]));
-    let image_entity = commands
-        .spawn((
-            ImageNode::new(image.clone()).with_mode(NodeImageMode::Stretch),
-            Node {
-                width: percent(100),
-                max_height: percent(100),
-                aspect_ratio: Some(1.0),
-                ..default()
-            },
-            Pickable::IGNORE,
-        ))
-        .id();
     let root = commands
         .spawn((
             Node {
@@ -229,7 +223,6 @@ fn start_pending_video(
             GlobalZIndex(VIDEO_Z_INDEX),
             Pickable::IGNORE,
         ))
-        .add_child(image_entity)
         .id();
     let audio = audio_assets.add(stream.audio);
     // Keep audio stopped until the first decoded frame is ready. This makes
@@ -241,8 +234,7 @@ fn start_pending_video(
         id: pending.id,
         receiver: stream.video,
         frames: VecDeque::new(),
-        image,
-        image_entity,
+        surface: None,
         root,
         audio_entity,
         position: Duration::ZERO,
@@ -312,6 +304,7 @@ fn update_video(
     mut commands: Commands,
     time: Res<Time>,
     mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<Yuv420Material>>,
     mut nodes: Query<&mut Node>,
     sinks: Query<&AudioSink>,
     mut player: ResMut<VideoPlayer>,
@@ -381,12 +374,14 @@ fn update_video(
             .pop_front()
             .expect("the checked frame queue must not be empty");
         playback.last_timestamp = frame.timestamp;
-        if let Some(mut image) = images.get_mut(&playback.image) {
-            *image = frame_image(frame.width, frame.height, frame.rgba);
-        }
-        if let Ok(mut node) = nodes.get_mut(playback.image_entity) {
-            node.aspect_ratio = Some(frame.width as f32 / frame.height as f32);
-        }
+        present_frame(
+            &mut commands,
+            &mut images,
+            &mut materials,
+            &mut nodes,
+            playback,
+            frame,
+        );
     }
     if playback.paused
         && let Ok(sink) = sinks.get(playback.audio_entity)
@@ -411,6 +406,75 @@ fn update_video(
     }
 }
 
+fn present_frame(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<Yuv420Material>,
+    nodes: &mut Query<&mut Node>,
+    playback: &mut ActivePlayback,
+    frame: DecodedFrame,
+) {
+    let aspect_ratio = frame.width as f32 / frame.height as f32;
+    if let Some(surface) = playback.surface.as_ref() {
+        replace_plane(images, &surface.y_image, frame.width, frame.height, frame.y);
+        replace_plane(
+            images,
+            &surface.u_image,
+            frame.chroma_width,
+            frame.chroma_height,
+            frame.u,
+        );
+        replace_plane(
+            images,
+            &surface.v_image,
+            frame.chroma_width,
+            frame.chroma_height,
+            frame.v,
+        );
+        if let Ok(mut node) = nodes.get_mut(surface.image_entity) {
+            node.aspect_ratio = Some(aspect_ratio);
+        }
+        return;
+    }
+
+    let y_image = images.add(plane_image(frame.width, frame.height, frame.y));
+    let u_image = images.add(plane_image(
+        frame.chroma_width,
+        frame.chroma_height,
+        frame.u,
+    ));
+    let v_image = images.add(plane_image(
+        frame.chroma_width,
+        frame.chroma_height,
+        frame.v,
+    ));
+    let material = materials.add(Yuv420Material {
+        y: y_image.clone(),
+        u: u_image.clone(),
+        v: v_image.clone(),
+        color_transform: frame.color_transform,
+    });
+    let image_entity = commands
+        .spawn((
+            MaterialNode(material),
+            Node {
+                width: percent(100),
+                max_height: percent(100),
+                aspect_ratio: Some(aspect_ratio),
+                ..default()
+            },
+            Pickable::IGNORE,
+        ))
+        .id();
+    commands.entity(playback.root).add_child(image_entity);
+    playback.surface = Some(VideoSurface {
+        y_image,
+        u_image,
+        v_image,
+        image_entity,
+    });
+}
+
 fn cleanup_playback(commands: &mut Commands, playback: &ActivePlayback) {
     playback.cancellation.store(true, Ordering::Relaxed);
     commands.entity(playback.root).try_despawn();
@@ -429,7 +493,27 @@ fn fail_playback(
     events.write(VideoEvent::Failed { id, error });
 }
 
-fn frame_image(width: u32, height: u32, rgba: Vec<u8>) -> Image {
+fn replace_plane(
+    images: &mut Assets<Image>,
+    handle: &Handle<Image>,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+) {
+    if let Some(mut image) = images.get_mut(handle) {
+        let size = image.texture_descriptor.size;
+        if size.width == width
+            && size.height == height
+            && image.texture_descriptor.format == TextureFormat::R8Unorm
+        {
+            image.data = Some(data);
+        } else {
+            *image = plane_image(width, height, data);
+        }
+    }
+}
+
+fn plane_image(width: u32, height: u32, data: Vec<u8>) -> Image {
     Image::new(
         Extent3d {
             width,
@@ -437,8 +521,8 @@ fn frame_image(width: u32, height: u32, rgba: Vec<u8>) -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        rgba,
-        TextureFormat::Rgba8UnormSrgb,
+        data,
+        TextureFormat::R8Unorm,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     )
 }

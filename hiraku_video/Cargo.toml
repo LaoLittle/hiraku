@@ -10,7 +10,6 @@ crossbeam-channel = "0.5.15"
 opus-rs = "0.1.32"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rayon = "1.12.0"
 rav1d = { git = "https://github.com/memorysafety/rav1d.git" }
 
 [dependencies.symphonia]
