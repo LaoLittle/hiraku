@@ -1,0 +1,22 @@
+import ui.widgets.*
+
+screen {
+    column {
+        text("Hiraku Feature Showcase")
+            .phaseAnimator(
+                [.rotation(-2), .rotation(2)],
+                .easeInOut(0.7).repeatForever()
+            )
+
+        text("Glossary entries are project-owned HSON data:")
+        row {
+            term("hks")
+            term("ether")
+        }.gap(24)
+
+        button("dialogue") { text("Open custom dialogue") }
+        button("story") { text("Run standard dialogue") }
+        button("quit") { text("Exit") }
+    }.gap(18)
+}
+    .overlay(0.04, 0.06, 0.11, 0.96)

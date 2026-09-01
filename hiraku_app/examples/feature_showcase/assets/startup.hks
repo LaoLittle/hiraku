@@ -1,0 +1,26 @@
+global speaker = "Alice"
+global dialogueLine = "This dialogue box is a regular HKS UI component."
+
+ui.set("home", "ui/home.ui.hks")
+ui.set("dialogue", "ui/dialogue.ui.hks")
+ui.mount("status", "ui/status.ui.hks")
+
+while true {
+    let action = ui.open("home")
+
+    if action == "dialogue" {
+        "This narration is rendered by the dialogue component registered in startup."
+        say("Alice", "The component controls layout, colors, typography, and its advance button.")
+        ...: " Continuations append to the same model without remounting the component."
+    }
+
+    if action == "story" {
+        "A plain string statement uses Hiraku's standard dialogue printer."
+        say("Alice", "The same story can mix standard dialogue with custom modal UI.")
+        ...: " This sentence is appended without restarting the reveal animation."
+    }
+
+    if action == "quit" {
+        exit()
+    }
+}

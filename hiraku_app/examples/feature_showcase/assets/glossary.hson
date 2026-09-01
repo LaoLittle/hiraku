@@ -1,0 +1,14 @@
+.{
+    terms: [
+        .{
+            id: "hks",
+            name: "Hiraku Script",
+            description: "The strongly typed and restorable scripting language used by Hiraku.",
+        },
+        .{
+            id: "ether",
+            name: "Ether",
+            description: "A fictional energy used by this example's academy.",
+        },
+    ],
+}

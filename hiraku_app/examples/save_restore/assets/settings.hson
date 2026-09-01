@@ -1,0 +1,10 @@
+.{
+    startup: "startup.hks",
+    fonts: .{ path: "." },
+    texturesDir: ".",
+    charactersDir: ".",
+    backgroundsDir: ".",
+    soundeffectsDir: ".",
+    bgmDir: ".",
+    voiceDir: ".",
+}

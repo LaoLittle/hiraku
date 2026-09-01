@@ -1,0 +1,16 @@
+global checkpoint: Int = 0
+global dialogueTitle = "Save / Restore"
+global dialogueLine = ""
+
+ui.set("saveDialog", "ui/dialogue.ui.hks")
+
+while true {
+    checkpoint += 1
+    dialogueTitle = "Checkpoint ${checkpoint}"
+    dialogueLine = "Save here, continue to the next checkpoint, then load to restore this exact UI and VM position."
+    ui.open("saveDialog")
+
+    dialogueTitle = "Snapshot contents"
+    dialogueLine = "The save contains globals, call frames, the instruction pointer, scene state, and the pending custom dialogue."
+    ui.open("saveDialog")
+}

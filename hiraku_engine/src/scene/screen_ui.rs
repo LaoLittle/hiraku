@@ -1,9 +1,13 @@
 use super::*;
+use crate::ui::UiEffect;
 use bevy::{
     input::mouse::MouseScrollUnit,
     picking::events::Scroll,
     ui::{VisualBox, widget::NodeImageMode},
 };
+
+#[derive(Clone, Debug, Message)]
+pub struct UiEffectMessage(pub UiEffect);
 
 pub(super) fn clear_screen_ui(commands: &mut Commands, screen_state: &mut ScreenUiState) {
     if let Some(root) = screen_state.active_root.take() {
@@ -374,6 +378,7 @@ fn spawn_screen_node_entity(
             text,
             value,
             action,
+            click_effects,
             enabled,
             enabled_binding,
             reactive_enabled,
@@ -511,6 +516,7 @@ fn spawn_screen_node_entity(
             commands.entity(button).insert(ScreenUiButton {
                 root,
                 value: value.clone(),
+                click_effects: click_effects.clone(),
                 enabled: *enabled,
                 text_entity: text,
                 normal_background,
@@ -599,6 +605,7 @@ fn spawn_screen_node_entity(
             press_scale,
             value,
             action,
+            click_effects,
             enabled,
             enabled_binding,
             reactive_enabled,
@@ -643,6 +650,7 @@ fn spawn_screen_node_entity(
                     ScreenUiImageButton {
                         root,
                         value: value.clone(),
+                        click_effects: click_effects.clone(),
                         enabled: *enabled,
                         hovered_when_disabled: *hovered_when_disabled,
                         normal_rect,
@@ -1149,6 +1157,7 @@ fn align_items_from_option(value: &Option<String>) -> AlignItems {
 }
 pub fn handle_screen_buttons(
     mut screen_state: ResMut<ScreenUiState>,
+    mut effects: MessageWriter<UiEffectMessage>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
@@ -1218,15 +1227,48 @@ pub fn handle_screen_buttons(
             continue;
         }
         let Some(value) = button.value.clone() else {
+            emit_ui_effects(&mut effects, &button.click_effects);
             continue;
         };
         let Some(done) = screen_state.waiting.take() else {
             continue;
         };
+        emit_ui_effects(&mut effects, &button.click_effects);
         responses.write(ScriptResponseMessage {
             request: done,
             response: ScriptResponse::Choice(value),
         });
+    }
+}
+
+fn emit_ui_effects(writer: &mut MessageWriter<UiEffectMessage>, effects: &[UiEffect]) {
+    for effect in effects.iter().cloned() {
+        writer.write(UiEffectMessage(effect));
+    }
+}
+
+pub fn process_ui_effects(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    audio: Res<AudioCatalog>,
+    user_settings: Res<UserSettings>,
+    mut effects: MessageReader<UiEffectMessage>,
+) {
+    for UiEffectMessage(effect) in effects.read() {
+        match effect {
+            UiEffect::PlaySfx { name, volume } => {
+                let Some(definition) = audio.resolve_sfx(name) else {
+                    warn!("UI sound effect `{name}` is not defined");
+                    continue;
+                };
+                let playback_volume = apply_volume_setting(*volume, user_settings.sfx_volume);
+                commands.spawn((
+                    SfxChannel { volume: *volume },
+                    AudioPlayer::new(asset_server.load(definition.path.clone())),
+                    PlaybackSettings::DESPAWN.with_volume(Volume::Linear(playback_volume)),
+                ));
+            }
+        }
     }
 }
 
@@ -1251,6 +1293,7 @@ fn apply_screen_button_image(
 
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
+    mut effects: MessageWriter<UiEffectMessage>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
@@ -1333,11 +1376,13 @@ pub fn handle_screen_image_buttons(
             continue;
         }
         let Some(value) = button.value.clone() else {
+            emit_ui_effects(&mut effects, &button.click_effects);
             continue;
         };
         let Some(done) = screen_state.waiting.take() else {
             continue;
         };
+        emit_ui_effects(&mut effects, &button.click_effects);
         responses.write(ScriptResponseMessage {
             request: done,
             response: ScriptResponse::Choice(value),
@@ -1805,6 +1850,7 @@ mod tests {
         app.init_resource::<ScreenUiState>()
             .add_message::<Pointer<Click>>()
             .add_message::<ScriptResponseMessage>()
+            .add_message::<UiEffectMessage>()
             .add_systems(Update, handle_screen_buttons);
         let root = app.world_mut().spawn_empty().id();
         let text = app.world_mut().spawn(TextColor(Color::WHITE)).id();
@@ -1817,6 +1863,7 @@ mod tests {
                 ScreenUiButton {
                     root,
                     value: Some(StoredValue::String("continue".into())),
+                    click_effects: Vec::new(),
                     enabled: true,
                     text_entity: text,
                     normal_background: Color::BLACK,

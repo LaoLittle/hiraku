@@ -5,6 +5,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::StoredValue;
 
+/// A typed side effect dispatched after a UI button accepts a click.
+///
+/// These are data, rather than Rust callbacks or string action routes, so a
+/// declarative screen remains serializable and the ECS owns the actual work.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum UiEffect {
+    PlaySfx {
+        name: String,
+        #[serde(default = "default_ui_effect_volume")]
+        volume: f32,
+    },
+}
+
+fn default_ui_effect_volume() -> f32 {
+    1.0
+}
+
 /// Runtime metadata for an ordinary HKS expression captured by a declarative
 /// UI property. It is skipped by serialization; UI authors never manipulate
 /// this type or a signal handle directly.
@@ -364,6 +381,9 @@ pub struct ButtonNode {
     /// `storage.save.quick`, `story.next`, and `app.returnToTitle`.
     #[serde(default)]
     pub action: Option<String>,
+    /// Typed effects dispatched when the click is accepted.
+    #[serde(default)]
+    pub click_effects: Vec<UiEffect>,
     /// Whether the button can be pressed.
     ///
     /// Disabled buttons remain visible and use insensitive colors, matching
@@ -470,6 +490,9 @@ pub struct ScreenImageButtonNode {
     /// Namespace-qualified engine action route.
     #[serde(default)]
     pub action: Option<String>,
+    /// Typed effects dispatched when the click is accepted.
+    #[serde(default)]
+    pub click_effects: Vec<UiEffect>,
     /// Whether the button can be pressed.
     #[serde(default = "default_button_enabled")]
     pub enabled: bool,
@@ -624,6 +647,7 @@ pub struct ScreenUiButton {
     pub root: Entity,
     /// Intent value returned to the story runtime when the button is pressed.
     pub value: Option<StoredValue>,
+    pub click_effects: Vec<UiEffect>,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
     /// Text child whose color changes with interaction state.
@@ -665,6 +689,7 @@ pub struct ScreenUiImageButton {
     pub root: Entity,
     /// Intent value returned to the story runtime when pressed.
     pub value: Option<StoredValue>,
+    pub click_effects: Vec<UiEffect>,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
     /// Whether a disabled button still displays its hover artwork.

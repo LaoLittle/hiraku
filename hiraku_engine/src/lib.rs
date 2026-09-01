@@ -44,10 +44,10 @@ use scene::{
     handle_choice_action_input, handle_choice_buttons, handle_runtime_menu_buttons,
     handle_screen_buttons, handle_screen_image_buttons, handle_screen_scroll,
     handle_screen_toggles, poll_pending_character_shows, poll_voice_playback, prepare_bgm_preludes,
-    process_script_commands, reconcile_restored_bgm, reconcile_restored_characters, setup_frontend,
-    setup_stage, sync_scene_snapshot, tick_animation_waits, tick_pending_waits,
-    tick_script_batches, update_builtin_ui_models, update_ui_reactive_bindings,
-    update_ui_text_bindings,
+    process_script_commands, process_ui_effects, reconcile_restored_bgm,
+    reconcile_restored_characters, setup_frontend, setup_stage, sync_scene_snapshot,
+    tick_animation_waits, tick_pending_waits, tick_script_batches, update_builtin_ui_models,
+    update_runtime_menu_button_visuals, update_ui_reactive_bindings, update_ui_text_bindings,
 };
 use script::{
     ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
@@ -186,6 +186,7 @@ impl Plugin for HirakuPlugin {
             .init_resource::<ScriptRuntimeState>()
             .init_resource::<UiModels>()
             .add_message::<ScriptResponseMessage>()
+            .add_message::<scene::UiEffectMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(Update, stream_requested_hdp_volumes)
@@ -281,6 +282,13 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
+                process_ui_effects
+                    .after(handle_screen_buttons)
+                    .after(handle_screen_image_buttons)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
                 (handle_screen_scroll, handle_screen_toggles)
                     .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
@@ -288,6 +296,12 @@ impl Plugin for HirakuPlugin {
             .add_systems(
                 Update,
                 handle_choice_buttons
+                    .after(cleanup_stale_screen_ui)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                update_runtime_menu_button_visuals
                     .after(cleanup_stale_screen_ui)
                     .in_set(HirakuRuntimeSystems),
             )

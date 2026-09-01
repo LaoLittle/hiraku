@@ -23,14 +23,6 @@ const SAVE_EXTENSION: &str = "sav";
 mod user_settings;
 pub use user_settings::{UserSettings, read_user_settings, write_user_settings};
 
-#[derive(Clone, Debug)]
-pub struct SaveSlotSummary {
-    pub slot: String,
-    pub resume_script: String,
-    pub route: Option<String>,
-    pub background: Option<String>,
-}
-
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("failed to access storage: {0}")]
@@ -76,51 +68,6 @@ fn encode_save_data(data: &SaveGameData) -> Vec<u8> {
 
 fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
     proto::SaveGameData::decode(payload)?.try_into()
-}
-
-pub fn list_save_slots() -> Result<Vec<SaveSlotSummary>, StorageError> {
-    #[cfg(target_arch = "wasm32")]
-    return Ok(Vec::new());
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let root = save_root_path();
-        let entries = match fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(StorageError::Io(err)),
-        };
-
-        let mut slots = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some(SAVE_EXTENSION) {
-                continue;
-            }
-
-            let Some(slot) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-
-            let Ok(payload) = fs::read(&path) else {
-                continue;
-            };
-            let Ok(data) = decode_save_data(&payload) else {
-                continue;
-            };
-
-            slots.push(SaveSlotSummary {
-                slot: slot.to_string(),
-                resume_script: data.resume_script,
-                route: global_string(&data.globals, "route"),
-                background: data.scene.background.map(|background| background.path),
-            });
-        }
-
-        slots.sort_by(|left, right| right.slot.cmp(&left.slot));
-        Ok(slots)
-    }
 }
 
 pub fn slot_path_in(root: &Path, slot: &str) -> Result<PathBuf, StorageError> {
@@ -582,13 +529,6 @@ fn sanitize_slot_name(slot: &str) -> Result<&str, StorageError> {
         Ok(slot)
     } else {
         Err(StorageError::InvalidSlot)
-    }
-}
-
-fn global_string(globals: &BTreeMap<String, StoredValue>, key: &str) -> Option<String> {
-    match globals.get(key) {
-        Some(StoredValue::String(value)) => Some(value.clone()),
-        _ => None,
     }
 }
 

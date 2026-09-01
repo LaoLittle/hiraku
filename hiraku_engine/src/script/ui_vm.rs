@@ -18,7 +18,7 @@ use crate::{
     ui::{
         BarNode, ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
         ScreenNode, ScreenSpec, ScreenTexture, ScrollableNode, SpacerNode, TextNode, ToggleNode,
-        UiPhaseAnimation, UiReactiveBinding,
+        UiEffect, UiPhaseAnimation, UiReactiveBinding,
     },
 };
 
@@ -28,12 +28,17 @@ use super::{
 };
 
 const UI_NODE_HANDLE_TYPE: u32 = 0x5549_4e4f;
+const UI_EFFECT_HANDLE_TYPE: u32 = 0x5549_4546;
 const UI_STDLIB_PATH: &str = "hiraku://std/ui.hks";
 const UI_STDLIB_SOURCE: &str = include_str!("std/ui.hks");
 
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "UiNode", handle_type = UI_NODE_HANDLE_TYPE)]
 struct UiNodeHandle(u64);
+
+#[derive(Clone, Copy, hiraku_script::HksHandle)]
+#[hks(name = "UiEffect", handle_type = UI_EFFECT_HANDLE_TYPE)]
+struct UiEffectHandle(u64);
 
 hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -88,6 +93,7 @@ struct UiDraft {
     hovered: Option<HksClosure>,
     checked: Option<HksClosure>,
     action: Option<String>,
+    on_click: Option<HksClosure>,
     layout: ScreenLayout,
     panel: bool,
     enabled: bool,
@@ -119,6 +125,7 @@ impl UiDraft {
             hovered: None,
             checked: None,
             action: None,
+            on_click: None,
             layout: ScreenLayout::default(),
             panel: true,
             enabled: true,
@@ -149,6 +156,8 @@ struct UiVmContext {
     terms: TermCatalog,
     next_node: u64,
     nodes: BTreeMap<u64, UiDraft>,
+    next_effect: u64,
+    effects: BTreeMap<u64, UiEffect>,
 }
 
 impl UiVmContext {
@@ -158,6 +167,8 @@ impl UiVmContext {
             terms,
             next_node: 0,
             nodes: BTreeMap::new(),
+            next_effect: 0,
+            effects: BTreeMap::new(),
         }
     }
 
@@ -171,6 +182,18 @@ impl UiVmContext {
         self.nodes
             .get_mut(&handle.0)
             .ok_or_else(|| NativeError::message(format!("unknown UiNode handle {}", handle.0)))
+    }
+
+    fn insert_effect(&mut self, effect: UiEffect) -> UiEffectHandle {
+        self.next_effect += 1;
+        self.effects.insert(self.next_effect, effect);
+        UiEffectHandle(self.next_effect)
+    }
+
+    fn effect(&self, handle: UiEffectHandle) -> Result<&UiEffect, NativeError> {
+        self.effects
+            .get(&handle.0)
+            .ok_or_else(|| NativeError::message(format!("unknown UiEffect handle {}", handle.0)))
     }
 }
 
@@ -643,6 +666,48 @@ mod native_ui {
         Ok(node)
     }
 
+    /// Builds a one-shot sound effect for a button's click handler. Calling
+    /// this function is pure; playback starts only after the button accepts a
+    /// release event.
+    #[hks(name = "sfx")]
+    fn ui_sfx(
+        context: &mut UiVmContext,
+        name: String,
+        volume: Option<f64>,
+    ) -> Result<UiEffectHandle, NativeError> {
+        if name.trim().is_empty() {
+            return Err(NativeError::message(
+                "UI sound effect name must not be empty",
+            ));
+        }
+        let volume = volume.unwrap_or(1.0);
+        if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+            return Err(NativeError::message(
+                "UI sound effect volume must be between 0 and 1",
+            ));
+        }
+        Ok(context.insert_effect(UiEffect::PlaySfx {
+            name,
+            volume: volume as f32,
+        }))
+    }
+
+    #[hks(name = "onClick", receiver)]
+    fn ui_on_click(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        handler: HksClosure,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Button(_)) {
+            return Err(NativeError::message(
+                "onClick can only be applied to button nodes",
+            ));
+        }
+        draft.on_click = Some(handler);
+        Ok(node)
+    }
+
     #[hks(name = "animation", receiver)]
     fn ui_animation(
         context: &mut UiVmContext,
@@ -822,6 +887,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
         .expect("animation API registration must be internally consistent");
     // Register the nominal result type before compiling the HKS standard library.
     let ui_node = registry.define_type("UiNode");
+    registry.define_type("UiEffect");
     native_ui::register_hks(&mut registry)
         .expect("UI native primitives must be internally consistent");
     registry
@@ -1082,6 +1148,63 @@ fn closure_children_with_args(
     let vm = LinkedVm::from_callable(program.clone(), &callable, arguments)
         .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
     collect_nodes(vm, registry, context)
+}
+
+fn closure_effects(
+    closure: Option<HksClosure>,
+    program: &hiraku_script::LinkedProgram,
+    registry: &NativeRegistry<UiVmContext>,
+    context: &mut UiVmContext,
+) -> Result<Vec<UiEffect>, UiVmError> {
+    let Some(closure) = closure else {
+        return Ok(Vec::new());
+    };
+    let callable = closure.into_hks_value();
+    let mut vm = LinkedVm::from_callable(program.clone(), &callable, Vec::new())
+        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    let mut effects = Vec::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        match vm
+            .step()
+            .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?
+        {
+            Some(LinkedVmEvent::Call(call)) => {
+                let value = registry
+                    .call(context, &call)
+                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+                vm.resume(value)
+                    .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+            }
+            Some(LinkedVmEvent::Statement(StatementValue::Value(value))) => {
+                let handle = UiEffectHandle::from_hks_value(&value).map_err(|_| {
+                    UiVmError::Invalid(
+                        "onClick statements must produce a UI effect such as sfx(...)".into(),
+                    )
+                })?;
+                if seen.insert(handle.0) {
+                    effects.push(
+                        context
+                            .effect(handle)
+                            .map_err(|error| UiVmError::Runtime(error.to_string()))?
+                            .clone(),
+                    );
+                }
+            }
+            Some(LinkedVmEvent::Statement(StatementValue::Commit)) => {}
+            Some(LinkedVmEvent::Statement(StatementValue::String(_))) => {
+                return Err(UiVmError::Invalid(
+                    "bare strings are not valid onClick effects".into(),
+                ));
+            }
+            Some(LinkedVmEvent::Completed(_)) => return Ok(effects),
+            None => {
+                return Err(UiVmError::Runtime(
+                    "onClick handler stopped without completing".into(),
+                ));
+            }
+        }
+    }
 }
 
 fn context_globals(context: &UiVmContext) -> BTreeMap<String, Value> {
@@ -1486,6 +1609,7 @@ fn materialize_node(
             })
         }
         UiDraftKind::Button(value) => {
+            let click_effects = closure_effects(draft.on_click, program, registry, context)?;
             let (enabled, reactive_enabled) = if let Some(binding) = &draft.enabled_binding {
                 let reactive = reactive_binding(binding, program, context);
                 let value = evaluate_binding_value(&reactive, registry, context)?;
@@ -1513,6 +1637,7 @@ fn materialize_node(
                     text: text.text,
                     value,
                     action: draft.action,
+                    click_effects,
                     enabled,
                     enabled_binding: None,
                     reactive_enabled,
@@ -1574,6 +1699,7 @@ fn materialize_node(
                         press_scale: draft.press_scale,
                         value,
                         action: draft.action,
+                        click_effects,
                         enabled,
                         enabled_binding: None,
                         reactive_enabled,
@@ -1690,6 +1816,8 @@ screen {
         text("Hello ${playerName}")
         button("continue") {
             text("Continue")
+        }.onClick {
+            sfx("ui/confirm")
         }
     }.gap(18)
 }
@@ -1723,6 +1851,13 @@ screen {
         };
         assert_eq!(button.text, "Continue");
         assert_eq!(button.value, Some(StoredValue::String("continue".into())));
+        assert_eq!(
+            button.click_effects,
+            vec![UiEffect::PlaySfx {
+                name: "ui/confirm".into(),
+                volume: 1.0,
+            }]
+        );
     }
 
     #[test]

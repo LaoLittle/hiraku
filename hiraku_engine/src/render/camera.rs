@@ -7,8 +7,8 @@ use crate::{
 use crate::{
     effect::{custom::CustomScreenEffectPlayer, transition::RuleTransitionPlayer},
     scene::{
-        BackgroundLayer, ChoiceUi, DialogueRoot, FocusedActorPart, FrontendRoot, OverlayMarker,
-        PauseMenuRoot, SpriteActor,
+        BackgroundLayer, ChoiceUi, DialogueRoot, FocusedActorPart, OverlayMarker, PauseMenuRoot,
+        SpriteActor,
     },
     script::CharacterEase,
     ui::ScreenUiRoot,
@@ -203,7 +203,6 @@ pub fn assign_render_layers(
             Added<DialogueRoot>,
             Added<ChoiceUi>,
             Added<PauseMenuRoot>,
-            Added<FrontendRoot>,
             Added<ScreenUiRoot>,
         )>,
     >,
