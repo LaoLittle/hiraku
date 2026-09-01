@@ -1,13 +1,15 @@
 import ui.widgets.*
 
+@ui
+global fn main() -> UiNode {
 screen {
     column {
         text($dialogueTitle).pulse(1.4)
         text($dialogueLine)
 
         row {
-            button { text("Quick Save") }.action("storage.save.save_restore_example")
-            button { text("Quick Load") }.action("storage.load.save_restore_example")
+            button { text("Quick Save") }.onClick { storage.save("save_restore_example") }
+            button { text("Quick Load") }.onClick { storage.load("save_restore_example") }
             button("continue") { text("Continue") }
         }
             .size(.rel(70, 16))
@@ -17,3 +19,4 @@ screen {
         .gap(18)
 }
     .overlay(0.05, 0.07, 0.12, 0.96)
+}

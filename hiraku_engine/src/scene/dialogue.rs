@@ -121,7 +121,7 @@ pub fn advance_dialogue_on_input(
 
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
-    if runtime_menu.pause_open || dialogue_history.visible || choice_state.waiting.is_some() {
+    if dialogue_history.visible || choice_state.waiting.is_some() {
         return;
     }
     let advance = action_advance || pointer_advance;

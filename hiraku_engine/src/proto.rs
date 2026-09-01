@@ -34,6 +34,8 @@ pub struct SaveGameData {
     pub ui_registry_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "17")]
     pub mounted_ui_overlays_hson: Vec<u8>,
+    #[prost(bytes = "vec", tag = "18")]
+    pub pending_ui_arguments_hson: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]

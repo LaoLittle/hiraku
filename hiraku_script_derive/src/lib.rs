@@ -344,6 +344,7 @@ fn register_module_function(
         let signature = ::hiraku_script::FunctionSignature {
             receiver: #receiver,
             parameters: vec![ #( #parameters ),* ],
+            variadic: None,
             result: #result,
         };
         registry.set_signature(builtin, signature)?;
@@ -637,6 +638,7 @@ fn register_method(
             ::hiraku_script::FunctionSignature {
                 receiver: None,
                 parameters: vec![ #( #parameter_types ),* ],
+                variadic: None,
                 result: ::hiraku_script::ScriptType::Named(type_id),
             },
             #kind,

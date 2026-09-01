@@ -84,6 +84,7 @@ pub enum StoryRuntimeEvent {
     Wait(StoryWait),
     OpenUi {
         path: String,
+        arguments: Vec<Value>,
     },
     Choice {
         prompt: String,
@@ -325,9 +326,9 @@ impl StoryRuntime {
                             options: Vec::new(),
                         });
                     }
-                    StoryCallOutcome::Control(StoryControl::OpenUi { path }) => {
+                    StoryCallOutcome::Control(StoryControl::OpenUi { path, arguments }) => {
                         self.blocked = true;
-                        return Ok(Some(StoryRuntimeEvent::OpenUi { path }));
+                        return Ok(Some(StoryRuntimeEvent::OpenUi { path, arguments }));
                     }
                     StoryCallOutcome::Control(StoryControl::WaitTask { task }) => {
                         self.waiting_task = Some(task);
@@ -783,7 +784,7 @@ mod tests {
                 "ui.set(\"dialogue\", \"ui/dialogue.ui.hks\")\n",
                 "ui.mount(\"clock\", \"ui/clock.ui.hks\")\n",
                 "ui.unmount(\"clock\")\n",
-                "ui.open(\"dialogue\")",
+                "ui.open(\"dialogue\", \"Alice\", 3)",
             ),
         )
         .expect("UI role APIs must compile");
@@ -812,6 +813,7 @@ mod tests {
             runtime.step().expect("ui.open must run"),
             Some(StoryRuntimeEvent::OpenUi {
                 path: "dialogue".to_string(),
+                arguments: vec![Value::String("Alice".to_string()), Value::Number(3.0)],
             })
         );
     }
@@ -1276,7 +1278,7 @@ mod tests {
     #[test]
     fn representative_inline_stories_compile_as_whole_programs() {
         for (path, source) in [
-            ("<bootstrap>", r#"gotoScript("chapter.hks")"#),
+            ("<bootstrap>", r#"story.goto("chapter.hks")"#),
             (
                 "<dialogue>",
                 r#"

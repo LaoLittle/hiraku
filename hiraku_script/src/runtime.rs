@@ -13,6 +13,9 @@ pub struct FunctionSignature {
     #[serde(default)]
     pub receiver: Option<ScriptType>,
     pub parameters: Vec<ScriptType>,
+    /// Type accepted by every argument after the fixed parameter list.
+    #[serde(default)]
+    pub variadic: Option<ScriptType>,
     pub result: ScriptType,
 }
 

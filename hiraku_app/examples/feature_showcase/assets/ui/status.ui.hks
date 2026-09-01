@@ -4,8 +4,11 @@ fn elapsedLabel() -> String {
     "HKS UI • ${time.elapsedSeconds}s"
 }
 
+@ui
+global fn main() -> UiNode {
 canvas {
     text(${elapsedLabel()})
         .at(.rel(2, 2))
         .bob(4, 1.0)
+}
 }

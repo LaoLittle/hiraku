@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn parse_errors_render_all_source_labels() {
-        let source = ".{ first: @, second: # }";
+        let source = ".{ first: ^, second: # }";
         let error = parse(source).expect_err("invalid tokens must be rejected");
         let rendered = error.render("config/test.hson", source);
         assert_eq!(rendered.matches("[HSON-PARSE]").count(), 2);

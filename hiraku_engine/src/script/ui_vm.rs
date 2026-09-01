@@ -24,6 +24,7 @@ use crate::{
 
 use super::{
     animation::{AnimationPhase, AnimationSpec, register_animation_api},
+    navigation::{NavigationHandle, NavigationRequest, NavigationResetValue},
     ui_runtime::UiContext,
 };
 
@@ -92,7 +93,6 @@ struct UiDraft {
     content: Option<HksClosure>,
     hovered: Option<HksClosure>,
     checked: Option<HksClosure>,
-    action: Option<String>,
     on_click: Option<HksClosure>,
     layout: ScreenLayout,
     panel: bool,
@@ -124,7 +124,6 @@ impl UiDraft {
             content,
             hovered: None,
             checked: None,
-            action: None,
             on_click: None,
             layout: ScreenLayout::default(),
             panel: true,
@@ -158,6 +157,7 @@ struct UiVmContext {
     nodes: BTreeMap<u64, UiDraft>,
     next_effect: u64,
     effects: BTreeMap<u64, UiEffect>,
+    navigation_origin: Option<String>,
 }
 
 impl UiVmContext {
@@ -169,7 +169,13 @@ impl UiVmContext {
             nodes: BTreeMap::new(),
             next_effect: 0,
             effects: BTreeMap::new(),
+            navigation_origin: None,
         }
+    }
+
+    fn with_navigation_origin(mut self, origin: impl Into<String>) -> Self {
+        self.navigation_origin = Some(origin.into());
+        self
     }
 
     fn insert(&mut self, draft: UiDraft) -> UiNodeHandle {
@@ -194,6 +200,37 @@ impl UiVmContext {
         self.effects
             .get(&handle.0)
             .ok_or_else(|| NativeError::message(format!("unknown UiEffect handle {}", handle.0)))
+    }
+
+    fn insert_navigation(&mut self, navigation: NavigationRequest) -> NavigationHandle {
+        self.next_effect += 1;
+        self.effects
+            .insert(self.next_effect, UiEffect::Navigate(navigation));
+        NavigationHandle(self.next_effect)
+    }
+
+    fn reset_navigation(
+        &mut self,
+        NavigationHandle(handle): NavigationHandle,
+        reset: NavigationResetValue,
+    ) -> Result<NavigationHandle, NativeError> {
+        let Some(UiEffect::Navigate(navigation)) = self.effects.get_mut(&handle) else {
+            return Err(NativeError::message(format!(
+                "unknown Navigation handle {handle}"
+            )));
+        };
+        navigation.reset = reset.into();
+        Ok(NavigationHandle(handle))
+    }
+
+    fn navigation_effect(
+        &self,
+        NavigationHandle(handle): NavigationHandle,
+    ) -> Result<&UiEffect, NativeError> {
+        self.effects
+            .get(&handle)
+            .filter(|effect| matches!(effect, UiEffect::Navigate(_)))
+            .ok_or_else(|| NativeError::message(format!("unknown Navigation handle {handle}")))
     }
 }
 
@@ -647,25 +684,6 @@ mod native_ui {
         Ok(node)
     }
 
-    #[hks(name = "action", receiver)]
-    fn ui_action(
-        context: &mut UiVmContext,
-        node: UiNodeHandle,
-        action: String,
-    ) -> Result<UiNodeHandle, NativeError> {
-        if action.trim().is_empty() {
-            return Err(NativeError::message("UI action must not be empty"));
-        }
-        let draft = context.node_mut(node)?;
-        if !matches!(draft.kind, UiDraftKind::Button(_)) {
-            return Err(NativeError::message(
-                "action can only be applied to button nodes",
-            ));
-        }
-        draft.action = Some(action);
-        Ok(node)
-    }
-
     /// Builds a one-shot sound effect for a button's click handler. Calling
     /// this function is pure; playback starts only after the button accepts a
     /// release event.
@@ -706,6 +724,15 @@ mod native_ui {
         }
         draft.on_click = Some(handler);
         Ok(node)
+    }
+
+    #[hks(name = "reset", receiver)]
+    fn navigation_reset(
+        context: &mut UiVmContext,
+        navigation: NavigationHandle,
+        reset: NavigationResetValue,
+    ) -> Result<NavigationHandle, NativeError> {
+        context.reset_navigation(navigation, reset)
     }
 
     #[hks(name = "animation", receiver)]
@@ -800,6 +827,73 @@ mod native_ui {
     }
 }
 
+#[hiraku_script::hks_module("ui")]
+mod ui_actions {
+    use super::*;
+
+    #[hks]
+    fn native_open(context: &mut UiVmContext, role: String) -> Result<UiEffectHandle, NativeError> {
+        if role.trim().is_empty() {
+            return Err(NativeError::message("UI role must not be empty"));
+        }
+        Ok(context.insert_effect(UiEffect::OpenUi { role }))
+    }
+
+    #[hks]
+    fn native_close(context: &mut UiVmContext) -> Result<UiEffectHandle, NativeError> {
+        Ok(context.insert_effect(UiEffect::CloseUi))
+    }
+
+    #[hks]
+    fn native_set_history_visible(
+        context: &mut UiVmContext,
+        visible: bool,
+    ) -> Result<UiEffectHandle, NativeError> {
+        Ok(context.insert_effect(UiEffect::SetHistoryVisible { visible }))
+    }
+}
+
+#[hiraku_script::hks_module("storage")]
+mod storage_actions {
+    use super::*;
+
+    #[hks]
+    fn native_save(context: &mut UiVmContext, slot: String) -> Result<UiEffectHandle, NativeError> {
+        if slot.trim().is_empty() {
+            return Err(NativeError::message("save slot must not be empty"));
+        }
+        Ok(context.insert_effect(UiEffect::Save { slot }))
+    }
+
+    #[hks]
+    fn native_load(context: &mut UiVmContext, slot: String) -> Result<UiEffectHandle, NativeError> {
+        if slot.trim().is_empty() {
+            return Err(NativeError::message("save slot must not be empty"));
+        }
+        Ok(context.insert_effect(UiEffect::Load { slot }))
+    }
+}
+
+#[hiraku_script::hks_module("story")]
+mod story_actions {
+    use super::*;
+
+    #[hks]
+    fn native_next(context: &mut UiVmContext) -> Result<UiEffectHandle, NativeError> {
+        Ok(context.insert_effect(UiEffect::NextDialogue))
+    }
+
+    #[hks(name = "goto")]
+    fn native_goto_story(
+        context: &mut UiVmContext,
+        path: String,
+    ) -> Result<NavigationHandle, NativeError> {
+        let navigation =
+            NavigationRequest::goto(path)?.with_origin(context.navigation_origin.clone());
+        Ok(context.insert_navigation(navigation))
+    }
+}
+
 fn animation_seconds(value: Option<f64>, default: f64) -> Result<f64, NativeError> {
     let value = value.unwrap_or(default);
     if !value.is_finite() || value <= 0.0 {
@@ -885,17 +979,25 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     UiSize::register_hks(&mut registry).expect("UiSize registration must be internally consistent");
     register_animation_api(&mut registry)
         .expect("animation API registration must be internally consistent");
+    NavigationResetValue::register_hks(&mut registry)
+        .expect("navigation reset API registration must be internally consistent");
     // Register the nominal result type before compiling the HKS standard library.
     let ui_node = registry.define_type("UiNode");
     registry.define_type("UiEffect");
     native_ui::register_hks(&mut registry)
         .expect("UI native primitives must be internally consistent");
+    ui_actions::register_hks(&mut registry).expect("UI actions must be internally consistent");
+    storage_actions::register_hks(&mut registry)
+        .expect("storage actions must be internally consistent");
+    story_actions::register_hks(&mut registry)
+        .expect("story actions must be internally consistent");
     registry
         .set_signature(
             hiraku_script::native::stable_builtin_id("binding"),
             hiraku_script::FunctionSignature {
                 receiver: None,
                 parameters: vec![ScriptType::Function, ScriptType::Function],
+                variadic: None,
                 result: ScriptType::Binding(Box::new(ScriptType::Any)),
             },
         )
@@ -909,6 +1011,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
                     ScriptType::Any,
                     ScriptType::Nullable(Box::new(ScriptType::Function)),
                 ],
+                variadic: None,
                 result: ScriptType::Named(ui_node),
             },
         )
@@ -981,17 +1084,67 @@ pub enum UiVmError {
     Invalid(String),
 }
 
-pub fn evaluate_ui_component_named(
+#[cfg(test)]
+fn evaluate_ui_component_named(
     path: &str,
     source: &str,
     values: UiContext,
     textures: &TextureCatalog,
     terms: &TermCatalog,
 ) -> Result<ScreenSpec, UiVmError> {
+    evaluate_ui_component_named_with_args(path, source, values, textures, terms, &[])
+}
+
+pub fn evaluate_ui_component_named_with_args(
+    path: &str,
+    source: &str,
+    values: UiContext,
+    textures: &TextureCatalog,
+    terms: &TermCatalog,
+    arguments: &[StoredValue],
+) -> Result<ScreenSpec, UiVmError> {
     let registry = ui_registry(&values);
     let manifest = registry.manifest();
     let standard = compile_module(UI_STDLIB_PATH, UI_STDLIB_SOURCE, &manifest)?;
-    let document = compile_module(path, source, &manifest)?;
+    let parsed = parse_module(path, source)?;
+    let entries = parsed
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let hiraku_script::Stmt::Function {
+                attributes,
+                exported,
+                name,
+                ..
+            } = statement
+            else {
+                return None;
+            };
+            attributes
+                .iter()
+                .any(|attribute| attribute.name == "ui")
+                .then_some((*exported, name.clone()))
+        })
+        .collect::<Vec<_>>();
+    if entries.len() > 1 {
+        return Err(UiVmError::Invalid(
+            "a UI module may declare only one `@ui` entrypoint".into(),
+        ));
+    }
+    if entries.first().is_some_and(|(exported, _)| !exported) {
+        return Err(UiVmError::Invalid(
+            "the `@ui` entrypoint must be declared with `global fn`".into(),
+        ));
+    }
+    let document = compile_parsed_module(path, source, &parsed, &manifest)?;
+    let entry_symbol = entries
+        .first()
+        .map(|(_, name)| {
+            document.symbols.find(name).ok_or_else(|| {
+                UiVmError::Invalid(format!("UI entrypoint `{name}` was not interned"))
+            })
+        })
+        .transpose()?;
     let program = link_named_modules(
         vec![(Some("ui.widgets".to_string()), standard), (None, document)],
         &manifest,
@@ -1006,9 +1159,27 @@ pub fn evaluate_ui_component_named(
         )
     })?;
     let materialize_program = program.clone();
-    let mut context = UiVmContext::new(values, terms.clone());
-    let vm = LinkedVm::new(program, ModuleId(1))
-        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    let mut context = UiVmContext::new(values, terms.clone()).with_navigation_origin(path);
+    let vm = if let Some(symbol) = entry_symbol {
+        let callable = Value::Function {
+            module: Some(1),
+            symbol,
+        };
+        LinkedVm::from_callable(
+            program,
+            &callable,
+            arguments.iter().map(stored_to_hks).collect(),
+        )
+    } else if arguments.is_empty() {
+        // Temporary migration path for existing UI modules. New UI modules
+        // may expose one explicit @ui function when it needs parameters.
+        LinkedVm::new(program, ModuleId(1))
+    } else {
+        return Err(UiVmError::Invalid(
+            "parameterized UI modules require an `@ui global fn` entrypoint".into(),
+        ));
+    }
+    .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
     let roots = collect_nodes(vm, &registry, &mut context)?;
     if roots.len() != 1 {
         return Err(UiVmError::Invalid(format!(
@@ -1025,14 +1196,10 @@ pub fn evaluate_ui_component_named(
     )
 }
 
-fn compile_module(
-    path: &str,
-    source: &str,
-    manifest: &BuiltinManifest,
-) -> Result<hiraku_script::Bytecode, UiVmError> {
+fn parse_module(path: &str, source: &str) -> Result<hiraku_script::Program, UiVmError> {
     let mut sources = SourceMap::new();
     let source_id = sources.insert(path, source);
-    let program = parse_program(source).map_err(|errors| {
+    parse_program(source).map_err(|errors| {
         UiVmError::Compile(render_diagnostics(
             &errors
                 .into_iter()
@@ -1041,8 +1208,27 @@ fn compile_module(
             &sources,
             RenderOptions::terminal(),
         ))
-    })?;
-    compile_with_manifest(&program, source_hash(path, source), manifest).map_err(|errors| {
+    })
+}
+
+fn compile_module(
+    path: &str,
+    source: &str,
+    manifest: &BuiltinManifest,
+) -> Result<hiraku_script::Bytecode, UiVmError> {
+    let program = parse_module(path, source)?;
+    compile_parsed_module(path, source, &program, manifest)
+}
+
+fn compile_parsed_module(
+    path: &str,
+    source: &str,
+    program: &hiraku_script::Program,
+    manifest: &BuiltinManifest,
+) -> Result<hiraku_script::Bytecode, UiVmError> {
+    let mut sources = SourceMap::new();
+    let source_id = sources.insert(path, source);
+    compile_with_manifest(program, source_hash(path, source), manifest).map_err(|errors| {
         UiVmError::Compile(render_diagnostics(
             &errors
                 .into_iter()
@@ -1177,15 +1363,20 @@ fn closure_effects(
                     .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
             }
             Some(LinkedVmEvent::Statement(StatementValue::Value(value))) => {
-                let handle = UiEffectHandle::from_hks_value(&value).map_err(|_| {
-                    UiVmError::Invalid(
-                        "onClick statements must produce a UI effect such as sfx(...)".into(),
-                    )
-                })?;
-                if seen.insert(handle.0) {
+                let effect = if let Ok(handle) = UiEffectHandle::from_hks_value(&value) {
+                    (handle.0, context.effect(handle))
+                } else if let Ok(handle) = NavigationHandle::from_hks_value(&value) {
+                    (handle.0, context.navigation_effect(handle))
+                } else {
+                    return Err(UiVmError::Invalid(
+                        "onClick statements must produce an effect such as sfx(...) or story.goto(...)"
+                            .into(),
+                    ));
+                };
+                if seen.insert(effect.0) {
                     effects.push(
-                        context
-                            .effect(handle)
+                        effect
+                            .1
                             .map_err(|error| UiVmError::Runtime(error.to_string()))?
                             .clone(),
                     );
@@ -1627,7 +1818,7 @@ fn materialize_node(
                 )));
             }
             let normal = materialize_node(normal_handles[0], program, registry, context, textures)?;
-            let value = if draft.action.is_some() || matches!(&value, Value::Unit) {
+            let value = if matches!(&value, Value::Unit) {
                 None
             } else {
                 Some(stored_value(value)?)
@@ -1636,7 +1827,6 @@ fn materialize_node(
                 ScreenNode::Text(text) => Ok(ScreenNode::Button(ButtonNode {
                     text: text.text,
                     value,
-                    action: draft.action,
                     click_effects,
                     enabled,
                     enabled_binding: None,
@@ -1698,7 +1888,6 @@ fn materialize_node(
                         hover_scale: draft.hover_scale,
                         press_scale: draft.press_scale,
                         value,
-                        action: draft.action,
                         click_effects,
                         enabled,
                         enabled_binding: None,
@@ -1857,6 +2046,103 @@ screen {
                 name: "ui/confirm".into(),
                 volume: 1.0,
             }]
+        );
+    }
+
+    #[test]
+    fn main_ui_function_receives_typed_positional_arguments() {
+        let source = r#"
+import ui.widgets.*
+
+@ui
+global fn card(label: String, count: Int) -> UiNode {
+    screen {
+        column {
+            text(label)
+            progress(count).range(0, 10)
+        }
+    }
+}
+"#;
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://card.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[StoredValue::String("Items".into()), StoredValue::Int(3)],
+        )
+        .expect("the UI main function must receive persisted arguments");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("the main function must produce its screen tree")
+        };
+        assert!(matches!(&column.children[0], ScreenNode::Text(text) if text.text == "Items"));
+        assert!(matches!(&column.children[1], ScreenNode::Bar(bar) if bar.value == 3.0));
+    }
+
+    #[test]
+    fn on_click_builds_typed_state_actions_without_routes() {
+        let screen = evaluate_ui_component_named(
+            "memory://actions.ui.hks",
+            r#"
+import ui.widgets.*
+screen {
+    button { text("Save") }.onClick {
+        sfx("ui/confirm")
+        storage.save("quick")
+    }
+}
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("typed onClick actions must evaluate");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected a button")
+        };
+        assert_eq!(
+            button.click_effects,
+            vec![
+                UiEffect::PlaySfx {
+                    name: "ui/confirm".into(),
+                    volume: 1.0,
+                },
+                UiEffect::Save {
+                    slot: "quick".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ui_navigation_is_relative_to_the_declaring_component() {
+        let screen = evaluate_ui_component_named(
+            "memory://ui/menu.ui.hks",
+            r#"
+import ui.widgets.*
+screen {
+    button { text("Return") }.onClick {
+        story.goto("../title.hks").reset(.session)
+    }
+}
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("typed UI navigation must evaluate");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected a button")
+        };
+        assert_eq!(
+            button.click_effects,
+            vec![UiEffect::Navigate(NavigationRequest {
+                path: "../title.hks".into(),
+                kind: super::super::navigation::NavigationKind::Goto,
+                reset: super::super::navigation::NavigationReset::Session,
+                origin: Some("memory://ui/menu.ui.hks".into()),
+            })]
         );
     }
 
@@ -2028,7 +2314,7 @@ canvas { choiceOptions(renderOption) }
                 "import ui.widgets.*\n",
                 "canvas {\n",
                 "  button { text(\"Passive\") }\n",
-                "  button { text(\"Quick Save\") }.action(\"storage.save.quick\").hoverScale(1.08).pressScale(0.94)\n",
+                "  button { text(\"Quick Save\") }.onClick { storage.save(\"quick\") }.hoverScale(1.08).pressScale(0.94)\n",
                 "}",
             ),
             UiContext::default(),
@@ -2040,11 +2326,16 @@ canvas { choiceOptions(renderOption) }
             panic!("first child should be a closure-only button")
         };
         assert_eq!(passive.value, None);
-        assert_eq!(passive.action, None);
+        assert!(passive.click_effects.is_empty());
         let ScreenNode::Button(button) = &screen.children[1] else {
             panic!("second child should be an action button")
         };
-        assert_eq!(button.action.as_deref(), Some("storage.save.quick"));
+        assert_eq!(
+            button.click_effects,
+            vec![UiEffect::Save {
+                slot: "quick".into()
+            }]
+        );
         assert_eq!(button.value, None);
         assert_eq!(button.hover_scale, 1.08);
         assert_eq!(button.press_scale, 0.94);

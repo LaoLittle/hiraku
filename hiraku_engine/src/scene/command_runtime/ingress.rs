@@ -77,6 +77,29 @@ fn evaluate_ui_at_with(
     terms: Option<&TermCatalog>,
     extra_values: BTreeMap<String, StoredValue>,
 ) -> Result<ScreenSpec, String> {
+    evaluate_ui_at_with_arguments(
+        target,
+        runtime,
+        vfs,
+        user_settings,
+        textures,
+        terms,
+        extra_values,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_ui_at_with_arguments(
+    target: &str,
+    runtime: &ScriptRuntimeState,
+    vfs: &VfsResource,
+    user_settings: &UserSettings,
+    textures: Option<&TextureCatalog>,
+    terms: Option<&TermCatalog>,
+    extra_values: BTreeMap<String, StoredValue>,
+    arguments: &[StoredValue],
+) -> Result<ScreenSpec, String> {
     let mut values = runtime
         .story
         .as_ref()
@@ -100,8 +123,15 @@ fn evaluate_ui_at_with(
     let source = vfs.0.read_text(target).map_err(|error| error.to_string())?;
     let textures = textures.ok_or_else(|| "texture catalog is unavailable".to_string())?;
     let terms = terms.ok_or_else(|| "term catalog is unavailable".to_string())?;
-    evaluate_ui_component_named(target, &source, UiContext::new(values), textures, terms)
-        .map_err(|error| error.to_string())
+    evaluate_ui_component_named_with_args(
+        target,
+        &source,
+        UiContext::new(values),
+        textures,
+        terms,
+        arguments,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn default_dialogue_model() -> StoredValue {
@@ -176,6 +206,7 @@ pub fn drive_story_runtime(
             ScriptResponse::Continue => hiraku_script::Value::Unit,
         };
         runtime.pending_ui_screen = None;
+        runtime.pending_ui_arguments.clear();
         runtime.wait_request = None;
         if let Some(story) = runtime.story.as_mut()
             && let Err(error) = story.resume(direct_value)
@@ -199,56 +230,6 @@ pub fn drive_story_runtime(
 
     if let Some(event) = event {
         match event {
-            StoryRuntimeEvent::Effect(
-                effect @ (crate::script::capabilities::StoryEffect::GotoScript { .. }
-                | crate::script::capabilities::StoryEffect::CallScript { .. }),
-            ) => {
-                let (path, is_call) = match effect {
-                    crate::script::capabilities::StoryEffect::GotoScript { path } => (path, false),
-                    crate::script::capabilities::StoryEffect::CallScript { path } => (path, true),
-                    _ => unreachable!("matched script transfer effects above"),
-                };
-                let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
-                let inherited_globals = runtime
-                    .story
-                    .as_ref()
-                    .map(|story| story.globals().clone())
-                    .unwrap_or_default();
-                let result = vfs
-                    .0
-                    .read_text(&target)
-                    .map_err(|error| error.to_string())
-                    .and_then(|source| compile_story_bytecode(&target, &source))
-                    .and_then(|bytecode| {
-                        StoryRuntime::new(bytecode).map_err(|error| error.to_string())
-                    });
-                match result {
-                    Ok(mut story) => {
-                        let mut globals = inherited_globals;
-                        globals.extend(crate::script::capabilities::engine_globals(&user_settings));
-                        story.set_globals(globals);
-                        if is_call {
-                            if let (Some(script), Some(caller)) =
-                                (runtime.current_script.take(), runtime.story.take())
-                            {
-                                runtime.call_stack.push(crate::script::ScriptCallFrame {
-                                    script,
-                                    story: caller,
-                                });
-                            }
-                        } else {
-                            runtime.call_stack.clear();
-                        }
-                        runtime.story = Some(story);
-                        runtime.current_script = Some(target);
-                        runtime.task_requests.clear();
-                    }
-                    Err(error) => crate::script::emit_script_diagnostic(
-                        &format!("failed to load HKS script `{target}`:"),
-                        &error,
-                    ),
-                }
-            }
             StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayBgm {
                 path,
                 volume,
@@ -433,20 +414,32 @@ pub fn drive_story_runtime(
                     }
                 }
             }
-            StoryRuntimeEvent::OpenUi { path } => {
+            StoryRuntimeEvent::OpenUi { path, arguments } => {
                 let target = runtime.ui_registry.get(&path).cloned().unwrap_or_else(|| {
                     vfs.0.resolve_path(runtime.current_script.as_deref(), &path)
                 });
-                let screen = evaluate_ui_at(
+                let arguments = arguments
+                    .iter()
+                    .map(hks_to_stored)
+                    .collect::<Option<Vec<_>>>();
+                let Some(arguments) = arguments else {
+                    warn!("ui.open arguments must contain only persistable values");
+                    runtime.story = None;
+                    return;
+                };
+                let screen = evaluate_ui_at_with_arguments(
                     &target,
                     &runtime,
                     &vfs,
                     &user_settings,
                     textures.as_deref(),
                     terms.as_deref(),
+                    BTreeMap::new(),
+                    &arguments,
                 );
                 let request = runtime.allocate_request();
                 runtime.pending_ui_screen = Some(target.clone());
+                runtime.pending_ui_arguments = arguments;
                 runtime.wait_request = Some(request);
                 match screen {
                     Ok(screen) => {

@@ -8,6 +8,12 @@ pub struct Program {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Attribute {
+    pub name: String,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     Import {
         path: Vec<String>,
@@ -20,6 +26,7 @@ pub enum Stmt {
         span: Span,
     },
     Function {
+        attributes: Vec<Attribute>,
         /// Exported functions participate in runtime linking across scripts.
         exported: bool,
         name: String,

@@ -36,6 +36,7 @@ pub struct ScriptRuntimeState {
     pub current_script: Option<String>,
     pub call_stack: Vec<ScriptCallFrame>,
     pub pending_ui_screen: Option<String>,
+    pub pending_ui_arguments: Vec<crate::state::StoredValue>,
     /// Script-defined semantic UI role mappings. Values are normalized VFS paths.
     pub ui_registry: BTreeMap<String, String>,
     /// Non-modal UI mounts keyed by their stable script-provided mount name.

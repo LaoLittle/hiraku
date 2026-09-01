@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::script::navigation::NavigationRequest;
 use crate::state::StoredValue;
 
 /// A typed side effect dispatched after a UI button accepts a click.
@@ -16,6 +17,21 @@ pub enum UiEffect {
         #[serde(default = "default_ui_effect_volume")]
         volume: f32,
     },
+    OpenUi {
+        role: String,
+    },
+    CloseUi,
+    SetHistoryVisible {
+        visible: bool,
+    },
+    Save {
+        slot: String,
+    },
+    Load {
+        slot: String,
+    },
+    NextDialogue,
+    Navigate(NavigationRequest),
 }
 
 fn default_ui_effect_volume() -> f32 {
@@ -375,12 +391,6 @@ pub struct ButtonNode {
     /// `action` instead.
     #[serde(default)]
     pub value: Option<StoredValue>,
-    /// Built-in action for non-modal overlay buttons.
-    ///
-    /// Routes are namespace-qualified, for example `ui.open.settings`,
-    /// `storage.save.quick`, `story.next`, and `app.returnToTitle`.
-    #[serde(default)]
-    pub action: Option<String>,
     /// Typed effects dispatched when the click is accepted.
     #[serde(default)]
     pub click_effects: Vec<UiEffect>,
@@ -487,9 +497,6 @@ pub struct ScreenImageButtonNode {
     /// Value returned from `screen(...)` when the button is released.
     #[serde(default)]
     pub value: Option<StoredValue>,
-    /// Namespace-qualified engine action route.
-    #[serde(default)]
-    pub action: Option<String>,
     /// Typed effects dispatched when the click is accepted.
     #[serde(default)]
     pub click_effects: Vec<UiEffect>,

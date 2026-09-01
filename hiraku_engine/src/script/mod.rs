@@ -13,6 +13,7 @@ mod animation;
 pub(crate) mod capabilities;
 mod command;
 mod hks_runtime;
+pub(crate) mod navigation;
 mod runtime;
 mod task_runtime;
 pub mod ui_runtime;
@@ -52,7 +53,7 @@ pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
 }
 
 pub use ui_runtime::{UiContext, UiIntent};
-pub use ui_vm::evaluate_ui_component_named;
+pub(crate) use ui_vm::evaluate_ui_component_named_with_args;
 pub(crate) use ui_vm::evaluate_ui_reactive_binding;
 
 pub(crate) fn script_command_from_effect(
@@ -66,7 +67,9 @@ pub(crate) fn script_command_from_effect(
         StoryEffect::ClearDialogue => ScriptCommand::Dialogue(DialogueCommand::Clear),
         StoryEffect::StopBgm => ScriptCommand::Audio(AudioCommand::StopBgm),
         StoryEffect::Exit => ScriptCommand::Runtime(RuntimeCommand::Exit),
-        StoryEffect::ReturnToTitle => ScriptCommand::Runtime(RuntimeCommand::ReturnToTitle),
+        StoryEffect::Navigate(navigation) => {
+            ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation))
+        }
         StoryEffect::AdjustSetting { name, delta } => {
             ScriptCommand::Settings(SettingsCommand::Adjust { name, delta })
         }
@@ -128,9 +131,7 @@ pub(crate) fn script_command_from_effect(
             fade: None,
             animation_id: None,
         }),
-        StoryEffect::GotoScript { .. }
-        | StoryEffect::CallScript { .. }
-        | StoryEffect::SetUiRole { .. }
+        StoryEffect::SetUiRole { .. }
         | StoryEffect::MountUiOverlay { .. }
         | StoryEffect::UnmountUiOverlay { .. }
         | StoryEffect::PlayBgm { .. }
@@ -180,23 +181,12 @@ pub struct ScriptBootstrap {
     pub snapshot: Option<StoryRuntimeSnapshot>,
     pub call_stack: Vec<crate::state::ScriptCallFrameSnapshot>,
     pub pending_ui_screen: Option<String>,
+    pub pending_ui_arguments: Vec<StoredValue>,
     pub ui_registry: BTreeMap<String, String>,
     pub mounted_ui_overlays: BTreeMap<String, String>,
 }
 
 impl ScriptBootstrap {
-    pub fn new(startup_script: String) -> Self {
-        Self {
-            startup_script,
-            values: BTreeMap::new(),
-            snapshot: None,
-            call_stack: Vec::new(),
-            pending_ui_screen: None,
-            ui_registry: BTreeMap::new(),
-            mounted_ui_overlays: BTreeMap::new(),
-        }
-    }
-
     pub fn from_save(data: &SaveGameData) -> Self {
         let mut values = data.globals.clone();
         values.extend(data.scope.clone());
@@ -206,6 +196,7 @@ impl ScriptBootstrap {
             snapshot: data.vm_snapshot.clone(),
             call_stack: data.script_call_stack.clone(),
             pending_ui_screen: data.pending_ui_screen.clone(),
+            pending_ui_arguments: data.pending_ui_arguments.clone(),
             ui_registry: data.ui_registry.clone(),
             mounted_ui_overlays: data.mounted_ui_overlays.clone(),
         }
@@ -224,6 +215,7 @@ pub fn start_hks_runtime(
         snapshot,
         call_stack,
         pending_ui_screen,
+        pending_ui_arguments,
         ui_registry,
         mounted_ui_overlays,
     } = bootstrap;
@@ -270,7 +262,14 @@ pub fn start_hks_runtime(
     }
     if let Some(boundary) = restored_boundary {
         story.enqueue_event(if let Some(path) = pending_ui_screen.clone() {
-            StoryRuntimeEvent::OpenUi { path }
+            StoryRuntimeEvent::OpenUi {
+                path,
+                arguments: pending_ui_arguments
+                    .iter()
+                    .cloned()
+                    .map(stored_value_to_hks)
+                    .collect(),
+            }
         } else {
             boundary
         });
@@ -280,6 +279,7 @@ pub fn start_hks_runtime(
     runtime.call_stack = call_stack;
     runtime.wait_request = None;
     runtime.pending_ui_screen = pending_ui_screen;
+    runtime.pending_ui_arguments = pending_ui_arguments;
     runtime.ui_registry = ui_registry;
     runtime.mounted_ui_overlays = mounted_ui_overlays.clone();
     runtime.response_inbox.clear();
@@ -319,7 +319,7 @@ pub fn save_runtime_slot(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let data = SaveGameData {
-        version: 8,
+        version: 9,
         resume_script: current_script,
         script_stack: script_call_stack
             .iter()
@@ -330,6 +330,7 @@ pub fn save_runtime_slot(
         vm_snapshot: snapshot,
         script_call_stack,
         pending_ui_screen: runtime.pending_ui_screen.clone(),
+        pending_ui_arguments: runtime.pending_ui_arguments.clone(),
         ui_registry: runtime.ui_registry.clone(),
         mounted_ui_overlays: runtime.mounted_ui_overlays.clone(),
         ..Default::default()

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use bevy::math::{Vec2, Vec3};
 
+use crate::script::navigation::NavigationRequest;
 use crate::ui::ScreenSpec;
 
 use super::{CameraEffectScope, CameraProjectionMode, ScriptRequestId};
@@ -27,7 +28,7 @@ pub enum ScriptCommand {
 #[derive(Debug)]
 pub enum RuntimeCommand {
     Log(String),
-    ReturnToTitle,
+    Navigate(NavigationRequest),
     Exit,
 }
 

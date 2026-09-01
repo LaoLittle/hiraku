@@ -1716,6 +1716,7 @@ mod tests {
                 crate::FunctionSignature {
                     receiver: None,
                     parameters: vec![crate::ScriptType::Function],
+                    variadic: None,
                     result: crate::ScriptType::Any,
                 },
             )]),
@@ -1770,6 +1771,7 @@ mod tests {
                     parameters: vec![crate::ScriptType::Binding(Box::new(
                         crate::ScriptType::Bool,
                     ))],
+                    variadic: None,
                     result: crate::ScriptType::Unit,
                 },
             )]),
@@ -1824,6 +1826,7 @@ mod tests {
                 crate::FunctionSignature {
                     receiver: None,
                     parameters: vec![crate::ScriptType::Function],
+                    variadic: None,
                     result: crate::ScriptType::Task,
                 },
             )]),

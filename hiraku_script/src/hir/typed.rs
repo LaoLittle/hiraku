@@ -787,12 +787,15 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             } => {
                 let callee = self.lower_expression(callee);
                 let function = self.resolve_call(expression);
-                let expected_parameters = match function {
+                let (expected_parameters, expected_variadic) = match function {
                     ResolvedFunction::Builtin(builtin) => self
                         .manifest
                         .and_then(|manifest| manifest.signature(builtin))
-                        .map(|signature| signature.parameters.clone()),
-                    _ => None,
+                        .map(|signature| (signature.parameters.clone(), signature.variadic.clone()))
+                        .map_or((None, None), |(parameters, variadic)| {
+                            (Some(parameters), variadic)
+                        }),
+                    _ => (None, None),
                 };
                 let mut arguments = arguments
                     .iter()
@@ -803,7 +806,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                             &argument.value,
                             expected_parameters
                                 .as_ref()
-                                .and_then(|parameters| parameters.get(index)),
+                                .and_then(|parameters| parameters.get(index))
+                                .or(expected_variadic.as_ref()),
                         ),
                         span: argument.span,
                     })
@@ -1097,12 +1101,16 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             .iter()
             .rposition(|parameter| !matches!(parameter, ScriptType::Nullable(_)))
             .map_or(0, |index| index + 1);
-        if arguments.len() < required || arguments.len() > signature.parameters.len() {
+        if arguments.len() < required
+            || (signature.variadic.is_none() && arguments.len() > signature.parameters.len())
+        {
+            let maximum = signature.variadic.as_ref().map_or_else(
+                || signature.parameters.len().to_string(),
+                |_| "unbounded".into(),
+            );
             self.error(
                 format!(
-                    "function expects {} to {} arguments, got {}",
-                    required,
-                    signature.parameters.len(),
+                    "function expects {required} to {maximum} arguments, got {}",
                     arguments.len()
                 ),
                 span,
@@ -1121,7 +1129,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 callee.span,
             );
         }
-        for (expected, actual) in signature.parameters.iter().zip(arguments) {
+        for (index, actual) in arguments.iter().enumerate() {
+            let Some(expected) = signature
+                .parameters
+                .get(index)
+                .or(signature.variadic.as_ref())
+            else {
+                continue;
+            };
             if !expected.accepts(self.expression_type(actual.value)) {
                 self.error(
                     format!(

@@ -112,6 +112,7 @@ pub fn register_animation_api<C: 'static>(
         FunctionSignature {
             receiver: Some(ScriptType::Named(owner)),
             parameters: Vec::new(),
+            variadic: None,
             result: ScriptType::Named(owner),
         },
     )?;

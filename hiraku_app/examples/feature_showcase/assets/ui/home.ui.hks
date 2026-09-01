@@ -1,5 +1,7 @@
 import ui.widgets.*
 
+@ui
+global fn main() -> UiNode {
 screen {
     column {
         text("Hiraku Feature Showcase")
@@ -20,3 +22,4 @@ screen {
     }.gap(18)
 }
     .overlay(0.04, 0.06, 0.11, 0.96)
+}

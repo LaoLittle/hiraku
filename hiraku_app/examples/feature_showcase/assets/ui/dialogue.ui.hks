@@ -1,5 +1,7 @@
 import ui.widgets.*
 
+@ui
+global fn main() -> UiNode {
 canvas {
     column {
         text(${dialogue.speaker})
@@ -12,7 +14,7 @@ canvas {
             .color(0.96, 0.97, 1.0, 1.0)
 
         button { text("Continue") }
-            .action("story.next")
+            .onClick { story.next() }
             .enabled(${dialogue.canAdvance})
     }
         .at(.rel(8, 66))
@@ -21,4 +23,5 @@ canvas {
         .gap(12)
         .surface(0.035, 0.055, 0.11, 0.94)
         .visible(${dialogue.visible})
+}
 }

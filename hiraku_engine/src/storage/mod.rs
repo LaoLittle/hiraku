@@ -95,6 +95,8 @@ impl From<&SaveGameData> for proto::SaveGameData {
                 .and_then(|snapshot| hson::to_vec(snapshot).ok())
                 .unwrap_or_default(),
             pending_ui_screen: data.pending_ui_screen.clone(),
+            pending_ui_arguments_hson: hson::to_vec(&data.pending_ui_arguments)
+                .expect("pending UI arguments must serialize to HSON"),
             script_call_stack_hson: hson::to_vec(&data.script_call_stack)
                 .expect("script call stack snapshots must serialize to HSON"),
             ui_registry_hson: hson::to_vec(&data.ui_registry)
@@ -137,6 +139,13 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                 })?)
             },
             pending_ui_screen: data.pending_ui_screen,
+            pending_ui_arguments: if data.pending_ui_arguments_hson.is_empty() {
+                Vec::new()
+            } else {
+                hson::from_slice(&data.pending_ui_arguments_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid pending UI arguments: {error}"))
+                })?
+            },
             script_call_stack: if data.script_call_stack_hson.is_empty() {
                 Vec::new()
             } else {
@@ -558,6 +567,10 @@ mod tests {
             resume_script: "system.hks".to_string(),
             vm_snapshot: Some(snapshot.clone()),
             pending_ui_screen: Some("ui/title.ui.hks".to_string()),
+            pending_ui_arguments: vec![
+                StoredValue::String("Alice".to_string()),
+                StoredValue::Int(3),
+            ],
             ui_registry: BTreeMap::from([(
                 "dialogue".to_string(),
                 "hdp://main.hdp/ui/dialogue.ui.hks".to_string(),
@@ -572,6 +585,7 @@ mod tests {
             restored.pending_ui_screen.as_deref(),
             Some("ui/title.ui.hks")
         );
+        assert_eq!(restored.pending_ui_arguments, data.pending_ui_arguments);
         assert_eq!(restored.ui_registry, data.ui_registry);
         assert_eq!(restored.mounted_ui_overlays, data.mounted_ui_overlays);
         let restored_bytecode = compile_story_bytecode("save.story.hks", source)

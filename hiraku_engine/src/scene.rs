@@ -32,7 +32,7 @@ use crate::{
         DialogueCommand, ResolvedCharacterKeyframe, RuntimeCommand, ScriptBootstrap, ScriptCommand,
         ScriptRequestId, ScriptResponse, ScriptResponseMessage, ScriptRuntimeState,
         SettingsCommand, StageCommand, StoryRuntime, UiCommand, UiContext, VoicePlaybackMode,
-        compile_story_bytecode, evaluate_ui_component_named, save_runtime_slot,
+        compile_story_bytecode, evaluate_ui_component_named_with_args, save_runtime_slot,
         script_command_from_effect, start_hks_runtime,
     },
     state::{
@@ -99,10 +99,9 @@ use dialogue::{
     clear_dialogue_spans, complete_dialogue_wait, dialogue_text_effect_from_snapshot,
     set_dialogue_line_text, set_dialogue_model_reveal, text_effect_snapshot,
 };
-use runtime_menu::parse_ui_action_route;
 pub use runtime_menu::{
-    PauseMenuRoot, RuntimeMenuButton, RuntimeMenuState, handle_runtime_menu_buttons,
-    update_runtime_menu_button_visuals,
+    PauseMenuRoot, RuntimeMenuButton, RuntimeMenuButtonAction, RuntimeMenuState,
+    handle_runtime_menu_buttons, update_runtime_menu_button_visuals,
 };
 pub use screen_ui::{
     UiEffectMessage, animate_screen_ui, cleanup_stale_screen_ui, handle_screen_buttons,

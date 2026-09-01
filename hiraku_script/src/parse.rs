@@ -68,6 +68,7 @@ enum TokenKind {
     Star,
     Slash,
     Dollar,
+    At,
     LParen,
     RParen,
     LBrace,
@@ -153,6 +154,7 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Star => TokenKind::Star,
                 RawToken::Slash => TokenKind::Slash,
                 RawToken::Dollar => TokenKind::Dollar,
+                RawToken::At => TokenKind::At,
                 RawToken::Question => TokenKind::Question,
                 RawToken::Bang => TokenKind::Bang,
                 RawToken::Lt => TokenKind::Lt,
@@ -400,6 +402,9 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Stmt {
+        if self.at(TokenKind::At) {
+            return self.parse_attributed_statement();
+        }
         if let TokenKind::Ident(name) = &self.current().kind {
             match name.as_str() {
                 "import" => return self.parse_import(),
@@ -445,6 +450,44 @@ impl Parser {
         } else {
             Stmt::Expr(target)
         }
+    }
+
+    fn parse_attributed_statement(&mut self) -> Stmt {
+        let mut attributes = Vec::new();
+        while self.at(TokenKind::At) {
+            let start = self.advance().span;
+            let token = self.advance();
+            let name = match token.kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.errors.push(ParseError {
+                        message: "expected attribute name after `@`".to_string(),
+                        span: token.span,
+                    });
+                    "<error>".to_string()
+                }
+            };
+            attributes.push(Attribute {
+                name,
+                span: Span::join(&start, &token.span),
+            });
+            self.skip_separators();
+        }
+
+        let mut statement = self.parse_statement();
+        match &mut statement {
+            Stmt::Function {
+                attributes: target, ..
+            } => *target = attributes,
+            _ => self.errors.push(ParseError {
+                message: "attributes are currently supported only on functions".to_string(),
+                span: attributes
+                    .first()
+                    .map(|attribute| attribute.span)
+                    .unwrap_or(self.current().span),
+            }),
+        }
+        statement
     }
 
     fn parse_import(&mut self) -> Stmt {
@@ -544,6 +587,7 @@ impl Parser {
         let body = self.parse_block();
         let span = Span::join(&start.span, &body.span);
         Stmt::Function {
+            attributes: Vec::new(),
             exported,
             name,
             parameters,
@@ -1565,6 +1609,25 @@ mod tests {
             &program.statements[0],
             Stmt::Function { exported: true, name, .. } if name == "greet"
         ));
+    }
+
+    #[test]
+    fn parses_function_attributes_without_embedding_ui_semantics() {
+        let program = parse_program("@entry\nglobal fn app(title: String) -> String { title }")
+            .expect("a function attribute must parse");
+        let Stmt::Function {
+            attributes,
+            exported,
+            name,
+            ..
+        } = &program.statements[0]
+        else {
+            panic!("expected an attributed function")
+        };
+        assert!(*exported);
+        assert_eq!(name, "app");
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].name, "entry");
     }
 
     #[test]

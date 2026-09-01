@@ -377,7 +377,6 @@ fn spawn_screen_node_entity(
         ScreenNode::Button(ButtonNode {
             text,
             value,
-            action,
             click_effects,
             enabled,
             enabled_binding,
@@ -402,6 +401,7 @@ fn spawn_screen_node_entity(
             radius,
             layout,
         }) => {
+            let (click_effects, runtime_action) = partition_click_effects(click_effects);
             let normal_texture_resolved = background_texture
                 .as_ref()
                 .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
@@ -516,7 +516,7 @@ fn spawn_screen_node_entity(
             commands.entity(button).insert(ScreenUiButton {
                 root,
                 value: value.clone(),
-                click_effects: click_effects.clone(),
+                click_effects,
                 enabled: *enabled,
                 text_entity: text,
                 normal_background,
@@ -564,11 +564,7 @@ fn spawn_screen_node_entity(
                     rendered_revision: u64::MAX,
                 });
             }
-            if *enabled
-                && let Some(action) = action
-                    .as_ref()
-                    .and_then(|action| parse_ui_action_route(action))
-            {
+            if let Some(action) = runtime_action {
                 commands.entity(button).insert(RuntimeMenuButton {
                     action,
                     screen_root: Some(root),
@@ -604,7 +600,6 @@ fn spawn_screen_node_entity(
             hover_scale,
             press_scale,
             value,
-            action,
             click_effects,
             enabled,
             enabled_binding,
@@ -612,6 +607,7 @@ fn spawn_screen_node_entity(
             hovered_when_disabled,
             layout,
         }) => {
+            let (click_effects, runtime_action) = partition_click_effects(click_effects);
             let resolved = texture_atlases.resolve(&texture.path, texture.rect);
             let image = resolved
                 .map(|texture| texture.image.clone())
@@ -650,7 +646,7 @@ fn spawn_screen_node_entity(
                     ScreenUiImageButton {
                         root,
                         value: value.clone(),
-                        click_effects: click_effects.clone(),
+                        click_effects,
                         enabled: *enabled,
                         hovered_when_disabled: *hovered_when_disabled,
                         normal_rect,
@@ -674,7 +670,7 @@ fn spawn_screen_node_entity(
                     },
                 ))
                 .id();
-            if let Some(action) = action.as_deref().and_then(parse_ui_action_route) {
+            if let Some(action) = runtime_action {
                 commands.entity(entity).insert(RuntimeMenuButton {
                     action,
                     screen_root: Some(root),
@@ -987,6 +983,34 @@ fn spawn_screen_node_entity(
     }
 }
 
+fn partition_click_effects(
+    effects: &[UiEffect],
+) -> (Vec<UiEffect>, Option<RuntimeMenuButtonAction>) {
+    let mut passive = Vec::new();
+    let mut action = None;
+    for effect in effects {
+        let next = match effect {
+            UiEffect::PlaySfx { .. } => {
+                passive.push(effect.clone());
+                continue;
+            }
+            UiEffect::OpenUi { role } => RuntimeMenuButtonAction::OpenUi(role.clone()),
+            UiEffect::CloseUi => RuntimeMenuButtonAction::CloseUi,
+            UiEffect::SetHistoryVisible { visible } => {
+                RuntimeMenuButtonAction::SetHistoryVisible(*visible)
+            }
+            UiEffect::Save { slot } => RuntimeMenuButtonAction::Save(slot.clone()),
+            UiEffect::Load { slot } => RuntimeMenuButtonAction::Load(slot.clone()),
+            UiEffect::NextDialogue => RuntimeMenuButtonAction::AdvanceDialogue,
+            UiEffect::Navigate(navigation) => RuntimeMenuButtonAction::Navigate(navigation.clone()),
+        };
+        if action.replace(next).is_some() {
+            warn!("a button onClick handler may contain only one state-changing UI action");
+        }
+    }
+    (passive, action)
+}
+
 fn apply_live_layout_bindings(commands: &mut Commands, entity: Entity, layout: &ScreenLayout) {
     commands.entity(entity).insert(if layout.hidden {
         Visibility::Hidden
@@ -1268,6 +1292,7 @@ pub fn process_ui_effects(
                     PlaybackSettings::DESPAWN.with_volume(Volume::Linear(playback_volume)),
                 ));
             }
+            _ => warn!("state-changing UI action reached the passive effect dispatcher"),
         }
     }
 }
@@ -1762,7 +1787,7 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
         command,
         ScriptCommand::Dialogue(DialogueCommand::Say { .. } | DialogueCommand::AwaitAdvance { .. })
             | ScriptCommand::Character(CharacterCommand::Show { .. })
-            | ScriptCommand::Runtime(RuntimeCommand::Exit | RuntimeCommand::ReturnToTitle)
+            | ScriptCommand::Runtime(RuntimeCommand::Exit | RuntimeCommand::Navigate(_))
     )
 }
 
@@ -1770,9 +1795,7 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use crate::scene::{
-        command_runtime::resolve_ui_component_path, runtime_menu::RuntimeMenuButtonAction,
-    };
+    use crate::scene::command_runtime::resolve_ui_component_path;
 
     use bevy::{
         camera::NormalizedRenderTarget,
@@ -1783,22 +1806,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn ui_action_routes_are_namespace_qualified_and_structured() {
-        assert!(matches!(
-            parse_ui_action_route("ui.open.dialogue"),
-            Some(RuntimeMenuButtonAction::OpenUi(role)) if role == "dialogue"
-        ));
-        assert!(matches!(
-            parse_ui_action_route("storage.save.slot1"),
-            Some(RuntimeMenuButtonAction::Save(slot)) if slot == "slot1"
-        ));
-        assert!(matches!(
-            parse_ui_action_route("story.next"),
-            Some(RuntimeMenuButtonAction::AdvanceDialogue)
-        ));
-    }
 
     #[test]
     fn package_ui_paths_do_not_become_relative_to_the_restored_story() {

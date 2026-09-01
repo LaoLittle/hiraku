@@ -5,6 +5,7 @@ mod dialogue_commands;
 mod ingress;
 mod ui_commands;
 
+use crate::script::navigation::{NavigationKind, NavigationReset};
 use audio_commands::dispatch_audio_command;
 use dialogue_commands::dispatch_dialogue_command;
 pub use ingress::drive_story_runtime;
@@ -106,6 +107,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub camera_tweens: ResMut<'w, CameraTweenState>,
     pub voice_state: ResMut<'w, VoiceState>,
     pub pending_characters: ResMut<'w, PendingCharacterShows>,
+    pub waits: ResMut<'w, PendingWaits>,
 }
 
 pub fn process_script_commands(ctx: SceneCommandContext) {
@@ -137,6 +139,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut animations = execution.animations;
     let mut voice_state = ctx.voice_state;
     let mut pending_characters = ctx.pending_characters;
+    let mut waits = ctx.waits;
     let mut meshes = render_assets.meshes;
     let mut alpha_mask_materials = render_assets.alpha_mask_materials;
     let mut multiply_materials = render_assets.multiply_materials;
@@ -406,57 +409,110 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::Runtime(RuntimeCommand::Exit) => {
                 app_exit.write(AppExit::Success);
             }
-            ScriptCommand::Runtime(RuntimeCommand::ReturnToTitle) => {
-                finish_all_voices(&mut commands, &mut animations, &mut voice_state);
-                clear_choice_ui(&mut commands, &choice_ui_roots);
-                clear_screen_ui(&mut commands, &mut screen_state);
-                clear_overlay_ui(&mut commands, &mut overlay_state);
-                script_runtime.mounted_ui_overlays.clear();
-                script_runtime.ui_registry.clear();
-                pending_characters.items.clear();
-                shared_state.0 = SceneSnapshot::default();
-                restore_scene_snapshot(
-                    &mut commands,
-                    &asset_server,
-                    &mut stage,
-                    &mut dialogue_state,
-                    &mut choice_state,
-                    &mut dialogue_root,
-                    &mut speaker_text,
-                    &mut line_text,
-                    &user_settings,
-                    SceneSnapshot::default(),
+            ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation)) => {
+                let target = vfs.0.resolve_path(
+                    navigation
+                        .origin
+                        .as_deref()
+                        .or(script_runtime.current_script.as_deref()),
+                    &navigation.path,
                 );
-                frontend.runtime_started = true;
-                frontend.notice = None;
-                if !frontend.startup_script.is_empty() {
-                    let startup = frontend.startup_script.clone();
-                    let story = vfs
-                        .0
-                        .read_text(&startup)
-                        .map_err(|error| error.to_string())
-                        .and_then(|source| compile_story_bytecode(&startup, &source))
-                        .and_then(|bytecode| {
-                            StoryRuntime::new(bytecode).map_err(|error| error.to_string())
-                        });
-                    match story {
-                        Ok(mut story) => {
-                            story.set_globals(crate::script::capabilities::engine_globals(
-                                &user_settings,
-                            ));
-                            script_runtime.story = Some(story);
-                            script_runtime.current_script = Some(startup);
-                            script_runtime.pending_ui_screen = None;
-                            script_runtime.wait_request = None;
-                            script_runtime.response_inbox.clear();
-                            script_runtime.task_requests.clear();
-                        }
-                        Err(error) => crate::script::emit_script_diagnostic(
-                            "failed to return to HKS title:",
+                let prepared = vfs
+                    .0
+                    .read_text(&target)
+                    .map_err(|error| error.to_string())
+                    .and_then(|source| compile_story_bytecode(&target, &source))
+                    .and_then(|bytecode| {
+                        StoryRuntime::new(bytecode).map_err(|error| error.to_string())
+                    });
+                let mut next_story = match prepared {
+                    Ok(story) => story,
+                    Err(error) => {
+                        crate::script::emit_script_diagnostic(
+                            &format!("failed to navigate to HKS script `{target}`:"),
                             &error,
-                        ),
+                        );
+                        continue;
+                    }
+                };
+
+                let mut globals = if navigation.reset == NavigationReset::Session {
+                    BTreeMap::new()
+                } else {
+                    script_runtime
+                        .story
+                        .as_ref()
+                        .map(|story| story.globals().clone())
+                        .unwrap_or_default()
+                };
+                globals.extend(crate::script::capabilities::engine_globals(&user_settings));
+                next_story.set_globals(globals);
+
+                if navigation.kind == NavigationKind::Goto {
+                    clear_choice_ui(&mut commands, &choice_ui_roots);
+                    clear_screen_ui(&mut commands, &mut screen_state);
+                    choice_state.options.clear();
+                    choice_state.waiting.take();
+                    dialogue_state.waiting.take();
+                    screen_state.waiting.take();
+                    waits.items.clear();
+                    animations.waits.clear();
+                    pending_script_commands.clear();
+                    script_runtime.pending_ui_screen = None;
+                    script_runtime.pending_ui_arguments.clear();
+                    script_runtime.wait_request = None;
+                    script_runtime.response_inbox.clear();
+                    script_runtime.task_requests.clear();
+                }
+
+                if navigation.reset != NavigationReset::None {
+                    finish_all_voices(&mut commands, &mut animations, &mut voice_state);
+                    clear_overlay_ui(&mut commands, &mut overlay_state);
+                    script_runtime.mounted_ui_overlays.clear();
+                    pending_characters.items.clear();
+                    animations.completed.clear();
+                    camera_tweens.active = None;
+                    *camera_state = CameraState::default();
+                    let empty_scene = SceneSnapshot::default();
+                    shared_state.0 = empty_scene.clone();
+                    restore_scene_snapshot(
+                        &mut commands,
+                        &asset_server,
+                        &mut stage,
+                        &mut dialogue_state,
+                        &mut choice_state,
+                        &mut dialogue_root,
+                        &mut speaker_text,
+                        &mut line_text,
+                        &user_settings,
+                        empty_scene,
+                    );
+                    if navigation.reset == NavigationReset::Session {
+                        dialogue_history.entries.clear();
+                        dialogue_history.visible = false;
                     }
                 }
+
+                if navigation.kind == NavigationKind::Call {
+                    if let (Some(script), Some(caller)) = (
+                        script_runtime.current_script.take(),
+                        script_runtime.story.take(),
+                    ) {
+                        script_runtime
+                            .call_stack
+                            .push(crate::script::ScriptCallFrame {
+                                script,
+                                story: caller,
+                            });
+                    }
+                } else {
+                    script_runtime.call_stack.clear();
+                }
+                script_runtime.story = Some(next_story);
+                script_runtime.current_script = Some(target);
+                script_runtime.task_requests.clear();
+                frontend.runtime_started = true;
+                frontend.notice = None;
             }
         }
     }

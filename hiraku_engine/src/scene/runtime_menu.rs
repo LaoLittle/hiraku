@@ -1,12 +1,13 @@
 use super::*;
 
+/// Marker for an application-owned modal layered above Hiraku's script UI.
 #[derive(Component)]
 pub struct PauseMenuRoot;
 
 #[derive(Component)]
 pub struct RuntimeMenuButton {
     pub action: RuntimeMenuButtonAction,
-    /// Modal screen which owns this action, or `None` for the built-in pause UI.
+    /// Modal screen which owns this action.
     pub screen_root: Option<Entity>,
 }
 
@@ -14,19 +15,15 @@ pub struct RuntimeMenuButton {
 pub enum RuntimeMenuButtonAction {
     Save(String),
     Load(String),
-    OpenPauseMenu,
     OpenUi(String),
     CloseUi,
     SetHistoryVisible(bool),
-    Resume,
-    ReturnToTitle,
+    Navigate(crate::script::navigation::NavigationRequest),
     AdvanceDialogue,
 }
 
 #[derive(Resource, Default)]
 pub struct RuntimeMenuState {
-    pub pause_root: Option<Entity>,
-    pub pause_open: bool,
     /// Pointer clicks claimed by UI actions during this update. Keeping the
     /// pointer identity makes consumption survive deferred modal despawning.
     pub consumed_pointer_clicks: HashMap<PointerId, usize>,
@@ -38,7 +35,6 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub asset_server: Res<'w, AssetServer>,
     pub textures: Res<'w, TextureCatalog>,
     pub terms: Res<'w, TermCatalog>,
-    pub ui_fonts: Res<'w, UiFonts>,
     pub vfs: Res<'w, VfsResource>,
     pub shared_state: ResMut<'w, SceneSharedState>,
     pub script_runtime: ResMut<'w, ScriptRuntimeState>,
@@ -114,33 +110,6 @@ pub fn update_runtime_menu_button_visuals(
     }
 }
 
-pub(super) fn parse_ui_action_route(route: &str) -> Option<RuntimeMenuButtonAction> {
-    let segments = route.split('.').collect::<Vec<_>>();
-    let action = match segments.as_slice() {
-        ["ui", "open", "menu"] => RuntimeMenuButtonAction::OpenPauseMenu,
-        ["ui", "open", "history"] => RuntimeMenuButtonAction::SetHistoryVisible(true),
-        ["ui", "close", "history"] => RuntimeMenuButtonAction::SetHistoryVisible(false),
-        ["ui", "open", role] if !role.is_empty() => {
-            RuntimeMenuButtonAction::OpenUi((*role).to_string())
-        }
-        ["ui", "close"] => RuntimeMenuButtonAction::CloseUi,
-        ["ui", "close", "menu"] => RuntimeMenuButtonAction::Resume,
-        ["storage", "save", slot] if !slot.is_empty() => {
-            RuntimeMenuButtonAction::Save((*slot).to_string())
-        }
-        ["storage", "load", slot] if !slot.is_empty() => {
-            RuntimeMenuButtonAction::Load((*slot).to_string())
-        }
-        ["story", "next"] => RuntimeMenuButtonAction::AdvanceDialogue,
-        ["app", "returnToTitle"] => RuntimeMenuButtonAction::ReturnToTitle,
-        _ => {
-            warn!("unknown UI action route `{route}`");
-            return None;
-        }
-    };
-    Some(action)
-}
-
 fn start_frontend_session(
     commands: &mut Commands,
     asset_server: &AssetServer,
@@ -210,6 +179,9 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
         if screen_button.is_some_and(|button| !button.enabled) {
             continue;
         }
+        if image_button.is_some_and(|button| !button.enabled) {
+            continue;
+        }
         *ctx.runtime_menu
             .consumed_pointer_clicks
             .entry(click.pointer_id)
@@ -274,7 +246,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     &mut ctx.voice_state,
                     &ctx.choice_ui_roots,
                 );
-                close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
                 ctx.dialogue_history.entries.clear();
                 ctx.dialogue_history.visible = false;
                 clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
@@ -301,16 +272,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 } else {
                     info!("loaded save slot `{slot}`");
                 }
-            }
-            RuntimeMenuButtonAction::OpenPauseMenu => {
-                if ctx.runtime_menu.pause_root.is_none() {
-                    ctx.runtime_menu.pause_root = Some(spawn_pause_menu(
-                        &mut ctx.commands,
-                        &ctx.ui_fonts,
-                        &ctx.ui_style,
-                    ));
-                }
-                ctx.runtime_menu.pause_open = true;
             }
             RuntimeMenuButtonAction::OpenUi(role) => {
                 let Some(target) = ctx.script_runtime.ui_registry.get(role).cloned() else {
@@ -339,46 +300,10 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
             RuntimeMenuButtonAction::SetHistoryVisible(visible) => {
                 ctx.dialogue_history.visible = *visible;
             }
-            RuntimeMenuButtonAction::Resume => {
-                close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
-            }
-            RuntimeMenuButtonAction::ReturnToTitle => {
-                let startup_script = ctx.frontend.startup_script.clone();
-                abort_runtime_waiters(
-                    &mut ctx.commands,
-                    &mut ctx.waits,
-                    &mut ctx.dialogue_state,
-                    &mut ctx.choice_state,
-                    &mut ctx.screen_state,
-                    &mut ctx.pending_script_commands,
-                    &mut ctx.pending_characters,
-                    &mut ctx.animations,
-                    &mut ctx.voice_state,
-                    &ctx.choice_ui_roots,
-                );
-                close_pause_menu(&mut ctx.commands, &mut ctx.runtime_menu);
-                ctx.dialogue_history.entries.clear();
-                ctx.dialogue_history.visible = false;
-                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
-                start_frontend_session(
-                    &mut ctx.commands,
-                    &ctx.asset_server,
-                    &ctx.vfs,
-                    &mut ctx.shared_state,
-                    &mut ctx.stage,
-                    &mut ctx.dialogue_state,
-                    &mut ctx.choice_state,
-                    &ctx.choice_ui_roots,
-                    &mut ctx.dialogue_root,
-                    &mut ctx.speaker_text,
-                    &mut ctx.line_text,
-                    &ctx.user_settings,
-                    &mut ctx.frontend,
-                    &mut ctx.script_runtime,
-                    ScriptBootstrap::new(startup_script),
-                    SceneSnapshot::default(),
-                );
+            RuntimeMenuButtonAction::Navigate(navigation) => {
+                ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
+                    RuntimeCommand::Navigate(navigation.clone()),
+                ));
             }
             RuntimeMenuButtonAction::AdvanceDialogue => {
                 advance_dialogue(
@@ -389,126 +314,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 );
             }
         }
-    }
-}
-
-fn spawn_pause_menu(commands: &mut Commands, ui_fonts: &UiFonts, ui_style: &UiStyle) -> Entity {
-    let root = commands
-        .spawn((
-            PauseMenuRoot,
-            GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + 10),
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(0.0),
-                right: px(0.0),
-                top: px(0.0),
-                bottom: px(0.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(Color::BLACK.with_alpha(0.35)),
-            Visibility::Inherited,
-        ))
-        .id();
-
-    commands.entity(root).with_children(|parent| {
-        parent
-            .spawn((
-                Node {
-                    width: percent(72.0),
-                    max_width: px(640.0),
-                    padding: UiRect::all(px(32.0)),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: px(18.0),
-                    border: UiRect::all(px(2.0)),
-                    border_radius: BorderRadius::all(px(24.0)),
-                    ..default()
-                },
-                BackgroundColor(ui_style.choice_panel_bg),
-                BorderColor::all(ui_style.choice_button_border),
-            ))
-            .with_children(|panel| {
-                panel.spawn((
-                    Text::new("Game Menu"),
-                    ui_text_font(ui_fonts, 42.0),
-                    TextColor(ui_style.speaker_color),
-                ));
-                spawn_runtime_menu_button(
-                    panel,
-                    ui_fonts,
-                    ui_style,
-                    "Return",
-                    RuntimeMenuButtonAction::Resume,
-                );
-                spawn_runtime_menu_button(
-                    panel,
-                    ui_fonts,
-                    ui_style,
-                    "Quick Save",
-                    RuntimeMenuButtonAction::Save("quick".into()),
-                );
-                spawn_runtime_menu_button(
-                    panel,
-                    ui_fonts,
-                    ui_style,
-                    "Quick Load",
-                    RuntimeMenuButtonAction::Load("quick".into()),
-                );
-                spawn_runtime_menu_button(
-                    panel,
-                    ui_fonts,
-                    ui_style,
-                    "Main Menu",
-                    RuntimeMenuButtonAction::ReturnToTitle,
-                );
-            });
-    });
-
-    root
-}
-
-fn spawn_runtime_menu_button(
-    parent: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
-    ui_fonts: &UiFonts,
-    ui_style: &UiStyle,
-    text: &str,
-    action: RuntimeMenuButtonAction,
-) {
-    parent
-        .spawn((
-            RuntimeMenuButton {
-                action,
-                screen_root: None,
-            },
-            Button,
-            Node {
-                width: percent(100.0),
-                min_height: px(68.0),
-                border: UiRect::all(px(2.0)),
-                padding: UiRect::axes(px(24.0), px(14.0)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(px(14.0)),
-                ..default()
-            },
-            BackgroundColor(ui_style.choice_button_bg),
-            BorderColor::all(ui_style.choice_button_border),
-        ))
-        .with_children(|button| {
-            button.spawn((
-                Pickable::IGNORE,
-                Text::new(text),
-                ui_text_font(ui_fonts, ui_style.quick_button_size.max(30.0)),
-                TextColor(ui_style.choice_text_color),
-            ));
-        });
-}
-
-fn close_pause_menu(commands: &mut Commands, runtime_menu: &mut RuntimeMenuState) {
-    runtime_menu.pause_open = false;
-    if let Some(root) = runtime_menu.pause_root.take() {
-        commands.entity(root).try_despawn();
     }
 }
 
