@@ -77,6 +77,8 @@ pub struct ScriptExecutionCommandContext<'w> {
     pub pending_commands: ResMut<'w, PendingScriptCommands>,
     pub runtime: ResMut<'w, ScriptRuntimeState>,
     pub animations: ResMut<'w, AnimationState>,
+    pub video_player: ResMut<'w, VideoPlayer>,
+    pub movie_waits: ResMut<'w, PendingMovieWaits>,
 }
 
 #[derive(SystemParam)]
@@ -137,6 +139,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut screen_state = ui.screen_state;
     let mut overlay_state = ui.overlay_state;
     let mut animations = execution.animations;
+    let mut video_player = execution.video_player;
+    let mut movie_waits = execution.movie_waits;
     let mut voice_state = ctx.voice_state;
     let mut pending_characters = ctx.pending_characters;
     let mut waits = ctx.waits;
@@ -406,6 +410,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 &mut animations,
                 &mut voice_state,
             ),
+            ScriptCommand::Video(command) => {
+                dispatch_video_command(command, &asset_server, &mut video_player, &mut movie_waits)
+            }
             ScriptCommand::Runtime(RuntimeCommand::Exit) => {
                 app_exit.write(AppExit::Success);
             }

@@ -50,6 +50,7 @@ pub struct StoryRuntime {
     waiting_interactive_task: Option<u64>,
     choice: Option<ChoiceState>,
     blocked: bool,
+    blocked_wait: Option<StoryWait>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -107,6 +108,8 @@ pub struct StoryRuntimeSnapshot {
     waiting_interactive_task: Option<u64>,
     choice: Option<ChoiceState>,
     blocked: bool,
+    #[serde(default)]
+    blocked_wait: Option<StoryWait>,
 }
 
 impl StoryRuntime {
@@ -121,6 +124,7 @@ impl StoryRuntime {
             waiting_interactive_task: None,
             choice: None,
             blocked: false,
+            blocked_wait: None,
         })
     }
 
@@ -137,6 +141,7 @@ impl StoryRuntime {
             waiting_interactive_task: self.waiting_interactive_task,
             choice: self.choice.clone(),
             blocked: self.blocked,
+            blocked_wait: self.blocked_wait.clone(),
         })
     }
 
@@ -181,6 +186,7 @@ impl StoryRuntime {
             waiting_interactive_task: snapshot.waiting_interactive_task,
             choice: snapshot.choice,
             blocked: snapshot.blocked,
+            blocked_wait: snapshot.blocked_wait,
         };
         for task in completed_voice_tasks {
             runtime.finish_task_effects(task)?;
@@ -214,7 +220,11 @@ impl StoryRuntime {
                     options: options.iter().map(|option| option.label.clone()).collect(),
                 })
             }
-            _ => Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance)),
+            _ => Some(StoryRuntimeEvent::Wait(
+                self.blocked_wait
+                    .clone()
+                    .unwrap_or(StoryWait::DialogueAdvance),
+            )),
         }
     }
 
@@ -237,14 +247,17 @@ impl StoryRuntime {
                 .spawn_closure(&option, ExecutionMode::Interactive)?;
             self.choice = Some(ChoiceState::RunningBranch { task, selected });
             self.blocked = false;
+            self.blocked_wait = None;
             return Ok(());
         }
         if let Some(task) = self.waiting_interactive_task.take() {
             self.blocked = false;
+            self.blocked_wait = None;
             self.bytecode.unpause_task(task)?;
             return Ok(());
         }
         self.blocked = false;
+        self.blocked_wait = None;
         if self.bytecode.main_waiting_for_host() {
             self.bytecode.resume_main(value)?;
         }
@@ -288,6 +301,9 @@ impl StoryRuntime {
                     | StoryRuntimeEvent::Choice { .. }
             ) {
                 self.blocked = true;
+            }
+            if let StoryRuntimeEvent::Wait(wait) = &event {
+                self.blocked_wait = Some(wait.clone());
             }
             return Ok(Some(event));
         }
@@ -343,6 +359,9 @@ impl StoryRuntime {
                     if let Some(event) = self.pending.pop_front() {
                         if matches!(event, StoryRuntimeEvent::Wait(_)) {
                             self.blocked = true;
+                        }
+                        if let StoryRuntimeEvent::Wait(wait) = &event {
+                            self.blocked_wait = Some(wait.clone());
                         }
                         return Ok(Some(event));
                     }
@@ -459,15 +478,25 @@ impl StoryRuntime {
                 self.pending.push_back(StoryRuntimeEvent::Effect(effect));
             }
         }
-        let automatic_dialogue = self.host.take_wait().is_some();
-        if automatic_dialogue && self.bytecode.task_mode(task) == Some(ExecutionMode::Interactive) {
+        let wait = self.host.take_wait();
+        let task_mode = self.bytecode.task_mode(task);
+        if matches!(wait, Some(StoryWait::Movie { .. }))
+            && task_mode != Some(ExecutionMode::Interactive)
+        {
+            return Err(StoryRuntimeError::UnsupportedTaskWait(
+                wait.expect("the movie wait was matched"),
+            ));
+        }
+        let has_wait = wait.is_some();
+        if let Some(wait) = wait
+            && task_mode == Some(ExecutionMode::Interactive)
+        {
             self.bytecode.pause_task(task)?;
             self.waiting_interactive_task = Some(task);
-            self.pending
-                .push_back(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance));
+            self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
-        if self.bytecode.task_mode(task) == Some(ExecutionMode::Sequence)
-            && automatic_dialogue
+        if task_mode == Some(ExecutionMode::Sequence)
+            && has_wait
             && self.active_task_effects.contains_key(&task)
         {
             self.bytecode.pause_task(task)?;
@@ -664,6 +693,10 @@ pub enum StoryRuntimeError {
     UnexpectedMainControl(StoryControl),
     #[error("story control {0:?} is not supported inside a task closure")]
     UnsupportedTaskControl(StoryControl),
+    #[error(
+        "story wait {0:?} is not supported inside seq/par; call it from the main story or an interactive choice branch"
+    )]
+    UnsupportedTaskWait(StoryWait),
     #[error("story runtime is not waiting for a host response")]
     NotBlocked,
     #[error("story runtime snapshot requires an empty effect queue")]
@@ -1107,6 +1140,30 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
                 if text == "restored"
         ));
+    }
+
+    #[test]
+    fn a_blocked_movie_wait_survives_snapshot_restore() {
+        let bytecode = compile_story_bytecode(
+            "movie-save.hks",
+            "movie(\"movies/opening.mkv\")\n\"after movie\"",
+        )
+        .expect("movie story must compile");
+        let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime must initialize");
+        assert_eq!(
+            runtime.step().expect("movie must suspend"),
+            Some(StoryRuntimeEvent::Wait(StoryWait::Movie {
+                path: "movies/opening.mkv".into(),
+            }))
+        );
+        let snapshot = runtime.snapshot().expect("movie wait must be saveable");
+        let restored = StoryRuntime::restore(bytecode, snapshot).expect("movie wait must restore");
+        assert_eq!(
+            restored.restored_boundary_event(),
+            Some(StoryRuntimeEvent::Wait(StoryWait::Movie {
+                path: "movies/opening.mkv".into(),
+            }))
+        );
     }
 
     #[test]

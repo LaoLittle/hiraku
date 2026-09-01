@@ -40,7 +40,7 @@ use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_character_motion_effects,
     animate_custom_effects, animate_dialogue_text_reveal, animate_rule_transitions,
     animate_screen_ui, animate_visual_tweens, apply_animation_cancellations,
-    apply_live_audio_settings, cleanup_stale_screen_ui, drive_story_runtime,
+    apply_live_audio_settings, cleanup_stale_screen_ui, complete_movie_waits, drive_story_runtime,
     handle_choice_action_input, handle_choice_buttons, handle_runtime_menu_buttons,
     handle_screen_buttons, handle_screen_image_buttons, handle_screen_scroll,
     handle_screen_toggles, poll_pending_character_shows, poll_voice_playback, prepare_bgm_preludes,
@@ -154,6 +154,7 @@ struct HirakuRuntimeSystems;
 impl Plugin for HirakuPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
+            hiraku_video::HirakuVideoPlugin,
             MaterialPlugin::<CustomScreenEffectMaterial>::default(),
             MaterialPlugin::<RuleTransitionMaterial>::default(),
             MaterialPlugin::<AlphaMaskMaterial>::default(),
@@ -182,6 +183,7 @@ impl Plugin for HirakuPlugin {
             )
             .init_resource::<ScriptRuntimeState>()
             .init_resource::<UiModels>()
+            .init_resource::<scene::PendingMovieWaits>()
             .add_message::<ScriptResponseMessage>()
             .add_message::<scene::UiEffectMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store))
@@ -216,6 +218,12 @@ impl Plugin for HirakuPlugin {
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, drive_story_runtime.in_set(HirakuRuntimeSystems))
+            .add_systems(
+                Update,
+                complete_movie_waits
+                    .before(drive_story_runtime)
+                    .in_set(HirakuRuntimeSystems),
+            )
             .add_systems(
                 Update,
                 process_script_commands

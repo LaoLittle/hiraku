@@ -23,6 +23,7 @@ pub enum ScriptCommand {
     Character(CharacterCommand),
     Animation(AnimationCommand),
     Audio(AudioCommand),
+    Video(VideoCommand),
 }
 
 #[derive(Debug)]
@@ -131,6 +132,11 @@ pub enum AudioCommand {
         mode: VoicePlaybackMode,
         animation_id: Option<String>,
     },
+}
+
+#[derive(Debug)]
+pub enum VideoCommand {
+    Play { path: String, done: ScriptRequestId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -23,7 +23,7 @@ pub use animation::{AnimationPhase, AnimationSpec};
 pub(crate) use command::{
     AnimationCommand, AudioCommand, CameraCommand, CharacterCommand, CharacterEase,
     DialogueCommand, ResolvedCharacterKeyframe, RuntimeCommand, ScriptCommand, SettingsCommand,
-    StageCommand, UiCommand, VoicePlaybackMode,
+    StageCommand, UiCommand, VideoCommand, VoicePlaybackMode,
 };
 pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
 pub(crate) use runtime::{

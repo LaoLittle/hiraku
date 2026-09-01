@@ -411,6 +411,15 @@ pub fn drive_story_runtime(
                     DialogueCommand::AwaitAdvance { done: request },
                 ));
             }
+            StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Movie { path }) => {
+                let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
+                let request = runtime.allocate_request();
+                runtime.wait_request = Some(request);
+                pending_script_commands.enqueue(ScriptCommand::Video(VideoCommand::Play {
+                    path: target,
+                    done: request,
+                }));
+            }
             StoryRuntimeEvent::Choice { prompt, options } => {
                 let request = runtime.allocate_request();
                 runtime.wait_request = Some(request);

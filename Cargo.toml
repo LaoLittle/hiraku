@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_script_derive", "hiraku_cli", "hiraku_hdp", "hiraku_errors"]
+members = ["hiraku_engine", "hiraku_app", "hiraku_script", "hiraku_script_derive", "hiraku_cli", "hiraku_hdp", "hiraku_errors", "hiraku_video"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +20,7 @@ hiraku-engine = { path = "hiraku_engine" }
 hiraku-errors = { path = "hiraku_errors" }
 hiraku-hdp = { path = "hiraku_hdp" }
 hiraku-script = { path = "hiraku_script" }
+hiraku-video = { path = "hiraku_video" }
 
 [workspace.dependencies.bevy]
 version = "0.19.1"
@@ -40,3 +41,6 @@ strip = true
 lto = true
 panic = "abort"
 codegen-units = 1
+
+[profile.dev.package.hiraku-video]
+opt-level = 3

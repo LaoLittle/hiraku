@@ -1787,6 +1787,7 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
         command,
         ScriptCommand::Dialogue(DialogueCommand::Say { .. } | DialogueCommand::AwaitAdvance { .. })
             | ScriptCommand::Character(CharacterCommand::Show { .. })
+            | ScriptCommand::Video(_)
             | ScriptCommand::Runtime(RuntimeCommand::Exit | RuntimeCommand::Navigate(_))
     )
 }

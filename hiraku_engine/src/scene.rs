@@ -11,6 +11,7 @@ use bevy::{
     },
     prelude::*,
 };
+use hiraku_video::VideoPlayer;
 
 use crate::{
     audio::{AudioCatalog, PreludeLoopAudio, load_audio_catalog},
@@ -31,9 +32,9 @@ use crate::{
         AnimationCommand, AudioCommand, CameraCommand, CharacterCommand, CharacterEase,
         DialogueCommand, ResolvedCharacterKeyframe, RuntimeCommand, ScriptBootstrap, ScriptCommand,
         ScriptRequestId, ScriptResponse, ScriptResponseMessage, ScriptRuntimeState,
-        SettingsCommand, StageCommand, StoryRuntime, UiCommand, UiContext, VoicePlaybackMode,
-        compile_story_bytecode, evaluate_ui_component_named_with_args, save_runtime_slot,
-        script_command_from_effect, start_hks_runtime,
+        SettingsCommand, StageCommand, StoryRuntime, UiCommand, UiContext, VideoCommand,
+        VoicePlaybackMode, compile_story_bytecode, evaluate_ui_component_named_with_args,
+        save_runtime_slot, script_command_from_effect, start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -62,6 +63,7 @@ mod dialogue;
 mod runtime_menu;
 mod screen_ui;
 mod snapshot;
+mod video_runtime;
 
 pub use animation_runtime::{
     AnimationState, PendingAnimationCancels, PendingWaits, animate_custom_effects,
@@ -114,6 +116,8 @@ use screen_ui::{
 };
 use snapshot::restore_scene_snapshot;
 pub use snapshot::sync_scene_snapshot;
+use video_runtime::dispatch_video_command;
+pub use video_runtime::{PendingMovieWaits, complete_movie_waits};
 
 const STAGE_Z_BACKGROUND: f32 = 0.0;
 const STAGE_Z_SPRITE: f32 = 10.0;
