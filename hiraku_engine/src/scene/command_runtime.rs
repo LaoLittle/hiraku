@@ -1,5 +1,12 @@
 use super::*;
 
+mod ingress;
+
+pub use ingress::bridge_story_events;
+pub(super) use ingress::evaluate_ui_at;
+#[cfg(test)]
+pub(crate) use ingress::resolve_ui_component_path;
+
 #[derive(Debug)]
 pub struct SequencedScriptCommand {
     pub sequence: u64,

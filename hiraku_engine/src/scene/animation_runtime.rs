@@ -341,3 +341,232 @@ pub(crate) fn tween_fraction(timer: &Timer) -> f32 {
         (timer.elapsed_secs() / duration).clamp(0.0, 1.0)
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_animation_cancellations(
+    mut commands: Commands,
+    mut stage: ResMut<StageState>,
+    mut waits: ResMut<PendingWaits>,
+    mut dialogue_state: ResMut<DialogueState>,
+    mut pending_cancels: ResMut<PendingAnimationCancels>,
+    mut animations: ResMut<AnimationState>,
+    mut shake_state: ResMut<CameraShakeState>,
+    mut voice_state: ResMut<VoiceState>,
+    mut pending_characters: ResMut<PendingCharacterShows>,
+    mut tweens: Query<(Entity, Option<&SpriteActor>, &mut VisualTween)>,
+    mut bgm_fades: Query<(Entity, &mut BgmFade)>,
+    mut motion_queries: ParamSet<(
+        Query<'_, '_, &'static mut Transform, With<WorldCamera>>,
+        Query<
+            '_,
+            '_,
+            (
+                Entity,
+                &'static mut Transform,
+                Option<&'static mut CharacterJumpEffect>,
+                Option<&'static mut CharacterShakeEffect>,
+                Option<&'static mut CharacterTimelineEffect>,
+            ),
+            Without<WorldCamera>,
+        >,
+    )>,
+    mut transitions: Query<(Entity, &mut RuleTransitionPlayer)>,
+    mut effects: Query<(Entity, &mut CustomScreenEffectPlayer)>,
+) {
+    if pending_cancels.ids.is_empty() {
+        return;
+    }
+
+    let cancelled = pending_cancels.ids.drain(..).collect::<HashSet<_>>();
+    for id in &cancelled {
+        animations.completed.insert(id.clone());
+    }
+
+    waits.items.retain(|wait| {
+        if wait
+            .animation_id
+            .as_ref()
+            .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            commands.write_message(ScriptResponseMessage {
+                request: wait.done,
+                response: ScriptResponse::Continue,
+            });
+            false
+        } else {
+            true
+        }
+    });
+
+    if dialogue_state
+        .waiting
+        .as_ref()
+        .and_then(|waiting| waiting.animation_id.as_ref())
+        .is_some_and(|animation_id| cancelled.contains(animation_id))
+    {
+        if let Some(waiting) = dialogue_state.waiting.take() {
+            complete_dialogue_wait(&mut commands, &mut animations, waiting);
+        }
+    }
+
+    if let Some(shake) = shake_state.active.as_mut()
+        && shake
+            .animation_id
+            .as_ref()
+            .is_some_and(|animation_id| cancelled.contains(animation_id))
+    {
+        for mut camera in &mut motion_queries.p0() {
+            camera.translation.x = 0.0;
+            camera.translation.y = 0.0;
+        }
+        complete_missing_animation(&mut animations, shake.animation_id.take());
+        shake_state.active = None;
+    }
+
+    if voice_state
+        .active
+        .as_ref()
+        .and_then(|voice| voice.animation_id.as_ref())
+        .is_some_and(|animation_id| cancelled.contains(animation_id))
+    {
+        finish_active_voice(&mut commands, &mut animations, &mut voice_state);
+    }
+
+    pending_characters.items.retain_mut(|item| {
+        if item
+            .animation_id
+            .as_ref()
+            .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            for ((id, entity), newly_spawned) in item
+                .entity_ids
+                .drain(..)
+                .zip(item.entities.drain(..))
+                .zip(item.newly_spawned.drain(..))
+            {
+                if newly_spawned {
+                    if stage.sprites.get(&id) == Some(&entity) {
+                        stage.sprites.remove(&id);
+                    }
+                    commands.entity(entity).try_despawn();
+                } else {
+                    commands.entity(entity).try_insert(Visibility::Hidden);
+                }
+            }
+            complete_missing_animation(&mut animations, item.animation_id.take());
+            false
+        } else {
+            true
+        }
+    });
+
+    for (entity, actor, mut tween) in &mut tweens {
+        if tween
+            .animation_id
+            .as_ref()
+            .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            if tween.despawn_on_finish
+                && let Some(actor) = actor
+            {
+                stage.sprites.insert(actor.id.clone(), entity);
+            }
+            complete_missing_animation(&mut animations, tween.animation_id.take());
+            commands.entity(entity).try_remove::<VisualTween>();
+        }
+    }
+
+    for (entity, mut fade) in &mut bgm_fades {
+        if fade
+            .animation_id
+            .as_ref()
+            .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            complete_missing_animation(&mut animations, fade.animation_id.take());
+            commands.entity(entity).try_remove::<BgmFade>();
+        }
+    }
+
+    for (entity, mut transform, jump, shake, timeline) in &mut motion_queries.p1() {
+        let mut reset_translation = false;
+        let origin = timeline
+            .as_ref()
+            .map(|effect| effect.origin)
+            .or_else(|| jump.as_ref().map(|effect| effect.origin))
+            .or_else(|| shake.as_ref().map(|effect| effect.origin));
+
+        if let Some(mut effect) = jump
+            && effect
+                .animation_id
+                .as_ref()
+                .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            complete_missing_animation(&mut animations, effect.animation_id.take());
+            commands.entity(entity).try_remove::<CharacterJumpEffect>();
+            reset_translation = true;
+        }
+
+        if let Some(mut effect) = shake
+            && effect
+                .animation_id
+                .as_ref()
+                .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            complete_missing_animation(&mut animations, effect.animation_id.take());
+            commands.entity(entity).try_remove::<CharacterShakeEffect>();
+            reset_translation = true;
+        }
+
+        if let Some(mut effect) = timeline
+            && effect
+                .animation_id
+                .as_ref()
+                .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            if let Some(final_keyframe) = effect.keyframes.last() {
+                stage
+                    .character_positions
+                    .insert(effect.actor_id.clone(), final_keyframe.position);
+            }
+            complete_missing_animation(&mut animations, effect.animation_id.take());
+            commands
+                .entity(entity)
+                .try_remove::<CharacterTimelineEffect>();
+            reset_translation = true;
+        }
+
+        if reset_translation {
+            if let Some(origin) = origin {
+                transform.translation = origin;
+            }
+        }
+    }
+
+    for (entity, mut transition) in &mut transitions {
+        if transition
+            .animation_id
+            .as_ref()
+            .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            if stage.transition == Some(entity) {
+                stage.transition = None;
+            }
+            complete_missing_animation(&mut animations, transition.animation_id.take());
+            commands.entity(entity).try_despawn();
+        }
+    }
+
+    for (entity, mut effect) in &mut effects {
+        if effect
+            .animation_id
+            .as_ref()
+            .is_some_and(|animation_id| cancelled.contains(animation_id))
+        {
+            if stage.screen_effect == Some(entity) {
+                stage.screen_effect = None;
+            }
+            complete_missing_animation(&mut animations, effect.animation_id.take());
+            commands.entity(entity).try_despawn();
+        }
+    }
+}

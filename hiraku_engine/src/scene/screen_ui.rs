@@ -1786,6 +1786,10 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use crate::scene::{
+        command_runtime::resolve_ui_component_path, runtime_menu::RuntimeMenuButtonAction,
+    };
+
     use bevy::{
         camera::NormalizedRenderTarget,
         picking::{

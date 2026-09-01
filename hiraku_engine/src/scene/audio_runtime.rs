@@ -200,3 +200,30 @@ pub(super) fn finish_voice(
         animations.completed.insert(animation_id);
     }
 }
+
+pub fn poll_voice_playback(
+    mut commands: Commands,
+    mut animations: ResMut<AnimationState>,
+    mut voice_state: ResMut<VoiceState>,
+    sinks: Query<&AudioSink>,
+) {
+    let exclusive_finished = voice_state
+        .active
+        .as_ref()
+        .is_some_and(|active| sinks.get(active.entity).is_ok_and(|sink| sink.empty()));
+    if exclusive_finished {
+        finish_active_voice(&mut commands, &mut animations, &mut voice_state);
+    }
+
+    let completed = voice_state
+        .concurrent
+        .keys()
+        .copied()
+        .filter(|entity| sinks.get(*entity).is_ok_and(|sink| sink.empty()))
+        .collect::<Vec<_>>();
+    for entity in completed {
+        if let Some(active) = voice_state.concurrent.remove(&entity) {
+            finish_voice(&mut commands, &mut animations, active);
+        }
+    }
+}
