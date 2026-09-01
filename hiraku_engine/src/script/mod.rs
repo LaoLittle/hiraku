@@ -319,7 +319,7 @@ pub fn save_runtime_slot(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let data = SaveGameData {
-        version: 9,
+        version: crate::state::CURRENT_SAVE_VERSION,
         resume_script: current_script,
         script_stack: script_call_stack
             .iter()

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
+pub const CURRENT_SAVE_VERSION: u32 = 10;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
     pub script: String,
@@ -135,7 +137,7 @@ pub struct SceneSnapshot {
     pub camera: CameraSnapshot,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveGameData {
     #[serde(default = "default_save_version")]
     pub version: u32,
@@ -175,7 +177,31 @@ pub struct SaveGameData {
 }
 
 fn default_save_version() -> u32 {
-    1
+    CURRENT_SAVE_VERSION
+}
+
+impl Default for SaveGameData {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_SAVE_VERSION,
+            resume_script: String::new(),
+            random_seed: 0,
+            rng_state: None,
+            time_seed: 0,
+            checkpoint: None,
+            script_stack: Vec::new(),
+            globals: BTreeMap::new(),
+            scope: BTreeMap::new(),
+            input_log: Vec::new(),
+            scene: SceneSnapshot::default(),
+            vm_snapshot: None,
+            script_call_stack: Vec::new(),
+            pending_ui_screen: None,
+            pending_ui_arguments: Vec::new(),
+            ui_registry: BTreeMap::new(),
+            mounted_ui_overlays: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Resource, Clone, Default)]

@@ -11,9 +11,9 @@ use thiserror::Error;
 use crate::{
     proto,
     state::{
-        AudioSnapshot, CameraSnapshot, DialogueSnapshot, ImageLayerSnapshot, SaveCheckpoint,
-        SaveGameData, SavedInput, SceneSnapshot, ScriptPosition, SpriteSnapshot, StoredValue,
-        TextEffectSnapshot,
+        AudioSnapshot, CURRENT_SAVE_VERSION, CameraSnapshot, DialogueSnapshot, ImageLayerSnapshot,
+        SaveCheckpoint, SaveGameData, SavedInput, SceneSnapshot, ScriptPosition, SpriteSnapshot,
+        StoredValue, TextEffectSnapshot,
     },
     vfs::workspace_base_path,
 };
@@ -111,6 +111,12 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
     type Error = StorageError;
 
     fn try_from(data: proto::SaveGameData) -> Result<Self, Self::Error> {
+        if data.version != CURRENT_SAVE_VERSION {
+            return Err(StorageError::InvalidSave(format!(
+                "save format version {} is incompatible with runtime version {}; create a new save after script API changes",
+                data.version, CURRENT_SAVE_VERSION
+            )));
+        }
         Ok(Self {
             version: data.version,
             resume_script: data.resume_script,
@@ -548,6 +554,27 @@ mod tests {
     use crate::script::{StoryRuntime, StoryRuntimeEvent, compile_story_bytecode};
 
     #[test]
+    fn new_save_data_defaults_to_the_current_format() {
+        assert_eq!(SaveGameData::default().version, CURRENT_SAVE_VERSION);
+    }
+
+    #[test]
+    fn rejects_bytecode_saves_from_an_incompatible_script_api() {
+        let data = SaveGameData {
+            version: CURRENT_SAVE_VERSION - 1,
+            resume_script: "story.hks".into(),
+            ..Default::default()
+        };
+        let error = decode_save_data(&encode_save_data(&data))
+            .expect_err("old bytecode manifests must not reach the linker");
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible with runtime version")
+        );
+    }
+
+    #[test]
     fn save_roundtrip_preserves_exact_vm_wait_state() {
         let source = "let name = \"guest\"\n\"save ${name} 🚀\"";
         let bytecode =
@@ -563,7 +590,7 @@ mod tests {
         ));
         let snapshot = runtime.snapshot().expect("wait boundary must be saveable");
         let data = SaveGameData {
-            version: 7,
+            version: CURRENT_SAVE_VERSION,
             resume_script: "system.hks".to_string(),
             vm_snapshot: Some(snapshot.clone()),
             pending_ui_screen: Some("ui/title.ui.hks".to_string()),

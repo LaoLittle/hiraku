@@ -2147,6 +2147,26 @@ screen {
     }
 
     #[test]
+    fn unknown_ui_node_methods_are_rejected_during_compilation() {
+        let error = evaluate_ui_component_named(
+            "memory://invalid.ui.hks",
+            r#"
+import ui.widgets.*
+__uiScreen {}.missingMethod()
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect_err("nominal UI methods must be resolved by the compiler manifest");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown method `missingMethod` for `UiNode`"),
+            "unexpected diagnostic: {message}"
+        );
+    }
+
+    #[test]
     fn script_defined_choice_renderer_expands_the_engine_choice_model() {
         let source = r#"
 import ui.widgets.*

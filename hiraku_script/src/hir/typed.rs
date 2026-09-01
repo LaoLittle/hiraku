@@ -781,12 +781,23 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 (HirExprKind::NonNull(value), ty)
             }
             ExprKind::Call {
-                callee,
+                callee: syntax_callee,
                 arguments,
                 trailing_block,
             } => {
-                let callee = self.lower_expression(callee);
+                let callee = self.lower_expression(syntax_callee);
                 let function = self.resolve_call(expression);
+                if function == ResolvedFunction::Dynamic
+                    && let ExprKind::Member { name, .. } = &syntax_callee.kind
+                    && let HirExprKind::Member { object, .. } = callee.kind
+                    && let ScriptType::Named(owner) = self.expression_type(object)
+                {
+                    let owner = self.symbols.resolve(*owner).unwrap_or("<unknown>");
+                    self.error(
+                        format!("unknown method `{name}` for `{owner}`"),
+                        syntax_callee.span,
+                    );
+                }
                 let (expected_parameters, expected_variadic) = match function {
                     ResolvedFunction::Builtin(builtin) => self
                         .manifest

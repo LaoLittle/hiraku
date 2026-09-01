@@ -347,12 +347,47 @@ pub fn drive_story_runtime(
                 effect @ (crate::script::capabilities::StoryEffect::Say { .. }
                 | crate::script::capabilities::StoryEffect::ContinueDialogue { .. }),
             ) => {
-                if !runtime.ui_registry.contains_key("dialogue") {
+                let Some(dialogue_component) = runtime.ui_registry.get("dialogue").cloned() else {
                     warn!(
                         "dialogue UI is not configured; call ui.set(\"dialogue\", \"path/to/dialogue.ui.hks\") before executing dialogue"
                     );
                     runtime.story = None;
+                    return;
+                };
+
+                let dialogue_overlay = "__role.dialogue";
+                let dialogue_ready = if runtime.mounted_ui_overlays.contains_key(dialogue_overlay) {
+                    true
                 } else {
+                    match evaluate_ui_at(
+                        &dialogue_component,
+                        &runtime,
+                        &vfs,
+                        &user_settings,
+                        textures.as_deref(),
+                        terms.as_deref(),
+                    ) {
+                        Ok(screen) => {
+                            runtime
+                                .mounted_ui_overlays
+                                .insert(dialogue_overlay.into(), dialogue_component.clone());
+                            pending_script_commands.enqueue(ScriptCommand::Ui(
+                                UiCommand::ShowOverlay {
+                                    name: dialogue_overlay.into(),
+                                    screen,
+                                },
+                            ));
+                            true
+                        }
+                        Err(error) => {
+                            warn!("failed to restore dialogue UI `{dialogue_component}`: {error}");
+                            runtime.story = None;
+                            false
+                        }
+                    }
+                };
+
+                if dialogue_ready {
                     match script_command_from_effect(effect, textures.as_deref()) {
                         Ok(command) => {
                             pending_script_commands.enqueue(command);
