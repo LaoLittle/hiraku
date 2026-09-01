@@ -1,4 +1,5 @@
 use super::*;
+use crate::script::StoryRuntimeEvent;
 
 fn stored_to_hks(value: StoredValue) -> hiraku_script::Value {
     match value {
@@ -144,7 +145,7 @@ pub(crate) fn resolve_ui_component_path(
     vfs.0.resolve_path(current_script, component)
 }
 
-pub fn bridge_story_events(
+pub fn drive_story_runtime(
     mut runtime: ResMut<ScriptRuntimeState>,
     mut response_messages: MessageReader<ScriptResponseMessage>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
@@ -184,7 +185,19 @@ pub fn bridge_story_events(
         }
     }
 
-    if let Some(event) = runtime.story_events.pop_front() {
+    let event = match runtime.story.as_mut() {
+        Some(story) => match story.step() {
+            Ok(event) => event,
+            Err(error) => {
+                warn!("HKS runtime failed: {error}");
+                runtime.story = None;
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(event) = event {
         match event {
             StoryRuntimeEvent::Effect(
                 effect @ (crate::script::capabilities::StoryEffect::GotoScript { .. }
@@ -228,7 +241,6 @@ pub fn bridge_story_events(
                         }
                         runtime.story = Some(story);
                         runtime.current_script = Some(target);
-                        runtime.story_events.clear();
                         runtime.task_requests.clear();
                     }
                     Err(error) => crate::script::emit_script_diagnostic(
@@ -246,13 +258,13 @@ pub fn bridge_story_events(
                 .and_then(|catalog| catalog.resolve_music(&path))
             {
                 Some(definition) => {
-                    pending_script_commands.enqueue(ScriptCommand::PlayBgm {
+                    pending_script_commands.enqueue(ScriptCommand::Audio(AudioCommand::PlayBgm {
                         path: definition.path.clone(),
                         prelude: definition.prelude.clone(),
                         volume,
                         fade_in: fade_in_ms.map(std::time::Duration::from_millis),
                         animation_id: None,
-                    });
+                    }));
                 }
                 None => warn!("music `{path}` is not defined"),
             },
@@ -264,12 +276,14 @@ pub fn bridge_story_events(
                 .and_then(|catalog| catalog.resolve_voice(&path))
             {
                 Some(definition) => {
-                    pending_script_commands.enqueue(ScriptCommand::PlayVoice {
-                        path: definition.path.clone(),
-                        volume,
-                        mode: VoicePlaybackMode::Exclusive,
-                        animation_id: None,
-                    });
+                    pending_script_commands.enqueue(ScriptCommand::Audio(
+                        AudioCommand::PlayVoice {
+                            path: definition.path.clone(),
+                            volume,
+                            mode: VoicePlaybackMode::Exclusive,
+                            animation_id: None,
+                        },
+                    ));
                 }
                 None => warn!("voice `{path}` is not defined"),
             },
@@ -293,10 +307,12 @@ pub fn bridge_story_events(
                             runtime
                                 .mounted_ui_overlays
                                 .insert("__role.dialogue".into(), target);
-                            pending_script_commands.enqueue(ScriptCommand::ShowOverlay {
-                                name: "__role.dialogue".into(),
-                                screen,
-                            });
+                            pending_script_commands.enqueue(ScriptCommand::Ui(
+                                UiCommand::ShowOverlay {
+                                    name: "__role.dialogue".into(),
+                                    screen,
+                                },
+                            ));
                         }
                         Err(error) => {
                             warn!("failed to enable dialogue UI `{component}`: {error}");
@@ -333,7 +349,7 @@ pub fn bridge_story_events(
                             .mounted_ui_overlays
                             .insert(name.clone(), target.clone());
                         pending_script_commands
-                            .enqueue(ScriptCommand::ShowOverlay { name, screen });
+                            .enqueue(ScriptCommand::Ui(UiCommand::ShowOverlay { name, screen }));
                     }
                     Err(error) => {
                         warn!("failed to mount UI overlay `{name}` from `{target}`: {error}")
@@ -344,7 +360,7 @@ pub fn bridge_story_events(
                 crate::script::capabilities::StoryEffect::UnmountUiOverlay { name },
             ) => {
                 runtime.mounted_ui_overlays.remove(&name);
-                pending_script_commands.enqueue(ScriptCommand::HideOverlay { name });
+                pending_script_commands.enqueue(ScriptCommand::Ui(UiCommand::HideOverlay { name }));
             }
             StoryRuntimeEvent::Effect(
                 effect @ (crate::script::capabilities::StoryEffect::Say { .. }
@@ -355,7 +371,6 @@ pub fn bridge_story_events(
                         "dialogue UI is not configured; call ui.set(\"dialogue\", \"path/to/dialogue.ui.hks\") before executing dialogue"
                     );
                     runtime.story = None;
-                    runtime.story_events.clear();
                 } else {
                     match script_command_from_effect(effect, textures.as_deref()) {
                         Ok(command) => {
@@ -376,8 +391,9 @@ pub fn bridge_story_events(
             StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::DialogueAdvance) => {
                 let request = runtime.allocate_request();
                 runtime.wait_request = Some(request);
-                pending_script_commands
-                    .enqueue(ScriptCommand::AwaitDialogueAdvance { done: request });
+                pending_script_commands.enqueue(ScriptCommand::Dialogue(
+                    DialogueCommand::AwaitAdvance { done: request },
+                ));
             }
             StoryRuntimeEvent::Choice { prompt, options } => {
                 let request = runtime.allocate_request();
@@ -387,7 +403,6 @@ pub fn bridge_story_events(
                         "choice UI is not configured; call ui.set(\"choice\", \"path/to/choice.ui.hks\") before executing choice"
                     );
                     runtime.story = None;
-                    runtime.story_events.clear();
                     return;
                 };
                 let choice_model = StoredValue::Map(BTreeMap::from([
@@ -407,15 +422,14 @@ pub fn bridge_story_events(
                     BTreeMap::from([("choice".into(), choice_model)]),
                 ) {
                     Ok(screen) => {
-                        pending_script_commands.enqueue(ScriptCommand::ShowScreen {
+                        pending_script_commands.enqueue(ScriptCommand::Ui(UiCommand::ShowScreen {
                             screen,
                             done: Some(request),
-                        });
+                        }));
                     }
                     Err(error) => {
                         warn!("failed to render choice UI `{target}`: {error}");
                         runtime.story = None;
-                        runtime.story_events.clear();
                     }
                 }
             }
@@ -436,10 +450,10 @@ pub fn bridge_story_events(
                 runtime.wait_request = Some(request);
                 match screen {
                     Ok(screen) => {
-                        pending_script_commands.enqueue(ScriptCommand::ShowScreen {
+                        pending_script_commands.enqueue(ScriptCommand::Ui(UiCommand::ShowScreen {
                             screen,
                             done: Some(request),
-                        });
+                        }));
                     }
                     Err(error) => {
                         warn!("failed to render UI script `{target}`: {error}");
@@ -459,16 +473,20 @@ pub fn bridge_story_events(
                     let request = runtime.allocate_request();
                     let animation_id = format!("hks-task-voice-{}", request.0);
                     runtime.task_requests.insert(request, task);
-                    pending_script_commands.enqueue(ScriptCommand::PlayVoice {
-                        path: definition.path.clone(),
-                        volume,
-                        mode: VoicePlaybackMode::Concurrent,
-                        animation_id: Some(animation_id.clone()),
-                    });
-                    pending_script_commands.enqueue(ScriptCommand::WaitAnimations {
-                        ids: vec![animation_id],
-                        done: request,
-                    });
+                    pending_script_commands.enqueue(ScriptCommand::Audio(
+                        AudioCommand::PlayVoice {
+                            path: definition.path.clone(),
+                            volume,
+                            mode: VoicePlaybackMode::Concurrent,
+                            animation_id: Some(animation_id.clone()),
+                        },
+                    ));
+                    pending_script_commands.enqueue(ScriptCommand::Animation(
+                        AnimationCommand::Wait {
+                            ids: vec![animation_id],
+                            done: request,
+                        },
+                    ));
                 }
                 None => {
                     warn!("voice `{path}` is not defined");
@@ -498,7 +516,6 @@ pub fn bridge_story_events(
                     caller.set_globals(globals);
                     runtime.story = Some(caller);
                     runtime.current_script = Some(frame.script);
-                    runtime.story_events.clear();
                     runtime.task_requests.clear();
                 }
             }

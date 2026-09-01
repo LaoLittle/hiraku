@@ -50,7 +50,6 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub stage: ResMut<'w, StageState>,
     pub waits: ResMut<'w, PendingWaits>,
     pub pending_script_commands: ResMut<'w, PendingScriptCommands>,
-    pub active_batches: ResMut<'w, ActiveScriptBatches>,
     pub dialogue_state: ResMut<'w, DialogueState>,
     pub choice_state: ResMut<'w, ChoiceState>,
     pub screen_state: ResMut<'w, ScreenUiState>,
@@ -270,7 +269,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     &mut ctx.choice_state,
                     &mut ctx.screen_state,
                     &mut ctx.pending_script_commands,
-                    &mut ctx.active_batches,
                     &mut ctx.pending_characters,
                     &mut ctx.animations,
                     &mut ctx.voice_state,
@@ -328,8 +326,9 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     Some(&ctx.terms),
                 ) {
                     Ok(screen) => {
-                        ctx.pending_script_commands
-                            .enqueue(ScriptCommand::ShowScreen { screen, done: None });
+                        ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
+                            UiCommand::ShowScreen { screen, done: None },
+                        ));
                     }
                     Err(error) => warn!("failed to open UI role `{role}`: {error}"),
                 }
@@ -352,7 +351,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     &mut ctx.choice_state,
                     &mut ctx.screen_state,
                     &mut ctx.pending_script_commands,
-                    &mut ctx.active_batches,
                     &mut ctx.pending_characters,
                     &mut ctx.animations,
                     &mut ctx.voice_state,
@@ -522,7 +520,6 @@ fn abort_runtime_waiters(
     choice_state: &mut ChoiceState,
     screen_state: &mut ScreenUiState,
     pending_script_commands: &mut PendingScriptCommands,
-    active_batches: &mut ActiveScriptBatches,
     pending_characters: &mut PendingCharacterShows,
     animations: &mut AnimationState,
     voice_state: &mut VoiceState,
@@ -535,7 +532,6 @@ fn abort_runtime_waiters(
     dialogue_state.waiting.take();
     waits.items.clear();
     pending_script_commands.clear();
-    active_batches.items.clear();
     pending_characters.items.clear();
     animations.waits.clear();
     finish_all_voices(commands, animations, voice_state);

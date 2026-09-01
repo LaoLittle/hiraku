@@ -17,8 +17,8 @@ use super::task_runtime::{
     ExecutionMode, TaskEvent, TaskScheduler, TaskSchedulerError, TaskSchedulerSnapshot,
 };
 use crate::script::capabilities::{
-    CharacterCapabilityError, StoryEffect, StoryNativeHost, StoryNativeHostSnapshot, StoryWait,
-    story_manifest,
+    CharacterCapabilityError, StoryCallOutcome, StoryControl, StoryEffect, StoryNativeHost,
+    StoryNativeHostSnapshot, StoryTaskKind, StoryWait, story_manifest,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,8 +44,7 @@ pub struct StoryRuntime {
     bytecode: HksRuntime,
     host: StoryNativeHost,
     pending: VecDeque<StoryRuntimeEvent>,
-    active_task_effects: BTreeMap<u64, Vec<(StoryEffect, Value)>>,
-    task_modes: BTreeMap<u64, ExecutionMode>,
+    active_task_effects: BTreeMap<u64, Vec<StoryEffect>>,
     deferred_task_completions: BTreeMap<u64, Value>,
     waiting_task: Option<u64>,
     waiting_interactive_task: Option<u64>,
@@ -101,8 +100,7 @@ pub enum StoryRuntimeEvent {
 pub struct StoryRuntimeSnapshot {
     bytecode: HksRuntimeSnapshot,
     host: StoryNativeHostSnapshot,
-    active_task_effects: BTreeMap<u64, Vec<(StoryEffect, Value)>>,
-    task_modes: BTreeMap<u64, ExecutionMode>,
+    active_task_effects: BTreeMap<u64, Vec<StoryEffect>>,
     deferred_task_completions: BTreeMap<u64, Value>,
     waiting_task: Option<u64>,
     waiting_interactive_task: Option<u64>,
@@ -117,7 +115,6 @@ impl StoryRuntime {
             host: StoryNativeHost::new(),
             pending: VecDeque::new(),
             active_task_effects: BTreeMap::new(),
-            task_modes: BTreeMap::new(),
             deferred_task_completions: BTreeMap::new(),
             waiting_task: None,
             waiting_interactive_task: None,
@@ -134,7 +131,6 @@ impl StoryRuntime {
             bytecode: self.bytecode.snapshot(),
             host: self.host.snapshot(),
             active_task_effects: self.active_task_effects.clone(),
-            task_modes: self.task_modes.clone(),
             deferred_task_completions: self.deferred_task_completions.clone(),
             waiting_task: self.waiting_task,
             waiting_interactive_task: self.waiting_interactive_task,
@@ -155,8 +151,8 @@ impl StoryRuntime {
         for (task, effects) in &mut snapshot.active_task_effects {
             let had_voice = effects
                 .iter()
-                .any(|(effect, _)| matches!(effect, StoryEffect::PlayVoice { .. }));
-            effects.retain(|(effect, _)| !matches!(effect, StoryEffect::PlayVoice { .. }));
+                .any(|effect| matches!(effect, StoryEffect::PlayVoice { .. }));
+            effects.retain(|effect| !matches!(effect, StoryEffect::PlayVoice { .. }));
             if had_voice && effects.is_empty() {
                 completed_voice_tasks.push(*task);
             }
@@ -168,12 +164,10 @@ impl StoryRuntime {
             .active_task_effects
             .iter()
             .flat_map(|(task, effects)| {
-                effects
-                    .iter()
-                    .map(|(effect, _)| StoryRuntimeEvent::TaskEffect {
-                        task: *task,
-                        effect: effect.clone(),
-                    })
+                effects.iter().map(|effect| StoryRuntimeEvent::TaskEffect {
+                    task: *task,
+                    effect: effect.clone(),
+                })
             })
             .collect();
         let mut runtime = Self {
@@ -181,7 +175,6 @@ impl StoryRuntime {
             host: StoryNativeHost::restore(snapshot.host),
             pending,
             active_task_effects: snapshot.active_task_effects,
-            task_modes: snapshot.task_modes,
             deferred_task_completions: snapshot.deferred_task_completions,
             waiting_task: snapshot.waiting_task,
             waiting_interactive_task: snapshot.waiting_interactive_task,
@@ -200,6 +193,10 @@ impl StoryRuntime {
 
     pub fn globals(&self) -> &std::collections::BTreeMap<String, Value> {
         self.bytecode.globals()
+    }
+
+    pub(crate) fn enqueue_event(&mut self, event: StoryRuntimeEvent) {
+        self.pending.push_back(event);
     }
 
     /// Reconstructs the host-visible boundary represented by a restored VM.
@@ -237,7 +234,6 @@ impl StoryRuntime {
             let task = self
                 .bytecode
                 .spawn_closure(&option, ExecutionMode::Interactive)?;
-            self.task_modes.insert(task, ExecutionMode::Interactive);
             self.choice = Some(ChoiceState::RunningBranch { task, selected });
             self.blocked = false;
             return Ok(());
@@ -270,11 +266,10 @@ impl StoryRuntime {
     }
 
     fn finish_task_effects(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
-        if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence) {
+        if self.bytecode.task_mode(task) == Some(ExecutionMode::Sequence) {
             let _ = self.bytecode.unpause_task(task);
         }
         if let Some(value) = self.deferred_task_completions.remove(&task) {
-            self.task_modes.remove(&task);
             if self.waiting_task == Some(task) {
                 self.waiting_task = None;
                 self.bytecode.resume_main(value)?;
@@ -300,65 +295,8 @@ impl StoryRuntime {
                 let Some(event) = self.bytecode.step_task()? else {
                     return Ok(None);
                 };
-                match event {
-                    HksRuntimeEvent::TaskCall { task, call } => {
-                        let value = self.host.call(&call)?;
-                        if call.builtin == story_manifest().resolve("voice").expect("voice builtin")
-                        {
-                            let mut effects = self.host.drain_effects();
-                            let effect =
-                                effects.pop().ok_or(StoryRuntimeError::MissingTaskEffect)?;
-                            if !effects.is_empty() {
-                                return Err(StoryRuntimeError::AmbiguousTaskEffect);
-                            }
-                            self.active_task_effects
-                                .entry(task)
-                                .or_default()
-                                .push((effect.clone(), value.clone()));
-                            self.bytecode.resume_task(task, value)?;
-                            return Ok(Some(StoryRuntimeEvent::TaskEffect { task, effect }));
-                        }
-                        self.bytecode.resume_task(task, value)?;
-                    }
-                    HksRuntimeEvent::TaskStatement { task, value } => {
-                        self.host.handle_statement(&value)?;
-                        self.pending.extend(
-                            self.host
-                                .drain_effects()
-                                .into_iter()
-                                .map(StoryRuntimeEvent::Effect),
-                        );
-                        let automatic_dialogue = self.host.take_wait().is_some();
-                        if automatic_dialogue
-                            && self.task_modes.get(&task) == Some(&ExecutionMode::Interactive)
-                        {
-                            self.bytecode.pause_task(task)?;
-                            self.waiting_interactive_task = Some(task);
-                            self.pending
-                                .push_back(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance));
-                        }
-                        if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence)
-                            && automatic_dialogue
-                            && self.active_task_effects.contains_key(&task)
-                        {
-                            self.bytecode.pause_task(task)?;
-                        }
-                        if let Some(event) = self.pending.pop_front() {
-                            return Ok(Some(event));
-                        }
-                    }
-                    HksRuntimeEvent::TaskCompleted { task, value } => {
-                        if self.active_task_effects.contains_key(&task) {
-                            self.deferred_task_completions.insert(task, value);
-                        } else {
-                            self.task_modes.remove(&task);
-                            if self.waiting_task == Some(task) {
-                                self.waiting_task = None;
-                                self.bytecode.resume_main(value)?;
-                            }
-                        }
-                    }
-                    _ => unreachable!("task-only stepping cannot yield a main VM event"),
+                if let Some(event) = self.handle_task_event(event)? {
+                    return Ok(Some(event));
                 }
             }
         }
@@ -367,77 +305,37 @@ impl StoryRuntime {
                 return Ok(None);
             };
             match event {
-                HksRuntimeEvent::Call(call) => {
-                    let task_mode = if call.builtin
-                        == story_manifest().resolve("seq").expect("seq builtin")
-                    {
-                        Some(ExecutionMode::Sequence)
-                    } else if call.builtin == story_manifest().resolve("par").expect("par builtin")
-                    {
-                        Some(ExecutionMode::Parallel)
-                    } else {
-                        None
-                    };
-                    if let Some(mode) = task_mode {
-                        let Some(closure) = call
-                            .arguments
-                            .first()
-                            .and_then(|argument| closure_value(&argument.value))
-                        else {
-                            return Err(StoryRuntimeError::InvalidTaskClosure);
+                HksRuntimeEvent::Call(call) => match self.host.call(&call)? {
+                    StoryCallOutcome::Return(value) => self.bytecode.resume_main(value)?,
+                    StoryCallOutcome::Control(StoryControl::SpawnTask { kind, closure }) => {
+                        let mode = match kind {
+                            StoryTaskKind::Sequence => ExecutionMode::Sequence,
+                            StoryTaskKind::Parallel => ExecutionMode::Parallel,
                         };
-                        let task = self.bytecode.spawn_closure(&closure, mode)?;
-                        self.task_modes.insert(task, mode);
+                        let task = self.bytecode.spawn_closure(&ClosureValue(closure), mode)?;
                         self.bytecode.resume_main(Value::Task(task))?;
-                        continue;
                     }
-                    if call.builtin == story_manifest().resolve("choice").expect("choice builtin") {
-                        let closure =
-                            closure_argument(&call).ok_or(StoryRuntimeError::InvalidChoice)?;
-                        let prompt = call
-                            .arguments
-                            .iter()
-                            .find_map(|argument| match &argument.value {
-                                Value::String(prompt) => Some(prompt.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_default();
+                    StoryCallOutcome::Control(StoryControl::BeginChoice { prompt, closure }) => {
                         let builder_task = self
                             .bytecode
-                            .spawn_closure(&closure, ExecutionMode::Interactive)?;
-                        self.task_modes
-                            .insert(builder_task, ExecutionMode::Interactive);
+                            .spawn_closure(&ClosureValue(closure), ExecutionMode::Interactive)?;
                         self.choice = Some(ChoiceState::Collecting {
                             builder_task,
                             prompt,
                             options: Vec::new(),
                         });
-                        continue;
                     }
-                    if call.builtin
-                        == story_manifest()
-                            .resolve_selector("ui", "open")
-                            .expect("ui.open builtin")
-                    {
-                        let Some(Value::String(path)) =
-                            call.arguments.first().map(|arg| &arg.value)
-                        else {
-                            return Err(StoryRuntimeError::InvalidOpenUi);
-                        };
+                    StoryCallOutcome::Control(StoryControl::OpenUi { path }) => {
                         self.blocked = true;
-                        return Ok(Some(StoryRuntimeEvent::OpenUi { path: path.clone() }));
+                        return Ok(Some(StoryRuntimeEvent::OpenUi { path }));
                     }
-                    if call.builtin == story_manifest().resolve("wait").expect("wait builtin") {
-                        let Some(Value::Task(task)) = call.arguments.first().map(|arg| &arg.value)
-                        else {
-                            return Err(StoryRuntimeError::InvalidTaskHandle);
-                        };
-                        self.waiting_task = Some(*task);
-                        continue;
+                    StoryCallOutcome::Control(StoryControl::WaitTask { task }) => {
+                        self.waiting_task = Some(task);
                     }
-                    let value = self.host.call(&call)?;
-                    self.bytecode.resume_main(value)?;
-                }
+                    StoryCallOutcome::Control(control @ StoryControl::AddChoiceOption { .. }) => {
+                        return Err(StoryRuntimeError::UnexpectedMainControl(control));
+                    }
+                },
                 HksRuntimeEvent::Statement(statement) => {
                     self.host.handle_statement(&statement)?;
                     self.enqueue_host_boundaries();
@@ -448,107 +346,11 @@ impl StoryRuntime {
                         return Ok(Some(event));
                     }
                 }
-                HksRuntimeEvent::TaskCall { task, call } => {
-                    if call.builtin == story_manifest().resolve("option").expect("option builtin") {
-                        let Some(ChoiceState::Collecting { options, .. }) = &mut self.choice else {
-                            return Err(StoryRuntimeError::InvalidChoice);
-                        };
-                        let Some(Value::String(label)) =
-                            call.arguments.first().map(|arg| &arg.value)
-                        else {
-                            return Err(StoryRuntimeError::InvalidChoice);
-                        };
-                        let body =
-                            closure_argument(&call).ok_or(StoryRuntimeError::InvalidChoice)?;
-                        options.push(ChoiceOption {
-                            label: label.clone(),
-                            body,
-                        });
-                        self.bytecode.resume_task(task, Value::Unit)?;
-                        continue;
-                    }
-                    let value = self.host.call(&call)?;
-                    if call.builtin == story_manifest().resolve("voice").expect("voice builtin") {
-                        let mut effects = self.host.drain_effects();
-                        let effect = effects.pop().ok_or(StoryRuntimeError::MissingTaskEffect)?;
-                        if !effects.is_empty() {
-                            return Err(StoryRuntimeError::AmbiguousTaskEffect);
-                        }
-                        self.active_task_effects
-                            .entry(task)
-                            .or_default()
-                            .push((effect.clone(), value.clone()));
-                        self.bytecode.resume_task(task, value)?;
-                        return Ok(Some(StoryRuntimeEvent::TaskEffect { task, effect }));
-                    }
-                    self.bytecode.resume_task(task, value)?;
-                }
-                HksRuntimeEvent::TaskStatement { task, value } => {
-                    self.host.handle_statement(&value)?;
-                    self.pending.extend(
-                        self.host
-                            .drain_effects()
-                            .into_iter()
-                            .map(StoryRuntimeEvent::Effect),
-                    );
-                    let automatic_dialogue = self.host.take_wait().is_some();
-                    if automatic_dialogue
-                        && self.task_modes.get(&task) == Some(&ExecutionMode::Interactive)
-                    {
-                        self.bytecode.pause_task(task)?;
-                        self.waiting_interactive_task = Some(task);
-                        self.pending
-                            .push_back(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance));
-                    }
-                    if self.task_modes.get(&task) == Some(&ExecutionMode::Sequence)
-                        && automatic_dialogue
-                        && self.active_task_effects.contains_key(&task)
-                    {
-                        self.bytecode.pause_task(task)?;
-                    }
-                    if let Some(event) = self.pending.pop_front() {
+                event @ (HksRuntimeEvent::TaskCall { .. }
+                | HksRuntimeEvent::TaskStatement { .. }
+                | HksRuntimeEvent::TaskCompleted { .. }) => {
+                    if let Some(event) = self.handle_task_event(event)? {
                         return Ok(Some(event));
-                    }
-                }
-                HksRuntimeEvent::TaskCompleted { task, value } => {
-                    if self.active_task_effects.contains_key(&task) {
-                        self.deferred_task_completions.insert(task, value);
-                        continue;
-                    }
-                    self.task_modes.remove(&task);
-                    if let Some(ChoiceState::Collecting {
-                        builder_task,
-                        prompt,
-                        options,
-                    }) = &self.choice
-                        && *builder_task == task
-                    {
-                        let prompt = prompt.clone();
-                        let options = options.clone();
-                        let labels = options.iter().map(|option| option.label.clone()).collect();
-                        self.choice = Some(ChoiceState::AwaitingSelection {
-                            prompt: prompt.clone(),
-                            options,
-                        });
-                        self.blocked = true;
-                        return Ok(Some(StoryRuntimeEvent::Choice {
-                            prompt,
-                            options: labels,
-                        }));
-                    }
-                    if let Some(ChoiceState::RunningBranch {
-                        task: branch,
-                        selected,
-                    }) = self.choice
-                        && branch == task
-                    {
-                        self.choice = None;
-                        self.bytecode.resume_main(Value::Number(selected as f64))?;
-                        continue;
-                    }
-                    if self.waiting_task == Some(task) {
-                        self.waiting_task = None;
-                        self.bytecode.resume_main(value)?;
                     }
                 }
                 HksRuntimeEvent::Completed(value) => {
@@ -569,18 +371,107 @@ impl StoryRuntime {
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
     }
-}
 
-fn closure_argument(call: &BuiltinCall) -> Option<ClosureValue> {
-    call.arguments
-        .iter()
-        .find_map(|argument| closure_value(&argument.value))
-}
+    fn handle_task_event(
+        &mut self,
+        event: HksRuntimeEvent,
+    ) -> Result<Option<StoryRuntimeEvent>, StoryRuntimeError> {
+        match event {
+            HksRuntimeEvent::TaskCall { task, call } => match self.host.call(&call)? {
+                StoryCallOutcome::Return(value) => {
+                    self.bytecode.resume_task(task, value)?;
+                }
+                StoryCallOutcome::Control(StoryControl::AddChoiceOption { label, closure }) => {
+                    let Some(ChoiceState::Collecting { options, .. }) = &mut self.choice else {
+                        return Err(StoryRuntimeError::InvalidChoice);
+                    };
+                    options.push(ChoiceOption {
+                        label,
+                        body: ClosureValue(closure),
+                    });
+                    self.bytecode.resume_task(task, Value::Unit)?;
+                }
+                StoryCallOutcome::Control(control) => {
+                    return Err(StoryRuntimeError::UnsupportedTaskControl(control));
+                }
+            },
+            HksRuntimeEvent::TaskStatement { task, value } => {
+                self.host.handle_statement(&value)?;
+                self.enqueue_task_boundaries(task)?;
+                return Ok(self.pending.pop_front());
+            }
+            HksRuntimeEvent::TaskCompleted { task, value } => {
+                if self.active_task_effects.contains_key(&task) {
+                    self.deferred_task_completions.insert(task, value);
+                    return Ok(None);
+                }
+                if let Some(ChoiceState::Collecting {
+                    builder_task,
+                    prompt,
+                    options,
+                }) = &self.choice
+                    && *builder_task == task
+                {
+                    let prompt = prompt.clone();
+                    let options = options.clone();
+                    let labels = options.iter().map(|option| option.label.clone()).collect();
+                    self.choice = Some(ChoiceState::AwaitingSelection {
+                        prompt: prompt.clone(),
+                        options,
+                    });
+                    self.blocked = true;
+                    return Ok(Some(StoryRuntimeEvent::Choice {
+                        prompt,
+                        options: labels,
+                    }));
+                }
+                if let Some(ChoiceState::RunningBranch {
+                    task: branch,
+                    selected,
+                }) = self.choice
+                    && branch == task
+                {
+                    self.choice = None;
+                    self.bytecode.resume_main(Value::Number(selected as f64))?;
+                    return Ok(None);
+                }
+                if self.waiting_task == Some(task) {
+                    self.waiting_task = None;
+                    self.bytecode.resume_main(value)?;
+                }
+            }
+            _ => unreachable!("task handler requires a task VM event"),
+        }
+        Ok(None)
+    }
 
-fn closure_value(value: &Value) -> Option<ClosureValue> {
-    match value {
-        Value::Closure { .. } | Value::Function { .. } => Some(ClosureValue(value.clone())),
-        _ => None,
+    fn enqueue_task_boundaries(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
+        for effect in self.host.drain_effects() {
+            if matches!(effect, StoryEffect::PlayVoice { .. }) {
+                self.active_task_effects
+                    .entry(task)
+                    .or_default()
+                    .push(effect.clone());
+                self.pending
+                    .push_back(StoryRuntimeEvent::TaskEffect { task, effect });
+            } else {
+                self.pending.push_back(StoryRuntimeEvent::Effect(effect));
+            }
+        }
+        let automatic_dialogue = self.host.take_wait().is_some();
+        if automatic_dialogue && self.bytecode.task_mode(task) == Some(ExecutionMode::Interactive) {
+            self.bytecode.pause_task(task)?;
+            self.waiting_interactive_task = Some(task);
+            self.pending
+                .push_back(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance));
+        }
+        if self.bytecode.task_mode(task) == Some(ExecutionMode::Sequence)
+            && automatic_dialogue
+            && self.active_task_effects.contains_key(&task)
+        {
+            self.bytecode.pause_task(task)?;
+        }
+        Ok(())
     }
 }
 
@@ -726,6 +617,10 @@ impl HksRuntime {
         Ok(())
     }
 
+    fn task_mode(&self, task: u64) -> Option<ExecutionMode> {
+        self.scheduler.mode(task)
+    }
+
     fn link_call(&self, call: SymbolCall) -> Result<BuiltinCall, HksRuntimeError> {
         let Some(LinkedFunction::Native(builtin)) = self.linked.resolve(call.function) else {
             return Err(HksRuntimeError::UnlinkedCall(call.function));
@@ -762,24 +657,18 @@ pub enum StoryRuntimeError {
     Bytecode(#[from] HksRuntimeError),
     #[error(transparent)]
     Capability(#[from] CharacterCapabilityError),
-    #[error("ui.open requires a string role or component path")]
-    InvalidOpenUi,
     #[error("choice requires a string prompt and a list of string options")]
     InvalidChoice,
-    #[error("wait requires a task handle")]
-    InvalidTaskHandle,
-    #[error("seq/par require a trailing closure")]
-    InvalidTaskClosure,
+    #[error("story control {0:?} cannot be issued by the main program")]
+    UnexpectedMainControl(StoryControl),
+    #[error("story control {0:?} is not supported inside a task closure")]
+    UnsupportedTaskControl(StoryControl),
     #[error("story runtime is not waiting for a host response")]
     NotBlocked,
     #[error("story runtime snapshot requires an empty effect queue")]
     NotAtSnapshotBoundary,
     #[error("task {0} has no pending host effect")]
     UnknownTaskEffect(u64),
-    #[error("task native call did not produce an effect")]
-    MissingTaskEffect,
-    #[error("task native call produced more than one effect")]
-    AmbiguousTaskEffect,
 }
 
 fn evaluate_statement_template(
@@ -984,7 +873,11 @@ mod tests {
         loop {
             match runtime.step().expect("runtime must advance") {
                 Some(HksRuntimeEvent::Call(call)) => {
-                    let value = host.call(&call).expect("native call must succeed");
+                    let value = host
+                        .call(&call)
+                        .expect("native call must succeed")
+                        .into_return_value()
+                        .expect("ordinary native call must return a value");
                     runtime
                         .resume_main(value)
                         .expect("native result must resume the VM");
@@ -1035,7 +928,11 @@ mod tests {
         loop {
             match runtime.step().expect("runtime must advance") {
                 Some(HksRuntimeEvent::Call(call)) => {
-                    let value = host.call(&call).expect("native call must succeed");
+                    let value = host
+                        .call(&call)
+                        .expect("native call must succeed")
+                        .into_return_value()
+                        .expect("ordinary native call must return a value");
                     runtime
                         .resume_main(value)
                         .expect("native result must resume the VM");

@@ -146,6 +146,10 @@ impl TaskScheduler {
         Ok(())
     }
 
+    pub fn mode(&self, task: u64) -> Option<ExecutionMode> {
+        self.tasks.get(&task).map(|state| state.mode)
+    }
+
     pub fn eval_template(&self, task: u64, template: &str) -> Result<String, TemplateError> {
         self.tasks
             .get(&task)

@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
-use bevy::ecs::{resource::Resource, system::ResMut};
+use bevy::ecs::resource::Resource;
 use serde::{Deserialize, Serialize};
 
 use super::{ScriptRequestId, ScriptResponse, ScriptResponseMessage};
-use crate::script::hks_runtime::{StoryRuntime, StoryRuntimeEvent};
+use crate::script::hks_runtime::StoryRuntime;
 
 pub struct ScriptCallFrame {
     pub script: String,
@@ -32,7 +32,6 @@ pub enum CameraProjectionMode {
 #[derive(Default, Resource)]
 pub struct ScriptRuntimeState {
     pub story: Option<StoryRuntime>,
-    pub story_events: VecDeque<StoryRuntimeEvent>,
     pub wait_request: Option<ScriptRequestId>,
     pub current_script: Option<String>,
     pub call_stack: Vec<ScriptCallFrame>,
@@ -66,27 +65,6 @@ impl ScriptRuntimeState {
         self.response_inbox.retain(|id, _| *id >= request);
         self.response_inbox.remove(&request)
     }
-
-    fn tick(&mut self) {
-        if !self.story_events.is_empty() {
-            return;
-        }
-        let Some(story) = self.story.as_mut() else {
-            return;
-        };
-        match story.step() {
-            Ok(Some(event)) => self.story_events.push_back(event),
-            Ok(None) => {}
-            Err(error) => {
-                bevy::log::warn!("HKS runtime failed: {error}");
-                self.story = None;
-            }
-        }
-    }
-}
-
-pub fn tick_script_runtime(mut runtime: ResMut<ScriptRuntimeState>) {
-    runtime.tick();
 }
 
 #[cfg(test)]

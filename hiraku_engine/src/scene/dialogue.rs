@@ -426,27 +426,6 @@ fn reveal_all_dialogue_chars(
     reveal.accumulator = 0.0;
 }
 
-pub(super) fn apply_text_effect_spec(
-    effect: &mut DialogueTextEffect,
-    spec: crate::script::DialogueTextEffectSpec,
-) {
-    if let Some(mode) = spec.mode.as_deref() {
-        effect.mode = match mode {
-            "instant" => DialogueTextEffectMode::Instant,
-            _ => DialogueTextEffectMode::TypewriterFade,
-        };
-    }
-    if let Some(cps) = spec.cps {
-        effect.cps = cps.max(1.0);
-    }
-    if let Some(fade_seconds) = spec.fade_seconds {
-        effect.fade_seconds = fade_seconds.max(0.0);
-    }
-    if let Some(fade_ms) = spec.fade_ms {
-        effect.fade_seconds = (fade_ms / 1000.0).max(0.0);
-    }
-}
-
 pub(super) fn text_effect_snapshot(effect: &DialogueTextEffect) -> TextEffectSnapshot {
     TextEffectSnapshot {
         mode: match effect.mode {
@@ -472,73 +451,6 @@ pub(super) fn dialogue_text_effect_from_snapshot(
         effect.fade_seconds = snapshot.fade_seconds;
     }
     effect
-}
-
-pub(super) fn refresh_dialogue_ui_style(
-    ui_fonts: &UiFonts,
-    ui_style: &UiStyle,
-    dialogue_root_node: &mut Query<&mut Node, With<DialogueRoot>>,
-    dialogue_background: &mut Query<&mut BackgroundColor, With<DialogueRoot>>,
-    dialogue_border: &mut Query<&mut BorderColor, With<DialogueRoot>>,
-    speaker_font: &mut Query<&mut TextFont, (With<SpeakerText>, Without<LineText>)>,
-    line_font: &mut Query<&mut TextFont, (With<LineText>, Without<SpeakerText>)>,
-    hint_font: &mut Query<&mut TextFont, (With<HintText>, Without<SpeakerText>, Without<LineText>)>,
-    hint_visibility: &mut Query<&mut Visibility, (With<HintText>, Without<DialogueRoot>)>,
-    speaker_color: &mut Query<
-        &mut TextColor,
-        (With<SpeakerText>, Without<LineText>, Without<HintText>),
-    >,
-    line_color: &mut Query<
-        &mut TextColor,
-        (With<LineText>, Without<SpeakerText>, Without<HintText>),
-    >,
-    hint_color: &mut Query<
-        &mut TextColor,
-        (With<HintText>, Without<SpeakerText>, Without<LineText>),
-    >,
-) {
-    if let Ok(mut node) = dialogue_root_node.single_mut() {
-        node.left = px(ui_style.dialogue_left);
-        node.right = px(ui_style.dialogue_right);
-        node.bottom = px(ui_style.dialogue_bottom);
-        node.min_height = px(ui_style.dialogue_min_height);
-        node.padding = UiRect::axes(
-            px(ui_style.dialogue_padding_x),
-            px(ui_style.dialogue_padding_y),
-        );
-        node.border_radius = BorderRadius::all(px(ui_style.dialogue_radius));
-    }
-    if let Ok(mut color) = dialogue_background.single_mut() {
-        *color = ui_style.dialogue_bg.into();
-    }
-    if let Ok(mut color) = dialogue_border.single_mut() {
-        *color = BorderColor::all(ui_style.dialogue_border);
-    }
-    if let Ok(mut font) = speaker_font.single_mut() {
-        *font = ui_text_font(ui_fonts, ui_style.speaker_size);
-    }
-    if let Ok(mut font) = line_font.single_mut() {
-        *font = ui_text_font(ui_fonts, ui_style.line_size);
-    }
-    if let Ok(mut font) = hint_font.single_mut() {
-        *font = ui_text_font(ui_fonts, ui_style.hint_size);
-    }
-    if let Ok(mut visibility) = hint_visibility.single_mut() {
-        *visibility = if ui_style.hint_visible {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-    }
-    if let Ok(mut color) = speaker_color.single_mut() {
-        *color = ui_style.speaker_color.into();
-    }
-    if let Ok(mut color) = line_color.single_mut() {
-        *color = ui_style.line_color.into();
-    }
-    if let Ok(mut color) = hint_color.single_mut() {
-        *color = ui_style.hint_color.into();
-    }
 }
 
 pub(super) fn complete_dialogue_wait(

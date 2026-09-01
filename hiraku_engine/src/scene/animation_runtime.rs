@@ -16,16 +16,6 @@ pub struct PendingAnimationCancels {
     pub ids: Vec<String>,
 }
 
-#[derive(Resource, Default)]
-pub struct ActiveScriptBatches {
-    pub items: Vec<ActiveScriptBatch>,
-}
-
-pub struct ActiveScriptBatch {
-    pub remaining: VecDeque<BatchSubmissionItem>,
-    pub current_handle: String,
-}
-
 pub struct PendingWait {
     pub timer: Timer,
     pub animation_id: Option<String>,
@@ -300,28 +290,6 @@ pub fn tick_animation_waits(
             response: ScriptResponse::Continue,
         });
     }
-}
-
-pub fn tick_script_batches(
-    mut pending_script_commands: ResMut<PendingScriptCommands>,
-    mut active_batches: ResMut<ActiveScriptBatches>,
-    animations: Res<AnimationState>,
-) {
-    let completed = animations.completed.clone();
-    active_batches.items.retain_mut(|batch| {
-        if !completed.contains(&batch.current_handle) {
-            return true;
-        }
-        while let Some(next) = batch.remaining.pop_front() {
-            if completed.contains(&next.handle) {
-                continue;
-            }
-            batch.current_handle = next.handle;
-            pending_script_commands.enqueue(*next.command);
-            return true;
-        }
-        false
-    });
 }
 
 pub(crate) fn complete_missing_animation(

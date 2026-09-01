@@ -40,19 +40,16 @@ use scene::{
     advance_dialogue_on_input, animate_bgm_fades, animate_character_motion_effects,
     animate_custom_effects, animate_dialogue_text_reveal, animate_rule_transitions,
     animate_screen_ui, animate_visual_tweens, apply_animation_cancellations,
-    apply_live_audio_settings, bridge_story_events, cleanup_stale_screen_ui,
+    apply_live_audio_settings, cleanup_stale_screen_ui, drive_story_runtime,
     handle_choice_action_input, handle_choice_buttons, handle_runtime_menu_buttons,
     handle_screen_buttons, handle_screen_image_buttons, handle_screen_scroll,
     handle_screen_toggles, poll_pending_character_shows, poll_voice_playback, prepare_bgm_preludes,
     process_script_commands, process_ui_effects, reconcile_restored_bgm,
     reconcile_restored_characters, setup_frontend, setup_stage, sync_scene_snapshot,
-    tick_animation_waits, tick_pending_waits, tick_script_batches, update_builtin_ui_models,
+    tick_animation_waits, tick_pending_waits, update_builtin_ui_models,
     update_runtime_menu_button_visuals, update_ui_reactive_bindings, update_ui_text_bindings,
 };
-use script::{
-    ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode,
-    tick_script_runtime,
-};
+use script::{ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode};
 use state::SceneSharedState;
 use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
@@ -206,29 +203,23 @@ impl Plugin for HirakuPlugin {
                     .after(build_texture_atlases)
                     .run_if(texture_atlases_ready),
             )
-            .add_systems(Update, tick_script_runtime.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
                 reconcile_restored_characters
-                    .before(tick_script_runtime)
+                    .before(drive_story_runtime)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
                 reconcile_restored_bgm
-                    .before(tick_script_runtime)
+                    .before(drive_story_runtime)
                     .in_set(HirakuRuntimeSystems),
             )
-            .add_systems(
-                Update,
-                bridge_story_events
-                    .after(tick_script_runtime)
-                    .in_set(HirakuRuntimeSystems),
-            )
+            .add_systems(Update, drive_story_runtime.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
                 process_script_commands
-                    .after(bridge_story_events)
+                    .after(drive_story_runtime)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
@@ -345,7 +336,6 @@ impl Plugin for HirakuPlugin {
                         .after(reconcile_restored_characters)
                         .in_set(HirakuRuntimeSystems),
                     tick_animation_waits.in_set(HirakuRuntimeSystems),
-                    tick_script_batches.in_set(HirakuRuntimeSystems),
                     sync_scene_snapshot
                         .after(poll_pending_character_shows)
                         .after(reconcile_restored_bgm)

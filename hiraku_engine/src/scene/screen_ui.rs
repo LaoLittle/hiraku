@@ -1760,25 +1760,9 @@ fn expand_model_template(template: &str, models: &UiModels) -> String {
 pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) -> bool {
     matches!(
         command,
-        ScriptCommand::Say { .. }
-            | ScriptCommand::AwaitDialogueAdvance { .. }
-            | ScriptCommand::SetDialogue { .. }
-            | ScriptCommand::Choose { .. }
-            | ScriptCommand::ShowSprite { .. }
-            | ScriptCommand::HideSprite { .. }
-            | ScriptCommand::ShowCharacter { .. }
-            | ScriptCommand::HideCharacter { .. }
-            | ScriptCommand::JumpCharacter { .. }
-            | ScriptCommand::ShakeCharacter { .. }
-            | ScriptCommand::AnimateCharacter { .. }
-            | ScriptCommand::MoveSprite { .. }
-            | ScriptCommand::ScaleSprite { .. }
-            | ScriptCommand::FadeSprite { .. }
-            | ScriptCommand::RuleTransitionBg { .. }
-            | ScriptCommand::PlayCustomEffect { .. }
-            | ScriptCommand::RestoreSnapshot { .. }
-            | ScriptCommand::Exit
-            | ScriptCommand::ReturnToTitle
+        ScriptCommand::Dialogue(DialogueCommand::Say { .. } | DialogueCommand::AwaitAdvance { .. })
+            | ScriptCommand::Character(CharacterCommand::Show { .. })
+            | ScriptCommand::Runtime(RuntimeCommand::Exit | RuntimeCommand::ReturnToTitle)
     )
 }
 

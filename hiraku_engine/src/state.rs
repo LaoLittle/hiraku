@@ -176,50 +176,5 @@ fn default_save_version() -> u32 {
     1
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UiStylePatch {
-    pub dialogue_bg: Option<[f32; 4]>,
-    pub dialogue_border: Option<[f32; 4]>,
-    pub dialogue_left: Option<f32>,
-    pub dialogue_right: Option<f32>,
-    pub dialogue_bottom: Option<f32>,
-    pub dialogue_min_height: Option<f32>,
-    pub dialogue_padding_x: Option<f32>,
-    pub dialogue_padding_y: Option<f32>,
-    pub dialogue_radius: Option<f32>,
-    pub speaker_size: Option<f32>,
-    pub line_size: Option<f32>,
-    pub hint_size: Option<f32>,
-    pub hint_visible: Option<bool>,
-    pub speaker_color: Option<[f32; 4]>,
-    pub line_color: Option<[f32; 4]>,
-    pub hint_color: Option<[f32; 4]>,
-    pub choice_panel_bg: Option<[f32; 4]>,
-    pub choice_bottom: Option<f32>,
-    pub choice_panel_width: Option<f32>,
-    pub choice_padding: Option<f32>,
-    pub choice_gap: Option<f32>,
-    pub choice_prompt_size: Option<f32>,
-    pub choice_button_size: Option<f32>,
-    pub choice_center_text: Option<bool>,
-    pub choice_show_indices: Option<bool>,
-    pub choice_prompt_color: Option<[f32; 4]>,
-    pub choice_button_bg: Option<[f32; 4]>,
-    pub choice_button_hovered: Option<[f32; 4]>,
-    pub choice_button_pressed: Option<[f32; 4]>,
-    pub choice_button_border: Option<[f32; 4]>,
-    pub choice_text_color: Option<[f32; 4]>,
-    pub quick_menu_bottom: Option<f32>,
-    pub quick_menu_gap: Option<f32>,
-    pub quick_button_size: Option<f32>,
-    pub quick_menu_bg: Option<[f32; 4]>,
-    pub quick_button_bg: Option<[f32; 4]>,
-    pub quick_button_hovered: Option<[f32; 4]>,
-    pub quick_button_pressed: Option<[f32; 4]>,
-    pub quick_button_border: Option<[f32; 4]>,
-    pub quick_text_color: Option<[f32; 4]>,
-}
-
 #[derive(Resource, Clone, Default)]
 pub struct SceneSharedState(pub SceneSnapshot);

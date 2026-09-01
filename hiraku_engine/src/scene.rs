@@ -22,21 +22,22 @@ use crate::{
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     glossary::{TermCatalog, load_term_catalog},
     render::camera::{
-        CameraShake, CameraShakeState, CameraState, CameraTweenState, WorldCamera, focus_layer,
-        scene_layer, setup_stage_cameras, start_camera_tween, ui_layer,
+        CameraShakeState, CameraState, CameraTweenState, WorldCamera, focus_layer, scene_layer,
+        setup_stage_cameras, start_camera_tween, ui_layer,
     },
     render::character_part::{AlphaMaskMaterial, CharacterPartVisual, MultiplyMaterial},
     render::world_sprite::{WorldSprite, WorldSpriteMaterial, world_sprite_render_components},
     script::{
-        BatchSubmissionItem, BatchSubmitMode, CharacterEase, ResolvedCharacterKeyframe,
-        ScriptBootstrap, ScriptCommand, ScriptRequestId, ScriptResponse, ScriptResponseMessage,
-        ScriptRuntimeState, StoryRuntime, StoryRuntimeEvent, UiContext, VoicePlaybackMode,
+        AnimationCommand, AudioCommand, CameraCommand, CharacterCommand, CharacterEase,
+        DialogueCommand, ResolvedCharacterKeyframe, RuntimeCommand, ScriptBootstrap, ScriptCommand,
+        ScriptRequestId, ScriptResponse, ScriptResponseMessage, ScriptRuntimeState,
+        SettingsCommand, StageCommand, StoryRuntime, UiCommand, UiContext, VoicePlaybackMode,
         compile_story_bytecode, evaluate_ui_component_named, save_runtime_slot,
         script_command_from_effect, start_hks_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
-        SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot, UiStylePatch,
+        SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot,
     },
     storage::{UserSettings, load_save_data, read_user_settings, write_user_settings},
     texture::{TextureAtlasCatalog, TextureCatalog, prepare_texture_atlases},
@@ -47,6 +48,7 @@ use crate::{
         ScreenUiToggle, SpacerNode, StaleScreenRoot, TextNode, UiAnimationPlayer, UiEnabledBinding,
         UiModels, UiProgressBinding, UiReactiveEnabledBinding, UiReactiveProgressBinding,
         UiReactiveTextBinding, UiReactiveVisibilityBinding, UiTextBinding, UiVisibilityBinding,
+        color_from_rgba,
     },
     vfs::VfsResource,
 };
@@ -61,12 +63,12 @@ mod runtime_menu;
 mod screen_ui;
 mod snapshot;
 
-use animation_runtime::{ActiveScriptBatch, PendingAnimationWait, PendingWait, VisualTween};
 pub use animation_runtime::{
-    ActiveScriptBatches, AnimationState, PendingAnimationCancels, PendingWaits,
-    animate_custom_effects, animate_rule_transitions, animate_visual_tweens,
-    apply_animation_cancellations, tick_animation_waits, tick_pending_waits, tick_script_batches,
+    AnimationState, PendingAnimationCancels, PendingWaits, animate_custom_effects,
+    animate_rule_transitions, animate_visual_tweens, apply_animation_cancellations,
+    tick_animation_waits, tick_pending_waits,
 };
+use animation_runtime::{PendingAnimationWait, VisualTween};
 pub(crate) use animation_runtime::{complete_missing_animation, tween_fraction};
 use audio_runtime::{
     BgmChannel, BgmFade, BgmPrelude, SfxChannel, VoiceChannel, apply_volume_setting,
@@ -81,15 +83,12 @@ pub(crate) use character::apply_character_ease;
 pub use character::{
     animate_character_motion_effects, poll_pending_character_shows, reconcile_restored_characters,
 };
-use character::{
-    apply_character_motion, apply_character_timeline, despawn_character_actor,
-    queue_character_show, source_rect_from_corners, source_rect_to_corners,
-};
+use character::{queue_character_show, source_rect_from_corners, source_rect_to_corners};
+use choice::clear_choice_ui;
 pub(crate) use choice::{ChoiceButton, ChoiceUi};
 pub use choice::{ChoiceState, handle_choice_action_input, handle_choice_buttons};
-use choice::{clear_choice_ui, spawn_choice_ui};
 use command_runtime::evaluate_ui_at;
-pub use command_runtime::{PendingScriptCommands, bridge_story_events, process_script_commands};
+pub use command_runtime::{PendingScriptCommands, drive_story_runtime, process_script_commands};
 pub use dialogue::{
     DialogueAdvanceSurface, DialogueCharSpan, DialogueHistoryState, DialogueRoot, DialogueState,
     DialogueTextEffect, HintText, LineText, PendingDialogueAdvance, SpeakerText,
@@ -97,9 +96,8 @@ pub use dialogue::{
 };
 use dialogue::{
     advance_dialogue, append_dialogue_line_text, append_dialogue_model_reveal,
-    apply_text_effect_spec, clear_dialogue_spans, complete_dialogue_wait,
-    dialogue_text_effect_from_snapshot, refresh_dialogue_ui_style, set_dialogue_line_text,
-    set_dialogue_model_reveal, text_effect_snapshot,
+    clear_dialogue_spans, complete_dialogue_wait, dialogue_text_effect_from_snapshot,
+    set_dialogue_line_text, set_dialogue_model_reveal, text_effect_snapshot,
 };
 use runtime_menu::parse_ui_action_route;
 pub use runtime_menu::{
@@ -317,12 +315,6 @@ pub struct CharacterTimelineEffect {
     pub animation_id: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-pub enum CharacterMotionKind {
-    Jump { height: f32 },
-    Shake { amplitude: f32 },
-}
-
 #[derive(Component)]
 pub struct OverlayMarker;
 
@@ -379,7 +371,6 @@ pub fn setup_stage(
     commands.insert_resource(AnimationState::default());
     commands.insert_resource(PendingAnimationCancels::default());
     commands.insert_resource(PendingScriptCommands::default());
-    commands.insert_resource(ActiveScriptBatches::default());
     commands.insert_resource(VoiceState::default());
     commands.insert_resource(PendingCharacterShows::default());
     commands.insert_resource(ScreenUiState::default());
@@ -504,133 +495,6 @@ fn find_component_ancestor<T: bevy::ecs::query::QueryData, F: bevy::ecs::query::
 
 fn adjusted_volume(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(0.0, 1.0)
-}
-
-fn apply_ui_style_patch(ui_style: &mut UiStyle, patch: UiStylePatch) {
-    if let Some(color) = patch.dialogue_bg {
-        ui_style.dialogue_bg = color_from_rgba(color);
-    }
-    if let Some(color) = patch.dialogue_border {
-        ui_style.dialogue_border = color_from_rgba(color);
-    }
-    if let Some(value) = patch.dialogue_left {
-        ui_style.dialogue_left = value.max(0.0);
-    }
-    if let Some(value) = patch.dialogue_right {
-        ui_style.dialogue_right = value.max(0.0);
-    }
-    if let Some(value) = patch.dialogue_bottom {
-        ui_style.dialogue_bottom = value.max(0.0);
-    }
-    if let Some(value) = patch.dialogue_min_height {
-        ui_style.dialogue_min_height = value.max(0.0);
-    }
-    if let Some(value) = patch.dialogue_padding_x {
-        ui_style.dialogue_padding_x = value.max(0.0);
-    }
-    if let Some(value) = patch.dialogue_padding_y {
-        ui_style.dialogue_padding_y = value.max(0.0);
-    }
-    if let Some(value) = patch.dialogue_radius {
-        ui_style.dialogue_radius = value.max(0.0);
-    }
-    if let Some(value) = patch.speaker_size {
-        ui_style.speaker_size = value.max(1.0);
-    }
-    if let Some(value) = patch.line_size {
-        ui_style.line_size = value.max(1.0);
-    }
-    if let Some(value) = patch.hint_size {
-        ui_style.hint_size = value.max(1.0);
-    }
-    if let Some(value) = patch.hint_visible {
-        ui_style.hint_visible = value;
-    }
-    if let Some(color) = patch.speaker_color {
-        ui_style.speaker_color = color_from_rgba(color);
-    }
-    if let Some(color) = patch.line_color {
-        ui_style.line_color = color_from_rgba(color);
-    }
-    if let Some(color) = patch.hint_color {
-        ui_style.hint_color = color_from_rgba(color);
-    }
-    if let Some(color) = patch.choice_panel_bg {
-        ui_style.choice_panel_bg = color_from_rgba(color);
-    }
-    if let Some(value) = patch.choice_bottom {
-        ui_style.choice_bottom = value.max(0.0);
-    }
-    if let Some(value) = patch.choice_panel_width {
-        ui_style.choice_panel_width = value.max(0.0);
-    }
-    if let Some(value) = patch.choice_padding {
-        ui_style.choice_padding = value.max(0.0);
-    }
-    if let Some(value) = patch.choice_gap {
-        ui_style.choice_gap = value.max(0.0);
-    }
-    if let Some(value) = patch.choice_prompt_size {
-        ui_style.choice_prompt_size = value.max(1.0);
-    }
-    if let Some(value) = patch.choice_button_size {
-        ui_style.choice_button_size = value.max(1.0);
-    }
-    if let Some(value) = patch.choice_center_text {
-        ui_style.choice_center_text = value;
-    }
-    if let Some(value) = patch.choice_show_indices {
-        ui_style.choice_show_indices = value;
-    }
-    if let Some(color) = patch.choice_prompt_color {
-        ui_style.choice_prompt_color = color_from_rgba(color);
-    }
-    if let Some(color) = patch.choice_button_bg {
-        ui_style.choice_button_bg = color_from_rgba(color);
-    }
-    if let Some(color) = patch.choice_button_hovered {
-        ui_style.choice_button_hovered = color_from_rgba(color);
-    }
-    if let Some(color) = patch.choice_button_pressed {
-        ui_style.choice_button_pressed = color_from_rgba(color);
-    }
-    if let Some(color) = patch.choice_button_border {
-        ui_style.choice_button_border = color_from_rgba(color);
-    }
-    if let Some(color) = patch.choice_text_color {
-        ui_style.choice_text_color = color_from_rgba(color);
-    }
-    if let Some(value) = patch.quick_menu_bottom {
-        ui_style.quick_menu_bottom = value.max(0.0);
-    }
-    if let Some(value) = patch.quick_menu_gap {
-        ui_style.quick_menu_gap = value.max(0.0);
-    }
-    if let Some(value) = patch.quick_button_size {
-        ui_style.quick_button_size = value.max(1.0);
-    }
-    if let Some(color) = patch.quick_menu_bg {
-        ui_style.quick_menu_bg = color_from_rgba(color);
-    }
-    if let Some(color) = patch.quick_button_bg {
-        ui_style.quick_button_bg = color_from_rgba(color);
-    }
-    if let Some(color) = patch.quick_button_hovered {
-        ui_style.quick_button_hovered = color_from_rgba(color);
-    }
-    if let Some(color) = patch.quick_button_pressed {
-        ui_style.quick_button_pressed = color_from_rgba(color);
-    }
-    if let Some(color) = patch.quick_button_border {
-        ui_style.quick_button_border = color_from_rgba(color);
-    }
-    if let Some(color) = patch.quick_text_color {
-        ui_style.quick_text_color = color_from_rgba(color);
-    }
-}
-
-fn color_from_rgba(rgba: [f32; 4]) -> Color {
-    Color::srgba(rgba[0], rgba[1], rgba[2], rgba[3])
 }
 
 fn align_items_from_align(value: f32) -> AlignItems {

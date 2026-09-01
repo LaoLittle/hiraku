@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use hiraku_script::native::{NativeError, NativeRegistry};
 use hiraku_script::{
-    BuiltinCall, BuiltinManifest, Bytecode, ScriptType, Value, compile_with_manifest,
+    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, ScriptType, Value, compile_with_manifest,
 };
 use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, render_diagnostics};
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,37 @@ pub enum StoryEffect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoryWait {
     DialogueAdvance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoryTaskKind {
+    Sequence,
+    Parallel,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StoryControl {
+    SpawnTask { kind: StoryTaskKind, closure: Value },
+    BeginChoice { prompt: String, closure: Value },
+    AddChoiceOption { label: String, closure: Value },
+    OpenUi { path: String },
+    WaitTask { task: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StoryCallOutcome {
+    Return(Value),
+    Control(StoryControl),
+}
+
+impl StoryCallOutcome {
+    #[cfg(test)]
+    pub fn into_return_value(self) -> Option<Value> {
+        match self {
+            Self::Return(value) => Some(value),
+            Self::Control(_) => None,
+        }
+    }
 }
 
 const ACTOR_HANDLE_TYPE: u32 = 1;
@@ -310,6 +341,37 @@ mod ui_api {
 pub struct StoryNativeHost {
     context: CharacterContext,
     registry: NativeRegistry<CharacterContext>,
+    controls: StoryControlBuiltins,
+}
+
+struct StoryControlBuiltins {
+    sequence: BuiltinId,
+    parallel: BuiltinId,
+    choice: BuiltinId,
+    option: BuiltinId,
+    open_ui: BuiltinId,
+    wait: BuiltinId,
+}
+
+impl StoryControlBuiltins {
+    fn new(manifest: &BuiltinManifest) -> Self {
+        Self {
+            sequence: manifest.resolve("seq").expect("seq builtin is registered"),
+            parallel: manifest.resolve("par").expect("par builtin is registered"),
+            choice: manifest
+                .resolve("choice")
+                .expect("choice builtin is registered"),
+            option: manifest
+                .resolve("option")
+                .expect("option builtin is registered"),
+            open_ui: manifest
+                .resolve_selector("ui", "open")
+                .expect("ui.open builtin is registered"),
+            wait: manifest
+                .resolve("wait")
+                .expect("wait builtin is registered"),
+        }
+    }
 }
 
 impl Default for StoryNativeHost {
@@ -320,15 +382,112 @@ impl Default for StoryNativeHost {
 
 impl StoryNativeHost {
     pub fn new() -> Self {
+        let registry = story_registry();
+        let controls = StoryControlBuiltins::new(&registry.manifest());
         Self {
             context: CharacterContext::default(),
-            registry: story_registry(),
+            registry,
+            controls,
         }
     }
 
-    pub fn call(&mut self, call: &BuiltinCall) -> Result<Value, CharacterCapabilityError> {
+    pub fn call(
+        &mut self,
+        call: &BuiltinCall,
+    ) -> Result<StoryCallOutcome, CharacterCapabilityError> {
+        if call.builtin == self.controls.sequence || call.builtin == self.controls.parallel {
+            let closure = call
+                .arguments
+                .first()
+                .map(|argument| argument.value.clone())
+                .filter(is_callable)
+                .ok_or(CharacterCapabilityError::InvalidArguments(
+                    "seq/par require a trailing closure",
+                ))?;
+            let kind = if call.builtin == self.controls.sequence {
+                StoryTaskKind::Sequence
+            } else {
+                StoryTaskKind::Parallel
+            };
+            return Ok(StoryCallOutcome::Control(StoryControl::SpawnTask {
+                kind,
+                closure,
+            }));
+        }
+        if call.builtin == self.controls.choice {
+            let closure = call
+                .arguments
+                .iter()
+                .find_map(|argument| is_callable(&argument.value).then(|| argument.value.clone()))
+                .ok_or(CharacterCapabilityError::InvalidArguments(
+                    "choice requires a trailing closure",
+                ))?;
+            let prompt = call
+                .arguments
+                .iter()
+                .find_map(|argument| match &argument.value {
+                    Value::String(prompt) => Some(prompt.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return Ok(StoryCallOutcome::Control(StoryControl::BeginChoice {
+                prompt,
+                closure,
+            }));
+        }
+        if call.builtin == self.controls.option {
+            let label = call
+                .arguments
+                .first()
+                .and_then(|argument| match &argument.value {
+                    Value::String(label) => Some(label.clone()),
+                    _ => None,
+                })
+                .ok_or(CharacterCapabilityError::InvalidArguments(
+                    "option requires a string label",
+                ))?;
+            let closure = call
+                .arguments
+                .iter()
+                .find_map(|argument| is_callable(&argument.value).then(|| argument.value.clone()))
+                .ok_or(CharacterCapabilityError::InvalidArguments(
+                    "option requires a trailing closure",
+                ))?;
+            return Ok(StoryCallOutcome::Control(StoryControl::AddChoiceOption {
+                label,
+                closure,
+            }));
+        }
+        if call.builtin == self.controls.open_ui {
+            let path = call
+                .arguments
+                .first()
+                .and_then(|argument| match &argument.value {
+                    Value::String(path) => Some(path.clone()),
+                    _ => None,
+                })
+                .ok_or(CharacterCapabilityError::InvalidArguments(
+                    "ui.open requires a string role or component path",
+                ))?;
+            return Ok(StoryCallOutcome::Control(StoryControl::OpenUi { path }));
+        }
+        if call.builtin == self.controls.wait {
+            let task = call
+                .arguments
+                .first()
+                .and_then(|argument| match &argument.value {
+                    Value::Task(task) => Some(*task),
+                    _ => None,
+                })
+                .ok_or(CharacterCapabilityError::InvalidArguments(
+                    "wait requires a task handle",
+                ))?;
+            return Ok(StoryCallOutcome::Control(StoryControl::WaitTask { task }));
+        }
+
         self.registry
             .call(&mut self.context, call)
+            .map(StoryCallOutcome::Return)
             .map_err(|error| CharacterCapabilityError::Native(error.to_string()))
     }
 
@@ -367,6 +526,8 @@ impl StoryNativeHost {
     }
 
     pub fn restore(snapshot: StoryNativeHostSnapshot) -> Self {
+        let registry = story_registry();
+        let controls = StoryControlBuiltins::new(&registry.manifest());
         Self {
             context: CharacterContext {
                 next_handle: snapshot.next_handle,
@@ -381,9 +542,14 @@ impl StoryNativeHost {
                 next_camera_handle: snapshot.next_camera_handle,
                 pending_cameras: snapshot.pending_cameras,
             },
-            registry: story_registry(),
+            registry,
+            controls,
         }
     }
+}
+
+fn is_callable(value: &Value) -> bool {
+    matches!(value, Value::Closure { .. } | Value::Function { .. })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1251,7 +1417,11 @@ not_actor.at(.left)"#,
         loop {
             match runtime.step().expect("runtime must advance") {
                 Some(HksRuntimeEvent::Call(call)) => {
-                    let value = host.call(&call).expect("native call must succeed");
+                    let value = host
+                        .call(&call)
+                        .expect("native call must succeed")
+                        .into_return_value()
+                        .expect("ordinary native call must return a value");
                     runtime
                         .resume_main(value)
                         .expect("native result must resume VM");

@@ -424,7 +424,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             command,
-            crate::script::ScriptCommand::SetBackground { path, .. }
+            crate::script::ScriptCommand::Stage(crate::script::StageCommand::SetBackground {
+                path,
+                ..
+            })
                 if path == "hdp://main.hdp/textures/backgrounds/Background_016_001.png"
         ));
     }
