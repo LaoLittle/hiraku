@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use bevy::ecs::resource::Resource;
 use serde::{Deserialize, Serialize};
 
-use super::{ScriptRequestId, ScriptResponse, ScriptResponseMessage};
+use super::{ExecutionId, ScriptRequestId, ScriptResponse, ScriptResponseMessage};
 use crate::script::hks_runtime::StoryRuntime;
 
 pub struct ScriptCallFrame {
@@ -44,7 +44,7 @@ pub struct ScriptRuntimeState {
     /// reconstructed after restoring a save.
     pub mounted_ui_overlays: BTreeMap<String, String>,
     pub response_inbox: BTreeMap<ScriptRequestId, ScriptResponse>,
-    pub task_requests: BTreeMap<ScriptRequestId, u64>,
+    pub task_requests: BTreeMap<ScriptRequestId, ExecutionId>,
     next_request_id: u64,
 }
 

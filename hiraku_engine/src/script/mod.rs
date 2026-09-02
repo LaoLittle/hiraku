@@ -29,6 +29,7 @@ pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapsh
 pub(crate) use runtime::{
     CameraEffectScope, CameraProjectionMode, ScriptCallFrame, ScriptRuntimeState,
 };
+pub(crate) use task_runtime::ExecutionId;
 
 pub(crate) fn compile_story_bytecode(
     path: &str,

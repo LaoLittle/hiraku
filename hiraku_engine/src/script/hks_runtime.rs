@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::task_runtime::{
-    ExecutionMode, TaskEvent, TaskScheduler, TaskSchedulerError, TaskSchedulerSnapshot,
+    ChildExecutionScheduler, ExecutionId, ExecutionMode, ExecutionSchedulerError,
+    ExecutionSchedulerSnapshot, RawExecutionEvent,
 };
 use crate::script::capabilities::{
     CharacterCapabilityError, StoryCallOutcome, StoryControl, StoryEffect, StoryNativeHost,
@@ -22,18 +23,34 @@ use crate::script::capabilities::{
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum HksRuntimeEvent {
-    Call(BuiltinCall),
-    TaskCall { task: u64, call: BuiltinCall },
-    Statement(StatementValue),
-    TaskStatement { task: u64, value: StatementValue },
-    TaskCompleted { task: u64, value: Value },
-    Completed(Value),
+pub enum ExecutionEvent {
+    Call {
+        execution: ExecutionId,
+        call: BuiltinCall,
+    },
+    Statement {
+        execution: ExecutionId,
+        value: StatementValue,
+    },
+    Completed {
+        execution: ExecutionId,
+        value: Value,
+    },
 }
 
-pub struct HksRuntime {
+impl ExecutionEvent {
+    pub const fn execution(&self) -> ExecutionId {
+        match self {
+            Self::Call { execution, .. }
+            | Self::Statement { execution, .. }
+            | Self::Completed { execution, .. } => *execution,
+        }
+    }
+}
+
+pub struct ExecutionRuntime {
     vm: Vm,
-    scheduler: TaskScheduler,
+    children: ChildExecutionScheduler,
     linked: LinkedBytecode,
     globals: BTreeMap<String, Value>,
 }
@@ -41,13 +58,13 @@ pub struct HksRuntime {
 /// Engine-facing whole-story driver. It translates generic VM boundaries into
 /// story effects without introducing a second executable representation.
 pub struct StoryRuntime {
-    bytecode: HksRuntime,
+    execution: ExecutionRuntime,
     host: StoryNativeHost,
     pending: VecDeque<StoryRuntimeEvent>,
-    active_task_effects: BTreeMap<u64, Vec<StoryEffect>>,
-    deferred_task_completions: BTreeMap<u64, Value>,
-    waiting_task: Option<u64>,
-    waiting_interactive_task: Option<u64>,
+    active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
+    deferred_task_completions: BTreeMap<ExecutionId, Value>,
+    waiting_task: Option<ExecutionId>,
+    waiting_interactive_task: Option<ExecutionId>,
     choice: Option<ChoiceState>,
     blocked: bool,
     blocked_wait: Option<StoryWait>,
@@ -65,7 +82,7 @@ struct ChoiceOption {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum ChoiceState {
     Collecting {
-        builder_task: u64,
+        builder_task: ExecutionId,
         prompt: String,
         options: Vec<ChoiceOption>,
     },
@@ -74,7 +91,7 @@ enum ChoiceState {
         options: Vec<ChoiceOption>,
     },
     RunningBranch {
-        task: u64,
+        task: ExecutionId,
         selected: usize,
     },
 }
@@ -92,7 +109,7 @@ pub enum StoryRuntimeEvent {
         options: Vec<String>,
     },
     TaskEffect {
-        task: u64,
+        task: ExecutionId,
         effect: StoryEffect,
     },
     Completed(Value),
@@ -100,12 +117,12 @@ pub enum StoryRuntimeEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryRuntimeSnapshot {
-    bytecode: HksRuntimeSnapshot,
+    execution: ExecutionRuntimeSnapshot,
     host: StoryNativeHostSnapshot,
-    active_task_effects: BTreeMap<u64, Vec<StoryEffect>>,
-    deferred_task_completions: BTreeMap<u64, Value>,
-    waiting_task: Option<u64>,
-    waiting_interactive_task: Option<u64>,
+    active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
+    deferred_task_completions: BTreeMap<ExecutionId, Value>,
+    waiting_task: Option<ExecutionId>,
+    waiting_interactive_task: Option<ExecutionId>,
     choice: Option<ChoiceState>,
     blocked: bool,
     #[serde(default)]
@@ -115,7 +132,7 @@ pub struct StoryRuntimeSnapshot {
 impl StoryRuntime {
     pub fn new(bytecode: Bytecode) -> Result<Self, StoryRuntimeError> {
         Ok(Self {
-            bytecode: HksRuntime::new(bytecode)?,
+            execution: ExecutionRuntime::new(bytecode)?,
             host: StoryNativeHost::new(),
             pending: VecDeque::new(),
             active_task_effects: BTreeMap::new(),
@@ -133,7 +150,7 @@ impl StoryRuntime {
             return Err(StoryRuntimeError::NotAtSnapshotBoundary);
         }
         Ok(StoryRuntimeSnapshot {
-            bytecode: self.bytecode.snapshot(),
+            execution: self.execution.snapshot(),
             host: self.host.snapshot(),
             active_task_effects: self.active_task_effects.clone(),
             deferred_task_completions: self.deferred_task_completions.clone(),
@@ -177,7 +194,7 @@ impl StoryRuntime {
             })
             .collect();
         let mut runtime = Self {
-            bytecode: HksRuntime::restore(bytecode, snapshot.bytecode)?,
+            execution: ExecutionRuntime::restore(bytecode, snapshot.execution)?,
             host: StoryNativeHost::restore(snapshot.host),
             pending,
             active_task_effects: snapshot.active_task_effects,
@@ -195,11 +212,11 @@ impl StoryRuntime {
     }
 
     pub fn set_globals(&mut self, globals: std::collections::BTreeMap<String, Value>) {
-        self.bytecode.set_globals(globals);
+        self.execution.set_globals(globals);
     }
 
     pub fn globals(&self) -> &std::collections::BTreeMap<String, Value> {
-        self.bytecode.globals()
+        self.execution.globals()
     }
 
     pub(crate) fn enqueue_event(&mut self, event: StoryRuntimeEvent) {
@@ -243,7 +260,7 @@ impl StoryRuntime {
                 .body
                 .clone();
             let task = self
-                .bytecode
+                .execution
                 .spawn_closure(&option, ExecutionMode::Interactive)?;
             self.choice = Some(ChoiceState::RunningBranch { task, selected });
             self.blocked = false;
@@ -253,13 +270,13 @@ impl StoryRuntime {
         if let Some(task) = self.waiting_interactive_task.take() {
             self.blocked = false;
             self.blocked_wait = None;
-            self.bytecode.unpause_task(task)?;
+            self.execution.unpause(task)?;
             return Ok(());
         }
         self.blocked = false;
         self.blocked_wait = None;
-        if self.bytecode.main_waiting_for_host() {
-            self.bytecode.resume_main(value)?;
+        if self.execution.main_waiting_for_host() {
+            self.execution.resume(ExecutionId::MAIN, value)?;
         }
         Ok(())
     }
@@ -273,7 +290,7 @@ impl StoryRuntime {
         self.blocked
     }
 
-    pub fn resume_task(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
+    pub fn resume_task(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
         let effects = self
             .active_task_effects
             .get_mut(&task)
@@ -288,14 +305,14 @@ impl StoryRuntime {
         Ok(())
     }
 
-    fn finish_task_effects(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
-        if self.bytecode.task_mode(task) == Some(ExecutionMode::Sequence) {
-            let _ = self.bytecode.unpause_task(task);
+    fn finish_task_effects(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
+        if self.execution.mode(task) == Some(ExecutionMode::Sequence) {
+            let _ = self.execution.unpause(task);
         }
         if let Some(value) = self.deferred_task_completions.remove(&task) {
             if self.waiting_task == Some(task) {
                 self.waiting_task = None;
-                self.bytecode.resume_main(value)?;
+                self.execution.resume(ExecutionId::MAIN, value)?;
             }
         }
         Ok(())
@@ -308,7 +325,7 @@ impl StoryRuntime {
         }
         if self.blocked {
             loop {
-                let Some(event) = self.bytecode.step_task()? else {
+                let Some(event) = self.execution.step_children()? else {
                     return Ok(None);
                 };
                 if let Some(event) = self.handle_task_event(event)? {
@@ -317,42 +334,55 @@ impl StoryRuntime {
             }
         }
         loop {
-            let Some(event) = self.bytecode.step()? else {
+            let Some(event) = self.execution.step()? else {
                 return Ok(None);
             };
             match event {
-                HksRuntimeEvent::Call(call) => match self.host.call(&call)? {
-                    StoryCallOutcome::Return(value) => self.bytecode.resume_main(value)?,
-                    StoryCallOutcome::Control(StoryControl::SpawnTask { kind, closure }) => {
-                        let mode = match kind {
-                            StoryTaskKind::Sequence => ExecutionMode::Sequence,
-                            StoryTaskKind::Parallel => ExecutionMode::Parallel,
-                        };
-                        let task = self.bytecode.spawn_closure(&ClosureValue(closure), mode)?;
-                        self.bytecode.resume_main(Value::Task(task))?;
-                    }
-                    StoryCallOutcome::Control(StoryControl::BeginChoice { prompt, closure }) => {
-                        let builder_task = self
-                            .bytecode
-                            .spawn_closure(&ClosureValue(closure), ExecutionMode::Interactive)?;
-                        self.choice = Some(ChoiceState::Collecting {
-                            builder_task,
+                ExecutionEvent::Call { execution, call } if execution.is_main() => {
+                    match self.host.call(&call)? {
+                        StoryCallOutcome::Return(value) => {
+                            self.execution.resume(ExecutionId::MAIN, value)?
+                        }
+                        StoryCallOutcome::Control(StoryControl::SpawnTask { kind, closure }) => {
+                            let mode = match kind {
+                                StoryTaskKind::Sequence => ExecutionMode::Sequence,
+                                StoryTaskKind::Parallel => ExecutionMode::Parallel,
+                            };
+                            let task =
+                                self.execution.spawn_closure(&ClosureValue(closure), mode)?;
+                            self.execution
+                                .resume(ExecutionId::MAIN, Value::Task(task.raw()))?;
+                        }
+                        StoryCallOutcome::Control(StoryControl::BeginChoice {
                             prompt,
-                            options: Vec::new(),
-                        });
+                            closure,
+                        }) => {
+                            let builder_task = self.execution.spawn_closure(
+                                &ClosureValue(closure),
+                                ExecutionMode::Interactive,
+                            )?;
+                            self.choice = Some(ChoiceState::Collecting {
+                                builder_task,
+                                prompt,
+                                options: Vec::new(),
+                            });
+                        }
+                        StoryCallOutcome::Control(StoryControl::OpenUi { path, arguments }) => {
+                            self.blocked = true;
+                            return Ok(Some(StoryRuntimeEvent::OpenUi { path, arguments }));
+                        }
+                        StoryCallOutcome::Control(StoryControl::WaitTask { task }) => {
+                            self.waiting_task = Some(ExecutionId::from_raw(task));
+                        }
+                        StoryCallOutcome::Control(
+                            control @ StoryControl::AddChoiceOption { .. },
+                        ) => {
+                            return Err(StoryRuntimeError::UnexpectedMainControl(control));
+                        }
                     }
-                    StoryCallOutcome::Control(StoryControl::OpenUi { path, arguments }) => {
-                        self.blocked = true;
-                        return Ok(Some(StoryRuntimeEvent::OpenUi { path, arguments }));
-                    }
-                    StoryCallOutcome::Control(StoryControl::WaitTask { task }) => {
-                        self.waiting_task = Some(task);
-                    }
-                    StoryCallOutcome::Control(control @ StoryControl::AddChoiceOption { .. }) => {
-                        return Err(StoryRuntimeError::UnexpectedMainControl(control));
-                    }
-                },
-                HksRuntimeEvent::Statement(statement) => {
+                }
+                ExecutionEvent::Statement { execution, value } if execution.is_main() => {
+                    let statement = value;
                     self.host.handle_statement(&statement)?;
                     self.enqueue_host_boundaries();
                     if let Some(event) = self.pending.pop_front() {
@@ -360,17 +390,20 @@ impl StoryRuntime {
                         return Ok(Some(event));
                     }
                 }
-                event @ (HksRuntimeEvent::TaskCall { .. }
-                | HksRuntimeEvent::TaskStatement { .. }
-                | HksRuntimeEvent::TaskCompleted { .. }) => {
+                event @ (ExecutionEvent::Call { .. }
+                | ExecutionEvent::Statement { .. }
+                | ExecutionEvent::Completed { .. })
+                    if !event.execution().is_main() =>
+                {
                     if let Some(event) = self.handle_task_event(event)? {
                         self.mark_host_boundary(&event);
                         return Ok(Some(event));
                     }
                 }
-                HksRuntimeEvent::Completed(value) => {
+                ExecutionEvent::Completed { execution, value } if execution.is_main() => {
                     return Ok(Some(StoryRuntimeEvent::Completed(value)));
                 }
+                _ => unreachable!("execution event guard must classify main or child execution"),
             }
         }
     }
@@ -403,12 +436,15 @@ impl StoryRuntime {
 
     fn handle_task_event(
         &mut self,
-        event: HksRuntimeEvent,
+        event: ExecutionEvent,
     ) -> Result<Option<StoryRuntimeEvent>, StoryRuntimeError> {
         match event {
-            HksRuntimeEvent::TaskCall { task, call } => match self.host.call(&call)? {
+            ExecutionEvent::Call {
+                execution: task,
+                call,
+            } => match self.host.call(&call)? {
                 StoryCallOutcome::Return(value) => {
-                    self.bytecode.resume_task(task, value)?;
+                    self.execution.resume(task, value)?;
                 }
                 StoryCallOutcome::Control(StoryControl::AddChoiceOption { label, closure }) => {
                     let Some(ChoiceState::Collecting { options, .. }) = &mut self.choice else {
@@ -418,18 +454,24 @@ impl StoryRuntime {
                         label,
                         body: ClosureValue(closure),
                     });
-                    self.bytecode.resume_task(task, Value::Unit)?;
+                    self.execution.resume(task, Value::Unit)?;
                 }
                 StoryCallOutcome::Control(control) => {
                     return Err(StoryRuntimeError::UnsupportedTaskControl(control));
                 }
             },
-            HksRuntimeEvent::TaskStatement { task, value } => {
+            ExecutionEvent::Statement {
+                execution: task,
+                value,
+            } => {
                 self.host.handle_statement(&value)?;
                 self.enqueue_task_boundaries(task)?;
                 return Ok(self.pending.pop_front());
             }
-            HksRuntimeEvent::TaskCompleted { task, value } => {
+            ExecutionEvent::Completed {
+                execution: task,
+                value,
+            } => {
                 if self.active_task_effects.contains_key(&task) {
                     self.deferred_task_completions.insert(task, value);
                     return Ok(None);
@@ -461,20 +503,20 @@ impl StoryRuntime {
                     && branch == task
                 {
                     self.choice = None;
-                    self.bytecode.resume_main(Value::Number(selected as f64))?;
+                    self.execution
+                        .resume(ExecutionId::MAIN, Value::Number(selected as f64))?;
                     return Ok(None);
                 }
                 if self.waiting_task == Some(task) {
                     self.waiting_task = None;
-                    self.bytecode.resume_main(value)?;
+                    self.execution.resume(ExecutionId::MAIN, value)?;
                 }
             }
-            _ => unreachable!("task handler requires a task VM event"),
         }
         Ok(None)
     }
 
-    fn enqueue_task_boundaries(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
+    fn enqueue_task_boundaries(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
         for effect in self.host.drain_effects() {
             if matches!(effect, StoryEffect::PlayVoice { .. }) {
                 self.active_task_effects
@@ -488,7 +530,7 @@ impl StoryRuntime {
             }
         }
         let wait = self.host.take_wait();
-        let task_mode = self.bytecode.task_mode(task);
+        let task_mode = self.execution.mode(task);
         if matches!(wait, Some(StoryWait::Movie { .. }))
             && task_mode != Some(ExecutionMode::Interactive)
         {
@@ -500,7 +542,7 @@ impl StoryRuntime {
         if let Some(wait) = wait
             && task_mode == Some(ExecutionMode::Interactive)
         {
-            self.bytecode.pause_task(task)?;
+            self.execution.pause(task)?;
             self.waiting_interactive_task = Some(task);
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
@@ -508,38 +550,38 @@ impl StoryRuntime {
             && has_wait
             && self.active_task_effects.contains_key(&task)
         {
-            self.bytecode.pause_task(task)?;
+            self.execution.pause(task)?;
         }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HksRuntimeSnapshot {
+pub struct ExecutionRuntimeSnapshot {
     /// Exact executing bytecode. Restore relinks this against the current
     /// native registry instead of relying on source recompilation offsets.
     pub program: Bytecode,
     pub vm: VmSnapshot,
-    pub scheduler: TaskSchedulerSnapshot,
+    pub children: ExecutionSchedulerSnapshot,
 }
 
-impl HksRuntime {
-    pub fn new(bytecode: Bytecode) -> Result<Self, HksRuntimeError> {
-        let linked =
-            link_bytecode(bytecode.clone(), &story_manifest()).map_err(HksRuntimeError::Link)?;
+impl ExecutionRuntime {
+    pub fn new(bytecode: Bytecode) -> Result<Self, ExecutionRuntimeError> {
+        let linked = link_bytecode(bytecode.clone(), &story_manifest())
+            .map_err(ExecutionRuntimeError::Link)?;
         Ok(Self {
             vm: Vm::new(bytecode.clone())?,
-            scheduler: TaskScheduler::new(bytecode),
+            children: ChildExecutionScheduler::new(bytecode),
             linked,
             globals: BTreeMap::new(),
         })
     }
 
-    pub fn snapshot(&self) -> HksRuntimeSnapshot {
-        HksRuntimeSnapshot {
+    pub fn snapshot(&self) -> ExecutionRuntimeSnapshot {
+        ExecutionRuntimeSnapshot {
             program: self.linked.bytecode.clone(),
             vm: self.vm.snapshot(),
-            scheduler: self.scheduler.snapshot(),
+            children: self.children.snapshot(),
         }
     }
 
@@ -547,78 +589,96 @@ impl HksRuntime {
         &mut self,
         closure: &ClosureValue,
         mode: ExecutionMode,
-    ) -> Result<u64, HksRuntimeError> {
-        self.scheduler
+    ) -> Result<ExecutionId, ExecutionRuntimeError> {
+        self.children
             .set_global_values(self.vm.globals().to_vec())?;
-        Ok(self.scheduler.spawn(&closure.0, mode)?)
+        Ok(self.children.spawn(&closure.0, mode)?)
     }
 
     pub fn restore(
         _bytecode: Bytecode,
-        snapshot: HksRuntimeSnapshot,
-    ) -> Result<Self, HksRuntimeError> {
+        snapshot: ExecutionRuntimeSnapshot,
+    ) -> Result<Self, ExecutionRuntimeError> {
         let bytecode = snapshot.program;
-        let linked =
-            link_bytecode(bytecode.clone(), &story_manifest()).map_err(HksRuntimeError::Link)?;
+        let linked = link_bytecode(bytecode.clone(), &story_manifest())
+            .map_err(ExecutionRuntimeError::Link)?;
         let vm = Vm::restore(bytecode.clone(), snapshot.vm)?;
         let globals = globals_from_values(&bytecode, vm.globals());
         Ok(Self {
             vm,
-            scheduler: TaskScheduler::restore(bytecode, snapshot.scheduler)?,
+            children: ChildExecutionScheduler::restore(bytecode, snapshot.children)?,
             linked,
             globals,
         })
     }
 
     /// Advances either the main program or the first ready task to the next host boundary.
-    pub fn step(&mut self) -> Result<Option<HksRuntimeEvent>, HksRuntimeError> {
+    pub fn step(&mut self) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
         if let Some(event) = self.vm.step()? {
             return match event {
                 VmEvent::Call(call) => {
                     let mut call = self.link_call(call)?;
                     evaluate_call_templates(&mut call, |text| self.vm.eval_template(text))?;
-                    Ok(Some(HksRuntimeEvent::Call(call)))
+                    Ok(Some(ExecutionEvent::Call {
+                        execution: ExecutionId::MAIN,
+                        call,
+                    }))
                 }
                 VmEvent::Statement(value) => {
                     let value = evaluate_statement_template(&mut self.vm, value)?;
                     self.refresh_globals();
-                    self.scheduler
+                    self.children
                         .set_global_values(self.vm.globals().to_vec())?;
-                    Ok(Some(HksRuntimeEvent::Statement(value)))
+                    Ok(Some(ExecutionEvent::Statement {
+                        execution: ExecutionId::MAIN,
+                        value,
+                    }))
                 }
-                VmEvent::Completed(value) => Ok(Some(HksRuntimeEvent::Completed(value))),
+                VmEvent::Completed(value) => Ok(Some(ExecutionEvent::Completed {
+                    execution: ExecutionId::MAIN,
+                    value,
+                })),
             };
         }
 
-        self.step_task()
+        self.step_children()
     }
 
     /// Advances only scheduled child tasks, leaving the main VM untouched.
-    pub fn step_task(&mut self) -> Result<Option<HksRuntimeEvent>, HksRuntimeError> {
-        match self.scheduler.step()? {
-            Some(TaskEvent::Call { task, call }) => {
+    pub fn step_children(&mut self) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
+        match self.children.step()? {
+            Some(RawExecutionEvent::Call { execution, call }) => {
                 let mut call = self.link_call(call)?;
                 evaluate_call_templates(&mut call, |text| {
-                    self.scheduler.eval_template(task, text)
+                    self.children.eval_template(execution, text)
                 })?;
-                Ok(Some(HksRuntimeEvent::TaskCall { task, call }))
+                Ok(Some(ExecutionEvent::Call { execution, call }))
             }
-            Some(TaskEvent::Statement { task, value }) => {
-                let value = evaluate_task_statement_template(&mut self.scheduler, task, value)?;
+            Some(RawExecutionEvent::Statement { execution, value }) => {
+                let value =
+                    evaluate_child_statement_template(&mut self.children, execution, value)?;
                 self.vm
-                    .set_global_values(self.scheduler.global_values().to_vec())?;
+                    .set_global_values(self.children.global_values().to_vec())?;
                 self.refresh_globals();
-                Ok(Some(HksRuntimeEvent::TaskStatement { task, value }))
+                Ok(Some(ExecutionEvent::Statement { execution, value }))
             }
-            Some(TaskEvent::Completed { task, value }) => {
-                Ok(Some(HksRuntimeEvent::TaskCompleted { task, value }))
+            Some(RawExecutionEvent::Completed { execution, value }) => {
+                Ok(Some(ExecutionEvent::Completed { execution, value }))
             }
             None => Ok(None),
         }
     }
 
-    pub fn resume_main(&mut self, value: Value) -> Result<(), HksRuntimeError> {
-        self.vm.resume(value)?;
+    pub fn resume(
+        &mut self,
+        execution: ExecutionId,
+        value: Value,
+    ) -> Result<(), ExecutionRuntimeError> {
+        if execution.is_main() {
+            self.vm.resume(value)?;
+        } else {
+            self.children.resume(execution, value)?;
+        }
         Ok(())
     }
 
@@ -627,7 +687,7 @@ impl HksRuntime {
         self.vm
             .set_global_values(values.clone())
             .expect("compiled global frame shape must match its bytecode");
-        self.scheduler
+        self.children
             .set_global_values(values)
             .expect("compiled task global frame shape must match its bytecode");
         self.globals = globals;
@@ -641,28 +701,23 @@ impl HksRuntime {
         matches!(self.vm.status(), hiraku_script::VmStatus::WaitingForHost)
     }
 
-    pub fn resume_task(&mut self, task: u64, value: Value) -> Result<(), HksRuntimeError> {
-        self.scheduler.resume(task, value)?;
+    pub fn pause(&mut self, execution: ExecutionId) -> Result<(), ExecutionRuntimeError> {
+        self.children.pause(execution)?;
         Ok(())
     }
 
-    pub fn pause_task(&mut self, task: u64) -> Result<(), HksRuntimeError> {
-        self.scheduler.pause(task)?;
+    pub fn unpause(&mut self, execution: ExecutionId) -> Result<(), ExecutionRuntimeError> {
+        self.children.unpause(execution)?;
         Ok(())
     }
 
-    pub fn unpause_task(&mut self, task: u64) -> Result<(), HksRuntimeError> {
-        self.scheduler.unpause(task)?;
-        Ok(())
+    fn mode(&self, execution: ExecutionId) -> Option<ExecutionMode> {
+        self.children.mode(execution)
     }
 
-    fn task_mode(&self, task: u64) -> Option<ExecutionMode> {
-        self.scheduler.mode(task)
-    }
-
-    fn link_call(&self, call: SymbolCall) -> Result<BuiltinCall, HksRuntimeError> {
+    fn link_call(&self, call: SymbolCall) -> Result<BuiltinCall, ExecutionRuntimeError> {
         let Some(LinkedFunction::Native(builtin)) = self.linked.resolve(call.function) else {
-            return Err(HksRuntimeError::UnlinkedCall(call.function));
+            return Err(ExecutionRuntimeError::UnlinkedCall(call.function));
         };
         Ok(BuiltinCall {
             builtin,
@@ -677,11 +732,11 @@ impl HksRuntime {
 }
 
 #[derive(Debug, Error)]
-pub enum HksRuntimeError {
+pub enum ExecutionRuntimeError {
     #[error("HKS VM failed: {0:?}")]
     Vm(VmError),
     #[error("HKS task scheduler failed: {0}")]
-    Task(#[from] TaskSchedulerError),
+    Scheduler(#[from] ExecutionSchedulerError),
     #[error("HKS bytecode link failed: {0:?}")]
     Link(Vec<hiraku_script::LinkError>),
     #[error("HKS call references an unlinked symbol {0:?}")]
@@ -693,7 +748,7 @@ pub enum HksRuntimeError {
 #[derive(Debug, Error)]
 pub enum StoryRuntimeError {
     #[error(transparent)]
-    Bytecode(#[from] HksRuntimeError),
+    Bytecode(#[from] ExecutionRuntimeError),
     #[error(transparent)]
     Capability(#[from] CharacterCapabilityError),
     #[error("choice requires a string prompt and a list of string options")]
@@ -711,7 +766,7 @@ pub enum StoryRuntimeError {
     #[error("story runtime snapshot requires an empty effect queue")]
     NotAtSnapshotBoundary,
     #[error("task {0} has no pending host effect")]
-    UnknownTaskEffect(u64),
+    UnknownTaskEffect(ExecutionId),
 }
 
 fn evaluate_statement_template(
@@ -727,9 +782,9 @@ fn evaluate_statement_template(
     }
 }
 
-fn evaluate_task_statement_template(
-    scheduler: &mut TaskScheduler,
-    task: u64,
+fn evaluate_child_statement_template(
+    scheduler: &mut ChildExecutionScheduler,
+    task: ExecutionId,
     value: StatementValue,
 ) -> Result<StatementValue, TemplateError> {
     match value {
@@ -787,7 +842,7 @@ fn globals_from_values(bytecode: &Bytecode, values: &[Value]) -> BTreeMap<String
         .collect()
 }
 
-impl From<VmError> for HksRuntimeError {
+impl From<VmError> for ExecutionRuntimeError {
     fn from(error: VmError) -> Self {
         Self::Vm(error)
     }
@@ -804,18 +859,56 @@ mod tests {
     fn whole_program_runtime_yields_native_calls_without_ir() {
         let bytecode = compile_story_bytecode("test.story.hks", "log(\"hello\")")
             .expect("whole HKS story must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("script runtime must initialize");
-        let Some(HksRuntimeEvent::Call(call)) = runtime.step().expect("runtime must advance")
+        let mut runtime = ExecutionRuntime::new(bytecode).expect("script runtime must initialize");
+        let Some(ExecutionEvent::Call { execution, call }) =
+            runtime.step().expect("runtime must advance")
         else {
             panic!("expected a native call")
         };
+        assert_eq!(execution, ExecutionId::MAIN);
         assert_eq!(
             call.builtin,
             story_manifest().resolve("log").expect("log registration")
         );
         runtime
-            .resume_main(Value::Unit)
+            .resume(ExecutionId::MAIN, Value::Unit)
             .expect("host result must resume the main VM");
+    }
+
+    #[test]
+    fn child_closures_use_the_same_execution_event_protocol() {
+        let bytecode = compile_story_bytecode("execution.hks", "par { log(\"child\") }")
+            .expect("task story must compile");
+        let mut runtime = ExecutionRuntime::new(bytecode).expect("runtime must initialize");
+        let mut host = StoryNativeHost::new();
+        let Some(ExecutionEvent::Call {
+            execution: ExecutionId::MAIN,
+            call,
+        }) = runtime.step().expect("root execution must advance")
+        else {
+            panic!("expected the root par call")
+        };
+        let StoryCallOutcome::Control(StoryControl::SpawnTask { kind, closure }) =
+            host.call(&call).expect("par must create a child execution")
+        else {
+            panic!("expected a task spawn control")
+        };
+        assert_eq!(kind, StoryTaskKind::Parallel);
+        let child = runtime
+            .spawn_closure(&ClosureValue(closure), ExecutionMode::Parallel)
+            .expect("child execution must spawn");
+        runtime
+            .resume(ExecutionId::MAIN, Value::Task(child.raw()))
+            .expect("task handle must resume the root execution");
+
+        let Some(ExecutionEvent::Call { execution, .. }) = runtime
+            .step_children()
+            .expect("child execution must advance")
+        else {
+            panic!("expected the child log call")
+        };
+        assert_eq!(execution, child);
+        assert!(!execution.is_main());
     }
 
     #[test]
@@ -864,26 +957,31 @@ mod tests {
     fn whole_program_runtime_restores_at_a_host_boundary() {
         let bytecode = compile_story_bytecode("restore.story.hks", "log(\"before\")\n\"after\"")
             .expect("whole HKS story must compile");
-        let mut runtime = HksRuntime::new(bytecode.clone()).expect("runtime must initialize");
+        let mut runtime = ExecutionRuntime::new(bytecode.clone()).expect("runtime must initialize");
         assert!(matches!(
             runtime.step().expect("runtime must advance"),
-            Some(HksRuntimeEvent::Call(_))
+            Some(ExecutionEvent::Call { .. })
         ));
         let snapshot = runtime.snapshot();
-        let mut restored = HksRuntime::restore(bytecode, snapshot).expect("snapshot must restore");
+        let mut restored =
+            ExecutionRuntime::restore(bytecode, snapshot).expect("snapshot must restore");
         restored
-            .resume_main(Value::Unit)
+            .resume(ExecutionId::MAIN, Value::Unit)
             .expect("restored host call must resume");
-        assert_eq!(
+        assert!(matches!(
             restored.step().expect("runtime must reach statement"),
-            Some(HksRuntimeEvent::Statement(StatementValue::Commit))
-        );
-        assert_eq!(
+            Some(ExecutionEvent::Statement {
+                value: StatementValue::Commit,
+                ..
+            })
+        ));
+        assert!(matches!(
             restored.step().expect("runtime must reach string hook"),
-            Some(HksRuntimeEvent::Statement(StatementValue::String(
-                "after".to_string()
-            )))
-        );
+            Some(ExecutionEvent::Statement {
+                value: StatementValue::String(text),
+                ..
+            }) if text == "after"
+        ));
     }
 
     #[test]
@@ -893,17 +991,21 @@ mod tests {
             "global player = .{ name: \"alice\" }\n\"Hi, ${player.name}\"",
         )
         .expect("template story must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("runtime must initialize");
+        let mut runtime = ExecutionRuntime::new(bytecode).expect("runtime must initialize");
         assert!(matches!(
             runtime.step().expect("global declaration must run"),
-            Some(HksRuntimeEvent::Statement(StatementValue::Commit))
+            Some(ExecutionEvent::Statement {
+                value: StatementValue::Commit,
+                ..
+            })
         ));
-        assert_eq!(
+        assert!(matches!(
             runtime.step().expect("dialogue statement must run"),
-            Some(HksRuntimeEvent::Statement(StatementValue::String(
-                "Hi, alice".to_string()
-            )))
-        );
+            Some(ExecutionEvent::Statement {
+                value: StatementValue::String(text),
+                ..
+            }) if text == "Hi, alice"
+        ));
     }
 
     #[test]
@@ -911,27 +1013,32 @@ mod tests {
         let bytecode =
             compile_story_bytecode("test.story.hks", r#"char("alice").e("happy").at(.right)"#)
                 .expect("character story must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("script runtime must initialize");
+        let mut runtime = ExecutionRuntime::new(bytecode).expect("script runtime must initialize");
         let mut host = StoryNativeHost::new();
 
         loop {
             match runtime.step().expect("runtime must advance") {
-                Some(HksRuntimeEvent::Call(call)) => {
+                Some(ExecutionEvent::Call { call, .. }) => {
                     let value = host
                         .call(&call)
                         .expect("native call must succeed")
                         .into_return_value()
                         .expect("ordinary native call must return a value");
                     runtime
-                        .resume_main(value)
+                        .resume(ExecutionId::MAIN, value)
                         .expect("native result must resume the VM");
                 }
-                Some(HksRuntimeEvent::Statement(StatementValue::Commit)) => {
+                Some(ExecutionEvent::Statement {
+                    value: StatementValue::Commit,
+                    ..
+                }) => {
                     host.commit_statement()
                         .expect("statement commit must flush actor state");
                 }
-                Some(HksRuntimeEvent::Completed(_)) => break,
-                Some(event) => panic!("unexpected runtime event: {event:?}"),
+                Some(ExecutionEvent::Statement { value, .. }) => {
+                    panic!("unexpected statement boundary: {value:?}")
+                }
+                Some(ExecutionEvent::Completed { .. }) => break,
                 None => panic!("runtime stopped before completion"),
             }
         }
@@ -966,26 +1073,25 @@ mod tests {
             "#,
         )
         .expect("fluent engine APIs must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("script runtime must initialize");
+        let mut runtime = ExecutionRuntime::new(bytecode).expect("script runtime must initialize");
         let mut host = StoryNativeHost::new();
 
         loop {
             match runtime.step().expect("runtime must advance") {
-                Some(HksRuntimeEvent::Call(call)) => {
+                Some(ExecutionEvent::Call { call, .. }) => {
                     let value = host
                         .call(&call)
                         .expect("native call must succeed")
                         .into_return_value()
                         .expect("ordinary native call must return a value");
                     runtime
-                        .resume_main(value)
+                        .resume(ExecutionId::MAIN, value)
                         .expect("native result must resume the VM");
                 }
-                Some(HksRuntimeEvent::Statement(value)) => host
+                Some(ExecutionEvent::Statement { value, .. }) => host
                     .handle_statement(&value)
                     .expect("statement commit must succeed"),
-                Some(HksRuntimeEvent::Completed(_)) => break,
-                Some(event) => panic!("unexpected runtime event: {event:?}"),
+                Some(ExecutionEvent::Completed { .. }) => break,
                 None => panic!("runtime stopped before completion"),
             }
         }

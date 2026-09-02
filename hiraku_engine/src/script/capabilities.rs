@@ -1412,7 +1412,7 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::hks_runtime::{HksRuntime, HksRuntimeEvent};
+    use crate::script::hks_runtime::{ExecutionEvent, ExecutionRuntime};
 
     #[test]
     fn engine_settings_roundtrip_through_the_fixed_global_record() {
@@ -1530,25 +1530,24 @@ not_actor.at(.left)"#,
             "#,
         )
         .expect("dialogue sugar must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("runtime must initialize");
+        let mut runtime = ExecutionRuntime::new(bytecode).expect("runtime must initialize");
         let mut host = StoryNativeHost::new();
         loop {
             match runtime.step().expect("runtime must advance") {
-                Some(HksRuntimeEvent::Call(call)) => {
+                Some(ExecutionEvent::Call { call, .. }) => {
                     let value = host
                         .call(&call)
                         .expect("native call must succeed")
                         .into_return_value()
                         .expect("ordinary native call must return a value");
                     runtime
-                        .resume_main(value)
+                        .resume(crate::script::ExecutionId::MAIN, value)
                         .expect("native result must resume VM");
                 }
-                Some(HksRuntimeEvent::Statement(value)) => host
+                Some(ExecutionEvent::Statement { value, .. }) => host
                     .handle_statement(&value)
                     .expect("statement hook must succeed"),
-                Some(HksRuntimeEvent::Completed(_)) => break,
-                Some(event) => panic!("unexpected runtime event: {event:?}"),
+                Some(ExecutionEvent::Completed { .. }) => break,
                 None => panic!("runtime stopped before completion"),
             }
         }
@@ -1577,9 +1576,9 @@ not_actor.at(.left)"#,
     fn orphaned_continuation_falls_back_to_narration() {
         let bytecode = compile_story_bytecode("orphan.story.hks", r#"...: "orphan""#)
             .expect("orphaned continuation must compile");
-        let mut runtime = HksRuntime::new(bytecode).expect("runtime must initialize");
+        let mut runtime = ExecutionRuntime::new(bytecode).expect("runtime must initialize");
         let mut host = StoryNativeHost::new();
-        let Some(HksRuntimeEvent::Call(call)) = runtime.step().expect("runtime must advance")
+        let Some(ExecutionEvent::Call { call, .. }) = runtime.step().expect("runtime must advance")
         else {
             panic!("expected dialogue operator call")
         };
