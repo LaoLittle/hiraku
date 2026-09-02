@@ -453,6 +453,7 @@ fn present_frame(
         u: u_image.clone(),
         v: v_image.clone(),
         color_transform: frame.color_transform,
+        transfer: frame.transfer,
     });
     let image_entity = commands
         .spawn((

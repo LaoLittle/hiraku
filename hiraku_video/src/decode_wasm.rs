@@ -12,7 +12,10 @@ use bevy::{
 };
 use crossbeam_channel::{Receiver, bounded};
 
-use crate::{VideoAsset, VideoMetadata, color::YuvColorTransform};
+use crate::{
+    VideoAsset, VideoMetadata,
+    color::{TransferFunction, YuvColorTransform},
+};
 
 #[derive(Debug)]
 pub(crate) struct DecodedFrame {
@@ -22,6 +25,7 @@ pub(crate) struct DecodedFrame {
     pub chroma_width: u32,
     pub chroma_height: u32,
     pub color_transform: YuvColorTransform,
+    pub transfer: TransferFunction,
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,

@@ -1,13 +1,25 @@
-use bevy::{
-    math::{UVec3, Vec4},
-    render::render_resource::ShaderType,
-};
+use bevy::{math::Vec4, render::render_resource::ShaderType};
 
-pub(crate) const TRANSFER_LINEAR: u32 = 0;
-pub(crate) const TRANSFER_BT709: u32 = 1;
-pub(crate) const TRANSFER_SRGB: u32 = 2;
-pub(crate) const TRANSFER_GAMMA_22: u32 = 3;
-pub(crate) const TRANSFER_GAMMA_28: u32 = 4;
+/// BT.1886 display EOTF for conventional SDR television content.
+///
+/// With an ideal black level this is a pure 2.4 power function. It must not
+/// be replaced with the inverse BT.709 camera OETF: the two curves describe
+/// different sides of the imaging chain.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        dead_code,
+        reason = "the WebCodecs decoder backend is not implemented yet"
+    )
+)]
+pub(crate) enum TransferFunction {
+    Linear,
+    Bt1886,
+    Srgb,
+    Gamma22,
+    Gamma28,
+}
 
 /// A precombined YUV-range and YUV-to-RGB affine transform.
 ///
@@ -18,12 +30,11 @@ pub(crate) struct YuvColorTransform {
     pub row_r: Vec4,
     pub row_g: Vec4,
     pub row_b: Vec4,
-    pub transfer: u32,
-    pub _padding: UVec3,
 }
 
 impl YuvColorTransform {
-    pub fn from_luma_coefficients(kr: f32, kb: f32, limited_range: bool, transfer: u32) -> Self {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_luma_coefficients(kr: f32, kb: f32, limited_range: bool) -> Self {
         let kg = 1.0 - kr - kb;
         let red_v = 2.0 * (1.0 - kr);
         let blue_u = 2.0 * (1.0 - kb);
@@ -44,8 +55,6 @@ impl YuvColorTransform {
                 offset(green_u, green_v),
             ),
             row_b: Vec4::new(y_scale, blue_u * chroma_scale, 0.0, offset(blue_u, 0.0)),
-            transfer,
-            _padding: UVec3::ZERO,
         }
     }
 }
@@ -56,8 +65,7 @@ mod tests {
 
     #[test]
     fn limited_range_black_and_white_map_to_display_endpoints() {
-        let transform =
-            YuvColorTransform::from_luma_coefficients(0.2126, 0.0722, true, TRANSFER_BT709);
+        let transform = YuvColorTransform::from_luma_coefficients(0.2126, 0.0722, true);
         let black = Vec4::new(16.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0, 1.0);
         let white = Vec4::new(235.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0, 1.0);
         for row in [transform.row_r, transform.row_g, transform.row_b] {

@@ -24,10 +24,7 @@ use symphonia::core::codecs::{
 use crate::{
     VideoAsset, VideoMetadata,
     asset::open_container,
-    color::{
-        TRANSFER_BT709, TRANSFER_GAMMA_22, TRANSFER_GAMMA_28, TRANSFER_LINEAR, TRANSFER_SRGB,
-        YuvColorTransform,
-    },
+    color::{TransferFunction, YuvColorTransform},
 };
 
 const VIDEO_QUEUE_CAPACITY: usize = 3;
@@ -41,6 +38,7 @@ pub(crate) struct DecodedFrame {
     pub chroma_width: u32,
     pub chroma_height: u32,
     pub color_transform: YuvColorTransform,
+    pub transfer: TransferFunction,
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
@@ -327,20 +325,24 @@ fn picture_to_yuv420(
         }
         output
     };
+    let (color_transform, transfer) = picture_color_transform(picture)?;
     Ok(DecodedFrame {
         timestamp,
         width,
         height,
         chroma_width,
         chroma_height,
-        color_transform: picture_color_transform(picture),
+        color_transform,
+        transfer,
         y: copy_plane(PlanarImageComponent::Y, width, height),
         u: copy_plane(PlanarImageComponent::U, chroma_width, chroma_height),
         v: copy_plane(PlanarImageComponent::V, chroma_width, chroma_height),
     })
 }
 
-fn picture_color_transform(picture: &rav1d::Picture) -> YuvColorTransform {
+fn picture_color_transform(
+    picture: &rav1d::Picture,
+) -> Result<(YuvColorTransform, TransferFunction), String> {
     use rav1d::pixel::{MatrixCoefficients, TransferCharacteristic, YUVRange};
 
     let (kr, kb) = match picture.matrix_coefficients() {
@@ -359,11 +361,12 @@ fn picture_color_transform(picture: &rav1d::Picture) -> YuvColorTransform {
         | MatrixCoefficients::ChromaticityDerivedConstantLuminance
         | MatrixCoefficients::ICtCp => (0.2126, 0.0722),
     };
-    let transfer = match picture.transfer_characteristic() {
-        TransferCharacteristic::Linear => TRANSFER_LINEAR,
-        TransferCharacteristic::SRGB => TRANSFER_SRGB,
-        TransferCharacteristic::BT470M => TRANSFER_GAMMA_22,
-        TransferCharacteristic::BT470BG => TRANSFER_GAMMA_28,
+    let transfer_characteristic = picture.transfer_characteristic();
+    let transfer = match transfer_characteristic {
+        TransferCharacteristic::Linear => TransferFunction::Linear,
+        TransferCharacteristic::SRGB => TransferFunction::Srgb,
+        TransferCharacteristic::BT470M => TransferFunction::Gamma22,
+        TransferCharacteristic::BT470BG => TransferFunction::Gamma28,
         TransferCharacteristic::BT1886
         | TransferCharacteristic::Unspecified
         | TransferCharacteristic::Reserved0
@@ -373,19 +376,25 @@ fn picture_color_transform(picture: &rav1d::Picture) -> YuvColorTransform {
         | TransferCharacteristic::XVYCC
         | TransferCharacteristic::BT1361E
         | TransferCharacteristic::BT2020Ten
-        | TransferCharacteristic::BT2020Twelve
-        | TransferCharacteristic::Logarithmic100
+        | TransferCharacteristic::BT2020Twelve => TransferFunction::Bt1886,
+        TransferCharacteristic::Logarithmic100
         | TransferCharacteristic::Logarithmic316
         | TransferCharacteristic::PerceptualQuantizer
         | TransferCharacteristic::ST428
-        | TransferCharacteristic::HybridLogGamma => TRANSFER_BT709,
+        | TransferCharacteristic::HybridLogGamma => {
+            return Err(format!(
+                "unsupported AV1 transfer characteristic {transfer_characteristic:?}: HDR and log tone mapping are not implemented"
+            ));
+        }
     };
-    YuvColorTransform::from_luma_coefficients(
-        kr,
-        kb,
-        picture.color_range() == YUVRange::Limited,
+    Ok((
+        YuvColorTransform::from_luma_coefficients(
+            kr,
+            kb,
+            picture.color_range() == YUVRange::Limited,
+        ),
         transfer,
-    )
+    ))
 }
 
 pub(crate) fn drain_ready_frames(
