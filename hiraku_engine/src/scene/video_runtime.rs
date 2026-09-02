@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use bevy::prelude::*;
 use hiraku_video::{VideoAsset, VideoEvent, VideoPlaybackId, VideoPlayer};
 
-use crate::script::{ScriptRequestId, ScriptResponse, ScriptResponseMessage, VideoCommand};
+use crate::script::{
+    ScriptRequestId, ScriptResponse, ScriptResponseMessage, ScriptRuntimeState, VideoCommand,
+};
 
 #[derive(Resource, Default)]
 pub struct PendingMovieWaits(BTreeMap<VideoPlaybackId, ScriptRequestId>);
@@ -26,6 +28,7 @@ pub(super) fn dispatch_video_command(
 pub fn complete_movie_waits(
     mut events: MessageReader<VideoEvent>,
     mut waits: ResMut<PendingMovieWaits>,
+    runtime: Res<ScriptRuntimeState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
 ) {
     for event in events.read() {
@@ -37,7 +40,9 @@ pub fn complete_movie_waits(
                 *id
             }
         };
-        if let Some(request) = waits.0.remove(&playback) {
+        if let Some(request) = waits.0.remove(&playback)
+            && runtime.wait_request == Some(request)
+        {
             responses.write(ScriptResponseMessage {
                 request,
                 response: ScriptResponse::Continue,
@@ -54,6 +59,7 @@ mod tests {
     fn terminal_video_events_resume_only_the_matching_story_wait() {
         let mut app = App::new();
         app.init_resource::<PendingMovieWaits>()
+            .init_resource::<ScriptRuntimeState>()
             .add_message::<VideoEvent>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, complete_movie_waits);
@@ -62,6 +68,9 @@ mod tests {
             .resource_mut::<PendingMovieWaits>()
             .0
             .insert(playback, ScriptRequestId(11));
+        app.world_mut()
+            .resource_mut::<ScriptRuntimeState>()
+            .wait_request = Some(ScriptRequestId(11));
         app.world_mut()
             .write_message(VideoEvent::Finished { id: playback });
         app.update();
@@ -72,5 +81,27 @@ mod tests {
             .next()
             .expect("completion must resume the matching story request");
         assert_eq!(response.request, ScriptRequestId(11));
+    }
+
+    #[test]
+    fn terminal_video_events_discard_cancelled_story_waits() {
+        let mut app = App::new();
+        app.init_resource::<PendingMovieWaits>()
+            .init_resource::<ScriptRuntimeState>()
+            .add_message::<VideoEvent>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, complete_movie_waits);
+        let playback = VideoPlaybackId(9);
+        app.world_mut()
+            .resource_mut::<PendingMovieWaits>()
+            .0
+            .insert(playback, ScriptRequestId(12));
+        app.world_mut()
+            .write_message(VideoEvent::Finished { id: playback });
+        app.update();
+
+        let responses = app.world().resource::<Messages<ScriptResponseMessage>>();
+        assert_eq!(responses.len(), 0);
+        assert!(app.world().resource::<PendingMovieWaits>().0.is_empty());
     }
 }

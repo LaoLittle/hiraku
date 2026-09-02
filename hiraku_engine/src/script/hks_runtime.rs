@@ -264,6 +264,15 @@ impl StoryRuntime {
         Ok(())
     }
 
+    /// Returns whether the story currently owns a host-side wait boundary.
+    ///
+    /// ECS completions can arrive after navigation or state restoration has
+    /// invalidated their request. Callers must use this boundary state to
+    /// discard such late completions instead of treating them as VM failures.
+    pub fn is_waiting_for_host_response(&self) -> bool {
+        self.blocked
+    }
+
     pub fn resume_task(&mut self, task: u64) -> Result<(), StoryRuntimeError> {
         let effects = self
             .active_task_effects
@@ -294,17 +303,7 @@ impl StoryRuntime {
 
     pub fn step(&mut self) -> Result<Option<StoryRuntimeEvent>, StoryRuntimeError> {
         if let Some(event) = self.pending.pop_front() {
-            if matches!(
-                event,
-                StoryRuntimeEvent::Wait(_)
-                    | StoryRuntimeEvent::OpenUi { .. }
-                    | StoryRuntimeEvent::Choice { .. }
-            ) {
-                self.blocked = true;
-            }
-            if let StoryRuntimeEvent::Wait(wait) = &event {
-                self.blocked_wait = Some(wait.clone());
-            }
+            self.mark_host_boundary(&event);
             return Ok(Some(event));
         }
         if self.blocked {
@@ -357,12 +356,7 @@ impl StoryRuntime {
                     self.host.handle_statement(&statement)?;
                     self.enqueue_host_boundaries();
                     if let Some(event) = self.pending.pop_front() {
-                        if matches!(event, StoryRuntimeEvent::Wait(_)) {
-                            self.blocked = true;
-                        }
-                        if let StoryRuntimeEvent::Wait(wait) = &event {
-                            self.blocked_wait = Some(wait.clone());
-                        }
+                        self.mark_host_boundary(&event);
                         return Ok(Some(event));
                     }
                 }
@@ -370,6 +364,7 @@ impl StoryRuntime {
                 | HksRuntimeEvent::TaskStatement { .. }
                 | HksRuntimeEvent::TaskCompleted { .. }) => {
                     if let Some(event) = self.handle_task_event(event)? {
+                        self.mark_host_boundary(&event);
                         return Ok(Some(event));
                     }
                 }
@@ -377,6 +372,20 @@ impl StoryRuntime {
                     return Ok(Some(StoryRuntimeEvent::Completed(value)));
                 }
             }
+        }
+    }
+
+    fn mark_host_boundary(&mut self, event: &StoryRuntimeEvent) {
+        if matches!(
+            event,
+            StoryRuntimeEvent::Wait(_)
+                | StoryRuntimeEvent::OpenUi { .. }
+                | StoryRuntimeEvent::Choice { .. }
+        ) {
+            self.blocked = true;
+        }
+        if let StoryRuntimeEvent::Wait(wait) = event {
+            self.blocked_wait = Some(wait.clone());
         }
     }
 
@@ -1097,6 +1106,50 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
                 if text == "after choice"
         ));
+    }
+
+    #[test]
+    fn movie_wait_inside_a_choice_branch_resumes_that_branch() {
+        let bytecode = compile_story_bytecode(
+            "choice-movie.story.hks",
+            r#"
+                choice {
+                    option("Play movie") {
+                        movie("opening")
+                        "after movie"
+                    }
+                }
+                "after choice"
+            "#,
+        )
+        .expect("choice movie story must compile");
+        let mut runtime = StoryRuntime::new(bytecode).expect("story driver must initialize");
+        assert!(matches!(
+            runtime.step().expect("choice must suspend"),
+            Some(StoryRuntimeEvent::Choice { .. })
+        ));
+        runtime
+            .resume(Value::Number(0.0))
+            .expect("choice response must start the selected branch");
+        assert_eq!(
+            runtime.step().expect("movie must suspend its branch"),
+            Some(StoryRuntimeEvent::Wait(StoryWait::Movie {
+                path: "opening".into(),
+            }))
+        );
+        assert!(runtime.is_waiting_for_host_response());
+        runtime
+            .resume(Value::Unit)
+            .expect("movie completion must resume the selected branch");
+        assert!(matches!(
+            runtime.step().expect("branch dialogue must run after movie"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
+                if text == "after movie"
+        ));
+        assert_eq!(
+            runtime.step().expect("branch dialogue must await input"),
+            Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+        );
     }
 
     #[test]

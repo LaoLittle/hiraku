@@ -208,11 +208,16 @@ pub fn drive_story_runtime(
         runtime.pending_ui_screen = None;
         runtime.pending_ui_arguments.clear();
         runtime.wait_request = None;
-        if let Some(story) = runtime.story.as_mut()
-            && let Err(error) = story.resume(direct_value)
-        {
-            warn!("failed to resume script runtime: {error}");
-            runtime.story = None;
+        if let Some(story) = runtime.story.as_mut() {
+            if !story.is_waiting_for_host_response() {
+                // Host completions are asynchronous. Navigation, load, or a
+                // competing completion may have invalidated this request after
+                // it was emitted; the token has already been consumed above.
+                debug!("discarded stale script response for request {}", request.0);
+            } else if let Err(error) = story.resume(direct_value) {
+                warn!("failed to resume script runtime: {error}");
+                runtime.story = None;
+            }
         }
     }
 
