@@ -7,13 +7,10 @@
 
 mod asset;
 mod color;
-#[cfg(not(target_arch = "wasm32"))]
-mod decode;
-#[cfg(target_arch = "wasm32")]
-#[path = "decode_wasm.rs"]
-mod decode;
 mod player;
 mod render;
+mod platform;
 
 pub use asset::{VideoAsset, VideoAssetLoader, VideoAssetLoaderError, VideoMetadata};
+pub use player::VideoDecodeSettings;
 pub use player::{HirakuVideoPlugin, VideoEvent, VideoPlaybackId, VideoPlaybackState, VideoPlayer};

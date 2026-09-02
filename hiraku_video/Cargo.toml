@@ -12,6 +12,35 @@ opus-rs = "0.1.32"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rav1d = { git = "https://github.com/memorysafety/rav1d.git" }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.104"
+wasm-bindgen = "0.2.127"
+wasm-bindgen-futures = "0.4.77"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3.104"
+features = [
+    "Blob",
+    "BlobPropertyBag",
+    "CanvasRenderingContext2d",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "HardwareAcceleration",
+    "HtmlAudioElement",
+    "HtmlCanvasElement",
+    "ImageData",
+    "Url",
+    "VideoColorSpace",
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoFrame",
+    "VideoFrameCopyToOptions",
+    "VideoPixelFormat",
+    "Window",
+]
+
 [dependencies.symphonia]
 version = "0.6.1"
 default-features = false

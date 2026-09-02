@@ -15,6 +15,8 @@ use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoMetadata {
+    pub width: u32,
+    pub height: u32,
     pub sample_rate: u32,
     pub channels: u16,
 }
@@ -37,6 +39,8 @@ pub enum VideoAssetLoaderError {
     Container(String),
     #[error("video must contain the supported AV1 video track")]
     MissingAv1,
+    #[error("AV1 track must declare non-zero coded dimensions")]
+    MissingDimensions,
     #[error("video must contain the supported Opus audio track")]
     MissingOpus,
     #[error("Opus channel count {0} is unsupported")]
@@ -98,8 +102,8 @@ fn inspect_media_profile(
     extension: &str,
 ) -> Result<VideoMetadata, VideoAssetLoaderError> {
     let format = open_container(Arc::from(bytes), extension)?;
-    let mut has_av1 = false;
-    let mut opus = None;
+    let mut video_dimensions = None;
+    let mut audio_metadata = None;
     for track in format.tracks() {
         let Some(parameters) = &track.codec_params else {
             continue;
@@ -107,7 +111,9 @@ fn inspect_media_profile(
         if let Some(video) = parameters.video()
             && video.codec == video_codecs::CODEC_ID_AV1
         {
-            has_av1 = true;
+            video_dimensions = video.width.zip(video.height).and_then(|(width, height)| {
+                (width != 0 && height != 0).then_some((u32::from(width), u32::from(height)))
+            });
         }
         if let Some(audio) = parameters.audio()
             && audio.codec == audio_codecs::CODEC_ID_OPUS
@@ -125,16 +131,28 @@ fn inspect_media_profile(
             if sample_rate == 0 {
                 return Err(VideoAssetLoaderError::InvalidSampleRate);
             }
-            opus = Some(VideoMetadata {
-                sample_rate,
-                channels,
-            });
+            audio_metadata = Some((sample_rate, channels));
         }
     }
-    if !has_av1 {
+    let Some((width, height)) = video_dimensions else {
+        if format.tracks().iter().any(|track| {
+            track
+                .codec_params
+                .as_ref()
+                .and_then(|parameters| parameters.video())
+                .is_some_and(|video| video.codec == video_codecs::CODEC_ID_AV1)
+        }) {
+            return Err(VideoAssetLoaderError::MissingDimensions);
+        }
         return Err(VideoAssetLoaderError::MissingAv1);
-    }
-    opus.ok_or(VideoAssetLoaderError::MissingOpus)
+    };
+    let (sample_rate, channels) = audio_metadata.ok_or(VideoAssetLoaderError::MissingOpus)?;
+    Ok(VideoMetadata {
+        width,
+        height,
+        sample_rate,
+        channels,
+    })
 }
 
 #[cfg(test)]

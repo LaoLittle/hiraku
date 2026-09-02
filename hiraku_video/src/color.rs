@@ -33,7 +33,6 @@ pub(crate) struct YuvColorTransform {
 }
 
 impl YuvColorTransform {
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_luma_coefficients(kr: f32, kb: f32, limited_range: bool) -> Self {
         let kg = 1.0 - kr - kb;
         let red_v = 2.0 * (1.0 - kr);

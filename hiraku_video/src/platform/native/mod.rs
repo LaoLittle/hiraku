@@ -3,7 +3,7 @@ use std::{
     num::{NonZeroU16, NonZeroU32},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -12,7 +12,6 @@ use bevy::{
     audio::{ChannelCount, Decodable, SampleRate, Source},
     prelude::Asset,
     reflect::TypePath,
-    tasks::AsyncComputeTaskPool,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 use opus_rs::OpusDecoder;
@@ -22,7 +21,7 @@ use symphonia::core::codecs::{
 };
 
 use crate::{
-    VideoAsset, VideoMetadata,
+    VideoAsset, VideoDecodeSettings, VideoMetadata,
     asset::open_container,
     color::{TransferFunction, YuvColorTransform},
 };
@@ -39,9 +38,11 @@ pub(crate) struct DecodedFrame {
     pub chroma_height: u32,
     pub color_transform: YuvColorTransform,
     pub transfer: TransferFunction,
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    pub planes: Arc<[u8]>,
+    pub u_offset: usize,
+    pub v_offset: usize,
+    pub y_stride: u32,
+    pub chroma_stride: u32,
 }
 
 #[derive(Debug)]
@@ -123,20 +124,25 @@ pub(crate) struct DecodeStream {
     pub video: Receiver<DecodeEvent>,
     pub audio: VideoAudio,
     pub cancellation: Arc<AtomicBool>,
+    pub queued_frames: Option<Arc<AtomicUsize>>,
 }
 
-pub(crate) fn spawn_decoder(asset: &VideoAsset) -> DecodeStream {
+pub(crate) fn spawn_decoder(asset: &VideoAsset, settings: &VideoDecodeSettings) -> DecodeStream {
     let (video_sender, video_receiver) = bounded(VIDEO_QUEUE_CAPACITY);
     let (audio_sender, audio_receiver) = bounded(AUDIO_QUEUE_CAPACITY);
     let bytes = asset.bytes.clone();
     let metadata = asset.metadata;
+    let (decoder_threads, max_frame_delay) = settings.resolved();
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = cancellation.clone();
-    AsyncComputeTaskPool::get()
-        .spawn(async move {
+    std::thread::Builder::new()
+        .name("hiraku-av1-decoder".into())
+        .spawn(move || {
             if let Err(error) = decode_stream(
                 bytes,
                 metadata,
+                decoder_threads,
+                max_frame_delay,
                 &video_sender,
                 &audio_sender,
                 &worker_cancellation,
@@ -147,7 +153,8 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset) -> DecodeStream {
                 let _ = audio_sender.try_send(AudioEvent::End);
             }
         })
-        .detach();
+        .expect("failed to spawn the AV1 decoder thread");
+
     DecodeStream {
         video: video_receiver,
         audio: VideoAudio {
@@ -155,12 +162,15 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset) -> DecodeStream {
             metadata,
         },
         cancellation,
+        queued_frames: None,
     }
 }
 
 fn decode_stream(
     bytes: Arc<[u8]>,
     metadata: VideoMetadata,
+    decoder_threads: u32,
+    max_frame_delay: u32,
     video_sender: &Sender<DecodeEvent>,
     audio_sender: &Sender<AudioEvent>,
     cancellation: &AtomicBool,
@@ -191,11 +201,8 @@ fn decode_stream(
     let audio_track = audio_track.ok_or_else(|| "Opus audio track disappeared".to_string())?;
 
     let mut settings = Settings::new();
-    let decoder_threads = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1);
-    settings.set_n_threads(u32::try_from(decoder_threads).unwrap_or(u32::MAX));
-    settings.set_max_frame_delay(VIDEO_QUEUE_CAPACITY as u32);
+    settings.set_n_threads(decoder_threads);
+    settings.set_max_frame_delay(max_frame_delay);
     let mut video_decoder =
         Av1Decoder::with_settings(&settings).map_err(|error| error.to_string())?;
     let mut audio_decoder = OpusDecoder::new(metadata.sample_rate as i32, metadata.channels.into())
@@ -270,10 +277,7 @@ fn drain_pictures(
         let first = *first_timestamp.get_or_insert(timestamp);
         send_cancellable(
             sender,
-            DecodeEvent::Frame(picture_to_yuv420(
-                &picture,
-                timestamp.saturating_sub(first),
-            )?),
+            DecodeEvent::Frame(picture_to_yuv420(picture, timestamp.saturating_sub(first))?),
             cancellation,
         )?;
     }
@@ -299,10 +303,7 @@ fn send_cancellable<T>(
     }
 }
 
-fn picture_to_yuv420(
-    picture: &rav1d::Picture,
-    timestamp: Duration,
-) -> Result<DecodedFrame, String> {
+fn picture_to_yuv420(picture: rav1d::Picture, timestamp: Duration) -> Result<DecodedFrame, String> {
     if picture.bit_depth() != 8 || picture.pixel_layout() != PixelLayout::I420 {
         return Err(format!(
             "unsupported AV1 pixel format: expected 8-bit 4:2:0, got {}-bit {:?}",
@@ -314,18 +315,47 @@ fn picture_to_yuv420(
     let height = picture.height();
     let chroma_width = width.div_ceil(2);
     let chroma_height = height.div_ceil(2);
-    let copy_plane = |component, plane_width: u32, plane_height: u32| {
-        let source = picture.plane(component);
-        let stride = picture.stride(component) as usize;
-        let row_width = plane_width as usize;
-        let mut output = Vec::with_capacity(row_width * plane_height as usize);
-        for row in 0..plane_height as usize {
-            let start = row * stride;
-            output.extend_from_slice(&source[start..start + row_width]);
-        }
-        output
+    let (color_transform, transfer) = picture_color_transform(&picture)?;
+    let y_stride = picture.stride(PlanarImageComponent::Y);
+    let u_stride = picture.stride(PlanarImageComponent::U);
+    let v_stride = picture.stride(PlanarImageComponent::V);
+    if u_stride != v_stride {
+        return Err(format!(
+            "unsupported AV1 plane layout: U stride {u_stride} differs from V stride {v_stride}"
+        ));
+    }
+
+    // rav1d pictures are intentionally !Send/!Sync. Copy each padded plane once
+    // at the decoder boundary, retaining its row stride so no row-by-row pack is
+    // needed here or in the render world.
+    let plane_len = |stride: u32, plane_height: u32| {
+        usize::try_from(stride)
+            .expect("u32 stride must fit usize")
+            .checked_mul(usize::try_from(plane_height).expect("u32 height must fit usize"))
+            .expect("decoded video plane size must fit usize")
     };
-    let (color_transform, transfer) = picture_color_transform(picture)?;
+    let y_len = plane_len(y_stride, height);
+    let u_len = plane_len(u_stride, chroma_height);
+    let v_len = plane_len(v_stride, chroma_height);
+    let u_offset = y_len;
+    let v_offset = y_len
+        .checked_add(u_len)
+        .expect("decoded video plane offsets must fit usize");
+    let total_len = v_offset
+        .checked_add(v_len)
+        .expect("decoded video frame size must fit usize");
+    let mut planes = Arc::<[u8]>::new_uninit_slice(total_len);
+    let destination = Arc::get_mut(&mut planes).expect("new Arc storage must be uniquely owned");
+    let mut copy_plane = |offset: usize, source: &[u8]| {
+        let destination = &mut destination[offset..offset + source.len()];
+        destination.write_copy_of_slice(source);
+    };
+    copy_plane(0, &picture.plane(PlanarImageComponent::Y)[..y_len]);
+    copy_plane(u_offset, &picture.plane(PlanarImageComponent::U)[..u_len]);
+    copy_plane(v_offset, &picture.plane(PlanarImageComponent::V)[..v_len]);
+    // Every byte in the allocation was initialized by the three exhaustive
+    // plane copies above.
+    let planes = unsafe { planes.assume_init() };
     Ok(DecodedFrame {
         timestamp,
         width,
@@ -334,9 +364,11 @@ fn picture_to_yuv420(
         chroma_height,
         color_transform,
         transfer,
-        y: copy_plane(PlanarImageComponent::Y, width, height),
-        u: copy_plane(PlanarImageComponent::U, chroma_width, chroma_height),
-        v: copy_plane(PlanarImageComponent::V, chroma_width, chroma_height),
+        planes,
+        u_offset,
+        v_offset,
+        y_stride,
+        chroma_stride: u_stride,
     })
 }
 
