@@ -942,39 +942,56 @@ fn spawn_screen_node_entity(
             apply_screen_layout(&mut unchecked_node, &toggle.unchecked.layout);
             let mut checked_node = Node::default();
             apply_screen_layout(&mut checked_node, &toggle.checked.layout);
-            let (initial_image, initial_resolved) = if toggle.value {
-                (checked_image.clone(), checked_resolved)
+            // Authored sheet regions use ImageNode's source rectangle directly,
+            // keeping one stable image binding while a toggle changes visuals.
+            // Standalone packed images still use their generated atlas.
+            let unchecked_atlas = unchecked
+                .rect
+                .is_none()
+                .then(|| unchecked_resolved.map(|texture| texture.atlas.clone()))
+                .flatten();
+            let checked_atlas = checked
+                .rect
+                .is_none()
+                .then(|| checked_resolved.map(|texture| texture.atlas.clone()))
+                .flatten();
+            let unchecked_rect = unchecked.rect.map(texture_rect);
+            let checked_rect = checked.rect.map(texture_rect);
+            let (initial_image, initial_atlas, initial_rect) = if toggle.value {
+                (checked_image.clone(), checked_atlas.clone(), checked_rect)
             } else {
-                (unchecked_image.clone(), unchecked_resolved)
+                (
+                    unchecked_image.clone(),
+                    unchecked_atlas.clone(),
+                    unchecked_rect,
+                )
             };
             let initial_node = if toggle.value {
                 checked_node.clone()
             } else {
                 unchecked_node.clone()
             };
+            let mut image_node = ImageNode::new(initial_image).with_mode(NodeImageMode::Stretch);
+            image_node.visual_box = VisualBox::BorderBox;
+            image_node.texture_atlas = initial_atlas;
+            image_node.rect = initial_rect;
             let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Button,
                     BackgroundColor(Color::NONE),
-                    stretched_image_node(initial_image, initial_resolved),
+                    image_node,
                     initial_node,
                     ScreenUiToggle {
                         checked: toggle.value,
                         unchecked_node,
                         checked_node,
                         unchecked_texture: unchecked_image,
-                        unchecked_atlas: unchecked_resolved.map(|texture| texture.atlas.clone()),
-                        unchecked_rect: unchecked_resolved
-                            .is_none()
-                            .then(|| unchecked.rect.map(texture_rect))
-                            .flatten(),
+                        unchecked_atlas,
+                        unchecked_rect,
                         checked_texture: checked_image,
-                        checked_atlas: checked_resolved.map(|texture| texture.atlas.clone()),
-                        checked_rect: checked_resolved
-                            .is_none()
-                            .then(|| checked.rect.map(texture_rect))
-                            .flatten(),
+                        checked_atlas,
+                        checked_rect,
                     },
                 ))
                 .id();
