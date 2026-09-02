@@ -1362,12 +1362,6 @@ mod native_api {
         if path.trim().is_empty() {
             return Err(NativeError::message("movie path must not be empty"));
         }
-        let lower = path.to_ascii_lowercase();
-        if !lower.ends_with(".mkv") && !lower.ends_with(".webm") {
-            return Err(NativeError::message(
-                "movie only supports `.mkv` and `.webm` AV1 + Opus assets",
-            ));
-        }
         context.wait = Some(StoryWait::Movie { path });
         Ok(())
     }

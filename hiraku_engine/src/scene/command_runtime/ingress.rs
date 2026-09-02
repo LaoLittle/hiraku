@@ -148,7 +148,6 @@ fn default_history_model() -> StoredValue {
     StoredValue::Map(BTreeMap::from([
         ("entries".to_string(), StoredValue::Array(Vec::new())),
         ("text".to_string(), StoredValue::String(String::new())),
-        ("visible".to_string(), StoredValue::Bool(false)),
     ]))
 }
 
@@ -182,6 +181,7 @@ pub fn drive_story_runtime(
     textures: Option<Res<TextureCatalog>>,
     terms: Option<Res<TermCatalog>>,
     audio: Option<Res<AudioCatalog>>,
+    movies: Option<Res<crate::movie::MovieCatalog>>,
     vfs: Res<VfsResource>,
     user_settings: Res<UserSettings>,
 ) {
@@ -412,7 +412,20 @@ pub fn drive_story_runtime(
                 ));
             }
             StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Movie { path }) => {
-                let target = vfs.0.resolve_path(runtime.current_script.as_deref(), &path);
+                let target = movies
+                    .as_deref()
+                    .and_then(|catalog| catalog.resolve(&path))
+                    .map(|definition| definition.path.clone())
+                    .or_else(|| {
+                        let lower = path.to_ascii_lowercase();
+                        (lower.ends_with(".mkv") || lower.ends_with(".webm"))
+                            .then(|| vfs.0.resolve_path(runtime.current_script.as_deref(), &path))
+                    });
+                let Some(target) = target else {
+                    warn!("movie `{path}` is not defined");
+                    runtime.story = None;
+                    return;
+                };
                 let request = runtime.allocate_request();
                 runtime.wait_request = Some(request);
                 pending_script_commands.enqueue(ScriptCommand::Video(VideoCommand::Play {

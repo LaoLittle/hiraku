@@ -22,6 +22,7 @@ use crate::{
     effect::custom::{CustomScreenEffectMaterial, CustomScreenEffectPlayer},
     effect::transition::{RuleTransitionMaterial, RuleTransitionMesh, RuleTransitionPlayer},
     glossary::{TermCatalog, load_term_catalog},
+    movie::{MovieCatalog, load_movie_catalog},
     render::camera::{
         CameraShakeState, CameraState, CameraTweenState, WorldCamera, focus_layer, scene_layer,
         setup_stage_cameras, start_camera_tween, ui_layer,
@@ -412,6 +413,13 @@ pub fn setup_frontend(
         Err(error) => {
             warn!("failed to load audio catalog: {error}");
             commands.insert_resource(AudioCatalog::default());
+        }
+    }
+    match load_movie_catalog(&vfs.0) {
+        Ok(catalog) => commands.insert_resource(catalog),
+        Err(error) => {
+            warn!("failed to load movie catalog: {error}");
+            commands.insert_resource(MovieCatalog::default());
         }
     }
     match load_term_catalog(&vfs.0) {

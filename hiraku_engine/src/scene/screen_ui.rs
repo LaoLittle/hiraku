@@ -96,12 +96,19 @@ pub(super) fn spawn_screen_ui(
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     screen: &ScreenSpec,
+    capture_background_input: bool,
 ) -> SpawnedScreenUi {
     let root = commands
         .spawn((
             ScreenUiRoot,
             ScreenUiNode,
-            Pickable::IGNORE,
+            // A modal screen must own its empty area as well as its buttons.
+            // Otherwise picking falls through to the dialogue advance surface.
+            if capture_background_input {
+                Pickable::default()
+            } else {
+                Pickable::IGNORE
+            },
             UiTransform::IDENTITY,
             GlobalZIndex(SCREEN_ACTIVE_Z),
             screen_root_node(screen),
@@ -996,9 +1003,6 @@ fn partition_click_effects(
             }
             UiEffect::OpenUi { role } => RuntimeMenuButtonAction::OpenUi(role.clone()),
             UiEffect::CloseUi => RuntimeMenuButtonAction::CloseUi,
-            UiEffect::SetHistoryVisible { visible } => {
-                RuntimeMenuButtonAction::SetHistoryVisible(*visible)
-            }
             UiEffect::Save { slot } => RuntimeMenuButtonAction::Save(slot.clone()),
             UiEffect::Load { slot } => RuntimeMenuButtonAction::Load(slot.clone()),
             UiEffect::NextDialogue => RuntimeMenuButtonAction::AdvanceDialogue,
@@ -1559,10 +1563,6 @@ pub fn update_builtin_ui_models(
         StoredValue::Map(BTreeMap::from([
             ("entries".to_string(), StoredValue::Array(entries)),
             ("text".to_string(), StoredValue::String(text)),
-            (
-                "visible".to_string(),
-                StoredValue::Bool(dialogue_history.visible),
-            ),
         ])),
     );
 }
@@ -1928,6 +1928,7 @@ mod tests {
         app.init_resource::<DialogueState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
+            .init_resource::<ScreenUiState>()
             .init_resource::<RuntimeMenuState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
@@ -1971,11 +1972,65 @@ mod tests {
     }
 
     #[test]
+    fn blank_click_is_a_noop_while_a_declarative_screen_is_open() {
+        let mut app = App::new();
+        app.init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<ChoiceState>()
+            .init_resource::<ScreenUiState>()
+            .init_resource::<RuntimeMenuState>()
+            .init_resource::<DialogueHistoryState>()
+            .add_message::<crate::input::HirakuActionInput>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, advance_dialogue_on_input);
+        app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
+            animation_id: None,
+            request: Some(ScriptRequestId(13)),
+        });
+        let screen = app.world_mut().spawn(ScreenUiRoot).id();
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(screen);
+        let dialogue_surface = app.world_mut().spawn(DialogueAdvanceSurface).id();
+        app.world_mut().write_message(Pointer::new(
+            PointerId::Custom(uuid::Uuid::from_u128(3)),
+            Location {
+                target: NormalizedRenderTarget::None {
+                    width: 1,
+                    height: 1,
+                },
+                position: Vec2::ZERO,
+            },
+            Click {
+                button: PointerButton::Primary,
+                hit: HitData {
+                    camera: screen,
+                    depth: 0.0,
+                    position: None,
+                    normal: None,
+                    extra: None,
+                },
+                duration: Duration::ZERO,
+                count: 1,
+            },
+            dialogue_surface,
+        ));
+
+        app.update();
+
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        assert_eq!(
+            app.world().resource::<ScreenUiState>().active_root,
+            Some(screen)
+        );
+    }
+
+    #[test]
     fn claimed_pointer_click_survives_modal_despawn_before_dialogue_input() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
+            .init_resource::<ScreenUiState>()
             .init_resource::<RuntimeMenuState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()

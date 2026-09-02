@@ -843,14 +843,6 @@ mod ui_actions {
     fn native_close(context: &mut UiVmContext) -> Result<UiEffectHandle, NativeError> {
         Ok(context.insert_effect(UiEffect::CloseUi))
     }
-
-    #[hks]
-    fn native_set_history_visible(
-        context: &mut UiVmContext,
-        visible: bool,
-    ) -> Result<UiEffectHandle, NativeError> {
-        Ok(context.insert_effect(UiEffect::SetHistoryVisible { visible }))
-    }
 }
 
 #[hiraku_script::hks_module("storage")]

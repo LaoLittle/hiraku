@@ -20,6 +20,7 @@ pub(super) fn dispatch_ui_command(
                 ui_fonts,
                 ui_style,
                 &screen,
+                true,
             );
             let root = spawned.root;
             let previous = screen_state.active_root.take();
@@ -55,6 +56,7 @@ pub(super) fn dispatch_ui_command(
                 ui_fonts,
                 ui_style,
                 &screen,
+                false,
             );
             commands
                 .entity(spawned.root)

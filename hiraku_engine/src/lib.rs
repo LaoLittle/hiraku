@@ -5,6 +5,7 @@ mod data;
 mod effect;
 mod glossary;
 pub mod input;
+mod movie;
 mod proto;
 pub mod render;
 mod scene;

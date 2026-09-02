@@ -496,7 +496,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     );
                     if navigation.reset == NavigationReset::Session {
                         dialogue_history.entries.clear();
-                        dialogue_history.visible = false;
                     }
                 }
 

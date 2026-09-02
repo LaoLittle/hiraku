@@ -17,7 +17,6 @@ pub enum RuntimeMenuButtonAction {
     Load(String),
     OpenUi(String),
     CloseUi,
-    SetHistoryVisible(bool),
     Navigate(crate::script::navigation::NavigationRequest),
     AdvanceDialogue,
 }
@@ -247,7 +246,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     &ctx.choice_ui_roots,
                 );
                 ctx.dialogue_history.entries.clear();
-                ctx.dialogue_history.visible = false;
                 clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
                 start_frontend_session(
                     &mut ctx.commands,
@@ -296,9 +294,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
             }
             RuntimeMenuButtonAction::CloseUi => {
                 clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-            }
-            RuntimeMenuButtonAction::SetHistoryVisible(visible) => {
-                ctx.dialogue_history.visible = *visible;
             }
             RuntimeMenuButtonAction::Navigate(navigation) => {
                 ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(

@@ -11,7 +11,6 @@ pub struct DialogueState {
 #[derive(Resource, Default)]
 pub struct DialogueHistoryState {
     pub entries: Vec<DialogueSnapshot>,
-    pub visible: bool,
 }
 
 pub struct PendingDialogueAdvance {
@@ -84,8 +83,8 @@ pub fn advance_dialogue_on_input(
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     choice_state: Res<ChoiceState>,
+    screen_state: Res<ScreenUiState>,
     mut runtime_menu: ResMut<RuntimeMenuState>,
-    dialogue_history: Res<DialogueHistoryState>,
     ui_interactions: Query<
         Option<&PickingInteraction>,
         Or<(
@@ -121,7 +120,7 @@ pub fn advance_dialogue_on_input(
 
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
-    if dialogue_history.visible || choice_state.waiting.is_some() {
+    if choice_state.waiting.is_some() || screen_state.active_root.is_some() {
         return;
     }
     let advance = action_advance || pointer_advance;

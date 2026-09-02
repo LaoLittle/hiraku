@@ -21,9 +21,6 @@ pub enum UiEffect {
         role: String,
     },
     CloseUi,
-    SetHistoryVisible {
-        visible: bool,
-    },
     Save {
         slot: String,
     },

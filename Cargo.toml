@@ -42,6 +42,3 @@ strip = true
 lto = true
 panic = "abort"
 codegen-units = 1
-
-[profile.dev.package.hiraku-video]
-opt-level = 3

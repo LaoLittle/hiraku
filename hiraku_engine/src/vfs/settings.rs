@@ -15,6 +15,7 @@ pub(super) struct SettingsFile {
     pub(super) soundeffects_dir: Option<String>,
     pub(super) bgm_dir: Option<String>,
     pub(super) voice_dir: Option<String>,
+    pub(super) movies_dir: Option<String>,
     pub(super) characters_dir: Option<String>,
     pub(super) textures_dir: Option<String>,
     pub(super) res_root: Option<String>,
@@ -32,6 +33,7 @@ pub(super) fn settings_from_data(mut data: HsonMap, path: &str) -> Result<Settin
     let soundeffects_dir = take_data_string(&mut data, "soundeffectsDir", path)?;
     let bgm_dir = take_data_string(&mut data, "bgmDir", path)?;
     let voice_dir = take_data_string(&mut data, "voiceDir", path)?;
+    let movies_dir = take_data_string(&mut data, "moviesDir", path)?;
     let characters_dir = take_data_string(&mut data, "charactersDir", path)?;
     let textures_dir = take_data_string(&mut data, "texturesDir", path)?;
     let res_root = take_data_string(&mut data, "resRoot", path)?;
@@ -60,6 +62,7 @@ pub(super) fn settings_from_data(mut data: HsonMap, path: &str) -> Result<Settin
         soundeffects_dir,
         bgm_dir,
         voice_dir,
+        movies_dir,
         characters_dir,
         textures_dir,
         res_root,

@@ -30,6 +30,7 @@ pub const DEFAULT_BACKGROUNDS_DIR: &str = "backgrounds";
 pub const DEFAULT_BGM_DIR: &str = "bgm";
 pub const DEFAULT_SOUNDEFFECTS_DIR: &str = "soundeffects";
 pub const DEFAULT_VOICE_DIR: &str = "voice";
+pub const DEFAULT_MOVIES_DIR: &str = "movies";
 pub const DEFAULT_CHARACTERS_DIR: &str = "characters";
 pub const DEFAULT_FONTS_DIR: &str = "fonts";
 pub const DEFAULT_TEXTURES_DIR: &str = "textures";
@@ -336,6 +337,14 @@ impl HdpVfs {
             base,
             |settings| settings.voice_dir.clone(),
             DEFAULT_VOICE_DIR,
+        )
+    }
+
+    pub fn load_movies_dir_path(&self, base: Option<&str>) -> Result<String, VfsError> {
+        self.load_directory_path(
+            base,
+            |settings| settings.movies_dir.clone(),
+            DEFAULT_MOVIES_DIR,
         )
     }
 
