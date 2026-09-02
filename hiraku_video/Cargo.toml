@@ -6,11 +6,11 @@ edition.workspace = true
 [dependencies]
 bevy.workspace = true
 thiserror.workspace = true
-crossbeam-channel = "0.5.15"
-opus-rs = "0.1.32"
+crossbeam-channel = "0.5.16"
+opus-rs = { git = "https://github.com/Hiraku-Project/opus-rs.git" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rav1d = { git = "https://github.com/memorysafety/rav1d.git" }
+rav1d = { git = "https://github.com/Hiraku-Project/rav1d.git" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.104"
@@ -24,10 +24,6 @@ features = [
     "BlobPropertyBag",
     "CanvasRenderingContext2d",
     "Document",
-    "EncodedVideoChunk",
-    "EncodedVideoChunkInit",
-    "EncodedVideoChunkType",
-    "HardwareAcceleration",
     "HtmlAudioElement",
     "HtmlCanvasElement",
     "HtmlMediaElement",
@@ -35,9 +31,6 @@ features = [
     "PlaneLayout",
     "Url",
     "VideoColorSpace",
-    "VideoDecoder",
-    "VideoDecoderConfig",
-    "VideoDecoderInit",
     "VideoFrame",
     "VideoFrameCopyToOptions",
     "VideoMatrixCoefficients",

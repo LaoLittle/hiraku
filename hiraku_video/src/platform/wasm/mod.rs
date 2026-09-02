@@ -1,3 +1,5 @@
+mod bindgen;
+
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -20,10 +22,10 @@ use js_sys::{Array, Date, Promise, Uint8Array};
 use symphonia::core::codecs::video::well_known as video_codecs;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
+use bindgen::{EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, HardwareAcceleration, VideoDecoder, VideoDecoderConfig, VideoDecoderInit};
 use web_sys::{
-    Blob, BlobPropertyBag, CanvasRenderingContext2d, EncodedVideoChunk,
-    EncodedVideoChunkInit, EncodedVideoChunkType, HardwareAcceleration, HtmlAudioElement,
-    HtmlCanvasElement, PlaneLayout, Url, VideoDecoder, VideoDecoderConfig, VideoDecoderInit,
+    Blob, BlobPropertyBag, CanvasRenderingContext2d, HtmlAudioElement,
+    HtmlCanvasElement, PlaneLayout, Url,
     VideoFrame, VideoFrameCopyToOptions, VideoMatrixCoefficients, VideoPixelFormat,
     VideoTransferCharacteristics,
 };
@@ -647,7 +649,7 @@ fn copy_rgba_with_canvas(
         .draw_image_with_video_frame_and_dw_and_dh(frame, 0.0, 0.0, width.into(), height.into())
         .map_err(|error| format!("fallback canvas draw failed: {}", js_error(&error)))?;
     context
-        .get_image_data(0, 0, width as i32, height as i32)
+        .get_image_data(0.0, 0.0, width as f64, height as f64)
         .map(|image| image.data().0)
         .map_err(|error| format!("fallback canvas read failed: {}", js_error(&error)))
 }
