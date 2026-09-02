@@ -1412,7 +1412,7 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::hks_runtime::{ExecutionEvent, ExecutionRuntime};
+    use crate::script::execution_runtime::{ExecutionEvent, ExecutionRuntime};
 
     #[test]
     fn engine_settings_roundtrip_through_the_fixed_global_record() {

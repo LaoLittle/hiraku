@@ -12,10 +12,10 @@ use crate::{
 mod animation;
 pub(crate) mod capabilities;
 mod command;
-mod hks_runtime;
+mod execution_runtime;
 pub(crate) mod navigation;
 mod runtime;
-mod task_runtime;
+mod story_runtime;
 pub mod ui_runtime;
 mod ui_vm;
 
@@ -25,11 +25,11 @@ pub(crate) use command::{
     DialogueCommand, ResolvedCharacterKeyframe, RuntimeCommand, ScriptCommand, SettingsCommand,
     StageCommand, UiCommand, VideoCommand, VoicePlaybackMode,
 };
-pub(crate) use hks_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
+pub(crate) use execution_runtime::ExecutionId;
 pub(crate) use runtime::{
     CameraEffectScope, CameraProjectionMode, ScriptCallFrame, ScriptRuntimeState,
 };
-pub(crate) use task_runtime::ExecutionId;
+pub(crate) use story_runtime::{StoryRuntime, StoryRuntimeEvent, StoryRuntimeSnapshot};
 
 pub(crate) fn compile_story_bytecode(
     path: &str,
@@ -204,7 +204,7 @@ impl ScriptBootstrap {
     }
 }
 
-pub fn start_hks_runtime(
+pub fn start_story_runtime(
     vfs: &VfsResource,
     runtime: &mut ScriptRuntimeState,
     bootstrap: ScriptBootstrap,

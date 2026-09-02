@@ -90,6 +90,7 @@ pub fn advance_dialogue_on_input(
         Or<(
             With<ScreenUiButton>,
             With<ScreenUiImageButton>,
+            With<ScreenUiToggle>,
             With<RuntimeMenuButton>,
             With<ChoiceButton>,
             With<PauseMenuRoot>,

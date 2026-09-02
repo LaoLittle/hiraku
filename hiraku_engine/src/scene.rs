@@ -35,7 +35,7 @@ use crate::{
         ScriptRequestId, ScriptResponse, ScriptResponseMessage, ScriptRuntimeState,
         SettingsCommand, StageCommand, StoryRuntime, UiCommand, UiContext, VideoCommand,
         VoicePlaybackMode, compile_story_bytecode, evaluate_ui_component_named_with_args,
-        save_runtime_slot, script_command_from_effect, start_hks_runtime,
+        save_runtime_slot, script_command_from_effect, start_story_runtime,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,

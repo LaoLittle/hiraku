@@ -1,59 +1,21 @@
-//! Direct whole-program HKS execution state.
+//! Engine-facing story policy built on the generic execution runtime.
 //!
-//! It owns the generic VM and task scheduler while ECS systems own waits and effects.
+//! It owns story capabilities and wait policy while ECS systems own effects.
 
 use std::collections::{BTreeMap, VecDeque};
 
-use hiraku_script::StatementValue;
-use hiraku_script::TemplateError;
-use hiraku_script::{
-    BuiltinCall, Bytecode, LinkedBytecode, LinkedFunction, SymbolCall, Value, Vm, VmError, VmEvent,
-    VmSnapshot, link_bytecode,
-};
+use hiraku_script::{Bytecode, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::task_runtime::{
-    ChildExecutionScheduler, ExecutionId, ExecutionMode, ExecutionSchedulerError,
-    ExecutionSchedulerSnapshot, RawExecutionEvent,
+use super::execution_runtime::{
+    ExecutionEvent, ExecutionId, ExecutionMode, ExecutionRuntime, ExecutionRuntimeError,
+    ExecutionRuntimeSnapshot,
 };
 use crate::script::capabilities::{
     CharacterCapabilityError, StoryCallOutcome, StoryControl, StoryEffect, StoryNativeHost,
-    StoryNativeHostSnapshot, StoryTaskKind, StoryWait, story_manifest,
+    StoryNativeHostSnapshot, StoryTaskKind, StoryWait,
 };
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ExecutionEvent {
-    Call {
-        execution: ExecutionId,
-        call: BuiltinCall,
-    },
-    Statement {
-        execution: ExecutionId,
-        value: StatementValue,
-    },
-    Completed {
-        execution: ExecutionId,
-        value: Value,
-    },
-}
-
-impl ExecutionEvent {
-    pub const fn execution(&self) -> ExecutionId {
-        match self {
-            Self::Call { execution, .. }
-            | Self::Statement { execution, .. }
-            | Self::Completed { execution, .. } => *execution,
-        }
-    }
-}
-
-pub struct ExecutionRuntime {
-    vm: Vm,
-    children: ChildExecutionScheduler,
-    linked: LinkedBytecode,
-    globals: BTreeMap<String, Value>,
-}
 
 /// Engine-facing whole-story driver. It translates generic VM boundaries into
 /// story effects without introducing a second executable representation.
@@ -71,12 +33,9 @@ pub struct StoryRuntime {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct ClosureValue(Value);
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ChoiceOption {
     label: String,
-    body: ClosureValue,
+    body: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -167,7 +126,7 @@ impl StoryRuntime {
         mut snapshot: StoryRuntimeSnapshot,
     ) -> Result<Self, StoryRuntimeError> {
         // Voice playback is transient output rather than durable story state.
-        // The scheduler has already consumed the native call and only keeps an
+        // The execution has already consumed the native call and only keeps an
         // active effect so seq/wait can observe its completion. Loading must
         // complete that effect without emitting PlayVoice again.
         let mut completed_voice_tasks = Vec::new();
@@ -254,14 +213,12 @@ impl StoryRuntime {
                 return Err(StoryRuntimeError::InvalidChoice);
             };
             let selected = selected as usize;
-            let option = options
+            let closure = options
                 .get(selected)
                 .ok_or(StoryRuntimeError::InvalidChoice)?
                 .body
                 .clone();
-            let task = self
-                .execution
-                .spawn_closure(&option, ExecutionMode::Interactive)?;
+            let task = self.execution.spawn(&closure, ExecutionMode::Interactive)?;
             self.choice = Some(ChoiceState::RunningBranch { task, selected });
             self.blocked = false;
             self.blocked_wait = None;
@@ -275,7 +232,7 @@ impl StoryRuntime {
         }
         self.blocked = false;
         self.blocked_wait = None;
-        if self.execution.main_waiting_for_host() {
+        if self.execution.is_waiting_for_host(ExecutionId::MAIN) {
             self.execution.resume(ExecutionId::MAIN, value)?;
         }
         Ok(())
@@ -348,19 +305,16 @@ impl StoryRuntime {
                                 StoryTaskKind::Sequence => ExecutionMode::Sequence,
                                 StoryTaskKind::Parallel => ExecutionMode::Parallel,
                             };
-                            let task =
-                                self.execution.spawn_closure(&ClosureValue(closure), mode)?;
+                            let task = self.execution.spawn(&closure, mode)?;
                             self.execution
-                                .resume(ExecutionId::MAIN, Value::Task(task.raw()))?;
+                                .resume(ExecutionId::MAIN, Value::Task(task.task_handle()))?;
                         }
                         StoryCallOutcome::Control(StoryControl::BeginChoice {
                             prompt,
                             closure,
                         }) => {
-                            let builder_task = self.execution.spawn_closure(
-                                &ClosureValue(closure),
-                                ExecutionMode::Interactive,
-                            )?;
+                            let builder_task =
+                                self.execution.spawn(&closure, ExecutionMode::Interactive)?;
                             self.choice = Some(ChoiceState::Collecting {
                                 builder_task,
                                 prompt,
@@ -372,7 +326,7 @@ impl StoryRuntime {
                             return Ok(Some(StoryRuntimeEvent::OpenUi { path, arguments }));
                         }
                         StoryCallOutcome::Control(StoryControl::WaitTask { task }) => {
-                            self.waiting_task = Some(ExecutionId::from_raw(task));
+                            self.waiting_task = Some(ExecutionId::from_task_handle(task));
                         }
                         StoryCallOutcome::Control(
                             control @ StoryControl::AddChoiceOption { .. },
@@ -452,7 +406,7 @@ impl StoryRuntime {
                     };
                     options.push(ChoiceOption {
                         label,
-                        body: ClosureValue(closure),
+                        body: closure,
                     });
                     self.execution.resume(task, Value::Unit)?;
                 }
@@ -556,195 +510,6 @@ impl StoryRuntime {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ExecutionRuntimeSnapshot {
-    /// Exact executing bytecode. Restore relinks this against the current
-    /// native registry instead of relying on source recompilation offsets.
-    pub program: Bytecode,
-    pub vm: VmSnapshot,
-    pub children: ExecutionSchedulerSnapshot,
-}
-
-impl ExecutionRuntime {
-    pub fn new(bytecode: Bytecode) -> Result<Self, ExecutionRuntimeError> {
-        let linked = link_bytecode(bytecode.clone(), &story_manifest())
-            .map_err(ExecutionRuntimeError::Link)?;
-        Ok(Self {
-            vm: Vm::new(bytecode.clone())?,
-            children: ChildExecutionScheduler::new(bytecode),
-            linked,
-            globals: BTreeMap::new(),
-        })
-    }
-
-    pub fn snapshot(&self) -> ExecutionRuntimeSnapshot {
-        ExecutionRuntimeSnapshot {
-            program: self.linked.bytecode.clone(),
-            vm: self.vm.snapshot(),
-            children: self.children.snapshot(),
-        }
-    }
-
-    fn spawn_closure(
-        &mut self,
-        closure: &ClosureValue,
-        mode: ExecutionMode,
-    ) -> Result<ExecutionId, ExecutionRuntimeError> {
-        self.children
-            .set_global_values(self.vm.globals().to_vec())?;
-        Ok(self.children.spawn(&closure.0, mode)?)
-    }
-
-    pub fn restore(
-        _bytecode: Bytecode,
-        snapshot: ExecutionRuntimeSnapshot,
-    ) -> Result<Self, ExecutionRuntimeError> {
-        let bytecode = snapshot.program;
-        let linked = link_bytecode(bytecode.clone(), &story_manifest())
-            .map_err(ExecutionRuntimeError::Link)?;
-        let vm = Vm::restore(bytecode.clone(), snapshot.vm)?;
-        let globals = globals_from_values(&bytecode, vm.globals());
-        Ok(Self {
-            vm,
-            children: ChildExecutionScheduler::restore(bytecode, snapshot.children)?,
-            linked,
-            globals,
-        })
-    }
-
-    /// Advances either the main program or the first ready task to the next host boundary.
-    pub fn step(&mut self) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
-        if let Some(event) = self.vm.step()? {
-            return match event {
-                VmEvent::Call(call) => {
-                    let mut call = self.link_call(call)?;
-                    evaluate_call_templates(&mut call, |text| self.vm.eval_template(text))?;
-                    Ok(Some(ExecutionEvent::Call {
-                        execution: ExecutionId::MAIN,
-                        call,
-                    }))
-                }
-                VmEvent::Statement(value) => {
-                    let value = evaluate_statement_template(&mut self.vm, value)?;
-                    self.refresh_globals();
-                    self.children
-                        .set_global_values(self.vm.globals().to_vec())?;
-                    Ok(Some(ExecutionEvent::Statement {
-                        execution: ExecutionId::MAIN,
-                        value,
-                    }))
-                }
-                VmEvent::Completed(value) => Ok(Some(ExecutionEvent::Completed {
-                    execution: ExecutionId::MAIN,
-                    value,
-                })),
-            };
-        }
-
-        self.step_children()
-    }
-
-    /// Advances only scheduled child tasks, leaving the main VM untouched.
-    pub fn step_children(&mut self) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
-        match self.children.step()? {
-            Some(RawExecutionEvent::Call { execution, call }) => {
-                let mut call = self.link_call(call)?;
-                evaluate_call_templates(&mut call, |text| {
-                    self.children.eval_template(execution, text)
-                })?;
-                Ok(Some(ExecutionEvent::Call { execution, call }))
-            }
-            Some(RawExecutionEvent::Statement { execution, value }) => {
-                let value =
-                    evaluate_child_statement_template(&mut self.children, execution, value)?;
-                self.vm
-                    .set_global_values(self.children.global_values().to_vec())?;
-                self.refresh_globals();
-                Ok(Some(ExecutionEvent::Statement { execution, value }))
-            }
-            Some(RawExecutionEvent::Completed { execution, value }) => {
-                Ok(Some(ExecutionEvent::Completed { execution, value }))
-            }
-            None => Ok(None),
-        }
-    }
-
-    pub fn resume(
-        &mut self,
-        execution: ExecutionId,
-        value: Value,
-    ) -> Result<(), ExecutionRuntimeError> {
-        if execution.is_main() {
-            self.vm.resume(value)?;
-        } else {
-            self.children.resume(execution, value)?;
-        }
-        Ok(())
-    }
-
-    pub fn set_globals(&mut self, globals: std::collections::BTreeMap<String, Value>) {
-        let values = values_from_globals(&self.linked.bytecode, &globals);
-        self.vm
-            .set_global_values(values.clone())
-            .expect("compiled global frame shape must match its bytecode");
-        self.children
-            .set_global_values(values)
-            .expect("compiled task global frame shape must match its bytecode");
-        self.globals = globals;
-    }
-
-    pub fn globals(&self) -> &std::collections::BTreeMap<String, Value> {
-        &self.globals
-    }
-
-    fn main_waiting_for_host(&self) -> bool {
-        matches!(self.vm.status(), hiraku_script::VmStatus::WaitingForHost)
-    }
-
-    pub fn pause(&mut self, execution: ExecutionId) -> Result<(), ExecutionRuntimeError> {
-        self.children.pause(execution)?;
-        Ok(())
-    }
-
-    pub fn unpause(&mut self, execution: ExecutionId) -> Result<(), ExecutionRuntimeError> {
-        self.children.unpause(execution)?;
-        Ok(())
-    }
-
-    fn mode(&self, execution: ExecutionId) -> Option<ExecutionMode> {
-        self.children.mode(execution)
-    }
-
-    fn link_call(&self, call: SymbolCall) -> Result<BuiltinCall, ExecutionRuntimeError> {
-        let Some(LinkedFunction::Native(builtin)) = self.linked.resolve(call.function) else {
-            return Err(ExecutionRuntimeError::UnlinkedCall(call.function));
-        };
-        Ok(BuiltinCall {
-            builtin,
-            receiver: call.receiver,
-            arguments: call.arguments,
-        })
-    }
-
-    fn refresh_globals(&mut self) {
-        self.globals = globals_from_values(&self.linked.bytecode, self.vm.globals());
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum ExecutionRuntimeError {
-    #[error("HKS VM failed: {0:?}")]
-    Vm(VmError),
-    #[error("HKS task scheduler failed: {0}")]
-    Scheduler(#[from] ExecutionSchedulerError),
-    #[error("HKS bytecode link failed: {0:?}")]
-    Link(Vec<hiraku_script::LinkError>),
-    #[error("HKS call references an unlinked symbol {0:?}")]
-    UnlinkedCall(hiraku_script::SymbolId),
-    #[error("HKS string template failed: {0}")]
-    Template(#[from] TemplateError),
-}
-
 #[derive(Debug, Error)]
 pub enum StoryRuntimeError {
     #[error(transparent)]
@@ -769,91 +534,13 @@ pub enum StoryRuntimeError {
     UnknownTaskEffect(ExecutionId),
 }
 
-fn evaluate_statement_template(
-    vm: &mut Vm,
-    value: StatementValue,
-) -> Result<StatementValue, TemplateError> {
-    match value {
-        StatementValue::String(text) => Ok(StatementValue::String(vm.eval_template(&text)?)),
-        // Story expression values are implementation details (for example an
-        // Actor handle). At the public statement boundary they mean commit.
-        StatementValue::Value(_) => Ok(StatementValue::Commit),
-        value => Ok(value),
-    }
-}
-
-fn evaluate_child_statement_template(
-    scheduler: &mut ChildExecutionScheduler,
-    task: ExecutionId,
-    value: StatementValue,
-) -> Result<StatementValue, TemplateError> {
-    match value {
-        StatementValue::String(text) => Ok(StatementValue::String(
-            scheduler.eval_template(task, &text)?,
-        )),
-        StatementValue::Value(_) => Ok(StatementValue::Commit),
-        value => Ok(value),
-    }
-}
-
-fn evaluate_call_templates(
-    call: &mut BuiltinCall,
-    mut evaluate: impl FnMut(&str) -> Result<String, TemplateError>,
-) -> Result<(), TemplateError> {
-    if let Some(Value::String(text)) = &mut call.receiver {
-        *text = evaluate(text)?;
-    }
-    for argument in &mut call.arguments {
-        if let Value::String(text) = &mut argument.value {
-            *text = evaluate(text)?;
-        }
-    }
-    Ok(())
-}
-
-fn values_from_globals(bytecode: &Bytecode, globals: &BTreeMap<String, Value>) -> Vec<Value> {
-    bytecode
-        .globals
-        .iter()
-        .map(|symbol| {
-            bytecode
-                .symbols
-                .resolve(*symbol)
-                .and_then(|name| globals.get(name))
-                .cloned()
-                .unwrap_or(Value::Uninitialized)
-        })
-        .collect()
-}
-
-fn globals_from_values(bytecode: &Bytecode, values: &[Value]) -> BTreeMap<String, Value> {
-    bytecode
-        .globals
-        .iter()
-        .zip(values)
-        .filter_map(|(symbol, value)| {
-            (value != &Value::Uninitialized).then(|| {
-                bytecode
-                    .symbols
-                    .resolve(*symbol)
-                    .map(|name| (name.to_string(), value.clone()))
-            })?
-        })
-        .collect()
-}
-
-impl From<VmError> for ExecutionRuntimeError {
-    fn from(error: VmError) -> Self {
-        Self::Vm(error)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::script::capabilities::{
         StoryEffect, StoryNativeHost, compile_story_bytecode, story_manifest,
     };
+    use hiraku_script::StatementValue;
 
     #[test]
     fn whole_program_runtime_yields_native_calls_without_ir() {
@@ -895,10 +582,10 @@ mod tests {
         };
         assert_eq!(kind, StoryTaskKind::Parallel);
         let child = runtime
-            .spawn_closure(&ClosureValue(closure), ExecutionMode::Parallel)
+            .spawn(&closure, ExecutionMode::Parallel)
             .expect("child execution must spawn");
         runtime
-            .resume(ExecutionId::MAIN, Value::Task(child.raw()))
+            .resume(ExecutionId::MAIN, Value::Task(child.task_handle()))
             .expect("task handle must resume the root execution");
 
         let Some(ExecutionEvent::Call { execution, .. }) = runtime

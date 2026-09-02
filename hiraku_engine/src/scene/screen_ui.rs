@@ -938,12 +938,19 @@ fn spawn_screen_node_entity(
                 .unwrap_or_else(|| asset_server.load(checked.path.clone()));
             image_handles.extend([unchecked_image.clone(), checked_image.clone()]);
 
-            let mut node = Node::default();
-            apply_screen_layout(&mut node, &toggle.unchecked.layout);
+            let mut unchecked_node = Node::default();
+            apply_screen_layout(&mut unchecked_node, &toggle.unchecked.layout);
+            let mut checked_node = Node::default();
+            apply_screen_layout(&mut checked_node, &toggle.checked.layout);
             let (initial_image, initial_resolved) = if toggle.value {
                 (checked_image.clone(), checked_resolved)
             } else {
                 (unchecked_image.clone(), unchecked_resolved)
+            };
+            let initial_node = if toggle.value {
+                checked_node.clone()
+            } else {
+                unchecked_node.clone()
             };
             let entity = commands
                 .spawn((
@@ -951,9 +958,11 @@ fn spawn_screen_node_entity(
                     Button,
                     BackgroundColor(Color::NONE),
                     stretched_image_node(initial_image, initial_resolved),
-                    node,
+                    initial_node,
                     ScreenUiToggle {
                         checked: toggle.value,
+                        unchecked_node,
+                        checked_node,
                         unchecked_texture: unchecked_image,
                         unchecked_atlas: unchecked_resolved.map(|texture| texture.atlas.clone()),
                         unchecked_rect: unchecked_resolved
@@ -1446,7 +1455,7 @@ pub fn handle_screen_scroll(
 
 pub fn handle_screen_toggles(
     mut clicks: MessageReader<Pointer<Click>>,
-    mut toggles: Query<(&mut ScreenUiToggle, &mut ImageNode)>,
+    mut toggles: Query<(&mut ScreenUiToggle, &mut ImageNode, &mut Node)>,
     parents: Query<&ChildOf>,
 ) {
     for click in clicks.read() {
@@ -1455,16 +1464,18 @@ pub fn handle_screen_toggles(
         }
         let mut entity = click.entity;
         loop {
-            if let Ok((mut toggle, mut image)) = toggles.get_mut(entity) {
+            if let Ok((mut toggle, mut image, mut node)) = toggles.get_mut(entity) {
                 toggle.checked = !toggle.checked;
                 if toggle.checked {
                     image.image = toggle.checked_texture.clone();
                     image.texture_atlas = toggle.checked_atlas.clone();
                     image.rect = toggle.checked_rect;
+                    *node = toggle.checked_node.clone();
                 } else {
                     image.image = toggle.unchecked_texture.clone();
                     image.texture_atlas = toggle.unchecked_atlas.clone();
                     image.rect = toggle.unchecked_rect;
+                    *node = toggle.unchecked_node.clone();
                 }
                 break;
             }
@@ -2022,6 +2033,86 @@ mod tests {
             app.world().resource::<ScreenUiState>().active_root,
             Some(screen)
         );
+    }
+
+    #[test]
+    fn toggle_click_changes_its_visual_without_advancing_dialogue() {
+        let mut app = App::new();
+        app.init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<ChoiceState>()
+            .init_resource::<ScreenUiState>()
+            .init_resource::<RuntimeMenuState>()
+            .init_resource::<DialogueHistoryState>()
+            .add_message::<crate::input::HirakuActionInput>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, (handle_screen_toggles, advance_dialogue_on_input));
+        app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
+            animation_id: None,
+            request: Some(ScriptRequestId(17)),
+        });
+        let unchecked_node = Node {
+            width: px(100),
+            ..default()
+        };
+        let checked_node = Node {
+            width: px(75),
+            ..default()
+        };
+        let toggle = app
+            .world_mut()
+            .spawn((
+                ScreenUiToggle {
+                    checked: false,
+                    unchecked_node: unchecked_node.clone(),
+                    checked_node: checked_node.clone(),
+                    unchecked_texture: Handle::default(),
+                    unchecked_atlas: None,
+                    unchecked_rect: None,
+                    checked_texture: Handle::default(),
+                    checked_atlas: None,
+                    checked_rect: None,
+                },
+                ImageNode::default(),
+                unchecked_node,
+            ))
+            .id();
+        app.world_mut().write_message(Pointer::new(
+            PointerId::Custom(uuid::Uuid::from_u128(4)),
+            Location {
+                target: NormalizedRenderTarget::None {
+                    width: 1,
+                    height: 1,
+                },
+                position: Vec2::ZERO,
+            },
+            Click {
+                button: PointerButton::Primary,
+                hit: HitData {
+                    camera: toggle,
+                    depth: 0.0,
+                    position: None,
+                    normal: None,
+                    extra: None,
+                },
+                duration: Duration::ZERO,
+                count: 1,
+            },
+            toggle,
+        ));
+
+        app.update();
+
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        let entity = app.world().entity(toggle);
+        assert!(
+            entity
+                .get::<ScreenUiToggle>()
+                .expect("toggle state")
+                .checked
+        );
+        assert_eq!(entity.get::<Node>().expect("toggle layout").width, px(75));
     }
 
     #[test]

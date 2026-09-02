@@ -728,6 +728,8 @@ pub struct ScreenUiScrollable {
 #[derive(Component)]
 pub struct ScreenUiToggle {
     pub checked: bool,
+    pub unchecked_node: Node,
+    pub checked_node: Node,
     pub unchecked_texture: Handle<Image>,
     pub unchecked_atlas: Option<TextureAtlas>,
     pub unchecked_rect: Option<Rect>,

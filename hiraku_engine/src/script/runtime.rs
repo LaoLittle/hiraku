@@ -4,7 +4,7 @@ use bevy::ecs::resource::Resource;
 use serde::{Deserialize, Serialize};
 
 use super::{ExecutionId, ScriptRequestId, ScriptResponse, ScriptResponseMessage};
-use crate::script::hks_runtime::StoryRuntime;
+use crate::script::story_runtime::StoryRuntime;
 
 pub struct ScriptCallFrame {
     pub script: String,

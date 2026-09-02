@@ -145,7 +145,7 @@ fn start_frontend_session(
     frontend.notice = None;
     frontend.runtime_started = true;
 
-    if let Err(error) = start_hks_runtime(vfs, script_runtime, bootstrap, user_settings) {
+    if let Err(error) = start_story_runtime(vfs, script_runtime, bootstrap, user_settings) {
         frontend.notice = Some(format!("Failed to start HKS runtime: {error}"));
         frontend.runtime_started = false;
     }
