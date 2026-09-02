@@ -7,9 +7,9 @@
 
 mod asset;
 mod color;
+mod platform;
 mod player;
 mod render;
-mod platform;
 
 pub use asset::{VideoAsset, VideoAssetLoader, VideoAssetLoaderError, VideoMetadata};
 pub use player::VideoDecodeSettings;
