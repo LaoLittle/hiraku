@@ -401,7 +401,7 @@ fn evaluate_statement_template(
     value: StatementValue,
 ) -> Result<StatementValue, TemplateError> {
     match value {
-        StatementValue::String(text) => Ok(StatementValue::String(vm.eval_template(&text)?)),
+        StatementValue::TextTemplate(text) => Ok(StatementValue::String(vm.eval_template(&text)?)),
         StatementValue::Value(_) => Ok(StatementValue::Commit),
         value => Ok(value),
     }
@@ -411,11 +411,11 @@ fn evaluate_call_templates(
     call: &mut BuiltinCall,
     mut evaluate: impl FnMut(&str) -> Result<String, TemplateError>,
 ) -> Result<(), TemplateError> {
-    if let Some(Value::String(text)) = &mut call.receiver {
+    if let Some(Value::TextTemplate(text)) = &mut call.receiver {
         *text = evaluate(text)?;
     }
     for argument in &mut call.arguments {
-        if let Value::String(text) = &mut argument.value {
+        if let Value::TextTemplate(text) = &mut argument.value {
             *text = evaluate(text)?;
         }
     }

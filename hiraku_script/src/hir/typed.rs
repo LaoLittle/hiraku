@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use bumpalo::Bump;
 
 use crate::{
-    BinaryOp, Block, Expr, ExprKind, NumberUnit, Program, Span, Stmt, SymbolId, SymbolInterner,
-    SymbolManifest, TypeExpr, TypeExprKind,
+    BinaryOp, Block, CastMode, Expr, ExprKind, NumberUnit, Program, Span, Stmt, SymbolId,
+    SymbolInterner, SymbolManifest, TypeExpr, TypeExprKind,
     runtime::{BuiltinId, BuiltinManifest},
 };
 
@@ -91,6 +91,12 @@ pub enum HirExprKind<'hir> {
         fallback: &'hir HirExpr<'hir>,
     },
     NonNull(&'hir HirExpr<'hir>),
+    OptionalSome(&'hir HirExpr<'hir>),
+    Cast {
+        value: &'hir HirExpr<'hir>,
+        target: &'hir ScriptType,
+        mode: CastMode,
+    },
     Call {
         callee: &'hir HirExpr<'hir>,
         arguments: &'hir [HirArgument<'hir>],
@@ -122,6 +128,7 @@ pub enum HirLiteral<'hir> {
     Bool(bool),
     Number { value: f64, unit: NumberUnit },
     String(&'hir str),
+    TextTemplate(&'hir str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,8 +244,16 @@ pub fn lower_to_hir<'hir>(
 struct FunctionDeclaration {
     name: SymbolId,
     exported: bool,
+    type_parameters: Vec<SymbolId>,
+    parameters: Vec<ScriptType>,
     result: ScriptType,
     span: Span,
+}
+
+#[derive(Clone)]
+struct TypeAliasDeclaration {
+    parameters: Vec<String>,
+    body: TypeExpr,
 }
 
 struct Lowerer<'hir, 'manifest> {
@@ -253,10 +268,13 @@ struct Lowerer<'hir, 'manifest> {
     scopes: Vec<BTreeMap<SymbolId, HirLocalId>>,
     global_names: BTreeMap<SymbolId, HirGlobalId>,
     function_names: BTreeMap<SymbolId, HirFunctionId>,
-    aliases: BTreeMap<String, ScriptType>,
+    aliases: BTreeMap<String, TypeAliasDeclaration>,
+    type_parameters: Vec<BTreeMap<String, ScriptType>>,
+    type_expansions: Vec<String>,
     named_imports: BTreeMap<String, String>,
     wildcard_import: Option<String>,
     current_function: Option<HirFunctionId>,
+    refinements: Vec<BTreeMap<HirLocalId, ScriptType>>,
     errors: Vec<LoweringError>,
 }
 
@@ -318,9 +336,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             global_names: BTreeMap::new(),
             function_names: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            type_parameters: Vec::new(),
+            type_expansions: Vec::new(),
             named_imports,
             wildcard_import,
             current_function: None,
+            refinements: Vec::new(),
             errors: import_errors,
         }
     }
@@ -368,15 +389,25 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn declare_types(&mut self, program: &Program) {
         for statement in &program.statements {
-            let Stmt::TypeAlias { name, ty, span } = statement else {
+            let Stmt::TypeAlias {
+                name,
+                type_parameters,
+                ty,
+                span,
+            } = statement
+            else {
                 continue;
             };
             if self.aliases.contains_key(name) {
                 self.error(format!("type `{name}` is defined more than once"), *span);
-            } else if let Some(ty) = self.type_from_ast(ty) {
-                self.aliases.insert(name.clone(), ty);
             } else {
-                self.error(format!("type `{name}` refers to an unknown type"), ty.span);
+                self.aliases.insert(
+                    name.clone(),
+                    TypeAliasDeclaration {
+                        parameters: type_parameters.clone(),
+                        body: ty.clone(),
+                    },
+                );
             }
         }
     }
@@ -435,6 +466,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             let Stmt::Function {
                 exported,
                 name,
+                type_parameters,
+                parameters,
                 return_type,
                 span,
                 ..
@@ -451,13 +484,31 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 continue;
             }
             let id = HirFunctionId(self.functions.len() as u32);
+            self.push_type_parameters(type_parameters);
+            let parameter_types = parameters
+                .iter()
+                .map(|parameter| {
+                    parameter
+                        .ty
+                        .as_ref()
+                        .and_then(|ty| self.type_from_ast(ty))
+                        .unwrap_or(ScriptType::Any)
+                })
+                .collect();
             let result = return_type
                 .as_ref()
                 .and_then(|ty| self.type_from_ast(ty))
                 .unwrap_or(ScriptType::Any);
+            self.type_parameters.pop();
+            let generic_parameters = type_parameters
+                .iter()
+                .map(|name| self.symbol(name))
+                .collect();
             self.functions.push(FunctionDeclaration {
                 name: symbol,
                 exported: *exported,
+                type_parameters: generic_parameters,
+                parameters: parameter_types,
                 result,
                 span: *span,
             });
@@ -469,6 +520,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         for statement in &program.statements {
             let Stmt::Function {
                 name,
+                type_parameters,
                 parameters,
                 body,
                 ..
@@ -483,6 +535,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             self.current_function = Some(function_id);
             self.scopes.clear();
             self.scopes.push(BTreeMap::new());
+            self.push_type_parameters(type_parameters);
             let mut lowered_parameters = Vec::new();
             for parameter in parameters {
                 let ty = parameter
@@ -509,11 +562,34 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 body,
                 span: declaration.span,
             });
+            self.type_parameters.pop();
         }
+    }
+
+    fn push_type_parameters(&mut self, parameters: &[String]) {
+        let values = parameters
+            .iter()
+            .map(|name| {
+                let symbol = self.symbol(name);
+                (name.clone(), ScriptType::TypeParameter(symbol))
+            })
+            .collect();
+        self.type_parameters.push(values);
     }
 
     fn lower_block(&mut self, block: &Block, scoped: bool) -> &'hir HirBlock<'hir> {
         self.lower_statements(block.statements.iter(), block.span, scoped)
+    }
+
+    fn lower_refined_block(
+        &mut self,
+        block: &Block,
+        refinements: BTreeMap<HirLocalId, ScriptType>,
+    ) -> &'hir HirBlock<'hir> {
+        self.refinements.push(refinements);
+        let lowered = self.lower_block(block, true);
+        self.refinements.pop();
+        lowered
     }
 
     fn lower_statements<'source>(
@@ -554,12 +630,21 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 value,
                 span,
             } => {
-                let value = self.lower_expression(value);
-                let inferred = self.expression_type(value).clone();
-                let ty = type_annotation
+                let annotation = type_annotation
                     .as_ref()
-                    .and_then(|ty| self.type_from_ast(ty))
-                    .unwrap_or(inferred);
+                    .and_then(|ty| self.type_from_ast(ty));
+                let value = self.lower_expression_expected(value, annotation.as_ref());
+                let inferred = self.expression_type(value).clone();
+                if annotation.is_none() && is_untyped_none(&inferred) {
+                    self.error(
+                        format!(
+                            "cannot infer the element type of `{name}` from `null`; add an explicit optional type such as `{name}: String?`"
+                        ),
+                        value.span,
+                    );
+                }
+                let ty = annotation.unwrap_or_else(|| inferred.clone());
+                self.check_assignment(&ty, &inferred, value.span);
                 let local = self.declare_local(name, ty, *mutable, *span);
                 (HirStmtKind::Let { local, value }, *span)
             }
@@ -568,16 +653,30 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             } => {
                 let symbol = self.symbol(name);
                 let global = self.global_names.get(&symbol).copied();
-                let value = value.as_ref().map(|value| self.lower_expression(value));
                 let Some(global) = global else {
                     self.error(format!("unknown global `{name}`"), *span);
                     return None;
                 };
+                let declared = self.types.get(self.globals[global.0 as usize].ty).cloned();
+                let value = value
+                    .as_ref()
+                    .map(|value| self.lower_expression_expected(value, declared.as_ref()));
                 let any = self.any_type();
                 if self.globals[global.0 as usize].ty == any
                     && let Some(value) = value
                 {
+                    if is_untyped_none(self.expression_type(value)) {
+                        self.error(
+                            format!(
+                                "cannot infer the element type of global `{name}` from `null`; add an explicit optional type"
+                            ),
+                            value.span,
+                        );
+                    }
                     self.globals[global.0 as usize].ty = value.ty;
+                } else if let (Some(expected), Some(value)) = (declared, value) {
+                    let actual = self.expression_type(value).clone();
+                    self.check_assignment(&expected, &actual, value.span);
                 }
                 (HirStmtKind::Global { global, value }, *span)
             }
@@ -587,11 +686,27 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 span,
             } => {
                 let target = self.lower_place(target)?;
-                let value = self.lower_expression(value);
+                let expected = self.place_type(target);
+                let value = self.lower_expression_expected(value, expected.as_ref());
+                if let Some(expected) = expected {
+                    let actual = self.expression_type(value).clone();
+                    self.check_assignment(&expected, &actual, value.span);
+                }
+                if let Some(local) = place_root_local(target) {
+                    for refinements in self.refinements.iter_mut().rev() {
+                        refinements.remove(&local);
+                    }
+                }
                 (HirStmtKind::Assign { target, value }, *span)
             }
             Stmt::Expr(expression) => {
                 let value = self.lower_expression(expression);
+                if is_untyped_none(self.expression_type(value)) {
+                    self.error(
+                        "`null`/`.none` needs an expected Optional<T> type",
+                        expression.span,
+                    );
+                }
                 (HirStmtKind::Expr(value), expression.span)
             }
             Stmt::If {
@@ -600,6 +715,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 else_block,
                 span,
             } => {
+                let (truthy, falsy) = self.condition_refinements(condition);
                 let condition = self.lower_expression(condition);
                 if !ScriptType::Bool.accepts(self.expression_type(condition)) {
                     self.error(
@@ -610,10 +726,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         condition.span,
                     );
                 }
-                let then_block = self.lower_block(then_block, true);
+                let then_block = self.lower_refined_block(then_block, truthy);
                 let else_block = else_block
                     .as_ref()
-                    .map(|block| self.lower_block(block, true));
+                    .map(|block| self.lower_refined_block(block, falsy));
                 (
                     HirStmtKind::If {
                         condition,
@@ -628,6 +744,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 body,
                 span,
             } => {
+                let (truthy, _) = self.condition_refinements(condition);
                 let condition = self.lower_expression(condition);
                 if !ScriptType::Bool.accepts(self.expression_type(condition)) {
                     self.error(
@@ -638,7 +755,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         condition.span,
                     );
                 }
-                let body = self.lower_block(body, true);
+                let body = self.lower_refined_block(body, truthy);
                 (HirStmtKind::While { condition, body }, *span)
             }
         };
@@ -648,7 +765,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     fn lower_expression(&mut self, expression: &Expr) -> &'hir HirExpr<'hir> {
         let (kind, ty) = match &expression.kind {
             ExprKind::Unit => (HirExprKind::Literal(HirLiteral::Unit), ScriptType::Unit),
-            ExprKind::Null => (HirExprKind::Literal(HirLiteral::Null), ScriptType::Any),
+            ExprKind::Null => (
+                HirExprKind::Literal(HirLiteral::Null),
+                ScriptType::Optional(Box::new(ScriptType::Any)),
+            ),
             ExprKind::Ellipsis => (HirExprKind::Literal(HirLiteral::Ellipsis), ScriptType::Any),
             ExprKind::Bool(value) => (
                 HirExprKind::Literal(HirLiteral::Bool(*value)),
@@ -662,7 +782,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 match unit {
                     NumberUnit::Percent => ScriptType::Percent,
                     NumberUnit::Scalar if value.fract() == 0.0 => ScriptType::Int,
-                    NumberUnit::Scalar => ScriptType::Number,
+                    NumberUnit::Scalar => ScriptType::Float,
                 },
             ),
             ExprKind::String(value) => (
@@ -688,6 +808,13 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             ExprKind::Ident(name) => return self.lower_identifier(name, expression.span),
             ExprKind::Symbol(name) => {
+                if name == "none" {
+                    return self.alloc_expression(
+                        HirExprKind::Literal(HirLiteral::Null),
+                        ScriptType::Optional(Box::new(ScriptType::Any)),
+                        expression.span,
+                    );
+                }
                 let symbol = self.symbol(name);
                 if let Some(member) = self
                     .manifest
@@ -749,9 +876,15 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let object = self.lower_expression(object);
                 let member = self.symbol(name);
                 let safe = matches!(expression.kind, ExprKind::SafeMember { .. });
+                if !safe && matches!(self.expression_type(object), ScriptType::Optional(_)) {
+                    self.error(
+                        "optional member access requires `?.`, `!`, or a preceding null check",
+                        expression.span,
+                    );
+                }
                 let mut ty = member_type(self.expression_type(object), name);
                 if safe {
-                    ty = ScriptType::Nullable(Box::new(ty));
+                    ty = ScriptType::Optional(Box::new(ty));
                 }
                 (
                     HirExprKind::Member {
@@ -766,7 +899,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let value = self.lower_expression(value);
                 let fallback = self.lower_expression(fallback);
                 let ty = match self.expression_type(value) {
-                    ScriptType::Nullable(inner) => (**inner).clone(),
+                    ScriptType::Optional(inner) => (**inner).clone(),
                     ScriptType::Any => self.expression_type(fallback).clone(),
                     ty => ty.clone(),
                 };
@@ -775,16 +908,82 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             ExprKind::NonNull(value) => {
                 let value = self.lower_expression(value);
                 let ty = match self.expression_type(value) {
-                    ScriptType::Nullable(inner) => (**inner).clone(),
+                    ScriptType::Optional(inner) => (**inner).clone(),
                     ty => ty.clone(),
                 };
                 (HirExprKind::NonNull(value), ty)
             }
+            ExprKind::Cast { value, ty, mode } => {
+                let value = self.lower_expression(value);
+                let source = self.expression_type(value).clone();
+                let Some(target) = self.type_from_ast(ty) else {
+                    self.error("cast refers to an unknown type", ty.span);
+                    return self.alloc_expression(
+                        HirExprKind::Cast {
+                            value,
+                            target: self.arena.alloc(ScriptType::Any),
+                            mode: *mode,
+                        },
+                        ScriptType::Any,
+                        expression.span,
+                    );
+                };
+                match cast_certainty(&source, &target) {
+                    CastCertainty::Impossible if *mode == CastMode::Static => self.error(
+                        format!("cannot cast {source:?} to {target:?}"),
+                        expression.span,
+                    ),
+                    CastCertainty::Runtime if *mode == CastMode::Static => self.error(
+                        format!(
+                            "cannot prove a cast from {source:?} to {target:?}; use `as?` for an optional result or `as!` for a runtime-checked cast"
+                        ),
+                        expression.span,
+                    ),
+                    CastCertainty::Always
+                    | CastCertainty::Runtime
+                    | CastCertainty::Impossible => {}
+                }
+                let result = if *mode == CastMode::Optional {
+                    ScriptType::Optional(Box::new(target.clone()))
+                } else {
+                    target.clone()
+                };
+                (
+                    HirExprKind::Cast {
+                        value,
+                        target: self.arena.alloc(target),
+                        mode: *mode,
+                    },
+                    result,
+                )
+            }
             ExprKind::Call {
                 callee: syntax_callee,
+                type_arguments,
                 arguments,
                 trailing_block,
             } => {
+                let explicit_types = type_arguments
+                    .iter()
+                    .filter_map(|ty| self.type_from_ast(ty))
+                    .collect::<Vec<_>>();
+                if matches!(&syntax_callee.kind, ExprKind::Symbol(name) if name == "some") {
+                    if trailing_block.is_some() || arguments.len() != 1 {
+                        self.error("`.some` expects exactly one value", expression.span);
+                        return self.alloc_expression(
+                            HirExprKind::Literal(HirLiteral::Null),
+                            ScriptType::Optional(Box::new(ScriptType::Any)),
+                            expression.span,
+                        );
+                    }
+                    let value = self.lower_expression(&arguments[0].value);
+                    let ty = ScriptType::Optional(Box::new(self.expression_type(value).clone()));
+                    return self.alloc_expression(
+                        HirExprKind::OptionalSome(value),
+                        ty,
+                        expression.span,
+                    );
+                }
                 let callee = self.lower_expression(syntax_callee);
                 let function = self.resolve_call(expression);
                 if function == ResolvedFunction::Dynamic
@@ -806,6 +1005,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         .map_or((None, None), |(parameters, variadic)| {
                             (Some(parameters), variadic)
                         }),
+                    ResolvedFunction::User(function) => self
+                        .functions
+                        .get(function.0 as usize)
+                        .map(|function| (Some(function.parameters.clone()), None))
+                        .unwrap_or((None, None)),
                     _ => (None, None),
                 };
                 let mut arguments = arguments
@@ -837,8 +1041,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     });
                 }
                 let arguments = self.arena.alloc_slice_copy(&arguments);
-                self.check_call(function, callee, arguments, expression.span);
-                let ty = self.call_result(function);
+                self.check_call(
+                    function,
+                    callee,
+                    arguments,
+                    &explicit_types,
+                    expression.span,
+                );
+                let ty = self.call_result(function, arguments, &explicit_types);
                 (
                     HirExprKind::Call {
                         callee,
@@ -856,18 +1066,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let ty = if matches!(expression.kind, ExprKind::Tuple(_)) {
                     ScriptType::Tuple
                 } else {
-                    let element = values
-                        .first()
-                        .map(|value| self.expression_type(value).clone())
-                        .unwrap_or(ScriptType::Any);
-                    let element = if values
-                        .iter()
-                        .all(|value| element.accepts(self.expression_type(value)))
-                    {
-                        element
-                    } else {
-                        ScriptType::Any
-                    };
+                    let element = values.iter().fold(None, |element, value| {
+                        let value = self.expression_type(value).clone();
+                        Some(match element {
+                            None => value,
+                            Some(element) => join_types(element, value),
+                        })
+                    });
+                    let element = element.unwrap_or(ScriptType::Any);
                     ScriptType::List(Box::new(element))
                 };
                 let values = self.arena.alloc_slice_copy(&values);
@@ -877,9 +1083,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     (HirExprKind::List(values), ty)
                 }
             }
-            ExprKind::Map(fields) | ExprKind::TypedMap { fields, .. } => {
+            ExprKind::StructLiteral(fields) | ExprKind::TypedStructLiteral { fields, .. } => {
                 let type_name = match &expression.kind {
-                    ExprKind::TypedMap { type_name, .. } => Some(self.symbol(type_name)),
+                    ExprKind::TypedStructLiteral { type_name, .. } => Some(self.symbol(type_name)),
                     _ => None,
                 };
                 let mut record = BTreeMap::new();
@@ -894,10 +1100,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     .collect::<Vec<_>>();
                 let fields = self.arena.alloc_slice_copy(&fields);
                 let ty = match &expression.kind {
-                    ExprKind::TypedMap { type_name, .. } => self
-                        .aliases
-                        .get(type_name)
-                        .cloned()
+                    ExprKind::TypedStructLiteral { type_name, .. } => self
+                        .instantiate_named_type(type_name, &[], expression.span)
                         .unwrap_or(ScriptType::Record(record)),
                     _ => ScriptType::Record(record),
                 };
@@ -962,7 +1166,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                             arguments,
                             function: ResolvedFunction::Builtin(builtin),
                         },
-                        self.call_result(ResolvedFunction::Builtin(builtin)),
+                        self.call_result(ResolvedFunction::Builtin(builtin), arguments, &[]),
                         expression.span,
                     );
                 }
@@ -990,6 +1194,132 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if expected == Some(&ScriptType::TextTemplate)
+            && let ExprKind::String(value) = &expression.kind
+        {
+            return self.alloc_expression(
+                HirExprKind::Literal(HirLiteral::TextTemplate(self.arena.alloc_str(value))),
+                ScriptType::TextTemplate,
+                expression.span,
+            );
+        }
+        if let Some(ScriptType::Struct {
+            name,
+            arguments,
+            fields: expected_fields,
+        }) = expected
+            && let ExprKind::StructLiteral(fields) = &expression.kind
+        {
+            let mut actual_fields = BTreeMap::new();
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let field_name = self.symbol(&field.name);
+                    let value = self
+                        .lower_expression_expected(&field.value, expected_fields.get(&field.name));
+                    actual_fields.insert(field.name.clone(), self.expression_type(value).clone());
+                    (field_name, value)
+                })
+                .collect::<Vec<_>>();
+            self.check_assignment(
+                &ScriptType::Record(expected_fields.clone()),
+                &ScriptType::Record(actual_fields),
+                expression.span,
+            );
+            let ty = ScriptType::Struct {
+                name: *name,
+                arguments: arguments.clone(),
+                fields: expected_fields.clone(),
+            };
+            return self.alloc_expression(
+                HirExprKind::Map {
+                    type_name: Some(*name),
+                    fields: self.arena.alloc_slice_copy(&fields),
+                },
+                ty,
+                expression.span,
+            );
+        }
+        if let Some(ScriptType::Map(key, element)) = expected
+            && let ExprKind::StructLiteral(fields) = &expression.kind
+        {
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let name = self.symbol(&field.name);
+                    let value = self.lower_expression_expected(&field.value, Some(element));
+                    (name, value)
+                })
+                .collect::<Vec<_>>();
+            return self.alloc_expression(
+                HirExprKind::Map {
+                    type_name: None,
+                    fields: self.arena.alloc_slice_copy(&fields),
+                },
+                ScriptType::Map(key.clone(), element.clone()),
+                expression.span,
+            );
+        }
+        if let Some(ScriptType::Record(expected_fields)) = expected
+            && let ExprKind::StructLiteral(fields) | ExprKind::TypedStructLiteral { fields, .. } =
+                &expression.kind
+        {
+            let type_name = match &expression.kind {
+                ExprKind::TypedStructLiteral { type_name, .. } => Some(self.symbol(type_name)),
+                _ => None,
+            };
+            let mut actual_fields = BTreeMap::new();
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let name = self.symbol(&field.name);
+                    let value = self
+                        .lower_expression_expected(&field.value, expected_fields.get(&field.name));
+                    actual_fields.insert(field.name.clone(), self.expression_type(value).clone());
+                    (name, value)
+                })
+                .collect::<Vec<_>>();
+            self.check_assignment(
+                &ScriptType::Record(expected_fields.clone()),
+                &ScriptType::Record(actual_fields),
+                expression.span,
+            );
+            return self.alloc_expression(
+                HirExprKind::Map {
+                    type_name,
+                    fields: self.arena.alloc_slice_copy(&fields),
+                },
+                ScriptType::Record(expected_fields.clone()),
+                expression.span,
+            );
+        }
+        if let Some(ScriptType::Optional(inner)) = expected {
+            if matches!(expression.kind, ExprKind::Null)
+                || matches!(&expression.kind, ExprKind::Symbol(name) if name == "none")
+            {
+                return self.alloc_expression(
+                    HirExprKind::Literal(HirLiteral::Null),
+                    ScriptType::Optional(inner.clone()),
+                    expression.span,
+                );
+            }
+            if let ExprKind::Call {
+                callee,
+                type_arguments: _,
+                arguments,
+                trailing_block: None,
+            } = &expression.kind
+                && matches!(&callee.kind, ExprKind::Symbol(name) if name == "some")
+                && arguments.len() == 1
+            {
+                let value = self.lower_expression_expected(&arguments[0].value, Some(inner));
+                return self.alloc_expression(
+                    HirExprKind::OptionalSome(value),
+                    ScriptType::Optional(inner.clone()),
+                    expression.span,
+                );
+            }
+        }
         if let Some(ScriptType::List(element)) = expected
             && let ExprKind::List(values) = &expression.kind
         {
@@ -1005,7 +1335,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             );
         }
         let Some(ScriptType::Named(owner)) = expected else {
-            return self.lower_expression(expression);
+            let value = self.lower_expression(expression);
+            if let Some(expected @ ScriptType::Optional(inner)) = expected
+                && !matches!(self.expression_type(value), ScriptType::Optional(_))
+                && inner.accepts(self.expression_type(value))
+            {
+                return self.alloc_expression(
+                    HirExprKind::Cast {
+                        value,
+                        target: self.arena.alloc(expected.clone()),
+                        mode: CastMode::Static,
+                    },
+                    expected.clone(),
+                    expression.span,
+                );
+            }
+            return value;
         };
         if let ExprKind::Symbol(name) = &expression.kind
             && let Some(member) = self
@@ -1025,18 +1370,25 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     arguments: &[],
                     function: ResolvedFunction::Builtin(builtin),
                 },
-                self.call_result(ResolvedFunction::Builtin(builtin)),
+                self.call_result(ResolvedFunction::Builtin(builtin), &[], &[]),
                 expression.span,
             );
         }
         let ExprKind::Call {
             callee,
+            type_arguments,
             arguments,
             trailing_block,
         } = &expression.kind
         else {
             return self.lower_expression(expression);
         };
+        if !type_arguments.is_empty() {
+            self.error(
+                "engine static methods do not accept script type arguments",
+                expression.span,
+            );
+        }
         let ExprKind::Symbol(name) = &callee.kind else {
             return self.lower_expression(expression);
         };
@@ -1079,14 +1431,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
         let lowered_arguments = self.arena.alloc_slice_copy(&lowered_arguments);
         let function = ResolvedFunction::Builtin(builtin);
-        self.check_call(function, callee, lowered_arguments, expression.span);
+        self.check_call(function, callee, lowered_arguments, &[], expression.span);
         self.alloc_expression(
             HirExprKind::Call {
                 callee,
                 arguments: lowered_arguments,
                 function,
             },
-            self.call_result(function),
+            self.call_result(function, lowered_arguments, &[]),
             expression.span,
         )
     }
@@ -1096,11 +1448,79 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         function: ResolvedFunction,
         callee: &HirExpr<'_>,
         arguments: &[HirArgument<'_>],
+        explicit_types: &[ScriptType],
         span: Span,
     ) {
+        if let ResolvedFunction::User(function) = function {
+            let Some(declaration) = self.functions.get(function.0 as usize) else {
+                return;
+            };
+            let parameters = declaration.parameters.clone();
+            let generic_parameters = declaration.type_parameters.clone();
+            if parameters.len() != arguments.len() {
+                self.error(
+                    format!(
+                        "function expects {} arguments, got {}",
+                        parameters.len(),
+                        arguments.len()
+                    ),
+                    span,
+                );
+                return;
+            }
+            if !explicit_types.is_empty() && explicit_types.len() != generic_parameters.len() {
+                self.error(
+                    format!(
+                        "generic function expects {} type arguments, got {}",
+                        generic_parameters.len(),
+                        explicit_types.len()
+                    ),
+                    span,
+                );
+                return;
+            }
+            let substitutions = if explicit_types.is_empty() {
+                infer_type_arguments(&parameters, arguments, |value| {
+                    self.expression_type(value).clone()
+                })
+            } else {
+                generic_parameters
+                    .iter()
+                    .copied()
+                    .zip(explicit_types.iter().cloned())
+                    .collect()
+            };
+            for parameter in &generic_parameters {
+                if !substitutions.contains_key(parameter) {
+                    let name = self.symbols.resolve(*parameter).unwrap_or("<unknown>");
+                    self.error(
+                        format!(
+                            "cannot infer generic parameter `{name}` from this call; add a value whose type determines it"
+                        ),
+                        span,
+                    );
+                }
+            }
+            for (expected, actual) in parameters.iter().zip(arguments) {
+                let expected = substitute_type(expected, &substitutions);
+                if !expected.accepts(self.expression_type(actual.value)) {
+                    self.error(
+                        format!(
+                            "argument expects {expected:?}, got {:?}",
+                            self.expression_type(actual.value)
+                        ),
+                        actual.span,
+                    );
+                }
+            }
+            return;
+        }
         let ResolvedFunction::Builtin(builtin) = function else {
             return;
         };
+        if !explicit_types.is_empty() {
+            self.error("native functions do not accept script type arguments", span);
+        }
         let Some(signature) = self
             .manifest
             .and_then(|manifest| manifest.signature(builtin))
@@ -1110,7 +1530,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         let required = signature
             .parameters
             .iter()
-            .rposition(|parameter| !matches!(parameter, ScriptType::Nullable(_)))
+            .rposition(|parameter| !matches!(parameter, ScriptType::Optional(_)))
             .map_or(0, |index| index + 1);
         if arguments.len() < required
             || (signature.variadic.is_none() && arguments.len() > signature.parameters.len())
@@ -1163,6 +1583,17 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     fn lower_identifier(&mut self, name: &str, span: Span) -> &'hir HirExpr<'hir> {
         let symbol = self.symbol(name);
         if let Some(local) = self.resolve_local(symbol) {
+            let refined = self
+                .refinements
+                .iter()
+                .rev()
+                .find_map(|refinements| refinements.get(&local))
+                .cloned();
+            if let Some(refined) = refined {
+                let declared = self.locals[local.0 as usize].ty;
+                let value = self.alloc_typed_expression(HirExprKind::Local(local), declared, span);
+                return self.alloc_expression(HirExprKind::NonNull(value), refined, span);
+            }
             return self.alloc_typed_expression(
                 HirExprKind::Local(local),
                 self.locals[local.0 as usize].ty,
@@ -1177,7 +1608,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             );
         }
         if let Some(function) = self.function_names.get(&symbol).copied() {
-            return self.alloc_expression(HirExprKind::Function(function), ScriptType::Any, span);
+            return self.alloc_expression(
+                HirExprKind::Function(function),
+                ScriptType::Function,
+                span,
+            );
         }
         if let Some(builtin) = self.manifest.and_then(|manifest| manifest.resolve(name)) {
             return self.alloc_expression(HirExprKind::Builtin(builtin), ScriptType::Any, span);
@@ -1225,6 +1660,63 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         Some(self.arena.alloc(place))
     }
 
+    fn place_type(&self, place: &HirPlace<'hir>) -> Option<ScriptType> {
+        match place {
+            HirPlace::Local(local) => self
+                .types
+                .get(self.locals.get(local.0 as usize)?.ty)
+                .cloned(),
+            HirPlace::Global(global) => self
+                .types
+                .get(self.globals.get(global.0 as usize)?.ty)
+                .cloned(),
+            HirPlace::Member { object, member } => {
+                let object = self.place_type(object)?;
+                let name = self.symbols.resolve(*member)?;
+                Some(member_type(&object, name))
+            }
+        }
+    }
+
+    fn condition_refinements(
+        &mut self,
+        condition: &Expr,
+    ) -> (
+        BTreeMap<HirLocalId, ScriptType>,
+        BTreeMap<HirLocalId, ScriptType>,
+    ) {
+        let ExprKind::Binary { left, op, right } = &condition.kind else {
+            return (BTreeMap::new(), BTreeMap::new());
+        };
+        let name = match (&left.kind, &right.kind) {
+            (ExprKind::Ident(name), ExprKind::Null) | (ExprKind::Null, ExprKind::Ident(name)) => {
+                name
+            }
+            _ => return (BTreeMap::new(), BTreeMap::new()),
+        };
+        let symbol = self.symbol(name);
+        let Some(local) = self.resolve_local(symbol) else {
+            return (BTreeMap::new(), BTreeMap::new());
+        };
+        let Some(ScriptType::Optional(inner)) =
+            self.types.get(self.locals[local.0 as usize].ty).cloned()
+        else {
+            return (BTreeMap::new(), BTreeMap::new());
+        };
+        let narrowed = BTreeMap::from([(local, *inner)]);
+        match op {
+            BinaryOp::NotEqual => (narrowed, BTreeMap::new()),
+            BinaryOp::Equal => (BTreeMap::new(), narrowed),
+            _ => (BTreeMap::new(), BTreeMap::new()),
+        }
+    }
+
+    fn check_assignment(&mut self, expected: &ScriptType, actual: &ScriptType, span: Span) {
+        if !expected.accepts(actual) {
+            self.error(format!("expected {expected:?}, got {actual:?}"), span);
+        }
+    }
+
     fn resolve_call(&mut self, expression: &Expr) -> ResolvedFunction {
         let ExprKind::Call { callee, .. } = &expression.kind else {
             return ResolvedFunction::Dynamic;
@@ -1262,13 +1754,32 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         ResolvedFunction::Dynamic
     }
 
-    fn call_result(&self, function: ResolvedFunction) -> ScriptType {
+    fn call_result(
+        &self,
+        function: ResolvedFunction,
+        arguments: &[HirArgument<'hir>],
+        explicit_types: &[ScriptType],
+    ) -> ScriptType {
         match function {
-            ResolvedFunction::User(function) => self
-                .functions
-                .get(function.0 as usize)
-                .map(|function| function.result.clone())
-                .unwrap_or(ScriptType::Any),
+            ResolvedFunction::User(function) => {
+                self.functions
+                    .get(function.0 as usize)
+                    .map_or(ScriptType::Any, |function| {
+                        let substitutions = if explicit_types.is_empty() {
+                            infer_type_arguments(&function.parameters, arguments, |value| {
+                                self.expression_type(value).clone()
+                            })
+                        } else {
+                            function
+                                .type_parameters
+                                .iter()
+                                .copied()
+                                .zip(explicit_types.iter().cloned())
+                                .collect()
+                        };
+                        substitute_type(&function.result, &substitutions)
+                    })
+            }
             ResolvedFunction::Builtin(builtin) => self
                 .manifest
                 .and_then(|manifest| manifest.signature(builtin))
@@ -1323,25 +1834,30 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn type_from_ast(&mut self, ty: &TypeExpr) -> Option<ScriptType> {
         match &ty.kind {
-            TypeExprKind::Named(name) => match name.as_str() {
-                "Any" => Some(ScriptType::Any),
-                "Unit" => Some(ScriptType::Unit),
-                "Bool" => Some(ScriptType::Bool),
-                "Int" => Some(ScriptType::Int),
-                "Float" | "Number" => Some(ScriptType::Number),
-                "String" => Some(ScriptType::String),
-                "Symbol" => Some(ScriptType::Symbol),
-                "Selector" => Some(ScriptType::Selector),
-                "Function" => Some(ScriptType::Function),
-                "Task" => Some(ScriptType::Task),
-                _ => self.aliases.get(name).cloned().or_else(|| {
-                    self.manifest
-                        .and_then(|manifest| manifest.symbols().find(name))
-                        .map(ScriptType::Named)
-                }),
-            },
+            TypeExprKind::Named(name) => {
+                if let Some(parameter) = self
+                    .type_parameters
+                    .iter()
+                    .rev()
+                    .find_map(|parameters| parameters.get(name))
+                {
+                    return Some(parameter.clone());
+                }
+                self.instantiate_named_type(name, &[], ty.span)
+            }
+            TypeExprKind::Applied { name, arguments } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.type_from_ast(argument))
+                    .collect::<Option<Vec<_>>>()?;
+                self.instantiate_named_type(name, &arguments, ty.span)
+            }
             TypeExprKind::Nullable(inner) => {
-                Some(ScriptType::Nullable(Box::new(self.type_from_ast(inner)?)))
+                let inner = self.type_from_ast(inner)?;
+                Some(match inner {
+                    ScriptType::Optional(inner) => ScriptType::Optional(inner),
+                    inner => ScriptType::Optional(Box::new(inner)),
+                })
             }
             TypeExprKind::List(inner) => {
                 Some(ScriptType::List(Box::new(self.type_from_ast(inner)?)))
@@ -1356,6 +1872,114 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     .collect::<Option<_>>()?,
             )),
         }
+    }
+
+    fn instantiate_named_type(
+        &mut self,
+        name: &str,
+        arguments: &[ScriptType],
+        span: Span,
+    ) -> Option<ScriptType> {
+        let builtin = match name {
+            "Any" => Some(ScriptType::Any),
+            "Unit" => Some(ScriptType::Unit),
+            "Bool" => Some(ScriptType::Bool),
+            "Int" => Some(ScriptType::Int),
+            "Float" => Some(ScriptType::Float),
+            "String" => Some(ScriptType::String),
+            "TextTemplate" => Some(ScriptType::TextTemplate),
+            "Symbol" => Some(ScriptType::Symbol),
+            "Selector" => Some(ScriptType::Selector),
+            "Function" => Some(ScriptType::Function),
+            "Task" => Some(ScriptType::Task),
+            _ => None,
+        };
+        if let Some(builtin) = builtin {
+            if !arguments.is_empty() {
+                self.error(
+                    format!("type `{name}` does not accept type arguments"),
+                    span,
+                );
+                return None;
+            }
+            return Some(builtin);
+        }
+        if matches!(name, "List" | "Binding" | "Optional") {
+            if arguments.len() != 1 {
+                self.error(
+                    format!("type `{name}` expects exactly one type argument"),
+                    span,
+                );
+                return None;
+            }
+            return Some(match name {
+                "List" => ScriptType::List(Box::new(arguments[0].clone())),
+                "Binding" => ScriptType::Binding(Box::new(arguments[0].clone())),
+                "Optional" => ScriptType::Optional(Box::new(arguments[0].clone())),
+                _ => unreachable!(),
+            });
+        }
+        if name == "Map" {
+            if arguments.len() != 2 {
+                self.error(
+                    "type `Map` expects exactly two type arguments; raw Map is not allowed",
+                    span,
+                );
+                return None;
+            }
+            if arguments[0] != ScriptType::String {
+                self.error("HKS maps currently require String keys", span);
+                return None;
+            }
+            return Some(ScriptType::Map(
+                Box::new(arguments[0].clone()),
+                Box::new(arguments[1].clone()),
+            ));
+        }
+        if let Some(alias) = self.aliases.get(name).cloned() {
+            if alias.parameters.len() != arguments.len() {
+                self.error(
+                    format!(
+                        "type `{name}` expects {} type arguments; raw generic types are not allowed",
+                        alias.parameters.len()
+                    ),
+                    span,
+                );
+                return None;
+            }
+            if self.type_expansions.iter().any(|expanded| expanded == name) {
+                self.error(
+                    format!("recursive type alias `{name}` requires an indirection type"),
+                    span,
+                );
+                return None;
+            }
+            self.type_expansions.push(name.to_string());
+            self.type_parameters.push(
+                alias
+                    .parameters
+                    .iter()
+                    .cloned()
+                    .zip(arguments.iter().cloned())
+                    .collect(),
+            );
+            let body = self.type_from_ast(&alias.body);
+            self.type_parameters.pop();
+            self.type_expansions.pop();
+            let body = body?;
+            let fields = match body {
+                ScriptType::Record(fields) => fields,
+                other => return Some(other),
+            };
+            return Some(ScriptType::Struct {
+                name: self.symbol(name),
+                arguments: arguments.to_vec(),
+                fields,
+            });
+        }
+        self.manifest
+            .and_then(|manifest| manifest.symbols().find(name))
+            .map(ScriptType::Named)
     }
 
     fn alloc_expression(
@@ -1398,7 +2022,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 fn member_type(object: &ScriptType, member: &str) -> ScriptType {
     match object {
         ScriptType::Record(fields) => fields.get(member).cloned().unwrap_or(ScriptType::Any),
-        ScriptType::Nullable(inner) => member_type(inner, member),
+        ScriptType::Struct { fields, .. } => fields.get(member).cloned().unwrap_or(ScriptType::Any),
+        ScriptType::Map(_, value) => (**value).clone(),
+        ScriptType::Optional(inner) => member_type(inner, member),
         _ => ScriptType::Any,
     }
 }
@@ -1411,14 +2037,204 @@ fn binary_type(op: BinaryOp, left: &ScriptType, right: &ScriptType) -> ScriptTyp
         | BinaryOp::LessEqual
         | BinaryOp::Greater
         | BinaryOp::GreaterEqual => ScriptType::Bool,
-        BinaryOp::Divide => ScriptType::Number,
+        BinaryOp::Divide => ScriptType::Float,
         BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply
             if left == &ScriptType::Int && right == &ScriptType::Int =>
         {
             ScriptType::Int
         }
-        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => ScriptType::Number,
+        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => ScriptType::Float,
         BinaryOp::Colon => ScriptType::Any,
+    }
+}
+
+fn join_types(left: ScriptType, right: ScriptType) -> ScriptType {
+    use ScriptType::*;
+    if left == right {
+        return left;
+    }
+    match (left, right) {
+        (Int, Float) | (Float, Int) => Float,
+        (Optional(left), Optional(right)) => Optional(Box::new(join_types(*left, *right))),
+        (Optional(left), right) | (right, Optional(left)) => {
+            Optional(Box::new(join_types(*left, right)))
+        }
+        (Any, _) | (_, Any) => Any,
+        (left, right) if left.accepts(&right) => left,
+        (left, right) if right.accepts(&left) => right,
+        (left, right) => Union(vec![left, right]),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CastCertainty {
+    Always,
+    Runtime,
+    Impossible,
+}
+
+fn cast_certainty(source: &ScriptType, target: &ScriptType) -> CastCertainty {
+    use CastCertainty::{Always, Impossible, Runtime};
+    use ScriptType::*;
+
+    if target == &Any || source == target || target.accepts(source) && source != &Any {
+        return Always;
+    }
+    if source == &Any {
+        return Runtime;
+    }
+    match (source, target) {
+        // Numeric storage is normalized to f64. `as Int` supplies the explicit
+        // truncation requested by the author; Int -> Float is implicit.
+        (Float, Int) | (Int, Float) => Always,
+        (Optional(source), Optional(target)) => cast_certainty(source, target),
+        (Optional(source), target) => match cast_certainty(source, target) {
+            Impossible => Impossible,
+            Always | Runtime => Runtime,
+        },
+        (source, Optional(target)) => cast_certainty(source, target),
+        (Union(sources), target) => {
+            let mut certainty = Always;
+            for source in sources {
+                match cast_certainty(source, target) {
+                    Impossible => return Runtime,
+                    Runtime => certainty = Runtime,
+                    Always => {}
+                }
+            }
+            certainty
+        }
+        (source, Union(targets)) => targets
+            .iter()
+            .map(|target| cast_certainty(source, target))
+            .min_by_key(|certainty| match certainty {
+                Always => 0,
+                Runtime => 1,
+                Impossible => 2,
+            })
+            .unwrap_or(Impossible),
+        (List(source), List(target)) => cast_certainty(source, target),
+        (Record(_), Record(_))
+        | (Map(_, _), Record(_))
+        | (Record(_), Map(_, _))
+        | (Struct { .. }, Record(_))
+        | (Record(_), Struct { .. }) => Runtime,
+        (Named(source), Named(target)) if source == target => Always,
+        _ => Impossible,
+    }
+}
+
+fn is_untyped_none(ty: &ScriptType) -> bool {
+    matches!(ty, ScriptType::Optional(inner) if inner.as_ref() == &ScriptType::Any)
+}
+
+fn place_root_local(place: &HirPlace<'_>) -> Option<HirLocalId> {
+    match place {
+        HirPlace::Local(local) => Some(*local),
+        HirPlace::Global(_) => None,
+        HirPlace::Member { object, .. } => place_root_local(object),
+    }
+}
+
+fn infer_type_arguments<'hir>(
+    parameters: &[ScriptType],
+    arguments: &[HirArgument<'hir>],
+    mut type_of: impl FnMut(&HirExpr<'hir>) -> ScriptType,
+) -> BTreeMap<SymbolId, ScriptType> {
+    let mut substitutions = BTreeMap::new();
+    for (parameter, argument) in parameters.iter().zip(arguments) {
+        infer_type_argument(parameter, &type_of(argument.value), &mut substitutions);
+    }
+    substitutions
+}
+
+fn infer_type_argument(
+    parameter: &ScriptType,
+    actual: &ScriptType,
+    substitutions: &mut BTreeMap<SymbolId, ScriptType>,
+) {
+    match (parameter, actual) {
+        (ScriptType::TypeParameter(parameter), actual) => {
+            substitutions
+                .entry(*parameter)
+                .and_modify(|current| *current = join_types(current.clone(), actual.clone()))
+                .or_insert_with(|| actual.clone());
+        }
+        (ScriptType::Optional(parameter), ScriptType::Optional(actual))
+        | (ScriptType::List(parameter), ScriptType::List(actual)) => {
+            infer_type_argument(parameter, actual, substitutions)
+        }
+        (
+            ScriptType::Map(parameter_key, parameter_value),
+            ScriptType::Map(actual_key, actual_value),
+        ) => {
+            infer_type_argument(parameter_key, actual_key, substitutions);
+            infer_type_argument(parameter_value, actual_value, substitutions);
+        }
+        (
+            ScriptType::Struct {
+                arguments: parameters,
+                ..
+            },
+            ScriptType::Struct {
+                arguments: actuals, ..
+            },
+        ) => {
+            for (parameter, actual) in parameters.iter().zip(actuals) {
+                infer_type_argument(parameter, actual, substitutions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn substitute_type(ty: &ScriptType, substitutions: &BTreeMap<SymbolId, ScriptType>) -> ScriptType {
+    match ty {
+        ScriptType::TypeParameter(parameter) => substitutions
+            .get(parameter)
+            .cloned()
+            .unwrap_or(ScriptType::Any),
+        ScriptType::Optional(inner) => {
+            ScriptType::Optional(Box::new(substitute_type(inner, substitutions)))
+        }
+        ScriptType::List(inner) => {
+            ScriptType::List(Box::new(substitute_type(inner, substitutions)))
+        }
+        ScriptType::Binding(inner) => {
+            ScriptType::Binding(Box::new(substitute_type(inner, substitutions)))
+        }
+        ScriptType::Map(key, value) => ScriptType::Map(
+            Box::new(substitute_type(key, substitutions)),
+            Box::new(substitute_type(value, substitutions)),
+        ),
+        ScriptType::Struct {
+            name,
+            arguments,
+            fields,
+        } => ScriptType::Struct {
+            name: *name,
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_type(argument, substitutions))
+                .collect(),
+            fields: fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), substitute_type(ty, substitutions)))
+                .collect(),
+        },
+        ScriptType::Union(types) => ScriptType::Union(
+            types
+                .iter()
+                .map(|ty| substitute_type(ty, substitutions))
+                .collect(),
+        ),
+        ScriptType::Record(fields) => ScriptType::Record(
+            fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), substitute_type(ty, substitutions)))
+                .collect(),
+        ),
+        ty => ty.clone(),
     }
 }
 
@@ -1516,5 +2332,147 @@ mod tests {
             .expect("explicit binding source parses");
         let arena = HirArena::new();
         lower_to_hir(&arena, &explicit, None).expect("explicit selector binding must lower");
+    }
+
+    #[test]
+    fn normalized_inference_promotes_int_to_float_but_requires_an_explicit_downcast() {
+        let accepted = parse_program("let a = 1\nlet b: Float = a\nlet c: Int = b as Int")
+            .expect("source parses");
+        let arena = HirArena::new();
+        lower_to_hir(&arena, &accepted, None).expect("numeric conversions must lower");
+
+        let rejected = parse_program("let a = 1.5\nlet b: Int = a").expect("source parses");
+        let arena = HirArena::new();
+        let errors = lower_to_hir(&arena, &rejected, None)
+            .expect_err("implicit Float to Int conversion must be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("expected Int"))
+        );
+    }
+
+    #[test]
+    fn static_cast_rejects_dynamic_sources_with_actionable_guidance() {
+        let syntax = parse_program("fn convert(value) -> String { value as String }")
+            .expect("source parses");
+        let arena = HirArena::new();
+        let errors = lower_to_hir(&arena, &syntax, None)
+            .expect_err("a static cast from Any cannot be proven");
+        assert!(errors.iter().any(|error| {
+            error.message.contains("use `as?`") && error.message.contains("`as!`")
+        }));
+    }
+
+    #[test]
+    fn null_checks_narrow_optional_locals_inside_the_selected_branch() {
+        let consume = crate::BuiltinId(1);
+        let manifest = crate::BuiltinManifest::new([("consume", consume)]).with_type_metadata(
+            crate::SymbolManifest::default(),
+            BTreeMap::from([(
+                consume,
+                crate::FunctionSignature {
+                    receiver: None,
+                    parameters: vec![ScriptType::String],
+                    variadic: None,
+                    result: ScriptType::Unit,
+                },
+            )]),
+            Vec::new(),
+        );
+        let syntax =
+            parse_program("let name: String? = \"alice\"\nif name != null { consume(name) }")
+                .expect("source parses");
+        let arena = HirArena::new();
+        lower_to_hir(&arena, &syntax, Some(&manifest))
+            .expect("the non-null branch must see String rather than String?");
+    }
+
+    #[test]
+    fn bare_null_requires_an_explicit_optional_type() {
+        let syntax = parse_program("let name = null").expect("source parses");
+        let arena = HirArena::new();
+        let errors = lower_to_hir(&arena, &syntax, None)
+            .expect_err("none cannot determine its own element type");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("explicit optional type"))
+        );
+    }
+
+    #[test]
+    fn list_inference_joins_int_and_float_as_float() {
+        let syntax = parse_program("let values = [1, 2.5]").expect("source parses");
+        let arena = HirArena::new();
+        let hir = lower_to_hir(&arena, &syntax, None).expect("list lowers");
+        assert_eq!(
+            hir.types.get(hir.locals[0].ty),
+            Some(&ScriptType::List(Box::new(ScriptType::Float)))
+        );
+    }
+
+    #[test]
+    fn generic_struct_literals_are_target_typed_and_nominal() {
+        let valid = parse_program(
+            "type Player<T> = .{ name: T, score: Int }\nlet player: Player<String?> = .{ name: null, score: 12 }",
+        )
+        .expect("source parses");
+        let arena = HirArena::new();
+        let hir = lower_to_hir(&arena, &valid, None).expect("generic struct instantiates");
+        assert!(matches!(
+            hir.types.get(hir.locals[0].ty),
+            Some(ScriptType::Struct { arguments, .. })
+                if arguments == &vec![ScriptType::Optional(Box::new(ScriptType::String))]
+        ));
+
+        let map_conversion = parse_program(
+            "let value = .{ name: \"alice\", score: 12 }\nlet erased: Map<String, Any> = value",
+        )
+        .expect("source parses");
+        let arena = HirArena::new();
+        lower_to_hir(&arena, &map_conversion, None)
+            .expect("an anonymous struct can erase to a string-keyed map");
+
+        let invalid = parse_program(
+            "type Player<T> = .{ name: T, score: Int }\nlet value = .{ name: \"alice\", score: 12 }\nlet player: Player<String> = value",
+        )
+        .expect("source parses");
+        let arena = HirArena::new();
+        lower_to_hir(&arena, &invalid, None)
+            .expect_err("an anonymous struct must not become a nominal Player implicitly");
+    }
+
+    #[test]
+    fn raw_generic_types_are_rejected() {
+        let syntax = parse_program(
+            "type Box<T> = .{ value: T }\nlet values: List = []\nlet boxed: Box = .{ value: 1 }",
+        )
+        .expect("source parses");
+        let arena = HirArena::new();
+        let errors = lower_to_hir(&arena, &syntax, None).expect_err("raw List is invalid");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("exactly one type argument"))
+        );
+        assert!(errors.iter().any(|error| {
+            error.message.contains("raw generic types are not allowed")
+                && error.message.contains("Box")
+        }));
+    }
+
+    #[test]
+    fn recursive_generic_aliases_report_an_error_instead_of_recursing_forever() {
+        let syntax = parse_program("type Loop<T> = Loop<T>\nlet value: Loop<String>")
+            .expect("source parses");
+        let arena = HirArena::new();
+        let errors =
+            lower_to_hir(&arena, &syntax, None).expect_err("recursive aliases are invalid");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("recursive type alias `Loop`"))
+        );
     }
 }

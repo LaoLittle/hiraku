@@ -360,7 +360,7 @@ mod tests {
             .expect("bound closure invokes");
         assert_eq!(
             child.step().expect("closure executes"),
-            Some(LinkedVmEvent::Statement(StatementValue::String(
+            Some(LinkedVmEvent::Statement(StatementValue::TextTemplate(
                 "child".into()
             )))
         );
@@ -388,7 +388,7 @@ mod tests {
             .expect("bound function invokes");
         assert_eq!(
             child.step().expect("function executes"),
-            Some(LinkedVmEvent::Statement(StatementValue::String(
+            Some(LinkedVmEvent::Statement(StatementValue::TextTemplate(
                 "value".into()
             )))
         );

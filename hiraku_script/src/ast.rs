@@ -5,6 +5,13 @@ use crate::span::Span;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program {
     pub statements: Vec<Stmt>,
+    pub warnings: Vec<SyntaxWarning>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyntaxWarning {
+    pub message: String,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +29,7 @@ pub enum Stmt {
     },
     TypeAlias {
         name: String,
+        type_parameters: Vec<String>,
         ty: TypeExpr,
         span: Span,
     },
@@ -30,6 +38,7 @@ pub enum Stmt {
         /// Exported functions participate in runtime linking across scripts.
         exported: bool,
         name: String,
+        type_parameters: Vec<String>,
         parameters: Vec<FunctionParameter>,
         return_type: Option<TypeExpr>,
         body: Block,
@@ -83,6 +92,10 @@ pub struct TypeExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeExprKind {
     Named(String),
+    Applied {
+        name: String,
+        arguments: Vec<TypeExpr>,
+    },
     Nullable(Box<TypeExpr>),
     List(Box<TypeExpr>),
     Binding(Box<TypeExpr>),
@@ -137,15 +150,23 @@ pub enum ExprKind {
         fallback: Box<Expr>,
     },
     NonNull(Box<Expr>),
+    Cast {
+        value: Box<Expr>,
+        ty: TypeExpr,
+        mode: CastMode,
+    },
     Call {
         callee: Box<Expr>,
+        type_arguments: Vec<TypeExpr>,
         arguments: Vec<Argument>,
         trailing_block: Option<Block>,
     },
     Tuple(Vec<Expr>),
     List(Vec<Expr>),
-    Map(Vec<MapField>),
-    TypedMap {
+    /// A structural object literal. Its type is anonymous unless a target type
+    /// context supplies a nominal struct or `Map<String, V>`.
+    StructLiteral(Vec<MapField>),
+    TypedStructLiteral {
         type_name: String,
         fields: Vec<MapField>,
     },
@@ -159,6 +180,16 @@ pub enum ExprKind {
         op: BinaryOp,
         right: Box<Expr>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CastMode {
+    /// A cast whose validity must be proven from static types.
+    Static,
+    /// A checked runtime cast which produces `Optional<T>`.
+    Optional,
+    /// A checked runtime cast which raises an error on failure.
+    Forced,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

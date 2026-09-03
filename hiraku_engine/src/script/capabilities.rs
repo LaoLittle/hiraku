@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use hiraku_script::native::{NativeError, NativeRegistry};
 use hiraku_script::{
-    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, ScriptType, Value, compile_with_manifest,
+    BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, ScriptType, TextTemplate, Value,
+    compile_with_manifest,
 };
 use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, render_diagnostics};
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,15 @@ pub fn compile_story_bytecode_with_options(
             .collect::<Vec<_>>();
         render_diagnostics(&diagnostics, &sources, render_options)
     })?;
+    if !program.warnings.is_empty() {
+        let diagnostics = program
+            .warnings
+            .iter()
+            .map(|warning| warning.diagnostic(source_id.clone()))
+            .collect::<Vec<_>>();
+        let rendered = render_diagnostics(&diagnostics, &sources, render_options);
+        let _ = hiraku_script::emit_rendered_diagnostic("HKS compiler warning:", &rendered);
+    }
     compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
         |errors| {
             let diagnostics = errors
@@ -224,14 +234,29 @@ fn registry() -> NativeRegistry<CharacterContext> {
         .define_global(
             "settings",
             ScriptType::Record(BTreeMap::from([
-                ("bgmVolume".to_string(), ScriptType::Number),
-                ("voiceVolume".to_string(), ScriptType::Number),
-                ("sfxVolume".to_string(), ScriptType::Number),
+                ("bgmVolume".to_string(), ScriptType::Float),
+                ("voiceVolume".to_string(), ScriptType::Float),
+                ("sfxVolume".to_string(), ScriptType::Float),
             ])),
         )
         .expect("engine settings schema must be defined once");
     native_api::register_hks(&mut registry)
         .expect("story native API registration must be internally consistent");
+    let dialogue_operator = registry
+        .manifest()
+        .resolve_operator(":")
+        .expect("dialogue operator must be registered");
+    registry
+        .set_signature(
+            dialogue_operator,
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: vec![ScriptType::Any, ScriptType::TextTemplate],
+                variadic: None,
+                result: ScriptType::Unit,
+            },
+        )
+        .expect("dialogue operator signature must target its registered builtin");
     story_api::register_hks(&mut registry)
         .expect("story navigation API registration must be internally consistent");
     registry
@@ -648,7 +673,7 @@ impl CharacterContext {
     ) -> Result<(), CharacterCapabilityError> {
         self.commit()?;
         if let StatementValue::String(text) = statement {
-            native_api::native_narrate(self, text.clone())
+            native_api::native_narrate(self, TextTemplate(text.clone()))
                 .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
         }
         Ok(())
@@ -1280,8 +1305,9 @@ mod native_api {
     #[hks]
     pub(super) fn native_narrate(
         context: &mut CharacterContext,
-        text: String,
+        text: TextTemplate,
     ) -> Result<(), NativeError> {
+        let text = text.into_string();
         context.last_speaker = Some(String::new());
         context.dialogue_buffer = Some(text.clone());
         context.commands.push(StoryEffect::Say {
@@ -1296,8 +1322,9 @@ mod native_api {
     fn native_say(
         context: &mut CharacterContext,
         speaker: String,
-        text: String,
+        text: TextTemplate,
     ) -> Result<(), NativeError> {
+        let text = text.into_string();
         context.last_speaker = Some(speaker.clone());
         context.dialogue_buffer = Some(text.clone());
         context.commands.push(StoryEffect::Say { speaker, text });
@@ -1326,8 +1353,9 @@ mod native_api {
             Value::Ellipsis => context.last_speaker.clone().unwrap_or_default(),
             _ => return Err(NativeError::TypeMismatch("actor or ellipsis")),
         };
-        let Value::String(text) = &call.arguments[1].value else {
-            return Err(NativeError::TypeMismatch("string"));
+        let text = match &call.arguments[1].value {
+            Value::TextTemplate(text) | Value::String(text) => text,
+            _ => return Err(NativeError::TypeMismatch("TextTemplate")),
         };
         if continuation {
             if let Some(buffer) = context.dialogue_buffer.as_mut() {
@@ -1338,10 +1366,10 @@ mod native_api {
                 context.wait = Some(StoryWait::DialogueAdvance);
             } else {
                 bevy::log::warn!("`...` has no dialogue buffer; treating it as narration");
-                native_narrate(context, text.clone())?;
+                native_narrate(context, TextTemplate(text.clone()))?;
             }
         } else {
-            native_say(context, speaker, text.clone())?;
+            native_say(context, speaker, TextTemplate(text.clone()))?;
         }
         Ok(Value::Unit)
     }

@@ -211,6 +211,7 @@ impl Collector<'_> {
                 callee,
                 arguments,
                 trailing_block,
+                ..
             } => {
                 self.expression(callee);
                 for argument in arguments {
@@ -225,12 +226,13 @@ impl Collector<'_> {
             | ExprKind::UnaryMinus(object)
             | ExprKind::NonNull(object)
             | ExprKind::Binding(object) => self.expression(object),
+            ExprKind::Cast { value, .. } => self.expression(value),
             ExprKind::Tuple(values) | ExprKind::List(values) => {
                 for value in values {
                     self.expression(value);
                 }
             }
-            ExprKind::Map(fields) | ExprKind::TypedMap { fields, .. } => {
+            ExprKind::StructLiteral(fields) | ExprKind::TypedStructLiteral { fields, .. } => {
                 for field in fields {
                     self.expression(&field.value);
                 }

@@ -11,7 +11,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 4;
+pub const BYTECODE_VERSION: u16 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -96,6 +96,16 @@ pub enum Instruction {
         dst: Register,
         value: Register,
     },
+    Cast {
+        dst: Register,
+        value: Register,
+        target: crate::ScriptType,
+        mode: crate::CastMode,
+    },
+    MakeOptional {
+        dst: Register,
+        value: Register,
+    },
     Binary {
         dst: Register,
         op: crate::BinaryOp,
@@ -112,6 +122,7 @@ pub enum Instruction {
     },
     MakeMap {
         dst: Register,
+        type_name: Option<SymbolId>,
         names: Vec<SymbolId>,
         values: RegisterSlice,
     },
@@ -156,12 +167,14 @@ pub enum Instruction {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Constant {
+    Uninitialized,
     Null,
     Ellipsis,
     Bool(bool),
     Number(f64),
     Percent(f64),
     String(String),
+    TextTemplate(String),
     Symbol(SymbolId),
     Selector(SymbolId),
     Function(SymbolId),
@@ -417,6 +430,21 @@ fn emit_function(
                     dst: register(*dst),
                     value: register(*value),
                 },
+                MirInstruction::Cast {
+                    dst,
+                    value,
+                    target,
+                    mode,
+                } => Instruction::Cast {
+                    dst: register(*dst),
+                    value: register(*value),
+                    target: target.clone(),
+                    mode: *mode,
+                },
+                MirInstruction::MakeOptional { dst, value } => Instruction::MakeOptional {
+                    dst: register(*dst),
+                    value: register(*value),
+                },
                 MirInstruction::Binary {
                     dst,
                     op,
@@ -452,7 +480,11 @@ fn emit_function(
                         values: slice,
                     }
                 }
-                MirInstruction::MakeMap { dst, fields } => {
+                MirInstruction::MakeMap {
+                    dst,
+                    type_name,
+                    fields,
+                } => {
                     let slice = emit_register_window(
                         &mut emitted,
                         allocation.register_count,
@@ -461,6 +493,7 @@ fn emit_function(
                     max_window = max_window.max(fields.len());
                     Instruction::MakeMap {
                         dst: register(*dst),
+                        type_name: *type_name,
                         names: fields.iter().map(|(name, _)| *name).collect(),
                         values: slice,
                     }
@@ -666,6 +699,7 @@ fn emit_register_window(
 
 fn constant(value: MirConstant) -> Constant {
     match value {
+        MirConstant::Uninitialized => Constant::Uninitialized,
         MirConstant::Null => Constant::Null,
         MirConstant::Unit => Constant::Unit,
         MirConstant::Ellipsis => Constant::Ellipsis,
@@ -673,6 +707,7 @@ fn constant(value: MirConstant) -> Constant {
         MirConstant::Number(value) => Constant::Number(value),
         MirConstant::Percent(value) => Constant::Percent(value),
         MirConstant::String(value) => Constant::String(value),
+        MirConstant::TextTemplate(value) => Constant::TextTemplate(value),
         MirConstant::Symbol(value) => Constant::Symbol(value),
         MirConstant::Selector(value) => Constant::Selector(value),
         MirConstant::Function(_) => unreachable!("function constants require symbol resolution"),
@@ -942,6 +977,27 @@ impl Vm {
                     };
                     self.write(dst, Value::Number(-value))?;
                 }
+                Instruction::Cast {
+                    dst,
+                    value,
+                    target,
+                    mode,
+                } => {
+                    let value = cast_value(self.read(value)?, &target);
+                    let value = match (mode, value) {
+                        (crate::CastMode::Optional, Ok(value)) => {
+                            Value::Optional(Some(Box::new(value)))
+                        }
+                        (_, Ok(value)) => value,
+                        (crate::CastMode::Optional, Err(_)) => Value::Optional(None),
+                        (_, Err(error)) => return Err(error),
+                    };
+                    self.write(dst, value)?;
+                }
+                Instruction::MakeOptional { dst, value } => {
+                    let value = self.read(value)?.clone();
+                    self.write(dst, Value::Optional(Some(Box::new(value))))?;
+                }
                 Instruction::Binary {
                     dst,
                     op,
@@ -959,14 +1015,26 @@ impl Vm {
                     let values = self.read_slice(values)?;
                     self.write(dst, Value::List(values))?;
                 }
-                Instruction::MakeMap { dst, names, values } => {
+                Instruction::MakeMap {
+                    dst,
+                    type_name,
+                    names,
+                    values,
+                } => {
                     let values = self.read_slice(values)?;
                     let fields = names
                         .into_iter()
                         .zip(values)
                         .map(|(name, value)| Ok((self.symbol(name)?.to_string(), value)))
                         .collect::<Result<BTreeMap<_, _>, VmError>>()?;
-                    self.write(dst, Value::Map(fields))?;
+                    let value = Value::Map(fields);
+                    self.write(
+                        dst,
+                        type_name.map_or(value.clone(), |type_id| Value::Typed {
+                            type_id,
+                            value: Box::new(value),
+                        }),
+                    )?;
                 }
                 Instruction::Call {
                     dst,
@@ -1095,10 +1163,13 @@ impl Vm {
                 }
                 Instruction::AssertNonNull { dst, value } => {
                     let value = self.read(value)?.clone();
-                    if value == Value::Null {
-                        return Err(VmError::NullAssertion);
+                    match value {
+                        Value::Optional(Some(value)) => self.write(dst, *value)?,
+                        Value::Optional(None) | Value::Null => {
+                            return Err(VmError::NullAssertion);
+                        }
+                        value => self.write(dst, value)?,
                     }
-                    self.write(dst, value)?;
                 }
                 Instruction::SelectNonNull {
                     dst,
@@ -1106,10 +1177,10 @@ impl Vm {
                     fallback,
                 } => {
                     let value = self.read(value)?.clone();
-                    let value = if value == Value::Null {
-                        self.read(fallback)?.clone()
-                    } else {
-                        value
+                    let value = match value {
+                        Value::Optional(Some(value)) => *value,
+                        Value::Optional(None) | Value::Null => self.read(fallback)?.clone(),
+                        value => value,
                     };
                     self.write(dst, value)?;
                 }
@@ -1120,7 +1191,9 @@ impl Vm {
                 } => {
                     let value = self.read(value)?;
                     let statement = match (string, emit_value, value) {
-                        (true, _, Value::String(value)) => StatementValue::String(value.clone()),
+                        (true, _, Value::String(value)) => {
+                            StatementValue::TextTemplate(value.clone())
+                        }
                         (_, true, Value::Unit) | (_, false, _) => StatementValue::Commit,
                         (_, true, _) => StatementValue::Value(value.clone()),
                     };
@@ -1258,6 +1331,19 @@ impl Vm {
     }
 
     pub fn eval_template(&self, template: &str) -> Result<String, crate::TemplateError> {
+        self.eval_template_with(template, |source| Ok(source.to_string()))
+    }
+
+    /// Rewrites a lazy text template before evaluating its expressions.
+    ///
+    /// Embeddings can use this boundary for localization. The rewrite runs on
+    /// the complete template source first, so the translated text may use a
+    /// different set of `${...}` expressions than the source text.
+    pub fn eval_template_with(
+        &self,
+        template: &str,
+        rewrite: impl FnOnce(&str) -> Result<String, crate::TemplateError>,
+    ) -> Result<String, crate::TemplateError> {
         let mut context = BTreeMap::new();
         for (symbol, value) in self.bytecode.globals.iter().zip(self.globals.iter()) {
             if value != &Value::Uninitialized
@@ -1273,18 +1359,21 @@ impl Vm {
                 context.insert(name.to_string(), value.clone());
             }
         }
-        crate::eval_template(template, &mut context)
+        let template = rewrite(template)?;
+        crate::eval_template(&template, &mut context)
     }
 
     fn constant_value(&self, value: Constant) -> Result<Value, VmError> {
         Ok(match value {
-            Constant::Null => Value::Null,
+            Constant::Uninitialized => Value::Uninitialized,
+            Constant::Null => Value::Optional(None),
             Constant::Unit => Value::Unit,
             Constant::Ellipsis => Value::Ellipsis,
             Constant::Bool(value) => Value::Bool(value),
             Constant::Number(value) => Value::Number(value),
             Constant::Percent(value) => Value::Percent(value),
             Constant::String(value) => Value::String(value),
+            Constant::TextTemplate(value) => Value::TextTemplate(value),
             Constant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
             Constant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
             Constant::Function(symbol) => Value::Function {
@@ -1450,10 +1539,14 @@ impl Vm {
 }
 
 fn get_member(value: &Value, name: &str, safe: bool) -> Result<Value, VmError> {
-    if value == &Value::Null && safe {
-        return Ok(Value::Null);
-    }
     match value {
+        Value::Optional(None) if safe => Ok(Value::Optional(None)),
+        Value::Optional(None) => Err(VmError::NullMemberAccess(name.to_string())),
+        Value::Optional(Some(value)) if safe => {
+            get_member(value, name, false).map(|value| Value::Optional(Some(Box::new(value))))
+        }
+        Value::Optional(Some(value)) => get_member(value, name, false),
+        Value::Null if safe => Ok(Value::Optional(None)),
         Value::Map(fields) => fields
             .get(name)
             .cloned()
@@ -1522,6 +1615,102 @@ fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmE
     }
 }
 
+fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmError> {
+    use crate::ScriptType;
+
+    let mismatch = || VmError::CastFailed(format!("value cannot be cast to {target:?}"));
+    match target {
+        ScriptType::Any => Ok(value.clone()),
+        ScriptType::Unit if matches!(value, Value::Unit) => Ok(value.clone()),
+        ScriptType::Bool if matches!(value, Value::Bool(_)) => Ok(value.clone()),
+        ScriptType::Int => match value {
+            Value::Number(number) if number.is_finite() => {
+                // HKS integers use the exactly representable f64 integer range. Explicit
+                // Float -> Int conversion truncates toward zero and clamps at that boundary.
+                const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+                Ok(Value::Number(
+                    number.trunc().clamp(-MAX_SAFE_INTEGER, MAX_SAFE_INTEGER),
+                ))
+            }
+            _ => Err(mismatch()),
+        },
+        ScriptType::Float if matches!(value, Value::Number(_)) => Ok(value.clone()),
+        ScriptType::Percent if matches!(value, Value::Percent(_)) => Ok(value.clone()),
+        ScriptType::String if matches!(value, Value::String(_)) => Ok(value.clone()),
+        ScriptType::TextTemplate if matches!(value, Value::TextTemplate(_)) => Ok(value.clone()),
+        ScriptType::Symbol if matches!(value, Value::Symbol(_)) => Ok(value.clone()),
+        ScriptType::Selector if matches!(value, Value::Selector(_)) => Ok(value.clone()),
+        ScriptType::Function if matches!(value, Value::Function { .. } | Value::Closure { .. }) => {
+            Ok(value.clone())
+        }
+        ScriptType::Task if matches!(value, Value::Task(_)) => Ok(value.clone()),
+        ScriptType::Named(expected) => match value {
+            Value::Typed { type_id, .. } if type_id == expected => Ok(value.clone()),
+            Value::Handle { type_id, .. } if *type_id == expected.0 => Ok(value.clone()),
+            _ => Err(mismatch()),
+        },
+        ScriptType::Struct { name, fields, .. } => match value {
+            Value::Typed { type_id, value } if type_id == name => match value.as_ref() {
+                Value::Map(values) => fields
+                    .iter()
+                    .map(|(field, ty)| {
+                        let value = values.get(field).ok_or_else(mismatch)?;
+                        Ok((field.clone(), cast_value(value, ty)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()
+                    .map(|value| Value::Typed {
+                        type_id: *name,
+                        value: Box::new(Value::Map(value)),
+                    }),
+                _ => Err(mismatch()),
+            },
+            _ => Err(mismatch()),
+        },
+        ScriptType::TypeParameter(_) => Ok(value.clone()),
+        ScriptType::Optional(inner) => match value {
+            Value::Optional(None) | Value::Null => Ok(Value::Optional(None)),
+            Value::Optional(Some(value)) => {
+                cast_value(value, inner).map(|value| Value::Optional(Some(Box::new(value))))
+            }
+            value => cast_value(value, inner).map(|value| Value::Optional(Some(Box::new(value)))),
+        },
+        ScriptType::Union(types) => types
+            .iter()
+            .find_map(|candidate| cast_value(value, candidate).ok())
+            .ok_or_else(mismatch),
+        ScriptType::Tuple if matches!(value, Value::Tuple(_)) => Ok(value.clone()),
+        ScriptType::List(element) => match value {
+            Value::List(values) => values
+                .iter()
+                .map(|value| cast_value(value, element))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            _ => Err(mismatch()),
+        },
+        ScriptType::Record(fields) => match value {
+            Value::Map(values) => fields
+                .iter()
+                .map(|(name, ty)| {
+                    let value = values.get(name).ok_or_else(mismatch)?;
+                    Ok((name.clone(), cast_value(value, ty)?))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map(Value::Map),
+            _ => Err(mismatch()),
+        },
+        ScriptType::Map(key, element) if key.as_ref() == &ScriptType::String => match value {
+            Value::Map(values) => values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), cast_value(value, element)?)))
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map(Value::Map),
+            _ => Err(mismatch()),
+        },
+        ScriptType::Binding(_) if matches!(value, Value::Closure { .. }) => Ok(value.clone()),
+        _ => Err(mismatch()),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmError {
     UnsupportedBytecode(u16),
@@ -1533,6 +1722,7 @@ pub enum VmError {
     UnknownMember(String),
     NullMemberAccess(String),
     NullAssertion,
+    CastFailed(String),
     UninitializedLocal(u32),
     UninitializedGlobal(u32),
     TypeMismatch(&'static str),
@@ -1845,5 +2035,200 @@ mod tests {
                 symbol: function_symbol,
             }
         );
+    }
+
+    #[test]
+    fn cast_modes_execute_with_checked_runtime_semantics() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            "global rounded: Int = 3.75 as Int\nglobal absent: String? = 4 as? String",
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("casts execute"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("rounded"), Some(&Value::Number(3.0)));
+        assert_eq!(vm.global("absent"), Some(&Value::Optional(None)));
+    }
+
+    #[test]
+    fn optional_primitives_preserve_nested_some_and_none() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            "global present: String? = \"alice\"\nglobal nested: Optional<Optional<String>> = .some(null)\nglobal empty: Optional<Optional<String>> = .none",
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("optional values execute"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(
+            vm.global("present"),
+            Some(&Value::Optional(Some(Box::new(Value::String(
+                "alice".into()
+            )))))
+        );
+        assert_eq!(
+            vm.global("nested"),
+            Some(&Value::Optional(Some(Box::new(Value::Optional(None)))))
+        );
+        assert_eq!(vm.global("empty"), Some(&Value::Optional(None)));
+
+        let restored = Vm::restore(bytecode, vm.snapshot()).expect("snapshot restores");
+        assert_eq!(
+            restored.global("nested"),
+            Some(&Value::Optional(Some(Box::new(Value::Optional(None)))))
+        );
+    }
+
+    #[test]
+    fn narrowing_unwraps_an_optional_before_the_native_boundary() {
+        let consume = BuiltinId(20);
+        let manifest = BuiltinManifest::new([("consume", consume)]).with_type_metadata(
+            crate::SymbolManifest::default(),
+            BTreeMap::from([(
+                consume,
+                crate::FunctionSignature {
+                    receiver: None,
+                    parameters: vec![crate::ScriptType::String],
+                    variadic: None,
+                    result: crate::ScriptType::Unit,
+                },
+            )]),
+            Vec::new(),
+        );
+        let bytecode = compile(
+            "let name: String? = \"alice\"\nif name != null { consume(name) }",
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        let Some(VmEvent::Call(call)) = vm.step().expect("condition and call execute") else {
+            panic!("expected native call")
+        };
+        assert_eq!(call.arguments[0].value, Value::String("alice".into()));
+    }
+
+    #[test]
+    fn forced_cast_failure_is_a_runtime_error() {
+        let bytecode = compile(
+            "global result: Int = \"alice\" as! Int",
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        assert!(matches!(vm.step(), Err(VmError::CastFailed(_))));
+    }
+
+    #[test]
+    fn an_uninitialized_non_optional_global_fails_when_read() {
+        let bytecode = compile(
+            "global name: String\nname",
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        assert!(matches!(vm.step(), Err(VmError::UninitializedGlobal(_))));
+    }
+
+    #[test]
+    fn generic_functions_are_monomorphic_at_type_checking_and_erased_in_bytecode() {
+        let bytecode = compile(
+            "fn identity<T>(value: T) -> T { value }\nglobal result: String = identity(\"alice\")",
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("generic call executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::String("alice".into())));
+    }
+
+    #[test]
+    fn explicit_generic_function_arguments_are_erased_before_bytecode() {
+        let bytecode = compile(
+            "fn identity<T>(value: T) -> T { value }\nglobal result: String = identity<String>(\"alice\")",
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("generic call executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::String("alice".into())));
+    }
+
+    #[test]
+    fn text_template_values_are_distinct_from_plain_strings_at_native_boundaries() {
+        let narrate = BuiltinId(30);
+        let log = BuiltinId(31);
+        let manifest = BuiltinManifest::new([("narrate", narrate), ("log", log)])
+            .with_type_metadata(
+                crate::SymbolManifest::default(),
+                BTreeMap::from([
+                    (
+                        narrate,
+                        crate::FunctionSignature {
+                            receiver: None,
+                            parameters: vec![crate::ScriptType::TextTemplate],
+                            variadic: None,
+                            result: crate::ScriptType::Unit,
+                        },
+                    ),
+                    (
+                        log,
+                        crate::FunctionSignature {
+                            receiver: None,
+                            parameters: vec![crate::ScriptType::String],
+                            variadic: None,
+                            result: crate::ScriptType::Unit,
+                        },
+                    ),
+                ]),
+                Vec::new(),
+            );
+        let bytecode = compile(
+            "narrate(\"Hello, ${name}\")\nlog(\"${notEvaluated}\")",
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        let Some(VmEvent::Call(call)) = vm.step().expect("narrate yields") else {
+            panic!("expected narrate call")
+        };
+        assert_eq!(
+            call.arguments[0].value,
+            Value::TextTemplate("Hello, ${name}".into())
+        );
+        vm.resume(Value::Unit).expect("narrate resumes");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Statement(_)))));
+        let Some(VmEvent::Call(call)) = vm.step().expect("log yields") else {
+            panic!("expected log call")
+        };
+        assert_eq!(
+            call.arguments[0].value,
+            Value::String("${notEvaluated}".into())
+        );
+    }
+
+    #[test]
+    fn text_template_rewrite_happens_before_expression_evaluation() {
+        let bytecode = compile(
+            "global translatedName: String = \"Alice\"",
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("globals initialize"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        let rendered = vm
+            .eval_template_with("Hello, ${sourceName}", |_| {
+                Ok("Bonjour, ${translatedName}".to_string())
+            })
+            .expect("rewritten template evaluates against runtime values");
+        assert_eq!(rendered, "Bonjour, Alice");
     }
 }

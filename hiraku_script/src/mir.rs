@@ -73,6 +73,16 @@ pub enum MirInstruction {
         dst: VirtualRegister,
         value: VirtualRegister,
     },
+    Cast {
+        dst: VirtualRegister,
+        value: VirtualRegister,
+        target: crate::ScriptType,
+        mode: crate::CastMode,
+    },
+    MakeOptional {
+        dst: VirtualRegister,
+        value: VirtualRegister,
+    },
     Binary {
         dst: VirtualRegister,
         op: BinaryOp,
@@ -89,6 +99,7 @@ pub enum MirInstruction {
     },
     MakeMap {
         dst: VirtualRegister,
+        type_name: Option<SymbolId>,
         fields: Vec<(SymbolId, VirtualRegister)>,
     },
     Call {
@@ -124,6 +135,8 @@ impl MirInstruction {
             | Self::GetMember { dst, .. }
             | Self::SetMember { dst, .. }
             | Self::UnaryMinus { dst, .. }
+            | Self::Cast { dst, .. }
+            | Self::MakeOptional { dst, .. }
             | Self::Binary { dst, .. }
             | Self::MakeTuple { dst, .. }
             | Self::MakeList { dst, .. }
@@ -144,7 +157,10 @@ impl MirInstruction {
             Self::StoreLocal { src, .. } | Self::StoreGlobal { src, .. } => vec![*src],
             Self::GetMember { object, .. } => vec![*object],
             Self::SetMember { object, value, .. } => vec![*object, *value],
-            Self::UnaryMinus { value, .. } | Self::AssertNonNull { value, .. } => vec![*value],
+            Self::UnaryMinus { value, .. }
+            | Self::Cast { value, .. }
+            | Self::MakeOptional { value, .. }
+            | Self::AssertNonNull { value, .. } => vec![*value],
             Self::Binary { left, right, .. } => vec![*left, *right],
             Self::MakeTuple { values, .. } | Self::MakeList { values, .. } => values.clone(),
             Self::MakeMap { fields, .. } => fields.iter().map(|(_, value)| *value).collect(),
@@ -169,12 +185,14 @@ impl MirInstruction {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirConstant {
+    Uninitialized,
     Null,
     Ellipsis,
     Bool(bool),
     Number(f64),
     Percent(f64),
     String(String),
+    TextTemplate(String),
     Symbol(SymbolId),
     Selector(SymbolId),
     Function(ResolvedFunction),
@@ -307,7 +325,7 @@ impl MirBuilder {
             HirStmtKind::Global { global, value } => {
                 let value = match value {
                     Some(value) => self.lower_expression(value, errors)?,
-                    None => self.constant(MirConstant::Null),
+                    None => self.constant(MirConstant::Uninitialized),
                 };
                 self.push(MirInstruction::StoreGlobal { global, src: value });
                 self.push(MirInstruction::Statement {
@@ -402,6 +420,7 @@ impl MirBuilder {
                     unit: NumberUnit::Percent,
                 } => MirConstant::Percent(value),
                 HirLiteral::String(value) => MirConstant::String(value.to_string()),
+                HirLiteral::TextTemplate(value) => MirConstant::TextTemplate(value.to_string()),
             })),
             HirExprKind::Local(local) => {
                 let dst = self.register();
@@ -453,6 +472,27 @@ impl MirBuilder {
                 self.push(MirInstruction::AssertNonNull { dst, value });
                 Some(dst)
             }
+            HirExprKind::Cast {
+                value,
+                target,
+                mode,
+            } => {
+                let value = self.lower_expression(value, errors)?;
+                let dst = self.register();
+                self.push(MirInstruction::Cast {
+                    dst,
+                    value,
+                    target: target.clone(),
+                    mode,
+                });
+                Some(dst)
+            }
+            HirExprKind::OptionalSome(value) => {
+                let value = self.lower_expression(value, errors)?;
+                let dst = self.register();
+                self.push(MirInstruction::MakeOptional { dst, value });
+                Some(dst)
+            }
             HirExprKind::Call {
                 callee,
                 arguments,
@@ -502,7 +542,7 @@ impl MirBuilder {
                 }
                 Some(dst)
             }
-            HirExprKind::Map { fields, .. } => {
+            HirExprKind::Map { type_name, fields } => {
                 let fields = fields
                     .iter()
                     .map(|(name, value)| {
@@ -511,7 +551,11 @@ impl MirBuilder {
                     })
                     .collect::<Option<Vec<_>>>()?;
                 let dst = self.register();
-                self.push(MirInstruction::MakeMap { dst, fields });
+                self.push(MirInstruction::MakeMap {
+                    dst,
+                    type_name,
+                    fields,
+                });
                 Some(dst)
             }
             HirExprKind::Binary { left, op, right } => {

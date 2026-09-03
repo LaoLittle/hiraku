@@ -468,7 +468,7 @@ impl<C> NativeRegistry<C> {
         if let Some(signature) = self.signatures.get(&call.builtin) {
             let expected = signature.parameters.len() + usize::from(signature.receiver.is_some());
             while values.len() < expected {
-                values.push(Value::Null);
+                values.push(Value::Optional(None));
             }
         }
         function(context, &values)
@@ -750,6 +750,39 @@ impl HksScriptType for String {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextTemplate(pub String);
+
+impl TextTemplate {
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl FromHksValue for TextTemplate {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::TextTemplate(value) => Ok(Self(value.clone())),
+            // A computed String has no template expressions left to preserve and
+            // is therefore a valid degenerate TextTemplate.
+            Value::String(value) => Ok(Self(value.clone())),
+            _ => Err(NativeError::TypeMismatch("TextTemplate")),
+        }
+    }
+}
+
+impl IntoHksValue for TextTemplate {
+    fn into_hks_value(self) -> Value {
+        Value::TextTemplate(self.0)
+    }
+}
+
+impl HksScriptType for TextTemplate {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::TextTemplate
+    }
+}
+
 impl FromHksValue for bool {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
@@ -788,7 +821,7 @@ impl IntoHksValue for f64 {
 
 impl HksScriptType for f64 {
     fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
-        crate::ScriptType::Number
+        crate::ScriptType::Float
     }
 }
 
@@ -806,7 +839,7 @@ impl IntoHksValue for f32 {
 
 impl HksScriptType for f32 {
     fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
-        crate::ScriptType::Number
+        crate::ScriptType::Float
     }
 }
 
@@ -871,16 +904,23 @@ impl HksScriptType for () {
 
 impl<T: HksScriptType> HksScriptType for Option<T> {
     fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> crate::ScriptType {
-        crate::ScriptType::Nullable(Box::new(T::hks_script_type(registry)))
+        crate::ScriptType::Optional(Box::new(T::hks_script_type(registry)))
     }
 }
 
 impl<T: FromHksValue> FromHksValue for Option<T> {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
-            Value::Null => Ok(None),
+            Value::Optional(None) | Value::Null => Ok(None),
+            Value::Optional(Some(value)) => T::from_hks_value(value).map(Some),
             value => T::from_hks_value(value).map(Some),
         }
+    }
+}
+
+impl<T: IntoHksValue> IntoHksValue for Option<T> {
+    fn into_hks_value(self) -> Value {
+        Value::Optional(self.map(|value| Box::new(value.into_hks_value())))
     }
 }
 

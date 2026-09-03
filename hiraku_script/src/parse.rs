@@ -17,6 +17,14 @@ impl ParseError {
     }
 }
 
+impl SyntaxWarning {
+    pub fn diagnostic(&self, source: SourceId) -> Diagnostic {
+        Diagnostic::warning(&self.message)
+            .with_code("HKS-SYNTAX")
+            .with_label(DiagnosticLabel::primary(source, self.span.range()))
+    }
+}
+
 pub fn parse_program(source: &str) -> Result<Program, Vec<ParseError>> {
     parse_program_with_template_expressions(source, true)
 }
@@ -364,6 +372,7 @@ struct Parser {
     tokens: Vec<Token>,
     index: usize,
     errors: Vec<ParseError>,
+    warnings: Vec<SyntaxWarning>,
 }
 
 fn binary_expression(left: Expr, op: BinaryOp, right: Expr) -> Expr {
@@ -384,6 +393,7 @@ impl Parser {
             tokens,
             index: 0,
             errors: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -395,7 +405,10 @@ impl Parser {
             self.skip_separators();
         }
         if self.errors.is_empty() {
-            Ok(Program { statements })
+            Ok(Program {
+                statements,
+                warnings: self.warnings,
+            })
         } else {
             Err(self.errors)
         }
@@ -541,6 +554,7 @@ impl Parser {
                 "<error>".to_string()
             }
         };
+        let type_parameters = self.parse_type_parameter_names();
         self.expect(TokenKind::LParen, "expected `(` after function name");
         let mut parameters = Vec::new();
         self.skip_newlines();
@@ -590,6 +604,7 @@ impl Parser {
             attributes: Vec::new(),
             exported,
             name,
+            type_parameters,
             parameters,
             return_type,
             body,
@@ -606,10 +621,46 @@ impl Parser {
                 "<error>".to_string()
             }
         };
+        let type_parameters = self.parse_type_parameter_names();
         self.expect(TokenKind::Equal, "expected `=` after type name");
         let ty = self.parse_type();
         let span = Span::join(&start.span, &ty.span);
-        Stmt::TypeAlias { name, ty, span }
+        Stmt::TypeAlias {
+            name,
+            type_parameters,
+            ty,
+            span,
+        }
+    }
+
+    fn parse_type_parameter_names(&mut self) -> Vec<String> {
+        if !self.at(TokenKind::Lt) {
+            return Vec::new();
+        }
+        self.advance();
+        let mut parameters = Vec::new();
+        while !self.at(TokenKind::Gt) && !self.at(TokenKind::Eof) {
+            match self.advance().kind {
+                TokenKind::Ident(name) => {
+                    if parameters.contains(&name) {
+                        self.errors.push(ParseError {
+                            message: format!("duplicate type parameter `{name}`"),
+                            span: self.previous().span,
+                        });
+                    } else {
+                        parameters.push(name);
+                    }
+                }
+                _ => self.error_here("expected type parameter name"),
+            }
+            if self.at(TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::Gt, "expected `>` after type parameters");
+        parameters
     }
 
     fn parse_if(&mut self) -> Stmt {
@@ -761,16 +812,20 @@ impl Parser {
                     span: token.span,
                 };
             };
-            if (name == "List" || name == "Binding") && self.at(TokenKind::Lt) {
+            if self.at(TokenKind::Lt) {
                 self.advance();
-                let element = self.parse_type();
-                let end = self.expect(TokenKind::Gt, "expected `>` after generic element type");
-                TypeExpr {
-                    kind: if name == "List" {
-                        TypeExprKind::List(Box::new(element))
+                let mut arguments = Vec::new();
+                while !self.at(TokenKind::Gt) && !self.at(TokenKind::Eof) {
+                    arguments.push(self.parse_type());
+                    if self.at(TokenKind::Comma) {
+                        self.advance();
                     } else {
-                        TypeExprKind::Binding(Box::new(element))
-                    },
+                        break;
+                    }
+                }
+                let end = self.expect(TokenKind::Gt, "expected `>` after type arguments");
+                TypeExpr {
+                    kind: TypeExprKind::Applied { name, arguments },
                     span: Span::join(&token.span, &end.span),
                 }
             } else {
@@ -780,13 +835,23 @@ impl Parser {
                 }
             }
         };
-        if self.at(TokenKind::Question) {
+        let mut nullable_suffixes = 0usize;
+        while self.at(TokenKind::Question) {
             let end = self.advance();
-            let span = Span::join(&ty.span, &end.span);
-            ty = TypeExpr {
-                kind: TypeExprKind::Nullable(Box::new(ty)),
-                span,
-            };
+            nullable_suffixes += 1;
+            if nullable_suffixes == 1 {
+                let span = Span::join(&ty.span, &end.span);
+                ty = TypeExpr {
+                    kind: TypeExprKind::Nullable(Box::new(ty)),
+                    span,
+                };
+            } else {
+                self.warnings.push(SyntaxWarning {
+                    message: "repeated `?` is normalized to one Optional layer; write `Optional<Optional<T>>` for nested optionals".into(),
+                    span: end.span,
+                });
+                ty.span.end = end.span.end;
+            }
         }
         ty
     }
@@ -913,11 +978,11 @@ impl Parser {
                 let type_name = type_name.clone();
                 self.advance();
                 let map = self.parse_map(expression.span.start);
-                let ExprKind::Map(fields) = map.kind else {
+                let ExprKind::StructLiteral(fields) = map.kind else {
                     unreachable!("parse_map always returns a map expression")
                 };
                 expression = Expr {
-                    kind: ExprKind::TypedMap { type_name, fields },
+                    kind: ExprKind::TypedStructLiteral { type_name, fields },
                     span: map.span,
                 };
                 continue;
@@ -958,6 +1023,29 @@ impl Parser {
                 };
                 continue;
             }
+            if matches!(&self.current().kind, TokenKind::Ident(name) if name == "as") {
+                self.advance();
+                let mode = if self.at(TokenKind::Question) {
+                    self.advance();
+                    CastMode::Optional
+                } else if self.at(TokenKind::Bang) {
+                    self.advance();
+                    CastMode::Forced
+                } else {
+                    CastMode::Static
+                };
+                let ty = self.parse_type();
+                let span = Span::join(&expression.span, &ty.span);
+                expression = Expr {
+                    kind: ExprKind::Cast {
+                        value: Box::new(expression),
+                        ty,
+                        mode,
+                    },
+                    span,
+                };
+                continue;
+            }
             if self.at(TokenKind::Bang) {
                 let end = self.advance();
                 let span = Span::join(&expression.span, &end.span);
@@ -967,6 +1055,7 @@ impl Parser {
                 };
                 continue;
             }
+            let type_arguments = self.try_parse_call_type_arguments();
             if self.at(TokenKind::LParen) {
                 let mut arguments = self.parse_arguments();
                 let trailing = self.parse_optional_trailing_callable();
@@ -1000,6 +1089,7 @@ impl Parser {
                     span: Span::join(&expression.span, &end),
                     kind: ExprKind::Call {
                         callee: Box::new(expression),
+                        type_arguments,
                         arguments,
                         trailing_block,
                     },
@@ -1036,6 +1126,7 @@ impl Parser {
                     span,
                     kind: ExprKind::Call {
                         callee: Box::new(expression),
+                        type_arguments: Vec::new(),
                         arguments,
                         trailing_block,
                     },
@@ -1045,6 +1136,39 @@ impl Parser {
             break;
         }
         expression
+    }
+
+    fn try_parse_call_type_arguments(&mut self) -> Vec<TypeExpr> {
+        if !self.at(TokenKind::Lt) {
+            return Vec::new();
+        }
+        let saved_index = self.index;
+        let saved_errors = self.errors.len();
+        let saved_warnings = self.warnings.len();
+        self.advance();
+        let mut arguments = Vec::new();
+        while !self.at(TokenKind::Gt) && !self.at(TokenKind::Eof) {
+            arguments.push(self.parse_type());
+            if self.at(TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if arguments.is_empty() || !self.at(TokenKind::Gt) {
+            self.index = saved_index;
+            self.errors.truncate(saved_errors);
+            self.warnings.truncate(saved_warnings);
+            return Vec::new();
+        }
+        self.advance();
+        if !self.at(TokenKind::LParen) {
+            self.index = saved_index;
+            self.errors.truncate(saved_errors);
+            self.warnings.truncate(saved_warnings);
+            return Vec::new();
+        }
+        arguments
     }
 
     fn parse_primary(&mut self) -> Expr {
@@ -1241,7 +1365,7 @@ impl Parser {
             .span
             .end;
         Expr {
-            kind: ExprKind::Map(fields),
+            kind: ExprKind::StructLiteral(fields),
             span: Span { start, end },
         }
     }
@@ -1563,11 +1687,11 @@ mod tests {
     fn parses_nested_map_literals() {
         let expression =
             expression(".{ field1: \"string\", field2: 0.2, field3: .{ nested: true } }");
-        let ExprKind::Map(fields) = expression.kind else {
+        let ExprKind::StructLiteral(fields) = expression.kind else {
             panic!("expected map");
         };
         assert_eq!(fields.len(), 3);
-        assert!(matches!(fields[2].value.kind, ExprKind::Map(_)));
+        assert!(matches!(fields[2].value.kind, ExprKind::StructLiteral(_)));
     }
 
     #[test]
@@ -1692,10 +1816,10 @@ mod tests {
     #[test]
     fn parses_quoted_map_field_names() {
         let expression = expression(r#".{ regions: .{ "alice/body": (1, 2, 3, 4) } }"#);
-        let ExprKind::Map(fields) = expression.kind else {
+        let ExprKind::StructLiteral(fields) = expression.kind else {
             panic!("expected map");
         };
-        let ExprKind::Map(regions) = &fields[0].value.kind else {
+        let ExprKind::StructLiteral(regions) = &fields[0].value.kind else {
             panic!("expected nested map");
         };
         assert_eq!(regions[0].name, "alice/body");
@@ -1818,20 +1942,23 @@ mod tests {
             }
         ));
         assert!(matches!(&program.statements[3], Stmt::Assign { .. }));
-        assert!(matches!(
-            &program.statements[4],
-            Stmt::Let {
-                type_annotation: Some(TypeExpr {
-                    kind: TypeExprKind::List(_),
+        let Stmt::Let {
+            type_annotation:
+                Some(TypeExpr {
+                    kind: TypeExprKind::Applied { name, arguments },
                     ..
                 }),
-                value: Expr {
-                    kind: ExprKind::List(_),
-                    ..
-                },
+            value: Expr {
+                kind: ExprKind::List(_),
                 ..
-            }
-        ));
+            },
+            ..
+        } = &program.statements[4]
+        else {
+            panic!("expected a typed list literal")
+        };
+        assert_eq!(name, "List");
+        assert_eq!(arguments.len(), 1);
         assert!(matches!(
             &program.statements[5],
             Stmt::Let {
@@ -1853,6 +1980,116 @@ mod tests {
             &program.statements[7],
             Stmt::Expr(Expr {
                 kind: ExprKind::NonNull(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_static_optional_and_forced_casts() {
+        let program = parse_program(
+            "let a = value as Float\nlet b = value as? String\nlet c = value as! Int\nlet d: Optional<String> = null",
+        )
+        .expect("cast expressions and explicit Optional types must parse");
+        for (statement, expected) in program.statements[..3].iter().zip([
+            CastMode::Static,
+            CastMode::Optional,
+            CastMode::Forced,
+        ]) {
+            let Stmt::Let {
+                value:
+                    Expr {
+                        kind: ExprKind::Cast { mode, .. },
+                        ..
+                    },
+                ..
+            } = statement
+            else {
+                panic!("expected cast initializer")
+            };
+            assert_eq!(*mode, expected);
+        }
+        let Stmt::Let {
+            type_annotation:
+                Some(TypeExpr {
+                    kind: TypeExprKind::Applied { name, arguments },
+                    ..
+                }),
+            ..
+        } = &program.statements[3]
+        else {
+            panic!("expected an applied Optional type")
+        };
+        assert_eq!(name, "Optional");
+        assert_eq!(arguments.len(), 1);
+    }
+
+    #[test]
+    fn nullable_suffixes_normalize_but_explicit_optional_types_nest() {
+        let program = parse_program(
+            "let flat: String???? = null\nlet nested: Optional<Optional<String>> = .some(null)",
+        )
+        .expect("optional syntax parses");
+        assert_eq!(program.warnings.len(), 3);
+        let Stmt::Let {
+            type_annotation: Some(flat),
+            ..
+        } = &program.statements[0]
+        else {
+            panic!("expected annotated local")
+        };
+        assert!(matches!(flat.kind, TypeExprKind::Nullable(_)));
+        let Stmt::Let {
+            type_annotation: Some(nested),
+            ..
+        } = &program.statements[1]
+        else {
+            panic!("expected annotated local")
+        };
+        assert!(
+            matches!(nested.kind, TypeExprKind::Applied { ref name, .. } if name == "Optional")
+        );
+    }
+
+    #[test]
+    fn parses_generic_functions_and_type_aliases() {
+        let program = parse_program(
+            "type Player<T> = .{ name: T, score: Int }\nfn identity<T>(value: T) -> T { value }",
+        )
+        .expect("generic declarations parse");
+        assert!(matches!(
+            &program.statements[0],
+            Stmt::TypeAlias { type_parameters, .. } if type_parameters == &["T"]
+        ));
+        assert!(matches!(
+            &program.statements[1],
+            Stmt::Function { type_parameters, .. } if type_parameters == &["T"]
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_generic_call_arguments_without_confusing_comparison() {
+        let program = parse_program("identity<Optional<String>>(null)\n1 < 2")
+            .expect("generic calls and comparisons parse independently");
+        let Stmt::Expr(Expr {
+            kind: ExprKind::Call { type_arguments, .. },
+            ..
+        }) = &program.statements[0]
+        else {
+            panic!("expected a generic call")
+        };
+        assert_eq!(type_arguments.len(), 1);
+        assert!(matches!(
+            type_arguments[0].kind,
+            TypeExprKind::Applied { ref name, .. } if name == "Optional"
+        ));
+        assert!(matches!(
+            program.statements[1],
+            Stmt::Expr(Expr {
+                kind: ExprKind::Binary {
+                    op: BinaryOp::Less,
+                    ..
+                },
                 ..
             })
         ));

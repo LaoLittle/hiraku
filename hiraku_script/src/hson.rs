@@ -380,7 +380,7 @@ fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError
             .map(|value| literal_value(value, source))
             .collect::<Result<Vec<_>, _>>()
             .map(HsonValue::Array),
-        ExprKind::Map(fields) => {
+        ExprKind::StructLiteral(fields) => {
             let mut map = HsonMap::new();
             for field in fields {
                 if map

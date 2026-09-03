@@ -123,7 +123,7 @@ fn evaluate_ast(
     context: &mut impl TemplateContext,
 ) -> Result<Value, TemplateError> {
     match &expression.kind {
-        ExprKind::Null => Ok(Value::Null),
+        ExprKind::Null => Ok(Value::Optional(None)),
         ExprKind::Bool(value) => Ok(Value::Bool(*value)),
         ExprKind::Number { value, .. } => Ok(Value::Number(*value)),
         ExprKind::String(value) => Ok(Value::String(eval_template(value, context)?)),
@@ -136,18 +136,18 @@ fn evaluate_ast(
         }
         ExprKind::Elvis { value, fallback } => {
             let value = evaluate_ast(value, context)?;
-            if value == Value::Null {
-                evaluate_ast(fallback, context)
-            } else {
-                Ok(value)
+            match value {
+                Value::Optional(None) | Value::Null => evaluate_ast(fallback, context),
+                Value::Optional(Some(value)) => Ok(*value),
+                value => Ok(value),
             }
         }
         ExprKind::NonNull(value) => {
             let value = evaluate_ast(value, context)?;
-            if value == Value::Null {
-                Err(TemplateError::NullAssertion)
-            } else {
-                Ok(value)
+            match value {
+                Value::Optional(None) | Value::Null => Err(TemplateError::NullAssertion),
+                Value::Optional(Some(value)) => Ok(*value),
+                value => Ok(value),
             }
         }
         ExprKind::UnaryMinus(value) => match evaluate_ast(value, context)? {
@@ -197,9 +197,15 @@ fn evaluate_ast(
         }
         ExprKind::Call {
             callee,
+            type_arguments,
             arguments,
             trailing_block: None,
         } => {
+            if !type_arguments.is_empty() {
+                return Err(TemplateError::UnsupportedExpression(
+                    "generic calls are not available in templates".to_string(),
+                ));
+            }
             let (name, receiver) = match &callee.kind {
                 ExprKind::Ident(name) => (name.as_str(), None),
                 ExprKind::Member { object, name } => {
@@ -232,7 +238,7 @@ fn evaluate_ast(
             .map(|value| evaluate_ast(value, context))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::List),
-        ExprKind::Map(fields) | ExprKind::TypedMap { fields, .. } => fields
+        ExprKind::StructLiteral(fields) | ExprKind::TypedStructLiteral { fields, .. } => fields
             .iter()
             .map(|field| Ok((field.name.clone(), evaluate_ast(&field.value, context)?)))
             .collect::<Result<BTreeMap<_, _>, TemplateError>>()
@@ -245,9 +251,11 @@ fn evaluate_ast(
 }
 
 fn member_value(value: Value, name: &str, safe: bool) -> Result<Value, TemplateError> {
-    if value == Value::Null && safe {
-        return Ok(Value::Null);
-    }
+    let value = match value {
+        Value::Optional(None) | Value::Null if safe => return Ok(Value::Optional(None)),
+        Value::Optional(Some(value)) => *value,
+        value => value,
+    };
     let fields = match value {
         Value::Map(fields) => fields,
         Value::Typed { value, .. } => match *value {
@@ -268,6 +276,8 @@ fn display_value(value: Value) -> Result<String, TemplateError> {
         Value::Number(value) => Ok(value.to_string()),
         Value::Bool(value) => Ok(value.to_string()),
         Value::Null => Ok("null".to_string()),
+        Value::Optional(None) => Ok("null".to_string()),
+        Value::Optional(Some(value)) => display_value(*value),
         Value::Uninitialized => Err(TemplateError::UninitializedValue),
         value => Err(TemplateError::UnsupportedValue(format!("{value:?}"))),
     }

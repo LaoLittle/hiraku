@@ -705,7 +705,7 @@ fn script_type(ty: &Type) -> syn::Result<proc_macro2::TokenStream> {
         ));
     };
     match name.as_str() {
-        "f32" | "f64" => Ok(quote!(::hiraku_script::ScriptType::Number)),
+        "f32" | "f64" => Ok(quote!(::hiraku_script::ScriptType::Float)),
         "u8" | "u16" | "u32" | "i8" | "i16" | "i32" => Ok(quote!(::hiraku_script::ScriptType::Int)),
         "String" => Ok(quote!(::hiraku_script::ScriptType::String)),
         "bool" => Ok(quote!(::hiraku_script::ScriptType::Bool)),

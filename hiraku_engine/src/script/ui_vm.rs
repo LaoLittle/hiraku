@@ -1001,7 +1001,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
                 receiver: None,
                 parameters: vec![
                     ScriptType::Any,
-                    ScriptType::Nullable(Box::new(ScriptType::Function)),
+                    ScriptType::Optional(Box::new(ScriptType::Function)),
                 ],
                 variadic: None,
                 result: ScriptType::Named(ui_node),
@@ -1012,8 +1012,8 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
         .define_global(
             "time",
             ScriptType::Record(BTreeMap::from([
-                ("elapsedSeconds".to_string(), ScriptType::Number),
-                ("unixSeconds".to_string(), ScriptType::Number),
+                ("elapsedSeconds".to_string(), ScriptType::Float),
+                ("unixSeconds".to_string(), ScriptType::Float),
             ])),
         )
         .expect("built-in UI time model must be defined once");
@@ -1043,7 +1043,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
 fn stored_value_type(value: &StoredValue) -> ScriptType {
     match value {
         StoredValue::Bool(_) => ScriptType::Bool,
-        StoredValue::Int(_) | StoredValue::Float(_) => ScriptType::Number,
+        StoredValue::Int(_) | StoredValue::Float(_) => ScriptType::Float,
         StoredValue::String(_) => ScriptType::String,
         StoredValue::Array(values) => {
             let mut types = values.iter().map(stored_value_type);
@@ -1285,7 +1285,9 @@ fn collect_nodes(
                 }
             }
             Some(LinkedVmEvent::Statement(StatementValue::Commit)) => {}
-            Some(LinkedVmEvent::Statement(StatementValue::String(_))) => {
+            Some(LinkedVmEvent::Statement(
+                StatementValue::String(_) | StatementValue::TextTemplate(_),
+            )) => {
                 return Err(UiVmError::Invalid(
                     "bare strings are not UI nodes; wrap the value with text(...)".into(),
                 ));
@@ -1375,7 +1377,9 @@ fn closure_effects(
                 }
             }
             Some(LinkedVmEvent::Statement(StatementValue::Commit)) => {}
-            Some(LinkedVmEvent::Statement(StatementValue::String(_))) => {
+            Some(LinkedVmEvent::Statement(
+                StatementValue::String(_) | StatementValue::TextTemplate(_),
+            )) => {
                 return Err(UiVmError::Invalid(
                     "bare strings are not valid onClick effects".into(),
                 ));

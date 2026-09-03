@@ -16,8 +16,8 @@ pub mod template;
 pub mod vm;
 
 pub use ast::{
-    Argument, BinaryOp, Block, Expr, ExprKind, FunctionParameter, MapField, NumberUnit, Program,
-    Stmt, TypeExpr, TypeExprKind, TypeField,
+    Argument, BinaryOp, Block, CastMode, Expr, ExprKind, FunctionParameter, MapField, NumberUnit,
+    Program, Stmt, SyntaxWarning, TypeExpr, TypeExprKind, TypeField,
 };
 pub use blocks::{BlockDocument, BlockDocumentError, BlockId, SourceBlock, parse_block_document};
 pub use hir::{
@@ -42,6 +42,7 @@ pub use mir::{
     MirBasicBlock, MirBlockId, MirConstant, MirFunction, MirInstruction, MirLoweringError,
     MirProgram, MirTerminator, VirtualRegister, lower_hir_to_mir,
 };
+pub use native::TextTemplate;
 pub use parse::{ParseError, parse_program};
 pub use register::{
     InvalidRegister, Register, RegisterAllocation, RegisterAllocationError, RegisterFrame,

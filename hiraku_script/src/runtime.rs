@@ -239,6 +239,11 @@ fn hash_byte(hash: u64, byte: u8) -> u64 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Unit,
+    /// A script `Optional<T>`. Keeping the discriminant explicit preserves
+    /// `.some(.none)` and makes snapshots independent of pointer niches.
+    Optional(Option<Box<Value>>),
+    /// HSON's untyped null value. Executable HKS lowers `null` to
+    /// `Optional(None)` instead.
     Null,
     Uninitialized,
     Ellipsis,
@@ -246,6 +251,7 @@ pub enum Value {
     Number(f64),
     Percent(f64),
     String(String),
+    TextTemplate(String),
     Symbol(String),
     Selector(String),
     Function {

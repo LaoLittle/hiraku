@@ -40,18 +40,30 @@ fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
                 symbols.intern(path.join("."));
             }
         }
-        Stmt::TypeAlias { name, ty, .. } => {
+        Stmt::TypeAlias {
+            name,
+            type_parameters,
+            ty,
+            ..
+        } => {
             symbols.intern(name);
+            for parameter in type_parameters {
+                symbols.intern(parameter);
+            }
             intern_type(ty, symbols);
         }
         Stmt::Function {
             name,
+            type_parameters,
             parameters,
             return_type,
             body,
             ..
         } => {
             symbols.intern(name);
+            for parameter in type_parameters {
+                symbols.intern(parameter);
+            }
             for parameter in parameters {
                 symbols.intern(&parameter.name);
                 if let Some(ty) = &parameter.ty {
@@ -126,6 +138,12 @@ fn intern_type(ty: &TypeExpr, symbols: &mut SymbolInterner) {
         TypeExprKind::Named(name) => {
             symbols.intern(name);
         }
+        TypeExprKind::Applied { name, arguments } => {
+            symbols.intern(name);
+            for argument in arguments {
+                intern_type(argument, symbols);
+            }
+        }
         TypeExprKind::Nullable(inner)
         | TypeExprKind::List(inner)
         | TypeExprKind::Binding(inner) => intern_type(inner, symbols),
@@ -150,16 +168,24 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
         ExprKind::Binding(value) | ExprKind::UnaryMinus(value) | ExprKind::NonNull(value) => {
             intern_expression(value, symbols)
         }
+        ExprKind::Cast { value, ty, .. } => {
+            intern_expression(value, symbols);
+            intern_type(ty, symbols);
+        }
         ExprKind::Elvis { value, fallback } => {
             intern_expression(value, symbols);
             intern_expression(fallback, symbols);
         }
         ExprKind::Call {
             callee,
+            type_arguments,
             arguments,
             trailing_block,
         } => {
             intern_expression(callee, symbols);
+            for argument in type_arguments {
+                intern_type(argument, symbols);
+            }
             for argument in arguments {
                 if let Some(label) = &argument.label {
                     symbols.intern(label);
@@ -175,13 +201,13 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
                 intern_expression(value, symbols);
             }
         }
-        ExprKind::Map(fields) => {
+        ExprKind::StructLiteral(fields) => {
             for field in fields {
                 symbols.intern(&field.name);
                 intern_expression(&field.value, symbols);
             }
         }
-        ExprKind::TypedMap { type_name, fields } => {
+        ExprKind::TypedStructLiteral { type_name, fields } => {
             symbols.intern(type_name);
             for field in fields {
                 symbols.intern(&field.name);
@@ -219,6 +245,9 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
 pub enum StatementValue {
     Commit,
     String(String),
+    /// Raw localizable text plus `${...}` expressions. Embeddings may translate
+    /// this source before asking the VM to evaluate it.
+    TextTemplate(String),
     /// A non-string expression statement exposed to the embedding host.
     ///
     /// Story embeddings may treat this exactly like [`Commit`](Self::Commit),

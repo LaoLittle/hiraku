@@ -12,22 +12,30 @@ pub enum ScriptType {
     Unit,
     Bool,
     Int,
-    Number,
+    Float,
     Percent,
     String,
+    TextTemplate,
     Symbol,
     Selector,
     Function,
     /// An explicitly captured expression whose scheduling is owned by the embedding.
     Binding(Box<ScriptType>),
     Task,
+    TypeParameter(SymbolId),
     Named(SymbolId),
+    Struct {
+        name: SymbolId,
+        arguments: Vec<ScriptType>,
+        fields: BTreeMap<String, ScriptType>,
+    },
     Union(Vec<ScriptType>),
-    Nullable(Box<ScriptType>),
+    /// `Optional<T>`. The source spelling `T?` is sugar for this type.
+    Optional(Box<ScriptType>),
     Tuple,
     List(Box<ScriptType>),
     Record(BTreeMap<String, ScriptType>),
-    Map,
+    Map(Box<ScriptType>, Box<ScriptType>),
 }
 
 impl ScriptType {
@@ -36,14 +44,23 @@ impl ScriptType {
             || actual == &Self::Any
             || self == actual
             || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))
-            || matches!(self, Self::Nullable(inner) if inner.accepts(actual))
+            || matches!((self, actual),
+                (Self::Optional(_), Self::Optional(actual)) if actual.as_ref() == &Self::Any)
+            || matches!((self, actual),
+                (Self::Optional(expected), Self::Optional(actual)) if expected.accepts(actual))
+            || matches!(self, Self::Optional(inner) if inner.accepts(actual))
             || matches!((self, actual), (Self::List(expected), Self::List(actual)) if expected.accepts(actual))
             || matches!((self, actual), (Self::Binding(expected), Self::Binding(actual)) if expected.accepts(actual))
             || matches!((self, actual), (Self::Record(expected), Self::Record(actual))
                 if expected.len() == actual.len()
                     && expected.iter().all(|(name, expected)|
                         actual.get(name).is_some_and(|actual| expected.accepts(actual))))
-            || matches!((self, actual), (Self::Number, Self::Int))
+            || matches!((self, actual),
+                (Self::Map(key, value), Self::Record(fields))
+                    if key.accepts(&Self::String)
+                        && fields.values().all(|actual| value.accepts(actual)))
+            || matches!((self, actual), (Self::Float, Self::Int))
+            || matches!((self, actual), (Self::TextTemplate, Self::String))
     }
 }
 
