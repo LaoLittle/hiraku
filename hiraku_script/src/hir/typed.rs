@@ -2464,7 +2464,7 @@ mod tests {
 
     #[test]
     fn recursive_generic_aliases_report_an_error_instead_of_recursing_forever() {
-        let syntax = parse_program("type Loop<T> = Loop<T>\nlet value: Loop<String>")
+        let syntax = parse_program("type Loop<T> = Loop<T>\nglobal value: Loop<String>")
             .expect("source parses");
         let arena = HirArena::new();
         let errors =
