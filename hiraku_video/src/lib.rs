@@ -12,5 +12,7 @@ mod player;
 mod render;
 
 pub use asset::{VideoAsset, VideoAssetLoader, VideoAssetLoaderError, VideoMetadata};
-pub use player::VideoDecodeSettings;
-pub use player::{HirakuVideoPlugin, VideoEvent, VideoPlaybackId, VideoPlaybackState, VideoPlayer};
+pub use player::{
+    HirakuVideoPlugin, VideoDecodeSettings, VideoEvent, VideoPlaybackId, VideoPlaybackState,
+    VideoPlayer,
+};

@@ -14,7 +14,7 @@ use std::{
 
 use bevy::{
     audio::{ChannelCount, Decodable, SampleRate, Source},
-    prelude::Asset,
+    prelude::{Asset, Assets, Commands, Entity},
     reflect::TypePath,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -34,33 +34,15 @@ use crate::{
     VideoAsset, VideoDecodeSettings, VideoMetadata,
     asset::open_container,
     color::{TransferFunction, YuvColorTransform},
+    platform::{DecodeEvent, DecodedFrame, DecodedPixels},
 };
 
 const VIDEO_QUEUE_CAPACITY: usize = 3;
 const WEB_CODECS_QUEUE_LIMIT: u32 = VIDEO_QUEUE_CAPACITY as u32;
 const AV1_CODEC: &str = "av01.0.12M.08";
 
-#[derive(Debug)]
-pub(crate) struct DecodedFrame {
-    pub timestamp: Duration,
-    pub width: u32,
-    pub height: u32,
-    pub chroma_width: u32,
-    pub chroma_height: u32,
-    pub color_transform: YuvColorTransform,
-    pub transfer: TransferFunction,
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
-    pub rgba: Option<Vec<u8>>,
-}
-
-#[derive(Debug)]
-pub(crate) enum DecodeEvent {
-    Frame(DecodedFrame),
-    End,
-    Error(String),
-}
+mod upload;
+pub(crate) use upload::{VideoUpload, install_video_upload};
 
 #[derive(Asset, Clone, TypePath)]
 pub(crate) struct VideoAudio {
@@ -273,7 +255,7 @@ impl Drop for FrameCopyState {
     }
 }
 
-pub(crate) struct WebPlaybackBackend {
+pub(crate) struct PlaybackBackend {
     decoder: Option<VideoDecoder>,
     audio: Option<WebAudio>,
     copy_state: Rc<FrameCopyState>,
@@ -281,7 +263,7 @@ pub(crate) struct WebPlaybackBackend {
     _error_callback: Closure<dyn FnMut(JsValue)>,
 }
 
-impl WebPlaybackBackend {
+impl PlaybackBackend {
     pub fn play(&self) {
         if let Some(audio) = &self.audio {
             audio.play();
@@ -294,19 +276,23 @@ impl WebPlaybackBackend {
         }
     }
 
-    pub fn position(&self) -> Duration {
-        self.audio
+    pub fn position(&self) -> Option<Duration> {
+        Some(self.audio
             .as_ref()
             .map(WebAudio::position)
-            .unwrap_or(Duration::ZERO)
+            .unwrap_or(Duration::ZERO))
     }
 
-    pub fn audio_ended(&self) -> bool {
-        self.audio.as_ref().is_none_or(WebAudio::ended)
+    pub fn audio_ended(&self) -> Option<bool> {
+        Some(self.audio.as_ref().is_none_or(WebAudio::ended))
+    }
+
+    pub fn requires_bevy_audio(&self) -> bool {
+        false
     }
 }
 
-impl Drop for WebPlaybackBackend {
+impl Drop for PlaybackBackend {
     fn drop(&mut self) {
         self.copy_state.cancellation.store(true, Ordering::Relaxed);
         if let Some(decoder) = self.decoder.take() {
@@ -320,7 +306,7 @@ pub(crate) struct DecodeStream {
     pub audio: VideoAudio,
     pub cancellation: Arc<AtomicBool>,
     pub queued_frames: Option<Arc<AtomicUsize>>,
-    pub web_backend: WebPlaybackBackend,
+    pub backend: PlaybackBackend,
 }
 
 pub(crate) fn spawn_decoder(asset: &VideoAsset, _settings: &VideoDecodeSettings) -> DecodeStream {
@@ -412,7 +398,7 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset, _settings: &VideoDecodeSettings)
         },
         cancellation,
         queued_frames: Some(queued_frames),
-        web_backend: WebPlaybackBackend {
+        backend: PlaybackBackend {
             decoder,
             audio,
             copy_state,
@@ -420,6 +406,14 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset, _settings: &VideoDecodeSettings)
             _error_callback: error_callback,
         },
     }
+}
+
+pub(crate) fn spawn_movie_audio(
+    _commands: &mut Commands,
+    _audio_assets: &mut Assets<VideoAudio>,
+    _audio: VideoAudio,
+) -> Option<Entity> {
+    None
 }
 
 async fn feed_video_packets(
@@ -548,6 +542,10 @@ async fn decode_frame(frame: &VideoFrame, state: &FrameCopyState) -> Result<Deco
         )
     };
 
+    let pixels = match rgba {
+        Some(rgba) => DecodedPixels::Rgba(rgba),
+        None => DecodedPixels::PlanarYuv { y, u, v },
+    };
     Ok(DecodedFrame {
         timestamp: Duration::from_secs_f64(((timestamp - first_timestamp) / 1_000_000.0).max(0.0)),
         width,
@@ -556,10 +554,7 @@ async fn decode_frame(frame: &VideoFrame, state: &FrameCopyState) -> Result<Deco
         chroma_height,
         color_transform: YuvColorTransform::from_luma_coefficients(kr, kb, !full_range),
         transfer,
-        y,
-        u,
-        v,
-        rgba,
+        pixels,
     })
 }
 

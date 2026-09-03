@@ -23,7 +23,6 @@ pub struct VideoMetadata {
 
 #[derive(Asset, Clone, Debug, TypePath)]
 pub struct VideoAsset {
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) bytes: Arc<[u8]>,
     pub metadata: VideoMetadata,
 }

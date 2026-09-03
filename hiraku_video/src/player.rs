@@ -7,8 +7,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-use bevy::audio::{AudioPlayer, PlaybackSettings};
 use bevy::{
     asset::{AssetApp, LoadState, RenderAssetUsages},
     audio::{AddAudioSource, AudioSink, AudioSinkPlayback},
@@ -18,17 +16,18 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::render::{NativeVideoFrameUpload, NativeVideoUpload, install_native_video_upload};
+use crate::platform::{VideoFrameUpload, VideoUpload, install_video_upload};
 use crate::{
     VideoAsset, VideoAssetLoader,
-    platform::{DecodeEvent, DecodedFrame, VideoAudio, drain_ready_frames, spawn_decoder},
+    platform::{
+        DecodeEvent, DecodedFrame, DecodedPixels, PlaybackBackend, VideoAudio, drain_ready_frames,
+        spawn_decoder, spawn_movie_audio,
+    },
     render::{Yuv420Material, load_internal_shader},
 };
 
 const VIDEO_Z_INDEX: i32 = 30_000;
 const LAST_FRAME_HOLD: Duration = Duration::from_millis(50);
-#[cfg(not(target_arch = "wasm32"))]
 const AUDIO_SINK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -77,37 +76,6 @@ impl VideoDecodeSettings {
             decoder_threads: Some(decoder_threads.max(1)),
             max_frame_delay: Some(max_frame_delay.max(1)),
         }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn resolved(&self) -> (u32, u32) {
-        let available = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
-        self.resolved_for(available)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn resolved_for(&self, available: usize) -> (u32, u32) {
-        let automatic_threads = match available {
-            0 | 1 => 1,
-            2..=4 => 2,
-            5..=8 => 4,
-            9..=12 => 5,
-            13..=16 => 6,
-            _ => 8,
-        };
-        let threads = self
-            .decoder_threads
-            .unwrap_or(automatic_threads)
-            .clamp(1, 256);
-        let automatic_delay = if available <= 4 { 2 } else { 3 };
-        let frame_delay = self
-            .max_frame_delay
-            .unwrap_or(automatic_delay)
-            .max(1)
-            .min(threads);
-        (threads, frame_delay)
     }
 }
 
@@ -187,12 +155,8 @@ impl VideoPlayer {
     }
 }
 
-#[derive(Resource, Default)]
-struct ActiveVideo(Option<ActivePlayback>);
-
-#[cfg(target_arch = "wasm32")]
 #[derive(Default)]
-struct WebPlaybackBackends(BTreeMap<VideoPlaybackId, crate::platform::WebPlaybackBackend>);
+struct ActiveVideo(Option<ActivePlayback>);
 
 struct ActivePlayback {
     id: VideoPlaybackId,
@@ -209,6 +173,7 @@ struct ActivePlayback {
     cancellation: Arc<AtomicBool>,
     queued_frames: Option<Arc<std::sync::atomic::AtomicUsize>>,
     age: Duration,
+    backend: PlaybackBackend,
 }
 
 enum VideoSurface {
@@ -218,7 +183,6 @@ enum VideoSurface {
         v_image: Handle<Image>,
         image_entity: Entity,
     },
-    #[cfg(target_arch = "wasm32")]
     Rgba {
         image: Handle<Image>,
         image_entity: Entity,
@@ -230,17 +194,14 @@ pub struct HirakuVideoPlugin;
 impl Plugin for HirakuVideoPlugin {
     fn build(&self, app: &mut App) {
         load_internal_shader(app);
-        #[cfg(not(target_arch = "wasm32"))]
-        install_native_video_upload(app);
-        #[cfg(target_arch = "wasm32")]
-        app.insert_non_send(WebPlaybackBackends::default());
+        install_video_upload(app);
+        app.insert_non_send(ActiveVideo::default());
         app.init_asset::<VideoAsset>()
             .init_asset_loader::<VideoAssetLoader>()
             .add_audio_source::<VideoAudio>()
             .add_plugins(UiMaterialPlugin::<Yuv420Material>::default())
             .init_resource::<VideoDecodeSettings>()
             .init_resource::<VideoPlayer>()
-            .init_resource::<ActiveVideo>()
             .add_message::<VideoEvent>()
             .add_systems(
                 Update,
@@ -255,10 +216,9 @@ fn start_pending_video(
     videos: Res<Assets<VideoAsset>>,
     mut audio_assets: ResMut<Assets<VideoAudio>>,
     mut player: ResMut<VideoPlayer>,
-    mut active: ResMut<ActiveVideo>,
+    mut active: NonSendMut<ActiveVideo>,
     decode_settings: Res<VideoDecodeSettings>,
     mut events: MessageWriter<VideoEvent>,
-    #[cfg(target_arch = "wasm32")] mut web_backends: NonSendMut<WebPlaybackBackends>,
 ) {
     if active.0.is_some() {
         return;
@@ -290,8 +250,6 @@ fn start_pending_video(
         Some(VideoPlaybackState::Paused)
     );
     let stream = spawn_decoder(asset, &decode_settings);
-    #[cfg(target_arch = "wasm32")]
-    web_backends.0.insert(pending.id, stream.web_backend);
     let root = commands
         .spawn((
             Node {
@@ -326,16 +284,16 @@ fn start_pending_video(
         cancellation: stream.cancellation,
         queued_frames: stream.queued_frames,
         age: Duration::ZERO,
+        backend: stream.backend,
     });
 }
 
 fn apply_video_controls(
     mut commands: Commands,
     mut player: ResMut<VideoPlayer>,
-    mut active: ResMut<ActiveVideo>,
+    mut active: NonSendMut<ActiveVideo>,
     sinks: Query<&AudioSink>,
     mut events: MessageWriter<VideoEvent>,
-    #[cfg(target_arch = "wasm32")] mut web_backends: NonSendMut<WebPlaybackBackends>,
 ) {
     while let Some(control) = player.controls.pop_front() {
         match control {
@@ -347,10 +305,7 @@ fn apply_video_controls(
                     {
                         sink.pause();
                     }
-                    #[cfg(target_arch = "wasm32")]
-                    if let Some(backend) = web_backends.0.get(&id) {
-                        backend.pause();
-                    }
+                    playback.backend.pause();
                     player.states.insert(id, VideoPlaybackState::Paused);
                 } else if player.pending.iter().any(|pending| pending.id == id) {
                     player.states.insert(id, VideoPlaybackState::Paused);
@@ -364,10 +319,7 @@ fn apply_video_controls(
                     {
                         sink.play();
                     }
-                    #[cfg(target_arch = "wasm32")]
-                    if let Some(backend) = web_backends.0.get(&id) {
-                        backend.play();
-                    }
+                    playback.backend.play();
                     player.states.insert(id, VideoPlaybackState::Playing);
                 } else if player.pending.iter().any(|pending| pending.id == id) {
                     player.states.insert(id, VideoPlaybackState::Loading);
@@ -384,8 +336,6 @@ fn apply_video_controls(
                     player.states.insert(id, VideoPlaybackState::Skipped);
                     player.active = None;
                     active.0 = None;
-                    #[cfg(target_arch = "wasm32")]
-                    web_backends.0.remove(&id);
                     events.write(VideoEvent::Skipped { id });
                 } else if let Some(index) =
                     player.pending.iter().position(|pending| pending.id == id)
@@ -407,19 +357,18 @@ fn update_video(
     mut nodes: Query<&mut Node>,
     sinks: Query<&AudioSink>,
     mut player: ResMut<VideoPlayer>,
-    mut active: ResMut<ActiveVideo>,
+    mut active: NonSendMut<ActiveVideo>,
     mut events: MessageWriter<VideoEvent>,
-    #[cfg(not(target_arch = "wasm32"))] mut native_upload: ResMut<NativeVideoUpload>,
-    #[cfg(target_arch = "wasm32")] mut web_backends: NonSendMut<WebPlaybackBackends>,
+    mut video_upload: ResMut<VideoUpload>,
 ) {
     let Some(playback) = active.0.as_mut() else {
         return;
     };
     playback.age += time.delta();
-    #[cfg(not(target_arch = "wasm32"))]
-    if playback
-        .audio_entity
-        .is_none_or(|audio_entity| sinks.get(audio_entity).is_err())
+    if playback.backend.requires_bevy_audio()
+        && playback
+            .audio_entity
+            .is_none_or(|audio_entity| sinks.get(audio_entity).is_err())
         && playback.age >= AUDIO_SINK_TIMEOUT
     {
         let id = playback.id;
@@ -442,8 +391,6 @@ fn update_video(
                 cleanup_playback(&mut commands, playback);
                 active.0 = None;
                 player.active = None;
-                #[cfg(target_arch = "wasm32")]
-                web_backends.0.remove(&id);
                 fail_playback(id, error, &mut player, &mut events);
                 return;
             }
@@ -460,11 +407,8 @@ fn update_video(
             },
         );
         events.write(VideoEvent::Started { id: playback.id });
-        #[cfg(target_arch = "wasm32")]
         if !playback.paused {
-            if let Some(backend) = web_backends.0.get(&playback.id) {
-                backend.play();
-            }
+            playback.backend.play();
         }
     }
     if playback.started && !playback.paused {
@@ -474,22 +418,13 @@ fn update_video(
         {
             sink.play();
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            playback.position = playback
+        playback.position = playback.backend.position().unwrap_or_else(|| {
+            playback
                 .audio_entity
                 .and_then(|audio_entity| sinks.get(audio_entity).ok())
                 .map(AudioSinkPlayback::position)
-                .unwrap_or_else(|| playback.position + time.delta());
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            playback.position = web_backends
-                .0
-                .get(&playback.id)
-                .map(crate::platform::WebPlaybackBackend::position)
-                .unwrap_or(playback.position);
-        }
+                .unwrap_or_else(|| playback.position + time.delta())
+        });
     }
     while playback
         .frames
@@ -504,22 +439,12 @@ fn update_video(
             queued_frames.fetch_sub(1, Ordering::Relaxed);
         }
         playback.last_timestamp = frame.timestamp;
-        #[cfg(not(target_arch = "wasm32"))]
         present_frame(
             &mut commands,
             &mut images,
             &mut materials,
             &mut nodes,
-            &mut *native_upload,
-            playback,
-            frame,
-        );
-        #[cfg(target_arch = "wasm32")]
-        present_frame(
-            &mut commands,
-            &mut images,
-            &mut materials,
-            &mut nodes,
+            &mut video_upload,
             playback,
             frame,
         );
@@ -531,16 +456,12 @@ fn update_video(
     {
         sink.pause();
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    let audio_finished = playback
-        .audio_entity
-        .and_then(|audio_entity| sinks.get(audio_entity).ok())
-        .is_some_and(AudioSinkPlayback::empty);
-    #[cfg(target_arch = "wasm32")]
-    let audio_finished = web_backends
-        .0
-        .get(&playback.id)
-        .is_some_and(crate::platform::WebPlaybackBackend::audio_ended);
+    let audio_finished = playback.backend.audio_ended().unwrap_or_else(|| {
+        playback
+            .audio_entity
+            .and_then(|audio_entity| sinks.get(audio_entity).ok())
+            .is_some_and(AudioSinkPlayback::empty)
+    });
     if playback.decoder_ended
         && playback.frames.is_empty()
         && playback.position >= playback.last_timestamp + LAST_FRAME_HOLD
@@ -552,22 +473,35 @@ fn update_video(
         player.active = None;
         player.states.insert(id, VideoPlaybackState::Finished);
         events.write(VideoEvent::Finished { id });
-        #[cfg(target_arch = "wasm32")]
-        web_backends.0.remove(&id);
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn present_frame(
     commands: &mut Commands,
     images: &mut Assets<Image>,
     materials: &mut Assets<Yuv420Material>,
     nodes: &mut Query<&mut Node>,
+    upload: &mut VideoUpload,
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
     let aspect_ratio = frame.width as f32 / frame.height as f32;
-    if let Some(rgba) = frame.rgba {
+    let (y, u, v, rgba) = match frame.pixels {
+        DecodedPixels::PlanarYuv { y, u, v } => (y, u, v, None),
+        DecodedPixels::Rgba(rgba) => (Vec::new(), Vec::new(), Vec::new(), Some(rgba)),
+        pixels @ DecodedPixels::StridedYuv { .. } => {
+            return present_strided_frame(
+                commands,
+                images,
+                materials,
+                nodes,
+                upload,
+                playback,
+                DecodedFrame { pixels, ..frame },
+            );
+        }
+    };
+    if let Some(rgba) = rgba {
         if let Some(VideoSurface::Rgba {
             image,
             image_entity,
@@ -608,21 +542,9 @@ fn present_frame(
         image_entity,
     }) = playback.surface.as_ref()
     {
-        replace_plane(images, y_image, frame.width, frame.height, frame.y);
-        replace_plane(
-            images,
-            u_image,
-            frame.chroma_width,
-            frame.chroma_height,
-            frame.u,
-        );
-        replace_plane(
-            images,
-            v_image,
-            frame.chroma_width,
-            frame.chroma_height,
-            frame.v,
-        );
+        replace_plane(images, y_image, frame.width, frame.height, y);
+        replace_plane(images, u_image, frame.chroma_width, frame.chroma_height, u);
+        replace_plane(images, v_image, frame.chroma_width, frame.chroma_height, v);
         if let Ok(mut node) = nodes.get_mut(*image_entity) {
             node.aspect_ratio = Some(aspect_ratio);
         }
@@ -630,17 +552,9 @@ fn present_frame(
     }
     replace_surface(commands, playback);
 
-    let y_image = images.add(plane_image(frame.width, frame.height, frame.y));
-    let u_image = images.add(plane_image(
-        frame.chroma_width,
-        frame.chroma_height,
-        frame.u,
-    ));
-    let v_image = images.add(plane_image(
-        frame.chroma_width,
-        frame.chroma_height,
-        frame.v,
-    ));
+    let y_image = images.add(plane_image(frame.width, frame.height, y));
+    let u_image = images.add(plane_image(frame.chroma_width, frame.chroma_height, u));
+    let v_image = images.add(plane_image(frame.chroma_width, frame.chroma_height, v));
     let material = materials.add(Yuv420Material {
         y: y_image.clone(),
         u: u_image.clone(),
@@ -669,16 +583,25 @@ fn present_frame(
     });
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn present_frame(
+fn present_strided_frame(
     commands: &mut Commands,
     images: &mut Assets<Image>,
     materials: &mut Assets<Yuv420Material>,
     nodes: &mut Query<&mut Node>,
-    upload: &mut NativeVideoUpload,
+    upload: &mut VideoUpload,
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
+    let DecodedPixels::StridedYuv {
+        planes,
+        u_offset,
+        v_offset,
+        y_stride,
+        chroma_stride,
+    } = frame.pixels
+    else {
+        unreachable!("strided frame presenter received a packed WebCodecs frame")
+    };
     let aspect_ratio = frame.width as f32 / frame.height as f32;
     let (y_image, u_image, v_image, image_entity) = if let Some(VideoSurface::Yuv {
         y_image,
@@ -730,7 +653,7 @@ fn present_frame(
     if let Ok(mut node) = nodes.get_mut(image_entity) {
         node.aspect_ratio = Some(aspect_ratio);
     }
-    upload.publish(NativeVideoFrameUpload {
+    upload.publish(VideoFrameUpload {
         y_image,
         u_image,
         v_image,
@@ -738,18 +661,17 @@ fn present_frame(
         height: frame.height,
         chroma_width: frame.chroma_width,
         chroma_height: frame.chroma_height,
-        planes: frame.planes,
-        u_offset: frame.u_offset,
-        v_offset: frame.v_offset,
-        y_stride: frame.y_stride,
-        chroma_stride: frame.chroma_stride,
+        planes,
+        u_offset,
+        v_offset,
+        y_stride,
+        chroma_stride,
     });
 }
 
 fn replace_surface(commands: &mut Commands, playback: &mut ActivePlayback) {
     let entity = match playback.surface.take() {
         Some(VideoSurface::Yuv { image_entity, .. }) => image_entity,
-        #[cfg(target_arch = "wasm32")]
         Some(VideoSurface::Rgba { image_entity, .. }) => image_entity,
         None => return,
     };
@@ -764,31 +686,6 @@ fn cleanup_playback(commands: &mut Commands, playback: &ActivePlayback) {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_movie_audio(
-    commands: &mut Commands,
-    audio_assets: &mut Assets<VideoAudio>,
-    audio: VideoAudio,
-) -> Option<Entity> {
-    let audio = audio_assets.add(audio);
-    // Keep audio stopped until the first decoded frame is ready. This makes
-    // Opus the master clock without allowing it to run ahead during startup.
-    Some(
-        commands
-            .spawn((AudioPlayer(audio), PlaybackSettings::ONCE.paused()))
-            .id(),
-    )
-}
-
-#[cfg(target_arch = "wasm32")]
-fn spawn_movie_audio(
-    _commands: &mut Commands,
-    _audio_assets: &mut Assets<VideoAudio>,
-    _audio: VideoAudio,
-) -> Option<Entity> {
-    None
-}
-
 fn fail_playback(
     id: VideoPlaybackId,
     error: String,
@@ -801,7 +698,6 @@ fn fail_playback(
     events.write(VideoEvent::Failed { id, error });
 }
 
-#[cfg(target_arch = "wasm32")]
 fn replace_plane(
     images: &mut Assets<Image>,
     handle: &Handle<Image>,
@@ -822,7 +718,6 @@ fn replace_plane(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn plane_image(width: u32, height: u32, data: Vec<u8>) -> Image {
     Image::new(
         Extent3d {
@@ -837,7 +732,6 @@ fn plane_image(width: u32, height: u32, data: Vec<u8>) -> Image {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn empty_plane_image(width: u32, height: u32) -> Image {
     Image::new_fill(
         Extent3d {
@@ -852,7 +746,6 @@ fn empty_plane_image(width: u32, height: u32) -> Image {
     )
 }
 
-#[cfg(target_arch = "wasm32")]
 fn replace_rgba(
     images: &mut Assets<Image>,
     handle: &Handle<Image>,
@@ -873,7 +766,6 @@ fn replace_rgba(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn rgba_image(width: u32, height: u32, data: Vec<u8>) -> Image {
     Image::new(
         Extent3d {
@@ -904,21 +796,5 @@ mod tests {
         player.resume(first);
         player.skip(first);
         assert_eq!(player.controls.len(), 3);
-    }
-
-    #[test]
-    fn automatic_decoder_parallelism_is_conservative() {
-        let settings = VideoDecodeSettings::default();
-        assert_eq!(settings.resolved_for(2), (2, 2));
-        assert_eq!(settings.resolved_for(4), (2, 2));
-        assert_eq!(settings.resolved_for(8), (4, 3));
-        assert_eq!(settings.resolved_for(16), (6, 3));
-        assert_eq!(settings.resolved_for(64), (8, 3));
-    }
-
-    #[test]
-    fn explicit_frame_delay_cannot_exceed_decoder_parallelism() {
-        assert_eq!(VideoDecodeSettings::fixed(4, 20).resolved_for(64), (4, 4));
-        assert_eq!(VideoDecodeSettings::fixed(0, 0).resolved_for(64), (1, 1));
     }
 }

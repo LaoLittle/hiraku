@@ -9,8 +9,8 @@ use std::{
 };
 
 use bevy::{
-    audio::{ChannelCount, Decodable, SampleRate, Source},
-    prelude::Asset,
+    audio::{AudioPlayer, ChannelCount, Decodable, PlaybackSettings, SampleRate, Source},
+    prelude::{Asset, Assets, Commands, Entity},
     reflect::TypePath,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
@@ -24,32 +24,30 @@ use crate::{
     VideoAsset, VideoDecodeSettings, VideoMetadata,
     asset::open_container,
     color::{TransferFunction, YuvColorTransform},
+    platform::{DecodeEvent, DecodedFrame, DecodedPixels},
 };
 
 const VIDEO_QUEUE_CAPACITY: usize = 3;
 const AUDIO_QUEUE_CAPACITY: usize = 24;
 
-#[derive(Debug)]
-pub(crate) struct DecodedFrame {
-    pub timestamp: Duration,
-    pub width: u32,
-    pub height: u32,
-    pub chroma_width: u32,
-    pub chroma_height: u32,
-    pub color_transform: YuvColorTransform,
-    pub transfer: TransferFunction,
-    pub planes: Arc<[u8]>,
-    pub u_offset: usize,
-    pub v_offset: usize,
-    pub y_stride: u32,
-    pub chroma_stride: u32,
-}
+mod upload;
+pub(crate) use upload::{VideoUpload, install_video_upload};
 
-#[derive(Debug)]
-pub(crate) enum DecodeEvent {
-    Frame(DecodedFrame),
-    End,
-    Error(String),
+#[derive(Debug, Default)]
+pub(crate) struct PlaybackBackend;
+
+impl PlaybackBackend {
+    pub fn play(&self) {}
+    pub fn pause(&self) {}
+    pub fn position(&self) -> Option<Duration> {
+        None
+    }
+    pub fn audio_ended(&self) -> Option<bool> {
+        None
+    }
+    pub fn requires_bevy_audio(&self) -> bool {
+        true
+    }
 }
 
 enum AudioEvent {
@@ -125,6 +123,7 @@ pub(crate) struct DecodeStream {
     pub audio: VideoAudio,
     pub cancellation: Arc<AtomicBool>,
     pub queued_frames: Option<Arc<AtomicUsize>>,
+    pub backend: PlaybackBackend,
 }
 
 pub(crate) fn spawn_decoder(asset: &VideoAsset, settings: &VideoDecodeSettings) -> DecodeStream {
@@ -132,7 +131,10 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset, settings: &VideoDecodeSettings) 
     let (audio_sender, audio_receiver) = bounded(AUDIO_QUEUE_CAPACITY);
     let bytes = asset.bytes.clone();
     let metadata = asset.metadata;
-    let (decoder_threads, max_frame_delay) = settings.resolved();
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let (decoder_threads, max_frame_delay) = resolve_decode_settings(settings, available);
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = cancellation.clone();
     std::thread::Builder::new()
@@ -163,7 +165,70 @@ pub(crate) fn spawn_decoder(asset: &VideoAsset, settings: &VideoDecodeSettings) 
         },
         cancellation,
         queued_frames: None,
+        backend: PlaybackBackend,
     }
+}
+
+fn resolve_decode_settings(settings: &VideoDecodeSettings, available: usize) -> (u32, u32) {
+    let automatic_threads = match available {
+        0 | 1 => 1,
+        2..=4 => 2,
+        5..=8 => 4,
+        9..=12 => 5,
+        13..=16 => 6,
+        _ => 8,
+    };
+    let threads = settings
+        .decoder_threads
+        .unwrap_or(automatic_threads)
+        .clamp(1, 256);
+    let automatic_delay = if available <= 4 { 2 } else { 3 };
+    let frame_delay = settings
+        .max_frame_delay
+        .unwrap_or(automatic_delay)
+        .max(1)
+        .min(threads);
+    (threads, frame_delay)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_decoder_parallelism_is_conservative() {
+        let settings = VideoDecodeSettings::default();
+        assert_eq!(resolve_decode_settings(&settings, 2), (2, 2));
+        assert_eq!(resolve_decode_settings(&settings, 4), (2, 2));
+        assert_eq!(resolve_decode_settings(&settings, 8), (4, 3));
+        assert_eq!(resolve_decode_settings(&settings, 16), (6, 3));
+        assert_eq!(resolve_decode_settings(&settings, 64), (8, 3));
+    }
+
+    #[test]
+    fn explicit_frame_delay_cannot_exceed_decoder_parallelism() {
+        assert_eq!(
+            resolve_decode_settings(&VideoDecodeSettings::fixed(4, 20), 64),
+            (4, 4)
+        );
+        assert_eq!(
+            resolve_decode_settings(&VideoDecodeSettings::fixed(0, 0), 64),
+            (1, 1)
+        );
+    }
+}
+
+pub(crate) fn spawn_movie_audio(
+    commands: &mut Commands,
+    audio_assets: &mut Assets<VideoAudio>,
+    audio: VideoAudio,
+) -> Option<Entity> {
+    let audio = audio_assets.add(audio);
+    Some(
+        commands
+            .spawn((AudioPlayer(audio), PlaybackSettings::ONCE.paused()))
+            .id(),
+    )
 }
 
 fn decode_stream(
@@ -364,11 +429,13 @@ fn picture_to_yuv420(picture: rav1d::Picture, timestamp: Duration) -> Result<Dec
         chroma_height,
         color_transform,
         transfer,
-        planes,
-        u_offset,
-        v_offset,
-        y_stride,
-        chroma_stride: u_stride,
+        pixels: DecodedPixels::StridedYuv {
+            planes,
+            u_offset,
+            v_offset,
+            y_stride,
+            chroma_stride: u_stride,
+        },
     })
 }
 

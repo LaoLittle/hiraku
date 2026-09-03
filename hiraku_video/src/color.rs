@@ -6,12 +6,9 @@ use bevy::{math::Vec4, render::render_resource::ShaderType};
 /// be replaced with the inverse BT.709 camera OETF: the two curves describe
 /// different sides of the imaging chain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(
-    target_arch = "wasm32",
-    allow(
-        dead_code,
-        reason = "the WebCodecs decoder backend is not implemented yet"
-    )
+#[allow(
+    dead_code,
+    reason = "transfer metadata support differs by decoder backend"
 )]
 pub(crate) enum TransferFunction {
     Linear,
