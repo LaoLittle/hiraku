@@ -6,6 +6,7 @@
 //! story semantics belong to the embedding engine.
 
 mod asset;
+mod audio;
 mod color;
 mod platform;
 mod player;

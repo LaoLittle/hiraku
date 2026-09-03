@@ -9,7 +9,7 @@ use std::{
 
 use bevy::{
     asset::{AssetApp, LoadState, RenderAssetUsages},
-    audio::{AddAudioSource, AudioSink, AudioSinkPlayback},
+    audio::{AddAudioSource, AudioPlayer, AudioSink, AudioSinkPlayback, PlaybackSettings},
     image::Image,
     picking::Pickable,
     prelude::*,
@@ -19,11 +19,12 @@ use bevy::{
 use crate::platform::{VideoFrameUpload, VideoUpload, install_video_upload};
 use crate::{
     VideoAsset, VideoAssetLoader,
-    platform::{
-        DecodeEvent, DecodedFrame, DecodedPixels, PlaybackBackend, VideoAudio, drain_ready_frames,
-        spawn_decoder, spawn_movie_audio,
-    },
+    audio::VideoAudio,
     render::{Yuv420Material, load_internal_shader},
+};
+use hiraku_media::{
+    DecodeSettings, DecoderHandle, VideoEvent as DecodeEvent, VideoFrame as DecodedFrame,
+    VideoPixels as DecodedPixels,
 };
 
 const VIDEO_Z_INDEX: i32 = 30_000;
@@ -173,7 +174,7 @@ struct ActivePlayback {
     cancellation: Arc<AtomicBool>,
     queued_frames: Option<Arc<std::sync::atomic::AtomicUsize>>,
     age: Duration,
-    backend: PlaybackBackend,
+    _decoder: DecoderHandle,
 }
 
 enum VideoSurface {
@@ -249,7 +250,13 @@ fn start_pending_video(
         player.states.get(&pending.id),
         Some(VideoPlaybackState::Paused)
     );
-    let stream = spawn_decoder(asset, &decode_settings);
+    let stream = hiraku_media::decode(
+        &asset.media,
+        &DecodeSettings {
+            decoder_threads: decode_settings.decoder_threads,
+            max_frame_delay: decode_settings.max_frame_delay,
+        },
+    );
     let root = commands
         .spawn((
             Node {
@@ -267,7 +274,11 @@ fn start_pending_video(
             Pickable::IGNORE,
         ))
         .id();
-    let audio_entity = spawn_movie_audio(&mut commands, &mut audio_assets, stream.audio);
+    let audio_entity = spawn_movie_audio(
+        &mut commands,
+        &mut audio_assets,
+        VideoAudio::new(stream.audio, stream.metadata),
+    );
     player.active = Some(pending.id);
     active.0 = Some(ActivePlayback {
         id: pending.id,
@@ -284,7 +295,7 @@ fn start_pending_video(
         cancellation: stream.cancellation,
         queued_frames: stream.queued_frames,
         age: Duration::ZERO,
-        backend: stream.backend,
+        _decoder: stream.handle,
     });
 }
 
@@ -305,7 +316,6 @@ fn apply_video_controls(
                     {
                         sink.pause();
                     }
-                    playback.backend.pause();
                     player.states.insert(id, VideoPlaybackState::Paused);
                 } else if player.pending.iter().any(|pending| pending.id == id) {
                     player.states.insert(id, VideoPlaybackState::Paused);
@@ -319,7 +329,6 @@ fn apply_video_controls(
                     {
                         sink.play();
                     }
-                    playback.backend.play();
                     player.states.insert(id, VideoPlaybackState::Playing);
                 } else if player.pending.iter().any(|pending| pending.id == id) {
                     player.states.insert(id, VideoPlaybackState::Loading);
@@ -365,10 +374,9 @@ fn update_video(
         return;
     };
     playback.age += time.delta();
-    if playback.backend.requires_bevy_audio()
-        && playback
-            .audio_entity
-            .is_none_or(|audio_entity| sinks.get(audio_entity).is_err())
+    if playback
+        .audio_entity
+        .is_none_or(|audio_entity| sinks.get(audio_entity).is_err())
         && playback.age >= AUDIO_SINK_TIMEOUT
     {
         let id = playback.id;
@@ -407,9 +415,7 @@ fn update_video(
             },
         );
         events.write(VideoEvent::Started { id: playback.id });
-        if !playback.paused {
-            playback.backend.play();
-        }
+        if !playback.paused {}
     }
     if playback.started && !playback.paused {
         if let Some(audio_entity) = playback.audio_entity
@@ -418,13 +424,11 @@ fn update_video(
         {
             sink.play();
         }
-        playback.position = playback.backend.position().unwrap_or_else(|| {
-            playback
-                .audio_entity
-                .and_then(|audio_entity| sinks.get(audio_entity).ok())
-                .map(AudioSinkPlayback::position)
-                .unwrap_or_else(|| playback.position + time.delta())
-        });
+        playback.position = playback
+            .audio_entity
+            .and_then(|audio_entity| sinks.get(audio_entity).ok())
+            .map(AudioSinkPlayback::position)
+            .unwrap_or_else(|| playback.position + time.delta());
     }
     while playback
         .frames
@@ -456,12 +460,10 @@ fn update_video(
     {
         sink.pause();
     }
-    let audio_finished = playback.backend.audio_ended().unwrap_or_else(|| {
-        playback
-            .audio_entity
-            .and_then(|audio_entity| sinks.get(audio_entity).ok())
-            .is_some_and(AudioSinkPlayback::empty)
-    });
+    let audio_finished = playback
+        .audio_entity
+        .and_then(|audio_entity| sinks.get(audio_entity).ok())
+        .is_some_and(AudioSinkPlayback::empty);
     if playback.decoder_ended
         && playback.frames.is_empty()
         && playback.position >= playback.last_timestamp + LAST_FRAME_HOLD
@@ -559,8 +561,8 @@ fn present_frame(
         y: y_image.clone(),
         u: u_image.clone(),
         v: v_image.clone(),
-        color_transform: frame.color_transform,
-        transfer: frame.transfer,
+        color_transform: frame.color_transform.into(),
+        transfer: frame.transfer.into(),
     });
     let image_entity = commands
         .spawn((
@@ -625,8 +627,8 @@ fn present_strided_frame(
             y: y_image.clone(),
             u: u_image.clone(),
             v: v_image.clone(),
-            color_transform: frame.color_transform,
-            transfer: frame.transfer,
+            color_transform: frame.color_transform.into(),
+            transfer: frame.transfer.into(),
         });
         let image_entity = commands
             .spawn((
@@ -684,6 +686,37 @@ fn cleanup_playback(commands: &mut Commands, playback: &ActivePlayback) {
     if let Some(audio_entity) = playback.audio_entity {
         commands.entity(audio_entity).try_despawn();
     }
+}
+
+fn spawn_movie_audio(
+    commands: &mut Commands,
+    audio_assets: &mut Assets<VideoAudio>,
+    audio: VideoAudio,
+) -> Option<Entity> {
+    let audio = audio_assets.add(audio);
+    Some(
+        commands
+            .spawn((AudioPlayer(audio), PlaybackSettings::ONCE.paused()))
+            .id(),
+    )
+}
+
+fn drain_ready_frames(
+    receiver: &crossbeam_channel::Receiver<DecodeEvent>,
+    queue: &mut VecDeque<DecodedFrame>,
+) -> Option<Result<(), String>> {
+    let mut terminal = None;
+    while queue.len() < 3 {
+        let Ok(event) = receiver.try_recv() else {
+            break;
+        };
+        match event {
+            DecodeEvent::Frame(frame) => queue.push_back(frame),
+            DecodeEvent::End => terminal = Some(Ok(())),
+            DecodeEvent::Error(error) => terminal = Some(Err(error)),
+        }
+    }
+    terminal
 }
 
 fn fail_playback(

@@ -55,6 +55,28 @@ impl YuvColorTransform {
     }
 }
 
+impl From<hiraku_media::YuvColorTransform> for YuvColorTransform {
+    fn from(value: hiraku_media::YuvColorTransform) -> Self {
+        Self {
+            row_r: Vec4::from_array(value.row_r),
+            row_g: Vec4::from_array(value.row_g),
+            row_b: Vec4::from_array(value.row_b),
+        }
+    }
+}
+
+impl From<hiraku_media::TransferFunction> for TransferFunction {
+    fn from(value: hiraku_media::TransferFunction) -> Self {
+        match value {
+            hiraku_media::TransferFunction::Linear => Self::Linear,
+            hiraku_media::TransferFunction::Bt1886 => Self::Bt1886,
+            hiraku_media::TransferFunction::Srgb => Self::Srgb,
+            hiraku_media::TransferFunction::Gamma22 => Self::Gamma22,
+            hiraku_media::TransferFunction::Gamma28 => Self::Gamma28,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

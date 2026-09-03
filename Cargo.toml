@@ -29,6 +29,7 @@ uuid = "1.26.0"
 hiraku-engine = { path = "hiraku_engine" }
 hiraku-errors = { path = "hiraku_errors" }
 hiraku-hdp = { path = "hiraku_hdp" }
+hiraku-media = { path = "hiraku_media" }
 hiraku-script = { path = "hiraku_script" }
 hiraku-storage = { path = "hiraku_storage" }
 hiraku-video = { path = "hiraku_video" }

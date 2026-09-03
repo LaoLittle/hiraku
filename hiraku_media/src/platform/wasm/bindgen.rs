@@ -399,3 +399,184 @@ impl VideoDecoderInit {
         self
     }
 }
+
+// Audio WebCodecs is still gated by `web_sys_unstable_apis`. Keep the small
+// surface Hiraku needs here so downstream builds never require a global rustc
+// cfg flag.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedAudioChunkType {
+    Key = "key",
+    Delta = "delta",
+}
+
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSampleFormat {
+    U8 = "u8",
+    S16 = "s16",
+    S32 = "s32",
+    F32 = "f32",
+    U8Planar = "u8-planar",
+    S16Planar = "s16-planar",
+    S32Planar = "s32-planar",
+    F32Planar = "f32-planar",
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(extends = ::js_sys::Object, js_name = "EncodedAudioChunk")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type EncodedAudioChunk;
+
+    #[wasm_bindgen(catch, constructor, js_class = "EncodedAudioChunk")]
+    pub fn new(init: &EncodedAudioChunkInit) -> Result<EncodedAudioChunk, JsValue>;
+
+    #[wasm_bindgen(
+        extends = ::web_sys::EventTarget,
+        extends = ::js_sys::Object,
+        js_name = "AudioDecoder"
+    )]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type AudioDecoder;
+
+    #[wasm_bindgen(catch, constructor, js_class = "AudioDecoder")]
+    pub fn new(init: &AudioDecoderInit) -> Result<AudioDecoder, JsValue>;
+
+    #[wasm_bindgen(method, getter, js_class = "AudioDecoder", js_name = "decodeQueueSize")]
+    pub fn decode_queue_size(this: &AudioDecoder) -> u32;
+
+    #[wasm_bindgen(catch, method, js_class = "AudioDecoder")]
+    pub fn close(this: &AudioDecoder) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(catch, method, js_class = "AudioDecoder")]
+    pub fn configure(this: &AudioDecoder, config: &AudioDecoderConfig) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(catch, method, js_class = "AudioDecoder")]
+    pub fn decode(this: &AudioDecoder, chunk: &EncodedAudioChunk) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, js_class = "AudioDecoder")]
+    pub fn flush(this: &AudioDecoder) -> ::js_sys::Promise;
+
+    #[wasm_bindgen(extends = ::js_sys::Object, js_name = "AudioData")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type AudioData;
+
+    #[wasm_bindgen(method, getter, js_class = "AudioData", js_name = "numberOfFrames")]
+    pub fn number_of_frames(this: &AudioData) -> u32;
+
+    #[wasm_bindgen(method, getter, js_class = "AudioData", js_name = "numberOfChannels")]
+    pub fn number_of_channels(this: &AudioData) -> u32;
+
+    #[wasm_bindgen(method, getter, js_class = "AudioData", js_name = "sampleRate")]
+    pub fn sample_rate(this: &AudioData) -> f32;
+
+    #[wasm_bindgen(catch, method, js_class = "AudioData", js_name = "allocationSize")]
+    pub fn allocation_size(
+        this: &AudioData,
+        options: &AudioDataCopyToOptions,
+    ) -> Result<u32, JsValue>;
+
+    #[wasm_bindgen(catch, method, js_class = "AudioData", js_name = "copyTo")]
+    pub fn copy_to_with_buffer_source(
+        this: &AudioData,
+        destination: &::js_sys::Object,
+        options: &AudioDataCopyToOptions,
+    ) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, js_class = "AudioData")]
+    pub fn close(this: &AudioData);
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(extends = ::js_sys::Object, js_name = "EncodedAudioChunkInit")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type EncodedAudioChunkInit;
+
+    #[wasm_bindgen(method, setter = "data")]
+    pub fn set_data(this: &EncodedAudioChunkInit, value: &::js_sys::Object);
+
+    #[wasm_bindgen(method, setter = "duration")]
+    pub fn set_duration_f64(this: &EncodedAudioChunkInit, value: f64);
+
+    #[wasm_bindgen(method, setter = "timestamp")]
+    pub fn set_timestamp_f64(this: &EncodedAudioChunkInit, value: f64);
+
+    #[wasm_bindgen(method, setter = "type")]
+    pub fn set_type(this: &EncodedAudioChunkInit, value: EncodedAudioChunkType);
+
+    #[wasm_bindgen(extends = ::js_sys::Object, js_name = "AudioDecoderConfig")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type AudioDecoderConfig;
+
+    #[wasm_bindgen(method, setter = "codec")]
+    pub fn set_codec(this: &AudioDecoderConfig, value: &str);
+
+    #[wasm_bindgen(method, setter = "numberOfChannels")]
+    pub fn set_number_of_channels(this: &AudioDecoderConfig, value: u32);
+
+    #[wasm_bindgen(method, setter = "sampleRate")]
+    pub fn set_sample_rate(this: &AudioDecoderConfig, value: u32);
+
+    #[wasm_bindgen(extends = ::js_sys::Object, js_name = "AudioDecoderInit")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type AudioDecoderInit;
+
+    #[wasm_bindgen(method, setter = "error")]
+    pub fn set_error(this: &AudioDecoderInit, value: &::js_sys::Function);
+
+    #[wasm_bindgen(method, setter = "output")]
+    pub fn set_output(this: &AudioDecoderInit, value: &::js_sys::Function);
+
+    #[wasm_bindgen(extends = ::js_sys::Object, js_name = "AudioDataCopyToOptions")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type AudioDataCopyToOptions;
+
+    #[wasm_bindgen(method, setter = "format")]
+    pub fn set_format(this: &AudioDataCopyToOptions, value: AudioSampleFormat);
+
+    #[wasm_bindgen(method, setter = "planeIndex")]
+    pub fn set_plane_index(this: &AudioDataCopyToOptions, value: u32);
+}
+
+impl EncodedAudioChunkInit {
+    pub fn new(
+        data: &::js_sys::Object,
+        timestamp: i32,
+        type_: EncodedAudioChunkType,
+    ) -> Self {
+        let value: Self = ::wasm_bindgen::JsCast::unchecked_into(::js_sys::Object::new());
+        value.set_data(data);
+        value.set_timestamp_f64(f64::from(timestamp));
+        value.set_type(type_);
+        value
+    }
+}
+
+impl AudioDecoderConfig {
+    pub fn new(codec: &str, number_of_channels: u32, sample_rate: u32) -> Self {
+        let value: Self = ::wasm_bindgen::JsCast::unchecked_into(::js_sys::Object::new());
+        value.set_codec(codec);
+        value.set_number_of_channels(number_of_channels);
+        value.set_sample_rate(sample_rate);
+        value
+    }
+}
+
+impl AudioDecoderInit {
+    pub fn new(error: &::js_sys::Function, output: &::js_sys::Function) -> Self {
+        let value: Self = ::wasm_bindgen::JsCast::unchecked_into(::js_sys::Object::new());
+        value.set_error(error);
+        value.set_output(output);
+        value
+    }
+}
+
+impl AudioDataCopyToOptions {
+    pub fn new(plane_index: u32) -> Self {
+        let value: Self = ::wasm_bindgen::JsCast::unchecked_into(::js_sys::Object::new());
+        value.set_plane_index(plane_index);
+        value
+    }
+}

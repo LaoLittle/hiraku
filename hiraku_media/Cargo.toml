@@ -4,3 +4,36 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+crossbeam-channel = "0.5.16"
+opus-rs = { git = "https://github.com/Hiraku-Project/opus-rs.git" }
+
+[dependencies.symphonia]
+version = "0.6.1"
+default-features = false
+features = ["mkv"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rav1d = { git = "https://github.com/Hiraku-Project/rav1d.git" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.104"
+wasm-bindgen = "0.2.127"
+wasm-bindgen-futures = "0.4.77"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3.104"
+features = [
+    "CanvasRenderingContext2d",
+    "Document",
+    "HtmlCanvasElement",
+    "ImageData",
+    "PlaneLayout",
+    "VideoColorSpace",
+    "VideoFrame",
+    "VideoFrameCopyToOptions",
+    "VideoMatrixCoefficients",
+    "VideoPixelFormat",
+    "VideoTransferCharacteristics",
+    "Window",
+]
