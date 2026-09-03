@@ -1,0 +1,6 @@
+[package]
+name = "hiraku-media"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

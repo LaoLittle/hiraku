@@ -4,10 +4,7 @@
 #![allow(unused_mut)]
 #![allow(unused)]
 
-extern crate alloc;
-
 use wasm_bindgen::prelude::*;
-use web_sys::EventTarget;
 
 #[wasm_bindgen]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +73,7 @@ extern "C" {
     ) -> Result<(), JsValue>;
 
     #[wasm_bindgen(
-        extends = EventTarget,
+        extends = ::web_sys::EventTarget,
         extends = ::js_sys::Object,
         js_name = "VideoDecoder",
         typescript_type = "VideoDecoder"

@@ -11,6 +11,8 @@ cfg_select! {
 
 use std::{sync::Arc, time::Duration};
 
+use bevy::{asset::Handle, image::Image};
+
 use crate::color::{TransferFunction, YuvColorTransform};
 
 #[derive(Debug)]
@@ -56,9 +58,9 @@ pub(crate) enum DecodeEvent {
 #[derive(Clone)]
 #[allow(dead_code, reason = "the strided upload payload is native-only")]
 pub(crate) struct VideoFrameUpload {
-    pub y_image: bevy::prelude::Handle<bevy::image::Image>,
-    pub u_image: bevy::prelude::Handle<bevy::image::Image>,
-    pub v_image: bevy::prelude::Handle<bevy::image::Image>,
+    pub y_image: Handle<Image>,
+    pub u_image: Handle<Image>,
+    pub v_image: Handle<Image>,
     pub width: u32,
     pub height: u32,
     pub chroma_width: u32,

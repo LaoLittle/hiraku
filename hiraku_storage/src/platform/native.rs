@@ -53,7 +53,7 @@ impl ByteStorage for PlatformStorage {
     }
 }
 
-pub fn native_path(root: &Path, key: &str, extension: &str) -> Result<PathBuf, StorageError> {
+fn native_path(root: &Path, key: &str, extension: &str) -> Result<PathBuf, StorageError> {
     validate_key(key)?;
     Ok(root.join(format!("{key}.{extension}")))
 }
