@@ -10,7 +10,8 @@ members = [
     "hiraku_errors", 
     "hiraku_video", 
     "hiraku_storage", 
-    "hiraku_media"
+    "hiraku_media",
+    "hiraku"
 ]
 
 [workspace.package]
