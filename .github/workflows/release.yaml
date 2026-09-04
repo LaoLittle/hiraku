@@ -17,9 +17,23 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     env:
-      CROSS_TARGET_PRE_BUILD: |
-        apt-get update && apt-get install -y --no-install-recommends \
-          pkg-config libasound2-dev libudev-dev libwayland-dev
+      CROSS_TARGET_AARCH64_UNKNOWN_LINUX_GNU_PRE_BUILD: >-
+                  dpkg --add-architecture arm64 &&
+                  apt-get update &&
+                  apt-get install -y --no-install-recommends
+                  pkg-config
+                  libasound2-dev:arm64
+                  libudev-dev:arm64
+                  libwayland-dev:arm64
+      
+      CROSS_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_PRE_BUILD: >-
+                  dpkg --add-architecture riscv64 &&
+                  apt-get update &&
+                  apt-get install -y --no-install-recommends
+                  pkg-config
+                  libasound2-dev:riscv64
+                  libudev-dev:riscv64
+                  libwayland-dev:riscv64
 
     strategy:
       fail-fast: false
@@ -80,10 +94,12 @@ jobs:
           pkg-config \
           libwayland-dev \
           libasound2-dev \
-          libudev-dev \
+          libudev-dev
 
       - name: Install NASM
-        if: matrix.name == 'macos-x64'
+        if: |
+          matrix.name == 'macos-x64' ||
+          matrix.name == 'linux-x64'  
         uses: ilammy/setup-nasm@v1
 
       - name: Install cross
