@@ -1,3 +1,3 @@
-# Hiraku data pack
+# Hiraku Data Package
 
-Hiraku data pack (HDP) is an archive format designed for Hiraku engine.
+Hiraku data package (HDP) is an archive format designed for Hiraku engine.

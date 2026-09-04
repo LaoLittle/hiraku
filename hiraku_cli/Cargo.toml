@@ -1,7 +1,10 @@
 [package]
 name = "hiraku-cli"
+description = "Hiraku command line tools"
 version.workspace = true
 edition.workspace = true
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }

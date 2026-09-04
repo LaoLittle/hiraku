@@ -1,7 +1,10 @@
 [package]
 name = "hiraku-media"
+description = "Hiraku media processing library"
 version.workspace = true
 edition.workspace = true
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 thiserror.workspace = true

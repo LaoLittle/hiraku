@@ -1,7 +1,10 @@
 [package]
 name = "hiraku-storage"
+description = "Hiraku multiplatform storage library"
 version.workspace = true
 edition.workspace = true
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 thiserror.workspace = true

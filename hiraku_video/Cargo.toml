@@ -1,7 +1,10 @@
 [package]
 name = "hiraku-video"
+description = "Hiraku video player"
 version.workspace = true
 edition.workspace = true
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 bevy.workspace = true

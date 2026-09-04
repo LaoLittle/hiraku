@@ -1,8 +1,10 @@
 [package]
 name = "hiraku-script-derive"
+description = "Registration macros for Hiraku Script native APIs"
 version.workspace = true
 edition.workspace = true
-description = "Registration macros for Hiraku Script native APIs"
+author.workspace = true
+license.workspace = true
 
 [lib]
 proc-macro = true

@@ -1,7 +1,10 @@
 [package]
 name = "hiraku-errors"
+description = "Hiraku error handling"
 version.workspace = true
 edition.workspace = true
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 ariadne = { version = "0.6.0" }

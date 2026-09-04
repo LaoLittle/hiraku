@@ -1,7 +1,10 @@
 [package]
 name = "hiraku-hdp"
+description = "Hiraku data package"
 version.workspace = true
 edition.workspace = true
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 rayon = "1.12.0"

@@ -7,7 +7,10 @@ into mkv/webm with av1 in video and opus in audio.
 
 ## Specifications
 
-macOS: VideoToolbox
-Windows: MediaFoundation
-Web: WebCodec
-Other: rav1d
+- [x] macOS: VideoToolbox
+
+- [ ] Windows: MediaFoundation
+
+- [ ] Web: WebCodec
+
+- [x] Other: rav1d

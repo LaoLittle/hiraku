@@ -1,8 +1,10 @@
 [package]
 name = "hiraku-script"
+description = "Hiraku visual-novel scripting language"
 version.workspace = true
 edition.workspace = true
-description = "Embeddable visual-novel scripting language"
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 unicode-xid = "0.2.6"
@@ -12,4 +14,4 @@ rustc-hash.workspace = true
 indexmap = "2.14.0"
 bumpalo.workspace = true
 hiraku-errors.workspace = true
-hiraku-script-derive = { path = "../hiraku_script_derive" }
+hiraku-script-derive.workspace = true

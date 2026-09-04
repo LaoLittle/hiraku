@@ -1,8 +1,10 @@
 [package]
 name = "hiraku-engine"
+description = "Hiraku visual-novel engine"
 version.workspace = true
 edition.workspace = true
-description = "Embeddable visual-novel runtime"
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 bevy.workspace = true

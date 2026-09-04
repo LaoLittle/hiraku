@@ -1,8 +1,10 @@
 [package]
 name = "hiraku-app"
+description = "Hiraku engine launcher"
 version.workspace = true
 edition.workspace = true
-description = "Standalone Hiraku application"
+author.workspace = true
+license.workspace = true
 
 [dependencies]
 bevy.workspace = true
