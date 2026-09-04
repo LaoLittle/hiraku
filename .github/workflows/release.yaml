@@ -83,7 +83,7 @@ jobs:
           libudev-dev \
 
       - name: Install NASM
-        if: matrix.name == "macos-x64"
+        if: matrix.name == 'macos-x64'
         uses: ilammy/setup-nasm@v1
 
       - name: Install cross
