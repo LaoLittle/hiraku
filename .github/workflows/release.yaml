@@ -105,8 +105,8 @@ jobs:
           fi
 
           cp \
-            target/${{ matrix.target }}/release/hiraku${EXT} \
-            dist/hiraku-${{ matrix.name }}${EXT}
+            target/${{ matrix.target }}/release/hiraku-app${EXT} \
+            dist/hiraku-app-${{ matrix.name }}${EXT}
 
 
       - name: Upload artifact
