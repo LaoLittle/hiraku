@@ -3,7 +3,7 @@ name = "hiraku-script-derive"
 description = "Registration macros for Hiraku Script native APIs"
 version.workspace = true
 edition.workspace = true
-author.workspace = true
+authors.workspace = true
 license.workspace = true
 
 [lib]

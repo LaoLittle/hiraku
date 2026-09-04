@@ -3,7 +3,7 @@ name = "hiraku-engine"
 description = "Hiraku visual-novel engine"
 version.workspace = true
 edition.workspace = true
-author.workspace = true
+authors.workspace = true
 license.workspace = true
 
 [dependencies]

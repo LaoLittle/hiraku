@@ -3,7 +3,7 @@ name = "hiraku-app"
 description = "Hiraku engine launcher"
 version.workspace = true
 edition.workspace = true
-author.workspace = true
+authors.workspace = true
 license.workspace = true
 
 [dependencies]
