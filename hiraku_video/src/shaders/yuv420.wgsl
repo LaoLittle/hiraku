@@ -1,8 +1,14 @@
 #import bevy_ui::ui_vertex_output::UiVertexOutput
 
+#ifdef FORMAT_I420
 @group(1) @binding(0) var y_texture: texture_2d<f32>;
 @group(1) @binding(1) var u_texture: texture_2d<f32>;
 @group(1) @binding(2) var v_texture: texture_2d<f32>;
+#else ifdef FORMAT_NV12
+@group(1) @binding(0) var y_texture: texture_2d<f32>;
+@group(1) @binding(1) var uv_texture: texture_2d<f32>;
+@group(1) @binding(2) var _dummy: texture_2d<f32>;
+#endif
 @group(1) @binding(3) var main_sampler: sampler;
 
 struct YuvColorTransform {
@@ -34,12 +40,25 @@ fn to_linear_vec3(val: vec3<f32>) -> vec3<f32> {
 #endif
 }
 
+fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
+#ifdef FORMAT_I420
+    return vec3<f32>(
+        textureSample(y_texture, main_sampler, uv).r,
+        textureSample(u_texture, main_sampler, uv).r,
+        textureSample(v_texture, main_sampler, uv).r,
+    );
+#else ifdef FORMAT_NV12
+    let y = textureSample(y_texture, main_sampler, uv).r;
+    let chroma = textureSample(uv_texture, main_sampler, uv).rg;
+
+    return vec3<f32>(y, chroma.r, chroma.g);
+#endif
+}
+
 @fragment
 fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     let yuv = vec4<f32>(
-        textureSample(y_texture, main_sampler, in.uv).r,
-        textureSample(u_texture, main_sampler, in.uv).r,
-        textureSample(v_texture, main_sampler, in.uv).r,
+        sample_yuv(in.uv),
         1.0,
     );
 

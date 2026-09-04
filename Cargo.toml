@@ -9,8 +9,9 @@ members = [
     "hiraku_hdp", 
     "hiraku_errors", 
     "hiraku_video", 
-    "hiraku_storage"
-, "hiraku_media"]
+    "hiraku_storage", 
+    "hiraku_media"
+]
 
 [workspace.package]
 version = "0.1.0"

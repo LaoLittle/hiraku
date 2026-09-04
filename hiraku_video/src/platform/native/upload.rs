@@ -47,7 +47,7 @@ fn upload_video_frame(
     if upload.generation == *uploaded_generation {
         return;
     }
-    let Some(frame) = upload.frame.as_ref() else {
+    let Some(VideoFrameUpload::I420(frame)) = upload.frame.as_ref() else {
         *uploaded_generation = upload.generation;
         return;
     };

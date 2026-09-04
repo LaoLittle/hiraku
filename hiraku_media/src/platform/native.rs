@@ -312,7 +312,7 @@ fn picture_to_yuv420(picture: rav1d::Picture, timestamp: Duration) -> Result<Vid
         chroma_height,
         color_transform,
         transfer,
-        pixels: VideoPixels::StridedYuv {
+        pixels: VideoPixels::I420Strided {
             planes,
             u_offset,
             v_offset,

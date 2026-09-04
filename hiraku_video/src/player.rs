@@ -16,7 +16,9 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 
-use crate::platform::{VideoFrameUpload, VideoUpload, install_video_upload};
+use crate::platform::{
+    VideoFrameI420, VideoFrameNv12, VideoFrameUpload, VideoUpload, install_video_upload,
+};
 use crate::{
     VideoAsset, VideoAssetLoader,
     audio::VideoAudio,
@@ -24,7 +26,7 @@ use crate::{
 };
 use hiraku_media::{
     DecodeSettings, DecoderHandle, VideoEvent as DecodeEvent, VideoFrame as DecodedFrame,
-    VideoPixels as DecodedPixels,
+    VideoPixels as DecodedPixels, YuvPixelFormat,
 };
 
 const VIDEO_Z_INDEX: i32 = 30_000;
@@ -178,10 +180,15 @@ struct ActivePlayback {
 }
 
 enum VideoSurface {
-    Yuv {
+    YuvI420 {
         y_image: Handle<Image>,
         u_image: Handle<Image>,
         v_image: Handle<Image>,
+        image_entity: Entity,
+    },
+    YuvNv12 {
+        y_image: Handle<Image>,
+        uv_image: Handle<Image>,
         image_entity: Entity,
     },
     Rgba {
@@ -488,11 +495,43 @@ fn present_frame(
     frame: DecodedFrame,
 ) {
     let aspect_ratio = frame.width as f32 / frame.height as f32;
-    let (y, u, v, rgba) = match frame.pixels {
-        DecodedPixels::PlanarYuv { y, u, v } => (y, u, v, None),
-        DecodedPixels::Rgba(rgba) => (Vec::new(), Vec::new(), Vec::new(), Some(rgba)),
-        pixels @ DecodedPixels::StridedYuv { .. } => {
-            return present_strided_frame(
+    let (y, u, v) = match frame.pixels {
+        DecodedPixels::I420Planar { y, u, v } => (y, u, v),
+        DecodedPixels::Rgba(rgba) => {
+            if let Some(VideoSurface::Rgba {
+                image,
+                image_entity,
+            }) = playback.surface.as_ref()
+            {
+                replace_rgba(images, image, frame.width, frame.height, rgba);
+                if let Ok(mut node) = nodes.get_mut(*image_entity) {
+                    node.aspect_ratio = Some(aspect_ratio);
+                }
+                return;
+            }
+            replace_surface(commands, playback);
+            let image = images.add(rgba_image(frame.width, frame.height, rgba));
+            let image_entity = commands
+                .spawn((
+                    ImageNode::new(image.clone()),
+                    Node {
+                        width: percent(100),
+                        max_height: percent(100),
+                        aspect_ratio: Some(aspect_ratio),
+                        ..default()
+                    },
+                    Pickable::IGNORE,
+                ))
+                .id();
+            commands.entity(playback.root).add_child(image_entity);
+            playback.surface = Some(VideoSurface::Rgba {
+                image,
+                image_entity,
+            });
+            return;
+        }
+        pixels @ DecodedPixels::I420Strided { .. } => {
+            present_strided_frame(
                 commands,
                 images,
                 materials,
@@ -501,43 +540,23 @@ fn present_frame(
                 playback,
                 DecodedFrame { pixels, ..frame },
             );
-        }
-    };
-    if let Some(rgba) = rgba {
-        if let Some(VideoSurface::Rgba {
-            image,
-            image_entity,
-        }) = playback.surface.as_ref()
-        {
-            replace_rgba(images, image, frame.width, frame.height, rgba);
-            if let Ok(mut node) = nodes.get_mut(*image_entity) {
-                node.aspect_ratio = Some(aspect_ratio);
-            }
             return;
         }
-        replace_surface(commands, playback);
-        let image = images.add(rgba_image(frame.width, frame.height, rgba));
-        let image_entity = commands
-            .spawn((
-                ImageNode::new(image.clone()),
-                Node {
-                    width: percent(100),
-                    max_height: percent(100),
-                    aspect_ratio: Some(aspect_ratio),
-                    ..default()
-                },
-                Pickable::IGNORE,
-            ))
-            .id();
-        commands.entity(playback.root).add_child(image_entity);
-        playback.surface = Some(VideoSurface::Rgba {
-            image,
-            image_entity,
-        });
-        return;
-    }
+        pixels @ DecodedPixels::Nv12Strided { .. } => {
+            present_nv12_frame(
+                commands,
+                images,
+                materials,
+                nodes,
+                upload,
+                playback,
+                DecodedFrame { pixels, ..frame },
+            );
+            return;
+        }
+    };
 
-    if let Some(VideoSurface::Yuv {
+    if let Some(VideoSurface::YuvI420 {
         y_image,
         u_image,
         v_image,
@@ -563,6 +582,7 @@ fn present_frame(
         v: v_image.clone(),
         color_transform: frame.color_transform.into(),
         transfer: frame.transfer.into(),
+        format: YuvPixelFormat::I420,
     });
     let image_entity = commands
         .spawn((
@@ -577,7 +597,7 @@ fn present_frame(
         ))
         .id();
     commands.entity(playback.root).add_child(image_entity);
-    playback.surface = Some(VideoSurface::Yuv {
+    playback.surface = Some(VideoSurface::YuvI420 {
         y_image,
         u_image,
         v_image,
@@ -594,7 +614,7 @@ fn present_strided_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
-    let DecodedPixels::StridedYuv {
+    let DecodedPixels::I420Strided {
         planes,
         u_offset,
         v_offset,
@@ -605,7 +625,7 @@ fn present_strided_frame(
         unreachable!("strided frame presenter received a packed WebCodecs frame")
     };
     let aspect_ratio = frame.width as f32 / frame.height as f32;
-    let (y_image, u_image, v_image, image_entity) = if let Some(VideoSurface::Yuv {
+    let (y_image, u_image, v_image, image_entity) = if let Some(VideoSurface::YuvI420 {
         y_image,
         u_image,
         v_image,
@@ -629,6 +649,7 @@ fn present_strided_frame(
             v: v_image.clone(),
             color_transform: frame.color_transform.into(),
             transfer: frame.transfer.into(),
+            format: YuvPixelFormat::I420,
         });
         let image_entity = commands
             .spawn((
@@ -643,7 +664,7 @@ fn present_strided_frame(
             ))
             .id();
         commands.entity(playback.root).add_child(image_entity);
-        playback.surface = Some(VideoSurface::Yuv {
+        playback.surface = Some(VideoSurface::YuvI420 {
             y_image: y_image.clone(),
             u_image: u_image.clone(),
             v_image: v_image.clone(),
@@ -655,26 +676,130 @@ fn present_strided_frame(
     if let Ok(mut node) = nodes.get_mut(image_entity) {
         node.aspect_ratio = Some(aspect_ratio);
     }
-    upload.publish(VideoFrameUpload {
+
+    let DecodedFrame {
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        ..
+    } = frame;
+    upload.publish(VideoFrameUpload::I420(VideoFrameI420 {
         y_image,
         u_image,
         v_image,
-        width: frame.width,
-        height: frame.height,
-        chroma_width: frame.chroma_width,
-        chroma_height: frame.chroma_height,
+        width,
+        height,
+        chroma_width,
+        chroma_height,
         planes,
         u_offset,
         v_offset,
         y_stride,
         chroma_stride,
-    });
+    }));
+}
+
+fn present_nv12_frame(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<Yuv420Material>,
+    nodes: &mut Query<&mut Node>,
+    upload: &mut VideoUpload,
+    playback: &mut ActivePlayback,
+    frame: DecodedFrame,
+) {
+    let DecodedPixels::Nv12Strided {
+        planes,
+        uv_offset,
+        y_stride,
+        uv_stride,
+    } = frame.pixels
+    else {
+        unreachable!("Nv12 presenter received a non-NV12 frame");
+    };
+
+    let aspect_ratio = frame.width as f32 / frame.height as f32;
+
+    let (y_image, uv_image, image_entity) = if let Some(VideoSurface::YuvNv12 {
+        y_image,
+        uv_image,
+        image_entity,
+    }) = playback.surface.as_ref()
+    {
+        (y_image.clone(), uv_image.clone(), *image_entity)
+    } else {
+        replace_surface(commands, playback);
+
+        let y_image = images.add(empty_plane_image(frame.width, frame.height));
+
+        let uv_image = images.add(empty_uv_plane_image(
+            frame.chroma_width,
+            frame.chroma_height,
+        ));
+
+        let dummy_image = images.add(empty_plane_image(1, 1));
+
+        let material = materials.add(Yuv420Material {
+            y: y_image.clone(),
+            u: uv_image.clone(),
+            v: dummy_image.clone(),
+            color_transform: frame.color_transform.into(),
+            transfer: frame.transfer.into(),
+            format: YuvPixelFormat::Nv12,
+        });
+
+        let image_entity = commands
+            .spawn((
+                MaterialNode(material),
+                Node {
+                    width: percent(100),
+                    max_height: percent(100),
+                    aspect_ratio: Some(aspect_ratio),
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ))
+            .id();
+
+        commands.entity(playback.root).add_child(image_entity);
+
+        playback.surface = Some(VideoSurface::YuvNv12 {
+            y_image: y_image.clone(),
+            uv_image: uv_image.clone(),
+            image_entity,
+        });
+
+        (y_image, uv_image, image_entity)
+    };
+
+    let DecodedFrame {
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        ..
+    } = frame;
+
+    upload.publish(VideoFrameUpload::Nv12(VideoFrameNv12 {
+        y_image,
+        uv_image,
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        planes,
+        uv_offset,
+        y_stride,
+        uv_stride,
+    }));
 }
 
 fn replace_surface(commands: &mut Commands, playback: &mut ActivePlayback) {
     let entity = match playback.surface.take() {
-        Some(VideoSurface::Yuv { image_entity, .. }) => image_entity,
+        Some(VideoSurface::YuvI420 { image_entity, .. }) => image_entity,
         Some(VideoSurface::Rgba { image_entity, .. }) => image_entity,
+        Some(VideoSurface::YuvNv12 { image_entity, .. }) => image_entity,
         None => return,
     };
     commands.entity(entity).try_despawn();
@@ -775,6 +900,20 @@ fn empty_plane_image(width: u32, height: u32) -> Image {
         TextureDimension::D2,
         &[0],
         TextureFormat::R8Unorm,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+fn empty_uv_plane_image(width: u32, height: u32) -> Image {
+    Image::new_fill(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0],
+        TextureFormat::Rg8Unorm,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     )
 }

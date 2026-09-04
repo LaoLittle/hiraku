@@ -53,6 +53,12 @@ pub enum TransferFunction {
     Gamma28,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum YuvPixelFormat {
+    I420,
+    Nv12,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct YuvColorTransform {
     pub row_r: [f32; 4],
@@ -96,17 +102,23 @@ pub struct VideoFrame {
 #[derive(Debug)]
 #[allow(dead_code, reason = "decoder backends produce different pixel layouts")]
 pub enum VideoPixels {
-    StridedYuv {
+    I420Strided {
         planes: Arc<[u8]>,
         u_offset: usize,
         v_offset: usize,
         y_stride: u32,
         chroma_stride: u32,
     },
-    PlanarYuv {
+    I420Planar {
         y: Vec<u8>,
         u: Vec<u8>,
         v: Vec<u8>,
+    },
+    Nv12Strided {
+        planes: Arc<[u8]>,
+        uv_offset: usize,
+        y_stride: u32,
+        uv_stride: u32,
     },
     Rgba(Vec<u8>),
 }
