@@ -9,7 +9,7 @@ use std::{
 };
 
 use crossbeam_channel::{SendTimeoutError, Sender, bounded};
-use opus_rs::OpusDecoder;
+use hiraku_opus::OpusDecoder;
 use symphonia::core::codecs::{
     audio::well_known as audio_codecs, video::well_known as video_codecs,
 };

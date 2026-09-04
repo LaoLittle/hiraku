@@ -7,8 +7,8 @@ use std::{
 };
 
 use crossbeam_channel::{SendTimeoutError, Sender, bounded};
-use opus_rs::OpusDecoder;
-use rav1d::{Decoder as Av1Decoder, PixelLayout, PlanarImageComponent, Rav1dError, Settings};
+use hiraku_opus::OpusDecoder;
+use hiraku_rav1d::{Decoder as Av1Decoder, Picture as Av1Picture, PixelLayout, PlanarImageComponent, Rav1dError, Settings};
 use symphonia::core::codecs::{
     audio::well_known as audio_codecs, video::well_known as video_codecs,
 };
@@ -253,7 +253,7 @@ fn send_cancellable<T>(
     }
 }
 
-fn picture_to_yuv420(picture: rav1d::Picture, timestamp: Duration) -> Result<VideoFrame, String> {
+fn picture_to_yuv420(picture: Av1Picture, timestamp: Duration) -> Result<VideoFrame, String> {
     if picture.bit_depth() != 8 || picture.pixel_layout() != PixelLayout::I420 {
         return Err(format!(
             "unsupported AV1 pixel format: expected 8-bit 4:2:0, got {}-bit {:?}",
@@ -325,9 +325,9 @@ fn picture_to_yuv420(picture: rav1d::Picture, timestamp: Duration) -> Result<Vid
 }
 
 fn picture_color_transform(
-    picture: &rav1d::Picture,
+    picture: &Av1Picture,
 ) -> Result<(YuvColorTransform, TransferFunction), String> {
-    use rav1d::pixel::{MatrixCoefficients, TransferCharacteristic, YUVRange};
+    use hiraku_rav1d::pixel::{MatrixCoefficients, TransferCharacteristic, YUVRange};
 
     let (kr, kb) = match picture.matrix_coefficients() {
         MatrixCoefficients::BT470M => (0.30, 0.11),
