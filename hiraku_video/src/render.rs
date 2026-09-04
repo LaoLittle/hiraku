@@ -24,10 +24,14 @@ pub(crate) struct Yuv420Material {
     #[texture(0)]
     #[sampler(3)]
     pub y: Handle<Image>,
+    /// I420: U plane.
+    /// NV12: UV plane.
     #[texture(1)]
-    pub u: Handle<Image>,
+    pub chroma0: Handle<Image>,
+    /// I420: V plane.
+    /// NV12: dummy binding.
     #[texture(2)]
-    pub v: Handle<Image>,
+    pub chroma1: Handle<Image>,
     #[uniform(4)]
     pub color_transform: YuvColorTransform,
     pub transfer: TransferFunction,

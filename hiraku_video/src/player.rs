@@ -578,8 +578,8 @@ fn present_frame(
     let v_image = images.add(plane_image(frame.chroma_width, frame.chroma_height, v));
     let material = materials.add(Yuv420Material {
         y: y_image.clone(),
-        u: u_image.clone(),
-        v: v_image.clone(),
+        chroma0: u_image.clone(),
+        chroma1: v_image.clone(),
         color_transform: frame.color_transform.into(),
         transfer: frame.transfer.into(),
         format: YuvPixelFormat::I420,
@@ -645,8 +645,8 @@ fn present_strided_frame(
         let v_image = images.add(empty_plane_image(frame.chroma_width, frame.chroma_height));
         let material = materials.add(Yuv420Material {
             y: y_image.clone(),
-            u: u_image.clone(),
-            v: v_image.clone(),
+            chroma0: u_image.clone(),
+            chroma1: v_image.clone(),
             color_transform: frame.color_transform.into(),
             transfer: frame.transfer.into(),
             format: YuvPixelFormat::I420,
@@ -742,8 +742,8 @@ fn present_nv12_frame(
 
         let material = materials.add(Yuv420Material {
             y: y_image.clone(),
-            u: uv_image.clone(),
-            v: dummy_image.clone(),
+            chroma0: uv_image.clone(),
+            chroma1: dummy_image.clone(),
             color_transform: frame.color_transform.into(),
             transfer: frame.transfer.into(),
             format: YuvPixelFormat::Nv12,
@@ -773,6 +773,10 @@ fn present_nv12_frame(
         (y_image, uv_image, image_entity)
     };
 
+    if let Ok(mut node) = nodes.get_mut(image_entity) {
+        node.aspect_ratio = Some(aspect_ratio);
+    }
+
     let DecodedFrame {
         width,
         height,
@@ -780,7 +784,6 @@ fn present_nv12_frame(
         chroma_height,
         ..
     } = frame;
-
     upload.publish(VideoFrameUpload::Nv12(VideoFrameNv12 {
         y_image,
         uv_image,

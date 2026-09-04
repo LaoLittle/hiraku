@@ -10,7 +10,7 @@ use bevy::{
     },
 };
 
-use crate::platform::VideoFrameUpload;
+use crate::platform::{VideoFrameI420, VideoFrameNv12, VideoFrameUpload};
 
 #[derive(Clone, Default, Resource, ExtractResource)]
 pub(crate) struct VideoUpload {
@@ -47,42 +47,95 @@ fn upload_video_frame(
     if upload.generation == *uploaded_generation {
         return;
     }
-    let Some(VideoFrameUpload::I420(frame)) = upload.frame.as_ref() else {
+    let Some(frame) = upload.frame.as_ref() else {
         *uploaded_generation = upload.generation;
         return;
     };
+
+    let uploaded = match frame {
+        VideoFrameUpload::I420(frame) => upload_i420_frame(frame, &gpu_images, &render_queue),
+        VideoFrameUpload::Nv12(frame) => upload_nv12_frame(frame, &gpu_images, &render_queue)
+    };
+    
+    if uploaded {
+        *uploaded_generation = upload.generation;
+    }
+}
+
+fn upload_i420_frame(
+    frame: &VideoFrameI420,
+    gpu_images: &RenderAssets<GpuImage>,
+    render_queue: &RenderQueue,
+) -> bool {
     let (Some(y_image), Some(u_image), Some(v_image)) = (
         gpu_images.get(&frame.y_image),
         gpu_images.get(&frame.u_image),
         gpu_images.get(&frame.v_image),
     ) else {
-        return;
+        return false;
     };
+
     write_plane(
-        &render_queue,
+        render_queue,
         y_image,
         &frame.planes[..frame.u_offset],
         frame.y_stride,
         frame.width,
         frame.height,
     );
+
     write_plane(
-        &render_queue,
+        render_queue,
         u_image,
         &frame.planes[frame.u_offset..frame.v_offset],
         frame.chroma_stride,
         frame.chroma_width,
         frame.chroma_height,
     );
+
     write_plane(
-        &render_queue,
+        render_queue,
         v_image,
         &frame.planes[frame.v_offset..],
         frame.chroma_stride,
         frame.chroma_width,
         frame.chroma_height,
     );
-    *uploaded_generation = upload.generation;
+
+    true
+}
+
+fn upload_nv12_frame(
+    frame: &VideoFrameNv12,
+    gpu_images: &RenderAssets<GpuImage>,
+    render_queue: &RenderQueue,
+) -> bool {
+    let (Some(y_image), Some(uv_image)) = (
+        gpu_images.get(&frame.y_image),
+        gpu_images.get(&frame.uv_image),
+    ) else {
+        return false;
+    };
+
+    write_plane(
+        render_queue,
+        y_image,
+        &frame.planes[..frame.uv_offset],
+        frame.y_stride,
+        frame.width,
+        frame.height,
+    );
+
+    write_plane(
+        render_queue,
+        uv_image,
+        &frame.planes[frame.uv_offset..],
+        frame.uv_stride,
+        frame.chroma_width,
+        frame.chroma_height,
+    );
+
+    true
 }
 
 fn write_plane(
