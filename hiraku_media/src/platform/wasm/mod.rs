@@ -227,15 +227,17 @@ pub(crate) fn decode(media: &EncodedMedia, _settings: &DecodeSettings) -> Decode
         metadata: media.metadata,
         cancellation,
         queued_frames: Some(queued_frames),
-        handle: crate::DecoderHandle(DecoderHandle {
-            video_decoder,
-            audio_decoder,
-            copy_state,
-            _video_output: video_output,
-            _video_error: video_error,
-            _audio_output: audio_output,
-            _audio_error: audio_error,
-        }),
+        handle: crate::DecoderHandle(super::DecoderHandle::WebCodecs(
+            DecoderHandle {
+                video_decoder,
+                audio_decoder,
+                copy_state,
+                _video_output: video_output,
+                _video_error: video_error,
+                _audio_output: audio_output,
+                _audio_error: audio_error,
+            }
+        )),
     }
 }
 
@@ -407,7 +409,7 @@ async fn decode_frame(frame: &VideoFrame, state: &FrameCopyState) -> Result<Deco
     };
     let pixels = if frame.format() == Some(VideoPixelFormat::I420) {
         match copy_i420(frame, state, width, height).await {
-            Ok((y, u, v)) => VideoPixels::PlanarYuv { y, u, v },
+            Ok((y, u, v)) => VideoPixels::I420Planar { y, u, v },
             Err(_) => VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?),
         }
     } else {

@@ -61,7 +61,9 @@ pub(crate) fn decode(media: &EncodedMedia, settings: &DecodeSettings) -> DecodeS
         metadata,
         cancellation,
         queued_frames: None,
-        handle: crate::DecoderHandle(DecoderHandle),
+        handle: crate::DecoderHandle(
+            super::DecoderHandle::Software(DecoderHandle)
+        ),
     }
 }
 

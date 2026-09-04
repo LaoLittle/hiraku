@@ -146,6 +146,7 @@ pub struct DecodeStream {
     pub handle: DecoderHandle,
 }
 
+#[allow(dead_code)]
 pub struct DecoderHandle(platform::DecoderHandle);
 
 pub fn decode(media: &EncodedMedia, settings: &DecodeSettings) -> DecodeStream {
