@@ -27,7 +27,7 @@ pub(crate) struct DecoderHandle;
 
 pub(crate) fn decode(media: &EncodedMedia, settings: &DecodeSettings) -> DecodeStream {
     if !video_toolbox::av1_hardware_decode_supported() {
-        return super::native::decode(media, settings);
+        return super::software::decode(media, settings);
     }
     
     let (video_sender, video_receiver) = bounded(VIDEO_QUEUE_CAPACITY);

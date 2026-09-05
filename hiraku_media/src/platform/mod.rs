@@ -1,25 +1,29 @@
 cfg_select! {
-    target_os = "macos" => {
+    all(target_os = "macos", feature = "hardware") => {
         mod macos;
-        mod native;
+        mod software;
         pub(crate) use macos::decode;
+    },
+    all(target_os = "windows", feature = "hardware") => {
+        mod software;
+        pub(crate) use software::docode;
     },
     target_family = "wasm" => {
         mod wasm;
         pub(crate) use wasm::decode;
     },
     _ => {
-        mod native;
-        pub(crate) use native::decode;
+        mod software;
+        pub(crate) use software::decode;
     }
 }
 
 #[allow(dead_code)]
 pub enum DecoderHandle {
     #[cfg(not(target_family = "wasm"))]
-    Software(native::DecoderHandle),
+    Software(software::DecoderHandle),
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "hardware"))]
     VideoToolbox(macos::DecoderHandle),
 
     #[cfg(target_family = "wasm")]

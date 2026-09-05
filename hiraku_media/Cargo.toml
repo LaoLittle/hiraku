@@ -44,3 +44,7 @@ features = [
     "VideoTransferCharacteristics",
     "Window",
 ]
+
+[features]
+default = ["hardware"]
+hardware = []
