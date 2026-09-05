@@ -137,7 +137,7 @@ jobs:
           fi
 
           cp \
-            target/${{ matrix.target }}/release/hiraku-app${EXT} \
+            target/${{ matrix.target }}/app-release/hiraku-app${EXT} \
             dist/hiraku-app-${{ matrix.name }}${EXT}
 
 
