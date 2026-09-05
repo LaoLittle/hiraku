@@ -1,59 +1,227 @@
 mod bindgen;
-
-use std::{
-    cell::{Cell, RefCell},
-    collections::VecDeque,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
-use crossbeam_channel::{Sender, unbounded};
+use std::{cell::{Cell, RefCell}, collections::VecDeque, rc::Rc, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use js_sys::{Float32Array, Promise, Uint8Array};
-use symphonia::core::codecs::{
-    audio::well_known as audio_codecs, video::well_known as video_codecs,
-};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{
-    CanvasRenderingContext2d, HtmlCanvasElement, PlaneLayout, VideoFrame,
-    VideoFrameCopyToOptions, VideoMatrixCoefficients, VideoPixelFormat,
-    VideoTransferCharacteristics,
-};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, PlaneLayout, VideoFrameCopyToOptions,
+    VideoMatrixCoefficients, VideoPixelFormat, VideoTransferCharacteristics};
+use crate::{AudioData, AudioDecoderConfig, CodecError, DecoderEvent, EncodedChunk, FlushId,
+    HardwareAcceleration, TransferFunction, VideoDecoderConfig, VideoFrame, YuvColorTransform};
+use bindgen as web;
 
-use self::bindgen::{
-    AudioData, AudioDataCopyToOptions, AudioDecoder, AudioDecoderConfig, AudioDecoderInit,
-    AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
-    EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, HardwareAcceleration,
-    VideoDecoder, VideoDecoderConfig, VideoDecoderInit,
-};
-use crate::{
-    AudioEvent, DecodeSettings, DecodeStream, EncodedMedia, TransferFunction, VideoEvent,
-    VideoFrame as DecodedFrame, VideoPixels, YuvColorTransform, container::open_container,
-};
+pub(crate) struct VideoDecoder {
+    handle: Option<Rc<VideoHandle>>,
+    receiver: Option<Receiver<DecoderEvent<VideoFrame>>>,
+}
+struct VideoHandle {
+    decoder: web::VideoDecoder,
+    state: Rc<FrameCopyState>,
+    _output: Closure<dyn FnMut(web_sys::VideoFrame)>,
+    _error: Closure<dyn FnMut(JsValue)>,
+}
+impl Drop for VideoHandle {
+    fn drop(&mut self) {
+        self.state.cancellation.store(true, Ordering::Relaxed);
+        let _ = self.decoder.close();
+    }
+}
+impl VideoDecoder {
+    pub fn new() -> Result<Self, CodecError> { Ok(Self { handle: None, receiver: None }) }
+    pub fn configure(&mut self, config: VideoDecoderConfig) -> Result<(), CodecError> {
+        if self.handle.is_none() {
+            let (sender, receiver) = unbounded();
+            let state = Rc::new(FrameCopyState {
+                queue: RefCell::new(VecDeque::new()), running: Cell::new(false), pending: Cell::new(0),
+                enqueued: Cell::new(0), completed: Cell::new(0),
+                storage: RefCell::new(None), sender: sender.clone(), cancellation: Arc::new(AtomicBool::new(false)),
+            });
+            let output_state = state.clone();
+            let output = Closure::wrap(Box::new(move |frame: web_sys::VideoFrame| {
+                output_state.enqueue(frame);
+            }) as Box<dyn FnMut(web_sys::VideoFrame)>);
+            let error = Closure::wrap(Box::new(move |error: JsValue| {
+                let _ = sender.send(DecoderEvent::Error(operation(error)));
+            }) as Box<dyn FnMut(JsValue)>);
+            let init = web::VideoDecoderInit::new(error.as_ref().unchecked_ref(), output.as_ref().unchecked_ref());
+            let decoder = web::VideoDecoder::new(&init).map_err(operation)?;
+            self.handle = Some(Rc::new(VideoHandle { decoder, state, _output: output, _error: error }));
+            self.receiver = Some(receiver);
+        }
+        self.handle.as_ref().expect("decoder initialized").decoder.configure(&video_config(&config)).map_err(operation)
+    }
+    pub fn decode(&mut self, chunk: EncodedChunk) -> Result<(), CodecError> {
+        let handle = self.handle.as_ref().ok_or(CodecError::InvalidState("browser decoder absent"))?;
+        let bytes = Uint8Array::from(chunk.data.as_ref());
+        let kind = match chunk.kind { crate::ChunkType::Key => web::EncodedVideoChunkType::Key,
+            crate::ChunkType::Delta => web::EncodedVideoChunkType::Delta };
+        let init = web::EncodedVideoChunkInit::new(bytes.unchecked_ref(), 0, kind);
+        init.set_timestamp_f64(chunk.timestamp as f64);
+        if let Some(duration) = chunk.duration { init.set_duration_f64(duration as f64); }
+        handle.decoder.decode(&web::EncodedVideoChunk::new(&init).map_err(operation)?).map_err(operation)
+    }
+    pub fn flush(&mut self, id: FlushId) -> Result<(), CodecError> {
+        let handle = self.handle.as_ref().ok_or(CodecError::InvalidState("browser decoder absent"))?.clone();
+        let promise = handle.decoder.flush();
+        spawn_local(async move {
+            let result = JsFuture::from(promise).await.map_err(operation);
+            let target = handle.state.enqueued.get();
+            while result.is_ok() && handle.state.completed.get() < target && !handle.state.cancellation.load(Ordering::Relaxed) {
+                if let Err(error) = yield_to_browser().await {
+                    let _ = handle.state.sender.send(DecoderEvent::Error(CodecError::Operation(error)));
+                    return;
+                }
+            }
+            if !handle.state.cancellation.load(Ordering::Relaxed) {
+                let event = match result { Ok(_) => DecoderEvent::Flushed(id), Err(error) => DecoderEvent::Error(error) };
+                let _ = handle.state.sender.send(event);
+            }
+        });
+        Ok(())
+    }
+    pub fn decode_queue_size(&self) -> usize { self.handle.as_ref().map_or(0, |h| h.decoder.decode_queue_size() as usize) }
+    pub fn pending_output(&self) -> usize {
+        self.receiver.as_ref().map_or(0, Receiver::len) + self.handle.as_ref().map_or(0, |h| h.state.pending.get() as usize)
+    }
+    pub fn poll(&mut self) -> Option<DecoderEvent<VideoFrame>> { self.receiver.as_ref()?.try_recv().ok() }
+    pub fn close(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.state.cancellation.store(true, Ordering::Relaxed);
+            let _ = handle.decoder.close();
+        }
+        self.receiver = None;
+    }
+}
 
-const VIDEO_QUEUE_CAPACITY: usize = 3;
-const VIDEO_DECODE_QUEUE_LIMIT: u32 = VIDEO_QUEUE_CAPACITY as u32;
-const AUDIO_DECODE_QUEUE_LIMIT: u32 = 24;
-const AV1_CODEC: &str = "av01.0.12M.08";
-const OPUS_CODEC: &str = "opus";
+pub(crate) struct AudioDecoder {
+    handle: Option<Rc<AudioHandle>>,
+    receiver: Option<Receiver<DecoderEvent<AudioData>>>,
+}
+struct AudioHandle {
+    decoder: web::AudioDecoder,
+    sender: Sender<DecoderEvent<AudioData>>,
+    cancelled: Cell<bool>,
+    _output: Closure<dyn FnMut(web::AudioData)>,
+    _error: Closure<dyn FnMut(JsValue)>,
+}
+impl Drop for AudioHandle { fn drop(&mut self) { let _ = self.decoder.close(); } }
+impl AudioDecoder {
+    pub fn new() -> Result<Self, CodecError> { Ok(Self { handle: None, receiver: None }) }
+    pub fn configure(&mut self, config: AudioDecoderConfig) -> Result<(), CodecError> {
+        if self.handle.is_none() {
+            let (sender, receiver) = unbounded();
+            let output_sender = sender.clone();
+            let output = Closure::wrap(Box::new(move |data: web::AudioData| {
+                let event = match audio_data(&data) {
+                    Ok(data) => DecoderEvent::Output(data), Err(error) => DecoderEvent::Error(error),
+                };
+                data.close();
+                let _ = output_sender.send(event);
+            }) as Box<dyn FnMut(web::AudioData)>);
+            let error_sender = sender.clone();
+            let error = Closure::wrap(Box::new(move |error: JsValue| {
+                let _ = error_sender.send(DecoderEvent::Error(operation(error)));
+            }) as Box<dyn FnMut(JsValue)>);
+            let init = web::AudioDecoderInit::new(error.as_ref().unchecked_ref(), output.as_ref().unchecked_ref());
+            let decoder = web::AudioDecoder::new(&init).map_err(operation)?;
+            self.handle = Some(Rc::new(AudioHandle { decoder, sender, cancelled: Cell::new(false), _output: output, _error: error }));
+            self.receiver = Some(receiver);
+        }
+        self.handle.as_ref().expect("decoder initialized").decoder.configure(&audio_config(&config)).map_err(operation)
+    }
+    pub fn decode(&mut self, chunk: EncodedChunk) -> Result<(), CodecError> {
+        let handle = self.handle.as_ref().ok_or(CodecError::InvalidState("browser decoder absent"))?;
+        let bytes = Uint8Array::from(chunk.data.as_ref());
+        let kind = match chunk.kind { crate::ChunkType::Key => web::EncodedAudioChunkType::Key,
+            crate::ChunkType::Delta => web::EncodedAudioChunkType::Delta };
+        let init = web::EncodedAudioChunkInit::new(bytes.unchecked_ref(), 0, kind);
+        init.set_timestamp_f64(chunk.timestamp as f64);
+        if let Some(duration) = chunk.duration { init.set_duration_f64(duration as f64); }
+        handle.decoder.decode(&web::EncodedAudioChunk::new(&init).map_err(operation)?).map_err(operation)
+    }
+    pub fn flush(&mut self, id: FlushId) -> Result<(), CodecError> {
+        let handle = self.handle.as_ref().ok_or(CodecError::InvalidState("browser decoder absent"))?.clone();
+        let promise = handle.decoder.flush();
+        spawn_local(async move {
+            let event = match JsFuture::from(promise).await {
+                Ok(_) => DecoderEvent::Flushed(id), Err(error) => DecoderEvent::Error(operation(error)),
+            };
+            if !handle.cancelled.get() { let _ = handle.sender.send(event); }
+        });
+        Ok(())
+    }
+    pub fn decode_queue_size(&self) -> usize { self.handle.as_ref().map_or(0, |h| h.decoder.decode_queue_size() as usize) }
+    pub fn pending_output(&self) -> usize { self.receiver.as_ref().map_or(0, Receiver::len) }
+    pub fn poll(&mut self) -> Option<DecoderEvent<AudioData>> { self.receiver.as_ref()?.try_recv().ok() }
+    pub fn close(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.cancelled.set(true);
+            let _ = handle.decoder.close();
+        }
+        self.receiver = None;
+    }
+}
+fn video_config(config: &VideoDecoderConfig) -> web::VideoDecoderConfig {
+    let value = web::VideoDecoderConfig::new(&config.codec.0);
+    value.set_coded_width(config.coded_width);
+    value.set_coded_height(config.coded_height);
+    value.set_optimize_for_latency(config.optimize_for_latency);
+    value.set_hardware_acceleration(match config.hardware_acceleration {
+        HardwareAcceleration::NoPreference => web::HardwareAcceleration::NoPreference,
+        HardwareAcceleration::PreferHardware => web::HardwareAcceleration::PreferHardware,
+        HardwareAcceleration::PreferSoftware => web::HardwareAcceleration::PreferSoftware,
+    });
+    if let Some(description) = &config.description {
+        value.set_description_u8_array(&Uint8Array::from(description.as_ref()));
+    }
+    value
+}
+fn audio_config(config: &AudioDecoderConfig) -> web::AudioDecoderConfig {
+    let value = web::AudioDecoderConfig::new(&config.codec.0, config.number_of_channels.into(), config.sample_rate);
+    if let Some(description) = &config.description {
+        value.set_description_u8_array(&Uint8Array::from(description.as_ref()));
+    }
+    value
+}
+pub(crate) async fn video_config_supported(config: &VideoDecoderConfig) -> Result<bool, CodecError> {
+    support(web::VideoDecoder::is_config_supported(&video_config(config)).map_err(operation)?).await
+}
+pub(crate) async fn audio_config_supported(config: &AudioDecoderConfig) -> Result<bool, CodecError> {
+    support(web::AudioDecoder::is_config_supported(&audio_config(config)).map_err(operation)?).await
+}
+async fn support(promise: Promise) -> Result<bool, CodecError> {
+    let value = JsFuture::from(promise).await.map_err(operation)?;
+    Ok(js_sys::Reflect::get(&value, &JsValue::from_str("supported")).map_err(operation)?.as_bool().unwrap_or(false))
+}
+fn audio_data(data: &web::AudioData) -> Result<AudioData, CodecError> {
+    let options = web::AudioDataCopyToOptions::new(0);
+    options.set_format(web::AudioSampleFormat::F32);
+    let byte_len = data.allocation_size(&options).map_err(operation)?;
+    if byte_len % 4 != 0 { return Err(CodecError::Operation("unaligned f32 PCM size".into())); }
+    let storage = Float32Array::new_with_length(byte_len / 4);
+    data.copy_to_with_buffer_source(storage.unchecked_ref(), &options).map_err(operation)?;
+    let mut samples = vec![0.0; storage.length() as usize];
+    storage.copy_to(&mut samples);
+    Ok(AudioData { timestamp: data.timestamp() as i64, sample_rate: data.sample_rate() as u32,
+        number_of_channels: u16::try_from(data.number_of_channels()).map_err(|_| CodecError::Operation("channel count overflow".into()))?,
+        samples: samples.into() })
+}
+fn operation(error: JsValue) -> CodecError { CodecError::Operation(js_error(&error)) }
 
 struct FrameCopyState {
-    queue: RefCell<VecDeque<VideoFrame>>,
+    queue: RefCell<VecDeque<web_sys::VideoFrame>>,
     running: Cell<bool>,
     pending: Cell<u32>,
-    first_timestamp: Cell<Option<f64>>,
+    enqueued: Cell<u64>,
+    completed: Cell<u64>,
     storage: RefCell<Option<Uint8Array>>,
-    sender: Sender<VideoEvent>,
+    sender: Sender<DecoderEvent<VideoFrame>>,
     cancellation: Arc<AtomicBool>,
-    queued_frames: Arc<AtomicUsize>,
 }
 
 impl FrameCopyState {
-    fn enqueue(self: &Rc<Self>, frame: VideoFrame) {
+    fn enqueue(self: &Rc<Self>, frame: web_sys::VideoFrame) {
+        self.enqueued.set(self.enqueued.get() + 1);
         self.pending.set(self.pending.get().saturating_add(1));
         self.queue.borrow_mut().push_back(frame);
         if !self.running.replace(true) {
@@ -71,19 +239,19 @@ impl FrameCopyState {
             if self.cancellation.load(Ordering::Relaxed) {
                 frame.close();
                 self.pending.set(self.pending.get().saturating_sub(1));
+                self.completed.set(self.completed.get() + 1);
                 continue;
             }
             let decoded = decode_frame(&frame, &self).await;
             frame.close();
             self.pending.set(self.pending.get().saturating_sub(1));
+            self.completed.set(self.completed.get() + 1);
             match decoded {
                 Ok(frame) => {
-                    if self.sender.send(VideoEvent::Frame(frame)).is_ok() {
-                        self.queued_frames.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = self.sender.send(DecoderEvent::Output(frame));
                 }
                 Err(error) => {
-                    let _ = self.sender.send(VideoEvent::Error(error));
+                    let _ = self.sender.send(DecoderEvent::Error(CodecError::Operation(error)));
                 }
             }
         }
@@ -109,289 +277,12 @@ impl Drop for FrameCopyState {
     }
 }
 
-pub(crate) struct DecoderHandle {
-    video_decoder: Option<VideoDecoder>,
-    audio_decoder: Option<AudioDecoder>,
-    copy_state: Rc<FrameCopyState>,
-    _video_output: Closure<dyn FnMut(VideoFrame)>,
-    _video_error: Closure<dyn FnMut(JsValue)>,
-    _audio_output: Closure<dyn FnMut(AudioData)>,
-    _audio_error: Closure<dyn FnMut(JsValue)>,
-}
-
-impl Drop for DecoderHandle {
-    fn drop(&mut self) {
-        self.copy_state.cancellation.store(true, Ordering::Relaxed);
-        if let Some(decoder) = self.video_decoder.take() {
-            let _ = decoder.close();
-        }
-        if let Some(decoder) = self.audio_decoder.take() {
-            let _ = decoder.close();
-        }
-    }
-}
-
-pub(crate) fn decode(media: &EncodedMedia, _settings: &DecodeSettings) -> DecodeStream {
-    let (video_sender, video_receiver) = unbounded();
-    let (audio_sender, audio_receiver) = unbounded();
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let queued_frames = Arc::new(AtomicUsize::new(0));
-    let copy_state = Rc::new(FrameCopyState {
-        queue: RefCell::new(VecDeque::new()),
-        running: Cell::new(false),
-        pending: Cell::new(0),
-        first_timestamp: Cell::new(None),
-        storage: RefCell::new(None),
-        sender: video_sender.clone(),
-        cancellation: cancellation.clone(),
-        queued_frames: queued_frames.clone(),
-    });
-
-    let output_state = copy_state.clone();
-    let video_output = Closure::wrap(Box::new(move |frame: VideoFrame| {
-        output_state.enqueue(frame);
-    }) as Box<dyn FnMut(VideoFrame)>);
-    let video_error_sender = video_sender.clone();
-    let video_error = Closure::wrap(Box::new(move |error: JsValue| {
-        let _ = video_error_sender.send(VideoEvent::Error(format!(
-            "WebCodecs AV1 decode failed: {}",
-            js_error(&error)
-        )));
-    }) as Box<dyn FnMut(JsValue)>);
-
-    let audio_output_sender = audio_sender.clone();
-    let audio_output = Closure::wrap(Box::new(move |data: AudioData| {
-        match audio_data_to_pcm(&data) {
-            Ok(samples) => {
-                let _ = audio_output_sender.send(AudioEvent::Samples(samples));
-            }
-            Err(error) => {
-                let _ = audio_output_sender.send(AudioEvent::Error(error));
-            }
-        }
-        data.close();
-    }) as Box<dyn FnMut(AudioData)>);
-    let audio_error_sender = audio_sender.clone();
-    let audio_error = Closure::wrap(Box::new(move |error: JsValue| {
-        let _ = audio_error_sender.send(AudioEvent::Error(format!(
-            "WebCodecs Opus decode failed: {}",
-            js_error(&error)
-        )));
-    }) as Box<dyn FnMut(JsValue)>);
-
-    let video_decoder = create_video_decoder(media, &video_output, &video_error)
-        .inspect_err(|error| {
-            let _ = video_sender.send(VideoEvent::Error(error.clone()));
-        })
-        .ok();
-    let audio_decoder = create_audio_decoder(media, &audio_output, &audio_error)
-        .inspect_err(|error| {
-            let _ = audio_sender.send(AudioEvent::Error(error.clone()));
-        })
-        .ok();
-
-    if let (Some(video_decoder), Some(audio_decoder)) =
-        (video_decoder.clone(), audio_decoder.clone())
-    {
-        let bytes = media.bytes.clone();
-        let worker_cancellation = cancellation.clone();
-        let worker_queued_frames = queued_frames.clone();
-        let worker_copy_state = copy_state.clone();
-        spawn_local(async move {
-            match feed_packets(
-                bytes,
-                &video_decoder,
-                &audio_decoder,
-                &worker_cancellation,
-                &worker_queued_frames,
-                &worker_copy_state,
-            )
-            .await
-            {
-                Ok(()) if !worker_cancellation.load(Ordering::Relaxed) => {
-                    let _ = video_sender.send(VideoEvent::End);
-                    let _ = audio_sender.send(AudioEvent::End);
-                }
-                Err(error) if !worker_cancellation.load(Ordering::Relaxed) => {
-                    let _ = video_sender.send(VideoEvent::Error(error.clone()));
-                    let _ = audio_sender.send(AudioEvent::Error(error));
-                }
-                _ => {}
-            }
-        });
-    }
-
-    DecodeStream {
-        video: video_receiver,
-        audio: audio_receiver,
-        metadata: media.metadata,
-        cancellation,
-        queued_frames: Some(queued_frames),
-        handle: crate::DecoderHandle(super::DecoderHandle::WebCodecs(
-            DecoderHandle {
-                video_decoder,
-                audio_decoder,
-                copy_state,
-                _video_output: video_output,
-                _video_error: video_error,
-                _audio_output: audio_output,
-                _audio_error: audio_error,
-            }
-        )),
-    }
-}
-
-fn create_video_decoder(
-    media: &EncodedMedia,
-    output: &Closure<dyn FnMut(VideoFrame)>,
-    error: &Closure<dyn FnMut(JsValue)>,
-) -> Result<VideoDecoder, String> {
-    let init = VideoDecoderInit::new(error.as_ref().unchecked_ref(), output.as_ref().unchecked_ref());
-    let decoder = VideoDecoder::new(&init)
-        .map_err(|error| format!("WebCodecs AV1 decoder is unavailable: {}", js_error(&error)))?;
-    let config = VideoDecoderConfig::new(AV1_CODEC);
-    config.set_coded_width(media.metadata.width);
-    config.set_coded_height(media.metadata.height);
-    config.set_hardware_acceleration(HardwareAcceleration::PreferHardware);
-    config.set_optimize_for_latency(true);
-    decoder
-        .configure(&config)
-        .map_err(|error| format!("failed to configure WebCodecs AV1: {}", js_error(&error)))?;
-    Ok(decoder)
-}
-
-fn create_audio_decoder(
-    media: &EncodedMedia,
-    output: &Closure<dyn FnMut(AudioData)>,
-    error: &Closure<dyn FnMut(JsValue)>,
-) -> Result<AudioDecoder, String> {
-    let init = AudioDecoderInit::new(error.as_ref().unchecked_ref(), output.as_ref().unchecked_ref());
-    let decoder = AudioDecoder::new(&init)
-        .map_err(|error| format!("WebCodecs Opus decoder is unavailable: {}", js_error(&error)))?;
-    let config = AudioDecoderConfig::new(
-        OPUS_CODEC,
-        u32::from(media.metadata.channels),
-        media.metadata.sample_rate,
-    );
-    decoder
-        .configure(&config)
-        .map_err(|error| format!("failed to configure WebCodecs Opus: {}", js_error(&error)))?;
-    Ok(decoder)
-}
-
-fn audio_data_to_pcm(data: &AudioData) -> Result<Vec<f32>, String> {
-    let options = AudioDataCopyToOptions::new(0);
-    options.set_format(AudioSampleFormat::F32);
-    let byte_len = data
-        .allocation_size(&options)
-        .map_err(|error| format!("WebCodecs PCM allocation failed: {}", js_error(&error)))?;
-    if byte_len % 4 != 0 {
-        return Err(format!("WebCodecs returned a non-f32-aligned PCM size ({byte_len} bytes)"));
-    }
-    let storage = Float32Array::new_with_length(byte_len / 4);
-    data.copy_to_with_buffer_source(storage.unchecked_ref(), &options)
-        .map_err(|error| format!("WebCodecs PCM copy failed: {}", js_error(&error)))?;
-    let mut samples = vec![0.0; storage.length() as usize];
-    storage.copy_to(&mut samples);
-    Ok(samples)
-}
-
-async fn feed_packets(
-    bytes: Arc<[u8]>,
-    video_decoder: &VideoDecoder,
-    audio_decoder: &AudioDecoder,
-    cancellation: &AtomicBool,
-    queued_frames: &AtomicUsize,
-    copy_state: &FrameCopyState,
-) -> Result<(), String> {
-    let mut format = open_container(bytes, "webm").map_err(|error| error.to_string())?;
-    let mut video_track = None;
-    let mut audio_track = None;
-    let mut video_time_base = (1, 1);
-    let mut audio_time_base = (1, 1);
-    for track in format.tracks() {
-        let Some(parameters) = &track.codec_params else { continue };
-        if let Some(video) = parameters.video()
-            && video.codec == video_codecs::CODEC_ID_AV1
-        {
-            video_track = Some(track.id);
-            if let Some(base) = track.time_base {
-                video_time_base = (base.numer.get(), base.denom.get());
-            }
-        }
-        if let Some(audio) = parameters.audio()
-            && audio.codec == audio_codecs::CODEC_ID_OPUS
-        {
-            audio_track = Some(track.id);
-            if let Some(base) = track.time_base {
-                audio_time_base = (base.numer.get(), base.denom.get());
-            }
-        }
-    }
-    let video_track = video_track.ok_or_else(|| "AV1 video track disappeared".to_string())?;
-    let audio_track = audio_track.ok_or_else(|| "Opus audio track disappeared".to_string())?;
-    let mut first_video_packet = true;
-
-    loop {
-        if cancellation.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let packet = match format.next_packet() {
-            Ok(Some(packet)) => packet,
-            Ok(None) => break,
-            Err(error) => return Err(format!("Matroska demux failed: {error}")),
-        };
-        if packet.track_id == video_track {
-            while video_decoder.decode_queue_size() + copy_state.pending.get() >= VIDEO_DECODE_QUEUE_LIMIT
-                || queued_frames.load(Ordering::Relaxed) >= VIDEO_QUEUE_CAPACITY
-            {
-                yield_to_browser().await?;
-                if cancellation.load(Ordering::Relaxed) { return Ok(()) }
-            }
-            let data = Uint8Array::from(packet.data.as_ref());
-            let kind = if first_video_packet { EncodedVideoChunkType::Key } else { EncodedVideoChunkType::Delta };
-            let init = EncodedVideoChunkInit::new(data.unchecked_ref(), 0, kind);
-            init.set_timestamp_f64(timestamp_micros_signed(packet.pts.get(), video_time_base));
-            init.set_duration_f64(timestamp_micros(packet.dur.get(), video_time_base));
-            let chunk = EncodedVideoChunk::new(&init)
-                .map_err(|error| format!("failed to create WebCodecs AV1 packet: {}", js_error(&error)))?;
-            video_decoder.decode(&chunk)
-                .map_err(|error| format!("WebCodecs rejected AV1 packet: {}", js_error(&error)))?;
-            first_video_packet = false;
-        } else if packet.track_id == audio_track {
-            while audio_decoder.decode_queue_size() >= AUDIO_DECODE_QUEUE_LIMIT {
-                yield_to_browser().await?;
-                if cancellation.load(Ordering::Relaxed) { return Ok(()) }
-            }
-            let data = Uint8Array::from(packet.data.as_ref());
-            let init = EncodedAudioChunkInit::new(data.unchecked_ref(), 0, EncodedAudioChunkType::Key);
-            init.set_timestamp_f64(timestamp_micros_signed(packet.pts.get(), audio_time_base));
-            init.set_duration_f64(timestamp_micros(packet.dur.get(), audio_time_base));
-            let chunk = EncodedAudioChunk::new(&init)
-                .map_err(|error| format!("failed to create WebCodecs Opus packet: {}", js_error(&error)))?;
-            audio_decoder.decode(&chunk)
-                .map_err(|error| format!("WebCodecs rejected Opus packet: {}", js_error(&error)))?;
-        }
-    }
-
-    JsFuture::from(video_decoder.flush()).await
-        .map_err(|error| format!("WebCodecs video flush failed: {}", js_error(&error)))?;
-    JsFuture::from(audio_decoder.flush()).await
-        .map_err(|error| format!("WebCodecs audio flush failed: {}", js_error(&error)))?;
-    while copy_state.pending.get() != 0 { yield_to_browser().await?; }
-    Ok(())
-}
-
-async fn decode_frame(frame: &VideoFrame, state: &FrameCopyState) -> Result<DecodedFrame, String> {
+async fn decode_frame(frame: &web_sys::VideoFrame, state: &FrameCopyState) -> Result<VideoFrame, String> {
     let width = frame.coded_width();
     let height = frame.coded_height();
     let chroma_width = width.div_ceil(2);
     let chroma_height = height.div_ceil(2);
     let timestamp = frame.timestamp();
-    let first_timestamp = state.first_timestamp.get().unwrap_or_else(|| {
-        state.first_timestamp.set(Some(timestamp));
-        timestamp
-    });
     let color_space = frame.color_space();
     let full_range = color_space.full_range().unwrap_or(false);
     let (kr, kb) = match color_space.matrix() {
@@ -409,14 +300,14 @@ async fn decode_frame(frame: &VideoFrame, state: &FrameCopyState) -> Result<Deco
     };
     let pixels = if frame.format() == Some(VideoPixelFormat::I420) {
         match copy_i420(frame, state, width, height).await {
-            Ok((y, u, v)) => VideoPixels::I420Planar { y, u, v },
-            Err(_) => VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?),
+            Ok((y, u, v)) => crate::VideoPixels::I420Planar { y, u, v },
+            Err(_) => crate::VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?),
         }
     } else {
-        VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?)
+        crate::VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?)
     };
-    Ok(DecodedFrame {
-        timestamp: Duration::from_secs_f64(((timestamp - first_timestamp) / 1_000_000.0).max(0.0)),
+    Ok(VideoFrame {
+        timestamp: timestamp as i64,
         width,
         height,
         chroma_width,
@@ -428,7 +319,7 @@ async fn decode_frame(frame: &VideoFrame, state: &FrameCopyState) -> Result<Deco
 }
 
 async fn copy_i420(
-    frame: &VideoFrame,
+    frame: &web_sys::VideoFrame,
     state: &FrameCopyState,
     width: u32,
     height: u32,
@@ -456,7 +347,7 @@ async fn copy_i420(
     ))
 }
 
-async fn copy_rgba(frame: &VideoFrame, state: &FrameCopyState, width: u32, height: u32) -> Result<Vec<u8>, String> {
+async fn copy_rgba(frame: &web_sys::VideoFrame, state: &FrameCopyState, width: u32, height: u32) -> Result<Vec<u8>, String> {
     let options = VideoFrameCopyToOptions::new();
     options.set_format(VideoPixelFormat::Rgba);
     options.set_layout(&[PlaneLayout::new(0, width.saturating_mul(4))]);
@@ -469,7 +360,7 @@ async fn copy_rgba(frame: &VideoFrame, state: &FrameCopyState, width: u32, heigh
     copy_rgba_with_canvas(frame, width, height)
 }
 
-fn copy_rgba_with_canvas(frame: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>, String> {
+fn copy_rgba_with_canvas(frame: &web_sys::VideoFrame, width: u32, height: u32) -> Result<Vec<u8>, String> {
     let document = web_sys::window().and_then(|window| window.document())
         .ok_or_else(|| "browser document is unavailable".to_string())?;
     let canvas: HtmlCanvasElement = document.create_element("canvas")
@@ -500,14 +391,6 @@ async fn yield_to_browser() -> Result<(), String> {
     });
     JsFuture::from(promise).await.map(|_| ())
         .map_err(|error| format!("browser decode yield failed: {}", js_error(&error)))
-}
-
-fn timestamp_micros(value: u64, time_base: (u32, u32)) -> f64 {
-    value as f64 * f64::from(time_base.0) / f64::from(time_base.1) * 1_000_000.0
-}
-
-fn timestamp_micros_signed(value: i64, time_base: (u32, u32)) -> f64 {
-    value.max(0) as f64 * f64::from(time_base.0) / f64::from(time_base.1) * 1_000_000.0
 }
 
 fn uint8_array_to_vec(array: &Uint8Array) -> Vec<u8> {

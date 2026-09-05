@@ -1,9 +1,5 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::Duration,
 };
 
@@ -16,17 +12,15 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 
-use crate::platform::{
-    VideoFrameI420, VideoFrameNv12, VideoFrameUpload, VideoUpload, install_video_upload,
-};
+use crate::decode::{MediaDecoder, VideoEvent as DecodeEvent};
+use crate::upload::{VideoUpload, install_video_upload};
 use crate::{
     VideoAsset, VideoAssetLoader,
     audio::VideoAudio,
     render::{Yuv420Material, load_internal_shader},
 };
 use hiraku_media::{
-    DecodeSettings, DecoderHandle, VideoEvent as DecodeEvent, VideoFrame as DecodedFrame,
-    VideoPixels as DecodedPixels, YuvPixelFormat,
+    DecodeSettings, VideoFrame as DecodedFrame, VideoPixels as DecodedPixels, YuvPixelFormat,
 };
 
 const VIDEO_Z_INDEX: i32 = 30_000;
@@ -173,10 +167,9 @@ struct ActivePlayback {
     started: bool,
     decoder_ended: bool,
     last_timestamp: Duration,
-    cancellation: Arc<AtomicBool>,
-    queued_frames: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    audio_clock: VideoAudio,
     age: Duration,
-    _decoder: DecoderHandle,
+    decoder: MediaDecoder,
 }
 
 enum VideoSurface {
@@ -257,13 +250,20 @@ fn start_pending_video(
         player.states.get(&pending.id),
         Some(VideoPlaybackState::Paused)
     );
-    let stream = hiraku_media::decode(
+    let stream = match MediaDecoder::new(
         &asset.media,
-        &DecodeSettings {
+        DecodeSettings {
             decoder_threads: decode_settings.decoder_threads,
             max_frame_delay: decode_settings.max_frame_delay,
         },
-    );
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            fail_playback(pending.id, error.to_string(), &mut player, &mut events);
+            return;
+        }
+    };
+    let audio = VideoAudio::new(stream.audio.clone(), asset.metadata);
     let root = commands
         .spawn((
             Node {
@@ -281,15 +281,11 @@ fn start_pending_video(
             Pickable::IGNORE,
         ))
         .id();
-    let audio_entity = spawn_movie_audio(
-        &mut commands,
-        &mut audio_assets,
-        VideoAudio::new(stream.audio, stream.metadata),
-    );
+    let audio_entity = spawn_movie_audio(&mut commands, &mut audio_assets, audio.clone());
     player.active = Some(pending.id);
     active.0 = Some(ActivePlayback {
         id: pending.id,
-        receiver: stream.video,
+        receiver: stream.video.clone(),
         frames: VecDeque::new(),
         surface: None,
         root,
@@ -299,10 +295,9 @@ fn start_pending_video(
         started: false,
         decoder_ended: false,
         last_timestamp: Duration::ZERO,
-        cancellation: stream.cancellation,
-        queued_frames: stream.queued_frames,
+        audio_clock: audio,
         age: Duration::ZERO,
-        _decoder: stream.handle,
+        decoder: stream,
     });
 }
 
@@ -378,9 +373,11 @@ fn update_video(
     mut video_upload: ResMut<VideoUpload>,
 ) {
     let Some(playback) = active.0.as_mut() else {
+        video_upload.clear();
         return;
     };
     playback.age += time.delta();
+    playback.decoder.poll();
     if playback
         .audio_entity
         .is_none_or(|audio_entity| sinks.get(audio_entity).is_err())
@@ -422,7 +419,6 @@ fn update_video(
             },
         );
         events.write(VideoEvent::Started { id: playback.id });
-        if !playback.paused {}
     }
     if playback.started && !playback.paused {
         if let Some(audio_entity) = playback.audio_entity
@@ -434,22 +430,29 @@ fn update_video(
         playback.position = playback
             .audio_entity
             .and_then(|audio_entity| sinks.get(audio_entity).ok())
-            .map(AudioSinkPlayback::position)
+            .map(|sink| {
+                if sink.empty() {
+                    playback.position + time.delta()
+                } else {
+                    playback.audio_clock.position()
+                }
+            })
             .unwrap_or_else(|| playback.position + time.delta());
     }
-    while playback
-        .frames
-        .front()
-        .is_some_and(|frame| frame.timestamp <= playback.position)
-    {
+    // Only the newest due frame can be visible this render tick. Do not create/update
+    // surfaces or publish GPU uploads for frames that have already been superseded.
+    let mut due_frame = None;
+    while playback.frames.front().is_some_and(|frame| {
+        Duration::from_micros(frame.timestamp.max(0) as u64) <= playback.position
+    }) {
         let frame = playback
             .frames
             .pop_front()
             .expect("the checked frame queue must not be empty");
-        if let Some(queued_frames) = playback.queued_frames.as_ref() {
-            queued_frames.fetch_sub(1, Ordering::Relaxed);
-        }
-        playback.last_timestamp = frame.timestamp;
+        due_frame = Some(frame);
+    }
+    if let Some(frame) = due_frame {
+        playback.last_timestamp = Duration::from_micros(frame.timestamp.max(0) as u64);
         present_frame(
             &mut commands,
             &mut images,
@@ -496,8 +499,12 @@ fn present_frame(
 ) {
     let aspect_ratio = frame.width as f32 / frame.height as f32;
     let (y, u, v) = match frame.pixels {
-        DecodedPixels::I420Planar { y, u, v } => (y, u, v),
+        DecodedPixels::I420Planar { y, u, v } => {
+            upload.clear();
+            (y, u, v)
+        }
         DecodedPixels::Rgba(rgba) => {
+            upload.clear();
             if let Some(VideoSurface::Rgba {
                 image,
                 image_entity,
@@ -581,7 +588,7 @@ fn present_frame(
         chroma0: u_image.clone(),
         chroma1: v_image.clone(),
         color_transform: frame.color_transform.into(),
-        transfer: frame.transfer.into(),
+        transfer: frame.transfer,
         format: YuvPixelFormat::I420,
     });
     let image_entity = commands
@@ -614,16 +621,6 @@ fn present_strided_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
-    let DecodedPixels::I420Strided {
-        planes,
-        u_offset,
-        v_offset,
-        y_stride,
-        chroma_stride,
-    } = frame.pixels
-    else {
-        unreachable!("strided frame presenter received a packed WebCodecs frame")
-    };
     let aspect_ratio = frame.width as f32 / frame.height as f32;
     let (y_image, u_image, v_image, image_entity) = if let Some(VideoSurface::YuvI420 {
         y_image,
@@ -648,7 +645,7 @@ fn present_strided_frame(
             chroma0: u_image.clone(),
             chroma1: v_image.clone(),
             color_transform: frame.color_transform.into(),
-            transfer: frame.transfer.into(),
+            transfer: frame.transfer,
             format: YuvPixelFormat::I420,
         });
         let image_entity = commands
@@ -677,27 +674,7 @@ fn present_strided_frame(
         node.aspect_ratio = Some(aspect_ratio);
     }
 
-    let DecodedFrame {
-        width,
-        height,
-        chroma_width,
-        chroma_height,
-        ..
-    } = frame;
-    upload.publish(VideoFrameUpload::I420(VideoFrameI420 {
-        y_image,
-        u_image,
-        v_image,
-        width,
-        height,
-        chroma_width,
-        chroma_height,
-        planes,
-        u_offset,
-        v_offset,
-        y_stride,
-        chroma_stride,
-    }));
+    upload.publish(frame, [y_image, u_image, v_image]);
 }
 
 fn present_nv12_frame(
@@ -709,16 +686,6 @@ fn present_nv12_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
-    let DecodedPixels::Nv12Strided {
-        planes,
-        uv_offset,
-        y_stride,
-        uv_stride,
-    } = frame.pixels
-    else {
-        unreachable!("Nv12 presenter received a non-NV12 frame");
-    };
-
     let aspect_ratio = frame.width as f32 / frame.height as f32;
 
     let (y_image, uv_image, image_entity) = if let Some(VideoSurface::YuvNv12 {
@@ -745,7 +712,7 @@ fn present_nv12_frame(
             chroma0: uv_image.clone(),
             chroma1: dummy_image.clone(),
             color_transform: frame.color_transform.into(),
-            transfer: frame.transfer.into(),
+            transfer: frame.transfer,
             format: YuvPixelFormat::Nv12,
         });
 
@@ -777,25 +744,7 @@ fn present_nv12_frame(
         node.aspect_ratio = Some(aspect_ratio);
     }
 
-    let DecodedFrame {
-        width,
-        height,
-        chroma_width,
-        chroma_height,
-        ..
-    } = frame;
-    upload.publish(VideoFrameUpload::Nv12(VideoFrameNv12 {
-        y_image,
-        uv_image,
-        width,
-        height,
-        chroma_width,
-        chroma_height,
-        planes,
-        uv_offset,
-        y_stride,
-        uv_stride,
-    }));
+    upload.publish(frame, [y_image, uv_image, Handle::default()]);
 }
 
 fn replace_surface(commands: &mut Commands, playback: &mut ActivePlayback) {
@@ -809,7 +758,6 @@ fn replace_surface(commands: &mut Commands, playback: &mut ActivePlayback) {
 }
 
 fn cleanup_playback(commands: &mut Commands, playback: &ActivePlayback) {
-    playback.cancellation.store(true, Ordering::Relaxed);
     commands.entity(playback.root).try_despawn();
     if let Some(audio_entity) = playback.audio_entity {
         commands.entity(audio_entity).try_despawn();

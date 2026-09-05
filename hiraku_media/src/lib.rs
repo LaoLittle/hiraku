@@ -1,42 +1,13 @@
-//! Platform-independent media inspection and asynchronous decoding.
+//! A Rust WebCodecs-style API for platform-independent codec processing.
 //!
-//! This crate owns codecs and container parsing. Consumers receive timestamped
-//! PCM and video frames and decide how to play or render them.
+//! Feed encoded chunks and poll decoded frames. Containers, asset loading,
+//! playback clocks and rendering belong to consumers of this crate.
 
-mod container;
+mod codec;
 mod platform;
+pub use codec::*;
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize},
-    },
-    time::Duration,
-};
-
-pub use container::{MediaError, inspect_media};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MediaMetadata {
-    pub width: u32,
-    pub height: u32,
-    pub sample_rate: u32,
-    pub channels: u16,
-}
-
-#[derive(Clone, Debug)]
-pub struct EncodedMedia {
-    pub bytes: Arc<[u8]>,
-    pub metadata: MediaMetadata,
-}
-
-impl EncodedMedia {
-    pub fn inspect(bytes: impl Into<Arc<[u8]>>, extension: &str) -> Result<Self, MediaError> {
-        let bytes = bytes.into();
-        let metadata = inspect_media(&bytes, extension)?;
-        Ok(Self { bytes, metadata })
-    }
-}
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct DecodeSettings {
@@ -89,7 +60,7 @@ impl YuvColorTransform {
 
 #[derive(Debug)]
 pub struct VideoFrame {
-    pub timestamp: Duration,
+    pub timestamp: i64,
     pub width: u32,
     pub height: u32,
     pub chroma_width: u32,
@@ -123,32 +94,17 @@ pub enum VideoPixels {
     Rgba(Vec<u8>),
 }
 
-#[derive(Debug)]
-pub enum VideoEvent {
-    Frame(VideoFrame),
-    End,
-    Error(String),
+#[derive(Clone, Debug)]
+pub struct AudioData {
+    pub timestamp: i64,
+    pub sample_rate: u32,
+    pub number_of_channels: u16,
+    /// Interleaved f32 PCM. Clone retains the same allocation.
+    pub samples: Arc<[f32]>,
 }
 
-#[derive(Debug)]
-pub enum AudioEvent {
-    Samples(Vec<f32>),
-    End,
-    Error(String),
-}
-
-pub struct DecodeStream {
-    pub video: crossbeam_channel::Receiver<VideoEvent>,
-    pub audio: crossbeam_channel::Receiver<AudioEvent>,
-    pub metadata: MediaMetadata,
-    pub cancellation: Arc<AtomicBool>,
-    pub queued_frames: Option<Arc<AtomicUsize>>,
-    pub handle: DecoderHandle,
-}
-
-#[allow(dead_code)]
-pub struct DecoderHandle(platform::DecoderHandle);
-
-pub fn decode(media: &EncodedMedia, settings: &DecodeSettings) -> DecodeStream {
-    platform::decode(media, settings)
+impl AudioData {
+    pub fn number_of_frames(&self) -> usize {
+        self.samples.len() / usize::from(self.number_of_channels.max(1))
+    }
 }

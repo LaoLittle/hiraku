@@ -81,6 +81,9 @@ extern "C" {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub type VideoDecoder;
 
+    #[wasm_bindgen(catch, static_method_of = VideoDecoder, js_name = isConfigSupported)]
+    pub fn is_config_supported(config: &VideoDecoderConfig) -> Result<::js_sys::Promise, JsValue>;
+
     #[wasm_bindgen(method, getter, js_class = "VideoDecoder", js_name = "state")]
     pub fn state(this: &VideoDecoder) -> CodecState;
 
@@ -440,6 +443,9 @@ extern "C" {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub type AudioDecoder;
 
+    #[wasm_bindgen(catch, static_method_of = AudioDecoder, js_name = isConfigSupported)]
+    pub fn is_config_supported(config: &AudioDecoderConfig) -> Result<::js_sys::Promise, JsValue>;
+
     #[wasm_bindgen(catch, constructor, js_class = "AudioDecoder")]
     pub fn new(init: &AudioDecoderInit) -> Result<AudioDecoder, JsValue>;
 
@@ -461,6 +467,9 @@ extern "C" {
     #[wasm_bindgen(extends = ::js_sys::Object, js_name = "AudioData")]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub type AudioData;
+
+    #[wasm_bindgen(method, getter, js_class = "AudioData", js_name = "timestamp")]
+    pub fn timestamp(this: &AudioData) -> f64;
 
     #[wasm_bindgen(method, getter, js_class = "AudioData", js_name = "numberOfFrames")]
     pub fn number_of_frames(this: &AudioData) -> u32;
@@ -509,6 +518,9 @@ extern "C" {
     #[wasm_bindgen(extends = ::js_sys::Object, js_name = "AudioDecoderConfig")]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub type AudioDecoderConfig;
+
+    #[wasm_bindgen(method, setter = "description")]
+    pub fn set_description_u8_array(this: &AudioDecoderConfig, value: &::js_sys::Uint8Array);
 
     #[wasm_bindgen(method, setter = "codec")]
     pub fn set_codec(this: &AudioDecoderConfig, value: &str);

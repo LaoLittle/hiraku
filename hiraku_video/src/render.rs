@@ -4,9 +4,9 @@ use bevy::{
     shader::{ShaderDefVal, ShaderRef},
     ui_render::prelude::UiMaterialKey,
 };
-use hiraku_media::YuvPixelFormat;
+use hiraku_media::{TransferFunction, YuvPixelFormat};
 
-use crate::color::{TransferFunction, YuvColorTransform};
+use crate::color::YuvColorTransform;
 
 pub(crate) fn load_internal_shader(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/yuv420.wgsl");

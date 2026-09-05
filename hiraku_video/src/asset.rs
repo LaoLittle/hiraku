@@ -5,11 +5,22 @@ use bevy::{
 };
 use thiserror::Error;
 
-pub type VideoMetadata = hiraku_media::MediaMetadata;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EncodedMedia {
+    pub bytes: std::sync::Arc<[u8]>,
+}
 
 #[derive(Asset, Clone, Debug, TypePath)]
 pub struct VideoAsset {
-    pub(crate) media: hiraku_media::EncodedMedia,
+    pub(crate) media: EncodedMedia,
     pub metadata: VideoMetadata,
 }
 
@@ -21,7 +32,7 @@ pub enum VideoAssetLoaderError {
     #[error("failed to read video asset: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Media(#[from] hiraku_media::MediaError),
+    Media(#[from] crate::container::MediaError),
 }
 
 impl AssetLoader for VideoAssetLoader {
@@ -43,8 +54,10 @@ impl AssetLoader for VideoAssetLoader {
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("mkv");
-        let media = hiraku_media::EncodedMedia::inspect(bytes, extension)?;
-        let metadata = media.metadata;
+        let metadata = crate::container::inspect_media(&bytes, extension)?;
+        let media = EncodedMedia {
+            bytes: bytes.into(),
+        };
         Ok(VideoAsset { media, metadata })
     }
 

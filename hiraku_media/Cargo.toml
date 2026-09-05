@@ -10,14 +10,9 @@ license.workspace = true
 thiserror.workspace = true
 crossbeam-channel = "0.5.16"
 
-[dependencies.hiraku-opus]
+[target.'cfg(not(target_family = "wasm"))'.dependencies.hiraku-opus]
 git = "https://github.com/Hiraku-Project/opus-rs.git"
 version = "0.1.32"
-
-[dependencies.symphonia]
-version = "0.6.1"
-default-features = false
-features = ["mkv"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.hiraku-rav1d]
 git = "https://github.com/Hiraku-Project/rav1d.git"
@@ -47,4 +42,12 @@ features = [
 
 [features]
 default = ["hardware"]
-hardware = []
+hardware = ["dep:windows"]
+
+[dev-dependencies]
+futures-lite.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.62.2"
+optional = true
+features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage"]

@@ -1,10 +1,7 @@
 use std::{
-    collections::VecDeque,
     ffi::{c_char, c_void},
-    ptr,
-    slice,
+    ptr, slice,
     sync::Arc,
-    time::Duration,
 };
 
 use crate::{TransferFunction, VideoFrame, VideoPixels, YuvColorTransform};
@@ -14,31 +11,28 @@ unsafe extern "C" {
     fn VTIsHardwareDecodeSupported(codec_type: OSType) -> bool;
 }
 
-pub(super) fn av1_hardware_decode_supported() -> bool {
-    unsafe {
-        VTIsHardwareDecodeSupported(K_CM_VIDEO_CODEC_TYPE_AV1)
-    }
+pub(in crate::platform) fn av1_hardware_decode_supported() -> bool {
+    unsafe { VTIsHardwareDecodeSupported(K_CM_VIDEO_CODEC_TYPE_AV1) }
 }
 
 /// Synchronous VideoToolbox AV1 decoder.
 ///
 /// All CoreFoundation/CoreMedia/CoreVideo/VideoToolbox references are private to this module.
 /// `decode` and `finish` return owned `VideoFrame`s.
-pub(super) struct VideoToolboxDecoder {
+pub(in crate::platform) struct VideoToolboxDecoder {
     session: VTDecompressionSessionRef,
     format_description: CMVideoFormatDescriptionRef,
     callback_context: Box<CallbackContext>,
-    output_format: OutputPixelFormat,
 }
 
 impl VideoToolboxDecoder {
-    pub(super) fn new(width: u32, height: u32, av1c: &[u8]) -> Result<Self, String> {
+    pub(in crate::platform) fn new(width: u32, height: u32, av1c: &[u8]) -> Result<Self, String> {
         let format_description = create_av1_format_description(width, height, av1c)?;
         let mut callback_context = Box::new(CallbackContext::default());
         let callback_ref_con = (&mut *callback_context as *mut CallbackContext).cast();
 
         let result = create_decoder(format_description, callback_ref_con);
-        let (session, output_format) = match result {
+        let session = match result {
             Ok(value) => value,
             Err(error) => {
                 unsafe { cf_release(format_description.cast_const()) };
@@ -50,12 +44,7 @@ impl VideoToolboxDecoder {
             session,
             format_description,
             callback_context,
-            output_format,
         })
-    }
-
-    pub(super) fn output_format_name(&self) -> &'static str {
-        self.output_format.name()
     }
 
     /// Submit one compressed AV1 sample.
@@ -63,7 +52,7 @@ impl VideoToolboxDecoder {
     /// A vector is returned rather than a single frame because VideoToolbox is allowed to emit more
     /// than one output callback while processing a sample. With the current synchronous/low-latency
     /// path this is normally exactly one frame.
-    pub(super) fn decode(
+    pub(in crate::platform) fn decode(
         &mut self,
         packet: &[u8],
         pts: i64,
@@ -94,7 +83,7 @@ impl VideoToolboxDecoder {
     }
 
     /// Drain any delayed output before end-of-stream.
-    pub(super) fn finish(&mut self) -> Result<Vec<VideoFrame>, String> {
+    pub(in crate::platform) fn finish(&mut self) -> Result<Vec<VideoFrame>, String> {
         self.callback_context.prepare();
 
         check_status(
@@ -144,7 +133,7 @@ impl OutputPixelFormat {
 
 #[derive(Default)]
 struct CallbackContext {
-    frames: VecDeque<VideoFrame>,
+    frames: Vec<VideoFrame>,
     error: Option<String>,
 }
 
@@ -159,7 +148,7 @@ impl CallbackContext {
             self.frames.clear();
             return Err(error);
         }
-        Ok(self.frames.drain(..).collect())
+        Ok(std::mem::take(&mut self.frames))
     }
 }
 
@@ -182,7 +171,9 @@ unsafe extern "C" fn output_callback(
     let context = unsafe { &mut *decompression_output_ref_con.cast::<CallbackContext>() };
 
     if status != NO_ERR {
-        context.error = Some(format!("VideoToolbox output callback failed: OSStatus {status}"));
+        context.error = Some(format!(
+            "VideoToolbox output callback failed: OSStatus {status}"
+        ));
         return;
     }
     if image_buffer.is_null() {
@@ -192,7 +183,7 @@ unsafe extern "C" fn output_callback(
 
     let pixel_buffer = image_buffer as CVPixelBufferRef;
     match unsafe { copy_pixel_buffer(pixel_buffer, presentation_time_stamp) } {
-        Ok(frame) => context.frames.push_back(frame),
+        Ok(frame) => context.frames.push(frame),
         Err(error) => context.error = Some(error),
     }
 }
@@ -202,10 +193,16 @@ unsafe fn copy_pixel_buffer(
     presentation_time_stamp: CMTime,
 ) -> Result<VideoFrame, String> {
     let pixel_format = unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer) };
-    let width = usize_to_u32(unsafe { CVPixelBufferGetWidth(pixel_buffer) }, "frame width")?;
-    let height = usize_to_u32(unsafe { CVPixelBufferGetHeight(pixel_buffer) }, "frame height")?;
+    let width = usize_to_u32(
+        unsafe { CVPixelBufferGetWidth(pixel_buffer) },
+        "frame width",
+    )?;
+    let height = usize_to_u32(
+        unsafe { CVPixelBufferGetHeight(pixel_buffer) },
+        "frame height",
+    )?;
     let plane_count = unsafe { CVPixelBufferGetPlaneCount(pixel_buffer) };
-    let timestamp = cm_time_to_duration(presentation_time_stamp)?;
+    let timestamp = cm_time_to_timestamp(presentation_time_stamp)?;
 
     let limited_range = match pixel_format {
         K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE
@@ -228,18 +225,33 @@ unsafe fn copy_pixel_buffer(
     )?;
 
     let result = match pixel_format {
-        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE => {
-            unsafe { copy_nv12(pixel_buffer, timestamp, width, height, color_transform, transfer, plane_count) }
-        }
-        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR => {
-            unsafe { copy_i420(pixel_buffer, timestamp, width, height, color_transform, transfer, plane_count) }
-        }
+        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE => unsafe {
+            copy_nv12(
+                pixel_buffer,
+                timestamp,
+                width,
+                height,
+                color_transform,
+                transfer,
+                plane_count,
+            )
+        },
+        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR => unsafe {
+            copy_i420(
+                pixel_buffer,
+                timestamp,
+                width,
+                height,
+                color_transform,
+                transfer,
+                plane_count,
+            )
+        },
         _ => unreachable!(),
     };
 
-    let unlock = unsafe {
-        CVPixelBufferUnlockBaseAddress(pixel_buffer, K_CV_PIXEL_BUFFER_LOCK_READ_ONLY)
-    };
+    let unlock =
+        unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, K_CV_PIXEL_BUFFER_LOCK_READ_ONLY) };
     if unlock != K_CV_RETURN_SUCCESS {
         return Err(format!(
             "CVPixelBufferUnlockBaseAddress failed: CVReturn {unlock}"
@@ -251,7 +263,7 @@ unsafe fn copy_pixel_buffer(
 
 unsafe fn copy_nv12(
     pixel_buffer: CVPixelBufferRef,
-    timestamp: Duration,
+    timestamp: i64,
     width: u32,
     height: u32,
     color_transform: YuvColorTransform,
@@ -283,13 +295,10 @@ unsafe fn copy_nv12(
     let y_len = checked_plane_len(y_stride, height, "NV12 Y plane")?;
     let uv_len = checked_plane_len(uv_stride, chroma_height, "NV12 UV plane")?;
     let uv_offset = y_len;
-    let total_len = y_len
-        .checked_add(uv_len)
-        .ok_or_else(|| "NV12 frame allocation size overflow".to_string())?;
-
-    let mut storage = Vec::with_capacity(total_len);
-    storage.extend_from_slice(unsafe { slice::from_raw_parts(y_ptr, y_len) });
-    storage.extend_from_slice(unsafe { slice::from_raw_parts(uv_ptr, uv_len) });
+    // The pixel buffer remains locked while its planes are copied into their final allocation.
+    let planes = copy_planes(&[unsafe { slice::from_raw_parts(y_ptr, y_len) }, unsafe {
+        slice::from_raw_parts(uv_ptr, uv_len)
+    }])?;
 
     Ok(VideoFrame {
         timestamp,
@@ -300,7 +309,7 @@ unsafe fn copy_nv12(
         color_transform,
         transfer,
         pixels: VideoPixels::Nv12Strided {
-            planes: Arc::from(storage),
+            planes,
             uv_offset,
             y_stride: usize_to_u32(y_stride, "NV12 Y stride")?,
             uv_stride: usize_to_u32(uv_stride, "NV12 UV stride")?,
@@ -310,7 +319,7 @@ unsafe fn copy_nv12(
 
 unsafe fn copy_i420(
     pixel_buffer: CVPixelBufferRef,
-    timestamp: Duration,
+    timestamp: i64,
     width: u32,
     height: u32,
     color_transform: YuvColorTransform,
@@ -362,14 +371,11 @@ unsafe fn copy_i420(
     let v_offset = y_len
         .checked_add(u_len)
         .ok_or_else(|| "I420 V offset overflow".to_string())?;
-    let total_len = v_offset
-        .checked_add(v_len)
-        .ok_or_else(|| "I420 frame allocation size overflow".to_string())?;
-
-    let mut storage = Vec::with_capacity(total_len);
-    storage.extend_from_slice(unsafe { slice::from_raw_parts(y_ptr, y_len) });
-    storage.extend_from_slice(unsafe { slice::from_raw_parts(u_ptr, u_len) });
-    storage.extend_from_slice(unsafe { slice::from_raw_parts(v_ptr, v_len) });
+    let planes = copy_planes(&[
+        unsafe { slice::from_raw_parts(y_ptr, y_len) },
+        unsafe { slice::from_raw_parts(u_ptr, u_len) },
+        unsafe { slice::from_raw_parts(v_ptr, v_len) },
+    ])?;
 
     Ok(VideoFrame {
         timestamp,
@@ -380,13 +386,32 @@ unsafe fn copy_i420(
         color_transform,
         transfer,
         pixels: VideoPixels::I420Strided {
-            planes: Arc::from(storage),
+            planes,
             u_offset,
             v_offset,
             y_stride: usize_to_u32(y_stride, "I420 Y stride")?,
             chroma_stride: usize_to_u32(u_stride, "I420 chroma stride")?,
         },
     })
+}
+
+/// Preserve plane padding for GPU uploads without a staging Vec or a second frame-sized copy.
+fn copy_planes(planes: &[&[u8]]) -> Result<Arc<[u8]>, String> {
+    let total_len = planes.iter().try_fold(0usize, |len, plane| {
+        len.checked_add(plane.len())
+            .filter(|len| *len <= isize::MAX as usize)
+            .ok_or_else(|| "VideoToolbox frame allocation size overflow".to_string())
+    })?;
+    let mut storage = Arc::<[u8]>::new_uninit_slice(total_len);
+    let mut remaining =
+        Arc::get_mut(&mut storage).expect("new VideoToolbox frame allocation has a single owner");
+    for plane in planes {
+        let (destination, tail) = remaining.split_at_mut(plane.len());
+        destination.write_copy_of_slice(plane);
+        remaining = tail;
+    }
+    // SAFETY: the plane lengths sum to total_len, and every byte was initialized above.
+    Ok(unsafe { storage.assume_init() })
 }
 
 unsafe fn pixel_buffer_luma_coefficients(
@@ -412,7 +437,9 @@ unsafe fn pixel_buffer_luma_coefficients(
     result
 }
 
-unsafe fn pixel_buffer_transfer(pixel_buffer: CVPixelBufferRef) -> Result<TransferFunction, String> {
+unsafe fn pixel_buffer_transfer(
+    pixel_buffer: CVPixelBufferRef,
+) -> Result<TransferFunction, String> {
     let value = unsafe { copy_attachment(pixel_buffer, kCVImageBufferTransferFunctionKey) };
     let Some(value) = value else {
         return Ok(TransferFunction::Bt1886);
@@ -445,9 +472,9 @@ unsafe fn copy_attachment(pixel_buffer: CVPixelBufferRef, key: CFStringRef) -> O
 fn create_decoder(
     format_description: CMVideoFormatDescriptionRef,
     callback_ref_con: *mut c_void,
-) -> Result<(VTDecompressionSessionRef, OutputPixelFormat), String> {
+) -> Result<VTDecompressionSessionRef, String> {
     let probe = create_hardware_decoder_session(format_description, None, callback_ref_con)?;
-    let performance_order = copy_performance_ordered_pixel_formats(probe)?;
+    let performance_order = copy_performance_ordered_pixel_formats(probe);
     unsafe {
         VTDecompressionSessionInvalidate(probe);
         cf_release(probe.cast_const());
@@ -460,7 +487,7 @@ fn create_decoder(
                 Some(selected),
                 callback_ref_con,
             )?;
-            return Ok((session, selected));
+            return Ok(session);
         }
 
         let listed = formats
@@ -478,12 +505,9 @@ fn create_decoder(
     // session rather than destroying it and creating a third session.
     let mut errors = Vec::new();
     for candidate in [OutputPixelFormat::Nv12, OutputPixelFormat::I420] {
-        match create_hardware_decoder_session(
-            format_description,
-            Some(candidate),
-            callback_ref_con,
-        ) {
-            Ok(session) => return Ok((session, candidate)),
+        match create_hardware_decoder_session(format_description, Some(candidate), callback_ref_con)
+        {
+            Ok(session) => return Ok(session),
             Err(error) => errors.push(format!("{}: {error}", candidate.name())),
         }
     }
@@ -504,7 +528,7 @@ fn hiraku_pixel_format(format: OSType) -> Option<OutputPixelFormat> {
 
 fn copy_performance_ordered_pixel_formats(
     session: VTDecompressionSessionRef,
-) -> Result<Option<Vec<OSType>>, String> {
+) -> Option<Vec<OSType>> {
     let mut value: CFTypeRef = ptr::null();
     let status = unsafe {
         VTSessionCopyProperty(
@@ -521,7 +545,7 @@ fn copy_performance_ordered_pixel_formats(
         if !value.is_null() {
             unsafe { cf_release(value) };
         }
-        return Ok(None);
+        return None;
     }
 
     let array = value as CFArrayRef;
@@ -545,7 +569,7 @@ fn copy_performance_ordered_pixel_formats(
         }
     }
     unsafe { cf_release(value) };
-    Ok(Some(formats))
+    Some(formats)
 }
 
 fn create_hardware_decoder_session(
@@ -623,6 +647,9 @@ fn create_av1_format_description(
     height: u32,
     av1c: &[u8],
 ) -> Result<CMVideoFormatDescriptionRef, String> {
+    // Validate before creating CF objects so conversion failures cannot leak those objects.
+    let width = i32::try_from(width).map_err(|_| "video width exceeds i32".to_string())?;
+    let height = i32::try_from(height).map_err(|_| "video height exceeds i32".to_string())?;
     let av1c_data = unsafe {
         CFDataCreate(
             kCFAllocatorDefault,
@@ -671,8 +698,8 @@ fn create_av1_format_description(
         CMVideoFormatDescriptionCreate(
             kCFAllocatorDefault,
             K_CM_VIDEO_CODEC_TYPE_AV1,
-            i32::try_from(width).map_err(|_| "video width exceeds i32".to_string())?,
-            i32::try_from(height).map_err(|_| "video height exceeds i32".to_string())?,
+            width,
+            height,
             extensions,
             &mut format_description,
         )
@@ -796,7 +823,7 @@ unsafe fn cf_release(value: CFTypeRef) {
 
 fn timestamp_to_cm_time(timestamp: i64, numer: u32, denom: u32) -> Result<CMTime, String> {
     if denom == 0 {
-        return Err("invalid Symphonia time base denominator".into());
+        return Err("invalid decoder time base denominator".into());
     }
     let value = timestamp
         .checked_mul(i64::from(numer))
@@ -806,20 +833,18 @@ fn timestamp_to_cm_time(timestamp: i64, numer: u32, denom: u32) -> Result<CMTime
     Ok(CMTime::new(value, timescale))
 }
 
-fn cm_time_to_duration(time: CMTime) -> Result<Duration, String> {
+fn cm_time_to_timestamp(time: CMTime) -> Result<i64, String> {
     if time.flags & K_CM_TIME_FLAGS_VALID == 0 || time.timescale <= 0 {
         return Err("VideoToolbox returned an invalid presentation timestamp".into());
     }
-    let seconds = time.value as f64 / f64::from(time.timescale);
-    if !seconds.is_finite() {
-        return Err("VideoToolbox returned a non-finite presentation timestamp".into());
-    }
-    Ok(Duration::from_secs_f64(seconds.max(0.0)))
+    i64::try_from(i128::from(time.value) * 1_000_000 / i128::from(time.timescale))
+        .map_err(|_| "VideoToolbox timestamp exceeds i64 microseconds".into())
 }
 
 fn checked_plane_len(stride: usize, height: u32, name: &str) -> Result<usize, String> {
     stride
         .checked_mul(usize::try_from(height).map_err(|_| format!("{name} height overflow"))?)
+        .filter(|len| *len <= isize::MAX as usize)
         .ok_or_else(|| format!("{name} size overflow"))
 }
 
@@ -884,8 +909,7 @@ const K_CM_TIME_FLAGS_VALID: u32 = 1;
 const K_CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
 
 const K_CM_VIDEO_CODEC_TYPE_AV1: OSType = u32::from_be_bytes(*b"av01");
-const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE: OSType =
-    u32::from_be_bytes(*b"420v");
+const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE: OSType = u32::from_be_bytes(*b"420v");
 const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR: OSType = u32::from_be_bytes(*b"y420");
 
 #[repr(C)]
@@ -1064,7 +1088,10 @@ unsafe extern "C" {
         plane_index: usize,
     ) -> usize;
     fn CVPixelBufferLockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u64) -> CVReturn;
-    fn CVPixelBufferUnlockBaseAddress(pixel_buffer: CVPixelBufferRef, unlock_flags: u64) -> CVReturn;
+    fn CVPixelBufferUnlockBaseAddress(
+        pixel_buffer: CVPixelBufferRef,
+        unlock_flags: u64,
+    ) -> CVReturn;
     fn CVPixelBufferGetBaseAddressOfPlane(
         pixel_buffer: CVPixelBufferRef,
         plane_index: usize,
