@@ -1,6 +1,7 @@
 //! Runtime linking for symbolic register bytecode calls.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::{
     SymbolId,
@@ -20,7 +21,7 @@ pub enum LinkedFunction {
 #[derive(Clone, Debug)]
 pub struct LinkedModule {
     pub id: ModuleId,
-    pub bytecode: Bytecode,
+    pub bytecode: Arc<Bytecode>,
     calls: BTreeMap<SymbolId, LinkedFunction>,
 }
 
@@ -38,7 +39,7 @@ pub type LinkedBytecode = LinkedModule;
 
 #[derive(Clone, Debug)]
 pub struct LinkedProgram {
-    pub modules: Vec<LinkedModule>,
+    pub modules: Arc<[LinkedModule]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,7 +53,7 @@ pub fn link_bytecode(
     bytecode: Bytecode,
     natives: &BuiltinManifest,
 ) -> Result<LinkedBytecode, Vec<LinkError>> {
-    link_register_modules(vec![bytecode], natives).map(|mut program| program.modules.remove(0))
+    link_register_modules(vec![bytecode], natives).map(|program| program.modules[0].clone())
 }
 
 pub fn link_register_modules(
@@ -180,13 +181,13 @@ pub fn link_named_modules(
         }
         linked_modules.push(LinkedModule {
             id: module_id,
-            bytecode,
+            bytecode: Arc::new(bytecode),
             calls,
         });
     }
     if errors.is_empty() {
         Ok(LinkedProgram {
-            modules: linked_modules,
+            modules: linked_modules.into(),
         })
     } else {
         Err(errors)

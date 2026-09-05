@@ -111,8 +111,9 @@ pub struct ExecutionRuntime {
 
 impl ExecutionRuntime {
     pub fn new(bytecode: Bytecode) -> Result<Self, ExecutionRuntimeError> {
-        let linked = link_bytecode(bytecode.clone(), &story_manifest())
-            .map_err(ExecutionRuntimeError::Link)?;
+        let linked =
+            link_bytecode(bytecode, &story_manifest()).map_err(ExecutionRuntimeError::Link)?;
+        let bytecode = linked.bytecode.clone();
         let shared_globals = vec![Value::Uninitialized; bytecode.globals.len()];
         let mut executions = BTreeMap::new();
         executions.insert(
@@ -137,8 +138,9 @@ impl ExecutionRuntime {
         snapshot: ExecutionRuntimeSnapshot,
     ) -> Result<Self, ExecutionRuntimeError> {
         let bytecode = snapshot.program;
-        let linked = link_bytecode(bytecode.clone(), &story_manifest())
-            .map_err(ExecutionRuntimeError::Link)?;
+        let linked =
+            link_bytecode(bytecode, &story_manifest()).map_err(ExecutionRuntimeError::Link)?;
+        let bytecode = linked.bytecode.clone();
         let executions = snapshot
             .executions
             .into_iter()
@@ -167,7 +169,7 @@ impl ExecutionRuntime {
 
     pub fn snapshot(&self) -> ExecutionRuntimeSnapshot {
         ExecutionRuntimeSnapshot {
-            program: self.linked.bytecode.clone(),
+            program: self.linked.bytecode.as_ref().clone(),
             next_execution: self.next_execution,
             executions: self
                 .executions

@@ -11,6 +11,7 @@ pub mod parse;
 pub mod register;
 pub mod runtime;
 pub mod span;
+pub mod string_pool;
 pub mod symbol;
 pub mod template;
 pub mod vm;
@@ -53,6 +54,7 @@ pub use runtime::{
     StaticMemberKind, Value,
 };
 pub use span::Span;
+pub use string_pool::{StringId, StringPool};
 pub use symbol::{SymbolId, SymbolInterner, SymbolManifest};
 pub use template::{TemplateCallArgument, TemplateContext, TemplateError, eval_template};
 pub use vm::{

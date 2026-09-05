@@ -194,7 +194,7 @@ impl LinkedVm {
                 .program
                 .modules
                 .iter()
-                .map(|module| module.bytecode.clone())
+                .map(|module| module.bytecode.as_ref().clone())
                 .collect(),
             frames: self
                 .frames

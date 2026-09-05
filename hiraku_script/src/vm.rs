@@ -1,7 +1,9 @@
 //! The executable register-based HKS bytecode compiler and VM.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use crate::{StringId, StringPool, string_pool::StringPoolBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -11,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 6;
+pub const BYTECODE_VERSION: u16 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -25,6 +27,7 @@ pub struct Bytecode {
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
     pub symbols: SymbolManifest,
+    pub strings: StringPool,
     pub globals: Vec<SymbolId>,
     pub locals: Vec<SymbolId>,
     pub local_count: u32,
@@ -173,8 +176,8 @@ pub enum Constant {
     Bool(bool),
     Number(f64),
     Percent(f64),
-    String(String),
-    TextTemplate(String),
+    String(StringId),
+    TextTemplate(StringId),
     Symbol(SymbolId),
     Selector(SymbolId),
     Function(SymbolId),
@@ -239,12 +242,14 @@ pub fn compile_with_manifest(
         .map(|function| function.name)
         .collect::<Vec<_>>();
     let mut regions = Vec::new();
+    let mut strings = StringPoolBuilder::default();
     let entry = compile_register_code(
         &mir.entry,
         manifest,
         &function_symbols,
         &mut symbols,
         &mut regions,
+        &mut strings,
     )?;
     let mut functions = Vec::with_capacity(mir.functions.len());
     for (mir_function, hir_function) in mir.functions.iter().zip(hir.functions) {
@@ -254,6 +259,7 @@ pub fn compile_with_manifest(
             &function_symbols,
             &mut symbols,
             &mut regions,
+            &mut strings,
         )?;
         functions.push(BytecodeFunction {
             name: hir_function.name,
@@ -272,6 +278,7 @@ pub fn compile_with_manifest(
         source_hash,
         builtin_manifest_hash: manifest.hash(),
         symbols: symbols.manifest(),
+        strings: strings.finish(),
         globals: hir.globals.iter().map(|global| global.name).collect(),
         locals: hir.locals.iter().map(|local| local.name).collect(),
         local_count: hir.locals.len() as u32,
@@ -288,10 +295,18 @@ fn compile_register_code(
     function_symbols: &[SymbolId],
     symbols: &mut crate::SymbolInterner,
     regions: &mut Vec<BytecodeRegion>,
+    strings: &mut StringPoolBuilder,
 ) -> Result<BytecodeRegion, Vec<CompileError>> {
     let mut region_ids = Vec::with_capacity(function.regions.len());
     for region in &function.regions {
-        let compiled = compile_register_code(region, manifest, function_symbols, symbols, regions)?;
+        let compiled = compile_register_code(
+            region,
+            manifest,
+            function_symbols,
+            symbols,
+            regions,
+            strings,
+        )?;
         let id = regions.len() as u32;
         regions.push(compiled);
         region_ids.push(id);
@@ -309,6 +324,7 @@ fn compile_register_code(
         function_symbols,
         &region_ids,
         symbols,
+        strings,
     )?;
     Ok(BytecodeRegion {
         parameters: function
@@ -328,6 +344,7 @@ fn emit_function(
     function_symbols: &[SymbolId],
     region_ids: &[u32],
     symbols: &mut crate::SymbolInterner,
+    strings: &mut StringPoolBuilder,
 ) -> Result<(Vec<Instruction>, u16), Vec<CompileError>> {
     let register = |virtual_register| {
         allocation
@@ -381,7 +398,7 @@ fn emit_function(
                                 span: None,
                             }]);
                         }
-                        value => constant(value.clone()),
+                        value => constant(value.clone(), strings),
                     };
                     Instruction::Constant {
                         dst: register(*dst),
@@ -697,7 +714,7 @@ fn emit_register_window(
     })
 }
 
-fn constant(value: MirConstant) -> Constant {
+fn constant(value: MirConstant, strings: &mut StringPoolBuilder) -> Constant {
     match value {
         MirConstant::Uninitialized => Constant::Uninitialized,
         MirConstant::Null => Constant::Null,
@@ -706,8 +723,8 @@ fn constant(value: MirConstant) -> Constant {
         MirConstant::Bool(value) => Constant::Bool(value),
         MirConstant::Number(value) => Constant::Number(value),
         MirConstant::Percent(value) => Constant::Percent(value),
-        MirConstant::String(value) => Constant::String(value),
-        MirConstant::TextTemplate(value) => Constant::TextTemplate(value),
+        MirConstant::String(value) => Constant::String(strings.intern(value)),
+        MirConstant::TextTemplate(value) => Constant::TextTemplate(strings.intern(value)),
         MirConstant::Symbol(value) => Constant::Symbol(value),
         MirConstant::Selector(value) => Constant::Selector(value),
         MirConstant::Function(_) => unreachable!("function constants require symbol resolution"),
@@ -767,7 +784,7 @@ pub struct CallFrameSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vm {
-    bytecode: Bytecode,
+    bytecode: Arc<Bytecode>,
     pc: usize,
     registers: RegisterFrame,
     locals: Box<[Value]>,
@@ -779,7 +796,8 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(bytecode: Bytecode) -> Result<Self, VmError> {
+    pub fn new(bytecode: impl Into<Arc<Bytecode>>) -> Result<Self, VmError> {
+        let bytecode = bytecode.into();
         if bytecode.version != BYTECODE_VERSION {
             return Err(VmError::UnsupportedBytecode(bytecode.version));
         }
@@ -796,13 +814,20 @@ impl Vm {
         })
     }
 
-    pub fn from_closure(bytecode: Bytecode, closure: &Value) -> Result<Self, VmError> {
+    pub fn from_closure(
+        bytecode: impl Into<Arc<Bytecode>>,
+        closure: &Value,
+    ) -> Result<Self, VmError> {
+        let bytecode = bytecode.into();
         let Value::Closure {
             region, captures, ..
         } = closure
         else {
             return Err(VmError::TypeMismatch("expected Function"));
         };
+        if bytecode.version != BYTECODE_VERSION {
+            return Err(VmError::UnsupportedBytecode(bytecode.version));
+        }
         let code = bytecode
             .regions
             .get(*region as usize)
@@ -825,10 +850,11 @@ impl Vm {
 
     /// Creates an independent VM invocation from a save-safe function value.
     pub fn from_callable(
-        bytecode: Bytecode,
+        bytecode: impl Into<Arc<Bytecode>>,
         callable: &Value,
         arguments: Vec<Value>,
     ) -> Result<Self, VmError> {
+        let bytecode = bytecode.into();
         match callable {
             Value::Closure { region, .. } => {
                 let metadata = bytecode
@@ -861,14 +887,18 @@ impl Vm {
     }
 
     pub fn from_function(
-        bytecode: Bytecode,
+        bytecode: impl Into<Arc<Bytecode>>,
         function: u32,
         arguments: Vec<Value>,
     ) -> Result<Self, VmError> {
+        let bytecode = bytecode.into();
         let metadata = bytecode
             .functions
             .get(function as usize)
             .ok_or(VmError::UnknownFunction(function))?;
+        if bytecode.version != BYTECODE_VERSION {
+            return Err(VmError::UnsupportedBytecode(bytecode.version));
+        }
         if metadata.parameters.len() != arguments.len() {
             return Err(VmError::FunctionArity {
                 expected: metadata.parameters.len(),
@@ -1257,7 +1287,14 @@ impl Vm {
         }
     }
 
-    pub fn restore(bytecode: Bytecode, snapshot: VmSnapshot) -> Result<Self, VmError> {
+    pub fn restore(
+        bytecode: impl Into<Arc<Bytecode>>,
+        snapshot: VmSnapshot,
+    ) -> Result<Self, VmError> {
+        let bytecode = bytecode.into();
+        if bytecode.version != BYTECODE_VERSION {
+            return Err(VmError::UnsupportedBytecode(bytecode.version));
+        }
         if bytecode.source_hash != snapshot.source_hash {
             return Err(VmError::SourceHashMismatch);
         }
@@ -1372,8 +1409,8 @@ impl Vm {
             Constant::Bool(value) => Value::Bool(value),
             Constant::Number(value) => Value::Number(value),
             Constant::Percent(value) => Value::Percent(value),
-            Constant::String(value) => Value::String(value),
-            Constant::TextTemplate(value) => Value::TextTemplate(value),
+            Constant::String(id) => Value::String(self.string(id)?.to_owned()),
+            Constant::TextTemplate(id) => Value::TextTemplate(self.string(id)?.to_owned()),
             Constant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
             Constant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
             Constant::Function(symbol) => Value::Function {
@@ -1381,6 +1418,13 @@ impl Vm {
                 symbol,
             },
         })
+    }
+
+    fn string(&self, id: StringId) -> Result<&str, VmError> {
+        self.bytecode
+            .strings
+            .get(id)
+            .ok_or(VmError::UnknownString(id))
     }
 
     fn symbol(&self, symbol: SymbolId) -> Result<&str, VmError> {
@@ -1719,6 +1763,7 @@ pub enum VmError {
     InvalidLocal(u32),
     InvalidGlobal(u32),
     UnknownSymbol(SymbolId),
+    UnknownString(StringId),
     UnknownMember(String),
     NullMemberAccess(String),
     NullAssertion,
@@ -1746,6 +1791,74 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn repeated_literals_share_a_module_pool_across_functions() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let source =
+            "fn greeting() -> String { \"Hello, alice 🌸\" }\nlet label = \"Hello, alice 🌸\"";
+        let first = compile(source, &manifest);
+        let second = compile(source, &manifest);
+        assert_eq!(first, second, "pool IDs must be deterministic");
+        assert_eq!(first.strings.strings(), &["Hello, alice 🌸"]);
+        let ids = first
+            .instructions
+            .iter()
+            .chain(
+                first
+                    .functions
+                    .iter()
+                    .flat_map(|function| &function.instructions),
+            )
+            .filter_map(|instruction| match instruction {
+                Instruction::Constant {
+                    value: Constant::String(id),
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(ids.len() >= 2);
+        assert!(ids.iter().all(|id| *id == StringId(0)));
+    }
+
+    #[test]
+    fn invocations_share_bytecode_but_not_registers() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let program = Arc::new(compile("let label = \"alice\"", &manifest));
+        let mut first = Vm::new(program.clone()).expect("first VM initializes");
+        let second = Vm::new(program.clone()).expect("second VM initializes");
+        assert!(Arc::ptr_eq(&first.bytecode, &second.bytecode));
+        first.step().expect("literal statement executes");
+        assert_eq!(second.pc, 0);
+        let restored = Vm::restore(program, first.snapshot()).expect("snapshot restores");
+        assert!(Arc::ptr_eq(&first.bytecode, &restored.bytecode));
+        assert_eq!(restored.snapshot(), first.snapshot());
+    }
+
+    #[test]
+    fn invalid_literal_pool_reference_returns_an_error() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let mut program = compile("\"alice\"", &manifest);
+        let instruction = program
+            .instructions
+            .iter_mut()
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::Constant {
+                        value: Constant::String(_),
+                        ..
+                    }
+                )
+            })
+            .expect("literal instruction exists");
+        if let Instruction::Constant { value, .. } = instruction {
+            *value = Constant::String(StringId(u32::MAX));
+        }
+        let mut vm = Vm::new(program).expect("VM initializes");
+        assert_eq!(vm.step(), Err(VmError::UnknownString(StringId(u32::MAX))));
     }
 
     #[test]
