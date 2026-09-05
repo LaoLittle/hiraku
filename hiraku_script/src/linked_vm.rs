@@ -8,6 +8,7 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkedVmEvent {
+    BudgetExhausted,
     Call(BuiltinCall),
     Statement(StatementValue),
     Completed(Value),
@@ -89,18 +90,49 @@ impl LinkedVm {
         &self.program
     }
 
+    /// Named globals of the currently executing frame, for embedding commit boundaries.
+    pub fn current_globals(&self) -> std::collections::BTreeMap<String, Value> {
+        let Some((_, vm)) = self.frames.last() else {
+            return Default::default();
+        };
+        vm.bytecode()
+            .globals
+            .iter()
+            .zip(vm.globals())
+            .filter_map(|(symbol, value)| {
+                vm.bytecode()
+                    .symbols
+                    .resolve(*symbol)
+                    .map(|name| (name.to_owned(), value.clone()))
+            })
+            .collect()
+    }
+
     pub fn step(&mut self) -> Result<Option<LinkedVmEvent>, LinkedVmError> {
+        self.step_with_budget(&mut 10_000)
+    }
+
+    pub fn step_with_budget(
+        &mut self,
+        remaining: &mut u32,
+    ) -> Result<Option<LinkedVmEvent>, LinkedVmError> {
         loop {
+            let is_root = self.frames.len() == 1;
             let (module_id, vm) = self.frames.last_mut().ok_or(LinkedVmError::NoFrame)?;
-            let Some(event) = vm.step()? else {
+            let Some(event) = vm.step_with_budget(remaining)? else {
                 return Ok(None);
             };
             match event {
+                VmEvent::BudgetExhausted => return Ok(Some(LinkedVmEvent::BudgetExhausted)),
                 VmEvent::Statement(value) => {
                     return Ok(Some(LinkedVmEvent::Statement(value)));
                 }
                 VmEvent::Completed(value) => {
                     let value = bind_value_module(value, *module_id);
+                    // Retain the completed root's globals for the embedding's commit.
+                    if is_root {
+                        return Ok(Some(LinkedVmEvent::Completed(value)));
+                    }
                     self.frames.pop();
                     if let Some((_, caller)) = self.frames.last_mut() {
                         caller.resume(value)?;

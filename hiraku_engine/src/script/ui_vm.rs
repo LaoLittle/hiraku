@@ -18,13 +18,13 @@ use crate::{
     ui::{
         BarNode, ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
         ScreenNode, ScreenSpec, ScreenTexture, ScrollableNode, SpacerNode, TextNode, ToggleNode,
-        UiEffect, UiPhaseAnimation, UiReactiveBinding,
+        UiCallback, UiEffect, UiPhaseAnimation, UiReactiveBinding,
     },
 };
 
 use super::{
     animation::{AnimationPhase, AnimationSpec, register_animation_api},
-    navigation::{NavigationHandle, NavigationRequest, NavigationResetValue},
+    navigation::{NavigationOptions, NavigationRequest, NavigationResetValue},
     ui_runtime::UiContext,
 };
 
@@ -200,37 +200,6 @@ impl UiVmContext {
         self.effects
             .get(&handle.0)
             .ok_or_else(|| NativeError::message(format!("unknown UiEffect handle {}", handle.0)))
-    }
-
-    fn insert_navigation(&mut self, navigation: NavigationRequest) -> NavigationHandle {
-        self.next_effect += 1;
-        self.effects
-            .insert(self.next_effect, UiEffect::Navigate(navigation));
-        NavigationHandle(self.next_effect)
-    }
-
-    fn reset_navigation(
-        &mut self,
-        NavigationHandle(handle): NavigationHandle,
-        reset: NavigationResetValue,
-    ) -> Result<NavigationHandle, NativeError> {
-        let Some(UiEffect::Navigate(navigation)) = self.effects.get_mut(&handle) else {
-            return Err(NativeError::message(format!(
-                "unknown Navigation handle {handle}"
-            )));
-        };
-        navigation.reset = reset.into();
-        Ok(NavigationHandle(handle))
-    }
-
-    fn navigation_effect(
-        &self,
-        NavigationHandle(handle): NavigationHandle,
-    ) -> Result<&UiEffect, NativeError> {
-        self.effects
-            .get(&handle)
-            .filter(|effect| matches!(effect, UiEffect::Navigate(_)))
-            .ok_or_else(|| NativeError::message(format!("unknown Navigation handle {handle}")))
     }
 }
 
@@ -726,15 +695,6 @@ mod native_ui {
         Ok(node)
     }
 
-    #[hks(name = "reset", receiver)]
-    fn navigation_reset(
-        context: &mut UiVmContext,
-        navigation: NavigationHandle,
-        reset: NavigationResetValue,
-    ) -> Result<NavigationHandle, NativeError> {
-        context.reset_navigation(navigation, reset)
-    }
-
     #[hks(name = "animation", receiver)]
     fn ui_animation(
         context: &mut UiVmContext,
@@ -878,11 +838,13 @@ mod story_actions {
     #[hks(name = "goto")]
     fn native_goto_story(
         context: &mut UiVmContext,
-        path: String,
-    ) -> Result<NavigationHandle, NativeError> {
-        let navigation =
-            NavigationRequest::goto(path)?.with_origin(context.navigation_origin.clone());
-        Ok(context.insert_navigation(navigation))
+        _path: String,
+        _options: Option<NavigationOptions>,
+    ) -> Result<hiraku_script::native::Never, NativeError> {
+        let _ = context;
+        Err(NativeError::message(
+            "story.goto is only available in an onClick execution",
+        ))
     }
 }
 
@@ -1248,8 +1210,9 @@ fn collect_nodes(
 ) -> Result<Vec<UiNodeHandle>, UiVmError> {
     let mut nodes = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut budget = 100_000;
     loop {
-        let event = match vm.step() {
+        let event = match vm.step_with_budget(&mut budget) {
             Ok(event) => event,
             Err(error) => {
                 let snapshot = vm.snapshot();
@@ -1267,6 +1230,11 @@ fn collect_nodes(
             }
         };
         match event {
+            Some(LinkedVmEvent::BudgetExhausted) => {
+                return Err(UiVmError::Runtime(
+                    "UI invocation exceeded its instruction budget".into(),
+                ));
+            }
             Some(LinkedVmEvent::Call(call)) => {
                 let value = registry
                     .call(context, &call)
@@ -1330,28 +1298,48 @@ fn closure_children_with_args(
     collect_nodes(vm, registry, context)
 }
 
-fn closure_effects(
-    closure: Option<HksClosure>,
-    program: &hiraku_script::LinkedProgram,
-    registry: &NativeRegistry<UiVmContext>,
-    context: &mut UiVmContext,
-) -> Result<Vec<UiEffect>, UiVmError> {
-    let Some(closure) = closure else {
-        return Ok(Vec::new());
-    };
-    let callable = closure.into_hks_value();
-    let mut vm = LinkedVm::from_callable(program.clone(), &callable, Vec::new())
+pub(crate) fn evaluate_ui_callback(
+    callback: &UiCallback,
+    globals: &BTreeMap<String, Value>,
+    models: &crate::ui::UiModels,
+) -> Result<(Vec<UiEffect>, BTreeMap<String, Value>), UiVmError> {
+    let mut current_globals = callback.globals.clone();
+    current_globals.extend(globals.clone());
+    for (name, value) in models.roots() {
+        current_globals.insert(name.to_owned(), stored_to_hks(value));
+    }
+    let values = UiContext::default();
+    let registry = ui_registry(&values);
+    let mut context = UiVmContext::new(values, TermCatalog::default());
+    context.navigation_origin = callback.origin.clone();
+    let goto = registry.manifest().resolve_selector("story", "goto");
+    let mut vm = LinkedVm::from_callable(callback.program.clone(), &callback.callable, Vec::new())
+        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    vm.set_current_globals(&current_globals)
         .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
     let mut effects = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut budget = 100_000;
     loop {
         match vm
-            .step()
+            .step_with_budget(&mut budget)
             .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?
         {
+            Some(LinkedVmEvent::BudgetExhausted) => {
+                return Err(UiVmError::Runtime(
+                    "UI invocation exceeded its instruction budget".into(),
+                ));
+            }
             Some(LinkedVmEvent::Call(call)) => {
+                if Some(call.builtin) == goto {
+                    let request = NavigationRequest::from_goto_call(&call)
+                        .map_err(|error| UiVmError::Runtime(error.to_string()))?
+                        .with_origin(context.navigation_origin.clone());
+                    effects.push(UiEffect::Navigate(request));
+                    return Ok((effects, vm.current_globals()));
+                }
                 let value = registry
-                    .call(context, &call)
+                    .call(&mut context, &call)
                     .map_err(|error| UiVmError::Runtime(error.to_string()))?;
                 vm.resume(value)
                     .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
@@ -1359,8 +1347,6 @@ fn closure_effects(
             Some(LinkedVmEvent::Statement(StatementValue::Value(value))) => {
                 let effect = if let Ok(handle) = UiEffectHandle::from_hks_value(&value) {
                     (handle.0, context.effect(handle))
-                } else if let Ok(handle) = NavigationHandle::from_hks_value(&value) {
-                    (handle.0, context.navigation_effect(handle))
                 } else {
                     return Err(UiVmError::Invalid(
                         "onClick statements must produce an effect such as sfx(...) or story.goto(...)"
@@ -1384,7 +1370,7 @@ fn closure_effects(
                     "bare strings are not valid onClick effects".into(),
                 ));
             }
-            Some(LinkedVmEvent::Completed(_)) => return Ok(effects),
+            Some(LinkedVmEvent::Completed(_)) => return Ok((effects, vm.current_globals())),
             None => {
                 return Err(UiVmError::Runtime(
                     "onClick handler stopped without completing".into(),
@@ -1459,11 +1445,17 @@ fn evaluate_binding_callable(
         .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
     vm.set_current_globals(&binding.globals)
         .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    let mut budget = 100_000;
     loop {
         match vm
-            .step()
+            .step_with_budget(&mut budget)
             .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?
         {
+            Some(LinkedVmEvent::BudgetExhausted) => {
+                return Err(UiVmError::Runtime(
+                    "UI invocation exceeded its instruction budget".into(),
+                ));
+            }
             Some(LinkedVmEvent::Call(call)) => {
                 let value = registry
                     .call(context, &call)
@@ -1796,7 +1788,12 @@ fn materialize_node(
             })
         }
         UiDraftKind::Button(value) => {
-            let click_effects = closure_effects(draft.on_click, program, registry, context)?;
+            let on_click = draft.on_click.map(|closure| UiCallback {
+                program: program.clone(),
+                callable: closure.into_hks_value(),
+                globals: context_globals(context),
+                origin: context.navigation_origin.clone(),
+            });
             let (enabled, reactive_enabled) = if let Some(binding) = &draft.enabled_binding {
                 let reactive = reactive_binding(binding, program, context);
                 let value = evaluate_binding_value(&reactive, registry, context)?;
@@ -1823,7 +1820,7 @@ fn materialize_node(
                 ScreenNode::Text(text) => Ok(ScreenNode::Button(ButtonNode {
                     text: text.text,
                     value,
-                    click_effects,
+                    on_click,
                     enabled,
                     enabled_binding: None,
                     reactive_enabled,
@@ -1884,7 +1881,7 @@ fn materialize_node(
                         hover_scale: draft.hover_scale,
                         press_scale: draft.press_scale,
                         value,
-                        click_effects,
+                        on_click,
                         enabled,
                         enabled_binding: None,
                         reactive_enabled,
@@ -2037,7 +2034,13 @@ screen {
         assert_eq!(button.text, "Continue");
         assert_eq!(button.value, Some(StoredValue::String("continue".into())));
         assert_eq!(
-            button.click_effects,
+            evaluate_ui_callback(
+                button.on_click.as_ref().expect("callback retained"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default()
+            )
+            .expect("click executes")
+            .0,
             vec![UiEffect::PlaySfx {
                 name: "ui/confirm".into(),
                 volume: 1.0,
@@ -2077,7 +2080,65 @@ global fn card(label: String, count: Int) -> UiNode {
     }
 
     #[test]
-    fn on_click_builds_typed_state_actions_without_routes() {
+    fn on_click_reads_current_globals_and_preserves_operation_order() {
+        let screen = evaluate_ui_component_named(
+            "memory://callback.ui.hks",
+            r#"
+import ui.widgets.*
+screen {
+    button { text("Save") }.onClick {
+        if playerName == "alice" { storage.save("alice") }
+        else { storage.save("bob") }
+        ui.close()
+    }
+}
+"#,
+            UiContext::new(BTreeMap::from([(
+                "playerName".into(),
+                StoredValue::String("alice".into()),
+            )])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("screen constructs without running its callback");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected button")
+        };
+        let callback = button.on_click.as_ref().expect("callback retained");
+        let globals = BTreeMap::from([("playerName".into(), Value::String("bob".into()))]);
+        let (effects, _) =
+            evaluate_ui_callback(callback, &globals, &crate::ui::UiModels::default())
+                .expect("callback executes against current globals");
+        assert_eq!(
+            effects,
+            vec![UiEffect::Save { slot: "bob".into() }, UiEffect::CloseUi]
+        );
+    }
+
+    #[test]
+    fn nonterminating_click_does_not_execute_during_mount() {
+        let screen = evaluate_ui_component_named(
+            "memory://callback.ui.hks",
+            "import ui.widgets.*\nscreen { button { text(\"Run\") }.onClick { while true {} } }",
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("mount does not evaluate onClick");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected button")
+        };
+        let error = evaluate_ui_callback(
+            button.on_click.as_ref().expect("callback retained"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+        )
+        .expect_err("click budget must terminate evaluation");
+        assert!(error.to_string().contains("instruction budget"));
+    }
+
+    #[test]
+    fn on_click_executes_typed_state_actions_without_routes() {
         let screen = evaluate_ui_component_named(
             "memory://actions.ui.hks",
             r#"
@@ -2098,7 +2159,13 @@ screen {
             panic!("expected a button")
         };
         assert_eq!(
-            button.click_effects,
+            evaluate_ui_callback(
+                button.on_click.as_ref().expect("callback retained"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default()
+            )
+            .expect("click executes")
+            .0,
             vec![
                 UiEffect::PlaySfx {
                     name: "ui/confirm".into(),
@@ -2119,7 +2186,8 @@ screen {
 import ui.widgets.*
 screen {
     button { text("Return") }.onClick {
-        story.goto("../title.hks").reset(.session)
+        story.goto("../title.hks", .{ reset: .session })
+        sfx("ui/should-not-play")
     }
 }
 "#,
@@ -2132,7 +2200,13 @@ screen {
             panic!("expected a button")
         };
         assert_eq!(
-            button.click_effects,
+            evaluate_ui_callback(
+                button.on_click.as_ref().expect("callback retained"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default()
+            )
+            .expect("click executes")
+            .0,
             vec![UiEffect::Navigate(NavigationRequest {
                 path: "../title.hks".into(),
                 kind: super::super::navigation::NavigationKind::Goto,
@@ -2342,12 +2416,18 @@ canvas { choiceOptions(renderOption) }
             panic!("first child should be a closure-only button")
         };
         assert_eq!(passive.value, None);
-        assert!(passive.click_effects.is_empty());
+        assert!(passive.on_click.is_none());
         let ScreenNode::Button(button) = &screen.children[1] else {
             panic!("second child should be an action button")
         };
         assert_eq!(
-            button.click_effects,
+            evaluate_ui_callback(
+                button.on_click.as_ref().expect("callback retained"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default()
+            )
+            .expect("click executes")
+            .0,
             vec![UiEffect::Save {
                 slot: "quick".into()
             }]

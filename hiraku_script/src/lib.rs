@@ -1,3 +1,19 @@
+//! HKS bindings distinguish rebinding from object updates:
+//! `let` fixes a binding, while `var` allows reassignment. Both permit field updates.
+//! Global variables use `global let` (initialized) or `global var` (optionally
+//! initialized later). `global fn` exports a function.
+//!
+//! Unannotated numeric locals are constrained by their uses: `let a = 1; let b:
+//! Float = a` infers both bindings as Float. Explicit annotations remain fixed.
+//! `.toInt()` explicitly truncates a finite numeric value toward zero; implicit
+//! Float-to-Int assignment is rejected. Values outside the exactly representable
+//! integer range of the current numeric representation are rejected as well.
+//!
+//! `Never` is the bottom type. `todo()` and `unreachable()` trap; calls whose
+//! result is Never are followed by a VM trap if a host incorrectly returns.
+//! Any requires an explicit cast before assignment to a concrete script type;
+//! native calls can accept dynamic values and validate them at the Rust boundary.
+
 pub mod ast;
 pub mod blocks;
 pub mod hir;
@@ -43,7 +59,7 @@ pub use mir::{
     MirBasicBlock, MirBlockId, MirConstant, MirFunction, MirInstruction, MirLoweringError,
     MirProgram, MirTerminator, VirtualRegister, lower_hir_to_mir,
 };
-pub use native::TextTemplate;
+pub use native::{Never, TextTemplate};
 pub use parse::{ParseError, parse_program};
 pub use register::{
     InvalidRegister, Register, RegisterAllocation, RegisterAllocationError, RegisterFrame,

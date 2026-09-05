@@ -732,6 +732,17 @@ impl Parser {
         if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
             return self.parse_function(true);
         }
+        let mutable = match &self.current().kind {
+            TokenKind::Ident(name) if name == "let" || name == "var" => {
+                let mutable = name == "var";
+                self.advance();
+                mutable
+            }
+            _ => {
+                self.error_here("expected `let`, `var`, or `fn` after `global`; use `global let` for a fixed binding or `global var` for a reassignable binding");
+                false
+            }
+        };
         let name = match self.advance().kind {
             TokenKind::Ident(name) => name,
             _ => {
@@ -754,12 +765,18 @@ impl Parser {
         if type_annotation.is_none() && value.is_none() {
             self.error_here("a global requires a type or initializer");
         }
+        if !mutable && value.is_none() {
+            self.error_here(
+                "`global let` requires an initializer; use `global var` for delayed initialization",
+            );
+        }
         let end = value
             .as_ref()
             .map(|value| value.span.clone())
             .or_else(|| type_annotation.as_ref().map(|ty| ty.span.clone()))
             .unwrap_or_else(|| start.span.clone());
         Stmt::Global {
+            mutable,
             name,
             type_annotation,
             value,
@@ -1916,12 +1933,29 @@ mod tests {
     }
 
     #[test]
+    fn global_bindings_require_an_explicit_binding_kind() {
+        assert!(parse_program("global score = 1").is_err());
+        assert!(parse_program("global let score: Int").is_err());
+        let program = parse_program("global let name = \"alice\"\nglobal var score: Int")
+            .expect("explicit global bindings parse");
+        assert!(matches!(
+            &program.statements[0],
+            Stmt::Global { mutable: false, .. }
+        ));
+        assert!(matches!(
+            &program.statements[1],
+            Stmt::Global { mutable: true, .. }
+        ));
+        assert!(parse_program("global fn greet() { \"Hello\" }").is_ok());
+    }
+
+    #[test]
     fn parses_globals_nullable_types_assignment_and_lists() {
         let program = parse_program(
             r#"
-                global player: .{ name: String, health: Int } = .{ name: "", health: 123 }
-                global nickname: String? = null
-                global lazyName: String
+                global var player: .{ name: String, health: Int } = .{ name: "", health: 123 }
+                global var nickname: String? = null
+                global var lazyName: String
                 lazyName = "alice"
                 let values: List<Int> = [1, 2, 3]
                 let shown = nickname ?: "fallback"

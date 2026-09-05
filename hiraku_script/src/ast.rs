@@ -52,6 +52,7 @@ pub enum Stmt {
         span: Span,
     },
     Global {
+        mutable: bool,
         name: String,
         type_annotation: Option<TypeExpr>,
         value: Option<Expr>,

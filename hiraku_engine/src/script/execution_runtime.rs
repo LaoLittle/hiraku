@@ -216,17 +216,33 @@ impl ExecutionRuntime {
     }
 
     /// Advances the root execution first, then the first ready child.
+    #[cfg(test)]
     pub fn step(&mut self) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
+        self.step_with_budget(&mut 10_000)
+    }
+
+    pub fn step_with_budget(
+        &mut self,
+        budget: &mut u32,
+    ) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
         if self.executions.contains_key(&ExecutionId::MAIN)
-            && let Some(event) = self.step_execution(ExecutionId::MAIN)?
+            && let Some(event) = self.step_execution(ExecutionId::MAIN, budget)?
         {
             return Ok(Some(event));
         }
-        self.step_children()
+        self.step_children_with_budget(budget)
     }
 
     /// Advances children while the story policy keeps the root host-blocked.
+    #[cfg(test)]
     pub fn step_children(&mut self) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
+        self.step_children_with_budget(&mut 10_000)
+    }
+
+    pub fn step_children_with_budget(
+        &mut self,
+        budget: &mut u32,
+    ) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
         let ready = self
             .executions
             .iter()
@@ -234,7 +250,7 @@ impl ExecutionRuntime {
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         for execution in ready {
-            if let Some(event) = self.step_execution(execution)? {
+            if let Some(event) = self.step_execution(execution, budget)? {
                 return Ok(Some(event));
             }
         }
@@ -244,6 +260,7 @@ impl ExecutionRuntime {
     fn step_execution(
         &mut self,
         execution: ExecutionId,
+        budget: &mut u32,
     ) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
         let event = {
             let state = self
@@ -254,13 +271,17 @@ impl ExecutionRuntime {
                 return Ok(None);
             }
             state.vm.set_global_values(self.shared_globals.clone())?;
-            state.vm.step()?
+            state.vm.step_with_budget(budget)?
         };
         let Some(event) = event else {
             return Ok(None);
         };
 
         match event {
+            VmEvent::BudgetExhausted => {
+                self.capture_globals(execution)?;
+                Ok(None)
+            }
             VmEvent::Call(call) => {
                 self.capture_globals(execution)?;
                 let mut call = self.link_call(call)?;

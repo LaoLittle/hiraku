@@ -14,6 +14,22 @@ use crate::{
 };
 
 type NativeResult = Result<Value, NativeError>;
+
+/// Uninhabited Rust counterpart of the script bottom type.
+#[derive(Debug)]
+pub enum Never {}
+
+impl IntoHksValue for Never {
+    fn into_hks_value(self) -> Value {
+        match self {}
+    }
+}
+
+impl HksScriptType for Never {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
+        crate::ScriptType::Never
+    }
+}
 type NativeThunk<C> = dyn Fn(&mut C, &[Value]) -> NativeResult + Send + Sync + 'static;
 type RawNativeThunk<C> = dyn Fn(&mut C, &BuiltinCall) -> NativeResult + Send + Sync + 'static;
 

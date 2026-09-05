@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn top_level_markers_roundtrip_as_editor_metadata() {
-        let source = r#"global route = "a"
+        let source = r#"global var route = "a"
 
 // @block(intro)
 "Hello"
@@ -176,7 +176,7 @@ mod tests {
 char("alice"): "Next"
 "#;
         let document = parse_block_document(source).expect("block document parses");
-        assert_eq!(document.preamble, "global route = \"a\"");
+        assert_eq!(document.preamble, "global var route = \"a\"");
         assert_eq!(document.blocks.len(), 2);
         assert_eq!(document.block_name(document.blocks[0].id), Some("intro"));
         assert_eq!(document.block_name(document.blocks[1].id), Some("next"));

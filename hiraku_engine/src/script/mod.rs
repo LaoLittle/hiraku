@@ -54,6 +54,7 @@ pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
 }
 
 pub use ui_runtime::{UiContext, UiIntent};
+pub(crate) use ui_vm::evaluate_ui_callback;
 pub(crate) use ui_vm::evaluate_ui_component_named_with_args;
 pub(crate) use ui_vm::evaluate_ui_reactive_binding;
 

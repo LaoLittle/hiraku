@@ -6,19 +6,9 @@ pub struct PauseMenuRoot;
 
 #[derive(Component)]
 pub struct RuntimeMenuButton {
-    pub action: RuntimeMenuButtonAction,
+    pub callback: crate::ui::UiCallback,
     /// Modal screen which owns this action.
     pub screen_root: Option<Entity>,
-}
-
-#[derive(Clone)]
-pub enum RuntimeMenuButtonAction {
-    Save(String),
-    Load(String),
-    OpenUi(String),
-    CloseUi,
-    Navigate(crate::script::navigation::NavigationRequest),
-    AdvanceDialogue,
 }
 
 #[derive(Resource, Default)]
@@ -39,6 +29,8 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub script_runtime: ResMut<'w, ScriptRuntimeState>,
     pub frontend: ResMut<'w, FrontendState>,
     pub user_settings: Res<'w, UserSettings>,
+    pub models: Res<'w, crate::ui::UiModels>,
+    pub effects: MessageWriter<'w, super::screen_ui::UiEffectMessage>,
     pub ui_style: Res<'w, UiStyle>,
     pub runtime_menu: ResMut<'w, RuntimeMenuState>,
     pub dialogue_history: ResMut<'w, DialogueHistoryState>,
@@ -216,97 +208,128 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 .entity(button_entity)
                 .insert(BackgroundColor(ctx.ui_style.choice_button_bg));
         }
-        let action = button.action.clone();
-        match &action {
-            RuntimeMenuButtonAction::Save(slot) => {
-                if let Err(error) = save_runtime_slot(slot, &ctx.script_runtime, &ctx.shared_state)
-                {
-                    warn!("failed to save slot `{slot}`: {error}");
-                }
-            }
-            RuntimeMenuButtonAction::Load(slot) => {
-                let save_data = match load_save_data(slot) {
-                    Ok(save_data) => save_data,
-                    Err(error) => {
-                        warn!("failed to load slot `{slot}`: {error}");
-                        ctx.frontend.notice = Some(format!("Failed to load slot {slot}: {error}"));
-                        continue;
-                    }
-                };
-                abort_runtime_waiters(
-                    &mut ctx.commands,
-                    &mut ctx.waits,
-                    &mut ctx.dialogue_state,
-                    &mut ctx.choice_state,
-                    &mut ctx.screen_state,
-                    &mut ctx.pending_script_commands,
-                    &mut ctx.pending_characters,
-                    &mut ctx.animations,
-                    &mut ctx.voice_state,
-                    &ctx.choice_ui_roots,
-                );
-                ctx.dialogue_history.entries.clear();
-                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                start_frontend_session(
-                    &mut ctx.commands,
-                    &ctx.asset_server,
-                    &ctx.vfs,
-                    &mut ctx.shared_state,
-                    &mut ctx.stage,
-                    &mut ctx.dialogue_state,
-                    &mut ctx.choice_state,
-                    &ctx.choice_ui_roots,
-                    &mut ctx.dialogue_root,
-                    &mut ctx.speaker_text,
-                    &mut ctx.line_text,
-                    &ctx.user_settings,
-                    &mut ctx.frontend,
-                    &mut ctx.script_runtime,
-                    ScriptBootstrap::from_save(&save_data),
-                    save_data.scene.clone(),
-                );
-                if let Some(error) = ctx.frontend.notice.as_deref() {
-                    warn!("failed to restore slot `{slot}`: {error}");
-                } else {
-                    info!("loaded save slot `{slot}`");
-                }
-            }
-            RuntimeMenuButtonAction::OpenUi(role) => {
-                let Some(target) = ctx.script_runtime.ui_registry.get(role).cloned() else {
-                    warn!("UI action route references unregistered role `{role}`");
+        let callback = button.callback.clone();
+        let mut globals = ctx
+            .script_runtime
+            .story
+            .as_ref()
+            .map(|story| story.globals().clone())
+            .unwrap_or_default();
+        let (effects, updated) =
+            match crate::script::evaluate_ui_callback(&callback, &globals, &ctx.models) {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!("onClick failed: {error}");
                     continue;
-                };
-                match evaluate_ui_at(
-                    &target,
-                    &ctx.script_runtime,
-                    &ctx.vfs,
-                    &ctx.user_settings,
-                    Some(&ctx.textures),
-                    Some(&ctx.terms),
-                ) {
-                    Ok(screen) => {
-                        ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
-                            UiCommand::ShowScreen { screen, done: None },
-                        ));
-                    }
-                    Err(error) => warn!("failed to open UI role `{role}`: {error}"),
                 }
+            };
+        // Only story globals are writable here. UI models are read-only projections.
+        for (name, value) in updated {
+            if globals.contains_key(&name) && !ctx.models.roots().any(|(root, _)| root == name) {
+                globals.insert(name, value);
             }
-            RuntimeMenuButtonAction::CloseUi => {
-                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-            }
-            RuntimeMenuButtonAction::Navigate(navigation) => {
-                ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
-                    RuntimeCommand::Navigate(navigation.clone()),
-                ));
-            }
-            RuntimeMenuButtonAction::AdvanceDialogue => {
-                advance_dialogue(
-                    &mut ctx.dialogue_state,
-                    &mut ctx.animations,
-                    &mut ctx.dialogue_chars,
-                    &mut ctx.responses,
-                );
+        }
+        if let Some(story) = ctx.script_runtime.story.as_mut() {
+            story.set_globals(globals);
+        }
+        for effect in effects {
+            match &effect {
+                crate::ui::UiEffect::PlaySfx { .. } => {
+                    ctx.effects
+                        .write(super::screen_ui::UiEffectMessage(effect.clone()));
+                }
+                crate::ui::UiEffect::Save { slot } => {
+                    if let Err(error) =
+                        save_runtime_slot(slot, &ctx.script_runtime, &ctx.shared_state)
+                    {
+                        warn!("failed to save slot `{slot}`: {error}");
+                    }
+                }
+                crate::ui::UiEffect::Load { slot } => {
+                    let save_data = match load_save_data(slot) {
+                        Ok(save_data) => save_data,
+                        Err(error) => {
+                            warn!("failed to load slot `{slot}`: {error}");
+                            ctx.frontend.notice =
+                                Some(format!("Failed to load slot {slot}: {error}"));
+                            continue;
+                        }
+                    };
+                    abort_runtime_waiters(
+                        &mut ctx.commands,
+                        &mut ctx.waits,
+                        &mut ctx.dialogue_state,
+                        &mut ctx.choice_state,
+                        &mut ctx.screen_state,
+                        &mut ctx.pending_script_commands,
+                        &mut ctx.pending_characters,
+                        &mut ctx.animations,
+                        &mut ctx.voice_state,
+                        &ctx.choice_ui_roots,
+                    );
+                    ctx.dialogue_history.entries.clear();
+                    clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                    start_frontend_session(
+                        &mut ctx.commands,
+                        &ctx.asset_server,
+                        &ctx.vfs,
+                        &mut ctx.shared_state,
+                        &mut ctx.stage,
+                        &mut ctx.dialogue_state,
+                        &mut ctx.choice_state,
+                        &ctx.choice_ui_roots,
+                        &mut ctx.dialogue_root,
+                        &mut ctx.speaker_text,
+                        &mut ctx.line_text,
+                        &ctx.user_settings,
+                        &mut ctx.frontend,
+                        &mut ctx.script_runtime,
+                        ScriptBootstrap::from_save(&save_data),
+                        save_data.scene.clone(),
+                    );
+                    if let Some(error) = ctx.frontend.notice.as_deref() {
+                        warn!("failed to restore slot `{slot}`: {error}");
+                    } else {
+                        info!("loaded save slot `{slot}`");
+                    }
+                }
+                crate::ui::UiEffect::OpenUi { role } => {
+                    let Some(target) = ctx.script_runtime.ui_registry.get(role).cloned() else {
+                        warn!("UI action route references unregistered role `{role}`");
+                        continue;
+                    };
+                    match evaluate_ui_at(
+                        &target,
+                        &ctx.script_runtime,
+                        &ctx.vfs,
+                        &ctx.user_settings,
+                        Some(&ctx.textures),
+                        Some(&ctx.terms),
+                    ) {
+                        Ok(screen) => {
+                            ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
+                                UiCommand::ShowScreen { screen, done: None },
+                            ));
+                        }
+                        Err(error) => warn!("failed to open UI role `{role}`: {error}"),
+                    }
+                }
+                crate::ui::UiEffect::CloseUi => {
+                    clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                }
+                crate::ui::UiEffect::Navigate(navigation) => {
+                    ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
+                        RuntimeCommand::Navigate(navigation.clone()),
+                    ));
+                }
+                crate::ui::UiEffect::NextDialogue => {
+                    advance_dialogue(
+                        &mut ctx.dialogue_state,
+                        &mut ctx.animations,
+                        &mut ctx.dialogue_chars,
+                        &mut ctx.responses,
+                    );
+                }
             }
         }
     }

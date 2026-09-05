@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::script::animation::{AnimationSpec, register_animation_api};
-use crate::script::navigation::{NavigationHandle, NavigationRequest, NavigationResetValue};
+use crate::script::navigation::{NavigationOptions, NavigationRequest, NavigationResetValue};
 use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
@@ -94,6 +94,7 @@ pub enum StoryTaskKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoryControl {
+    Navigate(NavigationRequest),
     SpawnTask { kind: StoryTaskKind, closure: Value },
     BeginChoice { prompt: String, closure: Value },
     AddChoiceOption { label: String, closure: Value },
@@ -383,6 +384,7 @@ pub struct StoryNativeHost {
 }
 
 struct StoryControlBuiltins {
+    goto: BuiltinId,
     sequence: BuiltinId,
     parallel: BuiltinId,
     choice: BuiltinId,
@@ -394,6 +396,9 @@ struct StoryControlBuiltins {
 impl StoryControlBuiltins {
     fn new(manifest: &BuiltinManifest) -> Self {
         Self {
+            goto: manifest
+                .resolve_selector("story", "goto")
+                .expect("story.goto is registered"),
             sequence: manifest.resolve("seq").expect("seq builtin is registered"),
             parallel: manifest.resolve("par").expect("par builtin is registered"),
             choice: manifest
@@ -433,6 +438,11 @@ impl StoryNativeHost {
         &mut self,
         call: &BuiltinCall,
     ) -> Result<StoryCallOutcome, CharacterCapabilityError> {
+        if call.builtin == self.controls.goto {
+            let request = NavigationRequest::from_goto_call(call)
+                .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
+            return Ok(StoryCallOutcome::Control(StoryControl::Navigate(request)));
+        }
         if call.builtin == self.controls.sequence || call.builtin == self.controls.parallel {
             let closure = call
                 .arguments
@@ -568,8 +578,6 @@ impl StoryNativeHost {
             pending_bgm: self.context.pending_bgm.clone(),
             next_camera_handle: self.context.next_camera_handle,
             pending_cameras: self.context.pending_cameras.clone(),
-            next_navigation_handle: self.context.next_navigation_handle,
-            pending_navigations: self.context.pending_navigations.clone(),
         }
     }
 
@@ -589,8 +597,6 @@ impl StoryNativeHost {
                 pending_bgm: snapshot.pending_bgm,
                 next_camera_handle: snapshot.next_camera_handle,
                 pending_cameras: snapshot.pending_cameras,
-                next_navigation_handle: snapshot.next_navigation_handle,
-                pending_navigations: snapshot.pending_navigations,
             },
             registry,
             controls,
@@ -613,10 +619,6 @@ pub struct StoryNativeHostSnapshot {
     pending_bgm: BTreeMap<u64, PendingBgm>,
     next_camera_handle: u64,
     pending_cameras: BTreeMap<u64, PendingCamera>,
-    #[serde(default)]
-    next_navigation_handle: u64,
-    #[serde(default)]
-    pending_navigations: BTreeMap<u64, NavigationRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -662,8 +664,6 @@ struct CharacterContext {
     pending_bgm: BTreeMap<u64, PendingBgm>,
     next_camera_handle: u64,
     pending_cameras: BTreeMap<u64, PendingCamera>,
-    next_navigation_handle: u64,
-    pending_navigations: BTreeMap<u64, NavigationRequest>,
 }
 
 impl CharacterContext {
@@ -790,27 +790,6 @@ impl CharacterContext {
             .ok_or_else(|| NativeError::message(format!("unknown camera handle {handle}")))
     }
 
-    fn goto(&mut self, path: String) -> Result<NavigationHandle, NativeError> {
-        self.next_navigation_handle += 1;
-        let handle = self.next_navigation_handle;
-        self.pending_navigations
-            .insert(handle, NavigationRequest::goto(path)?);
-        Ok(NavigationHandle(handle))
-    }
-
-    fn reset_navigation(
-        &mut self,
-        NavigationHandle(handle): NavigationHandle,
-        reset: NavigationResetValue,
-    ) -> Result<NavigationHandle, NativeError> {
-        let navigation = self
-            .pending_navigations
-            .get_mut(&handle)
-            .ok_or_else(|| NativeError::message(format!("unknown Navigation handle {handle}")))?;
-        navigation.reset = reset.into();
-        Ok(NavigationHandle(handle))
-    }
-
     fn actor_mut(&mut self, handle: u64) -> Result<&mut PendingActor, CharacterCapabilityError> {
         self.actors
             .get_mut(&handle)
@@ -872,9 +851,6 @@ impl CharacterContext {
                 });
             }
         }
-        let navigations = std::mem::take(&mut self.pending_navigations);
-        self.commands
-            .extend(navigations.into_values().map(StoryEffect::Navigate));
         Ok(())
     }
 }
@@ -1094,15 +1070,6 @@ mod native_api {
             .commands
             .push(StoryEffect::SetBackground { texture });
         Ok(())
-    }
-
-    #[hks(name = "reset", receiver)]
-    fn native_navigation_reset(
-        context: &mut CharacterContext,
-        navigation: NavigationHandle,
-        reset: NavigationResetValue,
-    ) -> Result<NavigationHandle, NativeError> {
-        context.reset_navigation(navigation, reset)
     }
 
     #[hks]
@@ -1402,9 +1369,13 @@ mod story_api {
     #[hks(name = "goto")]
     fn native_goto_story(
         context: &mut CharacterContext,
-        path: String,
-    ) -> Result<NavigationHandle, NativeError> {
-        context.goto(path)
+        _path: String,
+        _options: Option<NavigationOptions>,
+    ) -> Result<hiraku_script::native::Never, NativeError> {
+        let _ = context;
+        Err(NativeError::message(
+            "story.goto requires a story execution host",
+        ))
     }
 
     #[hks(name = "call")]
@@ -1500,7 +1471,7 @@ not_actor.at(.left)"#,
         assert!(manifest.resolve("loadScript").is_none());
         let bytecode = compile_story_bytecode(
             "entry.hks",
-            "story.goto(\"ending.hks\").reset(.presentation)\nstory.call(\"credits.hks\")",
+            "story.goto(\"ending.hks\", .{ reset: .presentation })\nstory.call(\"credits.hks\")",
         )
         .expect("ordinary .hks paths must compile as story scripts");
         let mut runtime = crate::script::StoryRuntime::new(bytecode)
@@ -1517,16 +1488,23 @@ not_actor.at(.left)"#,
             ))
         );
         assert_eq!(
-            runtime.step().expect("call must execute"),
+            runtime
+                .step()
+                .expect("goto terminates the source execution"),
+            None
+        );
+        let bytecode = compile_story_bytecode("entry.hks", "story.call(\"credits.hks\")")
+            .expect("call compiles separately");
+        let mut runtime = crate::script::StoryRuntime::new(bytecode).expect("runtime initializes");
+        assert!(matches!(
+            runtime.step().expect("call executes"),
             Some(crate::script::StoryRuntimeEvent::Effect(
                 StoryEffect::Navigate(NavigationRequest {
-                    path: "credits.hks".into(),
                     kind: crate::script::navigation::NavigationKind::Call,
-                    reset: crate::script::navigation::NavigationReset::None,
-                    origin: None,
+                    ..
                 })
             ))
-        );
+        ));
     }
 
     #[test]

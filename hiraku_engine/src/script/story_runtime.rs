@@ -29,6 +29,7 @@ pub struct StoryRuntime {
     waiting_interactive_task: Option<ExecutionId>,
     choice: Option<ChoiceState>,
     blocked: bool,
+    terminated: bool,
     blocked_wait: Option<StoryWait>,
 }
 
@@ -84,6 +85,7 @@ pub struct StoryRuntimeSnapshot {
     waiting_interactive_task: Option<ExecutionId>,
     choice: Option<ChoiceState>,
     blocked: bool,
+    terminated: bool,
     #[serde(default)]
     blocked_wait: Option<StoryWait>,
 }
@@ -100,6 +102,7 @@ impl StoryRuntime {
             waiting_interactive_task: None,
             choice: None,
             blocked: false,
+            terminated: false,
             blocked_wait: None,
         })
     }
@@ -117,6 +120,7 @@ impl StoryRuntime {
             waiting_interactive_task: self.waiting_interactive_task,
             choice: self.choice.clone(),
             blocked: self.blocked,
+            terminated: self.terminated,
             blocked_wait: self.blocked_wait.clone(),
         })
     }
@@ -162,6 +166,7 @@ impl StoryRuntime {
             waiting_interactive_task: snapshot.waiting_interactive_task,
             choice: snapshot.choice,
             blocked: snapshot.blocked,
+            terminated: snapshot.terminated,
             blocked_wait: snapshot.blocked_wait,
         };
         for task in completed_voice_tasks {
@@ -205,6 +210,9 @@ impl StoryRuntime {
     }
 
     pub fn resume(&mut self, value: Value) -> Result<(), StoryRuntimeError> {
+        if self.terminated {
+            return Err(StoryRuntimeError::Terminated);
+        }
         if !self.blocked {
             return Err(StoryRuntimeError::NotBlocked);
         }
@@ -276,13 +284,17 @@ impl StoryRuntime {
     }
 
     pub fn step(&mut self) -> Result<Option<StoryRuntimeEvent>, StoryRuntimeError> {
+        if self.terminated {
+            return Ok(None);
+        }
+        let mut budget = 10_000;
         if let Some(event) = self.pending.pop_front() {
             self.mark_host_boundary(&event);
             return Ok(Some(event));
         }
         if self.blocked {
             loop {
-                let Some(event) = self.execution.step_children()? else {
+                let Some(event) = self.execution.step_children_with_budget(&mut budget)? else {
                     return Ok(None);
                 };
                 if let Some(event) = self.handle_task_event(event)? {
@@ -291,12 +303,18 @@ impl StoryRuntime {
             }
         }
         loop {
-            let Some(event) = self.execution.step()? else {
+            let Some(event) = self.execution.step_with_budget(&mut budget)? else {
                 return Ok(None);
             };
             match event {
                 ExecutionEvent::Call { execution, call } if execution.is_main() => {
                     match self.host.call(&call)? {
+                        StoryCallOutcome::Control(StoryControl::Navigate(request)) => {
+                            self.terminated = true;
+                            return Ok(Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(
+                                request,
+                            ))));
+                        }
                         StoryCallOutcome::Return(value) => {
                             self.execution.resume(ExecutionId::MAIN, value)?
                         }
@@ -397,6 +415,12 @@ impl StoryRuntime {
                 execution: task,
                 call,
             } => match self.host.call(&call)? {
+                StoryCallOutcome::Control(StoryControl::Navigate(request)) => {
+                    self.terminated = true;
+                    return Ok(Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(
+                        request,
+                    ))));
+                }
                 StoryCallOutcome::Return(value) => {
                     self.execution.resume(task, value)?;
                 }
@@ -512,6 +536,8 @@ impl StoryRuntime {
 
 #[derive(Debug, Error)]
 pub enum StoryRuntimeError {
+    #[error("story execution has terminated; it cannot accept a host response")]
+    Terminated,
     #[error(transparent)]
     Bytecode(#[from] ExecutionRuntimeError),
     #[error(transparent)]
@@ -540,6 +566,35 @@ mod tests {
     use crate::script::capabilities::{
         StoryEffect, StoryNativeHost, compile_story_bytecode, story_manifest,
     };
+
+    #[test]
+    fn terminal_navigation_cancels_the_source_including_child_executions() {
+        let bytecode = compile_story_bytecode(
+            "entry.hks",
+            r#"
+            let handle = par { story.goto("next.hks") log("unreachable child") }
+            wait(handle)
+            log("unreachable parent")
+        "#,
+        )
+        .expect("terminal child call compiles");
+        let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime initializes");
+        assert!(matches!(
+            runtime.step().expect("child jumps"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(_)))
+        ));
+        assert_eq!(runtime.step().expect("source stops"), None);
+        assert!(matches!(
+            runtime.resume(Value::Unit),
+            Err(StoryRuntimeError::Terminated)
+        ));
+        let mut restored = StoryRuntime::restore(bytecode, runtime.snapshot().expect("snapshot"))
+            .expect("restore");
+        assert_eq!(
+            restored.step().expect("restored source remains stopped"),
+            None
+        );
+    }
     use hiraku_script::StatementValue;
 
     #[test]
@@ -675,7 +730,7 @@ mod tests {
     fn whole_program_runtime_evaluates_dialogue_templates_from_globals() {
         let bytecode = compile_story_bytecode(
             "template.story.hks",
-            "global player = .{ name: \"alice\" }\n\"Hi, ${player.name}\"",
+            "global var player = .{ name: \"alice\" }\n\"Hi, ${player.name}\"",
         )
         .expect("template story must compile");
         let mut runtime = ExecutionRuntime::new(bytecode).expect("runtime must initialize");
@@ -825,7 +880,7 @@ mod tests {
         let bytecode = compile_story_bytecode(
             "driver.story.hks",
             r#"
-                global player = .{ name: "alice" }
+                global var player = .{ name: "alice" }
                 "Hi, ${player.name}"
                 "after"
             "#,
@@ -1195,7 +1250,7 @@ mod tests {
             (
                 "<control-flow>",
                 r#"
-                    let count = 0
+                    var count = 0
                     while count < 2 {
                         "Iteration ${count}"
                         count += 1

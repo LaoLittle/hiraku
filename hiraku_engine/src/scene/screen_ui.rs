@@ -384,7 +384,7 @@ fn spawn_screen_node_entity(
         ScreenNode::Button(ButtonNode {
             text,
             value,
-            click_effects,
+            on_click,
             enabled,
             enabled_binding,
             reactive_enabled,
@@ -408,7 +408,7 @@ fn spawn_screen_node_entity(
             radius,
             layout,
         }) => {
-            let (click_effects, runtime_action) = partition_click_effects(click_effects);
+            let callback = on_click.clone();
             let normal_texture_resolved = background_texture
                 .as_ref()
                 .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
@@ -523,7 +523,6 @@ fn spawn_screen_node_entity(
             commands.entity(button).insert(ScreenUiButton {
                 root,
                 value: value.clone(),
-                click_effects,
                 enabled: *enabled,
                 text_entity: text,
                 normal_background,
@@ -571,9 +570,9 @@ fn spawn_screen_node_entity(
                     rendered_revision: u64::MAX,
                 });
             }
-            if let Some(action) = runtime_action {
+            if let Some(callback) = callback {
                 commands.entity(button).insert(RuntimeMenuButton {
-                    action,
+                    callback,
                     screen_root: Some(root),
                 });
             }
@@ -607,14 +606,14 @@ fn spawn_screen_node_entity(
             hover_scale,
             press_scale,
             value,
-            click_effects,
+            on_click,
             enabled,
             enabled_binding,
             reactive_enabled,
             hovered_when_disabled,
             layout,
         }) => {
-            let (click_effects, runtime_action) = partition_click_effects(click_effects);
+            let callback = on_click.clone();
             let resolved = texture_atlases.resolve(&texture.path, texture.rect);
             let image = resolved
                 .map(|texture| texture.image.clone())
@@ -653,7 +652,6 @@ fn spawn_screen_node_entity(
                     ScreenUiImageButton {
                         root,
                         value: value.clone(),
-                        click_effects,
                         enabled: *enabled,
                         hovered_when_disabled: *hovered_when_disabled,
                         normal_rect,
@@ -677,9 +675,9 @@ fn spawn_screen_node_entity(
                     },
                 ))
                 .id();
-            if let Some(action) = runtime_action {
+            if let Some(callback) = callback {
                 commands.entity(entity).insert(RuntimeMenuButton {
-                    action,
+                    callback,
                     screen_root: Some(root),
                 });
             }
@@ -1016,31 +1014,6 @@ fn spawn_screen_node_entity(
     }
 }
 
-fn partition_click_effects(
-    effects: &[UiEffect],
-) -> (Vec<UiEffect>, Option<RuntimeMenuButtonAction>) {
-    let mut passive = Vec::new();
-    let mut action = None;
-    for effect in effects {
-        let next = match effect {
-            UiEffect::PlaySfx { .. } => {
-                passive.push(effect.clone());
-                continue;
-            }
-            UiEffect::OpenUi { role } => RuntimeMenuButtonAction::OpenUi(role.clone()),
-            UiEffect::CloseUi => RuntimeMenuButtonAction::CloseUi,
-            UiEffect::Save { slot } => RuntimeMenuButtonAction::Save(slot.clone()),
-            UiEffect::Load { slot } => RuntimeMenuButtonAction::Load(slot.clone()),
-            UiEffect::NextDialogue => RuntimeMenuButtonAction::AdvanceDialogue,
-            UiEffect::Navigate(navigation) => RuntimeMenuButtonAction::Navigate(navigation.clone()),
-        };
-        if action.replace(next).is_some() {
-            warn!("a button onClick handler may contain only one state-changing UI action");
-        }
-    }
-    (passive, action)
-}
-
 fn apply_live_layout_bindings(commands: &mut Commands, entity: Entity, layout: &ScreenLayout) {
     commands.entity(entity).insert(if layout.hidden {
         Visibility::Hidden
@@ -1211,7 +1184,6 @@ fn align_items_from_option(value: &Option<String>) -> AlignItems {
 }
 pub fn handle_screen_buttons(
     mut screen_state: ResMut<ScreenUiState>,
-    mut effects: MessageWriter<UiEffectMessage>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
@@ -1281,23 +1253,15 @@ pub fn handle_screen_buttons(
             continue;
         }
         let Some(value) = button.value.clone() else {
-            emit_ui_effects(&mut effects, &button.click_effects);
             continue;
         };
         let Some(done) = screen_state.waiting.take() else {
             continue;
         };
-        emit_ui_effects(&mut effects, &button.click_effects);
         responses.write(ScriptResponseMessage {
             request: done,
             response: ScriptResponse::Choice(value),
         });
-    }
-}
-
-fn emit_ui_effects(writer: &mut MessageWriter<UiEffectMessage>, effects: &[UiEffect]) {
-    for effect in effects.iter().cloned() {
-        writer.write(UiEffectMessage(effect));
     }
 }
 
@@ -1348,7 +1312,6 @@ fn apply_screen_button_image(
 
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
-    mut effects: MessageWriter<UiEffectMessage>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut clicks: MessageReader<Pointer<Click>>,
     mut interaction_query: Query<
@@ -1431,13 +1394,11 @@ pub fn handle_screen_image_buttons(
             continue;
         }
         let Some(value) = button.value.clone() else {
-            emit_ui_effects(&mut effects, &button.click_effects);
             continue;
         };
         let Some(done) = screen_state.waiting.take() else {
             continue;
         };
-        emit_ui_effects(&mut effects, &button.click_effects);
         responses.write(ScriptResponseMessage {
             request: done,
             response: ScriptResponse::Choice(value),
@@ -1887,7 +1848,6 @@ mod tests {
                 ScreenUiButton {
                     root,
                     value: Some(StoredValue::String("continue".into())),
-                    click_effects: Vec::new(),
                     enabled: true,
                     text_entity: text,
                     normal_background: Color::BLACK,

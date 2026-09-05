@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn normalization_interns_nested_selectors_and_bindings_once() {
         let program = crate::parse_program(
-            "global player = .{ stats: .{ health: 1 } }\nplayer.stats.health = 2",
+            "global var player = .{ stats: .{ health: 1 } }\nplayer.stats.health = 2",
         )
         .expect("source parses");
         let symbols = normalize_program_symbols(&program, None);

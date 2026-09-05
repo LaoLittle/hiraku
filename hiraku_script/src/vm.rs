@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 7;
+pub const BYTECODE_VERSION: u16 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -55,6 +55,7 @@ pub struct BytecodeRegion {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
+    Udf(StringId),
     Constant {
         dst: Register,
         value: Constant,
@@ -357,6 +358,7 @@ fn emit_function(
         let mut emitted = Vec::new();
         for instruction in &block.instructions {
             let scalar = match instruction {
+                MirInstruction::Udf(reason) => Instruction::Udf(strings.intern(reason.clone())),
                 MirInstruction::MakeClosure { dst, region } => Instruction::MakeClosure {
                     dst: register(*dst),
                     region: *region_ids.get(*region as usize).ok_or_else(|| {
@@ -747,6 +749,8 @@ pub enum CodeLocation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmEvent {
+    /// Cooperative yield, not a statement commit or a host wait.
+    BudgetExhausted,
     Call(SymbolCall),
     Statement(StatementValue),
     Completed(Value),
@@ -925,10 +929,20 @@ impl Vm {
     }
 
     pub fn step(&mut self) -> Result<Option<VmEvent>, VmError> {
+        self.step_with_budget(&mut 10_000)
+    }
+
+    /// The caller may share a budget across events and linked function calls.
+    /// Exhaustion preserves the exact execution state and requires no `resume`.
+    pub fn step_with_budget(&mut self, remaining: &mut u32) -> Result<Option<VmEvent>, VmError> {
         if self.status != VmStatus::Ready {
             return Ok(None);
         }
         loop {
+            if *remaining == 0 {
+                return Ok(Some(VmEvent::BudgetExhausted));
+            }
+            *remaining -= 1;
             let instruction = self
                 .current_instructions()
                 .get(self.pc)
@@ -936,6 +950,11 @@ impl Vm {
                 .ok_or(VmError::InvalidProgramCounter(self.pc))?;
             self.pc += 1;
             match instruction {
+                Instruction::Udf(reason) => {
+                    return Err(VmError::UndefinedInstruction(
+                        self.string(reason)?.to_owned(),
+                    ));
+                }
                 Instruction::Constant { dst, value } => {
                     let value = self.constant_value(value)?;
                     self.write(dst, value)?;
@@ -1669,12 +1688,13 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
         ScriptType::Bool if matches!(value, Value::Bool(_)) => Ok(value.clone()),
         ScriptType::Int => match value {
             Value::Number(number) if number.is_finite() => {
-                // HKS integers use the exactly representable f64 integer range. Explicit
-                // Float -> Int conversion truncates toward zero and clamps at that boundary.
+                // Until integers have a dedicated runtime representation, do not
+                // silently round/clamp values outside the exact integer range.
                 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-                Ok(Value::Number(
-                    number.trunc().clamp(-MAX_SAFE_INTEGER, MAX_SAFE_INTEGER),
-                ))
+                if number.trunc().abs() > MAX_SAFE_INTEGER {
+                    return Err(mismatch());
+                }
+                Ok(Value::Number(number.trunc()))
             }
             _ => Err(mismatch()),
         },
@@ -1757,6 +1777,7 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmError {
+    UndefinedInstruction(String),
     UnsupportedBytecode(u16),
     InvalidProgramCounter(usize),
     InvalidRegister(Register),
@@ -1791,6 +1812,35 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn instruction_budget_yields_without_a_host_wait_or_commit() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let program = Arc::new(compile("while true {}", &manifest));
+        let mut vm = Vm::new(program.clone()).expect("loop compiles");
+        let mut budget = 20;
+        assert_eq!(
+            vm.step_with_budget(&mut budget),
+            Ok(Some(VmEvent::BudgetExhausted))
+        );
+        assert_eq!(budget, 0);
+        assert_eq!(vm.status(), VmStatus::Ready);
+        let snapshot = vm.snapshot();
+        assert_eq!(
+            vm.step_with_budget(&mut budget),
+            Ok(Some(VmEvent::BudgetExhausted))
+        );
+        assert_eq!(
+            vm.snapshot(),
+            snapshot,
+            "zero budget must not execute instructions"
+        );
+        let mut restored = Vm::restore(program, snapshot).expect("yielded state restores");
+        assert_eq!(
+            restored.step_with_budget(&mut 20),
+            Ok(Some(VmEvent::BudgetExhausted))
+        );
     }
 
     #[test]
@@ -1901,8 +1951,8 @@ mod tests {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
             r#"
-                global player = .{ stats: .{ health: 1 } }
-                let index = 0
+                global var player = .{ stats: .{ health: 1 } }
+                var index = 0
                 while index < 3 {
                     player.stats.health += 1
                     index += 1
@@ -1929,7 +1979,7 @@ mod tests {
     fn native_wait_state_restores_and_resumes_into_its_destination() {
         let builtin = BuiltinId(8);
         let manifest = BuiltinManifest::new([("nativeValue", builtin)]);
-        let bytecode = compile("let value = nativeValue()\nvalue += 1", &manifest);
+        let bytecode = compile("var value = nativeValue()\nvalue += 1", &manifest);
         let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
         let Some(VmEvent::Call(call)) = vm.step().expect("call yields") else {
             panic!("expected native call")
@@ -2108,7 +2158,7 @@ mod tests {
     fn named_functions_are_first_class_and_dynamically_callable() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
-            "fn increment(value: Int) -> Int { value + 1 }\nlet callable = increment\nglobal result = callable(2)",
+            "fn increment(value: Int) -> Int { value + 1 }\nlet callable = increment\nglobal var result = callable(2)",
             &manifest,
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");
@@ -2154,7 +2204,7 @@ mod tests {
     fn cast_modes_execute_with_checked_runtime_semantics() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
-            "global rounded: Int = 3.75 as Int\nglobal absent: String? = 4 as? String",
+            "global var rounded: Int = 3.75 as Int\nglobal var absent: String? = 4 as? String",
             &manifest,
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");
@@ -2170,7 +2220,7 @@ mod tests {
     fn optional_primitives_preserve_nested_some_and_none() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
-            "global present: String? = \"alice\"\nglobal nested: Optional<Optional<String>> = .some(null)\nglobal empty: Optional<Optional<String>> = .none",
+            "global var present: String? = \"alice\"\nglobal var nested: Optional<Optional<String>> = .some(null)\nglobal var empty: Optional<Optional<String>> = .none",
             &manifest,
         );
         let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
@@ -2228,7 +2278,7 @@ mod tests {
     #[test]
     fn forced_cast_failure_is_a_runtime_error() {
         let bytecode = compile(
-            "global result: Int = \"alice\" as! Int",
+            "global var result: Int = \"alice\" as! Int",
             &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");
@@ -2236,9 +2286,77 @@ mod tests {
     }
 
     #[test]
+    fn explicit_to_int_truncates_and_rejects_invalid_values() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let mut vm = Vm::new(compile(
+            "let value = -3.8\nglobal var result = value.toInt()",
+            &manifest,
+        ))
+        .expect("VM initializes");
+        while !matches!(
+            vm.step().expect("conversion succeeds"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(-3.0)));
+        assert!(cast_value(&Value::Number(f64::INFINITY), &crate::ScriptType::Int).is_err());
+        assert!(cast_value(&Value::Number(1e30), &crate::ScriptType::Int).is_err());
+    }
+
+    #[test]
+    fn never_intrinsics_trap_and_never_host_returns_are_guarded() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for source in [
+            "unreachable()",
+            "todo()",
+            "fn stop() -> Never { todo() }\nstop()",
+        ] {
+            let mut vm = Vm::new(compile(source, &manifest)).expect("VM initializes");
+            assert!(
+                matches!(vm.step(), Err(VmError::UndefinedInstruction(_))),
+                "{source}"
+            );
+        }
+
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        registry
+            .register_fn(
+                "stop",
+                |_: &mut ()| -> Result<crate::native::Never, crate::native::NativeError> {
+                    Err(crate::native::NativeError::message(
+                        "host must transfer control",
+                    ))
+                },
+            )
+            .expect("native registers");
+        registry
+            .set_signature_for(
+                "stop",
+                crate::FunctionSignature {
+                    receiver: None,
+                    parameters: Vec::new(),
+                    variadic: None,
+                    result: crate::ScriptType::Never,
+                },
+            )
+            .expect("signature registers");
+        let bytecode = compile("stop()", &registry.manifest());
+        assert!(
+            bytecode
+                .instructions
+                .iter()
+                .any(|op| matches!(op, Instruction::Udf(_)))
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Call(_)))));
+        vm.resume(Value::Unit)
+            .expect("simulate a faulty host returning from Never");
+        assert!(matches!(vm.step(), Err(VmError::UndefinedInstruction(_))));
+    }
+
+    #[test]
     fn an_uninitialized_non_optional_global_fails_when_read() {
         let bytecode = compile(
-            "global name: String\nname",
+            "global var name: String\nname",
             &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");
@@ -2249,7 +2367,7 @@ mod tests {
     #[test]
     fn generic_functions_are_monomorphic_at_type_checking_and_erased_in_bytecode() {
         let bytecode = compile(
-            "fn identity<T>(value: T) -> T { value }\nglobal result: String = identity(\"alice\")",
+            "fn identity<T>(value: T) -> T { value }\nglobal var result: String = identity(\"alice\")",
             &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");
@@ -2263,7 +2381,7 @@ mod tests {
     #[test]
     fn explicit_generic_function_arguments_are_erased_before_bytecode() {
         let bytecode = compile(
-            "fn identity<T>(value: T) -> T { value }\nglobal result: String = identity<String>(\"alice\")",
+            "fn identity<T>(value: T) -> T { value }\nglobal var result: String = identity<String>(\"alice\")",
             &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");
@@ -2329,7 +2447,7 @@ mod tests {
     #[test]
     fn text_template_rewrite_happens_before_expression_evaluation() {
         let bytecode = compile(
-            "global translatedName: String = \"Alice\"",
+            "global var translatedName: String = \"Alice\"",
             &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");

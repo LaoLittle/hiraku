@@ -103,8 +103,8 @@ use dialogue::{
     set_dialogue_line_text, set_dialogue_model_reveal, text_effect_snapshot,
 };
 pub use runtime_menu::{
-    PauseMenuRoot, RuntimeMenuButton, RuntimeMenuButtonAction, RuntimeMenuState,
-    handle_runtime_menu_buttons, update_runtime_menu_button_visuals,
+    PauseMenuRoot, RuntimeMenuButton, RuntimeMenuState, handle_runtime_menu_buttons,
+    update_runtime_menu_button_visuals,
 };
 pub use screen_ui::{
     UiEffectMessage, animate_screen_ui, cleanup_stale_screen_ui, handle_screen_buttons,

@@ -1,5 +1,5 @@
-global speaker = "Alice"
-global dialogueLine = "This dialogue box is a regular HKS UI component."
+global var speaker = "Alice"
+global var dialogueLine = "This dialogue box is a regular HKS UI component."
 
 ui.set("home", "ui/home.ui.hks")
 ui.set("dialogue", "ui/dialogue.ui.hks")

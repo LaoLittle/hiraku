@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bumpalo::Bump;
 
@@ -72,6 +72,8 @@ pub struct HirExpr<'hir> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HirExprKind<'hir> {
+    Trap(&'hir str),
+    GuardNever(&'hir HirExpr<'hir>),
     Literal(HirLiteral<'hir>),
     Local(HirLocalId),
     Global(HirGlobalId),
@@ -211,6 +213,7 @@ pub struct HirLocal {
 pub struct HirGlobal {
     pub name: SymbolId,
     pub ty: TypeId,
+    pub mutable: bool,
     pub embedding_owned: bool,
     pub span: Option<Span>,
 }
@@ -276,6 +279,11 @@ struct Lowerer<'hir, 'manifest> {
     current_function: Option<HirFunctionId>,
     refinements: Vec<BTreeMap<HirLocalId, ScriptType>>,
     errors: Vec<LoweringError>,
+    numeric_hints: BTreeSet<usize>,
+    inferred_numeric: BTreeSet<HirLocalId>,
+    numeric_dependencies: BTreeMap<usize, BTreeSet<usize>>,
+    float_requirements: BTreeSet<usize>,
+    numeric_resolved: bool,
 }
 
 impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
@@ -343,6 +351,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             current_function: None,
             refinements: Vec::new(),
             errors: import_errors,
+            numeric_hints: BTreeSet::new(),
+            inferred_numeric: BTreeSet::new(),
+            numeric_dependencies: BTreeMap::new(),
+            float_requirements: BTreeSet::new(),
+            numeric_resolved: false,
         }
     }
 
@@ -367,6 +380,25 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             ),
             false,
         );
+        if !self.numeric_resolved && !self.float_requirements.is_empty() {
+            let mut hints = self.float_requirements.clone();
+            let mut pending = hints.iter().copied().collect::<Vec<_>>();
+            while let Some(binding) = pending.pop() {
+                if let Some(dependencies) = self.numeric_dependencies.get(&binding) {
+                    for dependency in dependencies {
+                        if hints.insert(*dependency) {
+                            pending.push(*dependency);
+                        }
+                    }
+                }
+            }
+            // Solve use-site constraints before producing the final typed HIR. The
+            // second pass also rechecks earlier uses against the resolved types.
+            let mut resolved = Self::new(self.arena, source, self.manifest);
+            resolved.numeric_hints = hints;
+            resolved.numeric_resolved = true;
+            return resolved.lower(source);
+        }
         if !self.errors.is_empty() {
             return Err(self.errors);
         }
@@ -416,11 +448,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         if let Some(manifest) = self.manifest {
             let globals = manifest.globals().clone();
             for (name, ty) in globals {
-                self.push_global(&name, ty, true, None);
+                self.push_global(&name, ty, true, true, None);
             }
         }
         for statement in &program.statements {
             let Stmt::Global {
+                mutable,
                 name,
                 type_annotation,
                 span,
@@ -438,7 +471,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .as_ref()
                 .and_then(|ty| self.type_from_ast(ty))
                 .unwrap_or(ScriptType::Any);
-            self.push_global(name, ty, false, Some(*span));
+            self.push_global(name, ty, *mutable, false, Some(*span));
         }
     }
 
@@ -446,6 +479,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         &mut self,
         name: &str,
         ty: ScriptType,
+        mutable: bool,
         embedding_owned: bool,
         span: Option<Span>,
     ) {
@@ -455,6 +489,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         self.globals.push(HirGlobal {
             name,
             ty,
+            mutable,
             embedding_owned,
             span,
         });
@@ -551,6 +586,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 ));
             }
             let body = self.lower_block(body, false);
+            if self.functions[function_id.0 as usize].result == ScriptType::Never
+                && !self.block_diverges(body)
+            {
+                self.error("a function declared `Never` must not return; terminate every path with a Never call or an infinite loop", body.span);
+            }
             let declaration = &self.functions[function_id.0 as usize];
             let parameters = self.arena.alloc_slice_copy(&lowered_parameters);
             let result = self.types.intern(declaration.result.clone());
@@ -564,6 +604,31 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             });
             self.type_parameters.pop();
         }
+    }
+
+    fn block_diverges(&self, block: &HirBlock<'hir>) -> bool {
+        block
+            .statements
+            .iter()
+            .any(|statement| match statement.kind {
+                HirStmtKind::Expr(value)
+                | HirStmtKind::Let { value, .. }
+                | HirStmtKind::Assign { value, .. } => {
+                    self.expression_type(value) == &ScriptType::Never
+                }
+                HirStmtKind::Global {
+                    value: Some(value), ..
+                } => self.expression_type(value) == &ScriptType::Never,
+                HirStmtKind::If {
+                    then_block,
+                    else_block: Some(else_block),
+                    ..
+                } => self.block_diverges(then_block) && self.block_diverges(else_block),
+                HirStmtKind::While { condition, .. } => {
+                    matches!(condition.kind, HirExprKind::Literal(HirLiteral::Bool(true)))
+                }
+                _ => false,
+            })
     }
 
     fn push_type_parameters(&mut self, parameters: &[String]) {
@@ -632,7 +697,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             } => {
                 let annotation = type_annotation
                     .as_ref()
-                    .and_then(|ty| self.type_from_ast(ty));
+                    .and_then(|ty| self.type_from_ast(ty))
+                    .or_else(|| {
+                        self.numeric_hints
+                            .contains(&span.start)
+                            .then_some(ScriptType::Float)
+                    });
                 let value = self.lower_expression_expected(value, annotation.as_ref());
                 let inferred = self.expression_type(value).clone();
                 if annotation.is_none() && is_untyped_none(&inferred) {
@@ -646,6 +716,13 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let ty = annotation.unwrap_or_else(|| inferred.clone());
                 self.check_assignment(&ty, &inferred, value.span);
                 let local = self.declare_local(name, ty, *mutable, *span);
+                if type_annotation.is_none()
+                    && matches!(inferred, ScriptType::Int | ScriptType::Float)
+                {
+                    let dependencies = self.numeric_sources(value);
+                    self.inferred_numeric.insert(local);
+                    self.numeric_dependencies.insert(span.start, dependencies);
+                }
                 (HirStmtKind::Let { local, value }, *span)
             }
             Stmt::Global {
@@ -686,6 +763,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 span,
             } => {
                 let target = self.lower_place(target)?;
+                // Only rebinding is restricted. A field assignment deliberately does
+                // not recurse to the root: `let actor = ...; actor.position = ...` is valid.
+                let immutable = match target {
+                    HirPlace::Local(id) if !self.locals[id.0 as usize].mutable => {
+                        Some(self.locals[id.0 as usize].name)
+                    }
+                    HirPlace::Global(id) if !self.globals[id.0 as usize].mutable => {
+                        Some(self.globals[id.0 as usize].name)
+                    }
+                    _ => None,
+                };
+                if let Some(name) = immutable {
+                    let name = self.symbols.resolve(name).unwrap_or("<unknown>");
+                    self.error(format!("cannot reassign immutable binding `{name}`; declare it with `var` (or `global var` for a global binding); `let` still permits object field updates"), *span);
+                    return None;
+                }
                 let expected = self.place_type(target);
                 let value = self.lower_expression_expected(value, expected.as_ref());
                 if let Some(expected) = expected {
@@ -967,6 +1060,52 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     .iter()
                     .filter_map(|ty| self.type_from_ast(ty))
                     .collect::<Vec<_>>();
+                if matches!(&syntax_callee.kind, ExprKind::Ident(name) if name == "unreachable" || name == "todo")
+                {
+                    if !arguments.is_empty()
+                        || trailing_block.is_some()
+                        || !type_arguments.is_empty()
+                    {
+                        self.error(
+                            "`unreachable()` and `todo()` take no arguments",
+                            expression.span,
+                        );
+                    }
+                    let ExprKind::Ident(name) = &syntax_callee.kind else {
+                        unreachable!()
+                    };
+                    return self.alloc_expression(
+                        HirExprKind::Trap(self.arena.alloc_str(name)),
+                        ScriptType::Never,
+                        expression.span,
+                    );
+                }
+                if let ExprKind::Member { object, name } = &syntax_callee.kind
+                    && name == "toInt"
+                {
+                    if !arguments.is_empty()
+                        || trailing_block.is_some()
+                        || !type_arguments.is_empty()
+                    {
+                        self.error("`toInt()` takes no arguments", expression.span);
+                    }
+                    let value = self.lower_expression(object);
+                    if !matches!(
+                        self.expression_type(value),
+                        ScriptType::Int | ScriptType::Float | ScriptType::Any | ScriptType::Never
+                    ) {
+                        self.error("`toInt()` requires a numeric receiver", expression.span);
+                    }
+                    return self.alloc_expression(
+                        HirExprKind::Cast {
+                            value,
+                            target: self.arena.alloc(ScriptType::Int),
+                            mode: CastMode::Forced,
+                        },
+                        ScriptType::Int,
+                        expression.span,
+                    );
+                }
                 if matches!(&syntax_callee.kind, ExprKind::Symbol(name) if name == "some") {
                     if trailing_block.is_some() || arguments.len() != 1 {
                         self.error("`.some` expects exactly one value", expression.span);
@@ -1194,6 +1333,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if expected == Some(&ScriptType::Float) {
+            let value = self.lower_expression(expression);
+            self.float_requirements.extend(self.numeric_sources(value));
+            return value;
+        }
         if expected == Some(&ScriptType::TextTemplate)
             && let ExprKind::String(value) = &expression.kind
         {
@@ -1550,7 +1694,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
         if let Some(expected) = &signature.receiver
             && let HirExprKind::Member { object, .. } = callee.kind
-            && !expected.accepts(self.expression_type(object))
+            && !expected.accepts_native_argument(self.expression_type(object))
         {
             self.error(
                 format!(
@@ -1568,7 +1712,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             else {
                 continue;
             };
-            if !expected.accepts(self.expression_type(actual.value)) {
+            if !expected.accepts_native_argument(self.expression_type(actual.value)) {
                 self.error(
                     format!(
                         "argument expects {expected:?}, got {:?}",
@@ -1711,9 +1855,35 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
     }
 
+    fn numeric_sources(&self, value: &HirExpr<'hir>) -> BTreeSet<usize> {
+        match value.kind {
+            HirExprKind::Local(id) if self.inferred_numeric.contains(&id) => {
+                BTreeSet::from([self.locals[id.0 as usize].span.start])
+            }
+            HirExprKind::UnaryMinus(value) => self.numeric_sources(value),
+            HirExprKind::Binary {
+                left,
+                right,
+                op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide,
+            } => {
+                let mut sources = self.numeric_sources(left);
+                sources.extend(self.numeric_sources(right));
+                sources
+            }
+            _ => BTreeSet::new(),
+        }
+    }
+
     fn check_assignment(&mut self, expected: &ScriptType, actual: &ScriptType, span: Span) {
         if !expected.accepts(actual) {
-            self.error(format!("expected {expected:?}, got {actual:?}"), span);
+            let help = if expected == &ScriptType::Int && actual == &ScriptType::Float {
+                "; use `.toInt()` for an explicit numeric conversion"
+            } else if actual == &ScriptType::Any {
+                "; narrow Any with `as?` or validate it with `as!`"
+            } else {
+                ""
+            };
+            self.error(format!("expected {expected:?}, got {actual:?}{help}"), span);
         }
     }
 
@@ -1882,6 +2052,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     ) -> Option<ScriptType> {
         let builtin = match name {
             "Any" => Some(ScriptType::Any),
+            "Never" => Some(ScriptType::Never),
             "Unit" => Some(ScriptType::Unit),
             "Bool" => Some(ScriptType::Bool),
             "Int" => Some(ScriptType::Int),
@@ -1998,7 +2169,18 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         ty: TypeId,
         span: Span,
     ) -> &'hir HirExpr<'hir> {
-        self.arena.alloc(HirExpr { kind, ty, span })
+        let expression = self.arena.alloc(HirExpr { kind, ty, span });
+        if self.types.get(ty) == Some(&ScriptType::Never)
+            && matches!(kind, HirExprKind::Call { .. })
+        {
+            self.arena.alloc(HirExpr {
+                kind: HirExprKind::GuardNever(expression),
+                ty,
+                span,
+            })
+        } else {
+            expression
+        }
     }
 
     fn expression_type(&self, expression: &HirExpr<'hir>) -> &ScriptType {
@@ -2054,6 +2236,7 @@ fn join_types(left: ScriptType, right: ScriptType) -> ScriptType {
         return left;
     }
     match (left, right) {
+        (Never, other) | (other, Never) => other,
         (Int, Float) | (Float, Int) => Float,
         (Optional(left), Optional(right)) => Optional(Box::new(join_types(*left, *right))),
         (Optional(left), right) | (right, Optional(left)) => {
@@ -2335,6 +2518,37 @@ mod tests {
     }
 
     #[test]
+    fn fixed_bindings_allow_field_updates_but_not_rebinding() {
+        for source in [
+            "let alice = .{ stats: .{ score: 1 } }\nalice.stats.score += 1",
+            "global let alice = .{ stats: .{ score: 1 } }\nalice.stats.score = 2",
+            "var score = 1\nscore += 1\nscore = 3",
+            "global var score: Int\nscore = 1\nscore += 1",
+        ] {
+            let syntax = parse_program(source).expect("binding syntax parses");
+            let arena = HirArena::new();
+            lower_to_hir(&arena, &syntax, None).expect("valid binding operation lowers");
+        }
+        for source in [
+            "let score = 1\nscore = 2",
+            "let score = 1\nscore += 1",
+            "global let score = 1\nscore = 2",
+            "global let score = 1\nscore += 1",
+            "let alice = .{ score: 1 }\nalice = .{ score: 2 }",
+        ] {
+            let syntax = parse_program(source).expect("binding syntax parses");
+            let arena = HirArena::new();
+            let errors = lower_to_hir(&arena, &syntax, None)
+                .expect_err("fixed binding cannot be reassigned");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("cannot reassign immutable binding"))
+            );
+        }
+    }
+
+    #[test]
     fn normalized_inference_promotes_int_to_float_but_requires_an_explicit_downcast() {
         let accepted = parse_program("let a = 1\nlet b: Float = a\nlet c: Int = b as Int")
             .expect("source parses");
@@ -2413,6 +2627,58 @@ mod tests {
     }
 
     #[test]
+    fn float_constraints_propagate_back_through_inferred_bindings() {
+        let syntax =
+            parse_program("let a = 1\nlet alias = a\nlet b: Float = alias").expect("parses");
+        let arena = HirArena::new();
+        let hir = lower_to_hir(&arena, &syntax, None).expect("inference succeeds");
+        for local in hir.locals.iter() {
+            assert_eq!(hir.types.get(local.ty), Some(&ScriptType::Float));
+        }
+    }
+
+    #[test]
+    fn explicit_int_annotation_is_not_reinferred() {
+        let syntax = parse_program("let a: Int = 1\nlet b: Float = a").expect("parses");
+        let arena = HirArena::new();
+        let hir = lower_to_hir(&arena, &syntax, None).expect("widening is permitted");
+        assert_eq!(hir.types.get(hir.locals[0].ty), Some(&ScriptType::Int));
+        assert_eq!(hir.types.get(hir.locals[1].ty), Some(&ScriptType::Float));
+    }
+
+    #[test]
+    fn narrowing_and_any_require_explicit_conversion() {
+        for source in [
+            "let a = 1.5\nlet b: Int = a",
+            "let a: Any = 1\nlet b: Int = a",
+        ] {
+            let syntax = parse_program(source).expect("parses");
+            let arena = HirArena::new();
+            assert!(lower_to_hir(&arena, &syntax, None).is_err());
+        }
+        assert!(ScriptType::String.accepts(&ScriptType::Never));
+        assert!(ScriptType::Any.accepts(&ScriptType::String));
+        assert!(!ScriptType::String.accepts(&ScriptType::Any));
+    }
+
+    #[test]
+    fn never_functions_cannot_fall_through() {
+        for (source, valid) in [
+            ("fn stop() -> Never { unreachable() }", true),
+            ("fn stop() -> Never { todo() }", true),
+            ("fn stop() -> Never { 1 }", false),
+        ] {
+            let syntax = parse_program(source).expect("parses");
+            let arena = HirArena::new();
+            assert_eq!(
+                lower_to_hir(&arena, &syntax, None).is_ok(),
+                valid,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn generic_struct_literals_are_target_typed_and_nominal() {
         let valid = parse_program(
             "type Player<T> = .{ name: T, score: Int }\nlet player: Player<String?> = .{ name: null, score: 12 }",
@@ -2464,7 +2730,7 @@ mod tests {
 
     #[test]
     fn recursive_generic_aliases_report_an_error_instead_of_recursing_forever() {
-        let syntax = parse_program("type Loop<T> = Loop<T>\nglobal value: Loop<String>")
+        let syntax = parse_program("type Loop<T> = Loop<T>\nglobal var value: Loop<String>")
             .expect("source parses");
         let arena = HirArena::new();
         let errors =

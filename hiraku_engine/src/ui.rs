@@ -46,6 +46,15 @@ pub struct UiReactiveBinding {
     pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
 }
 
+/// Recreated when a screen is mounted; pending click execution is not saved.
+#[derive(Clone, Debug)]
+pub struct UiCallback {
+    pub(crate) program: hiraku_script::LinkedProgram,
+    pub(crate) callable: hiraku_script::Value,
+    pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
+    pub(crate) origin: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiPhaseAnimation {
     pub phases: Vec<crate::script::AnimationPhase>,
@@ -388,9 +397,9 @@ pub struct ButtonNode {
     /// `action` instead.
     #[serde(default)]
     pub value: Option<StoredValue>,
-    /// Typed effects dispatched when the click is accepted.
-    #[serde(default)]
-    pub click_effects: Vec<UiEffect>,
+    /// Script callback invoked only after a click is accepted.
+    #[serde(skip)]
+    pub on_click: Option<UiCallback>,
     /// Whether the button can be pressed.
     ///
     /// Disabled buttons remain visible and use insensitive colors, matching
@@ -494,9 +503,9 @@ pub struct ScreenImageButtonNode {
     /// Value returned from `screen(...)` when the button is released.
     #[serde(default)]
     pub value: Option<StoredValue>,
-    /// Typed effects dispatched when the click is accepted.
-    #[serde(default)]
-    pub click_effects: Vec<UiEffect>,
+    /// Script callback invoked only after a click is accepted.
+    #[serde(skip)]
+    pub on_click: Option<UiCallback>,
     /// Whether the button can be pressed.
     #[serde(default = "default_button_enabled")]
     pub enabled: bool,
@@ -651,7 +660,6 @@ pub struct ScreenUiButton {
     pub root: Entity,
     /// Intent value returned to the story runtime when the button is pressed.
     pub value: Option<StoredValue>,
-    pub click_effects: Vec<UiEffect>,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
     /// Text child whose color changes with interaction state.
@@ -693,7 +701,6 @@ pub struct ScreenUiImageButton {
     pub root: Entity,
     /// Intent value returned to the story runtime when pressed.
     pub value: Option<StoredValue>,
-    pub click_effects: Vec<UiEffect>,
     /// Whether press interactions should produce a value.
     pub enabled: bool,
     /// Whether a disabled button still displays its hover artwork.

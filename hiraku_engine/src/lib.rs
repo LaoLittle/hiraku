@@ -285,6 +285,7 @@ impl Plugin for HirakuPlugin {
                 process_ui_effects
                     .after(handle_screen_buttons)
                     .after(handle_screen_image_buttons)
+                    .after(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(

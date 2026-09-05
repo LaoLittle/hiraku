@@ -8,6 +8,7 @@ use crate::SymbolId;
 /// for embedding-defined nominal type IDs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScriptType {
+    Never,
     Any,
     Unit,
     Bool,
@@ -39,9 +40,18 @@ pub enum ScriptType {
 }
 
 impl ScriptType {
+    /// Dynamic native arguments are validated by the host's typed conversion.
+    /// This does not make Any assignable to a concrete script binding.
+    pub(crate) fn accepts_native_argument(&self, actual: &Self) -> bool {
+        self.accepts(actual)
+            || actual == &Self::Any
+            || matches!(self, Self::Union(types) if types.iter().any(|ty| ty.accepts_native_argument(actual)))
+            || matches!((self, actual), (Self::Binding(expected), Self::Binding(actual)) if expected.accepts_native_argument(actual))
+    }
+
     pub(crate) fn accepts(&self, actual: &Self) -> bool {
         self == &Self::Any
-            || actual == &Self::Any
+            || actual == &Self::Never
             || self == actual
             || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))
             || matches!((self, actual),

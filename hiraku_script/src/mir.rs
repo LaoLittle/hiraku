@@ -33,6 +33,7 @@ pub struct MirBasicBlock {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirInstruction {
+    Udf(String),
     Constant {
         dst: VirtualRegister,
         value: MirConstant,
@@ -144,13 +145,17 @@ impl MirInstruction {
             | Self::Call { dst, .. }
             | Self::AssertNonNull { dst, .. }
             | Self::SelectNonNull { dst, .. } => Some(*dst),
-            Self::StoreLocal { .. } | Self::StoreGlobal { .. } | Self::Statement { .. } => None,
+            Self::StoreLocal { .. }
+            | Self::StoreGlobal { .. }
+            | Self::Statement { .. }
+            | Self::Udf(_) => None,
         }
     }
 
     pub fn used_registers(&self) -> Vec<VirtualRegister> {
         match self {
-            Self::Constant { .. }
+            Self::Udf(_)
+            | Self::Constant { .. }
             | Self::MakeClosure { .. }
             | Self::LoadLocal { .. }
             | Self::LoadGlobal { .. } => Vec::new(),
@@ -406,6 +411,17 @@ impl MirBuilder {
         errors: &mut Vec<MirLoweringError>,
     ) -> Option<VirtualRegister> {
         match expression.kind {
+            HirExprKind::Trap(reason) => {
+                self.push(MirInstruction::Udf(reason.to_owned()));
+                Some(self.constant(MirConstant::Unit))
+            }
+            HirExprKind::GuardNever(value) => {
+                let result = self.lower_expression(value, errors);
+                self.push(MirInstruction::Udf(
+                    "a Never-returning function returned".into(),
+                ));
+                result
+            }
             HirExprKind::Literal(literal) => Some(self.constant(match literal {
                 HirLiteral::Unit => MirConstant::Unit,
                 HirLiteral::Null => MirConstant::Null,
@@ -699,7 +715,7 @@ mod tests {
     #[test]
     fn lowers_if_and_while_into_a_control_flow_graph() {
         let syntax =
-            parse_program("let a = 0\nwhile a < 2 { if a == 1 { a += 1 } else { a += 1 } }")
+            parse_program("var a = 0\nwhile a < 2 { if a == 1 { a += 1 } else { a += 1 } }")
                 .expect("source parses");
         let arena = HirArena::new();
         let hir = lower_to_hir(&arena, &syntax, None).expect("HIR lowers");

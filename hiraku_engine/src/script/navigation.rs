@@ -1,7 +1,42 @@
-use hiraku_script::{HksHandle, native::NativeError};
+use hiraku_script::{
+    ScriptType,
+    native::{FromHksValue, HksScriptType, NativeError, NativeRegistry},
+    runtime::{BuiltinCall, Value},
+};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const NAVIGATION_HANDLE_TYPE: u32 = 4;
+/// Complete configuration for a terminal jump; there is no deferred builder.
+pub(crate) struct NavigationOptions {
+    reset: NavigationResetValue,
+}
+
+impl HksScriptType for NavigationOptions {
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> ScriptType {
+        ScriptType::Record(std::collections::BTreeMap::from([(
+            "reset".into(),
+            NavigationResetValue::hks_script_type(registry),
+        )]))
+    }
+}
+
+impl FromHksValue for NavigationOptions {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        let Value::Map(fields) = value else {
+            return Err(NativeError::message("goto options must be a record"));
+        };
+        if fields.len() != 1 {
+            return Err(NativeError::message(
+                "goto options require exactly the `reset` field",
+            ));
+        }
+        let reset = fields
+            .get("reset")
+            .ok_or_else(|| NativeError::message("goto options require `reset`"))?;
+        Ok(Self {
+            reset: NavigationResetValue::from_hks_value(reset)?,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NavigationKind {
@@ -27,6 +62,26 @@ pub struct NavigationRequest {
 }
 
 impl NavigationRequest {
+    pub(crate) fn from_goto_call(call: &BuiltinCall) -> Result<Self, NativeError> {
+        if !(1..=2).contains(&call.arguments.len()) {
+            return Err(NativeError::message(
+                "story.goto expects a path and optional options record",
+            ));
+        }
+        let path = String::from_hks_value(&call.arguments[0].value)?;
+        let options = call
+            .arguments
+            .get(1)
+            .map(|arg| Option::<NavigationOptions>::from_hks_value(&arg.value))
+            .transpose()?
+            .flatten();
+        let mut request = Self::goto(path)?;
+        if let Some(options) = options {
+            request.reset = options.reset.into();
+        }
+        Ok(request)
+    }
+
     pub fn goto(path: String) -> Result<Self, NativeError> {
         validate_path(&path)?;
         Ok(Self {
@@ -59,10 +114,6 @@ fn validate_path(path: &str) -> Result<(), NativeError> {
     }
     Ok(())
 }
-
-#[derive(Clone, Copy, HksHandle)]
-#[hks(name = "Navigation", handle_type = NAVIGATION_HANDLE_TYPE)]
-pub(crate) struct NavigationHandle(pub(crate) u64);
 
 hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

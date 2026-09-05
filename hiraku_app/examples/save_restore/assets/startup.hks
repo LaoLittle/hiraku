@@ -1,6 +1,6 @@
-global checkpoint: Int = 0
-global dialogueTitle = "Save / Restore"
-global dialogueLine = ""
+global var checkpoint: Int = 0
+global var dialogueTitle = "Save / Restore"
+global var dialogueLine = ""
 
 ui.set("saveDialog", "ui/dialogue.ui.hks")
 
