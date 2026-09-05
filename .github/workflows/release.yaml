@@ -116,11 +116,11 @@ jobs:
                 "${{ matrix.name }}" == "linux-riscv64" ]]
           then
             cross build \
-              --release \
+              --profile app-release \
               --target ${{ matrix.target }}
           else
             cargo build \
-              --release \
+              --profile app-release \
               --target ${{ matrix.target }}
           fi
 
