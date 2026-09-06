@@ -93,6 +93,7 @@ struct ExecutionSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionRuntimeSnapshot {
+    objects: hiraku_script::ObjectHeap,
     /// Exact executing bytecode. Restore relinks this against the current
     /// native registry instead of recompiling source and trusting offsets.
     pub program: Bytecode,
@@ -102,6 +103,7 @@ pub struct ExecutionRuntimeSnapshot {
 }
 
 pub struct ExecutionRuntime {
+    objects: hiraku_script::ObjectHeap,
     linked: LinkedBytecode,
     executions: BTreeMap<ExecutionId, ExecutionState>,
     next_execution: u64,
@@ -125,6 +127,7 @@ impl ExecutionRuntime {
             },
         );
         Ok(Self {
+            objects: hiraku_script::ObjectHeap::default(),
             linked,
             executions,
             next_execution: 1,
@@ -157,11 +160,15 @@ impl ExecutionRuntime {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let globals = globals_from_values(&bytecode, &snapshot.shared_globals);
+        let globals = globals_from_values(&bytecode, &snapshot.shared_globals)
+            .into_iter()
+            .map(|(key, value)| Ok((key, snapshot.objects.export(&value)?)))
+            .collect::<Result<_, hiraku_script::VmError>>()?;
         Ok(Self {
             linked,
             executions,
             next_execution: snapshot.next_execution,
+            objects: snapshot.objects,
             shared_globals: snapshot.shared_globals,
             globals,
         })
@@ -169,6 +176,7 @@ impl ExecutionRuntime {
 
     pub fn snapshot(&self) -> ExecutionRuntimeSnapshot {
         ExecutionRuntimeSnapshot {
+            objects: self.objects.clone(),
             program: self.linked.bytecode.as_ref().clone(),
             next_execution: self.next_execution,
             executions: self
@@ -202,7 +210,10 @@ impl ExecutionRuntime {
             .next_execution
             .checked_add(1)
             .expect("story execution identifier space must not be exhausted");
-        let mut vm = Vm::from_callable(self.linked.bytecode.clone(), closure, Vec::new())?;
+        // Import portable captures into the execution-owned heap before creating
+        // the child. All story executions must address the same object table.
+        let closure = self.objects.import(closure.clone());
+        let mut vm = Vm::from_callable(self.linked.bytecode.clone(), &closure, Vec::new())?;
         vm.set_global_values(self.shared_globals.clone())?;
         self.executions.insert(
             execution,
@@ -262,6 +273,37 @@ impl ExecutionRuntime {
         execution: ExecutionId,
         budget: &mut u32,
     ) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
+        self.executions
+            .get_mut(&execution)
+            .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?
+            .vm
+            .swap_objects(&mut self.objects);
+        let result = self.step_execution_inner(execution, budget);
+        if let Some(state) = self.executions.get_mut(&execution) {
+            state.vm.swap_objects(&mut self.objects);
+        }
+        self.refresh_globals();
+        let mut event = result?;
+        if let Some(ExecutionEvent::Call { call, .. }) = &mut event {
+            for value in call.receiver.iter_mut().chain(
+                call.arguments
+                    .iter_mut()
+                    .map(|argument| &mut argument.value),
+            ) {
+                // Scheduled story closures remain in this execution's heap.
+                if !matches!(value, Value::Closure { .. } | Value::Function { .. }) {
+                    *value = self.objects.export(value)?;
+                }
+            }
+        }
+        Ok(event)
+    }
+
+    fn step_execution_inner(
+        &mut self,
+        execution: ExecutionId,
+        budget: &mut u32,
+    ) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
         let event = {
             let state = self
                 .executions
@@ -304,12 +346,12 @@ impl ExecutionRuntime {
                 Ok(Some(ExecutionEvent::Statement { execution, value }))
             }
             VmEvent::Completed(value) => {
-                let state = self
+                let mut state = self
                     .executions
                     .remove(&execution)
                     .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
                 self.shared_globals = state.vm.globals().to_vec();
-                self.refresh_globals();
+                state.vm.swap_objects(&mut self.objects);
                 Ok(Some(ExecutionEvent::Completed { execution, value }))
             }
         }
@@ -320,12 +362,15 @@ impl ExecutionRuntime {
         execution: ExecutionId,
         value: Value,
     ) -> Result<(), ExecutionRuntimeError> {
-        self.executions
+        let vm = &mut self
+            .executions
             .get_mut(&execution)
             .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?
-            .vm
-            .resume(value)?;
-        Ok(())
+            .vm;
+        vm.swap_objects(&mut self.objects);
+        let result = vm.resume(value);
+        vm.swap_objects(&mut self.objects);
+        result.map_err(Into::into)
     }
 
     pub fn pause(&mut self, execution: ExecutionId) -> Result<(), ExecutionRuntimeError> {
@@ -355,7 +400,28 @@ impl ExecutionRuntime {
     }
 
     pub fn set_globals(&mut self, globals: BTreeMap<String, Value>) {
-        self.shared_globals = values_from_globals(&self.linked.bytecode, &globals);
+        let incoming = values_from_globals(&self.linked.bytecode, &globals);
+        let changed = self
+            .shared_globals
+            .iter()
+            .zip(incoming)
+            .map(|(old, new)| {
+                let same = self.objects.export(old).is_ok_and(|value| value == new);
+                (old.clone(), new, same)
+            })
+            .collect::<Vec<_>>();
+        self.shared_globals = changed
+            .into_iter()
+            .map(|(old, new, same)| {
+                if same {
+                    old
+                } else {
+                    self.objects
+                        .update(&old, new)
+                        .expect("host global updates target valid objects")
+                }
+            })
+            .collect();
         for state in self.executions.values_mut() {
             state
                 .vm
@@ -369,6 +435,26 @@ impl ExecutionRuntime {
         &self.globals
     }
 
+    pub fn export_value(&self, value: &Value) -> Result<Value, ExecutionRuntimeError> {
+        Ok(self.objects.export(value)?)
+    }
+
+    pub fn collect_objects_if_due(
+        &mut self,
+        host_roots: &[&Value],
+    ) -> Result<(), ExecutionRuntimeError> {
+        if self.objects.collection_due() {
+            self.objects.collect(
+                self.executions
+                    .values()
+                    .flat_map(|state| state.vm.object_roots())
+                    .chain(self.shared_globals.iter())
+                    .chain(host_roots.iter().copied()),
+            )?;
+        }
+        Ok(())
+    }
+
     fn capture_globals(&mut self, execution: ExecutionId) -> Result<(), ExecutionRuntimeError> {
         self.shared_globals = self
             .executions
@@ -377,12 +463,14 @@ impl ExecutionRuntime {
             .vm
             .globals()
             .to_vec();
-        self.refresh_globals();
         Ok(())
     }
 
     fn refresh_globals(&mut self) {
-        self.globals = globals_from_values(&self.linked.bytecode, &self.shared_globals);
+        self.globals = globals_from_values(&self.linked.bytecode, &self.shared_globals)
+            .into_iter()
+            .map(|(key, value)| (key, self.objects.export(&value).unwrap_or(value)))
+            .collect();
     }
 
     fn link_call(&self, call: SymbolCall) -> Result<BuiltinCall, ExecutionRuntimeError> {
@@ -474,4 +562,74 @@ fn globals_from_values(bytecode: &Bytecode, values: &[Value]) -> BTreeMap<String
             })?
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_execution_shares_captured_records_after_snapshot_restore() {
+        check_child_record_identity(false);
+    }
+
+    #[test]
+    fn host_global_updates_preserve_child_aliases() {
+        check_child_record_identity(true);
+    }
+
+    fn check_child_record_identity(update_from_host: bool) {
+        let bytecode = crate::script::compile_story_bytecode(
+            "reference_test.hks",
+            r#"
+            type Player = .{ score: Int }
+            global var player = Player.{ score: 1 }
+            let alias = player
+            par { alias.score += 2 }
+        "#,
+        )
+        .expect("reference story compiles");
+        let mut runtime = ExecutionRuntime::new(bytecode.clone()).expect("runtime initializes");
+        let closure = loop {
+            if let Some(ExecutionEvent::Call { call, .. }) = runtime.step().expect("root advances")
+            {
+                break call.arguments[0].value.clone();
+            }
+        };
+        let child = runtime
+            .spawn(&closure, ExecutionMode::Parallel)
+            .expect("child starts");
+        if update_from_host {
+            let mut globals = runtime.globals().clone();
+            let Value::Typed { value, .. } = globals.get_mut("player").expect("player exists")
+            else {
+                panic!("expected Player")
+            };
+            let Value::Map(fields) = value.as_mut() else {
+                panic!("expected fields")
+            };
+            fields.insert("score".into(), Value::Number(10.0));
+            runtime.set_globals(globals);
+        }
+        let encoded =
+            hiraku_script::hson::to_string(&runtime.snapshot()).expect("runtime serializes");
+        let snapshot = hiraku_script::hson::from_str(&encoded).expect("runtime deserializes");
+        let mut runtime = ExecutionRuntime::restore(bytecode, snapshot).expect("runtime restores");
+        loop {
+            if matches!(runtime.step_children().expect("child advances"), Some(ExecutionEvent::Completed { execution, .. }) if execution == child)
+            {
+                break;
+            }
+        }
+        let Value::Typed { value, .. } = &runtime.globals()["player"] else {
+            panic!("expected Player")
+        };
+        let Value::Map(fields) = value.as_ref() else {
+            panic!("expected fields")
+        };
+        assert_eq!(
+            fields["score"],
+            Value::Number(if update_from_host { 12.0 } else { 3.0 })
+        );
+    }
 }

@@ -176,7 +176,18 @@ impl Collector<'_> {
 
     fn nested(&mut self, statement: &Stmt) {
         match statement {
-            Stmt::Import { .. } | Stmt::TypeAlias { .. } => {}
+            Stmt::Import { .. } | Stmt::TypeAlias { .. } | Stmt::Const { .. } => {}
+            Stmt::Impl { methods, .. } => {
+                for method in methods {
+                    self.nested(method);
+                }
+            }
+            Stmt::Property { getter, setter, .. } => {
+                self.block(getter);
+                if let Some((_, body)) = setter {
+                    self.block(body);
+                }
+            }
             Stmt::Function { body, .. } | Stmt::While { body, .. } => self.block(body),
             Stmt::If {
                 then_block,
@@ -351,6 +362,9 @@ fn statement_span(statement: &Stmt) -> &Span {
     match statement {
         Stmt::Import { span, .. } | Stmt::TypeAlias { span, .. } => span,
         Stmt::Function { span, .. }
+        | Stmt::Const { span, .. }
+        | Stmt::Impl { span, .. }
+        | Stmt::Property { span, .. }
         | Stmt::Let { span, .. }
         | Stmt::Global { span, .. }
         | Stmt::Assign { span, .. }

@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 8;
+pub const BYTECODE_VERSION: u16 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -55,6 +55,7 @@ pub struct BytecodeRegion {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
+    Panic(Register),
     Udf(StringId),
     Constant {
         dst: Register,
@@ -358,6 +359,7 @@ fn emit_function(
         let mut emitted = Vec::new();
         for instruction in &block.instructions {
             let scalar = match instruction {
+                MirInstruction::Panic(message) => Instruction::Panic(register(*message)),
                 MirInstruction::Udf(reason) => Instruction::Udf(strings.intern(reason.clone())),
                 MirInstruction::MakeClosure { dst, region } => Instruction::MakeClosure {
                     dst: register(*dst),
@@ -765,6 +767,7 @@ pub struct SymbolCall {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmSnapshot {
+    pub objects: crate::ObjectHeap,
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
     pub pc: usize,
@@ -788,6 +791,7 @@ pub struct CallFrameSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vm {
+    objects: crate::ObjectHeap,
     bytecode: Arc<Bytecode>,
     pc: usize,
     registers: RegisterFrame,
@@ -815,6 +819,7 @@ impl Vm {
             status: VmStatus::Ready,
             location: CodeLocation::Entry,
             call_stack: Vec::new(),
+            objects: crate::ObjectHeap::default(),
         })
     }
 
@@ -823,9 +828,11 @@ impl Vm {
         closure: &Value,
     ) -> Result<Self, VmError> {
         let bytecode = bytecode.into();
+        let mut objects = crate::ObjectHeap::default();
+        let closure = objects.import(closure.clone());
         let Value::Closure {
             region, captures, ..
-        } = closure
+        } = &closure
         else {
             return Err(VmError::TypeMismatch("expected Function"));
         };
@@ -849,6 +856,7 @@ impl Vm {
             status: VmStatus::Ready,
             location: CodeLocation::Region(*region),
             call_stack: Vec::new(),
+            objects,
         })
     }
 
@@ -874,7 +882,7 @@ impl Vm {
                 let parameters = metadata.parameters.clone();
                 let mut vm = Self::from_closure(bytecode, callable)?;
                 for (local, value) in parameters.into_iter().zip(arguments) {
-                    *vm.local_mut(local)? = value;
+                    *vm.local_mut(local)? = vm.objects.import(value);
                 }
                 Ok(vm)
             }
@@ -921,9 +929,10 @@ impl Vm {
             status: VmStatus::Ready,
             location: CodeLocation::Function(function),
             call_stack: Vec::new(),
+            objects: crate::ObjectHeap::default(),
         };
         for (local, value) in parameters.into_iter().zip(arguments) {
-            *vm.local_mut(local)? = value;
+            *vm.local_mut(local)? = vm.objects.import(value);
         }
         Ok(vm)
     }
@@ -950,6 +959,14 @@ impl Vm {
                 .ok_or(VmError::InvalidProgramCounter(self.pc))?;
             self.pc += 1;
             match instruction {
+                Instruction::Panic(message) => {
+                    let Value::String(message) = self.read(message)? else {
+                        return Err(VmError::UndefinedInstruction(
+                            "panic expects a String".into(),
+                        ));
+                    };
+                    return Err(VmError::Panic(message.clone()));
+                }
                 Instruction::Udf(reason) => {
                     return Err(VmError::UndefinedInstruction(
                         self.string(reason)?.to_owned(),
@@ -970,6 +987,7 @@ impl Vm {
                     self.write(
                         dst,
                         Value::Closure {
+                            objects: None,
                             module: None,
                             region,
                             captures: self.locals.to_vec(),
@@ -1005,7 +1023,7 @@ impl Vm {
                     safe,
                 } => {
                     let name = self.symbol(member)?.to_string();
-                    let value = get_member(self.read(object)?, &name, safe)?;
+                    let value = get_member(self.read(object)?, &name, safe, &self.objects)?;
                     self.write(dst, value)?;
                 }
                 Instruction::SetMember {
@@ -1017,7 +1035,11 @@ impl Vm {
                     let name = self.symbol(member)?.to_string();
                     let mut object = self.read(object)?.clone();
                     let value = self.read(value)?.clone();
-                    set_member(&mut object, &name, value)?;
+                    if let Value::Object(id) = object {
+                        set_member(self.objects.get_mut(id)?, &name, value)?;
+                    } else {
+                        set_member(&mut object, &name, value)?;
+                    }
                     self.write(dst, object)?;
                 }
                 Instruction::UnaryMinus { dst, value } => {
@@ -1032,7 +1054,19 @@ impl Vm {
                     target,
                     mode,
                 } => {
-                    let value = cast_value(self.read(value)?, &target);
+                    let source = self.read(value)?.clone();
+                    let value = if matches!(source, Value::Object(_)) {
+                        if target == crate::ScriptType::Any {
+                            Ok(source)
+                        } else {
+                            self.objects
+                                .export(&source)
+                                .and_then(|value| cast_value(&value, &target))
+                                .map(|_| source)
+                        }
+                    } else {
+                        cast_value(&source, &target)
+                    };
                     let value = match (mode, value) {
                         (crate::CastMode::Optional, Ok(value)) => {
                             Value::Optional(Some(Box::new(value)))
@@ -1077,13 +1111,12 @@ impl Vm {
                         .map(|(name, value)| Ok((self.symbol(name)?.to_string(), value)))
                         .collect::<Result<BTreeMap<_, _>, VmError>>()?;
                     let value = Value::Map(fields);
-                    self.write(
-                        dst,
-                        type_name.map_or(value.clone(), |type_id| Value::Typed {
-                            type_id,
-                            value: Box::new(value),
-                        }),
-                    )?;
+                    let value = type_name.map_or(value.clone(), |type_id| Value::Typed {
+                        type_id,
+                        value: Box::new(value),
+                    });
+                    let value = self.objects.allocate(value);
+                    self.write(dst, value)?;
                 }
                 Instruction::Call {
                     dst,
@@ -1286,6 +1319,7 @@ impl Vm {
             .waiting_destination
             .take()
             .ok_or(VmError::NotWaitingForHost)?;
+        let value = self.objects.import(value);
         self.write(destination, value)?;
         self.status = VmStatus::Ready;
         Ok(())
@@ -1293,6 +1327,7 @@ impl Vm {
 
     pub fn snapshot(&self) -> VmSnapshot {
         VmSnapshot {
+            objects: self.objects.clone(),
             source_hash: self.bytecode.source_hash,
             builtin_manifest_hash: self.bytecode.builtin_manifest_hash,
             pc: self.pc,
@@ -1355,6 +1390,7 @@ impl Vm {
             status: snapshot.status,
             location: snapshot.location,
             call_stack: snapshot.call_stack,
+            objects: snapshot.objects,
         })
     }
 
@@ -1364,6 +1400,52 @@ impl Vm {
 
     pub fn bytecode(&self) -> &Bytecode {
         &self.bytecode
+    }
+
+    pub fn objects(&self) -> &crate::ObjectHeap {
+        &self.objects
+    }
+
+    /// Roots for a collector owned by an embedding that shares this VM's heap.
+    pub fn object_roots(&self) -> impl Iterator<Item = &Value> {
+        self.registers
+            .values()
+            .iter()
+            .chain(self.locals.iter())
+            .chain(self.globals.iter())
+            .chain(
+                self.call_stack
+                    .iter()
+                    .flat_map(|frame| frame.registers.iter().chain(frame.locals.iter())),
+            )
+    }
+
+    /// Collect this VM's private heap. Host-retained values must be included.
+    /// For shared heaps, enumerate every execution with `object_roots` instead.
+    pub fn collect_objects(&mut self, host_roots: &[Value]) -> Result<usize, VmError> {
+        let roots = self
+            .registers
+            .values()
+            .iter()
+            .chain(self.locals.iter())
+            .chain(self.globals.iter())
+            .chain(
+                self.call_stack
+                    .iter()
+                    .flat_map(|frame| frame.registers.iter().chain(frame.locals.iter())),
+            )
+            .chain(host_roots);
+        self.objects.collect(roots)
+    }
+
+    /// An embedding that schedules multiple VMs owns one heap and lends it to
+    /// the currently executing VM. This transfer never blocks a worker thread.
+    pub fn swap_objects(&mut self, objects: &mut crate::ObjectHeap) {
+        std::mem::swap(&mut self.objects, objects);
+    }
+
+    pub fn export_value(&self, value: &Value) -> Result<Value, VmError> {
+        self.objects.export(value)
     }
 
     pub fn global(&self, name: &str) -> Option<&Value> {
@@ -1382,7 +1464,10 @@ impl Vm {
         if values.len() != self.bytecode.globals.len() {
             return Err(VmError::FrameShapeMismatch);
         }
-        self.globals = values.into_boxed_slice();
+        self.globals = values
+            .into_iter()
+            .map(|value| self.objects.import(value))
+            .collect();
         Ok(())
     }
 
@@ -1405,14 +1490,20 @@ impl Vm {
             if value != &Value::Uninitialized
                 && let Some(name) = self.bytecode.symbols.resolve(*symbol)
             {
-                context.insert(name.to_string(), value.clone());
+                context.insert(
+                    name.to_string(),
+                    self.objects.export(value).unwrap_or_else(|_| value.clone()),
+                );
             }
         }
         for (symbol, value) in self.bytecode.locals.iter().zip(self.locals.iter()) {
             if value != &Value::Uninitialized
                 && let Some(name) = self.bytecode.symbols.resolve(*symbol)
             {
-                context.insert(name.to_string(), value.clone());
+                context.insert(
+                    name.to_string(),
+                    self.objects.export(value).unwrap_or_else(|_| value.clone()),
+                );
             }
         }
         let template = rewrite(template)?;
@@ -1601,20 +1692,25 @@ impl Vm {
     }
 }
 
-fn get_member(value: &Value, name: &str, safe: bool) -> Result<Value, VmError> {
+fn get_member(
+    value: &Value,
+    name: &str,
+    safe: bool,
+    objects: &crate::ObjectHeap,
+) -> Result<Value, VmError> {
     match value {
+        Value::Object(id) => get_member(objects.get(*id)?, name, safe, objects),
         Value::Optional(None) if safe => Ok(Value::Optional(None)),
         Value::Optional(None) => Err(VmError::NullMemberAccess(name.to_string())),
-        Value::Optional(Some(value)) if safe => {
-            get_member(value, name, false).map(|value| Value::Optional(Some(Box::new(value))))
-        }
-        Value::Optional(Some(value)) => get_member(value, name, false),
+        Value::Optional(Some(value)) if safe => get_member(value, name, false, objects)
+            .map(|value| Value::Optional(Some(Box::new(value)))),
+        Value::Optional(Some(value)) => get_member(value, name, false, objects),
         Value::Null if safe => Ok(Value::Optional(None)),
         Value::Map(fields) => fields
             .get(name)
             .cloned()
             .ok_or_else(|| VmError::UnknownMember(name.to_string())),
-        Value::Typed { value, .. } => get_member(value, name, safe),
+        Value::Typed { value, .. } => get_member(value, name, safe, objects),
         Value::Null => Err(VmError::NullMemberAccess(name.to_string())),
         _ => Err(VmError::TypeMismatch("member receiver is not a record")),
     }
@@ -1742,6 +1838,21 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
             .iter()
             .find_map(|candidate| cast_value(value, candidate).ok())
             .ok_or_else(mismatch),
+        ScriptType::TupleOf(types) => {
+            let Value::Tuple(values) = value else {
+                return Err(mismatch());
+            };
+            if values.len() != types.len() {
+                return Err(mismatch());
+            }
+            Ok(Value::Tuple(
+                values
+                    .iter()
+                    .zip(types)
+                    .map(|(value, ty)| cast_value(value, ty))
+                    .collect::<Result<_, _>>()?,
+            ))
+        }
         ScriptType::Tuple if matches!(value, Value::Tuple(_)) => Ok(value.clone()),
         ScriptType::List(element) => match value {
             Value::List(values) => values
@@ -1777,6 +1888,9 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmError {
+    InvalidObject(crate::ObjectId),
+    CyclicHostValue,
+    Panic(String),
     UndefinedInstruction(String),
     UnsupportedBytecode(u16),
     InvalidProgramCounter(usize),
@@ -1966,7 +2080,10 @@ mod tests {
                 break;
             }
         }
-        let Value::Map(player) = vm.global("player").expect("player global exists") else {
+        let Value::Map(player) = vm
+            .export_value(vm.global("player").expect("player global exists"))
+            .expect("record exports")
+        else {
             panic!("player is a record")
         };
         let Value::Map(stats) = &player["stats"] else {
@@ -2087,6 +2204,7 @@ mod tests {
         assert!(matches!(
             call.arguments[0].value,
             Value::Closure {
+                objects: None,
                 module: None,
                 region: 0,
                 ref captures,
@@ -2303,6 +2421,265 @@ mod tests {
     }
 
     #[test]
+    fn explicit_to_float_uses_the_core_method_and_intrinsic() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let mut vm = Vm::new(compile(
+            "let n: Int = 7\nglobal var result: Float = n.toFloat()",
+            &manifest,
+        ))
+        .expect("VM initializes");
+        while !matches!(
+            vm.step().expect("conversion executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(7.0)));
+    }
+
+    #[test]
+    fn impl_methods_receive_self_and_use_the_ordinary_call_path() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            r#"
+            type Player = .{ score: Int }
+            impl Player {
+                fn some_fn(self) { () }
+                fn scorePlus(self, extra: Int) -> Int { self.score + extra }
+            }
+            let player = Player.{ score: 12 }
+            player.some_fn()
+            global var result = player.scorePlus(3)
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("method executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(15.0)));
+    }
+
+    #[test]
+    fn rejects_invalid_constants_properties_and_callable_arguments() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for source in [
+            "const score = todo()",
+            "global const score = .{ value: 1 }",
+            "const score = 1\nscore = 2",
+            "type Player = .{}\nimpl Player { var score: Int { 1 } }\nlet alice = Player.{}\nalice.score = 2",
+            "let callback: (Int) -> Int = { value -> value }\ncallback(\"wrong\")",
+            "let callback: (Int) -> Int = { value -> value }\ncallback()",
+            "let callback: (Int) -> Int = { value -> \"wrong\" }",
+        ] {
+            let syntax =
+                crate::parse_program(source).expect("invalid program is syntactically valid");
+            assert!(
+                compile_with_manifest(&syntax, 0, &manifest).is_err(),
+                "must reject {source}"
+            );
+        }
+        for source in [
+            "type Player = .{}\nimpl Player { let score = 1 }",
+            "type Player = .{}\nimpl Player { var score: Int { get { 1 } set { 2 } } }",
+            "type Player = .{}\nimpl Player { var score: Int { get { 1 } set() { 2 } } }",
+        ] {
+            assert!(
+                crate::parse_program(source).is_err(),
+                "must reject {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn constants_and_computed_properties_use_shared_receivers() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            r#"
+            const base = 2 * 3
+            global const limit = base + 4
+            type Player = .{ score: Int }
+            impl Player {
+                const A = 7
+                var doubled: Int { self.score * 2 }
+                var current: Int {
+                    get { self.score }
+                    set(value) { self.score = value }
+                }
+            }
+            let alice = Player.{ score: 1 }
+            let bob = alice
+            bob.current = limit
+            global var result = alice.doubled + Player.A
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("properties execute"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(27.0)));
+    }
+
+    #[test]
+    fn callable_annotations_support_currying_and_unit_alias() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            r#"
+            fn add(a: Int) -> (Int) -> Int { { b -> a + b } }
+            let factory: (Int) -> (Int) -> Int = add
+            let plusTwo: (Int) -> Int = factory(2)
+            global var result = plusTwo(3)
+            let consume: (Int) -> () = { value -> let copy = value }
+            consume(1)
+            let nothing: Unit = ()
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("typed closures execute"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(5.0)));
+    }
+
+    #[test]
+    fn objects_keep_identity_across_aliases_calls_closures_and_restore() {
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let bytecode = compile(
+            r#"
+            type Player = .{ score: Int }
+            impl Player { fn add(self, n: Int) { self.score += n } }
+            global var player = Player.{ score: 1 }
+            let alias = player
+            let modify = { alias.add(2) }
+            checkpoint()
+            modify()
+            fn change(p: Player) { p.score += 4 }
+            change(player)
+            global var result = alias.score
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        loop {
+            if matches!(
+                vm.step().expect("checkpoint executes"),
+                Some(VmEvent::Call(_))
+            ) {
+                break;
+            }
+        }
+        let encoded = crate::hson::to_string(&vm.snapshot()).expect("snapshot serializes");
+        let snapshot = crate::hson::from_str(&encoded).expect("snapshot deserializes");
+        let mut vm = Vm::restore(bytecode, snapshot).expect("references restore");
+        vm.objects.allocate(Value::Map(BTreeMap::new()));
+        assert!(vm.collect_objects(&[]).expect("paused VM roots are traced") >= 1);
+        vm.resume(Value::Unit).expect("host resumes");
+        while !matches!(
+            vm.step().expect("aliases execute"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(7.0)));
+    }
+
+    #[test]
+    fn static_methods_use_type_names_without_a_receiver() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            r#"
+            type Player = .{}
+            impl Player {
+                fn name() -> String { "Player" }
+                fn add(a: Int, b: Int) -> Int { a + b }
+                fn instance(self) -> Int { 7 }
+            }
+            global var label = Player.name()
+            global var total = Player.add(2, 3)
+            let player = Player.{}
+            global var instance = player.instance()
+            let nameFunction = Player.name
+            global var indirect = nameFunction()
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("static and instance calls execute"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("label"), Some(&Value::String("Player".into())));
+        assert_eq!(vm.global("total"), Some(&Value::Number(5.0)));
+        assert_eq!(vm.global("instance"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("indirect"), Some(&Value::String("Player".into())));
+    }
+
+    #[test]
+    fn static_method_execution_can_be_restored_at_a_host_call() {
+        let manifest = BuiltinManifest::new([("host", BuiltinId(1))]);
+        let bytecode = compile(
+            r#"
+            type Player = .{}
+            impl Player { fn score(n: Int) -> Int { host(n) n + 1 } }
+            global var result = Player.score(4)
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Call(_)))));
+        let mut vm = Vm::restore(bytecode, vm.snapshot()).expect("method frame restores");
+        vm.resume(Value::Unit).expect("host resumes");
+        while !matches!(
+            vm.step().expect("restored method executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(5.0)));
+    }
+
+    #[test]
+    fn primitive_methods_do_not_box_their_receiver() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            r#"
+            impl Int { fn doubled(self) -> Int { self * 2 } }
+            let value: Int = 3
+            global var result = value.doubled()
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("method executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::Number(6.0)));
+    }
+
+    #[test]
+    fn panic_uses_a_runtime_string_and_core_helpers_are_ordinary_functions() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile("let reason = \"failure\"\npanic(reason)", &manifest);
+        assert!(
+            bytecode
+                .functions
+                .iter()
+                .any(|function| bytecode.symbols.resolve(function.name) == Some("panic"))
+        );
+        let mut vm = Vm::new(bytecode).expect("VM initializes");
+        loop {
+            match vm.step() {
+                Ok(Some(VmEvent::Statement(_))) => {}
+                Err(VmError::Panic(message)) => {
+                    assert_eq!(message, "failure");
+                    break;
+                }
+                result => panic!("unexpected result: {result:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn never_intrinsics_trap_and_never_host_returns_are_guarded() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         for source in [
@@ -2311,10 +2688,7 @@ mod tests {
             "fn stop() -> Never { todo() }\nstop()",
         ] {
             let mut vm = Vm::new(compile(source, &manifest)).expect("VM initializes");
-            assert!(
-                matches!(vm.step(), Err(VmError::UndefinedInstruction(_))),
-                "{source}"
-            );
+            assert!(matches!(vm.step(), Err(VmError::Panic(_))), "{source}");
         }
 
         let mut registry = crate::native::NativeRegistry::<()>::new();

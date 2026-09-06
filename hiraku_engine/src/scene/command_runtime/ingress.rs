@@ -190,7 +190,10 @@ pub fn drive_story_runtime(
             if let Some(story) = runtime.story.as_mut()
                 && let Err(error) = story.resume_task(task)
             {
-                warn!("failed to resume HKS task {task}: {error}");
+                crate::script::emit_script_diagnostic(
+                    &format!("failed to resume HKS task {task}"),
+                    &error.to_string(),
+                );
                 runtime.story = None;
             }
         } else {
@@ -215,7 +218,10 @@ pub fn drive_story_runtime(
                 // it was emitted; the token has already been consumed above.
                 debug!("discarded stale script response for request {}", request.0);
             } else if let Err(error) = story.resume(direct_value) {
-                warn!("failed to resume script runtime: {error}");
+                crate::script::emit_script_diagnostic(
+                    "failed to resume script runtime",
+                    &error.to_string(),
+                );
                 runtime.story = None;
             }
         }
@@ -225,7 +231,7 @@ pub fn drive_story_runtime(
         Some(story) => match story.step() {
             Ok(event) => event,
             Err(error) => {
-                warn!("HKS runtime failed: {error}");
+                crate::script::emit_script_diagnostic("HKS runtime failed", &error.to_string());
                 runtime.story = None;
                 None
             }
@@ -301,7 +307,10 @@ pub fn drive_story_runtime(
                             ));
                         }
                         Err(error) => {
-                            warn!("failed to enable dialogue UI `{component}`: {error}");
+                            crate::script::emit_script_diagnostic(
+                                &format!("failed to enable dialogue UI `{component}`"),
+                                &error.to_string(),
+                            );
                             runtime.story = None;
                         }
                     }
@@ -337,9 +346,10 @@ pub fn drive_story_runtime(
                         pending_script_commands
                             .enqueue(ScriptCommand::Ui(UiCommand::ShowOverlay { name, screen }));
                     }
-                    Err(error) => {
-                        warn!("failed to mount UI overlay `{name}` from `{target}`: {error}")
-                    }
+                    Err(error) => crate::script::emit_script_diagnostic(
+                        &format!("failed to mount UI overlay `{name}` from `{target}`"),
+                        &error.to_string(),
+                    ),
                 }
             }
             StoryRuntimeEvent::Effect(
@@ -385,7 +395,10 @@ pub fn drive_story_runtime(
                             true
                         }
                         Err(error) => {
-                            warn!("failed to restore dialogue UI `{dialogue_component}`: {error}");
+                            crate::script::emit_script_diagnostic(
+                                &format!("failed to restore dialogue UI `{dialogue_component}`"),
+                                &error.to_string(),
+                            );
                             runtime.story = None;
                             false
                         }
@@ -397,7 +410,10 @@ pub fn drive_story_runtime(
                         Ok(command) => {
                             pending_script_commands.enqueue(command);
                         }
-                        Err(error) => warn!("HKS dialogue command rejected: {error}"),
+                        Err(error) => crate::script::emit_script_diagnostic(
+                            "HKS dialogue command rejected",
+                            &error.to_string(),
+                        ),
                     }
                 }
             }
@@ -406,7 +422,10 @@ pub fn drive_story_runtime(
                     Ok(command) => {
                         pending_script_commands.enqueue(command);
                     }
-                    Err(error) => warn!("HKS native command rejected: {error}"),
+                    Err(error) => crate::script::emit_script_diagnostic(
+                        "HKS native command rejected",
+                        &error.to_string(),
+                    ),
                 }
             }
             StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::DialogueAdvance) => {
@@ -471,7 +490,10 @@ pub fn drive_story_runtime(
                         }));
                     }
                     Err(error) => {
-                        warn!("failed to render choice UI `{target}`: {error}");
+                        crate::script::emit_script_diagnostic(
+                            &format!("failed to render choice UI `{target}`"),
+                            &error.to_string(),
+                        );
                         runtime.story = None;
                     }
                 }
@@ -511,7 +533,10 @@ pub fn drive_story_runtime(
                         }));
                     }
                     Err(error) => {
-                        warn!("failed to render UI script `{target}`: {error}");
+                        crate::script::emit_script_diagnostic(
+                            &format!("failed to render UI script `{target}`"),
+                            &error.to_string(),
+                        );
                         runtime.story = None;
                         runtime.wait_request = None;
                     }
@@ -548,7 +573,10 @@ pub fn drive_story_runtime(
                     if let Some(story) = runtime.story.as_mut()
                         && let Err(error) = story.resume_task(task)
                     {
-                        warn!("failed to skip missing HKS task voice: {error}");
+                        crate::script::emit_script_diagnostic(
+                            "failed to skip missing HKS task voice",
+                            &error.to_string(),
+                        );
                     }
                 }
             },
@@ -557,7 +585,10 @@ pub fn drive_story_runtime(
                 if let Some(story) = runtime.story.as_mut()
                     && let Err(error) = story.resume_task(task)
                 {
-                    warn!("failed to resume unsupported HKS task effect: {error}");
+                    crate::script::emit_script_diagnostic(
+                        "failed to resume unsupported HKS task effect",
+                        &error.to_string(),
+                    );
                 }
             }
             StoryRuntimeEvent::Completed(_) => {

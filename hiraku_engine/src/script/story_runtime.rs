@@ -287,6 +287,24 @@ impl StoryRuntime {
         if self.terminated {
             return Ok(None);
         }
+        // Choice branches can outlive their builder VM. They and deferred
+        // completions are explicit host roots, not incidental register liveness.
+        let mut roots = self.deferred_task_completions.values().collect::<Vec<_>>();
+        if let Some(
+            ChoiceState::Collecting { options, .. }
+            | ChoiceState::AwaitingSelection { options, .. },
+        ) = &self.choice
+        {
+            roots.extend(options.iter().map(|option| &option.body));
+        }
+        for event in &self.pending {
+            match event {
+                StoryRuntimeEvent::OpenUi { arguments, .. } => roots.extend(arguments),
+                StoryRuntimeEvent::Completed(value) => roots.push(value),
+                _ => {}
+            }
+        }
+        self.execution.collect_objects_if_due(&roots)?;
         let mut budget = 10_000;
         if let Some(event) = self.pending.pop_front() {
             self.mark_host_boundary(&event);
@@ -340,6 +358,10 @@ impl StoryRuntime {
                             });
                         }
                         StoryCallOutcome::Control(StoryControl::OpenUi { path, arguments }) => {
+                            let arguments = arguments
+                                .iter()
+                                .map(|value| self.execution.export_value(value))
+                                .collect::<Result<_, _>>()?;
                             self.blocked = true;
                             return Ok(Some(StoryRuntimeEvent::OpenUi { path, arguments }));
                         }
@@ -910,6 +932,44 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
                 if text == "after"
         ));
+    }
+
+    #[test]
+    fn collection_keeps_choice_captures_after_the_builder_completes() {
+        let bytecode = compile_story_bytecode(
+            "choice_gc.hks",
+            r#"
+            choice("Select") {
+                let alice = .{ name: "alice" }
+                option("A") { "${alice.name}" }
+                var index = 0
+                while index < 1100 {
+                    let unused = .{ score: index }
+                    index += 1
+                }
+            }
+        "#,
+        )
+        .expect("choice compiles");
+        let mut runtime = StoryRuntime::new(bytecode).expect("runtime initializes");
+        let mut reached_choice = false;
+        for _ in 0..100 {
+            if matches!(
+                runtime.step().expect("builder executes"),
+                Some(StoryRuntimeEvent::Choice { .. })
+            ) {
+                reached_choice = true;
+                break;
+            }
+        }
+        assert!(reached_choice);
+        assert_eq!(runtime.step().expect("blocked choice can collect"), None);
+        runtime
+            .resume(Value::Number(0.0))
+            .expect("selection resumes");
+        assert!(
+            matches!(runtime.step().expect("captured object survives collection"), Some(StoryRuntimeEvent::Effect(StoryEffect::Say { text, .. })) if text == "alice")
+        );
     }
 
     #[test]

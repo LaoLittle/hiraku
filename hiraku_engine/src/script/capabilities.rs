@@ -152,7 +152,7 @@ pub fn compile_story_bytecode_with_options(
             .map(|warning| warning.diagnostic(source_id.clone()))
             .collect::<Vec<_>>();
         let rendered = render_diagnostics(&diagnostics, &sources, render_options);
-        let _ = hiraku_script::emit_rendered_diagnostic("HKS compiler warning:", &rendered);
+        super::emit_script_diagnostic("HKS compiler warning:", &rendered);
     }
     compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
         |errors| {

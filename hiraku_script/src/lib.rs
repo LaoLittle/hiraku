@@ -5,24 +5,63 @@
 //!
 //! Unannotated numeric locals are constrained by their uses: `let a = 1; let b:
 //! Float = a` infers both bindings as Float. Explicit annotations remain fixed.
+//! An already typed Int requires `.toFloat()` before use as Float. Numeric
+//! literals (including negative literals) can instead be inferred as Float.
 //! `.toInt()` explicitly truncates a finite numeric value toward zero; implicit
 //! Float-to-Int assignment is rejected. Values outside the exactly representable
 //! integer range of the current numeric representation are rejected as well.
 //!
 //! `Never` is the bottom type. `todo()` and `unreachable()` trap; calls whose
 //! result is Never are followed by a VM trap if a host incorrectly returns.
+//! A value-returning named function's tail expression returns to its caller;
+//! it does not emit a separate statement hook. Unit-returning procedures and
+//! closure command lists continue to emit their statement hooks.
 //! Any requires an explicit cast before assignment to a concrete script type;
 //! native calls can accept dynamic values and validate them at the Rust boundary.
+//!
+//! `impl Player { fn score(self) -> Int { self.value } }` defines an instance
+//! method using the same function/bytecode machinery as ordinary functions.
+//! Methods without `self` are static: `impl Player { fn name() -> String {
+//! "Player" } }` is called with `Player.name()`, without creating an instance.
+//! Method lookup uses the canonical receiver type; primitive receivers are not
+//! boxed. Records, including `self`, use execution-owned object references;
+//! aliases and function arguments share field mutations. Primitive values are copied.
+//! Generic impl blocks and bound-method values are not supported yet.
+//!
+//! Callable annotations use right-associative arrows: `(Int) -> (Int) -> ()`.
+//! The unit type is spelled `()`; the standard prelude defines the transparent
+//! alias `type Unit = ()`. Closure parameters can infer their types from an
+//! expected callable signature. Native adapters may still use the erased
+//! `Function` capability when a concrete signature is not available.
+//!
+//! `const` and `global const` require compile-time scalar initializers. Stored
+//! objects and native calls are intentionally not constant expressions.
+//! In an impl, `const A = 1` is accessed as `Player.A`. Computed properties use
+//! `var score: Int { ... }` or `var score: Int { get { ... } set(value) { ... } }`.
+//! Accessors lower to ordinary script functions; a setter parameter is mandatory.
+//!
+//! Object collection is non-moving mark-and-sweep. Shared-heap owners enumerate
+//! all VM and host roots at safe points. IDs are never reused, and snapshots
+//! retain the reachable graph's identity. Standalone VM users supply retained
+//! host values to `Vm::collect_objects`; linked execution also collects at
+//! allocation thresholds because its host boundary exports owned values.
+//!
+//! The bundled `std/core.hks` defines panic/todo/unreachable and numeric methods.
+//! Only compiler operations in [`intrinsics`] receive dedicated lowering;
+//! unused core definitions are omitted from the self-contained bytecode.
 
 pub mod ast;
 pub mod blocks;
 pub mod hir;
 pub mod hson;
+pub mod intrinsics;
 pub mod lex;
 pub mod linked_vm;
 pub mod linker;
 pub mod mir;
 pub mod native;
+pub mod objects;
+pub use objects::{ObjectHeap, ObjectId};
 pub mod parse;
 pub mod register;
 pub mod runtime;

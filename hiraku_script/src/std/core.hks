@@ -1,0 +1,15 @@
+type Unit = ()
+
+fn panic(message: String) -> Never { __builtin_panic(message) }
+fn unreachable() -> Never { panic("entered unreachable code") }
+fn todo() -> Never { panic("not yet implemented") }
+
+impl Float {
+    fn toFloat(self) -> Float { self }
+    fn toInt(self) -> Int { __builtin_f2i(self) }
+}
+
+impl Int {
+    fn toFloat(self) -> Float { __builtin_i2f(self) }
+    fn toInt(self) -> Int { self }
+}

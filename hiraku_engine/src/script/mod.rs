@@ -47,6 +47,9 @@ pub(crate) fn compile_story_bytecode(
     )
 }
 
+/// The terminal boundary for script/UI/HSON diagnostics. Never pass rendered
+/// reports through tracing: its formatter may escape their ANSI sequences.
+/// Callers keep the error as data until this boundary, avoiding duplicate output.
 pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
     if let Err(error) = hiraku_script::emit_rendered_diagnostic(context, diagnostic) {
         bevy::log::error!("failed to write script diagnostic to stderr: {error}");

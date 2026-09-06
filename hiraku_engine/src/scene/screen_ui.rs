@@ -1671,7 +1671,9 @@ pub fn update_ui_reactive_bindings(
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::String(value)) => text.0 = value,
             Ok(value) => warn!("reactive UI text returned {value:?}, expected String"),
-            Err(error) => warn!("reactive UI text failed: {error}"),
+            Err(error) => {
+                crate::script::emit_script_diagnostic("reactive UI text failed", &error.to_string())
+            }
         }
         binding.rendered_revision = revision;
     }
@@ -1688,7 +1690,10 @@ pub fn update_ui_reactive_bindings(
                 };
             }
             Ok(value) => warn!("reactive UI visibility returned {value:?}, expected Bool"),
-            Err(error) => warn!("reactive UI visibility failed: {error}"),
+            Err(error) => crate::script::emit_script_diagnostic(
+                "reactive UI visibility failed",
+                &error.to_string(),
+            ),
         }
         binding.rendered_revision = revision;
     }
@@ -1715,7 +1720,10 @@ pub fn update_ui_reactive_bindings(
                 }
             }
             Ok(value) => warn!("reactive UI enabled expression returned {value:?}, expected Bool"),
-            Err(error) => warn!("reactive UI enabled expression failed: {error}"),
+            Err(error) => crate::script::emit_script_diagnostic(
+                "reactive UI enabled expression failed",
+                &error.to_string(),
+            ),
         }
         binding.rendered_revision = revision;
     }
@@ -1726,7 +1734,10 @@ pub fn update_ui_reactive_bindings(
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::Bool(enabled)) => button.enabled = enabled,
             Ok(value) => warn!("reactive UI enabled expression returned {value:?}, expected Bool"),
-            Err(error) => warn!("reactive UI enabled expression failed: {error}"),
+            Err(error) => crate::script::emit_script_diagnostic(
+                "reactive UI enabled expression failed",
+                &error.to_string(),
+            ),
         }
         binding.rendered_revision = revision;
     }
@@ -1741,7 +1752,10 @@ pub fn update_ui_reactive_bindings(
                 node.width = percent(progress * 100.0);
             }
             Ok(value) => warn!("reactive UI progress returned {value:?}, expected Float"),
-            Err(error) => warn!("reactive UI progress failed: {error}"),
+            Err(error) => crate::script::emit_script_diagnostic(
+                "reactive UI progress failed",
+                &error.to_string(),
+            ),
         }
         binding.rendered_revision = revision;
     }

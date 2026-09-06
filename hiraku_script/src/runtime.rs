@@ -238,6 +238,7 @@ fn hash_byte(hash: u64, byte: u8) -> u64 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    Object(crate::ObjectId),
     Unit,
     /// A script `Optional<T>`. Keeping the discriminant explicit preserves
     /// `.some(.none)` and makes snapshots independent of pointer niches.
@@ -262,6 +263,9 @@ pub enum Value {
         symbol: SymbolId,
     },
     Closure {
+        /// Portable captures at an embedding boundary. Live VM closures use
+        /// the execution heap and leave this empty.
+        objects: Option<Box<crate::ObjectHeap>>,
         /// Runtime linker module owning `region`. Generic single-module VMs
         /// leave this unset; `LinkedVm` binds it before a closure crosses a
         /// module or native boundary.

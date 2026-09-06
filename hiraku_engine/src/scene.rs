@@ -411,28 +411,37 @@ pub fn setup_frontend(
     match load_audio_catalog(&vfs.0) {
         Ok(catalog) => commands.insert_resource(catalog),
         Err(error) => {
-            warn!("failed to load audio catalog: {error}");
+            crate::script::emit_script_diagnostic(
+                "failed to load audio catalog",
+                &error.to_string(),
+            );
             commands.insert_resource(AudioCatalog::default());
         }
     }
     match load_movie_catalog(&vfs.0) {
         Ok(catalog) => commands.insert_resource(catalog),
         Err(error) => {
-            warn!("failed to load movie catalog: {error}");
+            crate::script::emit_script_diagnostic(
+                "failed to load movie catalog",
+                &error.to_string(),
+            );
             commands.insert_resource(MovieCatalog::default());
         }
     }
     match load_term_catalog(&vfs.0) {
         Ok(catalog) => commands.insert_resource(catalog),
         Err(error) => {
-            warn!("failed to load glossary: {error}");
+            crate::script::emit_script_diagnostic("failed to load glossary", &error.to_string());
             commands.insert_resource(TermCatalog::default());
         }
     }
     let startup_script = match vfs.0.load_startup_script_path() {
         Ok(startup_script) => startup_script,
         Err(err) => {
-            warn!("failed to resolve startup script: {err}");
+            crate::script::emit_script_diagnostic(
+                "failed to resolve startup script",
+                &err.to_string(),
+            );
             String::new()
         }
     };
@@ -440,7 +449,7 @@ pub fn setup_frontend(
     let user_settings = match read_user_settings() {
         Ok(settings) => settings,
         Err(err) => {
-            warn!("failed to read user settings: {err}");
+            crate::script::emit_script_diagnostic("failed to read user settings", &err.to_string());
             UserSettings::default()
         }
     };
@@ -448,7 +457,10 @@ pub fn setup_frontend(
     let font_paths = match vfs.0.load_font_paths() {
         Ok(paths) => paths,
         Err(err) => {
-            warn!("failed to enumerate fonts directory: {err}");
+            crate::script::emit_script_diagnostic(
+                "failed to enumerate fonts directory:",
+                &err.to_string(),
+            );
             Vec::new()
         }
     };
@@ -456,7 +468,10 @@ pub fn setup_frontend(
     let character_catalog = match load_character_catalog(&vfs.0) {
         Ok(catalog) => catalog,
         Err(err) => {
-            warn!("failed to load character catalog: {err}");
+            crate::script::emit_script_diagnostic(
+                "failed to load character catalog",
+                &err.to_string(),
+            );
             CharacterCatalog::default()
         }
     };

@@ -1,5 +1,6 @@
 //! High-level statement semantics shared by the compiler and embedding host.
 
+mod prepare;
 mod typed;
 mod types;
 
@@ -35,6 +36,29 @@ pub fn normalize_program_symbols(
 
 fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
     match statement {
+        Stmt::Property {
+            name,
+            ty,
+            getter,
+            setter,
+            ..
+        } => {
+            symbols.intern(name);
+            intern_type(ty, symbols);
+            intern_block(getter, symbols);
+            if let Some((parameter, body)) = setter {
+                symbols.intern(parameter);
+                intern_block(body, symbols);
+            }
+        }
+        Stmt::Impl {
+            target, methods, ..
+        } => {
+            intern_type(target, symbols);
+            for method in methods {
+                intern_statement(method, symbols);
+            }
+        }
         Stmt::Import { path, .. } => {
             if !path.is_empty() {
                 symbols.intern(path.join("."));
@@ -75,7 +99,13 @@ fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
             }
             intern_block(body, symbols);
         }
-        Stmt::Let {
+        Stmt::Const {
+            name,
+            type_annotation,
+            value,
+            ..
+        }
+        | Stmt::Let {
             name,
             type_annotation,
             value,
@@ -135,6 +165,18 @@ fn intern_block(block: &Block, symbols: &mut SymbolInterner) {
 
 fn intern_type(ty: &TypeExpr, symbols: &mut SymbolInterner) {
     match &ty.kind {
+        TypeExprKind::Unit => {}
+        TypeExprKind::Tuple(values) => {
+            for value in values {
+                intern_type(value, symbols);
+            }
+        }
+        TypeExprKind::Function { parameters, result } => {
+            for parameter in parameters {
+                intern_type(parameter, symbols);
+            }
+            intern_type(result, symbols);
+        }
         TypeExprKind::Named(name) => {
             symbols.intern(name);
         }

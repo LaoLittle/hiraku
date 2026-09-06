@@ -22,6 +22,25 @@ pub struct Attribute {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
+    Const {
+        exported: bool,
+        name: String,
+        type_annotation: Option<TypeExpr>,
+        value: Expr,
+        span: Span,
+    },
+    Property {
+        name: String,
+        ty: TypeExpr,
+        getter: Block,
+        setter: Option<(String, Block)>,
+        span: Span,
+    },
+    Impl {
+        target: TypeExpr,
+        methods: Vec<Stmt>,
+        span: Span,
+    },
     Import {
         path: Vec<String>,
         wildcard: bool,
@@ -92,6 +111,12 @@ pub struct TypeExpr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeExprKind {
+    Unit,
+    Tuple(Vec<TypeExpr>),
+    Function {
+        parameters: Vec<TypeExpr>,
+        result: Box<TypeExpr>,
+    },
     Named(String),
     Applied {
         name: String,

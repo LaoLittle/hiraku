@@ -219,7 +219,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
             match crate::script::evaluate_ui_callback(&callback, &globals, &ctx.models) {
                 Ok(result) => result,
                 Err(error) => {
-                    warn!("onClick failed: {error}");
+                    crate::script::emit_script_diagnostic("onClick failed", &error.to_string());
                     continue;
                 }
             };
@@ -288,7 +288,10 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                         save_data.scene.clone(),
                     );
                     if let Some(error) = ctx.frontend.notice.as_deref() {
-                        warn!("failed to restore slot `{slot}`: {error}");
+                        crate::script::emit_script_diagnostic(
+                            &format!("failed to restore slot `{slot}`"),
+                            &error.to_string(),
+                        );
                     } else {
                         info!("loaded save slot `{slot}`");
                     }
@@ -311,7 +314,10 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                                 UiCommand::ShowScreen { screen, done: None },
                             ));
                         }
-                        Err(error) => warn!("failed to open UI role `{role}`: {error}"),
+                        Err(error) => crate::script::emit_script_diagnostic(
+                            &format!("failed to open UI role `{role}`"),
+                            &error.to_string(),
+                        ),
                     }
                 }
                 crate::ui::UiEffect::CloseUi => {

@@ -39,7 +39,23 @@ enum Command {
     HdpVerify { package: PathBuf },
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // Result's default termination handler formats errors with Debug,
+            // which escapes ANSI in rendered script diagnostics.
+            if let Err(output_error) =
+                hiraku_script::emit_rendered_diagnostic("hiraku-cli failed:", &error.to_string())
+            {
+                eprintln!("failed to write diagnostic to stderr: {output_error}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Command::HdpPack {
             source,

@@ -422,7 +422,9 @@ impl Parser {
             match name.as_str() {
                 "import" => return self.parse_import(),
                 "fn" => return self.parse_function(false),
+                "impl" => return self.parse_impl(),
                 "type" => return self.parse_type_alias(),
+                "const" => return self.parse_const(false),
                 "let" | "var" => return self.parse_let(),
                 "global" => return self.parse_global(),
                 "if" => return self.parse_if(),
@@ -612,6 +614,143 @@ impl Parser {
         }
     }
 
+    fn parse_impl(&mut self) -> Stmt {
+        let start = self.advance().span;
+        let target = self.parse_type();
+        self.skip_newlines();
+        self.expect(TokenKind::LBrace, "expected `{` after impl type");
+        self.skip_separators();
+        let mut methods = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
+                methods.push(self.parse_function(false));
+            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "var") {
+                methods.push(self.parse_property());
+            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "const") {
+                methods.push(self.parse_const(false));
+            } else {
+                self.error_here("impl blocks accept functions and computed properties, not stored let/var fields");
+                self.parse_statement();
+            }
+            self.skip_separators();
+        }
+        let end = self.current().span;
+        self.expect(TokenKind::RBrace, "expected `}` after impl methods");
+        Stmt::Impl {
+            target,
+            methods,
+            span: Span::join(&start, &end),
+        }
+    }
+
+    fn parse_const(&mut self, exported: bool) -> Stmt {
+        let statement = self.parse_let();
+        let Stmt::Let {
+            name,
+            type_annotation,
+            value,
+            span,
+            ..
+        } = statement
+        else {
+            unreachable!("binding parser returns Let")
+        };
+        Stmt::Const {
+            exported,
+            name,
+            type_annotation,
+            value,
+            span,
+        }
+    }
+
+    fn parse_property(&mut self) -> Stmt {
+        let start = self.advance().span;
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected property name");
+                "<error>".into()
+            }
+        };
+        self.expect(
+            TokenKind::Colon,
+            "computed properties require an explicit type",
+        );
+        let ty = self.parse_type();
+        self.skip_newlines();
+        self.expect(
+            TokenKind::LBrace,
+            "expected `{` before computed property body",
+        );
+        self.skip_separators();
+        if !matches!(&self.current().kind, TokenKind::Ident(name) if name == "get" || name == "set")
+        {
+            let getter = self.parse_block_contents(start.start);
+            let span = Span::join(&start, &getter.span);
+            return Stmt::Property {
+                name,
+                ty,
+                getter,
+                setter: None,
+                span,
+            };
+        }
+        let mut getter = None;
+        let mut setter = None;
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            match self.advance().kind {
+                TokenKind::Ident(accessor) if accessor == "get" => {
+                    if getter.is_some() {
+                        self.error_here("duplicate property getter");
+                    }
+                    self.skip_newlines();
+                    getter = Some(self.parse_block());
+                }
+                TokenKind::Ident(accessor) if accessor == "set" => {
+                    if setter.is_some() {
+                        self.error_here("duplicate property setter");
+                    }
+                    self.expect(
+                        TokenKind::LParen,
+                        "setter requires an explicit parameter: set(value) { ... }",
+                    );
+                    let parameter = if let TokenKind::Ident(parameter) = &self.current().kind {
+                        let parameter = parameter.clone();
+                        self.advance();
+                        parameter
+                    } else {
+                        self.error_here("setter requires a named parameter");
+                        "<error>".into()
+                    };
+                    self.expect(TokenKind::RParen, "expected `)` after setter parameter");
+                    self.skip_newlines();
+                    setter = Some((parameter, self.parse_block()));
+                }
+                _ => {
+                    self.error_here("expected get or set accessor");
+                }
+            }
+            self.skip_separators();
+        }
+        let end = self
+            .expect(TokenKind::RBrace, "expected `}` after property accessors")
+            .span;
+        if getter.is_none() {
+            self.error_here("computed property requires a getter");
+        }
+        Stmt::Property {
+            name,
+            ty,
+            getter: getter.unwrap_or(Block {
+                statements: Vec::new(),
+                span: start,
+            }),
+            setter,
+            span: Span::join(&start, &end),
+        }
+    }
+
     fn parse_type_alias(&mut self) -> Stmt {
         let start = self.advance();
         let name = match self.advance().kind {
@@ -729,6 +868,9 @@ impl Parser {
 
     fn parse_global(&mut self) -> Stmt {
         let start = self.advance();
+        if matches!(&self.current().kind, TokenKind::Ident(name) if name == "const") {
+            return self.parse_const(true);
+        }
         if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
             return self.parse_function(true);
         }
@@ -786,7 +928,47 @@ impl Parser {
 
     fn parse_type(&mut self) -> TypeExpr {
         let start = self.current().span.clone();
-        let mut ty = if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::LBrace) {
+        let mut ty = if self.at(TokenKind::LParen) {
+            self.advance();
+            let mut parameters = Vec::new();
+            let mut comma = false;
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                parameters.push(self.parse_type());
+                if !self.at(TokenKind::Comma) {
+                    break;
+                }
+                comma = true;
+                self.advance();
+            }
+            let end = self
+                .expect(TokenKind::RParen, "expected `)` after type")
+                .span;
+            if self.at(TokenKind::Minus) && self.peek().kind == TokenKind::Gt {
+                self.advance();
+                self.advance();
+                let result = self.parse_type();
+                let span = Span::join(&start, &result.span);
+                TypeExpr {
+                    kind: TypeExprKind::Function {
+                        parameters,
+                        result: Box::new(result),
+                    },
+                    span,
+                }
+            } else {
+                let kind = if parameters.is_empty() {
+                    TypeExprKind::Unit
+                } else if parameters.len() == 1 && !comma {
+                    parameters.remove(0).kind
+                } else {
+                    TypeExprKind::Tuple(parameters)
+                };
+                TypeExpr {
+                    kind,
+                    span: Span::join(&start, &end),
+                }
+            }
+        } else if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::LBrace) {
             self.advance();
             self.advance();
             let mut fields = Vec::new();
@@ -1425,20 +1607,25 @@ impl Parser {
         let mut lambda = self.at(TokenKind::Minus) && self.peek().kind == TokenKind::Gt;
         while !lambda
             && matches!(self.current().kind, TokenKind::Ident(_))
-            && matches!(self.peek().kind, TokenKind::Colon)
+            && matches!(
+                self.peek().kind,
+                TokenKind::Colon | TokenKind::Comma | TokenKind::Minus
+            )
         {
             let parameter_start = self.current().span.clone();
             let TokenKind::Ident(name) = self.advance().kind else {
                 unreachable!("the lambda parameter lookahead requires an identifier")
             };
-            self.advance();
-            let ty = self.parse_type();
-            let span = Span::join(&parameter_start, &ty.span);
-            parameters.push(FunctionParameter {
-                name,
-                ty: Some(ty),
-                span,
-            });
+            let ty = if self.at(TokenKind::Colon) {
+                self.advance();
+                Some(self.parse_type())
+            } else {
+                None
+            };
+            let span = ty
+                .as_ref()
+                .map_or(parameter_start, |ty| Span::join(&parameter_start, &ty.span));
+            parameters.push(FunctionParameter { name, ty, span });
             self.skip_newlines();
             if self.at(TokenKind::Comma) {
                 self.advance();

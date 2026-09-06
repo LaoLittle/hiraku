@@ -445,7 +445,7 @@ fn boot_runtime(
             *booted = true;
         }
         Err(err) => {
-            error!("failed to resolve startup script: {err}");
+            script::emit_script_diagnostic("failed to resolve startup script:", &err.to_string());
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use hiraku_script::native::{
     FromHksValue, HksBindable, HksBinding, HksCallable, HksClosure, IntoHksValue, NativeError,
@@ -195,12 +195,6 @@ impl UiVmContext {
         self.effects.insert(self.next_effect, effect);
         UiEffectHandle(self.next_effect)
     }
-
-    fn effect(&self, handle: UiEffectHandle) -> Result<&UiEffect, NativeError> {
-        self.effects
-            .get(&handle.0)
-            .ok_or_else(|| NativeError::message(format!("unknown UiEffect handle {}", handle.0)))
-    }
 }
 
 #[hiraku_script::hks_module]
@@ -270,14 +264,9 @@ mod native_ui {
     fn string_prefix(
         _context: &mut UiVmContext,
         value: String,
-        characters: f64,
+        characters: u32,
     ) -> Result<String, NativeError> {
-        if !characters.is_finite() || characters < 0.0 {
-            return Err(NativeError::message(
-                "String.prefix character count must be finite and non-negative",
-            ));
-        }
-        Ok(value.chars().take(characters.floor() as usize).collect())
+        Ok(value.chars().take(characters as usize).collect())
     }
 
     /// Creates a writable binding from ordinary script functions. The getter
@@ -1209,7 +1198,9 @@ fn collect_nodes(
     context: &mut UiVmContext,
 ) -> Result<Vec<UiNodeHandle>, UiVmError> {
     let mut nodes = Vec::new();
-    let mut seen = BTreeSet::new();
+    // Statement boundaries seal drafts allocated by this invocation. A fluent
+    // return value is only a handle, never an instruction to emit a node.
+    let mut committed_node = context.next_node;
     let mut budget = 100_000;
     loop {
         let event = match vm.step_with_budget(&mut budget) {
@@ -1242,17 +1233,10 @@ fn collect_nodes(
                 vm.resume(value)
                     .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
             }
-            Some(LinkedVmEvent::Statement(StatementValue::Value(value))) => {
-                let node = UiNodeHandle::from_hks_value(&value).map_err(|_| {
-                    UiVmError::Invalid("UI expression statements must produce UiNode".into())
-                })?;
-                // Script-defined components can return the same handle through
-                // several wrapper frames. It still represents one emitted node.
-                if seen.insert(node.0) {
-                    nodes.push(node);
-                }
+            Some(LinkedVmEvent::Statement(StatementValue::Value(_) | StatementValue::Commit)) => {
+                nodes.extend(((committed_node + 1)..=context.next_node).map(UiNodeHandle));
+                committed_node = context.next_node;
             }
-            Some(LinkedVmEvent::Statement(StatementValue::Commit)) => {}
             Some(LinkedVmEvent::Statement(
                 StatementValue::String(_) | StatementValue::TextTemplate(_),
             )) => {
@@ -1260,7 +1244,11 @@ fn collect_nodes(
                     "bare strings are not UI nodes; wrap the value with text(...)".into(),
                 ));
             }
-            Some(LinkedVmEvent::Completed(_)) => return Ok(nodes),
+            Some(LinkedVmEvent::Completed(_)) => {
+                // Value-returning helper tails need not emit a statement event.
+                nodes.extend(((committed_node + 1)..=context.next_node).map(UiNodeHandle));
+                return Ok(nodes);
+            }
             None => {
                 return Err(UiVmError::Runtime(
                     "UI VM stopped without completing or requesting a native call".into(),
@@ -1318,7 +1306,7 @@ pub(crate) fn evaluate_ui_callback(
     vm.set_current_globals(&current_globals)
         .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
     let mut effects = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut committed_effect = context.next_effect;
     let mut budget = 100_000;
     loop {
         match vm
@@ -1344,25 +1332,15 @@ pub(crate) fn evaluate_ui_callback(
                 vm.resume(value)
                     .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
             }
-            Some(LinkedVmEvent::Statement(StatementValue::Value(value))) => {
-                let effect = if let Ok(handle) = UiEffectHandle::from_hks_value(&value) {
-                    (handle.0, context.effect(handle))
-                } else {
-                    return Err(UiVmError::Invalid(
-                        "onClick statements must produce an effect such as sfx(...) or story.goto(...)"
-                            .into(),
-                    ));
-                };
-                if seen.insert(effect.0) {
-                    effects.push(
-                        effect
-                            .1
-                            .map_err(|error| UiVmError::Runtime(error.to_string()))?
-                            .clone(),
-                    );
-                }
+            Some(LinkedVmEvent::Statement(StatementValue::Value(_) | StatementValue::Commit)) => {
+                effects.extend(
+                    context
+                        .effects
+                        .range((committed_effect + 1)..)
+                        .map(|(_, effect)| effect.clone()),
+                );
+                committed_effect = context.next_effect;
             }
-            Some(LinkedVmEvent::Statement(StatementValue::Commit)) => {}
             Some(LinkedVmEvent::Statement(
                 StatementValue::String(_) | StatementValue::TextTemplate(_),
             )) => {
@@ -1370,7 +1348,15 @@ pub(crate) fn evaluate_ui_callback(
                     "bare strings are not valid onClick effects".into(),
                 ));
             }
-            Some(LinkedVmEvent::Completed(_)) => return Ok((effects, vm.current_globals())),
+            Some(LinkedVmEvent::Completed(_)) => {
+                effects.extend(
+                    context
+                        .effects
+                        .range((committed_effect + 1)..)
+                        .map(|(_, effect)| effect.clone()),
+                );
+                return Ok((effects, vm.current_globals()));
+            }
             None => {
                 return Err(UiVmError::Runtime(
                     "onClick handler stopped without completing".into(),
@@ -1989,6 +1975,42 @@ mod tests {
     }
 
     #[test]
+    fn statement_boundaries_commit_allocated_nodes_not_returned_handles() {
+        let source = r#"
+            import ui.widgets.*
+            fn heading() -> UiNode { text("alice") }
+            screen {
+                let title = heading()
+                let alias = title
+                alias
+                42
+                text("bob")
+            }
+        "#;
+        let screen = evaluate_ui_component_named(
+            "memory://boundaries.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("node collection does not depend on statement values");
+        assert_eq!(
+            screen.children.len(),
+            2,
+            "returned aliases do not emit duplicate nodes"
+        );
+        let ScreenNode::Text(first) = &screen.children[0] else {
+            panic!("expected text")
+        };
+        let ScreenNode::Text(second) = &screen.children[1] else {
+            panic!("expected text")
+        };
+        assert_eq!(first.text, "alice");
+        assert_eq!(second.text, "bob");
+    }
+
+    #[test]
     fn evaluates_script_defined_compose_ui() {
         let source = r#"
 import ui.widgets.*
@@ -2058,7 +2080,7 @@ global fn card(label: String, count: Int) -> UiNode {
     screen {
         column {
             text(label)
-            progress(count).range(0, 10)
+            progress(count.toFloat()).range(0, 10)
         }
     }
 }
@@ -2435,6 +2457,58 @@ canvas { choiceOptions(renderOption) }
         assert_eq!(button.value, None);
         assert_eq!(button.hover_scale, 1.08);
         assert_eq!(button.press_scale, 0.94);
+    }
+
+    #[test]
+    fn dialogue_prefix_accepts_integer_character_counts() {
+        let dialogue = |count| {
+            StoredValue::Map(BTreeMap::from([
+                (
+                    "text".into(),
+                    StoredValue::String("A\u{e9}\u{1f642}".into()),
+                ),
+                ("revealedCharacters".into(), StoredValue::Int(count)),
+            ]))
+        };
+        let screen = evaluate_ui_component_named(
+            "memory://dialogue_prefix.ui.hks",
+            "import ui.widgets.*\ncanvas { text(${dialogue.text.prefix(dialogue.revealedCharacters)}) }",
+            UiContext::new(BTreeMap::from([("dialogue".into(), dialogue(2))])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        ).expect("the dialogue model count matches the prefix signature");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("expected text")
+        };
+        assert_eq!(text.text, "A\u{e9}");
+        let binding = text
+            .reactive_text
+            .as_ref()
+            .expect("dialogue text retains its binding");
+        let mut models = crate::ui::UiModels::default();
+        for (count, expected) in [(0, ""), (3, "A\u{e9}\u{1f642}"), (20, "A\u{e9}\u{1f642}")] {
+            models.set("dialogue", dialogue(count));
+            assert_eq!(
+                evaluate_ui_reactive_binding(binding, &models).expect("updated count evaluates"),
+                Value::String(expected.into())
+            );
+        }
+        for source in [
+            "import ui.widgets.*\ncanvas { text(\"abc\".prefix(1.5)) }",
+            "import ui.widgets.*\ncanvas { text(\"abc\".prefix(-1)) }",
+        ] {
+            assert!(
+                evaluate_ui_component_named(
+                    "memory://invalid_prefix.ui.hks",
+                    source,
+                    UiContext::default(),
+                    &TextureCatalog::default(),
+                    &TermCatalog::default()
+                )
+                .is_err(),
+                "fractional and negative counts must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -62,7 +62,10 @@ pub fn prepare_texture_atlases(commands: &mut Commands, asset_server: &AssetServ
     let catalog = match load_texture_catalog(vfs) {
         Ok(catalog) => catalog,
         Err(error) => {
-            warn!("failed to load texture catalog: {error}");
+            crate::script::emit_script_diagnostic(
+                "failed to load texture catalog",
+                &error.to_string(),
+            );
             TextureCatalog::default()
         }
     };

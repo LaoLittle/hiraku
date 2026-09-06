@@ -22,11 +22,13 @@ pub struct LinkedVmFrameSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedVmSnapshot {
+    pub objects: crate::ObjectHeap,
     pub modules: Vec<Bytecode>,
     pub frames: Vec<LinkedVmFrameSnapshot>,
 }
 
 pub struct LinkedVm {
+    objects: crate::ObjectHeap,
     program: LinkedProgram,
     frames: Vec<(ModuleId, Vm)>,
 }
@@ -39,6 +41,7 @@ impl LinkedVm {
             .ok_or(LinkedVmError::UnknownModule(entry))?;
         let vm = Vm::new(module.bytecode.clone())?;
         Ok(Self {
+            objects: crate::ObjectHeap::default(),
             program,
             frames: vec![(entry, vm)],
         })
@@ -79,8 +82,11 @@ impl LinkedVm {
             .ok_or(LinkedVmError::UnknownModule(module))?
             .bytecode
             .clone();
-        let vm = Vm::from_callable(bytecode, callable, arguments)?;
+        let mut vm = Vm::from_callable(bytecode, callable, arguments)?;
+        let mut objects = crate::ObjectHeap::default();
+        vm.swap_objects(&mut objects);
         Ok(Self {
+            objects,
             program,
             frames: vec![(module, vm)],
         })
@@ -88,6 +94,16 @@ impl LinkedVm {
 
     pub fn program(&self) -> &LinkedProgram {
         &self.program
+    }
+
+    /// A safe-point collection across all linked call frames, including host roots.
+    pub fn collect_objects(&mut self, host_roots: &[Value]) -> Result<usize, VmError> {
+        self.objects.collect(
+            self.frames
+                .iter()
+                .flat_map(|(_, vm)| vm.object_roots())
+                .chain(host_roots),
+        )
     }
 
     /// Named globals of the currently executing frame, for embedding commit boundaries.
@@ -100,10 +116,12 @@ impl LinkedVm {
             .iter()
             .zip(vm.globals())
             .filter_map(|(symbol, value)| {
-                vm.bytecode()
-                    .symbols
-                    .resolve(*symbol)
-                    .map(|name| (name.to_owned(), value.clone()))
+                vm.bytecode().symbols.resolve(*symbol).map(|name| {
+                    (
+                        name.to_owned(),
+                        self.objects.export(value).unwrap_or_else(|_| value.clone()),
+                    )
+                })
             })
             .collect()
     }
@@ -117,21 +135,32 @@ impl LinkedVm {
         remaining: &mut u32,
     ) -> Result<Option<LinkedVmEvent>, LinkedVmError> {
         loop {
+            if self.objects.collection_due() {
+                // LinkedVm exports owned values/portable closures at every host
+                // boundary; no host-side object IDs refer into this heap.
+                self.collect_objects(&[])?;
+            }
             let is_root = self.frames.len() == 1;
             let (module_id, vm) = self.frames.last_mut().ok_or(LinkedVmError::NoFrame)?;
-            let Some(event) = vm.step_with_budget(remaining)? else {
+            vm.swap_objects(&mut self.objects);
+            let event = vm.step_with_budget(remaining);
+            vm.swap_objects(&mut self.objects);
+            let Some(event) = event? else {
                 return Ok(None);
             };
             match event {
                 VmEvent::BudgetExhausted => return Ok(Some(LinkedVmEvent::BudgetExhausted)),
-                VmEvent::Statement(value) => {
+                VmEvent::Statement(mut value) => {
+                    if let StatementValue::Value(item) = &mut value {
+                        *item = self.objects.export(item)?;
+                    }
                     return Ok(Some(LinkedVmEvent::Statement(value)));
                 }
                 VmEvent::Completed(value) => {
                     let value = bind_value_module(value, *module_id);
                     // Retain the completed root's globals for the embedding's commit.
                     if is_root {
-                        return Ok(Some(LinkedVmEvent::Completed(value)));
+                        return Ok(Some(LinkedVmEvent::Completed(self.objects.export(&value)?)));
                     }
                     self.frames.pop();
                     if let Some((_, caller)) = self.frames.last_mut() {
@@ -146,15 +175,23 @@ impl LinkedVm {
                         Some(LinkedFunction::Native(builtin)) => {
                             let receiver = call
                                 .receiver
-                                .map(|value| bind_value_module(value, *module_id));
+                                .map(|value| {
+                                    self.objects
+                                        .export(&value)
+                                        .map(|value| bind_value_module(value, *module_id))
+                                })
+                                .transpose()?;
                             let arguments = call
                                 .arguments
                                 .into_iter()
                                 .map(|mut argument| {
-                                    argument.value = bind_value_module(argument.value, *module_id);
-                                    argument
+                                    argument.value = bind_value_module(
+                                        self.objects.export(&argument.value)?,
+                                        *module_id,
+                                    );
+                                    Ok(argument)
                                 })
-                                .collect();
+                                .collect::<Result<_, VmError>>()?;
                             return Ok(Some(LinkedVmEvent::Call(BuiltinCall {
                                 builtin,
                                 receiver,
@@ -188,12 +225,11 @@ impl LinkedVm {
     }
 
     pub fn resume(&mut self, value: Value) -> Result<(), LinkedVmError> {
-        self.frames
-            .last_mut()
-            .ok_or(LinkedVmError::NoFrame)?
-            .1
-            .resume(value)?;
-        Ok(())
+        let vm = &mut self.frames.last_mut().ok_or(LinkedVmError::NoFrame)?.1;
+        vm.swap_objects(&mut self.objects);
+        let result = vm.resume(value);
+        vm.swap_objects(&mut self.objects);
+        result.map_err(Into::into)
     }
 
     /// Replaces the globals of the currently executing frame by symbol name.
@@ -216,12 +252,16 @@ impl LinkedVm {
                     .unwrap_or(Value::Uninitialized)
             })
             .collect();
-        vm.set_global_values(globals)?;
+        vm.swap_objects(&mut self.objects);
+        let result = vm.set_global_values(globals);
+        vm.swap_objects(&mut self.objects);
+        result?;
         Ok(())
     }
 
     pub fn snapshot(&self) -> LinkedVmSnapshot {
         LinkedVmSnapshot {
+            objects: self.objects.clone(),
             modules: self
                 .program
                 .modules
@@ -258,7 +298,11 @@ impl LinkedVm {
                 Ok((frame.module, Vm::restore(bytecode, frame.vm)?))
             })
             .collect::<Result<_, LinkedVmError>>()?;
-        Ok(Self { program, frames })
+        Ok(Self {
+            program,
+            frames,
+            objects: snapshot.objects,
+        })
     }
 }
 
@@ -287,7 +331,9 @@ fn bind_value_module(value: Value, module: ModuleId) -> Value {
             module: owner,
             region,
             captures,
+            objects,
         } => Value::Closure {
+            objects,
             module: owner.or(Some(module.0)),
             region,
             captures: captures
@@ -420,9 +466,7 @@ mod tests {
             .expect("bound function invokes");
         assert_eq!(
             child.step().expect("function executes"),
-            Some(LinkedVmEvent::Statement(StatementValue::TextTemplate(
-                "value".into()
-            )))
+            Some(LinkedVmEvent::Completed(Value::String("value".into())))
         );
     }
 }

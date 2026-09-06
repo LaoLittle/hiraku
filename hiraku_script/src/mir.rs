@@ -33,6 +33,7 @@ pub struct MirBasicBlock {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirInstruction {
+    Panic(VirtualRegister),
     Udf(String),
     Constant {
         dst: VirtualRegister,
@@ -149,11 +150,13 @@ impl MirInstruction {
             | Self::StoreGlobal { .. }
             | Self::Statement { .. }
             | Self::Udf(_) => None,
+            Self::Panic(_) => None,
         }
     }
 
     pub fn used_registers(&self) -> Vec<VirtualRegister> {
         match self {
+            Self::Panic(message) => vec![*message],
             Self::Udf(_)
             | Self::Constant { .. }
             | Self::MakeClosure { .. }
@@ -247,11 +250,22 @@ pub struct MirLoweringError {
 
 pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLoweringError>> {
     let mut errors = Vec::new();
-    let entry = MirBuilder::lower(hir.entry, false, Vec::new(), &mut errors);
+    let entry = MirBuilder::lower(hir.entry, false, false, Vec::new(), &mut errors);
     let functions = hir
         .functions
         .iter()
-        .map(|function| MirBuilder::lower(function.body, true, Vec::new(), &mut errors))
+        .map(|function| {
+            MirBuilder::lower(
+                function.body,
+                true,
+                !matches!(
+                    hir.types.get(function.result),
+                    Some(crate::ScriptType::Unit | crate::ScriptType::Never)
+                ),
+                Vec::new(),
+                &mut errors,
+            )
+        })
         .collect();
     if errors.is_empty() {
         Ok(MirProgram { entry, functions })
@@ -271,6 +285,7 @@ impl MirBuilder {
     fn lower(
         block: &HirBlock<'_>,
         function: bool,
+        return_value: bool,
         parameters: Vec<crate::HirLocalId>,
         errors: &mut Vec<MirLoweringError>,
     ) -> MirFunction {
@@ -283,7 +298,17 @@ impl MirBuilder {
             current: MirBlockId(0),
             next_register: 0,
         };
-        let result = builder.lower_block(block, errors);
+        let result = if return_value
+            && let Some((last, preceding)) = block.statements.split_last()
+            && let HirStmtKind::Expr(expression) = last.kind
+        {
+            for statement in preceding {
+                builder.lower_statement(statement, errors);
+            }
+            builder.lower_expression(expression, errors)
+        } else {
+            builder.lower_block(block, errors)
+        };
         if matches!(builder.current_block().terminator, MirTerminator::Unset) {
             builder.current_block_mut().terminator = if function {
                 MirTerminator::Return(result)
@@ -411,9 +436,33 @@ impl MirBuilder {
         errors: &mut Vec<MirLoweringError>,
     ) -> Option<VirtualRegister> {
         match expression.kind {
-            HirExprKind::Trap(reason) => {
-                self.push(MirInstruction::Udf(reason.to_owned()));
-                Some(self.constant(MirConstant::Unit))
+            HirExprKind::Intrinsic {
+                operation,
+                argument,
+            } => {
+                let value = self.lower_expression(argument, errors)?;
+                match operation {
+                    crate::intrinsics::Intrinsic::Panic => {
+                        self.push(MirInstruction::Panic(value));
+                        Some(self.constant(MirConstant::Unit))
+                    }
+                    crate::intrinsics::Intrinsic::FloatToInt
+                    | crate::intrinsics::Intrinsic::IntToFloat => {
+                        let dst = self.register();
+                        self.push(MirInstruction::Cast {
+                            dst,
+                            value,
+                            target: match operation {
+                                crate::intrinsics::Intrinsic::IntToFloat => {
+                                    crate::ScriptType::Float
+                                }
+                                _ => crate::ScriptType::Int,
+                            },
+                            mode: crate::CastMode::Forced,
+                        });
+                        Some(dst)
+                    }
+                }
             }
             HirExprKind::GuardNever(value) => {
                 let result = self.lower_expression(value, errors);
@@ -587,7 +636,7 @@ impl MirBuilder {
                 Some(dst)
             }
             HirExprKind::Block(block) => {
-                let region = Self::lower(block, true, Vec::new(), errors);
+                let region = Self::lower(block, true, false, Vec::new(), errors);
                 let region_id = self.regions.len() as u32;
                 self.regions.push(region);
                 let dst = self.register();
@@ -597,8 +646,12 @@ impl MirBuilder {
                 });
                 Some(dst)
             }
-            HirExprKind::Lambda { parameters, body } => {
-                let region = Self::lower(body, true, parameters.to_vec(), errors);
+            HirExprKind::Lambda {
+                parameters,
+                body,
+                return_value,
+            } => {
+                let region = Self::lower(body, true, return_value, parameters.to_vec(), errors);
                 let region_id = self.regions.len() as u32;
                 self.regions.push(region);
                 let dst = self.register();
