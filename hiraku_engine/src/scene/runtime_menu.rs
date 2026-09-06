@@ -11,13 +11,6 @@ pub struct RuntimeMenuButton {
     pub screen_root: Option<Entity>,
 }
 
-#[derive(Resource, Default)]
-pub struct RuntimeMenuState {
-    /// Pointer clicks claimed by UI actions during this update. Keeping the
-    /// pointer identity makes consumption survive deferred modal despawning.
-    pub consumed_pointer_clicks: HashMap<PointerId, usize>,
-}
-
 #[derive(SystemParam)]
 pub struct RuntimeMenuContext<'w, 's> {
     pub commands: Commands<'w, 's>,
@@ -32,7 +25,6 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub models: Res<'w, crate::ui::UiModels>,
     pub effects: MessageWriter<'w, super::screen_ui::UiEffectMessage>,
     pub ui_style: Res<'w, UiStyle>,
-    pub runtime_menu: ResMut<'w, RuntimeMenuState>,
     pub dialogue_history: ResMut<'w, DialogueHistoryState>,
     pub stage: ResMut<'w, StageState>,
     pub waits: ResMut<'w, PendingWaits>,
@@ -173,10 +165,6 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
         if image_button.is_some_and(|button| !button.enabled) {
             continue;
         }
-        *ctx.runtime_menu
-            .consumed_pointer_clicks
-            .entry(click.pointer_id)
-            .or_default() += 1;
         // The action may replace or cover this node before picking emits a
         // later interaction transition. Restore its release visual now.
         if let Some(image_button) = image_button {

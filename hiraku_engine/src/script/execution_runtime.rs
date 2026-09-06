@@ -94,9 +94,8 @@ struct ExecutionSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionRuntimeSnapshot {
     objects: hiraku_script::ObjectHeap,
-    /// Exact executing bytecode. Restore relinks this against the current
-    /// native registry instead of recompiling source and trusting offsets.
-    pub program: Bytecode,
+    /// The save contains state only. Code must be recompiled and match exactly.
+    pub program: hiraku_script::ProgramFingerprint,
     next_execution: u64,
     executions: BTreeMap<ExecutionId, ExecutionSnapshot>,
     shared_globals: Vec<Value>,
@@ -137,12 +136,14 @@ impl ExecutionRuntime {
     }
 
     pub fn restore(
-        _bytecode: Bytecode,
+        bytecode: Bytecode,
         snapshot: ExecutionRuntimeSnapshot,
     ) -> Result<Self, ExecutionRuntimeError> {
-        let bytecode = snapshot.program;
         let linked =
             link_bytecode(bytecode, &story_manifest()).map_err(ExecutionRuntimeError::Link)?;
+        if linked.fingerprint != snapshot.program {
+            return Err(VmError::ProgramFingerprintMismatch.into());
+        }
         let bytecode = linked.bytecode.clone();
         let executions = snapshot
             .executions
@@ -177,7 +178,7 @@ impl ExecutionRuntime {
     pub fn snapshot(&self) -> ExecutionRuntimeSnapshot {
         ExecutionRuntimeSnapshot {
             objects: self.objects.clone(),
-            program: self.linked.bytecode.as_ref().clone(),
+            program: self.linked.fingerprint.clone(),
             next_execution: self.next_execution,
             executions: self
                 .executions
@@ -487,7 +488,7 @@ impl ExecutionRuntime {
 
 #[derive(Debug, Error)]
 pub enum ExecutionRuntimeError {
-    #[error("HKS VM failed: {0:?}")]
+    #[error("HKS VM failed: {0}")]
     Vm(VmError),
     #[error("unknown story execution {0}")]
     UnknownExecution(ExecutionId),
@@ -576,6 +577,31 @@ mod tests {
     #[test]
     fn host_global_updates_preserve_child_aliases() {
         check_child_record_identity(true);
+    }
+
+    #[test]
+    fn restore_requires_identical_recompiled_code() {
+        let compile = |source| {
+            crate::script::compile_story_bytecode("entry.hks", source).expect("fixture compiles")
+        };
+        let original = compile("log(\"alice\")");
+        let runtime = ExecutionRuntime::new(original.clone()).expect("runtime starts");
+        let snapshot = runtime.snapshot();
+        let encoded = hiraku_script::hson::to_string(&snapshot).expect("snapshot serializes");
+        assert!(
+            !encoded.contains("instructions"),
+            "save must not contain executable code"
+        );
+        assert!(ExecutionRuntime::restore(original.clone(), snapshot.clone()).is_ok());
+        assert!(ExecutionRuntime::restore(compile("log(\"bob\")"), snapshot.clone()).is_err());
+        let mut changed_layout = original;
+        changed_layout
+            .instructions
+            .push(hiraku_script::vm::Instruction::Halt);
+        assert!(
+            ExecutionRuntime::restore(changed_layout, snapshot).is_err(),
+            "matching source hash alone is insufficient"
+        );
     }
 
     fn check_child_record_identity(update_from_host: bool) {

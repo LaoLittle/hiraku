@@ -2,8 +2,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BuiltinCall, BuiltinManifest, Bytecode, LinkedFunction, LinkedProgram, ModuleId,
-    StatementValue, Value, Vm, VmError, VmEvent, VmSnapshot, link_register_modules,
+    BuiltinCall, LinkedFunction, LinkedProgram, ModuleId, StatementValue, Value, Vm, VmError,
+    VmEvent, VmSnapshot,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,7 +23,7 @@ pub struct LinkedVmFrameSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedVmSnapshot {
     pub objects: crate::ObjectHeap,
-    pub modules: Vec<Bytecode>,
+    pub modules: Vec<crate::ProgramFingerprint>,
     pub frames: Vec<LinkedVmFrameSnapshot>,
 }
 
@@ -145,6 +145,14 @@ impl LinkedVm {
             vm.swap_objects(&mut self.objects);
             let event = vm.step_with_budget(remaining);
             vm.swap_objects(&mut self.objects);
+            if let Err(mut error) = event {
+                if let VmError::Panic { frames, .. } = &mut error {
+                    for (_, caller) in self.frames.iter().rev().skip(1) {
+                        frames.extend(caller.stack_trace());
+                    }
+                }
+                return Err(error.into());
+            }
             let Some(event) = event? else {
                 return Ok(None);
             };
@@ -266,7 +274,7 @@ impl LinkedVm {
                 .program
                 .modules
                 .iter()
-                .map(|module| module.bytecode.as_ref().clone())
+                .map(|module| module.fingerprint.clone())
                 .collect(),
             frames: self
                 .frames
@@ -281,10 +289,17 @@ impl LinkedVm {
 
     pub fn restore(
         snapshot: LinkedVmSnapshot,
-        natives: &BuiltinManifest,
+        program: LinkedProgram,
     ) -> Result<Self, LinkedVmError> {
-        let program =
-            link_register_modules(snapshot.modules, natives).map_err(LinkedVmError::Link)?;
+        if snapshot.modules
+            != program
+                .modules
+                .iter()
+                .map(|module| module.fingerprint.clone())
+                .collect::<Vec<_>>()
+        {
+            return Err(VmError::ProgramFingerprintMismatch.into());
+        }
         let frames = snapshot
             .frames
             .into_iter()
@@ -373,9 +388,23 @@ impl From<VmError> for LinkedVmError {
     }
 }
 
+impl std::fmt::Display for LinkedVmError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::Vm(error) = self
+            && let Some(rendered) = error.render_diagnostic(crate::RenderOptions::terminal())
+        {
+            return formatter.write_str(&rendered);
+        }
+        write!(formatter, "{self:?}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{BuiltinId, compile_with_manifest, parse_program};
+    use crate::{
+        BuiltinId, BuiltinManifest, Bytecode, compile_with_manifest, link_register_modules,
+        parse_program,
+    };
 
     use super::*;
 
@@ -394,7 +423,7 @@ mod tests {
         let consumer = compile("greet(\"alice\")", &natives);
         let program =
             link_register_modules(vec![provider, consumer], &natives).expect("modules link");
-        let mut vm = LinkedVm::new(program, ModuleId(1)).expect("entry starts");
+        let mut vm = LinkedVm::new(program.clone(), ModuleId(1)).expect("entry starts");
         let Some(LinkedVmEvent::Call(call)) = vm.step().expect("native call yields") else {
             panic!("expected native call")
         };
@@ -402,7 +431,7 @@ mod tests {
         assert_eq!(call.arguments[0].value, Value::String("alice".into()));
 
         let snapshot = vm.snapshot();
-        let mut restored = LinkedVm::restore(snapshot, &natives).expect("linked frames restore");
+        let mut restored = LinkedVm::restore(snapshot, program).expect("linked frames restore");
         restored
             .resume(Value::String("hello".into()))
             .expect("call resumes");

@@ -1925,13 +1925,75 @@ mod tests {
     }
 
     #[test]
+    fn dialogue_click_routing_does_not_need_widget_type_registration() {
+        for (surface, button, advances) in [
+            (true, PointerButton::Primary, true),
+            (true, PointerButton::Secondary, false),
+            (false, PointerButton::Primary, false),
+        ] {
+            let mut app = App::new();
+            app.init_resource::<DialogueState>()
+                .init_resource::<AnimationState>()
+                .init_resource::<ChoiceState>()
+                .init_resource::<ScreenUiState>()
+                .init_resource::<DialogueHistoryState>()
+                .add_message::<crate::input::HirakuActionInput>()
+                .add_message::<Pointer<Click>>()
+                .add_message::<ScriptResponseMessage>()
+                .add_systems(Update, advance_dialogue_on_input);
+            app.world_mut().resource_mut::<DialogueState>().waiting =
+                Some(PendingDialogueAdvance {
+                    animation_id: None,
+                    request: Some(ScriptRequestId(19)),
+                });
+            // This custom widget has no engine-specific component or callback.
+            let target = app
+                .world_mut()
+                .spawn((Node::default(), Pickable::default()))
+                .id();
+            if surface {
+                app.world_mut()
+                    .entity_mut(target)
+                    .insert(DialogueAdvanceSurface);
+            }
+            app.world_mut().write_message(Pointer::new(
+                PointerId::Custom(uuid::Uuid::from_u128(19)),
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
+                },
+                Click {
+                    button,
+                    hit: HitData {
+                        camera: target,
+                        depth: 0.0,
+                        position: None,
+                        normal: None,
+                        extra: None,
+                    },
+                    duration: Duration::ZERO,
+                    count: 1,
+                },
+                target,
+            ));
+            app.update();
+            assert_eq!(
+                app.world().resource::<DialogueState>().waiting.is_none(),
+                advances
+            );
+        }
+    }
+
+    #[test]
     fn closing_a_modal_consumes_the_same_frame_dialogue_action() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()
-            .init_resource::<RuntimeMenuState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
             .add_message::<Pointer<Click>>()
@@ -1980,7 +2042,6 @@ mod tests {
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()
-            .init_resource::<RuntimeMenuState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
             .add_message::<Pointer<Click>>()
@@ -2033,7 +2094,6 @@ mod tests {
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()
-            .init_resource::<RuntimeMenuState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
             .add_message::<Pointer<Click>>()
@@ -2107,13 +2167,12 @@ mod tests {
     }
 
     #[test]
-    fn claimed_pointer_click_survives_modal_despawn_before_dialogue_input() {
+    fn despawned_ui_targets_never_become_dialogue_clicks() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()
-            .init_resource::<RuntimeMenuState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
             .add_message::<Pointer<Click>>()
@@ -2124,10 +2183,6 @@ mod tests {
             request: Some(ScriptRequestId(12)),
         });
         let pointer = PointerId::Custom(uuid::Uuid::from_u128(2));
-        app.world_mut()
-            .resource_mut::<RuntimeMenuState>()
-            .consumed_pointer_clicks
-            .insert(pointer, 2);
         let former_button = app.world_mut().spawn_empty().id();
         for _ in 0..2 {
             app.world_mut().write_message(Pointer::new(
@@ -2155,15 +2210,10 @@ mod tests {
             ));
         }
 
+        app.world_mut().entity_mut(former_button).despawn();
         app.update();
 
         assert!(app.world().resource::<DialogueState>().waiting.is_some());
-        assert!(
-            app.world()
-                .resource::<RuntimeMenuState>()
-                .consumed_pointer_clicks
-                .is_empty()
-        );
     }
 
     #[test]

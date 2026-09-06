@@ -60,6 +60,8 @@ impl ScriptType {
             || self == actual
             || matches!((self, actual), (Self::Function, Self::Callable { .. }))
             || matches!((self, actual), (Self::Tuple, Self::TupleOf(_)))
+            || matches!((self, actual), (Self::TupleOf(expected), Self::TupleOf(actual))
+                if expected.len() == actual.len() && expected.iter().zip(actual).all(|(expected, actual)| expected.accepts(actual)))
             || matches!((self, actual), (Self::Callable { parameters: expected, result }, Self::Callable { parameters: actual, result: actual_result })
                 if expected.len() == actual.len() && expected.iter().zip(actual).all(|(expected, actual)| actual.accepts(expected)) && result.accepts(actual_result))
             || matches!(self, Self::Union(types) if types.iter().any(|expected| expected.accepts(actual)))

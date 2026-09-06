@@ -98,6 +98,7 @@ pub enum StoryControl {
     SpawnTask { kind: StoryTaskKind, closure: Value },
     BeginChoice { prompt: String, closure: Value },
     AddChoiceOption { label: String, closure: Value },
+    EnableChoiceOption { id: u64, enabled: bool },
     OpenUi { path: String, arguments: Vec<Value> },
     WaitTask { task: u64 },
 }
@@ -154,15 +155,21 @@ pub fn compile_story_bytecode_with_options(
         let rendered = render_diagnostics(&diagnostics, &sources, render_options);
         super::emit_script_diagnostic("HKS compiler warning:", &rendered);
     }
-    compile_with_manifest(&program, source_hash(path, source), &story_manifest()).map_err(
-        |errors| {
+    compile_with_manifest(&program, source_hash(path, source), &story_manifest())
+        .map(|mut bytecode| {
+            bytecode.debug.source = Some(hiraku_script::debug::DebugSource {
+                path: path.into(),
+                text: source.into(),
+            });
+            bytecode
+        })
+        .map_err(|errors| {
             let diagnostics = errors
                 .into_iter()
                 .map(|error| error.diagnostic(source_id.clone()))
                 .collect::<Vec<_>>();
             render_diagnostics(&diagnostics, &sources, render_options)
-        },
-    )
+        })
 }
 
 pub fn engine_globals(settings: &UserSettings) -> BTreeMap<String, Value> {
@@ -303,6 +310,11 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
     let option = registry
         .register_raw_fn("option", async_capability_placeholder)
         .expect("built-in `option` registration must be unique");
+    let option_type = registry
+        .manifest()
+        .symbols()
+        .find("ChoiceOption")
+        .expect("choice option type is registered");
     registry
         .set_signature(
             option,
@@ -310,7 +322,7 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
                 receiver: None,
                 parameters: vec![ScriptType::String, ScriptType::Function],
                 variadic: None,
-                result: ScriptType::Unit,
+                result: ScriptType::Named(option_type),
             },
         )
         .expect("option signature must target its registered builtin");
@@ -384,6 +396,7 @@ pub struct StoryNativeHost {
 }
 
 struct StoryControlBuiltins {
+    enable_option: BuiltinId,
     goto: BuiltinId,
     sequence: BuiltinId,
     parallel: BuiltinId,
@@ -396,6 +409,9 @@ struct StoryControlBuiltins {
 impl StoryControlBuiltins {
     fn new(manifest: &BuiltinManifest) -> Self {
         Self {
+            enable_option: manifest
+                .resolve("enable")
+                .expect("option enable is registered"),
             goto: manifest
                 .resolve_selector("story", "goto")
                 .expect("story.goto is registered"),
@@ -505,6 +521,32 @@ impl StoryNativeHost {
                 label,
                 closure,
             }));
+        }
+        if call.builtin == self.controls.enable_option {
+            let Some(Value::Handle {
+                type_id: CHOICE_OPTION_HANDLE_TYPE,
+                id,
+            }) = &call.receiver
+            else {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "enable requires a ChoiceOption receiver",
+                ));
+            };
+            let Some(hiraku_script::runtime::CallArgument {
+                value: Value::Bool(enabled),
+                ..
+            }) = call.arguments.first()
+            else {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "enable requires Bool",
+                ));
+            };
+            return Ok(StoryCallOutcome::Control(
+                StoryControl::EnableChoiceOption {
+                    id: *id,
+                    enabled: *enabled,
+                },
+            ));
         }
         if call.builtin == self.controls.open_ui {
             let path = call
@@ -859,6 +901,11 @@ impl CharacterContext {
 #[hks(name = "Actor", handle_type = ACTOR_HANDLE_TYPE)]
 struct ActorHandle(u64);
 
+pub(super) const CHOICE_OPTION_HANDLE_TYPE: u32 = 0x434f5054;
+#[derive(Clone, Copy, hiraku_script::HksHandle)]
+#[hks(name = "ChoiceOption", handle_type = CHOICE_OPTION_HANDLE_TYPE)]
+struct ChoiceOptionHandle(u64);
+
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "Bgm", handle_type = BGM_HANDLE_TYPE)]
 struct BgmHandle(u64);
@@ -983,6 +1030,17 @@ impl Position {
 #[hiraku_script::hks_module]
 mod native_api {
     use super::*;
+
+    #[hks(name = "enable", receiver)]
+    fn native_option_enable(
+        _context: &mut CharacterContext,
+        _option: ChoiceOptionHandle,
+        _enabled: bool,
+    ) -> Result<ChoiceOptionHandle, NativeError> {
+        Err(NativeError::message(
+            "option enable requires the story choice builder",
+        ))
+    }
 
     #[hks(name = "char")]
     fn native_char(

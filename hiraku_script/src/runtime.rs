@@ -8,6 +8,15 @@ use crate::{ScriptType, SymbolId, SymbolManifest};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuiltinId(pub u32);
 
+/// Type evidence preserved at a symbolic call site. A numeric literal can
+/// adopt Float when the provider signature first becomes available at link time;
+/// an already-bound Int cannot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgumentType {
+    pub ty: ScriptType,
+    pub numeric_literal: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionSignature {
     #[serde(default)]

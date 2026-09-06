@@ -84,39 +84,18 @@ pub fn advance_dialogue_on_input(
     mut responses: MessageWriter<ScriptResponseMessage>,
     choice_state: Res<ChoiceState>,
     screen_state: Res<ScreenUiState>,
-    mut runtime_menu: ResMut<RuntimeMenuState>,
-    ui_interactions: Query<
-        Option<&PickingInteraction>,
-        Or<(
-            With<ScreenUiButton>,
-            With<ScreenUiImageButton>,
-            With<ScreenUiToggle>,
-            With<RuntimeMenuButton>,
-            With<ChoiceButton>,
-            With<PauseMenuRoot>,
-        )>,
-    >,
-    parents: Query<&ChildOf>,
+    advance_surfaces: Query<(), With<DialogueAdvanceSurface>>,
 ) {
     let action_advance = actions
         .read()
         .any(|action| action.0 == crate::input::HirakuAction::NextDialogue);
     let mut pointer_advance = false;
     for click in clicks.read() {
-        if let Some(count) = runtime_menu
-            .consumed_pointer_clicks
-            .get_mut(&click.pointer_id)
-        {
-            *count -= 1;
-            if *count == 0 {
-                runtime_menu
-                    .consumed_pointer_clicks
-                    .remove(&click.pointer_id);
-            }
-            continue;
-        }
+        // Bevy UI picking decides which surface owns the click. Never infer
+        // dialogue intent from an unrecognized widget or a despawned target.
         pointer_advance |= click.pointer_id.is_custom()
-            && find_component_ancestor(click.entity, &ui_interactions, &parents).is_none()
+            && click.button == PointerButton::Primary
+            && advance_surfaces.contains(click.entity);
     }
 
     // Always drain both readers above so input produced while a modal is open
@@ -127,15 +106,6 @@ pub fn advance_dialogue_on_input(
     let advance = action_advance || pointer_advance;
 
     if !advance {
-        return;
-    }
-
-    if action_advance
-        && ui_interactions
-            .iter()
-            .flatten()
-            .any(|interaction| !matches!(*interaction, PickingInteraction::None))
-    {
         return;
     }
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 11;
+pub const CURRENT_SAVE_VERSION: u32 = 13;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {

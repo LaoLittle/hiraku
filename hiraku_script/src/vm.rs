@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 11;
+pub const BYTECODE_VERSION: u16 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -23,6 +23,7 @@ pub struct RegisterSlice {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Bytecode {
+    pub debug: crate::debug::DebugInfo,
     pub version: u16,
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
@@ -41,6 +42,8 @@ pub struct Bytecode {
 pub struct BytecodeFunction {
     pub name: SymbolId,
     pub exported: bool,
+    /// Receiver, parameter and return types refer to this module's symbol manifest.
+    pub signature: crate::FunctionSignature,
     pub parameters: Vec<u32>,
     pub register_count: u16,
     pub instructions: Vec<Instruction>,
@@ -48,6 +51,7 @@ pub struct BytecodeFunction {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BytecodeRegion {
+    pub signature: crate::FunctionSignature,
     pub parameters: Vec<u32>,
     pub register_count: u16,
     pub instructions: Vec<Instruction>,
@@ -55,7 +59,9 @@ pub struct BytecodeRegion {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
-    Panic(Register),
+    Panic {
+        message: Register,
+    },
     Udf(StringId),
     Constant {
         dst: Register,
@@ -136,6 +142,8 @@ pub enum Instruction {
     Call {
         dst: Register,
         function: SymbolId,
+        /// Caller-side types, including an explicit receiver when present.
+        argument_types: Vec<crate::runtime::ArgumentType>,
         receiver: Option<Register>,
         labels: Vec<Option<SymbolId>>,
         arguments: RegisterSlice,
@@ -212,8 +220,32 @@ pub fn compile_with_manifest(
     source_hash: u64,
     manifest: &BuiltinManifest,
 ) -> Result<Bytecode, Vec<CompileError>> {
+    compile_program(program, source_hash, manifest, None)
+}
+
+pub fn compile_with_project_interface(
+    program: &Program,
+    source_hash: u64,
+    manifest: &BuiltinManifest,
+    interface: &crate::project::ProjectInterface,
+) -> Result<Bytecode, Vec<CompileError>> {
+    compile_program(program, source_hash, manifest, Some(interface))
+}
+
+fn compile_program(
+    program: &Program,
+    source_hash: u64,
+    manifest: &BuiltinManifest,
+    interface: Option<&crate::project::ProjectInterface>,
+) -> Result<Bytecode, Vec<CompileError>> {
     let arena = HirArena::new();
-    let hir = lower_to_hir(&arena, program, Some(manifest)).map_err(|errors| {
+    let hir = match interface {
+        Some(interface) => {
+            crate::hir::lower_with_project_interface(&arena, program, manifest, interface)
+        }
+        None => lower_to_hir(&arena, program, Some(manifest)),
+    }
+    .map_err(|errors| {
         errors
             .into_iter()
             .map(|error| CompileError {
@@ -245,37 +277,41 @@ pub fn compile_with_manifest(
         .collect::<Vec<_>>();
     let mut regions = Vec::new();
     let mut strings = StringPoolBuilder::default();
-    let entry = compile_register_code(
+    let mut debug = crate::debug::DebugInfo::default();
+    let (entry, entry_debug) = compile_register_code(
         &mir.entry,
         manifest,
         &function_symbols,
         &mut symbols,
         &mut regions,
         &mut strings,
+        &mut debug.regions,
     )?;
+    debug.entry = entry_debug;
     let mut functions = Vec::with_capacity(mir.functions.len());
     for (mir_function, hir_function) in mir.functions.iter().zip(hir.functions) {
-        let code = compile_register_code(
+        let (code, mut code_debug) = compile_register_code(
             mir_function,
             manifest,
             &function_symbols,
             &mut symbols,
             &mut regions,
             &mut strings,
+            &mut debug.regions,
         )?;
+        code_debug.track_caller = hir_function.track_caller;
+        debug.functions.push(code_debug);
         functions.push(BytecodeFunction {
             name: hir_function.name,
             exported: hir_function.exported,
-            parameters: hir_function
-                .parameters
-                .iter()
-                .map(|local| local.0)
-                .collect(),
+            signature: code.signature,
+            parameters: code.parameters,
             register_count: code.register_count,
             instructions: code.instructions,
         });
     }
     Ok(Bytecode {
+        debug,
         version: BYTECODE_VERSION,
         source_hash,
         builtin_manifest_hash: manifest.hash(),
@@ -298,19 +334,22 @@ fn compile_register_code(
     symbols: &mut crate::SymbolInterner,
     regions: &mut Vec<BytecodeRegion>,
     strings: &mut StringPoolBuilder,
-) -> Result<BytecodeRegion, Vec<CompileError>> {
+    region_debug: &mut Vec<crate::debug::CodeDebugInfo>,
+) -> Result<(BytecodeRegion, crate::debug::CodeDebugInfo), Vec<CompileError>> {
     let mut region_ids = Vec::with_capacity(function.regions.len());
     for region in &function.regions {
-        let compiled = compile_register_code(
+        let (compiled, debug) = compile_register_code(
             region,
             manifest,
             function_symbols,
             symbols,
             regions,
             strings,
+            region_debug,
         )?;
         let id = regions.len() as u32;
         regions.push(compiled);
+        region_debug.push(debug);
         region_ids.push(id);
     }
     let allocation = allocate_registers(function).map_err(|error| {
@@ -319,7 +358,7 @@ fn compile_register_code(
             span: None,
         }]
     })?;
-    let (instructions, register_count) = emit_function(
+    let (instructions, register_count, debug) = emit_function(
         function,
         &allocation,
         manifest,
@@ -328,15 +367,19 @@ fn compile_register_code(
         symbols,
         strings,
     )?;
-    Ok(BytecodeRegion {
-        parameters: function
-            .parameters
-            .iter()
-            .map(|parameter| parameter.0)
-            .collect(),
-        register_count,
-        instructions,
-    })
+    Ok((
+        BytecodeRegion {
+            signature: function.signature.clone(),
+            parameters: function
+                .parameters
+                .iter()
+                .map(|parameter| parameter.0)
+                .collect(),
+            register_count,
+            instructions,
+        },
+        debug,
+    ))
 }
 
 fn emit_function(
@@ -347,7 +390,7 @@ fn emit_function(
     region_ids: &[u32],
     symbols: &mut crate::SymbolInterner,
     strings: &mut StringPoolBuilder,
-) -> Result<(Vec<Instruction>, u16), Vec<CompileError>> {
+) -> Result<(Vec<Instruction>, u16, crate::debug::CodeDebugInfo), Vec<CompileError>> {
     let register = |virtual_register| {
         allocation
             .register_for(virtual_register)
@@ -357,9 +400,12 @@ fn emit_function(
     let mut max_window = 0usize;
     for block in &function.blocks {
         let mut emitted = Vec::new();
+        let mut locations = BTreeMap::new();
         for instruction in &block.instructions {
             let scalar = match instruction {
-                MirInstruction::Panic(message) => Instruction::Panic(register(*message)),
+                MirInstruction::Panic { message, .. } => Instruction::Panic {
+                    message: register(*message),
+                },
                 MirInstruction::Udf(reason) => Instruction::Udf(strings.intern(reason.clone())),
                 MirInstruction::MakeClosure { dst, region } => Instruction::MakeClosure {
                     dst: register(*dst),
@@ -520,11 +566,13 @@ fn emit_function(
                     }
                 }
                 MirInstruction::Call {
+                    span: _,
                     dst,
                     function: ResolvedFunction::Builtin(builtin),
                     receiver,
                     dynamic_callee: None,
                     arguments,
+                    argument_types,
                 } => {
                     let name = manifest.callable_name(*builtin).ok_or_else(|| {
                         vec![CompileError {
@@ -543,16 +591,19 @@ fn emit_function(
                         dst: register(*dst),
                         function,
                         receiver: receiver.map(register),
+                        argument_types: argument_types.clone(),
                         labels: arguments.iter().map(|(label, _)| *label).collect(),
                         arguments: slice,
                     }
                 }
                 MirInstruction::Call {
+                    span: _,
                     dst,
                     function: ResolvedFunction::External(function),
                     receiver,
                     dynamic_callee: None,
                     arguments,
+                    argument_types,
                 } => {
                     let slice = emit_register_window(
                         &mut emitted,
@@ -564,16 +615,19 @@ fn emit_function(
                         dst: register(*dst),
                         function: *function,
                         receiver: receiver.map(register),
+                        argument_types: argument_types.clone(),
                         labels: arguments.iter().map(|(label, _)| *label).collect(),
                         arguments: slice,
                     }
                 }
                 MirInstruction::Call {
+                    span: _,
                     dst,
                     function: ResolvedFunction::User(function),
                     receiver: None,
                     dynamic_callee: None,
                     arguments,
+                    argument_types,
                 } => {
                     let function = *function_symbols.get(function.0 as usize).ok_or_else(|| {
                         vec![CompileError {
@@ -591,16 +645,19 @@ fn emit_function(
                         dst: register(*dst),
                         function,
                         receiver: None,
+                        argument_types: argument_types.clone(),
                         labels: arguments.iter().map(|(label, _)| *label).collect(),
                         arguments: slice,
                     }
                 }
                 MirInstruction::Call {
+                    span: _,
                     dst,
                     function: ResolvedFunction::Dynamic,
                     receiver: None,
                     dynamic_callee: Some(callee),
                     arguments,
+                    ..
                 } => {
                     let slice = emit_register_window(
                         &mut emitted,
@@ -645,18 +702,29 @@ fn emit_function(
                     emit_value: *emit_value,
                 },
             };
+            if let MirInstruction::Panic { span, .. } | MirInstruction::Call { span, .. } =
+                instruction
+            {
+                locations.insert(emitted.len(), *span);
+            }
             emitted.push(scalar);
         }
-        blocks.push((emitted, block.terminator.clone()));
+        blocks.push((emitted, block.terminator.clone(), locations));
     }
     let mut starts = Vec::with_capacity(blocks.len());
     let mut offset = 0usize;
-    for (instructions, _) in &blocks {
+    for (instructions, _, _) in &blocks {
         starts.push(offset);
         offset += instructions.len() + 1;
     }
     let mut output = Vec::with_capacity(offset);
-    for (mut instructions, terminator) in blocks {
+    let mut debug = crate::debug::CodeDebugInfo::default();
+    for (mut instructions, terminator, locations) in blocks {
+        debug.locations.extend(
+            locations
+                .into_iter()
+                .map(|(pc, span)| (output.len() + pc, span)),
+        );
         output.append(&mut instructions);
         output.push(match terminator {
             MirTerminator::Jump(target) => Instruction::Jump(starts[target.0 as usize]),
@@ -688,7 +756,7 @@ fn emit_function(
                 span: None,
             }]
         })?;
-    Ok((output, register_count))
+    Ok((output, register_count, debug))
 }
 
 fn emit_register_window(
@@ -951,6 +1019,11 @@ impl Vm {
             if *remaining == 0 {
                 return Ok(Some(VmEvent::BudgetExhausted));
             }
+            // Validate after the embedding has installed the execution heap.
+            // This also covers linked calls and restored function-entry frames.
+            if self.pc == 0 {
+                self.validate_function_arguments()?;
+            }
             *remaining -= 1;
             let instruction = self
                 .current_instructions()
@@ -959,13 +1032,21 @@ impl Vm {
                 .ok_or(VmError::InvalidProgramCounter(self.pc))?;
             self.pc += 1;
             match instruction {
-                Instruction::Panic(message) => {
+                Instruction::Panic { message } => {
                     let Value::String(message) = self.read(message)? else {
                         return Err(VmError::UndefinedInstruction(
                             "panic expects a String".into(),
                         ));
                     };
-                    return Err(VmError::Panic(message.clone()));
+                    let frames = self.stack_trace();
+                    return Err(VmError::Panic {
+                        message: message.clone(),
+                        span: frames
+                            .first()
+                            .and_then(|frame| frame.span)
+                            .unwrap_or(Span { start: 0, end: 0 }),
+                        frames,
+                    });
                 }
                 Instruction::Udf(reason) => {
                     return Err(VmError::UndefinedInstruction(
@@ -1124,6 +1205,7 @@ impl Vm {
                     receiver,
                     labels,
                     arguments,
+                    ..
                 } => {
                     let receiver = receiver
                         .map(|receiver| self.read(receiver).cloned())
@@ -1545,13 +1627,83 @@ impl Vm {
     }
 
     fn current_instructions(&self) -> &[Instruction] {
-        match self.location {
+        self.instructions_at(self.location)
+    }
+
+    fn instructions_at(&self, location: CodeLocation) -> &[Instruction] {
+        match location {
             CodeLocation::Entry => &self.bytecode.instructions,
             CodeLocation::Function(function) => {
                 &self.bytecode.functions[function as usize].instructions
             }
             CodeLocation::Region(region) => &self.bytecode.regions[region as usize].instructions,
         }
+    }
+
+    pub(crate) fn stack_trace(&self) -> Vec<crate::debug::StackTraceFrame> {
+        let source = self.bytecode.debug.source.clone().map(Arc::new);
+        std::iter::once((self.location, self.pc))
+            .chain(
+                self.call_stack
+                    .iter()
+                    .rev()
+                    .map(|frame| (frame.location, frame.pc)),
+            )
+            .filter_map(|(location, return_pc)| {
+                let function = match location {
+                    CodeLocation::Entry => "entry".to_string(),
+                    CodeLocation::Region(index) => format!("closure#{index}"),
+                    CodeLocation::Function(index) => {
+                        let function = &self.bytecode.functions[index as usize];
+                        if self
+                            .bytecode
+                            .debug
+                            .functions
+                            .get(index as usize)
+                            .is_some_and(|info| info.track_caller)
+                        {
+                            return None;
+                        }
+                        self.bytecode
+                            .symbols
+                            .resolve(function.name)
+                            .unwrap_or("<unknown>")
+                            .replace("::", ".")
+                    }
+                };
+                let pc = return_pc.saturating_sub(1);
+                Some(crate::debug::StackTraceFrame {
+                    function,
+                    pc,
+                    span: self.bytecode.debug.span(location, pc),
+                    source: source.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn validate_function_arguments(&self) -> Result<(), VmError> {
+        let (parameters, signature) = match self.location {
+            CodeLocation::Entry => return Ok(()),
+            CodeLocation::Function(index) => {
+                let function = &self.bytecode.functions[index as usize];
+                (&function.parameters, &function.signature)
+            }
+            CodeLocation::Region(index) => {
+                let region = &self.bytecode.regions[index as usize];
+                (&region.parameters, &region.signature)
+            }
+        };
+        let types = signature.receiver.iter().chain(&signature.parameters);
+        for (index, (local, ty)) in parameters.iter().zip(types).enumerate() {
+            if !argument_matches(self.local(*local)?, ty, &self.objects)? {
+                return Err(VmError::ArgumentTypeMismatch {
+                    argument: index + 1,
+                    expected: format!("{ty:?}"),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn call_script(
@@ -1774,6 +1926,94 @@ fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmE
     }
 }
 
+/// Non-coercing validation of the runtime representation at a script boundary.
+/// Nominal host IDs and erased callable signatures require linker/host metadata;
+/// those checks are intentionally not guessed from module-local symbol IDs.
+fn argument_matches(
+    value: &Value,
+    ty: &crate::ScriptType,
+    heap: &crate::ObjectHeap,
+) -> Result<bool, VmError> {
+    use crate::ScriptType as T;
+    if matches!(ty, T::Any | T::TypeParameter(_)) {
+        return Ok(!matches!(value, Value::Uninitialized));
+    }
+    if let Value::Object(id) = value {
+        return argument_matches(heap.get(*id)?, ty, heap);
+    }
+    Ok(match (ty, value) {
+        (T::Unit, Value::Unit)
+        | (T::Bool, Value::Bool(_))
+        | (T::Float, Value::Number(_))
+        | (T::Percent, Value::Percent(_))
+        | (T::String, Value::String(_))
+        | (T::TextTemplate, Value::TextTemplate(_))
+        | (T::Symbol, Value::Symbol(_))
+        | (T::Selector, Value::Selector(_))
+        | (T::Task, Value::Task(_))
+        | (T::Tuple, Value::Tuple(_)) => true,
+        (T::Int, Value::Number(n)) => {
+            n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
+        }
+        (T::Optional(_), Value::Optional(None) | Value::Null) => true,
+        (T::Optional(inner), Value::Optional(Some(value))) => argument_matches(value, inner, heap)?,
+        (T::Optional(inner), value) => argument_matches(value, inner, heap)?,
+        (T::TupleOf(types), Value::Tuple(values)) => {
+            if types.len() != values.len() {
+                return Ok(false);
+            }
+            for (ty, value) in types.iter().zip(values) {
+                if !argument_matches(value, ty, heap)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        (T::List(element), Value::List(values)) => {
+            for value in values {
+                if !argument_matches(value, element, heap)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        (T::Record(fields), Value::Map(values)) => {
+            for (name, ty) in fields {
+                let Some(value) = values.get(name) else {
+                    return Ok(false);
+                };
+                if !argument_matches(value, ty, heap)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        (T::Map(key, element), Value::Map(values)) if **key == T::String => {
+            for value in values.values() {
+                if !argument_matches(value, element, heap)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        (T::Union(types), value) => {
+            for ty in types {
+                if argument_matches(value, ty, heap)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        (T::Function | T::Callable { .. }, Value::Function { .. } | Value::Closure { .. })
+        | (T::Binding(_), Value::Closure { .. })
+        | (T::Named(_), Value::Handle { .. } | Value::Typed { .. }) => true,
+        (T::Struct { fields, .. }, Value::Typed { value, .. }) => {
+            argument_matches(value, &T::Record(fields.clone()), heap)?
+        }
+        _ => false,
+    })
+}
+
 fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmError> {
     use crate::ScriptType;
 
@@ -1888,9 +2128,14 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmError {
+    ProgramFingerprintMismatch,
     InvalidObject(crate::ObjectId),
     CyclicHostValue,
-    Panic(String),
+    Panic {
+        message: String,
+        span: Span,
+        frames: Vec<crate::debug::StackTraceFrame>,
+    },
     UndefinedInstruction(String),
     UnsupportedBytecode(u16),
     InvalidProgramCounter(usize),
@@ -1913,8 +2158,67 @@ pub enum VmError {
     FrameShapeMismatch,
     UnknownFunction(u32),
     UnknownRegion(u32),
-    FunctionArity { expected: usize, actual: usize },
+    FunctionArity {
+        expected: usize,
+        actual: usize,
+    },
+    ArgumentTypeMismatch {
+        argument: usize,
+        expected: String,
+    },
     ReturnOutsideFunction,
+}
+
+impl VmError {
+    pub fn render_diagnostic(&self, options: crate::RenderOptions) -> Option<String> {
+        let Self::Panic {
+            message, frames, ..
+        } = self
+        else {
+            return None;
+        };
+        let mut output = format!("script panicked: {message}\n");
+        for (index, frame) in frames.iter().enumerate() {
+            if index < 3
+                && let (Some(source), Some(span)) = (&frame.source, frame.span)
+            {
+                let mut sources = crate::SourceMap::new();
+                let id = sources.insert(&source.path, &source.text);
+                let diagnostic = crate::Diagnostic::error(format!("at {}", frame.function))
+                    .with_code("HKS-PANIC")
+                    .with_label(crate::DiagnosticLabel::primary(id, span.range()));
+                output.push_str(&crate::render_diagnostics(&[diagnostic], &sources, options));
+            } else {
+                output.push_str(&format!("  at {}\n", frame.location()));
+            }
+        }
+        Some(output)
+    }
+
+    pub fn diagnostic(&self, source: crate::SourceId) -> crate::Diagnostic {
+        match self {
+            Self::Panic { message, span, .. } => crate::Diagnostic::error(message)
+                .with_code("HKS-PANIC")
+                .with_label(crate::DiagnosticLabel::primary(source, span.range())),
+            error => crate::Diagnostic::error(format!("{error:?}")).with_code("HKS-RUNTIME"),
+        }
+    }
+}
+
+impl std::fmt::Display for VmError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(rendered) = self.render_diagnostic(crate::RenderOptions::terminal()) {
+            return formatter.write_str(&rendered);
+        }
+        match self {
+            Self::Panic { message, span, .. } => write!(
+                formatter,
+                "script panicked at bytes {}..{}: {message}",
+                span.start, span.end
+            ),
+            error => write!(formatter, "{error:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1926,6 +2230,156 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn function_entry_rejects_wrong_host_values_without_coercion() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = Arc::new(compile(
+            "fn identity(value: Int) -> Int { value }",
+            &manifest,
+        ));
+        for value in [Value::String("alice".into()), Value::Number(1.5)] {
+            let mut vm =
+                Vm::from_function(bytecode.clone(), 0, vec![value]).expect("arity is valid");
+            let before = vm.snapshot();
+            assert_eq!(
+                vm.step(),
+                Err(VmError::ArgumentTypeMismatch {
+                    argument: 1,
+                    expected: "Int".into(),
+                })
+            );
+            assert_eq!(
+                vm.snapshot(),
+                before,
+                "invalid arguments must not execute the body"
+            );
+        }
+        let mut vm =
+            Vm::from_function(bytecode, 0, vec![Value::Number(2.0)]).expect("arity is valid");
+        assert!(vm.step().is_ok());
+    }
+
+    #[test]
+    fn function_entry_checks_nested_values_after_snapshot_restore() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = Arc::new(compile(
+            "fn inspect(value: List<(Int, String?)>) { }",
+            &manifest,
+        ));
+        for (value, valid) in [
+            (Value::Optional(None), true),
+            (
+                Value::Optional(Some(Box::new(Value::String("bob".into())))),
+                true,
+            ),
+            (Value::Optional(Some(Box::new(Value::Bool(false)))), false),
+        ] {
+            let vm = Vm::from_function(
+                bytecode.clone(),
+                0,
+                vec![Value::List(vec![Value::Tuple(vec![
+                    Value::Number(1.0),
+                    value,
+                ])])],
+            )
+            .expect("arity is valid");
+            let mut restored =
+                Vm::restore(bytecode.clone(), vm.snapshot()).expect("entry restores");
+            assert_eq!(restored.step().is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn any_function_call_requires_an_explicit_cast() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let syntax = parse_program(
+            r#"
+            fn identity(value: Int) -> Int { value }
+            let dynamic: Any = identity
+            dynamic("alice")
+        "#,
+        )
+        .expect("source parses");
+        let errors =
+            compile_with_manifest(&syntax, 91, &manifest).expect_err("Any is not callable");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("cannot call Any"))
+        );
+    }
+
+    #[test]
+    fn proven_any_cast_preserves_the_value() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = compile(
+            "let a: Int = 1\nlet b: Any = a\nlet c: Int = b as Int",
+            &manifest,
+        );
+        let result = bytecode
+            .locals
+            .iter()
+            .position(|symbol| bytecode.symbols.resolve(*symbol) == Some("c"))
+            .expect("result local exists");
+        let mut vm = Vm::new(bytecode).expect("program initializes");
+        while vm.step().expect("proven cast executes").is_some() {}
+        assert_eq!(vm.locals[result], Value::Number(1.0));
+    }
+
+    #[test]
+    fn explicitly_cast_lambda_retains_its_signature() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for declaration in [
+            "let callback = { value: Int -> value }",
+            "let callback: (Int) -> Int = { value -> value }",
+        ] {
+            let bytecode = compile(
+                &format!(
+                    "{declaration}\nlet erased: Any = callback\nlet typed = erased as (Int) -> Int\ntyped(1)"
+                ),
+                &manifest,
+            );
+            assert_eq!(
+                bytecode.regions[0].signature.parameters,
+                vec![crate::ScriptType::Int]
+            );
+            assert_eq!(bytecode.regions[0].signature.result, crate::ScriptType::Int);
+            let mut vm = Vm::new(bytecode).expect("program initializes");
+            while vm
+                .step()
+                .expect("explicitly cast lambda executes")
+                .is_some()
+            {}
+        }
+    }
+
+    #[test]
+    fn restored_closure_entry_validates_host_arguments() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = Arc::new(compile(
+            "let callback = { value: String -> value }",
+            &manifest,
+        ));
+        let mut vm = Vm::new(bytecode.clone()).expect("program initializes");
+        while vm.step().expect("closure initializes").is_some() {}
+        let closure = vm
+            .locals
+            .iter()
+            .find(|value| matches!(value, Value::Closure { .. }))
+            .expect("closure is stored")
+            .clone();
+        for (value, valid) in [
+            (Value::String("bob".into()), true),
+            (Value::Bool(false), false),
+        ] {
+            let vm =
+                Vm::from_callable(bytecode.clone(), &closure, vec![value]).expect("arity matches");
+            let mut restored =
+                Vm::restore(bytecode.clone(), vm.snapshot()).expect("closure entry restores");
+            assert_eq!(restored.step().is_ok(), valid);
+        }
     }
 
     #[test]
@@ -2491,6 +2945,32 @@ mod tests {
     }
 
     #[test]
+    fn tuple_literals_use_element_type_context_without_converting_int_bindings() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let source = "global let pair: (Float, String) = (1, \"alice\")";
+        let mut vm = Vm::new(compile(source, &manifest)).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("tuple executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(
+            vm.global("pair"),
+            Some(&Value::Tuple(vec![
+                Value::Number(1.0),
+                Value::String("alice".into())
+            ]))
+        );
+        for source in [
+            "let integer: Int = 1\nlet pair: (Float, String) = (integer, \"alice\")",
+            "let pair: (Int, String) = (1, 2)",
+            "let pair: (Int, String) = (1, \"alice\", 3)",
+        ] {
+            let program = crate::parse_program(source).expect("source parses");
+            assert!(compile_with_manifest(&program, 0, &manifest).is_err());
+        }
+    }
+
+    #[test]
     fn constants_and_computed_properties_use_shared_receivers() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
@@ -2670,11 +3150,80 @@ mod tests {
         loop {
             match vm.step() {
                 Ok(Some(VmEvent::Statement(_))) => {}
-                Err(VmError::Panic(message)) => {
+                Err(VmError::Panic { message, .. }) => {
                     assert_eq!(message, "failure");
                     break;
                 }
                 result => panic!("unexpected result: {result:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn panic_locations_track_user_calls_not_core_library_offsets() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for (source, call) in [
+            (
+                "let name = \"élise\"\npanic(\"failure\")",
+                "panic(\"failure\")",
+            ),
+            ("fn stop() -> Never { todo() }\nstop()", "todo()"),
+            ("unreachable()", "unreachable()"),
+            (
+                "__builtin_panic(\"failure\")",
+                "__builtin_panic(\"failure\")",
+            ),
+        ] {
+            let mut vm = Vm::new(compile(source, &manifest)).expect("VM initializes");
+            loop {
+                match vm.step() {
+                    Ok(Some(VmEvent::Statement(_))) => continue,
+                    Err(error @ VmError::Panic { span, .. }) => {
+                        assert_eq!(&source[span.range()], call);
+                        let mut sources = crate::SourceMap::new();
+                        let id = sources.insert("entry.hks", source);
+                        let rendered = crate::render_diagnostics(
+                            &[error.diagnostic(id)],
+                            &sources,
+                            crate::RenderOptions::plain(),
+                        );
+                        assert!(rendered.contains("HKS-PANIC"));
+                        assert!(rendered.contains("entry.hks"));
+                        assert!(rendered.contains(call));
+                        break;
+                    }
+                    result => panic!("expected located panic, got {result:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn panic_location_survives_a_saved_call_frame() {
+        let source = "fn stop() -> Never { checkpoint(); panic(\"failure\") }\nstop()";
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let mut bytecode = compile(source, &manifest);
+        bytecode.debug.source = Some(crate::debug::DebugSource {
+            path: "entry.hks".into(),
+            text: source.into(),
+        });
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        assert!(matches!(vm.step(), Ok(Some(VmEvent::Call(_)))));
+        let mut restored = Vm::restore(bytecode, vm.snapshot()).expect("call frame restores");
+        restored.resume(Value::Unit).expect("checkpoint resumes");
+        loop {
+            match restored.step() {
+                Ok(Some(VmEvent::Statement(_))) => continue,
+                Err(error @ VmError::Panic { span, .. }) => {
+                    assert_eq!(&source[span.range()], "panic(\"failure\")");
+                    let report = error
+                        .render_diagnostic(crate::RenderOptions::plain())
+                        .expect("source is available");
+                    assert!(report.contains("entry.hks:1:"));
+                    assert!(report.contains("failure"));
+                    break;
+                }
+                result => panic!("expected a located panic, got {result:?}"),
             }
         }
     }
@@ -2688,7 +3237,7 @@ mod tests {
             "fn stop() -> Never { todo() }\nstop()",
         ] {
             let mut vm = Vm::new(compile(source, &manifest)).expect("VM initializes");
-            assert!(matches!(vm.step(), Err(VmError::Panic(_))), "{source}");
+            assert!(matches!(vm.step(), Err(VmError::Panic { .. })), "{source}");
         }
 
         let mut registry = crate::native::NativeRegistry::<()>::new();

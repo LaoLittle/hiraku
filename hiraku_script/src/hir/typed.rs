@@ -224,6 +224,7 @@ pub struct HirGlobal {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HirFunction<'hir> {
+    pub track_caller: bool,
     pub name: SymbolId,
     pub exported: bool,
     pub parameters: &'hir [HirLocalId],
@@ -249,6 +250,73 @@ pub fn lower_to_hir<'hir>(
     Lowerer::new(arena, &program, manifest).lower(&program)
 }
 
+pub(crate) fn collect_project_exports(
+    program: &Program,
+    namespace: Option<&str>,
+    manifest: &BuiltinManifest,
+    interface: &mut crate::project::ProjectInterface,
+) -> Result<(), Vec<LoweringError>> {
+    let program = super::prepare::prepare(program)?;
+    let arena = HirArena::new();
+    let mut lowerer = Lowerer::new(&arena, &program, Some(manifest));
+    lowerer.symbols = SymbolInterner::from_manifest(super::normalize_program_symbols(
+        &program,
+        Some(&interface.symbols),
+    ))
+    .expect("project symbols are unique");
+    lowerer.declare_types(&program);
+    lowerer.declare_functions(&program);
+    for function in &lowerer.functions {
+        if !function.exported {
+            continue;
+        }
+        let name = lowerer
+            .symbols
+            .resolve(function.name)
+            .expect("function is interned");
+        let name = namespace.map_or_else(
+            || name.to_string(),
+            |namespace| format!("{namespace}.{name}"),
+        );
+        let symbol = lowerer.symbols.intern(&name);
+        let signature = crate::FunctionSignature {
+            receiver: None,
+            parameters: function.parameters.clone(),
+            variadic: None,
+            result: function.result.clone(),
+        };
+        if interface.functions.insert(symbol, signature).is_some() {
+            lowerer.errors.push(LoweringError {
+                message: format!("duplicate exported function `{name}`"),
+                span: function.span,
+            });
+        }
+    }
+    interface.symbols = lowerer.symbols.manifest();
+    if lowerer.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(lowerer.errors)
+    }
+}
+
+pub(crate) fn lower_with_project_interface<'hir>(
+    arena: &'hir HirArena,
+    program: &Program,
+    manifest: &BuiltinManifest,
+    interface: &crate::project::ProjectInterface,
+) -> Result<HirProgram<'hir>, Vec<LoweringError>> {
+    let program = super::prepare::prepare(program)?;
+    let mut lowerer = Lowerer::new(arena, &program, Some(manifest));
+    lowerer.symbols = SymbolInterner::from_manifest(super::normalize_program_symbols(
+        &program,
+        Some(&interface.symbols),
+    ))
+    .expect("project symbols are unique");
+    lowerer.external_functions = interface.functions.clone();
+    lowerer.lower(&program)
+}
+
 struct FunctionDeclaration {
     name: SymbolId,
     exported: bool,
@@ -272,6 +340,7 @@ struct Lowerer<'hir, 'manifest> {
     locals: Vec<HirLocal>,
     globals: Vec<HirGlobal>,
     functions: Vec<FunctionDeclaration>,
+    external_functions: BTreeMap<SymbolId, crate::FunctionSignature>,
     lowered_functions: Vec<HirFunction<'hir>>,
     scopes: Vec<BTreeMap<SymbolId, HirLocalId>>,
     global_names: BTreeMap<SymbolId, HirGlobalId>,
@@ -288,6 +357,9 @@ struct Lowerer<'hir, 'manifest> {
     errors: Vec<LoweringError>,
     numeric_hints: BTreeSet<usize>,
     inferred_numeric: BTreeSet<HirLocalId>,
+    /// Evidence for explicit casts only; this never changes an Any binding's
+    /// public type or permits implicit calls/member access.
+    immutable_any_types: BTreeMap<HirLocalId, ScriptType>,
     numeric_dependencies: BTreeMap<usize, BTreeSet<usize>>,
     float_requirements: BTreeSet<usize>,
     numeric_resolved: bool,
@@ -346,6 +418,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             locals: Vec::new(),
             globals: Vec::new(),
             functions: Vec::new(),
+            external_functions: BTreeMap::new(),
             lowered_functions: Vec::new(),
             scopes: vec![BTreeMap::new()],
             global_names: BTreeMap::new(),
@@ -362,6 +435,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             errors: import_errors,
             numeric_hints: BTreeSet::new(),
             inferred_numeric: BTreeSet::new(),
+            immutable_any_types: BTreeMap::new(),
             numeric_dependencies: BTreeMap::new(),
             float_requirements: BTreeSet::new(),
             numeric_resolved: false,
@@ -588,6 +662,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     fn lower_functions(&mut self, program: &Program) {
         for statement in &program.statements {
             let Stmt::Function {
+                attributes,
                 name,
                 type_parameters,
                 parameters,
@@ -678,6 +753,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             let parameters = self.arena.alloc_slice_copy(&lowered_parameters);
             let result = self.types.intern(declaration.result.clone());
             self.lowered_functions.push(HirFunction {
+                track_caller: attributes
+                    .iter()
+                    .any(|attribute| attribute.name == "trackCaller"),
                 name: declaration.name,
                 exported: declaration.exported,
                 parameters,
@@ -802,7 +880,13 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 }
                 let ty = annotation.unwrap_or_else(|| inferred.clone());
                 self.check_assignment(&ty, &inferred, value.span);
+                let evidence = (!*mutable && ty == ScriptType::Any)
+                    .then(|| self.cast_source_type(value))
+                    .filter(stable_cast_evidence);
                 let local = self.declare_local(name, ty, *mutable, *span);
+                if let Some(evidence) = evidence {
+                    self.immutable_any_types.insert(local, evidence);
+                }
                 if type_annotation.is_none()
                     && matches!(inferred, ScriptType::Int | ScriptType::Float)
                 {
@@ -1140,7 +1224,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             ExprKind::Cast { value, ty, mode } => {
                 let value = self.lower_expression(value);
-                let source = self.expression_type(value).clone();
+                let source = self.cast_source_type(value);
                 let Some(target) = self.type_from_ast(ty) else {
                     self.error("cast refers to an unknown type", ty.span);
                     return self.alloc_expression(
@@ -1153,6 +1237,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         expression.span,
                     );
                 };
+                if *mode == CastMode::Static
+                    && matches!(target, ScriptType::Callable { .. })
+                    && matches!(cast_certainty(&source, &target), CastCertainty::Always)
+                {
+                    // A proven function cast changes only the static view;
+                    // it does not wrap or replace the closure object.
+                    return self.alloc_expression(value.kind, target, expression.span);
+                }
                 match cast_certainty(&source, &target) {
                     CastCertainty::Impossible if *mode == CastMode::Static => self.error(
                         format!("cannot cast {source:?} to {target:?}"),
@@ -1574,6 +1666,40 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if let Some(ScriptType::TupleOf(types)) = expected
+            && let ExprKind::Tuple(values) = &expression.kind
+        {
+            if types.len() != values.len() {
+                self.error(
+                    format!(
+                        "tuple expects {} elements, got {}",
+                        types.len(),
+                        values.len()
+                    ),
+                    expression.span,
+                );
+            }
+            let values = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let value = self.lower_expression_expected(value, types.get(index));
+                    if let Some(expected) = types.get(index) {
+                        self.check_assignment(
+                            expected,
+                            &self.expression_type(value).clone(),
+                            value.span,
+                        );
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            return self.alloc_expression(
+                HirExprKind::Tuple(self.arena.alloc_slice_copy(&values)),
+                ScriptType::TupleOf(types.clone()),
+                expression.span,
+            );
+        }
         if let Some(ScriptType::Callable {
             parameters: expected_parameters,
             result,
@@ -1968,8 +2094,18 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         explicit_types: &[ScriptType],
         span: Span,
     ) {
-        if function == ResolvedFunction::Dynamic
-            && let ScriptType::Callable { parameters, .. } = self.expression_type(callee).clone()
+        if function == ResolvedFunction::Dynamic && self.expression_type(callee) == &ScriptType::Any
+        {
+            self.error(
+                "cannot call Any; explicitly cast to a function type such as `(Int) -> Int` using `as`, `as?`, or `as!` before calling",
+                callee.span,
+            );
+            return;
+        }
+        if matches!(
+            function,
+            ResolvedFunction::Dynamic | ResolvedFunction::External(_)
+        ) && let ScriptType::Callable { parameters, .. } = self.expression_type(callee).clone()
         {
             if parameters.len() != arguments.len() {
                 self.error(
@@ -2240,7 +2376,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
         let imported = self.imported_name(name);
         let symbol = self.symbol(&imported);
-        self.alloc_expression(HirExprKind::Unresolved(symbol), ScriptType::Any, span)
+        let ty = self
+            .external_functions
+            .get(&symbol)
+            .map_or(ScriptType::Any, |signature| ScriptType::Callable {
+                parameters: signature.parameters.clone(),
+                result: Box::new(signature.result.clone()),
+            });
+        self.alloc_expression(HirExprKind::Unresolved(symbol), ty, span)
     }
 
     fn lower_place(&mut self, expression: &Expr) -> Option<&'hir HirPlace<'hir>> {
@@ -2341,6 +2484,25 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
     }
 
+    fn cast_source_type(&self, value: &HirExpr<'_>) -> ScriptType {
+        if self.expression_type(value) == &ScriptType::Any {
+            if let HirExprKind::Local(id) = value.kind
+                && let Some(ty) = self.immutable_any_types.get(&id)
+            {
+                return ty.clone();
+            }
+            if let HirExprKind::Cast {
+                value,
+                target: ScriptType::Any,
+                ..
+            } = value.kind
+            {
+                return self.cast_source_type(value);
+            }
+        }
+        self.expression_type(value).clone()
+    }
+
     fn check_assignment(&mut self, expected: &ScriptType, actual: &ScriptType, span: Span) {
         if !expected.accepts(actual) {
             let help = if expected == &ScriptType::Int && actual == &ScriptType::Float {
@@ -2424,7 +2586,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .and_then(|manifest| manifest.signature(builtin))
                 .map(|signature| signature.result.clone())
                 .unwrap_or(ScriptType::Any),
-            ResolvedFunction::External(_) | ResolvedFunction::Dynamic => ScriptType::Any,
+            ResolvedFunction::External(symbol) => self
+                .external_functions
+                .get(&symbol)
+                .map_or(ScriptType::Any, |signature| signature.result.clone()),
+            ResolvedFunction::Dynamic => ScriptType::Any,
         }
     }
 
@@ -2757,6 +2923,24 @@ enum CastCertainty {
     Always,
     Runtime,
     Impossible,
+}
+
+// Reference-backed containers can be mutated through aliases, even under let.
+// Do not preserve their element/field types as flow evidence without alias analysis.
+fn stable_cast_evidence(ty: &ScriptType) -> bool {
+    matches!(
+        ty,
+        ScriptType::Unit
+            | ScriptType::Bool
+            | ScriptType::Int
+            | ScriptType::Float
+            | ScriptType::Percent
+            | ScriptType::String
+            | ScriptType::TextTemplate
+            | ScriptType::Symbol
+            | ScriptType::Selector
+            | ScriptType::Callable { .. }
+    )
 }
 
 fn cast_certainty(source: &ScriptType, target: &ScriptType) -> CastCertainty {
@@ -3211,6 +3395,52 @@ mod tests {
         assert!(ScriptType::String.accepts(&ScriptType::Never));
         assert!(ScriptType::Any.accepts(&ScriptType::String));
         assert!(!ScriptType::String.accepts(&ScriptType::Any));
+    }
+
+    #[test]
+    fn immutable_any_evidence_is_available_only_to_explicit_casts() {
+        for source in [
+            "let a: Int = 1\nlet b: Any = a\nlet c: Int = b as Int",
+            "let a: Any = 1\nlet b: Any = a\nlet c = b as Int",
+            "let a = 1 as Any\nlet b = a as Int",
+            "fn convert(value: Any) -> Int { value as! Int }",
+            "fn convert(value: Any) -> Int? { value as? Int }",
+        ] {
+            let syntax = parse_program(source).expect("source parses");
+            let arena = HirArena::new();
+            assert!(lower_to_hir(&arena, &syntax, None).is_ok(), "{source}");
+        }
+        for (source, diagnostic) in [
+            ("let a: Any = 1\nlet b: Int = a", "expected Int"),
+            ("let a: Any = 1\nlet b = a as String", "cannot cast"),
+            (
+                "fn convert(value: Any) -> Int { value as Int }",
+                "cannot prove",
+            ),
+            (
+                "var a: Any = 1\na = \"alice\"\nlet b = a as Int",
+                "cannot prove",
+            ),
+            (
+                "let a: Any = { value: Int -> value }\na(1)",
+                "cannot call Any",
+            ),
+            (
+                "let a: Any = { value: Int -> value }\nlet b = a as (Int) -> Int\nb(\"alice\")",
+                "expected Int",
+            ),
+        ] {
+            let syntax = parse_program(source).expect("source parses");
+            let arena = HirArena::new();
+            let errors =
+                lower_to_hir(&arena, &syntax, None).expect_err("invalid Any use is rejected");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message.contains(diagnostic)),
+                "{source}: {errors:?}"
+            );
+        }
     }
 
     #[test]

@@ -5,10 +5,7 @@ use bevy::{
     audio::{AudioSink, AudioSinkPlayback, Volume},
     ecs::system::SystemParam,
     log::{info, warn},
-    picking::{
-        hover::PickingInteraction,
-        pointer::{PointerButton, PointerId},
-    },
+    picking::{hover::PickingInteraction, pointer::PointerButton},
     prelude::*,
 };
 use hiraku_video::VideoPlayer;
@@ -87,8 +84,8 @@ pub use character::{
     animate_character_motion_effects, poll_pending_character_shows, reconcile_restored_characters,
 };
 use character::{queue_character_show, source_rect_from_corners, source_rect_to_corners};
+pub(crate) use choice::ChoiceUi;
 use choice::clear_choice_ui;
-pub(crate) use choice::{ChoiceButton, ChoiceUi};
 pub use choice::{ChoiceState, handle_choice_action_input, handle_choice_buttons};
 use command_runtime::evaluate_ui_at;
 pub use command_runtime::{PendingScriptCommands, drive_story_runtime, process_script_commands};
@@ -103,7 +100,7 @@ use dialogue::{
     set_dialogue_line_text, set_dialogue_model_reveal, text_effect_snapshot,
 };
 pub use runtime_menu::{
-    PauseMenuRoot, RuntimeMenuButton, RuntimeMenuState, handle_runtime_menu_buttons,
+    PauseMenuRoot, RuntimeMenuButton, handle_runtime_menu_buttons,
     update_runtime_menu_button_visuals,
 };
 pub use screen_ui::{
@@ -394,7 +391,6 @@ pub fn setup_stage(
         ui_layer(),
     ));
 
-    commands.insert_resource(RuntimeMenuState::default());
     commands.insert_resource(OverlayUiState::default());
 
     let mut snapshot = SceneSnapshot::default();

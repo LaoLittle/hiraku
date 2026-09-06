@@ -12,7 +12,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ModuleId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkedFunction {
     Native(BuiltinId),
     Script { module: ModuleId, function: u32 },
@@ -20,6 +20,7 @@ pub enum LinkedFunction {
 
 #[derive(Clone, Debug)]
 pub struct LinkedModule {
+    pub fingerprint: crate::ProgramFingerprint,
     pub id: ModuleId,
     pub bytecode: Arc<Bytecode>,
     calls: BTreeMap<SymbolId, LinkedFunction>,
@@ -74,6 +75,21 @@ pub fn link_named_modules(
     natives: &BuiltinManifest,
 ) -> Result<LinkedProgram, Vec<LinkError>> {
     let mut exports = BTreeMap::<String, LinkedFunction>::new();
+    let manifests = modules
+        .iter()
+        .map(|(_, module)| module.symbols.clone())
+        .collect::<Vec<_>>();
+    let mut type_symbols = crate::SymbolInterner::default();
+    let signatures = modules
+        .iter()
+        .map(|(_, module)| {
+            module
+                .functions
+                .iter()
+                .map(|function| function.signature.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let mut errors = Vec::new();
     for (module_index, (namespace, module)) in modules.iter().enumerate() {
         let module_id = ModuleId(module_index as u32);
@@ -143,10 +159,23 @@ pub fn link_named_modules(
                     .flat_map(|region| &region.instructions),
             )
         {
-            let Instruction::Call { function, .. } = instruction else {
+            let Instruction::Call {
+                function,
+                arguments,
+                receiver,
+                argument_types,
+                ..
+            } = instruction
+            else {
                 continue;
             };
-            if calls.contains_key(function) {
+            if argument_types.len() != arguments.count as usize + usize::from(receiver.is_some()) {
+                errors.push(LinkError {
+                    module: module_id,
+                    symbol: Some(*function),
+                    message: "call argument type metadata does not match its register window"
+                        .into(),
+                });
                 continue;
             }
             let Some(name) = bytecode.symbols.resolve(*function) else {
@@ -170,6 +199,53 @@ pub fn link_named_modules(
                 });
             match target {
                 Some(target) => {
+                    if let LinkedFunction::Script {
+                        module,
+                        function: index,
+                    } = target
+                    {
+                        let signature = &signatures[module.0 as usize][index as usize];
+                        let expected =
+                            signature.parameters.len() + usize::from(signature.receiver.is_some());
+                        let actual = arguments.count as usize + usize::from(receiver.is_some());
+                        if expected != actual {
+                            errors.push(LinkError {
+                                module: module_id,
+                                symbol: Some(*function),
+                                message: format!(
+                                    "function `{name}` expects {expected} arguments, got {actual}"
+                                ),
+                            });
+                        }
+                        let expected_types = signature.receiver.iter().chain(&signature.parameters);
+                        let mut substitutions = BTreeMap::new();
+                        for (index, (expected, actual)) in
+                            expected_types.zip(argument_types).enumerate()
+                        {
+                            let expected = canonical_type(
+                                expected,
+                                &manifests[module.0 as usize],
+                                module,
+                                &mut type_symbols,
+                            );
+                            let numeric_literal = actual.numeric_literal;
+                            let actual = canonical_type(
+                                &actual.ty,
+                                &bytecode.symbols,
+                                module_id,
+                                &mut type_symbols,
+                            );
+                            if numeric_literal
+                                && expected == crate::ScriptType::Float
+                                && actual == crate::ScriptType::Int
+                            {
+                                continue;
+                            }
+                            if !parameter_accepts(&expected, &actual, &mut substitutions) {
+                                errors.push(LinkError { module: module_id, symbol: Some(*function), message: format!("argument {} of `{name}` expects {expected:?}, got {actual:?}", index + 1) });
+                            }
+                        }
+                    }
                     calls.insert(*function, target);
                 }
                 None => errors.push(LinkError {
@@ -179,7 +255,19 @@ pub fn link_named_modules(
                 }),
             }
         }
+        let fingerprint = match crate::fingerprint::fingerprint(&(&bytecode, &calls)) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                errors.push(LinkError {
+                    module: module_id,
+                    symbol: None,
+                    message: format!("cannot fingerprint bytecode: {error}"),
+                });
+                continue;
+            }
+        };
         linked_modules.push(LinkedModule {
+            fingerprint,
             id: module_id,
             bytecode: Arc::new(bytecode),
             calls,
@@ -194,11 +282,196 @@ pub fn link_named_modules(
     }
 }
 
+/// Symbol IDs are local to a module. Compare types in a shared link-time
+/// namespace; a script-defined nominal struct remains owned by its module.
+fn canonical_type(
+    ty: &crate::ScriptType,
+    manifest: &crate::SymbolManifest,
+    module: ModuleId,
+    symbols: &mut crate::SymbolInterner,
+) -> crate::ScriptType {
+    use crate::ScriptType as T;
+    let name = |id| manifest.resolve(id).unwrap_or("<invalid type symbol>");
+    match ty {
+        T::Named(id) => T::Named(symbols.intern(name(*id))),
+        T::TypeParameter(id) => {
+            T::TypeParameter(symbols.intern(format!("{}::{}", module.0, name(*id))))
+        }
+        T::Struct {
+            name: id,
+            arguments,
+            fields,
+        } => T::Struct {
+            name: symbols.intern(format!("{}::{}", module.0, name(*id))),
+            arguments: arguments
+                .iter()
+                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .collect(),
+            fields: fields
+                .iter()
+                .map(|(key, ty)| (key.clone(), canonical_type(ty, manifest, module, symbols)))
+                .collect(),
+        },
+        T::Callable { parameters, result } => T::Callable {
+            parameters: parameters
+                .iter()
+                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .collect(),
+            result: Box::new(canonical_type(result, manifest, module, symbols)),
+        },
+        T::TupleOf(values) => T::TupleOf(
+            values
+                .iter()
+                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .collect(),
+        ),
+        T::Union(values) => T::Union(
+            values
+                .iter()
+                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .collect(),
+        ),
+        T::List(inner) => T::List(Box::new(canonical_type(inner, manifest, module, symbols))),
+        T::Optional(inner) => {
+            T::Optional(Box::new(canonical_type(inner, manifest, module, symbols)))
+        }
+        T::Binding(inner) => T::Binding(Box::new(canonical_type(inner, manifest, module, symbols))),
+        T::Map(key, value) => T::Map(
+            Box::new(canonical_type(key, manifest, module, symbols)),
+            Box::new(canonical_type(value, manifest, module, symbols)),
+        ),
+        T::Record(fields) => T::Record(
+            fields
+                .iter()
+                .map(|(key, ty)| (key.clone(), canonical_type(ty, manifest, module, symbols)))
+                .collect(),
+        ),
+        ty => ty.clone(),
+    }
+}
+
+fn parameter_accepts(
+    expected: &crate::ScriptType,
+    actual: &crate::ScriptType,
+    substitutions: &mut BTreeMap<SymbolId, crate::ScriptType>,
+) -> bool {
+    use crate::ScriptType as T;
+    // Erased values cannot be proven here; concrete mismatches can and must be
+    // rejected before execution. Dynamic checks are a separate VM boundary.
+    if actual == &T::Any {
+        return true;
+    }
+    match (expected, actual) {
+        (T::TypeParameter(id), actual) => match substitutions.get(id) {
+            Some(bound) => bound.accepts(actual),
+            None => {
+                substitutions.insert(*id, actual.clone());
+                true
+            }
+        },
+        (T::List(expected), T::List(actual))
+        | (T::Optional(expected), T::Optional(actual))
+        | (T::Binding(expected), T::Binding(actual)) => {
+            parameter_accepts(expected, actual, substitutions)
+        }
+        (T::TupleOf(expected), T::TupleOf(actual)) => {
+            expected.len() == actual.len()
+                && expected
+                    .iter()
+                    .zip(actual)
+                    .all(|(expected, actual)| parameter_accepts(expected, actual, substitutions))
+        }
+        (T::Map(ek, ev), T::Map(ak, av)) => {
+            parameter_accepts(ek, ak, substitutions) && parameter_accepts(ev, av, substitutions)
+        }
+        _ => expected.accepts(actual),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{BuiltinManifest, compile_with_manifest, parse_program};
 
     use super::*;
+
+    #[test]
+    fn cross_module_concrete_types_are_checked_before_execution() {
+        let natives = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let provider = compile("global fn score(value: Int) -> Int { value }");
+        for source in ["score(\"alice\")", "score(1)\nscore(false)"] {
+            let errors = link_register_modules(vec![compile(source), provider.clone()], &natives)
+                .expect_err("concrete argument mismatch must fail during linking");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("argument 1 of `score` expects Int"))
+            );
+        }
+        let provider = compile("global fn label(value: (Int, String)) -> Unit { () }");
+        assert!(
+            link_register_modules(
+                vec![compile("label((1, \"alice\"))"), provider.clone()],
+                &natives
+            )
+            .is_ok()
+        );
+        assert!(
+            link_register_modules(vec![compile("label((1, false))"), provider], &natives).is_err()
+        );
+    }
+
+    #[test]
+    fn late_float_context_accepts_literals_but_not_int_bindings() {
+        let natives = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let provider = compile("global fn scale(value: Float) -> Float { value }");
+        assert!(
+            link_register_modules(
+                vec![compile("scale(1)\nscale(-2)"), provider.clone()],
+                &natives
+            )
+            .is_ok()
+        );
+        let errors = link_register_modules(
+            vec![compile("let count: Int = 1\nscale(count)"), provider],
+            &natives,
+        )
+        .expect_err("typed Int is not a contextual literal");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("expects Float, got Int"))
+        );
+    }
+
+    #[test]
+    fn identically_named_private_structs_are_not_shared_module_types() {
+        let natives = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let provider = compile(
+            "type Player = .{ score: Int }\nglobal fn score(player: Player) -> Int { player.score }",
+        );
+        let consumer = compile("type Player = .{ score: Int }\nscore(Player.{ score: 1 })");
+        assert!(link_register_modules(vec![consumer, provider], &natives).is_err());
+    }
+
+    #[test]
+    fn every_cross_module_call_is_checked_for_arity() {
+        let provider = compile("global fn score(value: Int) -> Int { value }");
+        let consumer = compile("score(1)\nscore(1, 2)");
+        let signature = &provider.functions[0].signature;
+        assert_eq!(signature.parameters, vec![crate::ScriptType::Int]);
+        assert_eq!(signature.result, crate::ScriptType::Int);
+        assert_eq!(signature.receiver, None);
+        let errors = link_register_modules(
+            vec![consumer, provider],
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        )
+        .expect_err("a prior valid call must not hide a later invalid call");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("expects 1 arguments, got 2"))
+        );
+    }
 
     fn compile(source: &str) -> Bytecode {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());

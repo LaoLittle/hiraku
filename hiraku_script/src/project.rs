@@ -1,0 +1,252 @@
+//! Platform-independent project compilation: discover sources in the embedding,
+//! then collect every export before checking any module body.
+use crate::{
+    BuiltinManifest, Bytecode, CompileError, FunctionSignature, LinkedProgram, ModuleId, Program,
+    SymbolId, SymbolManifest,
+};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug)]
+pub struct ScriptSource {
+    pub path: String,
+    pub namespace: Option<String>,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProjectInterface {
+    pub(crate) symbols: SymbolManifest,
+    pub(crate) functions: BTreeMap<SymbolId, FunctionSignature>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledProject {
+    pub paths: BTreeMap<String, ModuleId>,
+    pub program: LinkedProgram,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectError {
+    pub path: String,
+    pub error: CompileError,
+}
+
+pub fn compile_project(
+    mut sources: Vec<ScriptSource>,
+    natives: &BuiltinManifest,
+) -> Result<CompiledProject, Vec<ProjectError>> {
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut errors = Vec::new();
+    let mut parsed = Vec::<Program>::new();
+    let mut paths = BTreeMap::new();
+    for (index, source) in sources.iter().enumerate() {
+        if paths
+            .insert(source.path.clone(), ModuleId(index as u32))
+            .is_some()
+        {
+            errors.push(ProjectError {
+                path: source.path.clone(),
+                error: CompileError {
+                    message: "duplicate script path".into(),
+                    span: None,
+                },
+            });
+        }
+        match crate::parse_program(&source.source) {
+            Ok(program) => parsed.push(program),
+            Err(parse_errors) => {
+                for error in parse_errors {
+                    errors.push(ProjectError {
+                        path: source.path.clone(),
+                        error: CompileError {
+                            message: error.message,
+                            span: Some(error.span),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let mut interface = ProjectInterface {
+        symbols: natives.symbols().clone(),
+        functions: BTreeMap::new(),
+    };
+    for (source, program) in sources.iter().zip(&parsed) {
+        if let Err(declarations) = crate::hir::collect_project_exports(
+            program,
+            source.namespace.as_deref(),
+            natives,
+            &mut interface,
+        ) {
+            errors.extend(declarations.into_iter().map(|error| ProjectError {
+                path: source.path.clone(),
+                error: CompileError {
+                    message: error.message,
+                    span: Some(error.span),
+                },
+            }));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let mut modules = Vec::<(Option<String>, Bytecode)>::new();
+    for (source, program) in sources.iter().zip(&parsed) {
+        let mut hash = blake3::Hasher::new();
+        hash.update(source.path.as_bytes());
+        hash.update(&[0]);
+        hash.update(source.source.as_bytes());
+        let source_hash = u64::from_le_bytes(
+            hash.finalize().as_bytes()[..8]
+                .try_into()
+                .expect("hash has eight bytes"),
+        );
+        match crate::vm::compile_with_project_interface(program, source_hash, natives, &interface) {
+            Ok(mut bytecode) => {
+                bytecode.debug.source = Some(crate::debug::DebugSource {
+                    path: source.path.clone(),
+                    text: source.source.clone(),
+                });
+                modules.push((source.namespace.clone(), bytecode));
+            }
+            Err(compilation) => errors.extend(compilation.into_iter().map(|error| ProjectError {
+                path: source.path.clone(),
+                error,
+            })),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let program = crate::link_named_modules(modules, natives).map_err(|link_errors| {
+        link_errors
+            .into_iter()
+            .map(|error| ProjectError {
+                path: sources[error.module.0 as usize].path.clone(),
+                error: CompileError {
+                    message: error.message,
+                    span: None,
+                },
+            })
+            .collect::<Vec<_>>()
+    })?;
+    Ok(CompiledProject { paths, program })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn source(path: &str, source: &str) -> ScriptSource {
+        ScriptSource {
+            path: path.into(),
+            source: source.into(),
+            namespace: None,
+        }
+    }
+
+    #[test]
+    fn declarations_are_available_before_any_body_is_checked() {
+        let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        let project = compile_project(
+            vec![
+                source("a.hks", "let name: String = greet(1)"),
+                source(
+                    "z.hks",
+                    "global fn greet(index: Int) -> String { \"alice\" }",
+                ),
+            ],
+            &natives,
+        )
+        .expect("consumer compiles before provider body");
+        let mut vm =
+            crate::LinkedVm::new(project.program, project.paths["a.hks"]).expect("entry starts");
+        while vm.step().expect("cross-module call executes").is_some() {}
+        for body in ["let name: Int = greet(1)", "greet(false)"] {
+            assert!(
+                compile_project(
+                    vec![
+                        source("a.hks", body),
+                        source(
+                            "z.hks",
+                            "global fn greet(index: Int) -> String { \"alice\" }"
+                        )
+                    ],
+                    &natives
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn compilation_is_independent_of_discovery_order() {
+        let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        let sources = vec![
+            source("z.hks", "global fn greet() -> String { \"bob\" }"),
+            source("a.hks", "let name: String = greet()"),
+        ];
+        let first = compile_project(sources.clone(), &natives).expect("project compiles");
+        let second = compile_project(sources.into_iter().rev().collect(), &natives)
+            .expect("reordered project compiles");
+        assert_eq!(first.paths, second.paths);
+        for (left, right) in first
+            .program
+            .modules
+            .iter()
+            .zip(second.program.modules.iter())
+        {
+            assert_eq!(left.bytecode, right.bytecode);
+            assert_eq!(left.fingerprint, right.fingerprint);
+        }
+    }
+
+    #[test]
+    fn restored_cross_module_panic_has_three_snippets_then_compact_frames() {
+        let natives = BuiltinManifest::new([("checkpoint", crate::BuiltinId(1))]);
+        let project = compile_project(vec![
+            source("entry.hks", "fn outer() -> Never { second() }\nouter()"),
+            source("provider.hks", "fn third() -> Never {\n checkpoint()\n panic(\"failure\")\n}\nglobal fn second() -> Never { third() }"),
+        ], &natives).expect("project compiles");
+        let mut vm = crate::LinkedVm::new(project.program.clone(), project.paths["entry.hks"])
+            .expect("entry starts");
+        assert!(matches!(vm.step(), Ok(Some(crate::LinkedVmEvent::Call(_)))));
+        let mut vm =
+            crate::LinkedVm::restore(vm.snapshot(), project.program).expect("frames restore");
+        vm.resume(crate::Value::Unit).expect("checkpoint resumes");
+        loop {
+            match vm.step() {
+                Ok(Some(crate::LinkedVmEvent::Statement(_))) => continue,
+                Err(crate::LinkedVmError::Vm(error @ crate::VmError::Panic { .. })) => {
+                    let crate::VmError::Panic { frames, .. } = &error else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        frames
+                            .iter()
+                            .map(|frame| frame.function.as_str())
+                            .collect::<Vec<_>>(),
+                        ["third", "second", "outer", "entry"]
+                    );
+                    assert_eq!(
+                        frames[0].source.as_ref().expect("source").path,
+                        "provider.hks"
+                    );
+                    let report = error
+                        .render_diagnostic(crate::RenderOptions::plain())
+                        .expect("report renders");
+                    assert_eq!(report.matches("[HKS-PANIC]").count(), 3, "{report}");
+                    assert!(report.contains("at entry(entry.hks 2:1)"), "{report}");
+                    assert!(
+                        report.contains("checkpoint()"),
+                        "previous context line: {report}"
+                    );
+                    break;
+                }
+                event => panic!("expected panic, got {event:?}"),
+            }
+        }
+    }
+}

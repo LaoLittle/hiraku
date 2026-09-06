@@ -1,7 +1,10 @@
 type Unit = ()
 
+@trackCaller
 fn panic(message: String) -> Never { __builtin_panic(message) }
+@trackCaller
 fn unreachable() -> Never { panic("entered unreachable code") }
+@trackCaller
 fn todo() -> Never { panic("not yet implemented") }
 
 impl Float {

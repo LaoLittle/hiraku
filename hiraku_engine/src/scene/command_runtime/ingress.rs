@@ -208,6 +208,13 @@ pub fn drive_story_runtime(
             ScriptResponse::Choice(value) => stored_to_hks(value.clone()),
             ScriptResponse::Continue => hiraku_script::Value::Unit,
         };
+        if runtime
+            .story
+            .as_ref()
+            .is_some_and(|story| !story.accepts_choice_response(&direct_value))
+        {
+            return;
+        }
         runtime.pending_ui_screen = None;
         runtime.pending_ui_arguments.clear();
         runtime.wait_request = None;
@@ -457,7 +464,11 @@ pub fn drive_story_runtime(
                     done: request,
                 }));
             }
-            StoryRuntimeEvent::Choice { prompt, options } => {
+            StoryRuntimeEvent::Choice {
+                prompt,
+                options,
+                enabled,
+            } => {
                 let request = runtime.allocate_request();
                 runtime.wait_request = Some(request);
                 let Some(target) = runtime.ui_registry.get("choice").cloned() else {
@@ -468,6 +479,10 @@ pub fn drive_story_runtime(
                     return;
                 };
                 let choice_model = StoredValue::Map(BTreeMap::from([
+                    (
+                        "enabled".into(),
+                        StoredValue::Array(enabled.into_iter().map(StoredValue::Bool).collect()),
+                    ),
                     ("prompt".into(), StoredValue::String(prompt)),
                     (
                         "options".into(),

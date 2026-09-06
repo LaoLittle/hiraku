@@ -254,6 +254,9 @@ fn write_diagnostic(
     writer: &mut impl io::Write,
     options: RenderOptions,
 ) -> io::Result<()> {
+    if diagnostic.labels.len() == 1 {
+        return write_source_excerpt(diagnostic, source_map, writer, options);
+    }
     let Some(primary) = diagnostic
         .labels
         .iter()
@@ -293,6 +296,35 @@ fn write_diagnostic(
         builder = builder.with_code(code);
     }
     for (index, label) in diagnostic.labels.iter().enumerate() {
+        // Ariadne has no context-line setting. Message-free, uncolored anchors
+        // include adjacent lines without extending the primary highlight.
+        if let Some(source) = source_map.get(&label.source) {
+            let span = normalized_span(label, source_map);
+            let starts = std::iter::once(0)
+                .chain(
+                    source
+                        .bytes()
+                        .enumerate()
+                        .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+                )
+                .collect::<Vec<_>>();
+            let first = starts
+                .partition_point(|start| *start <= span.start)
+                .saturating_sub(1);
+            let last = starts
+                .partition_point(|start| *start <= span.end.saturating_sub(1).max(span.start))
+                .saturating_sub(1);
+            for line in [first.checked_sub(1), last.checked_add(1)]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(offset) = starts.get(line).copied() {
+                    let end = offset + source[offset..].chars().next().map_or(0, char::len_utf8);
+                    builder = builder
+                        .with_label(Label::new((label.source.clone(), offset..end)).with_order(-1));
+                }
+            }
+        }
         let mut rendered = Label::new((label.source.clone(), normalized_span(label, source_map)))
             .with_color(if label.primary {
                 diagnostic.severity.color()
@@ -318,6 +350,95 @@ fn write_diagnostic(
             .map(|(id, source)| (id.clone(), source.clone())),
     );
     builder.finish().write(cache, writer)
+}
+
+/// Single-location diagnostics use one continuous excerpt. Context lines are
+/// presentation, not labels: feeding them to Ariadne creates separate groups.
+fn write_source_excerpt(
+    diagnostic: &Diagnostic,
+    source_map: &SourceMap,
+    writer: &mut impl io::Write,
+    options: RenderOptions,
+) -> io::Result<()> {
+    let label = &diagnostic.labels[0];
+    let source = source_map.get(&label.source).unwrap_or("");
+    let span = normalized_span(label, source_map);
+    let mut start = span.start;
+    while !source.is_char_boundary(start) {
+        start -= 1;
+    }
+    let lines = source.split('\n').collect::<Vec<_>>();
+    let first = source[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let end = span.end.saturating_sub(1).max(start);
+    let last = source.as_bytes()[..end]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let column = source[..start]
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .count()
+        + 1;
+    let from = first.saturating_sub(1);
+    let to = (last + 1).min(lines.len() - 1);
+    let width = (to + 1).to_string().len();
+    let (color, reset) = if options.color {
+        (
+            match diagnostic.severity {
+                Severity::Error => "\x1b[31m",
+                Severity::Warning => "\x1b[33m",
+                Severity::Advice => "\x1b[36m",
+            },
+            "\x1b[0m",
+        )
+    } else {
+        ("", "")
+    };
+    if let Some(code) = &diagnostic.code {
+        write!(writer, "{color}[{code}] ")?;
+    }
+    writeln!(
+        writer,
+        "{color}{}:{reset} {}",
+        match diagnostic.severity {
+            Severity::Error => "Error",
+            Severity::Warning => "Warning",
+            Severity::Advice => "Advice",
+        },
+        diagnostic.message
+    )?;
+    writeln!(
+        writer,
+        "{:width$} ╭─[ {}:{}:{} ]",
+        "",
+        label.source,
+        first + 1,
+        column
+    )?;
+    for (index, line) in lines.iter().enumerate().take(to + 1).skip(from) {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if (first..=last).contains(&index) {
+            writeln!(writer, "{color}{:width$} │ {line}{reset}", index + 1)?;
+        } else {
+            writeln!(writer, "{:width$} │ {line}", index + 1)?;
+        }
+    }
+    writeln!(writer, "{:width$} ╰─", "")?;
+    if let Some(message) = &label.message {
+        writeln!(writer, "  = {message}")?;
+    }
+    for note in &diagnostic.notes {
+        writeln!(writer, "Note: {note}")?;
+    }
+    for help in &diagnostic.help {
+        writeln!(writer, "Help: {help}")?;
+    }
+    Ok(())
 }
 
 fn normalized_span(label: &DiagnosticLabel, source_map: &SourceMap) -> Range<usize> {
@@ -365,6 +486,68 @@ mod tests {
             Diagnostic::error("invalid expression").with_label(DiagnosticLabel::primary(id, 0..7));
         let rendered = render_diagnostics(&[diagnostic], &sources, RenderOptions::plain());
         assert!(!rendered.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn reports_include_one_context_line_on_each_side() {
+        let mut sources = SourceMap::new();
+        let source = "outer before\nprevious line\nbroken\nfollowing line\nouter after";
+        let id = sources.insert("entry.hks", source);
+        let start = source.find("broken").expect("marker exists");
+        let diagnostic =
+            Diagnostic::error("failure").with_label(DiagnosticLabel::primary(id, start..start + 6));
+        let rendered = render_diagnostics(&[diagnostic], &sources, RenderOptions::plain());
+        assert!(rendered.contains("previous line"), "{rendered}");
+        assert!(rendered.contains("following line"), "{rendered}");
+        assert!(!rendered.contains("outer before"), "{rendered}");
+        assert!(!rendered.contains("outer after"), "{rendered}");
+        assert_eq!(rendered.matches("╭─[").count(), 1, "one continuous excerpt");
+        assert!(
+            !rendered.contains("├─["),
+            "context must not form another group"
+        );
+        assert!(
+            rendered.contains("2 │ previous line\n3 │ broken\n4 │ following line"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn only_the_error_source_line_is_red() {
+        let mut sources = SourceMap::new();
+        let source = "before\nbroken\nafter";
+        let id = sources.insert("entry.hks", source);
+        let diagnostic =
+            Diagnostic::error("failure").with_label(DiagnosticLabel::primary(id, 7..13));
+        let rendered = render_diagnostics(
+            &[diagnostic],
+            &sources,
+            RenderOptions {
+                color: true,
+                compact: false,
+            },
+        );
+        assert!(
+            rendered.contains("1 │ before\n\x1b[31m2 │ broken\x1b[0m\n3 │ after"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn context_handles_unicode_and_file_boundaries() {
+        let mut sources = SourceMap::new();
+        let source = "élise\nbroken\nbob";
+        let id = sources.insert("data.hson", source);
+        for (text, adjacent) in [("élise", "broken"), ("broken", "élise"), ("bob", "broken")] {
+            let start = source.find(text).expect("fixture text exists");
+            let diagnostic = Diagnostic::error("failure").with_label(DiagnosticLabel::primary(
+                id.clone(),
+                start..start + text.len(),
+            ));
+            let report = render_diagnostics(&[diagnostic], &sources, RenderOptions::plain());
+            assert!(report.contains(text), "{report}");
+            assert!(report.contains(adjacent), "{report}");
+        }
     }
 
     #[test]

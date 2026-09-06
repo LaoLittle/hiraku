@@ -5,9 +5,8 @@ use hiraku_script::native::{
     NativeRegistry,
 };
 use hiraku_script::{
-    BuiltinManifest, LinkedVm, LinkedVmEvent, ModuleId, RenderOptions, ScriptType, SourceMap,
-    StatementValue, Value, compile_with_manifest, link_named_modules, parse_program,
-    render_diagnostics,
+    LinkedVm, LinkedVmEvent, RenderOptions, ScriptType, SourceMap, StatementValue, Value,
+    parse_program, render_diagnostics,
 };
 use thiserror::Error;
 
@@ -1019,8 +1018,6 @@ fn stored_value_type(value: &StoredValue) -> ScriptType {
 pub enum UiVmError {
     #[error("failed to compile declarative UI: {0}")]
     Compile(String),
-    #[error("failed to link declarative UI: {0}")]
-    Link(String),
     #[error("declarative UI runtime failed: {0}")]
     Runtime(String),
     #[error("invalid declarative UI: {0}")]
@@ -1048,7 +1045,6 @@ pub fn evaluate_ui_component_named_with_args(
 ) -> Result<ScreenSpec, UiVmError> {
     let registry = ui_registry(&values);
     let manifest = registry.manifest();
-    let standard = compile_module(UI_STDLIB_PATH, UI_STDLIB_SOURCE, &manifest)?;
     let parsed = parse_module(path, source)?;
     let entries = parsed
         .statements
@@ -1079,7 +1075,47 @@ pub fn evaluate_ui_component_named_with_args(
             "the `@ui` entrypoint must be declared with `global fn`".into(),
         ));
     }
-    let document = compile_parsed_module(path, source, &parsed, &manifest)?;
+    let project = hiraku_script::compile_project(
+        vec![
+            hiraku_script::ScriptSource {
+                path: UI_STDLIB_PATH.into(),
+                namespace: Some("ui.widgets".into()),
+                source: UI_STDLIB_SOURCE.into(),
+            },
+            hiraku_script::ScriptSource {
+                path: path.into(),
+                namespace: None,
+                source: source.into(),
+            },
+        ],
+        &manifest,
+    )
+    .map_err(|errors| {
+        let mut sources = SourceMap::new();
+        sources.insert(UI_STDLIB_PATH, UI_STDLIB_SOURCE);
+        sources.insert(path, source);
+        let diagnostics = errors
+            .into_iter()
+            .map(|error| {
+                let id = sources.insert(
+                    &error.path,
+                    if error.path == path {
+                        source
+                    } else {
+                        UI_STDLIB_SOURCE
+                    },
+                );
+                error.error.diagnostic(id)
+            })
+            .collect::<Vec<_>>();
+        UiVmError::Invalid(render_diagnostics(
+            &diagnostics,
+            &sources,
+            RenderOptions::terminal(),
+        ))
+    })?;
+    let entry = project.paths[path];
+    let document = &project.program.modules[entry.0 as usize].bytecode;
     let entry_symbol = entries
         .first()
         .map(|(_, name)| {
@@ -1088,24 +1124,12 @@ pub fn evaluate_ui_component_named_with_args(
             })
         })
         .transpose()?;
-    let program = link_named_modules(
-        vec![(Some("ui.widgets".to_string()), standard), (None, document)],
-        &manifest,
-    )
-    .map_err(|errors| {
-        UiVmError::Link(
-            errors
-                .into_iter()
-                .map(|error| error.message)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    })?;
+    let program = project.program;
     let materialize_program = program.clone();
     let mut context = UiVmContext::new(values, terms.clone()).with_navigation_origin(path);
     let vm = if let Some(symbol) = entry_symbol {
         let callable = Value::Function {
-            module: Some(1),
+            module: Some(entry.0),
             symbol,
         };
         LinkedVm::from_callable(
@@ -1116,13 +1140,13 @@ pub fn evaluate_ui_component_named_with_args(
     } else if arguments.is_empty() {
         // Temporary migration path for existing UI modules. New UI modules
         // may expose one explicit @ui function when it needs parameters.
-        LinkedVm::new(program, ModuleId(1))
+        LinkedVm::new(program, entry)
     } else {
         return Err(UiVmError::Invalid(
             "parameterized UI modules require an `@ui global fn` entrypoint".into(),
         ));
     }
-    .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     let roots = collect_nodes(vm, &registry, &mut context)?;
     if roots.len() != 1 {
         return Err(UiVmError::Invalid(format!(
@@ -1154,44 +1178,6 @@ fn parse_module(path: &str, source: &str) -> Result<hiraku_script::Program, UiVm
     })
 }
 
-fn compile_module(
-    path: &str,
-    source: &str,
-    manifest: &BuiltinManifest,
-) -> Result<hiraku_script::Bytecode, UiVmError> {
-    let program = parse_module(path, source)?;
-    compile_parsed_module(path, source, &program, manifest)
-}
-
-fn compile_parsed_module(
-    path: &str,
-    source: &str,
-    program: &hiraku_script::Program,
-    manifest: &BuiltinManifest,
-) -> Result<hiraku_script::Bytecode, UiVmError> {
-    let mut sources = SourceMap::new();
-    let source_id = sources.insert(path, source);
-    compile_with_manifest(program, source_hash(path, source), manifest).map_err(|errors| {
-        UiVmError::Compile(render_diagnostics(
-            &errors
-                .into_iter()
-                .map(|error| error.diagnostic(source_id.clone()))
-                .collect::<Vec<_>>(),
-            &sources,
-            RenderOptions::terminal(),
-        ))
-    })
-}
-
-fn source_hash(path: &str, source: &str) -> u64 {
-    path.bytes()
-        .chain([0])
-        .chain(source.bytes())
-        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
-        })
-}
-
 fn collect_nodes(
     mut vm: LinkedVm,
     registry: &NativeRegistry<UiVmContext>,
@@ -1206,6 +1192,12 @@ fn collect_nodes(
         let event = match vm.step_with_budget(&mut budget) {
             Ok(event) => event,
             Err(error) => {
+                if matches!(
+                    error,
+                    hiraku_script::LinkedVmError::Vm(hiraku_script::VmError::Panic { .. })
+                ) {
+                    return Err(UiVmError::Runtime(error.to_string()));
+                }
                 let snapshot = vm.snapshot();
                 let frame = snapshot.frames.last();
                 return Err(UiVmError::Runtime(match frame {
@@ -1216,7 +1208,7 @@ fn collect_nodes(
                         frame.vm.pc.saturating_sub(1),
                         frame.vm.registers,
                     ),
-                    None => format!("{error:?}"),
+                    None => error.to_string(),
                 }));
             }
         };
@@ -1231,7 +1223,7 @@ fn collect_nodes(
                     .call(context, &call)
                     .map_err(|error| UiVmError::Runtime(error.to_string()))?;
                 vm.resume(value)
-                    .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
             }
             Some(LinkedVmEvent::Statement(StatementValue::Value(_) | StatementValue::Commit)) => {
                 nodes.extend(((committed_node + 1)..=context.next_node).map(UiNodeHandle));
@@ -1269,7 +1261,7 @@ fn closure_children(
     };
     let callable = closure.into_hks_value();
     let vm = LinkedVm::from_callable(program.clone(), &callable, Vec::new())
-        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     collect_nodes(vm, registry, context)
 }
 
@@ -1282,7 +1274,7 @@ fn closure_children_with_args(
 ) -> Result<Vec<UiNodeHandle>, UiVmError> {
     let callable = callable.into_value();
     let vm = LinkedVm::from_callable(program.clone(), &callable, arguments)
-        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     collect_nodes(vm, registry, context)
 }
 
@@ -1302,16 +1294,16 @@ pub(crate) fn evaluate_ui_callback(
     context.navigation_origin = callback.origin.clone();
     let goto = registry.manifest().resolve_selector("story", "goto");
     let mut vm = LinkedVm::from_callable(callback.program.clone(), &callback.callable, Vec::new())
-        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     vm.set_current_globals(&current_globals)
-        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     let mut effects = Vec::new();
     let mut committed_effect = context.next_effect;
     let mut budget = 100_000;
     loop {
         match vm
             .step_with_budget(&mut budget)
-            .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?
+            .map_err(|error| UiVmError::Runtime(error.to_string()))?
         {
             Some(LinkedVmEvent::BudgetExhausted) => {
                 return Err(UiVmError::Runtime(
@@ -1330,7 +1322,7 @@ pub(crate) fn evaluate_ui_callback(
                     .call(&mut context, &call)
                     .map_err(|error| UiVmError::Runtime(error.to_string()))?;
                 vm.resume(value)
-                    .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
             }
             Some(LinkedVmEvent::Statement(StatementValue::Value(_) | StatementValue::Commit)) => {
                 effects.extend(
@@ -1428,14 +1420,14 @@ fn evaluate_binding_callable(
     context: &mut UiVmContext,
 ) -> Result<Value, UiVmError> {
     let mut vm = LinkedVm::from_callable(binding.program.clone(), callable, arguments)
-        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     vm.set_current_globals(&binding.globals)
-        .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     let mut budget = 100_000;
     loop {
         match vm
             .step_with_budget(&mut budget)
-            .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?
+            .map_err(|error| UiVmError::Runtime(error.to_string()))?
         {
             Some(LinkedVmEvent::BudgetExhausted) => {
                 return Err(UiVmError::Runtime(
@@ -1447,7 +1439,7 @@ fn evaluate_binding_callable(
                     .call(context, &call)
                     .map_err(|error| UiVmError::Runtime(error.to_string()))?;
                 vm.resume(value)
-                    .map_err(|error| UiVmError::Runtime(format!("{error:?}")))?;
+                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
             }
             Some(LinkedVmEvent::Completed(value)) => return Ok(value),
             Some(LinkedVmEvent::Statement(_)) => {}
@@ -1540,6 +1532,32 @@ fn materialize_screen(
         border: None,
         children,
     })
+}
+
+fn disable_choice_buttons(node: &mut ScreenNode) {
+    match node {
+        ScreenNode::Button(button) => {
+            button.enabled = false;
+            button.enabled_binding = None;
+            button.reactive_enabled = None;
+        }
+        ScreenNode::ImageButton(button) => {
+            button.enabled = false;
+            button.enabled_binding = None;
+            button.reactive_enabled = None;
+        }
+        ScreenNode::Column(container) | ScreenNode::Row(container) => {
+            for child in &mut container.children {
+                disable_choice_buttons(child);
+            }
+        }
+        ScreenNode::Scrollable(container) => {
+            for child in &mut container.children {
+                disable_choice_buttons(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn materialize_node(
@@ -1695,6 +1713,18 @@ fn materialize_node(
             }))
         }
         UiDraftKind::ChoiceOptions(renderer) => {
+            let enabled = context
+                .values
+                .story_values()
+                .get("choice")
+                .and_then(|choice| match choice {
+                    StoredValue::Map(fields) => fields.get("enabled"),
+                    _ => None,
+                })
+                .and_then(|value| match value {
+                    StoredValue::Array(values) => Some(values.clone()),
+                    _ => None,
+                });
             let options = context
                 .values
                 .story_values()
@@ -1731,13 +1761,13 @@ fn materialize_node(
                         "choice option renderer must return exactly one UiNode".into(),
                     ));
                 }
-                children.push(materialize_node(
-                    rendered[0],
-                    program,
-                    registry,
-                    context,
-                    textures,
-                )?);
+                let mut node = materialize_node(rendered[0], program, registry, context, textures)?;
+                if enabled.as_ref().and_then(|values| values.get(index))
+                    == Some(&StoredValue::Bool(false))
+                {
+                    disable_choice_buttons(&mut node);
+                }
+                children.push(node);
             }
             Ok(ScreenNode::Column(ContainerNode {
                 gap: draft.gap,
@@ -2273,13 +2303,19 @@ canvas {
 "#;
         let values = UiContext::new(BTreeMap::from([(
             "choice".to_string(),
-            StoredValue::Map(BTreeMap::from([(
-                "options".to_string(),
-                StoredValue::Array(vec![
-                    StoredValue::String("Route A".to_string()),
-                    StoredValue::String("Route B".to_string()),
-                ]),
-            )])),
+            StoredValue::Map(BTreeMap::from([
+                (
+                    "options".to_string(),
+                    StoredValue::Array(vec![
+                        StoredValue::String("Route A".to_string()),
+                        StoredValue::String("Route B".to_string()),
+                    ]),
+                ),
+                (
+                    "enabled".into(),
+                    StoredValue::Array(vec![StoredValue::Bool(false), StoredValue::Bool(true)]),
+                ),
+            ])),
         )]));
 
         let screen = evaluate_ui_component_named(
@@ -2303,12 +2339,14 @@ canvas {
             &options.children[0],
             ScreenNode::Button(button)
                 if button.text == "Route A"
+                    && !button.enabled
                     && button.value == Some(StoredValue::Int(0))
         ));
         assert!(matches!(
             &options.children[1],
             ScreenNode::Button(button)
                 if button.text == "Route B"
+                    && button.enabled
                     && button.value == Some(StoredValue::Int(1))
         ));
     }

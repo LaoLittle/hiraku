@@ -19,6 +19,7 @@ pub struct MirProgram {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MirFunction {
+    pub signature: crate::FunctionSignature,
     pub blocks: Vec<MirBasicBlock>,
     pub regions: Vec<MirFunction>,
     pub parameters: Vec<crate::HirLocalId>,
@@ -33,7 +34,10 @@ pub struct MirBasicBlock {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirInstruction {
-    Panic(VirtualRegister),
+    Panic {
+        message: VirtualRegister,
+        span: Span,
+    },
     Udf(String),
     Constant {
         dst: VirtualRegister,
@@ -105,11 +109,13 @@ pub enum MirInstruction {
         fields: Vec<(SymbolId, VirtualRegister)>,
     },
     Call {
+        span: Span,
         dst: VirtualRegister,
         function: ResolvedFunction,
         receiver: Option<VirtualRegister>,
         dynamic_callee: Option<VirtualRegister>,
         arguments: Vec<(Option<SymbolId>, VirtualRegister)>,
+        argument_types: Vec<crate::runtime::ArgumentType>,
     },
     AssertNonNull {
         dst: VirtualRegister,
@@ -150,13 +156,13 @@ impl MirInstruction {
             | Self::StoreGlobal { .. }
             | Self::Statement { .. }
             | Self::Udf(_) => None,
-            Self::Panic(_) => None,
+            Self::Panic { .. } => None,
         }
     }
 
     pub fn used_registers(&self) -> Vec<VirtualRegister> {
         match self {
-            Self::Panic(message) => vec![*message],
+            Self::Panic { message, .. } => vec![*message],
             Self::Udf(_)
             | Self::Constant { .. }
             | Self::MakeClosure { .. }
@@ -250,21 +256,50 @@ pub struct MirLoweringError {
 
 pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLoweringError>> {
     let mut errors = Vec::new();
-    let entry = MirBuilder::lower(hir.entry, false, false, Vec::new(), &mut errors);
+    let entry = MirBuilder::lower(hir.entry, false, false, Vec::new(), &hir.types, &mut errors);
     let functions = hir
         .functions
         .iter()
         .map(|function| {
-            MirBuilder::lower(
+            let mut lowered = MirBuilder::lower(
                 function.body,
                 true,
                 !matches!(
                     hir.types.get(function.result),
                     Some(crate::ScriptType::Unit | crate::ScriptType::Never)
                 ),
-                Vec::new(),
+                function.parameters.to_vec(),
+                &hir.types,
                 &mut errors,
-            )
+            );
+            let mut parameters = function
+                .parameters
+                .iter()
+                .map(|local| {
+                    hir.types
+                        .get(hir.locals[local.0 as usize].ty)
+                        .expect("parameter type is interned")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let receiver = if function.parameters.first().is_some_and(|local| {
+                hir.symbols.resolve(hir.locals[local.0 as usize].name) == Some("self")
+            }) {
+                Some(parameters.remove(0))
+            } else {
+                None
+            };
+            lowered.signature = crate::FunctionSignature {
+                receiver,
+                parameters,
+                variadic: None,
+                result: hir
+                    .types
+                    .get(function.result)
+                    .expect("return type is interned")
+                    .clone(),
+            };
+            lowered
         })
         .collect();
     if errors.is_empty() {
@@ -274,22 +309,25 @@ pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLower
     }
 }
 
-struct MirBuilder {
+struct MirBuilder<'types> {
+    types: &'types crate::TypeTable,
     blocks: Vec<MirBasicBlock>,
     regions: Vec<MirFunction>,
     current: MirBlockId,
     next_register: u32,
 }
 
-impl MirBuilder {
+impl<'types> MirBuilder<'types> {
     fn lower(
         block: &HirBlock<'_>,
         function: bool,
         return_value: bool,
         parameters: Vec<crate::HirLocalId>,
+        types: &'types crate::TypeTable,
         errors: &mut Vec<MirLoweringError>,
     ) -> MirFunction {
         let mut builder = Self {
+            types,
             blocks: vec![MirBasicBlock {
                 instructions: Vec::new(),
                 terminator: MirTerminator::Unset,
@@ -317,10 +355,35 @@ impl MirBuilder {
             };
         }
         MirFunction {
+            signature: crate::FunctionSignature {
+                receiver: None,
+                parameters: vec![crate::ScriptType::Any; parameters.len()],
+                variadic: None,
+                result: crate::ScriptType::Any,
+            },
             blocks: builder.blocks,
             regions: builder.regions,
             parameters,
             virtual_register_count: builder.next_register,
+        }
+    }
+
+    fn closure_signature(&self, expression: &HirExpr<'_>) -> crate::FunctionSignature {
+        let (parameters, result) = match self.types.get(expression.ty) {
+            Some(crate::ScriptType::Callable { parameters, result }) => {
+                (parameters.clone(), result.as_ref().clone())
+            }
+            Some(crate::ScriptType::Binding(result)) => (Vec::new(), result.as_ref().clone()),
+            // Native trailing blocks currently have an erased Function type,
+            // but always have zero parameters.
+            Some(crate::ScriptType::Function) => (Vec::new(), crate::ScriptType::Any),
+            _ => unreachable!("typed HIR closures must have a callable or binding type"),
+        };
+        crate::FunctionSignature {
+            receiver: None,
+            parameters,
+            variadic: None,
+            result,
         }
     }
 
@@ -443,7 +506,10 @@ impl MirBuilder {
                 let value = self.lower_expression(argument, errors)?;
                 match operation {
                     crate::intrinsics::Intrinsic::Panic => {
-                        self.push(MirInstruction::Panic(value));
+                        self.push(MirInstruction::Panic {
+                            message: value,
+                            span: expression.span,
+                        });
                         Some(self.constant(MirConstant::Unit))
                     }
                     crate::intrinsics::Intrinsic::FloatToInt
@@ -563,6 +629,39 @@ impl MirBuilder {
                 arguments,
                 function,
             } => {
+                let mut argument_types = Vec::new();
+                if let HirExprKind::Member { object, .. } = callee.kind
+                    && matches!(
+                        function,
+                        ResolvedFunction::Builtin(_) | ResolvedFunction::External(_)
+                    )
+                {
+                    argument_types.push(crate::runtime::ArgumentType {
+                        ty: self
+                            .types
+                            .get(object.ty)
+                            .expect("receiver type exists")
+                            .clone(),
+                        numeric_literal: false,
+                    });
+                }
+                argument_types.extend(arguments.iter().map(|argument| {
+                    crate::runtime::ArgumentType {
+                        ty: self
+                            .types
+                            .get(argument.value.ty)
+                            .expect("argument type exists")
+                            .clone(),
+                        numeric_literal: match argument.value.kind {
+                            HirExprKind::Literal(HirLiteral::Number { .. }) => true,
+                            HirExprKind::UnaryMinus(value) => matches!(
+                                value.kind,
+                                HirExprKind::Literal(HirLiteral::Number { .. })
+                            ),
+                            _ => false,
+                        },
+                    }
+                }));
                 let dynamic_callee = matches!(function, ResolvedFunction::Dynamic)
                     .then(|| self.lower_expression(callee, errors))
                     .flatten();
@@ -586,11 +685,13 @@ impl MirBuilder {
                     .collect::<Option<Vec<_>>>()?;
                 let dst = self.register();
                 self.push(MirInstruction::Call {
+                    span: expression.span,
                     dst,
                     function,
                     receiver,
                     dynamic_callee,
                     arguments,
+                    argument_types,
                 });
                 Some(dst)
             }
@@ -636,7 +737,8 @@ impl MirBuilder {
                 Some(dst)
             }
             HirExprKind::Block(block) => {
-                let region = Self::lower(block, true, false, Vec::new(), errors);
+                let mut region = Self::lower(block, true, false, Vec::new(), self.types, errors);
+                region.signature = self.closure_signature(expression);
                 let region_id = self.regions.len() as u32;
                 self.regions.push(region);
                 let dst = self.register();
@@ -651,7 +753,15 @@ impl MirBuilder {
                 body,
                 return_value,
             } => {
-                let region = Self::lower(body, true, return_value, parameters.to_vec(), errors);
+                let mut region = Self::lower(
+                    body,
+                    true,
+                    return_value,
+                    parameters.to_vec(),
+                    self.types,
+                    errors,
+                );
+                region.signature = self.closure_signature(expression);
                 let region_id = self.regions.len() as u32;
                 self.regions.push(region);
                 let dst = self.register();
