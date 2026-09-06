@@ -18,6 +18,7 @@ pub fn load_internal_shaders(app: &mut App) {
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, AlphaMaskUniform)]
+#[bind_group_data(AlphaMaskKey)]
 pub struct AlphaMaskMaterial {
     #[texture(1)]
     #[sampler(2)]
@@ -32,6 +33,19 @@ pub struct AlphaMaskMaterial {
     pub offsets: Vec4,
     pub opacity: f32,
     pub mask_enabled: f32,
+    /// Blending is independent of coverage; this selects a pipeline variant.
+    pub multiply: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AlphaMaskKey {
+    multiply: bool,
+}
+
+impl From<&AlphaMaskMaterial> for AlphaMaskKey {
+    fn from(material: &AlphaMaskMaterial) -> Self {
+        Self { multiply: material.multiply }
+    }
 }
 
 #[derive(Clone, Debug, ShaderType)]
@@ -70,6 +84,21 @@ impl Material for AlphaMaskMaterial {
 
     fn enable_shadows() -> bool {
         false
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if key.bind_group_data.multiply {
+            descriptor.fragment.as_mut()
+                .expect("character material requires a fragment stage")
+                .shader_defs.push("MASK_MULTIPLY".into());
+            specialize_multiply_blend(descriptor);
+        }
+        Ok(())
     }
 }
 
@@ -122,21 +151,31 @@ impl Material for MultiplyMaterial {
         _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        let target = descriptor
-            .fragment
-            .as_mut()
-            .and_then(|fragment| fragment.targets.first_mut())
-            .and_then(Option::as_mut)
-            .expect("Material2d must provide a color target");
-        target.blend = Some(BlendState {
+        specialize_multiply_blend(descriptor);
+        Ok(())
+    }
+}
+
+/// Both multiply paths output premultiplied color. For coverage `a`, this
+/// computes destination * (source * a + 1 - a), including mask/fade opacity.
+fn specialize_multiply_blend(descriptor: &mut RenderPipelineDescriptor) {
+    let target = descriptor
+        .fragment
+        .as_mut()
+        .and_then(|fragment| fragment.targets.first_mut())
+        .and_then(Option::as_mut)
+        .expect("character material requires a color target");
+    target.blend = Some(multiply_blend_state());
+}
+
+fn multiply_blend_state() -> BlendState {
+    BlendState {
             color: BlendComponent {
                 src_factor: BlendFactor::Dst,
                 dst_factor: BlendFactor::OneMinusSrcAlpha,
                 operation: BlendOperation::Add,
             },
             alpha: BlendComponent::OVER,
-        });
-        Ok(())
     }
 }
 
@@ -152,4 +191,40 @@ pub fn rgba8_color(color: [u8; 4]) -> Color {
 
 pub fn rgba8_linear(color: [u8; 4]) -> Vec4 {
     rgba8_color(color).to_linear().to_f32_array().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_blend_mode_is_part_of_pipeline_key_not_uniform_layout() {
+        let mut material = AlphaMaskMaterial {
+            texture: Handle::default(), mask_texture: Handle::default(),
+            tint: Vec4::ONE, main_rect: Vec4::ONE, mask_rect: Vec4::ONE,
+            offsets: Vec4::ZERO, opacity: 0.5, mask_enabled: 1.0, multiply: false,
+        };
+        let normal = material.bind_group_data();
+        material.multiply = true;
+        let multiply = material.bind_group_data();
+        assert_ne!(normal, multiply);
+        assert!(multiply.multiply);
+        let uniform = AlphaMaskUniform::from(&material);
+        assert_eq!(uniform.opacity, 0.5);
+        assert_eq!(uniform.mask_enabled, 1.0);
+    }
+
+    #[test]
+    fn multiply_preserves_uncovered_destination_and_composites_alpha() {
+        let blend = multiply_blend_state();
+        assert_eq!(blend.color.src_factor, BlendFactor::Dst);
+        assert_eq!(blend.color.dst_factor, BlendFactor::OneMinusSrcAlpha);
+        assert_eq!(blend.alpha, BlendComponent::OVER);
+        let composite = |source: f32, destination: f32, alpha: f32| {
+            source * alpha * destination + destination * (1.0 - alpha)
+        };
+        assert_eq!(composite(0.25, 0.8, 0.0), 0.8);
+        assert_eq!(composite(0.25, 0.8, 1.0), 0.2);
+        assert_eq!(composite(0.25, 0.8, 0.5), 0.5);
+    }
 }

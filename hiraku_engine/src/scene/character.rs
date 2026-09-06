@@ -576,6 +576,7 @@ pub(super) fn queue_character_show(
                             ),
                             opacity: 1.0,
                             mask_enabled: (writer.id != part.id) as u8 as f32,
+                            multiply: part.blend == CharacterBlendMode::Multiply,
                         });
                         commands
                             .spawn((

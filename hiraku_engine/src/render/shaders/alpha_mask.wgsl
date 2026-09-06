@@ -49,5 +49,9 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
+#ifdef MASK_MULTIPLY
+    return vec4(color.rgb * color.a, color.a);
+#else
     return color;
+#endif
 }

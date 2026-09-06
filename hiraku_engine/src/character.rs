@@ -405,16 +405,6 @@ fn character_definition_from_config(
                     texture_rect
                         .map(|rect| [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]])
                 });
-            if part.mask.is_some_and(|mask| mask.kind == CharacterMaskKind::Read)
-                && part.blend == CharacterBlendMode::Multiply
-            {
-                return Err(CharacterCatalogError::Data {
-                    path: config_path.clone(),
-                    message: format!(
-                        "part `{id}` cannot combine `mask: \"read\"` with `blend: \"multiply\"`; use separate parts"
-                    ),
-                });
-            }
             Ok(CharacterPartDefinition {
                 id,
                 slot: part
@@ -592,6 +582,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_masked_multiply_parts_without_splitting_layers() {
+        let source = r#".{
+            slots: ["eyes", "shade"],
+            parts: .{
+                eyes: .{ path: "alice.png", slot: "eyes", rect: (0, 0, 32, 16),
+                    mask: .{ kind: "write", ref: 2 } },
+                shade: .{ path: "alice.png", slot: "shade", rect: (32, 0, 32, 16),
+                    mask: .{ kind: "read", ref: 2 }, blend: "multiply",
+                    color: [255, 128, 64, 96] }
+            },
+            basis: ["eyes", "shade"]
+        }"#;
+        let config = parse_hks_data("characters/alice.char.hson", source)
+            .expect("synthetic character config should deserialize");
+        let vfs = HdpVfs::new_with_config(".", "settings.hson", "startup.hks");
+        let alice = character_definition_from_config(
+            &vfs, &TextureCatalog::default(), "alice".into(),
+            "characters".into(), "characters/alice.char.hson".into(), config,
+        ).expect("mask coverage and multiply blending must be composable");
+        let visible = alice.parts_for_expressions(&[]).expect("basis should resolve");
+        assert_eq!(visible.len(), 2);
+        let shade = visible.iter().find(|part| part.id == "shade").expect("shade must exist");
+        assert_eq!(shade.mask, Some(CharacterMaskDefinition {
+            kind: CharacterMaskKind::Read, reference: 2,
+        }));
+        assert_eq!(shade.blend, CharacterBlendMode::Multiply);
+        assert_eq!(shade.color, [255, 128, 64, 96]);
+    }
 
     #[test]
     fn loads_hks_character_catalog_and_parts() {
