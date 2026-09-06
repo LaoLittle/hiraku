@@ -1,0 +1,9 @@
+.{
+    name: "palette",
+    image: "palette.png",
+    regions: .{
+        "swatch/off": (0, 0, 64, 64),
+        "swatch/hover": (64, 0, 64, 64),
+        "swatch/on": (128, 0, 64, 64),
+    },
+}

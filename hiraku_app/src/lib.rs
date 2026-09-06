@@ -6,12 +6,16 @@ use bevy::{
     sprite::{SpritePickingCamera, SpritePickingMode, SpritePickingSettings},
     window::WindowPlugin,
 };
+use bevy::{input::mouse::MouseScrollUnit, picking::events::Scroll};
+use hiraku_engine::input::{HirakuScrollInput, HirakuScrollUnit};
 use hiraku_engine::{
     HirakuCanvas, HirakuPluginGroup, RuntimeLaunchConfig, configure_runtime_app,
     input::{HirakuAction, HirakuActionInput, HirakuPointerInput, HirakuPointerPhase},
 };
 
 const PRESENTATION_LAYER: usize = 31;
+
+pub mod text_input;
 
 #[derive(Component)]
 struct CanvasPresentation;
@@ -29,6 +33,7 @@ impl Plugin for HirakuPresentationPlugin {
             require_markers: true,
             picking_mode: SpritePickingMode::BoundingBox,
         })
+        .add_plugins(text_input::HirakuTextInputPlugin)
         .add_systems(Update, (present_hiraku_canvas, bridge_host_actions));
     }
 }
@@ -68,7 +73,11 @@ pub fn build_app(config: RuntimeLaunchConfig) -> App {
 fn bridge_host_actions(
     keys: Res<ButtonInput<KeyCode>>,
     mut actions: MessageWriter<HirakuActionInput>,
+    focus: Res<hiraku_engine::input::HirakuTextFocus>,
 ) {
+    if focus.0.is_some() {
+        return;
+    }
     if keys.any_just_pressed([KeyCode::Enter, KeyCode::Space]) {
         actions.write(HirakuActionInput(HirakuAction::NextDialogue));
     }
@@ -200,6 +209,34 @@ fn forward_canvas_release(
     }
 }
 
+fn forward_canvas_scroll(
+    mut event: On<Pointer<Scroll>>,
+    targets: Query<&GlobalTransform, With<CanvasPresentation>>,
+    canvas: Option<Res<HirakuCanvas>>,
+    mut output: MessageWriter<HirakuScrollInput>,
+) {
+    let (Some(pointer), Some(canvas), Ok(transform)) = (
+        host_pointer_id(event.pointer_id),
+        canvas.as_ref(),
+        targets.get(event.event_target()),
+    ) else {
+        return;
+    };
+    let Some(uv) = canvas_uv(&event.hit, transform, canvas.size.as_vec2()) else {
+        return;
+    };
+    output.write(HirakuScrollInput {
+        pointer,
+        uv,
+        delta: Vec2::new(event.x, event.y),
+        unit: match event.unit {
+            MouseScrollUnit::Line => HirakuScrollUnit::Line,
+            MouseScrollUnit::Pixel => HirakuScrollUnit::Pixel,
+        },
+    });
+    event.propagate(false);
+}
+
 fn present_hiraku_canvas(
     mut commands: Commands,
     canvas: Option<Res<HirakuCanvas>>,
@@ -222,7 +259,8 @@ fn present_hiraku_canvas(
         .entity(surface)
         .observe(forward_canvas_move)
         .observe(forward_canvas_press)
-        .observe(forward_canvas_release);
+        .observe(forward_canvas_release)
+        .observe(forward_canvas_scroll);
     commands.spawn((
         PresentationCamera,
         SpritePickingCamera,
@@ -240,4 +278,70 @@ fn present_hiraku_canvas(
         }),
         layer,
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::{
+        camera::NormalizedRenderTarget,
+        picking::{backend::HitData, pointer::Location},
+    };
+
+    #[test]
+    fn canvas_scroll_observer_forwards_physical_input_but_not_virtual_input() {
+        let mut app = App::new();
+        app.insert_resource(HirakuCanvas {
+            image: Handle::default(),
+            size: UVec2::new(800, 600),
+        })
+        .add_message::<HirakuScrollInput>();
+        let surface = app
+            .world_mut()
+            .spawn((CanvasPresentation, GlobalTransform::IDENTITY))
+            .observe(forward_canvas_scroll)
+            .id();
+        for pointer in [PointerId::Mouse, PointerId::Touch(3)] {
+            app.world_mut().trigger(Pointer::new(
+                pointer,
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 800,
+                        height: 600,
+                    },
+                    position: Vec2::ZERO,
+                },
+                Scroll {
+                    unit: MouseScrollUnit::Line,
+                    x: 0.0,
+                    y: -2.0,
+                    hit: HitData {
+                        camera: surface,
+                        depth: 0.0,
+                        position: Some(Vec3::ZERO),
+                        normal: None,
+                        extra: None,
+                    },
+                    phase: bevy::input::touch::TouchPhase::Moved,
+                },
+                surface,
+            ));
+        }
+        let forwarded = app
+            .world_mut()
+            .resource_mut::<Messages<HirakuScrollInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(forwarded.len(), 2);
+        assert_eq!(forwarded[0].pointer, 0);
+        assert_eq!(forwarded[1].pointer, 4);
+        for event in forwarded {
+            assert_eq!(event.uv, Vec2::splat(0.5));
+            assert_eq!(event.delta, Vec2::new(0.0, -2.0));
+            assert_eq!(event.unit, HirakuScrollUnit::Line);
+        }
+        // Custom pointers belong to the embedded canvas and must not be
+        // reflected back into the host-to-engine bridge.
+        assert_eq!(host_pointer_id(PointerId::Custom(Default::default())), None);
+    }
 }

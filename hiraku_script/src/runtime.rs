@@ -272,6 +272,9 @@ pub enum Value {
         symbol: SymbolId,
     },
     Closure {
+        /// Reified type arguments captured from the enclosing invocation.
+        #[serde(default)]
+        type_bindings: Vec<(SymbolId, crate::ScriptType)>,
         /// Portable captures at an embedding boundary. Live VM closures use
         /// the execution heap and leave this empty.
         objects: Option<Box<crate::ObjectHeap>>,

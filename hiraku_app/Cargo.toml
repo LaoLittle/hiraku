@@ -9,3 +9,6 @@ license.workspace = true
 [dependencies]
 bevy.workspace = true
 hiraku-engine.workspace = true
+
+[dev-dependencies]
+hiraku-script.workspace = true

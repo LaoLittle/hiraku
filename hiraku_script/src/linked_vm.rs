@@ -96,6 +96,23 @@ impl LinkedVm {
         &self.program
     }
 
+    /// Host access policy, inherited by subsequently invoked script modules.
+    pub fn set_read_only_globals(&mut self, names: std::collections::BTreeSet<String>) {
+        for (_, vm) in &mut self.frames {
+            vm.set_read_only_globals(names.clone());
+        }
+    }
+
+    /// Make a fresh invocation's input object graph read-only without restricting
+    /// objects subsequently allocated by the function itself.
+    pub fn freeze_invocation_inputs(&mut self) -> Result<(), LinkedVmError> {
+        let (_, vm) = self.frames.last_mut().ok_or(LinkedVmError::NoFrame)?;
+        vm.swap_objects(&mut self.objects);
+        let result = vm.freeze_invocation_inputs();
+        vm.swap_objects(&mut self.objects);
+        result.map_err(Into::into)
+    }
+
     /// A safe-point collection across all linked call frames, including host roots.
     pub fn collect_objects(&mut self, host_roots: &[Value]) -> Result<usize, VmError> {
         self.objects.collect(
@@ -222,7 +239,9 @@ impl LinkedVm {
                                 .into_iter()
                                 .map(|argument| bind_value_module(argument.value, *module_id))
                                 .collect();
-                            let callee = Vm::from_function(bytecode, function, arguments)?;
+                            let mut callee = Vm::from_function(bytecode, function, arguments)?;
+                            callee.set_type_bindings(call.type_bindings);
+                            callee.set_read_only_globals(vm.read_only_globals().clone());
                             self.frames.push((module, callee));
                         }
                         None => return Err(LinkedVmError::UnlinkedCall(call.function)),
@@ -343,11 +362,13 @@ fn bind_value_module(value: Value, module: ModuleId) -> Value {
             symbol,
         },
         Value::Closure {
+            type_bindings,
             module: owner,
             region,
             captures,
             objects,
         } => Value::Closure {
+            type_bindings,
             objects,
             module: owner.or(Some(module.0)),
             region,
@@ -390,10 +411,8 @@ impl From<VmError> for LinkedVmError {
 
 impl std::fmt::Display for LinkedVmError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Self::Vm(error) = self
-            && let Some(rendered) = error.render_diagnostic(crate::RenderOptions::terminal())
-        {
-            return formatter.write_str(&rendered);
+        if let Self::Vm(error) = self {
+            return std::fmt::Display::fmt(error, formatter);
         }
         write!(formatter, "{self:?}")
     }

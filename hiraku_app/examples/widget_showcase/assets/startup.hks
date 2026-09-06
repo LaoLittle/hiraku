@@ -1,0 +1,9 @@
+// Input drafts belong to the mounted UI, not to the story save state.
+ui.set("widgets", "ui/widgets.ui.hks")
+
+while true {
+    let result = ui.open("widgets")
+    if result == "quit" {
+        exit()
+    }
+}

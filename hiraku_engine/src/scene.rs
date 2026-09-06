@@ -60,6 +60,7 @@ mod command_runtime;
 mod dialogue;
 mod runtime_menu;
 mod screen_ui;
+pub(crate) mod widgets;
 mod snapshot;
 mod video_runtime;
 

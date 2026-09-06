@@ -794,6 +794,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_ui_result_requires_and_obeys_a_concrete_cast() {
+        let source = "global var answer: Int = 0\nlet result = ui.open_any(\"form\") as! .{ a: Int }\nanswer = result.a";
+        for value in [Value::Number(1.0), Value::String("alice".into())] {
+            let code =
+                compile_story_bytecode("memory://result.hks", source).expect("raw API compiles");
+            let mut runtime = StoryRuntime::new(code).expect("runtime");
+            assert!(matches!(
+                runtime.step().expect("open UI"),
+                Some(StoryRuntimeEvent::OpenUi { .. })
+            ));
+            runtime
+                .resume(Value::Map(BTreeMap::from([("a".into(), value.clone())])))
+                .expect("host result accepted");
+            if matches!(value, Value::String(_)) {
+                assert!(
+                    runtime.step().is_err(),
+                    "invalid data must fail the explicit cast"
+                );
+            } else {
+                while runtime.step().expect("valid result").is_some() {}
+                assert_eq!(runtime.globals().get("answer"), Some(&Value::Number(1.0)));
+            }
+        }
+    }
+
+    #[test]
     fn ui_roles_are_engine_effects_and_ui_open_is_a_selector_call() {
         let bytecode = compile_story_bytecode(
             "ui_roles.hks",

@@ -13,6 +13,7 @@ pub struct RuntimeMenuButton {
 
 #[derive(SystemParam)]
 pub struct RuntimeMenuContext<'w, 's> {
+    pub local_states: Query<'w, 's, &'static mut super::widgets::UiLocalState>,
     pub commands: Commands<'w, 's>,
     pub asset_server: Res<'w, AssetServer>,
     pub textures: Res<'w, TextureCatalog>,
@@ -44,6 +45,8 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub speaker_text: Query<'w, 's, &'static mut Text, (With<SpeakerText>, Without<LineText>)>,
     pub line_text: Query<'w, 's, &'static mut Text, (With<LineText>, Without<SpeakerText>)>,
     pub clicks: MessageReader<'w, 's, Pointer<Click>>,
+    pub widget_callbacks: MessageReader<'w, 's, super::widgets::UiCallbackRequest>,
+    pub entities: Query<'w, 's, Entity>,
     pub action_query: Query<
         'w,
         's,
@@ -54,6 +57,7 @@ pub struct RuntimeMenuContext<'w, 's> {
         ),
     >,
     pub parents: Query<'w, 's, &'static ChildOf>,
+    pub images: Query<'w, 's, &'static mut ImageNode>,
 }
 
 pub fn update_runtime_menu_button_visuals(
@@ -137,6 +141,7 @@ fn start_frontend_session(
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
+    let mut invocations = Vec::new();
     for click in ctx.clicks.read() {
         if click.button != PointerButton::Primary {
             continue;
@@ -168,13 +173,17 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
         // The action may replace or cover this node before picking emits a
         // later interaction transition. Restore its release visual now.
         if let Some(image_button) = image_button {
-            let mut image = ImageNode::new(image_button.normal_texture.clone());
-            image.texture_atlas = image_button.normal_atlas.clone();
-            image.rect = image_button.normal_rect;
+            if let Ok(mut image) = ctx.images.get_mut(button_entity) {
+                restore_image_source(
+                    &mut image,
+                    &image_button.normal_texture,
+                    &image_button.normal_atlas,
+                    image_button.normal_rect,
+                );
+            }
             ctx.commands.entity(button_entity).insert((
                 BackgroundColor(Color::NONE),
                 UiTransform::IDENTITY,
-                image,
                 image_button.normal_node.clone(),
             ));
         } else if let Some(screen_button) = screen_button {
@@ -186,39 +195,84 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 .entity(screen_button.text_entity)
                 .insert(TextColor(screen_button.normal_text_color));
             if let Some(texture) = screen_button.normal_texture.as_ref() {
-                let mut image = ImageNode::new(texture.clone());
-                image.texture_atlas = screen_button.normal_atlas.clone();
-                image.rect = screen_button.normal_rect;
-                ctx.commands.entity(button_entity).insert(image);
+                if let Ok(mut image) = ctx.images.get_mut(button_entity) {
+                    restore_image_source(
+                        &mut image,
+                        texture,
+                        &screen_button.normal_atlas,
+                        screen_button.normal_rect,
+                    );
+                }
             }
         } else {
             ctx.commands
                 .entity(button_entity)
                 .insert(BackgroundColor(ctx.ui_style.choice_button_bg));
         }
-        let callback = button.callback.clone();
+        invocations.push((button.screen_root, button.callback.clone(), Vec::new()));
+    }
+    for request in ctx.widget_callbacks.read() {
+        if ctx.entities.contains(request.entity)
+            && ctx.screen_state.active_root.map_or_else(
+                || {
+                    ctx.overlay_state
+                        .roots
+                        .values()
+                        .any(|root| *root == request.root)
+                },
+                |root| root == request.root,
+            )
+        {
+            invocations.push((
+                Some(request.root),
+                request.callback.clone(),
+                request.arguments.clone(),
+            ));
+        }
+    }
+    for (root, callback, arguments) in invocations {
+        if let Some(root) = root
+            && Some(root) != ctx.screen_state.active_root
+            && !ctx
+                .overlay_state
+                .roots
+                .values()
+                .any(|overlay| *overlay == root)
+        {
+            continue;
+        }
         let mut globals = ctx
             .script_runtime
             .story
             .as_ref()
             .map(|story| story.globals().clone())
             .unwrap_or_default();
-        let (effects, updated) =
-            match crate::script::evaluate_ui_callback(&callback, &globals, &ctx.models) {
-                Ok(result) => result,
-                Err(error) => {
-                    crate::script::emit_script_diagnostic("onClick failed", &error.to_string());
-                    continue;
-                }
-            };
-        // Only story globals are writable here. UI models are read-only projections.
-        for (name, value) in updated {
-            if globals.contains_key(&name) && !ctx.models.roots().any(|(root, _)| root == name) {
-                globals.insert(name, value);
-            }
+        if let Some(root) = root
+            && let Ok(local) = ctx.local_states.get(root)
+        {
+            globals.extend(local.0.clone());
         }
-        if let Some(story) = ctx.script_runtime.story.as_mut() {
-            story.set_globals(globals);
+        let (effects, updated) = match crate::script::evaluate_ui_callback_with_args(
+            &callback,
+            &globals,
+            &ctx.models,
+            arguments,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                crate::script::emit_script_diagnostic("UI callback failed", &error.to_string());
+                continue;
+            }
+        };
+        // Accept only this screen's explicitly declared state. No story writeback.
+        if let Some(root) = root
+            && let Ok(mut local) = ctx.local_states.get_mut(root)
+        {
+            for (name, value) in updated {
+                if callback.owned_globals.contains(&name) {
+                    local.0.insert(name, value);
+                }
+            }
         }
         for effect in effects {
             match &effect {
@@ -308,7 +362,13 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                         ),
                     }
                 }
-                crate::ui::UiEffect::CloseUi => {
+                crate::ui::UiEffect::CloseUi { value } => {
+                    if let Some(request) = ctx.screen_state.waiting.take() {
+                        ctx.responses.write(ScriptResponseMessage {
+                            request,
+                            response: ScriptResponse::UiResult(value.clone()),
+                        });
+                    }
                     clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
                 }
                 crate::ui::UiEffect::Navigate(navigation) => {
@@ -325,6 +385,44 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     );
                 }
             }
+        }
+    }
+}
+
+/// Swapping artwork must not discard stretching, tint, flips or visual-box
+/// settings. Reconstructing ImageNode here made buttons shrink after a click.
+fn restore_image_source(
+    image: &mut ImageNode,
+    texture: &Handle<Image>,
+    atlas: &Option<TextureAtlas>,
+    rect: Option<Rect>,
+) {
+    image.image = texture.clone();
+    image.texture_atlas = atlas.clone();
+    image.rect = rect;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restoring_button_artwork_preserves_rendering_configuration() {
+        let mut image = ImageNode::default().with_mode(bevy::ui::widget::NodeImageMode::Stretch);
+        image.visual_box = bevy::ui::VisualBox::BorderBox;
+        image.flip_x = true;
+        image.color = Color::srgb(0.3, 0.5, 0.7);
+        let rect = Some(Rect::new(0.0, 0.0, 64.0, 64.0));
+        for _ in 0..3 {
+            restore_image_source(&mut image, &Handle::default(), &None, rect);
+            assert!(matches!(
+                image.image_mode,
+                bevy::ui::widget::NodeImageMode::Stretch
+            ));
+            assert_eq!(image.visual_box, bevy::ui::VisualBox::BorderBox);
+            assert!(image.flip_x);
+            assert_eq!(image.color, Color::srgb(0.3, 0.5, 0.7));
+            assert_eq!(image.rect, rect);
         }
     }
 }

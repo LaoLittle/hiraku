@@ -207,6 +207,7 @@ pub fn drive_story_runtime(
         let direct_value = match &response {
             ScriptResponse::Choice(value) => stored_to_hks(value.clone()),
             ScriptResponse::Continue => hiraku_script::Value::Unit,
+            ScriptResponse::UiResult(value) => value.clone(),
         };
         if runtime
             .story

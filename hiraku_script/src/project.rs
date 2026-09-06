@@ -15,6 +15,7 @@ pub struct ScriptSource {
 
 #[derive(Clone, Debug, Default)]
 pub struct ProjectInterface {
+    pub(crate) type_parameters: BTreeMap<SymbolId, Vec<SymbolId>>,
     pub(crate) symbols: SymbolManifest,
     pub(crate) functions: BTreeMap<SymbolId, FunctionSignature>,
 }
@@ -71,6 +72,7 @@ pub fn compile_project(
         return Err(errors);
     }
     let mut interface = ProjectInterface {
+        type_parameters: BTreeMap::new(),
         symbols: natives.symbols().clone(),
         functions: BTreeMap::new(),
     };
@@ -182,6 +184,43 @@ mod tests {
     }
 
     #[test]
+    fn generic_module_exports_infer_result_and_check_runtime_casts() {
+        let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for literal in ["1", "\"alice\""] {
+            let project = compile_project(
+                vec![
+                    source(
+                        "entry.hks",
+                        &format!("let result: Int = api.convert({literal})"),
+                    ),
+                    ScriptSource {
+                        path: "api.hks".into(),
+                        namespace: Some("api".into()),
+                        source: "global fn convert<T>(value: Any) -> T { value as! T }".into(),
+                    },
+                ],
+                &natives,
+            )
+            .expect("generic module compiles");
+            let mut vm =
+                crate::LinkedVm::new(project.program, project.paths["entry.hks"]).expect("VM");
+            let mut failed = false;
+            loop {
+                match vm.step() {
+                    Err(crate::LinkedVmError::Vm(crate::VmError::CastFailed(_))) => {
+                        failed = true;
+                        break;
+                    }
+                    Ok(Some(crate::LinkedVmEvent::Completed(_))) | Ok(None) => break,
+                    Ok(_) => {}
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            assert_eq!(failed, literal != "1");
+        }
+    }
+
+    #[test]
     fn compilation_is_independent_of_discovery_order() {
         let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
         let sources = vec![
@@ -204,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_cross_module_panic_has_three_snippets_then_compact_frames() {
+    fn restored_cross_module_panic_pretty_prints_the_bottom_three_frames() {
         let natives = BuiltinManifest::new([("checkpoint", crate::BuiltinId(1))]);
         let project = compile_project(vec![
             source("entry.hks", "fn outer() -> Never { second() }\nouter()"),
@@ -238,10 +277,17 @@ mod tests {
                         .render_diagnostic(crate::RenderOptions::plain())
                         .expect("report renders");
                     assert_eq!(report.matches("[HKS-PANIC]").count(), 3, "{report}");
-                    assert!(report.contains("at entry(entry.hks 2:1)"), "{report}");
+                    assert!(report.contains("  at third(provider.hks 3:2)"), "{report}");
+                    for name in ["second", "outer", "entry"] {
+                        assert!(
+                            report.contains(&format!("[HKS-PANIC] Error: at {name}")),
+                            "{report}"
+                        );
+                    }
+                    assert!(!report.contains("[HKS-PANIC] Error: at third"), "{report}");
                     assert!(
-                        report.contains("checkpoint()"),
-                        "previous context line: {report}"
+                        !report.contains("checkpoint()"),
+                        "top frame must be compact: {report}"
                     );
                     break;
                 }

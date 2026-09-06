@@ -109,6 +109,7 @@ pub enum MirInstruction {
         fields: Vec<(SymbolId, VirtualRegister)>,
     },
     Call {
+        type_bindings: std::collections::BTreeMap<crate::SymbolId, crate::ScriptType>,
         span: Span,
         dst: VirtualRegister,
         function: ResolvedFunction,
@@ -625,6 +626,7 @@ impl<'types> MirBuilder<'types> {
                 Some(dst)
             }
             HirExprKind::Call {
+                type_bindings,
                 callee,
                 arguments,
                 function,
@@ -685,6 +687,15 @@ impl<'types> MirBuilder<'types> {
                     .collect::<Option<Vec<_>>>()?;
                 let dst = self.register();
                 self.push(MirInstruction::Call {
+                    type_bindings: type_bindings
+                        .iter()
+                        .map(|(name, ty)| {
+                            (
+                                *name,
+                                self.types.get(*ty).expect("generic type exists").clone(),
+                            )
+                        })
+                        .collect(),
                     span: expression.span,
                     dst,
                     function,

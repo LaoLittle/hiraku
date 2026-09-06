@@ -1,0 +1,125 @@
+import ui.widgets.*
+
+// Module state is private to each mounted instance and resets when reopened.
+global var playerName: String = "alice"
+global var notifications: Bool = false
+global var imageToggle: Bool = false
+global var volume: Float = 0.5
+global var committedVolume: Float = 0.5
+global var submittedName: String = "alice"
+global var status: String = "Try the controls below."
+
+// Named function references work too; the other controls demonstrate closures.
+fn acceptVolume(value: Float) {
+    volume = value
+}
+
+@ui
+global fn main() -> UiNode {
+    screen {
+        column {
+            text("Widget Showcase").fontSize(42)
+            text("Values flow into controls. onChange updates this screen's own state.").fontSize(22)
+
+            row {
+                scrollable {
+                    column {
+                        text("INPUT CONTROLS").fontSize(28).color(0.4, 0.8, 1.0, 1.0)
+
+                        text("Text input — edit, select all, or use IME; Enter submits.").fontSize(20)
+                        textInput(${playerName})
+                            .size(.abs(660, 52))
+                            .placeholder("Player name")
+                            .onChange { value: String -> playerName = value }
+                            .onCommit { value: String -> submittedName = value }
+                        text("Last submitted name (read-only text input)").fontSize(18)
+                        textInput(${submittedName}).size(.abs(660, 48)).enabled(false)
+
+                        text("Checkbox — the script accepts the proposed Bool.").fontSize(20)
+                        checkbox(${notifications}).size(.abs(140, 48))
+                            .onChange { value: Bool -> notifications = value }
+
+                        text("Slider — updates while dragging; commits on release.").fontSize(20)
+                        slider(${volume}, 0.0, 1.0).size(.abs(660, 52))
+                            .onChange(acceptVolume)
+                            .onCommit { value: Float -> committedVolume = value }
+                        text("Last committed value (disabled slider)").fontSize(18)
+                        slider(${committedVolume}, 0.0, 1.0)
+                            .size(.abs(660, 40)).enabled(false)
+
+                        text("Ignored edit — onChange does not accept the proposal.").fontSize(20)
+                        checkbox(false).size(.abs(140, 48))
+                            .onChange { value: Bool -> status = "Proposal ignored; checkbox stays unchecked." }
+
+                        text("Image toggle — gray is off; green is on.").fontSize(20)
+                        toggle(${imageToggle}) {
+                            image("swatch/off").size(.abs(140, 52))
+                        }.checked {
+                            image("swatch/on").size(.abs(140, 52))
+                        }.onChange { value: Bool -> imageToggle = value }
+                    }.gap(16).padding(12)
+                }.size(.abs(720, 650)).scrollSpeed(60)
+
+                scrollable {
+                    column {
+                        text("DISPLAY AND LAYOUT").fontSize(28).color(0.4, 0.8, 1.0, 1.0)
+                        text("Text, row, column and spacer").fontSize(22)
+                        row {
+                            text("Left").color(0.5, 0.9, 0.8, 1.0)
+                            spacer().size(.abs(80, 1))
+                            text("Right").color(0.6, 0.7, 1.0, 1.0)
+                        }.gap(16)
+
+                        text("Progress — a non-interactive 65% bar.").fontSize(20)
+                        progress(0.65).range(0.0, 1.0).size(.abs(660, 24))
+
+                        text("Image — a tiny example-owned color atlas.").fontSize(20)
+                        image("palette").size(.abs(330, 80))
+
+                        text("Image button — hover artwork, press scale, onClick.").fontSize(20)
+                        button {
+                            image("swatch/off").size(.abs(180, 60))
+                        }.hovered {
+                            image("swatch/hover").size(.abs(180, 60))
+                        }.hoverScale(1.04).pressScale(0.96)
+                            .onClick { status = "Image button clicked." }
+
+                        row {
+                            button { text("Text button") }
+                                .onClick { status = "Text button clicked." }
+                            button { text("Disabled") }.enabled(false)
+                        }.gap(18)
+
+                        text("Animation — script-authored pulse and bob.").fontSize(20)
+                        row {
+                            text("Pulse").pulse(1.2)
+                            spacer().size(.abs(70, 1))
+                            text("Bob").bob(6, 1.2)
+                        }.gap(20).padding(12)
+
+                        text("Scrollable — each column is a clipped viewport.").fontSize(20)
+                        text("Scroll to reach the controls at the bottom.").fontSize(20)
+                        spacer().size(.abs(1, 100))
+                        text("You reached the end of this column.").fontSize(20)
+                    }.gap(18).padding(12)
+                }.size(.abs(720, 650)).scrollSpeed(60)
+            }.gap(32)
+
+            // Input properties currently refresh from live story globals. This
+            // disabled input also demonstrates a model-driven status display.
+            textInput(${status}).size(.abs(1460, 48)).enabled(false)
+            row {
+                button { text("Reset values") }.onClick {
+                    playerName = "alice"
+                    submittedName = "alice"
+                    notifications = false
+                    imageToggle = false
+                    volume = 0.5
+                    committedVolume = 0.5
+                    status = "Model reset; no onChange handlers were invoked."
+                }
+                button("quit") { text("Exit") }
+            }.gap(20)
+        }.gap(16)
+    }.size(.abs(1550, 960)).overlay(0.03, 0.04, 0.07, 0.98)
+}

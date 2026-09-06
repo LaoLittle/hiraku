@@ -551,6 +551,7 @@ impl FromHksValue for SelectorValue {
 /// when and how to schedule it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HksClosure {
+    pub type_bindings: Vec<(crate::SymbolId, crate::ScriptType)>,
     pub objects: Option<Box<crate::ObjectHeap>>,
     pub module: Option<u32>,
     pub region: u32,
@@ -597,11 +598,13 @@ impl FromHksValue for HksClosure {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
             Value::Closure {
+                type_bindings,
                 objects,
                 module,
                 region,
                 captures,
             } => Ok(Self {
+                type_bindings: type_bindings.clone(),
                 objects: objects.clone(),
                 module: *module,
                 region: *region,
@@ -615,6 +618,7 @@ impl FromHksValue for HksClosure {
 impl IntoHksValue for HksClosure {
     fn into_hks_value(self) -> Value {
         Value::Closure {
+            type_bindings: self.type_bindings,
             objects: self.objects,
             module: self.module,
             region: self.region,

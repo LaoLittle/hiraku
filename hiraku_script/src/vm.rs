@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 16;
+pub const BYTECODE_VERSION: u16 = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -140,6 +140,8 @@ pub enum Instruction {
     /// A symbolic call. Runtime linking decides whether the target is script
     /// bytecode or a native implementation.
     Call {
+        #[serde(with = "type_binding_table")]
+        type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
         dst: Register,
         function: SymbolId,
         /// Caller-side types, including an explicit receiver when present.
@@ -566,6 +568,7 @@ fn emit_function(
                     }
                 }
                 MirInstruction::Call {
+                    type_bindings,
                     span: _,
                     dst,
                     function: ResolvedFunction::Builtin(builtin),
@@ -588,6 +591,7 @@ fn emit_function(
                     )?;
                     max_window = max_window.max(arguments.len());
                     Instruction::Call {
+                        type_bindings: type_bindings.clone(),
                         dst: register(*dst),
                         function,
                         receiver: receiver.map(register),
@@ -597,6 +601,7 @@ fn emit_function(
                     }
                 }
                 MirInstruction::Call {
+                    type_bindings,
                     span: _,
                     dst,
                     function: ResolvedFunction::External(function),
@@ -612,6 +617,7 @@ fn emit_function(
                     )?;
                     max_window = max_window.max(arguments.len());
                     Instruction::Call {
+                        type_bindings: type_bindings.clone(),
                         dst: register(*dst),
                         function: *function,
                         receiver: receiver.map(register),
@@ -621,6 +627,7 @@ fn emit_function(
                     }
                 }
                 MirInstruction::Call {
+                    type_bindings,
                     span: _,
                     dst,
                     function: ResolvedFunction::User(function),
@@ -642,6 +649,7 @@ fn emit_function(
                     )?;
                     max_window = max_window.max(arguments.len());
                     Instruction::Call {
+                        type_bindings: type_bindings.clone(),
                         dst: register(*dst),
                         function,
                         receiver: None,
@@ -828,6 +836,7 @@ pub enum VmEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SymbolCall {
+    pub type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
     pub function: SymbolId,
     pub receiver: Option<Value>,
     pub arguments: Vec<CallArgument>,
@@ -835,6 +844,10 @@ pub struct SymbolCall {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmSnapshot {
+    #[serde(with = "type_binding_table")]
+    pub type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
+    #[serde(default)]
+    pub read_only_globals: std::collections::BTreeSet<String>,
     pub objects: crate::ObjectHeap,
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
@@ -850,6 +863,8 @@ pub struct VmSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CallFrameSnapshot {
+    #[serde(with = "type_binding_table")]
+    pub type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
     pub location: CodeLocation,
     pub pc: usize,
     pub registers: Vec<Value>,
@@ -859,6 +874,8 @@ pub struct CallFrameSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vm {
+    type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
+    read_only_globals: std::collections::BTreeSet<String>,
     objects: crate::ObjectHeap,
     bytecode: Arc<Bytecode>,
     pc: usize,
@@ -871,6 +888,27 @@ pub struct Vm {
     call_stack: Vec<CallFrameSnapshot>,
 }
 
+mod type_binding_table {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        values: &BTreeMap<SymbolId, crate::ScriptType>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        values.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<SymbolId, crate::ScriptType>, D::Error> {
+        let entries = Vec::<(SymbolId, crate::ScriptType)>::deserialize(deserializer)?;
+        let count = entries.len();
+        let values: BTreeMap<_, _> = entries.into_iter().collect();
+        if values.len() != count {
+            return Err(serde::de::Error::custom("duplicate generic type binding"));
+        }
+        Ok(values)
+    }
+}
+
 impl Vm {
     pub fn new(bytecode: impl Into<Arc<Bytecode>>) -> Result<Self, VmError> {
         let bytecode = bytecode.into();
@@ -879,6 +917,8 @@ impl Vm {
         }
         Ok(Self {
             registers: RegisterFrame::new(bytecode.register_count),
+            read_only_globals: Default::default(),
+            type_bindings: Default::default(),
             locals: vec![Value::Uninitialized; bytecode.local_count as usize].into_boxed_slice(),
             globals: vec![Value::Uninitialized; bytecode.globals.len()].into_boxed_slice(),
             bytecode,
@@ -899,7 +939,10 @@ impl Vm {
         let mut objects = crate::ObjectHeap::default();
         let closure = objects.import(closure.clone());
         let Value::Closure {
-            region, captures, ..
+            region,
+            captures,
+            type_bindings,
+            ..
         } = &closure
         else {
             return Err(VmError::TypeMismatch("expected Function"));
@@ -917,6 +960,8 @@ impl Vm {
         Ok(Self {
             registers: RegisterFrame::new(code.register_count),
             locals: captures.clone().into_boxed_slice(),
+            read_only_globals: Default::default(),
+            type_bindings: type_bindings.iter().cloned().collect(),
             globals: vec![Value::Uninitialized; bytecode.globals.len()].into_boxed_slice(),
             bytecode,
             pc: 0,
@@ -988,6 +1033,8 @@ impl Vm {
         let register_count = metadata.register_count;
         let parameters = metadata.parameters.clone();
         let mut vm = Self {
+            read_only_globals: Default::default(),
+            type_bindings: Default::default(),
             registers: RegisterFrame::new(register_count),
             locals: vec![Value::Uninitialized; bytecode.local_count as usize].into_boxed_slice(),
             globals: vec![Value::Uninitialized; bytecode.globals.len()].into_boxed_slice(),
@@ -1068,6 +1115,11 @@ impl Vm {
                     self.write(
                         dst,
                         Value::Closure {
+                            type_bindings: self
+                                .type_bindings
+                                .iter()
+                                .map(|(name, ty)| (*name, ty.clone()))
+                                .collect(),
                             objects: None,
                             module: None,
                             region,
@@ -1088,12 +1140,18 @@ impl Vm {
                 }
                 Instruction::LoadGlobal { dst, global } => {
                     let value = self.global_slot(global)?.clone();
+                    if self.global_is_read_only(global) {
+                        self.objects.freeze(&value)?;
+                    }
                     if value == Value::Uninitialized {
                         return Err(VmError::UninitializedGlobal(global));
                     }
                     self.write(dst, value)?;
                 }
                 Instruction::StoreGlobal { global, src } => {
+                    if self.global_is_read_only(global) {
+                        return Err(VmError::ReadOnlyValue);
+                    }
                     let value = self.read(src)?.clone();
                     *self.global_mut(global)? = value;
                 }
@@ -1135,6 +1193,7 @@ impl Vm {
                     target,
                     mode,
                 } => {
+                    let target = crate::hir::substitute_type(&target, &self.type_bindings);
                     let source = self.read(value)?.clone();
                     let value = if matches!(source, Value::Object(_)) {
                         if target == crate::ScriptType::Any {
@@ -1200,6 +1259,7 @@ impl Vm {
                     self.write(dst, value)?;
                 }
                 Instruction::Call {
+                    type_bindings,
                     dst,
                     function,
                     receiver,
@@ -1207,6 +1267,12 @@ impl Vm {
                     arguments,
                     ..
                 } => {
+                    let type_bindings = type_bindings
+                        .into_iter()
+                        .map(|(name, ty)| {
+                            (name, crate::hir::substitute_type(&ty, &self.type_bindings))
+                        })
+                        .collect::<BTreeMap<_, _>>();
                     let receiver = receiver
                         .map(|receiver| self.read(receiver).cloned())
                         .transpose()?;
@@ -1235,11 +1301,13 @@ impl Vm {
                             .map(|argument| argument.value.clone())
                             .collect::<Vec<_>>();
                         self.call_script(function_index, dst, values)?;
+                        self.type_bindings = type_bindings;
                         continue;
                     }
                     self.status = VmStatus::WaitingForHost;
                     self.waiting_destination = Some(dst);
                     return Ok(Some(VmEvent::Call(SymbolCall {
+                        type_bindings,
                         function,
                         receiver,
                         arguments,
@@ -1289,13 +1357,17 @@ impl Vm {
                             self.status = VmStatus::WaitingForHost;
                             self.waiting_destination = Some(dst);
                             return Ok(Some(VmEvent::Call(SymbolCall {
+                                type_bindings: Default::default(),
                                 function,
                                 receiver: None,
                                 arguments,
                             })));
                         }
                         Value::Closure {
-                            region, captures, ..
+                            region,
+                            captures,
+                            type_bindings,
+                            ..
                         } => {
                             let parameters = self
                                 .bytecode
@@ -1320,6 +1392,7 @@ impl Vm {
                                     .collect(),
                                 dst,
                             )?;
+                            self.type_bindings = type_bindings.into_iter().collect();
                             continue;
                         }
                         _ => return Err(VmError::TypeMismatch("callee expects Function")),
@@ -1409,6 +1482,8 @@ impl Vm {
 
     pub fn snapshot(&self) -> VmSnapshot {
         VmSnapshot {
+            type_bindings: self.type_bindings.clone(),
+            read_only_globals: self.read_only_globals.clone(),
             objects: self.objects.clone(),
             source_hash: self.bytecode.source_hash,
             builtin_manifest_hash: self.bytecode.builtin_manifest_hash,
@@ -1464,6 +1539,8 @@ impl Vm {
         }
         Ok(Self {
             bytecode,
+            read_only_globals: snapshot.read_only_globals,
+            type_bindings: snapshot.type_bindings,
             pc: snapshot.pc,
             registers,
             locals: snapshot.locals.into_boxed_slice(),
@@ -1486,6 +1563,15 @@ impl Vm {
 
     pub fn objects(&self) -> &crate::ObjectHeap {
         &self.objects
+    }
+
+    /// Freeze objects supplied to a fresh invocation (parameters and captures).
+    /// Call before stepping when an embedding exposes borrowed, read-only inputs.
+    pub fn freeze_invocation_inputs(&mut self) -> Result<(), VmError> {
+        for value in &self.locals {
+            self.objects.freeze(value)?;
+        }
+        Ok(())
     }
 
     /// Roots for a collector owned by an embedding that shares this VM's heap.
@@ -1540,6 +1626,26 @@ impl Vm {
 
     pub fn globals(&self) -> &[Value] {
         &self.globals
+    }
+
+    pub fn set_read_only_globals(&mut self, names: std::collections::BTreeSet<String>) {
+        self.read_only_globals = names;
+    }
+
+    pub(crate) fn set_type_bindings(&mut self, bindings: BTreeMap<SymbolId, crate::ScriptType>) {
+        self.type_bindings = bindings;
+    }
+
+    pub(crate) fn read_only_globals(&self) -> &std::collections::BTreeSet<String> {
+        &self.read_only_globals
+    }
+
+    fn global_is_read_only(&self, index: u32) -> bool {
+        self.bytecode
+            .globals
+            .get(index as usize)
+            .and_then(|symbol| self.bytecode.symbols.resolve(*symbol))
+            .is_some_and(|name| self.read_only_globals.contains(name))
     }
 
     pub fn set_global_values(&mut self, values: Vec<Value>) -> Result<(), VmError> {
@@ -1696,7 +1802,8 @@ impl Vm {
         };
         let types = signature.receiver.iter().chain(&signature.parameters);
         for (index, (local, ty)) in parameters.iter().zip(types).enumerate() {
-            if !argument_matches(self.local(*local)?, ty, &self.objects)? {
+            let ty = crate::hir::substitute_type(ty, &self.type_bindings);
+            if !argument_matches(self.local(*local)?, &ty, &self.objects)? {
                 return Err(VmError::ArgumentTypeMismatch {
                     argument: index + 1,
                     expected: format!("{ty:?}"),
@@ -1724,6 +1831,7 @@ impl Vm {
             });
         }
         self.call_stack.push(CallFrameSnapshot {
+            type_bindings: self.type_bindings.clone(),
             location: self.location,
             pc: self.pc,
             registers: self.registers.values().to_vec(),
@@ -1760,6 +1868,7 @@ impl Vm {
             return Err(VmError::FrameShapeMismatch);
         }
         self.call_stack.push(CallFrameSnapshot {
+            type_bindings: self.type_bindings.clone(),
             location: self.location,
             pc: self.pc,
             registers: self.registers.values().to_vec(),
@@ -1783,6 +1892,7 @@ impl Vm {
             .pop()
             .ok_or(VmError::ReturnOutsideFunction)?;
         self.location = frame.location;
+        self.type_bindings = frame.type_bindings;
         self.pc = frame.pc;
         let mut registers = RegisterFrame::new(frame.registers.len() as u16);
         for (index, value) in frame.registers.into_iter().enumerate() {
@@ -2066,7 +2176,9 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
             },
             _ => Err(mismatch()),
         },
-        ScriptType::TypeParameter(_) => Ok(value.clone()),
+        ScriptType::TypeParameter(_) => Err(VmError::CastFailed(
+            "cast target contains an unresolved generic parameter".into(),
+        )),
         ScriptType::Optional(inner) => match value {
             Value::Optional(None) | Value::Null => Ok(Value::Optional(None)),
             Value::Optional(Some(value)) => {
@@ -2128,6 +2240,7 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmError {
+    ReadOnlyValue,
     ProgramFingerprintMismatch,
     InvalidObject(crate::ObjectId),
     CyclicHostValue,
@@ -2178,8 +2291,9 @@ impl VmError {
             return None;
         };
         let mut output = format!("script panicked: {message}\n");
+        let pretty_start = frames.len().saturating_sub(3);
         for (index, frame) in frames.iter().enumerate() {
-            if index < 3
+            if index >= pretty_start
                 && let (Some(source), Some(span)) = (&frame.source, frame.span)
             {
                 let mut sources = crate::SourceMap::new();
@@ -2211,6 +2325,7 @@ impl std::fmt::Display for VmError {
             return formatter.write_str(&rendered);
         }
         match self {
+            Self::ReadOnlyValue => formatter.write_str("cannot modify a read-only value; request changes through an explicitly provided callback"),
             Self::Panic { message, span, .. } => write!(
                 formatter,
                 "script panicked at bytes {}..{}: {message}",
@@ -2230,6 +2345,133 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn generic_cast_uses_call_site_type_and_survives_snapshot() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for literal in ["1", "\"alice\""] {
+            let source = format!(
+                "fn cast<T>(value: Any) -> T {{ value as! T }}\nglobal var result: Int = cast({literal})"
+            );
+            let code = Arc::new(compile(&source, &manifest));
+            let mut vm = Vm::new(code.clone()).expect("VM");
+            let mut failed = false;
+            loop {
+                let encoded =
+                    crate::hson::to_string(&vm.snapshot()).expect("generic snapshot encodes");
+                let snapshot = crate::hson::from_str(&encoded).expect("generic snapshot decodes");
+                vm = Vm::restore(code.clone(), snapshot).expect("restore");
+                match vm.step_with_budget(&mut 1) {
+                    Err(VmError::CastFailed(_)) => {
+                        failed = true;
+                        break;
+                    }
+                    Ok(Some(VmEvent::Completed(_))) => break,
+                    Ok(_) => {}
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            assert_eq!(failed, literal != "1");
+        }
+    }
+
+    #[test]
+    fn generic_wrapper_checks_host_result_after_restoring_a_wait() {
+        let manifest = BuiltinManifest::new([("raw", BuiltinId(91))]);
+        let code = Arc::new(compile(
+            "fn open<T>() -> T { raw() as! T }\nglobal var result: Int = open()",
+            &manifest,
+        ));
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        loop {
+            if matches!(vm.step().expect("wait for raw API"), Some(VmEvent::Call(_))) {
+                break;
+            }
+        }
+        let encoded = crate::hson::to_string(&vm.snapshot()).expect("waiting state serializes");
+        for value in [Value::Number(1.0), Value::String("bob".into())] {
+            let mut restored = Vm::restore(
+                code.clone(),
+                crate::hson::from_str(&encoded).expect("snapshot"),
+            )
+            .expect("restore");
+            restored.resume(value.clone()).expect("resume raw API");
+            let mut failed = false;
+            loop {
+                match restored.step() {
+                    Err(VmError::CastFailed(_)) => {
+                        failed = true;
+                        break;
+                    }
+                    Ok(Some(VmEvent::Completed(_))) => break,
+                    Ok(_) => {}
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            assert_eq!(failed, matches!(value, Value::String(_)));
+        }
+    }
+
+    #[test]
+    fn returned_closures_capture_generic_types_not_the_callers_types() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for literal in ["1", "\"alice\""] {
+            let source = format!(
+                "fn converter<T>() -> (Any) -> T {{ {{ value: Any -> value as! T }} }}\nlet convert: (Any) -> Int = converter()\nlet result: Int = convert({literal})"
+            );
+            let code = Arc::new(compile(&source, &manifest));
+            let mut vm = Vm::new(code.clone()).expect("VM");
+            let mut failed = false;
+            loop {
+                let encoded = crate::hson::to_string(&vm.snapshot()).expect("snapshot");
+                vm = Vm::restore(
+                    code.clone(),
+                    crate::hson::from_str(&encoded).expect("snapshot decodes"),
+                )
+                .expect("restore");
+                match vm.step_with_budget(&mut 1) {
+                    Err(VmError::CastFailed(_)) => {
+                        failed = true;
+                        break;
+                    }
+                    Ok(Some(VmEvent::Completed(_))) => break,
+                    Ok(_) => {}
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            assert_eq!(failed, literal != "1");
+        }
+    }
+
+    #[test]
+    fn readonly_globals_reject_rebinding_and_mutation_through_aliases_after_restore() {
+        for update in [
+            "player = .{ name: \"bob\" }",
+            "player.name = \"bob\"",
+            "let alias = player; alias.name = \"bob\"",
+            "fn change(value: .{ name: String }) { value.name = \"bob\" }; change(player)",
+        ] {
+            let source = format!("global var player = .{{ name: \"alice\" }}; {update}");
+            let code = Arc::new(compile(
+                &source,
+                &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+            ));
+            let mut vm = Vm::new(code.clone()).expect("VM");
+            assert!(matches!(
+                vm.step().expect("initializer"),
+                Some(VmEvent::Statement(_))
+            ));
+            vm.set_read_only_globals(["player".into()].into_iter().collect());
+            let mut vm = Vm::restore(code, vm.snapshot()).expect("restore readonly policy");
+            loop {
+                match vm.step() {
+                    Err(VmError::ReadOnlyValue) => break,
+                    Ok(Some(VmEvent::Statement(_))) => {}
+                    other => panic!("expected readonly error for {update}, got {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -2662,6 +2904,7 @@ mod tests {
                 module: None,
                 region: 0,
                 ref captures,
+                ..
             }
                 if captures.contains(&Value::Number(4.0))
         ));

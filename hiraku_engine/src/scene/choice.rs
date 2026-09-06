@@ -49,14 +49,13 @@ pub fn handle_choice_action_input(
     mut commands: Commands,
     mut choice_state: ResMut<ChoiceState>,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
+    text_focus: Option<Res<crate::input::HirakuTextFocus>>,
 ) {
-    if choice_state.waiting.is_none() {
-        return;
-    }
     let selected = actions.read().find_map(|action| match action.0 {
         crate::input::HirakuAction::Choice(index) => Some(index),
         _ => None,
     });
+    if choice_state.waiting.is_none() || text_focus.is_some_and(|focus| focus.0.is_some()) { return; }
     if let Some(index) = selected {
         resolve_choice(&mut commands, &mut choice_state, &choice_ui, index);
     }

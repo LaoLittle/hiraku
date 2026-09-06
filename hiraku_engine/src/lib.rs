@@ -177,6 +177,7 @@ impl Plugin for HirakuPlugin {
             .init_resource::<HdpVolumeLoads>()
             .init_resource::<texture::TextureAtlasCatalog>()
             .add_message::<input::HirakuPointerInput>()
+            .add_message::<input::HirakuScrollInput>()
             .add_message::<input::HirakuActionInput>()
             .add_systems(
                 First,
@@ -216,6 +217,22 @@ impl Plugin for HirakuPlugin {
                 Update,
                 reconcile_restored_bgm
                     .before(drive_story_runtime)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_message::<scene::widgets::UiCallbackRequest>()
+            .add_message::<input::HirakuTextInput>()
+            .init_resource::<input::HirakuTextFocus>()
+            .add_systems(
+                Update,
+                scene::widgets::input_events
+                    .after(cleanup_stale_screen_ui)
+                    .before(handle_runtime_menu_buttons)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                (scene::widgets::sync_inputs, scene::widgets::sync_toggles)
+                    .after(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, drive_story_runtime.in_set(HirakuRuntimeSystems))
@@ -292,6 +309,7 @@ impl Plugin for HirakuPlugin {
                 Update,
                 (handle_screen_scroll, handle_screen_toggles)
                     .after(cleanup_stale_screen_ui)
+                    .before(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(

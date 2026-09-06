@@ -276,6 +276,17 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
         .expect("story UI API registration must be internally consistent");
     registry
         .set_signature(
+            hiraku_script::native::stable_builtin_id("ui.open_any"),
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: vec![ScriptType::String],
+                variadic: Some(ScriptType::Any),
+                result: ScriptType::Any,
+            },
+        )
+        .expect("raw UI API is registered");
+    registry
+        .set_signature(
             hiraku_script::native::stable_builtin_id("ui.open"),
             hiraku_script::FunctionSignature {
                 receiver: None,
@@ -342,6 +353,16 @@ fn async_capability_placeholder(
 mod ui_api {
     use super::*;
 
+    #[hks(name = "open_any")]
+    fn native_open_any(
+        _context: &mut CharacterContext,
+        _role_or_component: String,
+    ) -> Result<Value, NativeError> {
+        Err(NativeError::message(
+            "ui.open_any requires the direct engine HKS runtime",
+        ))
+    }
+
     #[hks]
     fn native_open(
         _context: &mut CharacterContext,
@@ -403,12 +424,16 @@ struct StoryControlBuiltins {
     choice: BuiltinId,
     option: BuiltinId,
     open_ui: BuiltinId,
+    open_ui_any: BuiltinId,
     wait: BuiltinId,
 }
 
 impl StoryControlBuiltins {
     fn new(manifest: &BuiltinManifest) -> Self {
         Self {
+            open_ui_any: manifest
+                .resolve_selector("ui", "open_any")
+                .expect("raw UI API is registered"),
             enable_option: manifest
                 .resolve("enable")
                 .expect("option enable is registered"),
@@ -548,7 +573,7 @@ impl StoryNativeHost {
                 },
             ));
         }
-        if call.builtin == self.controls.open_ui {
+        if call.builtin == self.controls.open_ui || call.builtin == self.controls.open_ui_any {
             let path = call
                 .arguments
                 .first()

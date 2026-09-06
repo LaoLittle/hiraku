@@ -20,7 +20,9 @@ pub enum UiEffect {
     OpenUi {
         role: String,
     },
-    CloseUi,
+    CloseUi {
+        value: hiraku_script::Value,
+    },
     Save {
         slot: String,
     },
@@ -49,6 +51,7 @@ pub struct UiReactiveBinding {
 /// Recreated when a screen is mounted; pending click execution is not saved.
 #[derive(Clone, Debug)]
 pub struct UiCallback {
+    pub(crate) owned_globals: std::collections::BTreeSet<String>,
     pub(crate) program: hiraku_script::LinkedProgram,
     pub(crate) callable: hiraku_script::Value,
     pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
@@ -131,6 +134,8 @@ pub enum ScreenNode {
     Scrollable(ScrollableNode),
     /// A locally stateful two-visual toggle.
     Toggle(ToggleNode),
+    /// A model-owned input; user edits are proposals delivered to onChange.
+    Input(InputNode),
     /// Empty fixed-size space.
     Spacer(SpacerNode),
 }
@@ -148,6 +153,36 @@ pub struct ToggleNode {
     pub unchecked: ScreenImageNode,
     pub checked: ScreenImageNode,
     pub value: bool,
+    #[serde(skip)]
+    pub reactive_value: Option<UiReactiveBinding>,
+    #[serde(skip)]
+    pub on_change: Option<UiCallback>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum InputKind {
+    Checkbox,
+    Slider { min: f64, max: f64 },
+    TextInput { placeholder: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InputNode {
+    pub kind: InputKind,
+    pub value: StoredValue,
+    pub enabled: bool,
+    #[serde(skip)]
+    pub reactive_enabled: Option<UiReactiveBinding>,
+    pub layout: ScreenLayout,
+    pub text_size: Option<f32>,
+    pub text_color: Option<[f32; 4]>,
+    pub background: Option<[f32; 4]>,
+    #[serde(skip)]
+    pub reactive_value: Option<UiReactiveBinding>,
+    #[serde(skip)]
+    pub on_change: Option<UiCallback>,
+    #[serde(skip)]
+    pub on_commit: Option<UiCallback>,
 }
 
 /// Shared layout options supported by most screen nodes.

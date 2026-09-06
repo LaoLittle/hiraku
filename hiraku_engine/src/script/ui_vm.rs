@@ -72,7 +72,10 @@ enum UiDraftKind {
     Column,
     Row,
     Scrollable,
-    Toggle(bool),
+    Toggle(HksBindable<bool>),
+    Checkbox(HksBindable<bool>),
+    Slider(HksBindable<f64>, f64, f64),
+    TextInput(HksBindable<String>),
     ChoiceOptions(HksCallable),
     Image(String),
     Text(HksBindable<String>),
@@ -93,6 +96,9 @@ struct UiDraft {
     hovered: Option<HksClosure>,
     checked: Option<HksClosure>,
     on_click: Option<HksClosure>,
+    on_change: Option<HksCallable>,
+    on_commit: Option<HksCallable>,
+    placeholder: String,
     layout: ScreenLayout,
     panel: bool,
     enabled: bool,
@@ -124,6 +130,9 @@ impl UiDraft {
             hovered: None,
             checked: None,
             on_click: None,
+            on_change: None,
+            on_commit: None,
+            placeholder: String::new(),
             layout: ScreenLayout::default(),
             panel: true,
             enabled: true,
@@ -150,6 +159,8 @@ impl UiDraft {
 }
 
 struct UiVmContext {
+    owned_globals: std::collections::BTreeSet<String>,
+    local_globals: BTreeMap<String, Value>,
     values: UiContext,
     terms: TermCatalog,
     next_node: u64,
@@ -162,6 +173,8 @@ struct UiVmContext {
 impl UiVmContext {
     fn new(values: UiContext, terms: TermCatalog) -> Self {
         Self {
+            owned_globals: Default::default(),
+            local_globals: Default::default(),
             values,
             terms,
             next_node: 0,
@@ -229,10 +242,10 @@ mod native_ui {
         Ok(context.insert(UiDraft::new(UiDraftKind::Scrollable, Some(content))))
     }
 
-    #[hks(name = "__uiToggle")]
+    #[hks(name = "toggle")]
     fn ui_toggle(
         context: &mut UiVmContext,
-        value: bool,
+        value: HksBindable<bool>,
         content: HksClosure,
     ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Toggle(value), Some(content))))
@@ -244,6 +257,88 @@ mod native_ui {
         renderer: HksCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::ChoiceOptions(renderer), None)))
+    }
+
+    #[hks(name = "checkbox")]
+    fn checkbox(
+        context: &mut UiVmContext,
+        value: HksBindable<bool>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        Ok(context.insert(UiDraft::new(UiDraftKind::Checkbox(value), None)))
+    }
+
+    #[hks(name = "slider")]
+    fn slider(
+        context: &mut UiVmContext,
+        value: HksBindable<f64>,
+        min: f64,
+        max: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if !min.is_finite() || !max.is_finite() || min >= max {
+            return Err(NativeError::message("slider requires finite min < max"));
+        }
+        Ok(context.insert(UiDraft::new(UiDraftKind::Slider(value, min, max), None)))
+    }
+
+    #[hks(name = "textInput")]
+    fn text_input(
+        context: &mut UiVmContext,
+        value: HksBindable<String>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        Ok(context.insert(UiDraft::new(UiDraftKind::TextInput(value), None)))
+    }
+
+    #[hks(name = "placeholder", receiver)]
+    fn placeholder(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        text: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::TextInput(_)) {
+            return Err(NativeError::message("placeholder requires textInput"));
+        }
+        draft.placeholder = text;
+        Ok(node)
+    }
+
+    #[hks(name = "onChange", receiver)]
+    fn on_change(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        handler: HksCallable,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(
+            draft.kind,
+            UiDraftKind::Toggle(_)
+                | UiDraftKind::Checkbox(_)
+                | UiDraftKind::Slider(..)
+                | UiDraftKind::TextInput(_)
+        ) {
+            return Err(NativeError::message("onChange requires an input widget"));
+        }
+        draft.on_change = Some(handler);
+        Ok(node)
+    }
+
+    #[hks(name = "onCommit", receiver)]
+    fn on_commit(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        handler: HksCallable,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(
+            draft.kind,
+            UiDraftKind::Slider(..) | UiDraftKind::TextInput(_)
+        ) {
+            return Err(NativeError::message(
+                "onCommit requires slider or textInput",
+            ));
+        }
+        draft.on_commit = Some(handler);
+        Ok(node)
     }
 
     #[hks(name = "__uiImage")]
@@ -786,10 +881,47 @@ mod ui_actions {
         }
         Ok(context.insert_effect(UiEffect::OpenUi { role }))
     }
+}
 
-    #[hks]
-    fn native_close(context: &mut UiVmContext) -> Result<UiEffectHandle, NativeError> {
-        Ok(context.insert_effect(UiEffect::CloseUi))
+fn close_ui(
+    context: &mut UiVmContext,
+    call: &hiraku_script::BuiltinCall,
+) -> Result<Value, NativeError> {
+    let value = match call.arguments.as_slice() {
+        [] => Value::Unit,
+        [argument] => argument.value.clone(),
+        _ => {
+            return Err(NativeError::message(
+                "ui.close expects zero or one result value",
+            ));
+        }
+    };
+    validate_ui_result(&value)?;
+    Ok(context
+        .insert_effect(UiEffect::CloseUi { value })
+        .into_hks_value())
+}
+
+fn validate_ui_result(value: &Value) -> Result<(), NativeError> {
+    match value {
+        Value::Unit
+        | Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::Percent(_)
+        | Value::String(_)
+        | Value::Optional(None) => Ok(()),
+        Value::Optional(Some(value)) => validate_ui_result(value),
+        Value::Map(fields) => fields.values().try_for_each(validate_ui_result),
+        Value::List(values) | Value::Tuple(values) => {
+            values.iter().try_for_each(validate_ui_result)
+        }
+        Value::Typed { .. } => Err(NativeError::message(
+            "named UI results require shared type metadata between the UI and story modules; return plain data until type linking is available",
+        )),
+        _ => Err(NativeError::message(
+            "UI results must be owned data, not function references, live handles, or UI nodes",
+        )),
     }
 }
 
@@ -925,10 +1057,24 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
         .expect("navigation reset API registration must be internally consistent");
     // Register the nominal result type before compiling the HKS standard library.
     let ui_node = registry.define_type("UiNode");
-    registry.define_type("UiEffect");
+    let ui_effect = registry.define_type("UiEffect");
     native_ui::register_hks(&mut registry)
         .expect("UI native primitives must be internally consistent");
     ui_actions::register_hks(&mut registry).expect("UI actions must be internally consistent");
+    let close = registry
+        .register_selector_raw_fn("ui", "close", close_ui)
+        .expect("UI close primitive is unique");
+    registry
+        .set_signature(
+            close,
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: Vec::new(),
+                variadic: Some(ScriptType::Any),
+                result: ScriptType::Named(ui_effect),
+            },
+        )
+        .expect("UI close signature is registered");
     storage_actions::register_hks(&mut registry)
         .expect("storage actions must be internally consistent");
     story_actions::register_hks(&mut registry)
@@ -1116,6 +1262,13 @@ pub fn evaluate_ui_component_named_with_args(
     })?;
     let entry = project.paths[path];
     let document = &project.program.modules[entry.0 as usize].bytecode;
+    let owned_globals = document
+        .globals
+        .iter()
+        .filter_map(|symbol| document.symbols.resolve(*symbol))
+        .filter(|name| !manifest.globals().contains_key(*name))
+        .map(str::to_owned)
+        .collect();
     let entry_symbol = entries
         .first()
         .map(|(_, name)| {
@@ -1127,7 +1280,17 @@ pub fn evaluate_ui_component_named_with_args(
     let program = project.program;
     let materialize_program = program.clone();
     let mut context = UiVmContext::new(values, terms.clone()).with_navigation_origin(path);
-    let vm = if let Some(symbol) = entry_symbol {
+    context.owned_globals = owned_globals;
+    if entry_symbol.is_some() {
+        let initializer = LinkedVm::new(program.clone(), entry)
+            .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+        if !collect_nodes(initializer, &registry, &mut context)?.is_empty() {
+            return Err(UiVmError::Invalid(
+                "an @ui document must emit nodes inside its entrypoint, not at module scope".into(),
+            ));
+        }
+    }
+    let mut vm = if let Some(symbol) = entry_symbol {
         let callable = Value::Function {
             module: Some(entry.0),
             symbol,
@@ -1147,6 +1310,8 @@ pub fn evaluate_ui_component_named_with_args(
         ));
     }
     .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+    vm.freeze_invocation_inputs()
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     let roots = collect_nodes(vm, &registry, &mut context)?;
     if roots.len() != 1 {
         return Err(UiVmError::Invalid(format!(
@@ -1183,6 +1348,16 @@ fn collect_nodes(
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
 ) -> Result<Vec<UiNodeHandle>, UiVmError> {
+    let globals = context_globals(context);
+    vm.set_current_globals(&globals)
+        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+    vm.set_read_only_globals(
+        globals
+            .keys()
+            .filter(|name| !context.owned_globals.contains(*name))
+            .cloned()
+            .collect(),
+    );
     let mut nodes = Vec::new();
     // Statement boundaries seal drafts allocated by this invocation. A fluent
     // return value is only a handle, never an instruction to emit a node.
@@ -1238,6 +1413,11 @@ fn collect_nodes(
             }
             Some(LinkedVmEvent::Completed(_)) => {
                 // Value-returning helper tails need not emit a statement event.
+                for (name, value) in vm.current_globals() {
+                    if context.owned_globals.contains(&name) && value != Value::Uninitialized {
+                        context.local_globals.insert(name, value);
+                    }
+                }
                 nodes.extend(((committed_node + 1)..=context.next_node).map(UiNodeHandle));
                 return Ok(nodes);
             }
@@ -1278,10 +1458,20 @@ fn closure_children_with_args(
     collect_nodes(vm, registry, context)
 }
 
-pub(crate) fn evaluate_ui_callback(
+#[cfg(test)]
+fn evaluate_ui_callback(
     callback: &UiCallback,
     globals: &BTreeMap<String, Value>,
     models: &crate::ui::UiModels,
+) -> Result<(Vec<UiEffect>, BTreeMap<String, Value>), UiVmError> {
+    evaluate_ui_callback_with_args(callback, globals, models, Vec::new())
+}
+
+pub(crate) fn evaluate_ui_callback_with_args(
+    callback: &UiCallback,
+    globals: &BTreeMap<String, Value>,
+    models: &crate::ui::UiModels,
+    arguments: Vec<Value>,
 ) -> Result<(Vec<UiEffect>, BTreeMap<String, Value>), UiVmError> {
     let mut current_globals = callback.globals.clone();
     current_globals.extend(globals.clone());
@@ -1293,10 +1483,17 @@ pub(crate) fn evaluate_ui_callback(
     let mut context = UiVmContext::new(values, TermCatalog::default());
     context.navigation_origin = callback.origin.clone();
     let goto = registry.manifest().resolve_selector("story", "goto");
-    let mut vm = LinkedVm::from_callable(callback.program.clone(), &callback.callable, Vec::new())
+    let mut vm = LinkedVm::from_callable(callback.program.clone(), &callback.callable, arguments)
         .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     vm.set_current_globals(&current_globals)
         .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+    vm.set_read_only_globals(
+        current_globals
+            .keys()
+            .filter(|name| !callback.owned_globals.contains(*name))
+            .cloned()
+            .collect(),
+    );
     let mut effects = Vec::new();
     let mut committed_effect = context.next_effect;
     let mut budget = 100_000;
@@ -1372,6 +1569,7 @@ fn context_globals(context: &UiVmContext) -> BTreeMap<String, Value> {
             ("unixSeconds".to_string(), Value::Number(0.0)),
         ])),
     );
+    globals.extend(context.local_globals.clone());
     globals
 }
 
@@ -1423,6 +1621,7 @@ fn evaluate_binding_callable(
         .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     vm.set_current_globals(&binding.globals)
         .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+    vm.set_read_only_globals(binding.globals.keys().cloned().collect());
     let mut budget = 100_000;
     loop {
         match vm
@@ -1560,6 +1759,132 @@ fn disable_choice_buttons(node: &mut ScreenNode) {
     }
 }
 
+fn ui_callback(
+    handler: HksCallable,
+    program: &hiraku_script::LinkedProgram,
+    context: &UiVmContext,
+) -> UiCallback {
+    UiCallback {
+        owned_globals: context.owned_globals.clone(),
+        program: program.clone(),
+        callable: handler.into_value(),
+        globals: context_globals(context),
+        origin: context.navigation_origin.clone(),
+    }
+}
+
+fn input_value<T: IntoHksValue + hiraku_script::native::HksScriptType>(
+    value: HksBindable<T>,
+    program: &hiraku_script::LinkedProgram,
+    registry: &NativeRegistry<UiVmContext>,
+    context: &mut UiVmContext,
+) -> Result<(Value, Option<UiReactiveBinding>), UiVmError> {
+    match value {
+        HksBindable::Value(value) => Ok((value.into_hks_value(), None)),
+        HksBindable::Binding(binding) => {
+            let reactive = reactive_binding(&binding, program, context);
+            let value = evaluate_binding_value(&reactive, registry, context)?;
+            Ok((value, Some(reactive)))
+        }
+    }
+}
+
+fn input_node(
+    draft: &UiDraft,
+    kind: crate::ui::InputKind,
+    value: Value,
+    reactive_value: Option<UiReactiveBinding>,
+    program: &hiraku_script::LinkedProgram,
+    context: &UiVmContext,
+) -> Result<ScreenNode, UiVmError> {
+    let expected = match kind {
+        crate::ui::InputKind::Checkbox => ScriptType::Bool,
+        crate::ui::InputKind::Slider { .. } => ScriptType::Float,
+        crate::ui::InputKind::TextInput { .. } => ScriptType::String,
+    };
+    for handler in [&draft.on_change, &draft.on_commit].into_iter().flatten() {
+        validate_input_handler(handler, &expected, program)?;
+    }
+    let value = match (&kind, value) {
+        (crate::ui::InputKind::Checkbox, Value::Bool(value)) => StoredValue::Bool(value),
+        (crate::ui::InputKind::Slider { min, max }, Value::Number(value)) if value.is_finite() => {
+            StoredValue::Float(value.clamp(*min, *max))
+        }
+        (crate::ui::InputKind::TextInput { .. }, Value::String(value)) => {
+            StoredValue::String(value)
+        }
+        _ => {
+            return Err(UiVmError::Invalid(format!(
+                "input value requires {expected:?}; numeric values must be finite"
+            )));
+        }
+    };
+    Ok(ScreenNode::Input(crate::ui::InputNode {
+        kind,
+        value,
+        enabled: draft.enabled,
+        reactive_enabled: draft
+            .enabled_binding
+            .as_ref()
+            .map(|binding| reactive_binding(binding, program, context)),
+        layout: draft.layout.clone(),
+        text_size: draft.text_size,
+        text_color: draft.text_color,
+        background: draft.surface,
+        reactive_value,
+        on_change: draft
+            .on_change
+            .clone()
+            .map(|handler| ui_callback(handler, program, context)),
+        on_commit: draft
+            .on_commit
+            .clone()
+            .map(|handler| ui_callback(handler, program, context)),
+    }))
+}
+
+fn validate_input_handler(
+    handler: &HksCallable,
+    expected: &ScriptType,
+    program: &hiraku_script::LinkedProgram,
+) -> Result<(), UiVmError> {
+    let signature = match handler.value() {
+        Value::Closure {
+            module: Some(module),
+            region,
+            ..
+        } => program
+            .modules
+            .get(*module as usize)
+            .and_then(|module| module.bytecode.regions.get(*region as usize))
+            .map(|region| &region.signature),
+        Value::Function {
+            module: Some(module),
+            symbol,
+        } => program
+            .modules
+            .get(*module as usize)
+            .and_then(|module| {
+                module
+                    .bytecode
+                    .functions
+                    .iter()
+                    .find(|function| function.name == *symbol)
+            })
+            .map(|function| &function.signature),
+        _ => None,
+    };
+    if signature.is_some_and(|signature| {
+        signature.parameters == [expected.clone()]
+            && matches!(signature.result, ScriptType::Unit | ScriptType::Never)
+    }) {
+        return Ok(());
+    }
+    Err(UiVmError::Invalid(format!(
+        "input handler requires ({expected:?}) -> Unit; annotate the callback parameter, for example {{ value: {expected:?} -> ... }}"
+    )))
+}
+
 fn materialize_node(
     handle: UiNodeHandle,
     program: &hiraku_script::LinkedProgram,
@@ -1574,8 +1899,14 @@ fn materialize_node(
         .ok_or_else(|| UiVmError::Invalid(format!("unknown UiNode handle {}", handle.0)))?;
     draft.layout.hidden = !draft.visible;
     draft.layout.animation = draft.animation;
-    draft.layout.phase_animation = draft.phase_animation;
+    draft.layout.phase_animation = draft.phase_animation.clone();
     draft.layout.visible_binding = None;
+    if let Some(binding) = &draft.enabled_binding {
+        let reactive = reactive_binding(binding, program, context);
+        let value = evaluate_binding_value(&reactive, registry, context)?;
+        draft.enabled =
+            bool::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?;
+    }
     if let Some(binding) = &draft.visible_binding {
         let reactive = reactive_binding(binding, program, context);
         let value = evaluate_binding_value(&reactive, registry, context)?;
@@ -1584,6 +1915,41 @@ fn materialize_node(
         draft.layout.reactive_visibility = Some(reactive);
     }
     match draft.kind {
+        UiDraftKind::Checkbox(ref value) => {
+            let (value, reactive_value) = input_value(value.clone(), program, registry, context)?;
+            input_node(
+                &draft,
+                crate::ui::InputKind::Checkbox,
+                value,
+                reactive_value,
+                program,
+                context,
+            )
+        }
+        UiDraftKind::Slider(ref value, min, max) => {
+            let (value, reactive_value) = input_value(value.clone(), program, registry, context)?;
+            input_node(
+                &draft,
+                crate::ui::InputKind::Slider { min, max },
+                value,
+                reactive_value,
+                program,
+                context,
+            )
+        }
+        UiDraftKind::TextInput(ref value) => {
+            let (value, reactive_value) = input_value(value.clone(), program, registry, context)?;
+            input_node(
+                &draft,
+                crate::ui::InputKind::TextInput {
+                    placeholder: draft.placeholder.clone(),
+                },
+                value,
+                reactive_value,
+                program,
+                context,
+            )
+        }
         UiDraftKind::Screen => Err(UiVmError::Invalid(
             "screen nodes may only appear at the document root".into(),
         )),
@@ -1676,6 +2042,12 @@ fn materialize_node(
             }))
         }
         UiDraftKind::Toggle(value) => {
+            if let Some(handler) = &draft.on_change {
+                validate_input_handler(handler, &ScriptType::Bool, program)?;
+            }
+            let (value, reactive_value) = input_value(value, program, registry, context)?;
+            let value = bool::from_hks_value(&value)
+                .map_err(|error| UiVmError::Invalid(error.to_string()))?;
             let normal_handles = closure_children(draft.content, program, registry, context)?;
             let checked_handles = closure_children(draft.checked, program, registry, context)?;
             let [normal_handle] = normal_handles.as_slice() else {
@@ -1710,6 +2082,10 @@ fn materialize_node(
                 unchecked,
                 checked,
                 value,
+                reactive_value,
+                on_change: draft
+                    .on_change
+                    .map(|handler| ui_callback(handler, program, context)),
             }))
         }
         UiDraftKind::ChoiceOptions(renderer) => {
@@ -1805,6 +2181,7 @@ fn materialize_node(
         }
         UiDraftKind::Button(value) => {
             let on_click = draft.on_click.map(|closure| UiCallback {
+                owned_globals: context.owned_globals.clone(),
                 program: program.clone(),
                 callable: closure.into_hks_value(),
                 globals: context_globals(context),
@@ -1948,6 +2325,219 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_close_returns_owned_data_and_preserves_unit_and_null() {
+        for (expression, expected) in [
+            ("ui.close()", Value::Unit),
+            ("ui.close(null)", Value::Optional(None)),
+            (
+                "ui.close(.{ a: 1 })",
+                Value::Map(BTreeMap::from([("a".into(), Value::Number(1.0))])),
+            ),
+        ] {
+            let source = format!(
+                "import ui.widgets.*\nscreen {{ button {{ text(\"Confirm\") }}.onClick {{ {expression} }} }}"
+            );
+            let screen = evaluate_ui_component_named(
+                "memory://result.ui.hks",
+                &source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("UI compiles");
+            let ScreenNode::Button(button) = &screen.children[0] else {
+                panic!("button");
+            };
+            let (effects, _) = evaluate_ui_callback(
+                button.on_click.as_ref().expect("callback"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default(),
+            )
+            .expect("callback returns data");
+            assert_eq!(effects, vec![UiEffect::CloseUi { value: expected }]);
+        }
+        assert!(validate_ui_result(&Value::Handle { type_id: 1, id: 1 }).is_err());
+    }
+
+    #[test]
+    fn optional_float_widget_arguments_infer_integer_literals() {
+        for expression in [
+            "text(\"Bob\").bob(6, 1.2)",
+            "text(\"Bob\").bob(-6, 1)",
+            "text(\"Bob\").bob()",
+            "text(\"Pulse\").pulse(2)",
+        ] {
+            let source = format!("import ui.widgets.*\ncanvas {{ {expression} }}");
+            evaluate_ui_component_named(
+                "memory://animation.ui.hks",
+                &source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .unwrap_or_else(|error| panic!("{expression}: {error}"));
+        }
+        let error = evaluate_ui_component_named("memory://animation.ui.hks",
+            "import ui.widgets.*\nlet distance: Int = 6\ncanvas { text(\"Bob\").bob(distance, 1.2) }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default())
+            .expect_err("an explicitly typed Int requires toFloat");
+        assert!(error.to_string().contains("got Int"), "{error}");
+    }
+
+    #[test]
+    fn input_widgets_deliver_typed_proposals_without_running_during_mount() {
+        let source = r#"import ui.widgets.*
+global var enabled: Bool = false
+global var volume: Float = 0.5
+global var name: String = "alice"
+fn accept(value: Float) { volume = value }
+screen {
+    checkbox(${enabled}).onChange { value: Bool -> enabled = value }
+    slider(${volume}, 0.0, 1.0).onChange(accept)
+    textInput(${name}).placeholder("Name").onChange { value: String -> name = value }
+}"#;
+        let screen = evaluate_ui_component_named(
+            "memory://inputs.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("inputs compile and mount");
+        for (index, argument, global) in [
+            (0, Value::Bool(true), "enabled"),
+            (1, Value::Number(0.8), "volume"),
+            (2, Value::String("bob".into()), "name"),
+        ] {
+            let ScreenNode::Input(input) = &screen.children[index] else {
+                panic!("expected input")
+            };
+            let callback = input.on_change.as_ref().expect("callback retained");
+            assert_ne!(
+                callback.globals.get(global),
+                Some(&argument),
+                "mount must not invoke a change callback"
+            );
+            let (effects, globals) = evaluate_ui_callback_with_args(
+                callback,
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default(),
+                vec![argument.clone()],
+            )
+            .expect("typed handler executes");
+            assert!(effects.is_empty());
+            assert_eq!(globals.get(global), Some(&argument));
+        }
+    }
+
+    #[test]
+    fn ui_callback_cannot_write_story_globals() {
+        let screen = evaluate_ui_component_named(
+            "memory://readonly.ui.hks",
+            "import ui.widgets.*\nscreen { textInput(${name}).onChange { value: String -> name = value } }",
+            UiContext::new(BTreeMap::from([("name".into(), StoredValue::String("alice".into()))])),
+            &TextureCatalog::default(), &TermCatalog::default(),
+        ).expect("reading a story global is permitted");
+        let ScreenNode::Input(input) = &screen.children[0] else {
+            panic!("expected input");
+        };
+        let error = evaluate_ui_callback_with_args(
+            input.on_change.as_ref().expect("handler"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+            vec![Value::String("bob".into())],
+        )
+        .expect_err("a UI cannot write its story inputs");
+        assert!(error.to_string().contains("read-only"), "{error}");
+    }
+
+    #[test]
+    fn ui_entry_initializes_private_state_and_callbacks_share_it() {
+        let source = r#"import ui.widgets.*
+global var name: String = "alice"
+@ui global fn main() -> UiNode {
+    screen { textInput(${name}).onChange { value: String -> name = value } }
+}"#;
+        let mount = || {
+            evaluate_ui_component_named(
+                "memory://local.ui.hks",
+                source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("mount")
+        };
+        let screen = mount();
+        let ScreenNode::Input(input) = &screen.children[0] else {
+            panic!("input");
+        };
+        assert_eq!(input.value, StoredValue::String("alice".into()));
+        let (_, local) = evaluate_ui_callback_with_args(
+            input.on_change.as_ref().expect("handler"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+            vec![Value::String("bob".into())],
+        )
+        .expect("local write");
+        let mut binding = input.reactive_value.clone().expect("binding");
+        binding.globals.extend(local);
+        assert_eq!(
+            evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
+                .expect("updated"),
+            Value::String("bob".into())
+        );
+        let other = mount();
+        let ScreenNode::Input(input) = &other.children[0] else {
+            panic!("input");
+        };
+        assert_eq!(
+            input.value,
+            StoredValue::String("alice".into()),
+            "another screen has independent state"
+        );
+    }
+
+    #[test]
+    fn ui_entry_cannot_mutate_an_input_record() {
+        let source = r#"import ui.widgets.*
+@ui global fn main(player: .{ name: String }) -> UiNode {
+    let alias = player
+    alias.name = "bob"
+    screen { text(player.name) }
+}"#;
+        let error = evaluate_ui_component_named_with_args(
+            "memory://readonly_input.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[StoredValue::Map(BTreeMap::from([(
+                "name".into(),
+                StoredValue::String("alice".into()),
+            )]))],
+        )
+        .expect_err("UI input records are read-only");
+        assert!(
+            error.to_string().contains("ReadOnlyValue") || error.to_string().contains("read-only"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn input_rejects_wrong_callback_type_before_interaction() {
+        let error = evaluate_ui_component_named(
+            "memory://invalid_input.ui.hks",
+            "import ui.widgets.*\nscreen { checkbox(false).onChange { value: String -> () } }",
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect_err("Bool input rejects String callback");
+        assert!(error.to_string().contains("(Bool) -> Unit"), "{error}");
+    }
 
     #[derive(Default)]
     struct NamespaceTestContext;
@@ -2163,7 +2753,10 @@ screen {
                 .expect("callback executes against current globals");
         assert_eq!(
             effects,
-            vec![UiEffect::Save { slot: "bob".into() }, UiEffect::CloseUi]
+            vec![
+                UiEffect::Save { slot: "bob".into() },
+                UiEffect::CloseUi { value: Value::Unit }
+            ]
         );
     }
 

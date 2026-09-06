@@ -101,6 +101,7 @@ pub(super) fn spawn_screen_ui(
     let root = commands
         .spawn((
             ScreenUiRoot,
+            super::widgets::UiLocalState::default(),
             ScreenUiNode,
             // A modal screen must own its empty area as well as its buttons.
             // Otherwise picking falls through to the dialogue advance surface.
@@ -275,7 +276,7 @@ fn screen_root_background(screen: &ScreenSpec) -> BackgroundColor {
     )
 }
 
-fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
+pub(super) fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
     if let Some(width) = layout.width {
         node.width = px(width);
     }
@@ -340,6 +341,7 @@ fn spawn_screen_node_entity(
     image_handles: &mut Vec<Handle<Image>>,
 ) -> Entity {
     match node {
+        ScreenNode::Input(input) => super::widgets::spawn_input(commands, root, input, ui_fonts),
         ScreenNode::Text(TextNode {
             text,
             binding,
@@ -994,6 +996,15 @@ fn spawn_screen_node_entity(
                 ))
                 .id();
             apply_live_layout_bindings(commands, entity, &toggle.unchecked.layout);
+            commands
+                .entity(entity)
+                .insert(super::widgets::ToggleCallback {
+                    root,
+                    callback: toggle.on_change.clone(),
+                    binding: toggle.reactive_value.clone(),
+                    revision: u64::MAX,
+                    globals: BTreeMap::new(),
+                });
             entity
         }
         ScreenNode::Spacer(SpacerNode {
@@ -1014,7 +1025,11 @@ fn spawn_screen_node_entity(
     }
 }
 
-fn apply_live_layout_bindings(commands: &mut Commands, entity: Entity, layout: &ScreenLayout) {
+pub(super) fn apply_live_layout_bindings(
+    commands: &mut Commands,
+    entity: Entity,
+    layout: &ScreenLayout,
+) {
     commands.entity(entity).insert(if layout.hidden {
         Visibility::Hidden
     } else {
@@ -1408,19 +1423,33 @@ pub fn handle_screen_image_buttons(
 
 pub fn handle_screen_scroll(
     mut scrolls: MessageReader<Pointer<Scroll>>,
-    mut scrollables: Query<(&ScreenUiScrollable, &mut ScrollPosition)>,
+    mut scrollables: Query<(
+        &ScreenUiScrollable,
+        &ComputedNode,
+        &Node,
+        &mut ScrollPosition,
+    )>,
     parents: Query<&ChildOf>,
 ) {
     for scroll in scrolls.read() {
         let mut entity = scroll.entity;
         loop {
-            if let Ok((scrollable, mut position)) = scrollables.get_mut(entity) {
+            if let Ok((scrollable, computed, node, mut position)) = scrollables.get_mut(entity) {
                 let unit = match scroll.unit {
                     MouseScrollUnit::Line => scrollable.speed,
                     MouseScrollUnit::Pixel => 1.0,
                 };
-                position.x = (position.x - scroll.x * unit).max(0.0);
-                position.y = (position.y - scroll.y * unit).max(0.0);
+                let maximum = scroll_limit(computed, node);
+                // Clamp the old value as well: a resize or content change can
+                // leave an offset beyond the new end before this input arrives.
+                let current = Vec2::new(position.x, position.y).clamp(Vec2::ZERO, maximum);
+                let delta = Vec2::new(scroll.x, scroll.y) * unit;
+                if delta.is_finite() {
+                    let next = (current - delta).clamp(Vec2::ZERO, maximum);
+                    if position.0 != next {
+                        position.0 = next;
+                    }
+                }
                 break;
             }
             let Ok(parent) = parents.get(entity) else {
@@ -1431,10 +1460,32 @@ pub fn handle_screen_scroll(
     }
 }
 
+fn scroll_limit(computed: &ComputedNode, node: &Node) -> Vec2 {
+    // Match Bevy's physical layout bounds, then convert to ScrollPosition's
+    // logical pixels. Include the opposite scrollbar's reserved space.
+    let extent = (computed.content_size() - computed.size() + computed.scrollbar_size)
+        .max(Vec2::ZERO)
+        * computed.inverse_scale_factor();
+    Vec2::new(
+        if node.overflow.x == OverflowAxis::Scroll {
+            extent.x
+        } else {
+            0.0
+        },
+        if node.overflow.y == OverflowAxis::Scroll {
+            extent.y
+        } else {
+            0.0
+        },
+    )
+}
+
 pub fn handle_screen_toggles(
     mut clicks: MessageReader<Pointer<Click>>,
-    mut toggles: Query<(&mut ScreenUiToggle, &mut ImageNode, &mut Node)>,
+    toggles: Query<&ScreenUiToggle>,
     parents: Query<&ChildOf>,
+    callbacks: Query<&super::widgets::ToggleCallback>,
+    mut output: MessageWriter<super::widgets::UiCallbackRequest>,
 ) {
     for click in clicks.read() {
         if click.button != PointerButton::Primary {
@@ -1442,18 +1493,17 @@ pub fn handle_screen_toggles(
         }
         let mut entity = click.entity;
         loop {
-            if let Ok((mut toggle, mut image, mut node)) = toggles.get_mut(entity) {
-                toggle.checked = !toggle.checked;
-                if toggle.checked {
-                    image.image = toggle.checked_texture.clone();
-                    image.texture_atlas = toggle.checked_atlas.clone();
-                    image.rect = toggle.checked_rect;
-                    *node = toggle.checked_node.clone();
-                } else {
-                    image.image = toggle.unchecked_texture.clone();
-                    image.texture_atlas = toggle.unchecked_atlas.clone();
-                    image.rect = toggle.unchecked_rect;
-                    *node = toggle.unchecked_node.clone();
+            if let Ok(toggle) = toggles.get(entity) {
+                if let Ok(handler) = callbacks.get(entity)
+                    && let Some(callback) = &handler.callback
+                {
+                    output.write(super::widgets::UiCallbackRequest {
+                        entity,
+                        root: handler.root,
+                        callback: callback.clone(),
+                        arguments: vec![hiraku_script::Value::Bool(!toggle.checked)],
+                    });
+                    break;
                 }
                 break;
             }
@@ -1646,10 +1696,13 @@ pub fn update_ui_text_bindings(
 
 pub fn update_ui_reactive_bindings(
     models: Res<UiModels>,
-    mut text_bindings: Query<(&mut UiReactiveTextBinding, &mut Text)>,
-    mut visibility_bindings: Query<(&mut UiReactiveVisibilityBinding, &mut Visibility)>,
+    parents: Query<&ChildOf>,
+    local_states: Query<&super::widgets::UiLocalState>,
+    mut text_bindings: Query<(Entity, &mut UiReactiveTextBinding, &mut Text)>,
+    mut visibility_bindings: Query<(Entity, &mut UiReactiveVisibilityBinding, &mut Visibility)>,
     mut button_bindings: Query<
         (
+            Entity,
             &mut UiReactiveEnabledBinding,
             &mut ScreenUiButton,
             &mut BackgroundColor,
@@ -1657,15 +1710,21 @@ pub fn update_ui_reactive_bindings(
         Without<ScreenUiImageButton>,
     >,
     mut image_button_bindings: Query<
-        (&mut UiReactiveEnabledBinding, &mut ScreenUiImageButton),
+        (
+            Entity,
+            &mut UiReactiveEnabledBinding,
+            &mut ScreenUiImageButton,
+        ),
         Without<ScreenUiButton>,
     >,
-    mut progress_bindings: Query<(&mut UiReactiveProgressBinding, &mut Node)>,
+    mut progress_bindings: Query<(Entity, &mut UiReactiveProgressBinding, &mut Node)>,
     mut button_texts: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
     let revision = models.revision();
-    for (mut binding, mut text) in &mut text_bindings {
-        if binding.rendered_revision == revision {
+    for (entity, mut binding, mut text) in &mut text_bindings {
+        let changed =
+            refresh_local_binding(entity, &mut binding.expression, &parents, &local_states);
+        if binding.rendered_revision == revision && !changed {
             continue;
         }
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
@@ -1677,8 +1736,10 @@ pub fn update_ui_reactive_bindings(
         }
         binding.rendered_revision = revision;
     }
-    for (mut binding, mut visibility) in &mut visibility_bindings {
-        if binding.rendered_revision == revision {
+    for (entity, mut binding, mut visibility) in &mut visibility_bindings {
+        let changed =
+            refresh_local_binding(entity, &mut binding.expression, &parents, &local_states);
+        if binding.rendered_revision == revision && !changed {
             continue;
         }
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
@@ -1697,8 +1758,10 @@ pub fn update_ui_reactive_bindings(
         }
         binding.rendered_revision = revision;
     }
-    for (mut binding, mut button, mut background) in &mut button_bindings {
-        if binding.rendered_revision == revision {
+    for (entity, mut binding, mut button, mut background) in &mut button_bindings {
+        let changed =
+            refresh_local_binding(entity, &mut binding.expression, &parents, &local_states);
+        if binding.rendered_revision == revision && !changed {
             continue;
         }
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
@@ -1727,8 +1790,10 @@ pub fn update_ui_reactive_bindings(
         }
         binding.rendered_revision = revision;
     }
-    for (mut binding, mut button) in &mut image_button_bindings {
-        if binding.rendered_revision == revision {
+    for (entity, mut binding, mut button) in &mut image_button_bindings {
+        let changed =
+            refresh_local_binding(entity, &mut binding.expression, &parents, &local_states);
+        if binding.rendered_revision == revision && !changed {
             continue;
         }
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
@@ -1741,8 +1806,10 @@ pub fn update_ui_reactive_bindings(
         }
         binding.rendered_revision = revision;
     }
-    for (mut binding, mut node) in &mut progress_bindings {
-        if binding.rendered_revision == revision {
+    for (entity, mut binding, mut node) in &mut progress_bindings {
+        let changed =
+            refresh_local_binding(entity, &mut binding.expression, &parents, &local_states);
+        if binding.rendered_revision == revision && !changed {
             continue;
         }
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
@@ -1758,6 +1825,30 @@ pub fn update_ui_reactive_bindings(
             ),
         }
         binding.rendered_revision = revision;
+    }
+}
+
+fn refresh_local_binding(
+    mut entity: Entity,
+    expression: &mut crate::ui::UiReactiveBinding,
+    parents: &Query<&ChildOf>,
+    local_states: &Query<&super::widgets::UiLocalState>,
+) -> bool {
+    loop {
+        if let Ok(local) = local_states.get(entity) {
+            let mut changed = false;
+            for (name, value) in &local.0 {
+                if expression.globals.get(name) != Some(value) {
+                    expression.globals.insert(name.clone(), value.clone());
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        let Ok(parent) = parents.get(entity) else {
+            return false;
+        };
+        entity = parent.parent();
     }
 }
 
@@ -1810,6 +1901,142 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn scroll_limits_match_physical_layout_and_disabled_axes() {
+        let computed = ComputedNode {
+            size: Vec2::new(200.0, 160.0),
+            content_size: Vec2::new(600.0, 500.0),
+            scrollbar_size: Vec2::new(12.0, 8.0),
+            inverse_scale_factor: 0.5,
+            ..default()
+        };
+        assert_eq!(
+            scroll_limit(
+                &computed,
+                &Node {
+                    overflow: Overflow::scroll(),
+                    ..default()
+                }
+            ),
+            Vec2::new(206.0, 174.0)
+        );
+        assert_eq!(
+            scroll_limit(
+                &computed,
+                &Node {
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                }
+            ),
+            Vec2::new(0.0, 174.0)
+        );
+        assert_eq!(scroll_limit(&computed, &Node::default()), Vec2::ZERO);
+        assert_eq!(
+            scroll_limit(
+                &ComputedNode {
+                    content_size: Vec2::ZERO,
+                    ..computed
+                },
+                &Node {
+                    overflow: Overflow::scroll(),
+                    ..default()
+                }
+            ),
+            Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn scroll_targets_the_nearest_scrollable_ancestor() {
+        let mut app = App::new();
+        app.add_message::<Pointer<Scroll>>()
+            .add_systems(Update, handle_screen_scroll);
+        let outer = app
+            .world_mut()
+            .spawn((
+                ScreenUiScrollable { speed: 40.0 },
+                ScrollPosition::default(),
+                Node {
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+                ComputedNode {
+                    size: Vec2::splat(100.0),
+                    content_size: Vec2::new(100.0, 300.0),
+                    ..default()
+                },
+            ))
+            .id();
+        let inner = app
+            .world_mut()
+            .spawn((
+                ScreenUiScrollable { speed: 60.0 },
+                ScrollPosition::default(),
+                Node {
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+                ComputedNode {
+                    size: Vec2::splat(100.0),
+                    content_size: Vec2::new(100.0, 300.0),
+                    ..default()
+                },
+                ChildOf(outer),
+            ))
+            .id();
+        let child = app.world_mut().spawn(ChildOf(inner)).id();
+        for (unit, delta, expected) in [
+            (MouseScrollUnit::Line, -2.0, 120.0),
+            (MouseScrollUnit::Pixel, -2.0, 122.0),
+            (MouseScrollUnit::Line, -20.0, 200.0),
+            (MouseScrollUnit::Line, -20.0, 200.0),
+            (MouseScrollUnit::Pixel, 1.0, 199.0),
+            (MouseScrollUnit::Line, 20.0, 0.0),
+            (MouseScrollUnit::Line, 20.0, 0.0),
+            (MouseScrollUnit::Pixel, -1.0, 1.0),
+        ] {
+            app.world_mut().write_message(Pointer::new(
+                PointerId::Custom(uuid::Uuid::from_u128(1)),
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 800,
+                        height: 600,
+                    },
+                    position: Vec2::ZERO,
+                },
+                Scroll {
+                    unit,
+                    x: 0.0,
+                    y: delta,
+                    hit: HitData {
+                        camera: outer,
+                        depth: 0.0,
+                        position: None,
+                        normal: None,
+                        extra: None,
+                    },
+                    phase: bevy::input::touch::TouchPhase::Moved,
+                },
+                child,
+            ));
+            app.update();
+            assert_eq!(
+                app.world()
+                    .get::<ScrollPosition>(inner)
+                    .expect("inner scroll state")
+                    .y,
+                expected
+            );
+            assert_eq!(
+                app.world()
+                    .get::<ScrollPosition>(outer)
+                    .expect("outer scroll state")
+                    .y,
+                0.0
+            );
+        }
+    }
 
     #[test]
     fn package_ui_paths_do_not_become_relative_to_the_restored_story() {
@@ -2088,7 +2315,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_click_changes_its_visual_without_advancing_dialogue() {
+    fn toggle_without_change_handler_keeps_model_value_without_advancing_dialogue() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
             .init_resource::<AnimationState>()
@@ -2099,6 +2326,7 @@ mod tests {
             .add_message::<Pointer<Click>>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, (handle_screen_toggles, advance_dialogue_on_input));
+        app.add_message::<super::widgets::UiCallbackRequest>();
         app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
             animation_id: None,
             request: Some(ScriptRequestId(17)),
@@ -2158,12 +2386,76 @@ mod tests {
         assert!(app.world().resource::<DialogueState>().waiting.is_some());
         let entity = app.world().entity(toggle);
         assert!(
-            entity
+            !entity
                 .get::<ScreenUiToggle>()
                 .expect("toggle state")
                 .checked
         );
-        assert_eq!(entity.get::<Node>().expect("toggle layout").width, px(75));
+        assert_eq!(entity.get::<Node>().expect("toggle layout").width, px(100));
+
+        // A controlled toggle responds once its UI-owned model accepts edits.
+        // Use a synthetic Bool control to obtain the same callback/binding pair;
+        // no image assets or game scripts are needed for this regression.
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://toggle_state.ui.hks",
+            "import ui.widgets.*\nglobal var enabled: Bool = false\nscreen { checkbox(${enabled}).onChange { value: Bool -> enabled = value } }",
+            crate::script::UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("local Bool state compiles");
+        let ScreenNode::Input(input) = &screen.children[0] else {
+            panic!("input");
+        };
+        let callback = input.on_change.clone().expect("change handler");
+        let root = app
+            .world_mut()
+            .spawn(super::widgets::UiLocalState::default())
+            .id();
+        app.world_mut()
+            .entity_mut(toggle)
+            .insert(super::widgets::ToggleCallback {
+                root,
+                callback: Some(callback.clone()),
+                binding: input.reactive_value.clone(),
+                revision: u64::MAX,
+                globals: BTreeMap::new(),
+            });
+        app.init_resource::<ScriptRuntimeState>()
+            .init_resource::<UiModels>()
+            .add_systems(Update, super::widgets::sync_toggles);
+        let mut globals = BTreeMap::new();
+        for checked in [true, false, true] {
+            let (effects, updated) = crate::script::evaluate_ui_callback_with_args(
+                &callback,
+                &globals,
+                &UiModels::default(),
+                vec![hiraku_script::Value::Bool(checked)],
+            )
+            .expect("UI accepts the toggle proposal");
+            assert!(
+                effects.is_empty(),
+                "visual toggle must not request dialogue advance"
+            );
+            globals = updated;
+            app.world_mut()
+                .get_mut::<super::widgets::UiLocalState>(root)
+                .expect("state")
+                .0 = globals.clone();
+            app.update();
+            assert_eq!(
+                app.world()
+                    .get::<ScreenUiToggle>(toggle)
+                    .expect("toggle")
+                    .checked,
+                checked
+            );
+            assert_eq!(
+                app.world()
+                    .get::<Node>(toggle)
+                    .expect("authored layout")
+                    .width,
+                if checked { px(75) } else { px(100) }
+            );
+            assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        }
     }
 
     #[test]
@@ -2214,6 +2506,69 @@ mod tests {
         app.update();
 
         assert!(app.world().resource::<DialogueState>().waiting.is_some());
+    }
+
+    #[test]
+    fn local_state_refreshes_only_its_own_screen_without_remounting() {
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://local_state.ui.hks",
+            "import ui.widgets.*\nglobal var name: String = \"alice\"\nscreen { text(${name}) }",
+            crate::script::UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("UI compiles");
+        let crate::ui::ScreenNode::Text(spec) = &screen.children[0] else {
+            panic!("text node");
+        };
+        let expression = spec.reactive_text.clone().expect("reactive text");
+        let mut app = App::new();
+        app.init_resource::<UiModels>()
+            .add_systems(Update, update_ui_reactive_bindings);
+        let mut entities = Vec::new();
+        for _ in 0..2 {
+            let root = app
+                .world_mut()
+                .spawn(super::super::widgets::UiLocalState::default())
+                .id();
+            let text = app
+                .world_mut()
+                .spawn((
+                    ChildOf(root),
+                    Text::new("pending"),
+                    UiReactiveTextBinding {
+                        expression: expression.clone(),
+                        rendered_revision: u64::MAX,
+                    },
+                ))
+                .id();
+            entities.push((root, text));
+        }
+        app.update();
+        for (_, text) in &entities {
+            assert_eq!(app.world().get::<Text>(*text).expect("text").0, "alice");
+        }
+        app.world_mut()
+            .get_mut::<super::super::widgets::UiLocalState>(entities[0].0)
+            .expect("local state")
+            .0
+            .insert("name".into(), hiraku_script::Value::String("bob".into()));
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Text>(entities[0].1)
+                .expect("same text entity")
+                .0,
+            "bob"
+        );
+        assert_eq!(
+            app.world()
+                .get::<Text>(entities[1].1)
+                .expect("other screen")
+                .0,
+            "alice"
+        );
     }
 
     #[test]

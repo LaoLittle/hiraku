@@ -85,6 +85,7 @@ pub fn advance_dialogue_on_input(
     choice_state: Res<ChoiceState>,
     screen_state: Res<ScreenUiState>,
     advance_surfaces: Query<(), With<DialogueAdvanceSurface>>,
+    text_focus: Option<Res<crate::input::HirakuTextFocus>>,
 ) {
     let action_advance = actions
         .read()
@@ -103,7 +104,8 @@ pub fn advance_dialogue_on_input(
     if choice_state.waiting.is_some() || screen_state.active_root.is_some() {
         return;
     }
-    let advance = action_advance || pointer_advance;
+    let advance =
+        (action_advance && text_focus.is_none_or(|focus| focus.0.is_none())) || pointer_advance;
 
     if !advance {
         return;

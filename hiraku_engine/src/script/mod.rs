@@ -57,7 +57,7 @@ pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
 }
 
 pub use ui_runtime::{UiContext, UiIntent};
-pub(crate) use ui_vm::evaluate_ui_callback;
+pub(crate) use ui_vm::evaluate_ui_callback_with_args;
 pub(crate) use ui_vm::evaluate_ui_component_named_with_args;
 pub(crate) use ui_vm::evaluate_ui_reactive_binding;
 
@@ -162,6 +162,7 @@ fn parse_camera_ease(name: &str) -> Result<CharacterEase, String> {
 pub enum ScriptResponse {
     Continue,
     Choice(StoredValue),
+    UiResult(hiraku_script::Value),
 }
 
 /// Stable identifier joining an ECS-owned script wait with its eventual response.

@@ -15,6 +15,8 @@ pub struct ObjectHeap {
     next_id: u32,
     #[serde(skip)]
     last_collection: u32,
+    #[serde(default)]
+    read_only: BTreeSet<ObjectId>,
 }
 
 mod object_table {
@@ -107,9 +109,37 @@ impl ObjectHeap {
     }
 
     pub fn get_mut(&mut self, id: ObjectId) -> Result<&mut Value, crate::VmError> {
+        if self.read_only.contains(&id) {
+            return Err(crate::VmError::ReadOnlyValue);
+        }
         self.objects
             .get_mut(&id)
             .ok_or(crate::VmError::InvalidObject(id))
+    }
+
+    /// Freeze a reachable graph, including aliases, nested records and cycles.
+    /// Portable closures retain this property when their heaps are relocated.
+    pub fn freeze(&mut self, root: &Value) -> Result<(), crate::VmError> {
+        let mut pending = vec![root.clone()];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Object(id) => {
+                    if self.read_only.insert(id) {
+                        pending.push(self.get(id)?.clone());
+                    }
+                }
+                Value::Map(fields) => pending.extend(fields.into_values()),
+                Value::Typed { value, .. } | Value::Optional(Some(value)) => pending.push(*value),
+                Value::Tuple(values) | Value::List(values) => pending.extend(values),
+                Value::Closure {
+                    captures,
+                    objects: None,
+                    ..
+                } => pending.extend(captures),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Bring owned host records into this execution. Existing object IDs are
@@ -138,6 +168,7 @@ impl ObjectHeap {
                 }
             }
             Value::Closure {
+                type_bindings,
                 module,
                 region,
                 captures,
@@ -145,6 +176,12 @@ impl ObjectHeap {
             } => {
                 let captures = if let Some(objects) = objects {
                     let base = self.next_id;
+                    self.read_only.extend(objects.read_only.iter().map(|id| {
+                        ObjectId(
+                            id.0.checked_add(base)
+                                .expect("object identifier space exhausted"),
+                        )
+                    }));
                     self.next_id = base
                         .checked_add(objects.next_id)
                         .expect("object identifier space exhausted");
@@ -169,6 +206,7 @@ impl ObjectHeap {
                         .collect()
                 };
                 Value::Closure {
+                    type_bindings,
                     module,
                     region,
                     captures,
@@ -223,6 +261,7 @@ impl ObjectHeap {
         }
         let previous = self.objects.len();
         self.objects.retain(|id, _| marked.contains(id));
+        self.read_only.retain(|id| marked.contains(id));
         self.last_collection = self.next_id;
         Ok(previous - self.objects.len())
     }
@@ -275,6 +314,7 @@ impl ObjectHeap {
                 Value::Optional(Some(Box::new(self.export_inner(value, visiting)?)))
             }
             Value::Closure {
+                type_bindings,
                 module,
                 region,
                 captures,
@@ -287,6 +327,7 @@ impl ObjectHeap {
                     .map(|value| self.copy_reachable(value, &mut heap, &mut ids))
                     .collect::<Result<_, _>>()?;
                 Value::Closure {
+                    type_bindings: type_bindings.clone(),
                     module: *module,
                     region: *region,
                     captures,
@@ -318,6 +359,9 @@ impl ObjectHeap {
                     unreachable!("allocation returns an object reference")
                 };
                 *target.get_mut(target_id)? = record;
+                if self.read_only.contains(id) {
+                    target.read_only.insert(target_id);
+                }
                 reference
             }
             Value::Map(fields) => Value::Map(
@@ -346,11 +390,13 @@ impl ObjectHeap {
                 Value::Optional(Some(Box::new(self.copy_reachable(value, target, ids)?)))
             }
             Value::Closure {
+                type_bindings,
                 module,
                 region,
                 captures,
                 objects: None,
             } => Value::Closure {
+                type_bindings: type_bindings.clone(),
                 module: *module,
                 region: *region,
                 captures: captures
@@ -393,11 +439,13 @@ fn relocate(value: Value, base: u32) -> Value {
         ),
         Value::Optional(Some(value)) => Value::Optional(Some(Box::new(relocate(*value, base)))),
         Value::Closure {
+            type_bindings,
             module,
             region,
             captures,
             objects: None,
         } => Value::Closure {
+            type_bindings,
             module,
             region,
             captures: captures
@@ -428,6 +476,7 @@ mod tests {
         *heap.get_mut(dead_id).expect("allocated object") =
             Value::Map(BTreeMap::from([("self".into(), dead)]));
         let callback = Value::Closure {
+            type_bindings: Vec::new(),
             module: None,
             region: 0,
             captures: vec![live.clone()],
@@ -468,6 +517,7 @@ mod tests {
             ("name".into(), Value::String("alice".into())),
         ]));
         let closure = Value::Closure {
+            type_bindings: Vec::new(),
             module: None,
             region: 0,
             captures: vec![object.clone(), object],
@@ -500,5 +550,53 @@ mod tests {
         };
         assert_eq!(fields["self"], captures[0]);
         assert_eq!(id, ObjectId(1));
+    }
+
+    #[test]
+    fn frozen_nested_graph_survives_portable_closure_and_collection() {
+        let mut heap = ObjectHeap::default();
+        let root = heap.import(Value::Map(BTreeMap::from([(
+            "child".into(),
+            Value::Map(BTreeMap::from([(
+                "name".into(),
+                Value::String("alice".into()),
+            )])),
+        )])));
+        heap.freeze(&root).expect("freeze nested record");
+        let closure = Value::Closure {
+            type_bindings: Vec::new(),
+            module: None,
+            region: 0,
+            captures: vec![root],
+            objects: None,
+        };
+        let portable = heap.export(&closure).expect("portable closure");
+        let encoded = crate::hson::to_string(&portable).expect("serialize");
+        let portable = crate::hson::from_str(&encoded).expect("deserialize");
+        let mut target = ObjectHeap::default();
+        target.allocate(Value::Unit);
+        let closure = target.import(portable);
+        target.collect([&closure]).expect("collect unused object");
+        let Value::Closure { captures, .. } = closure else {
+            panic!("closure");
+        };
+        let Value::Object(root) = captures[0] else {
+            panic!("object");
+        };
+        let Value::Map(fields) = target.get(root).expect("root") else {
+            panic!("record");
+        };
+        let Value::Object(child) = fields["child"] else {
+            panic!("child");
+        };
+        assert_eq!(target.get_mut(root), Err(crate::VmError::ReadOnlyValue));
+        assert_eq!(target.get_mut(child), Err(crate::VmError::ReadOnlyValue));
+        let Value::Object(local) = target.allocate(Value::Unit) else {
+            panic!("object");
+        };
+        assert!(
+            target.get_mut(local).is_ok(),
+            "new local allocations remain mutable"
+        );
     }
 }
