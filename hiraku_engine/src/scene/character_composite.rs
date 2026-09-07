@@ -22,6 +22,12 @@ struct GroupTween {
     animation_id: Option<String>,
 }
 
+impl CharacterGroup {
+    pub(super) fn is_animating(&self) -> bool {
+        self.tween.is_some()
+    }
+}
+
 pub(crate) fn install(app: &mut App) {
     if !app.is_plugin_added::<Sprite3dPlugin>() {
         app.add_plugins(Sprite3dPlugin);

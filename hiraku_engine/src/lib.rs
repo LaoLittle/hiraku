@@ -443,6 +443,11 @@ impl Plugin for HirakuPlugin {
                     scene::actor_motion::animate
                         .after(animate_character_motion_effects)
                         .in_set(HirakuRuntimeSystems),
+                    scene::effect_wait::complete
+                        .after(process_script_commands)
+                        .after(poll_pending_character_shows)
+                        .after(scene::pictures::sync_pictures)
+                        .in_set(HirakuRuntimeSystems),
                     poll_voice_playback.in_set(HirakuRuntimeSystems),
                     poll_pending_character_shows
                         .after(reconcile_restored_characters)

@@ -29,6 +29,7 @@ pub struct StoryRuntime {
     completed_groups: std::collections::BTreeSet<ExecutionId>,
     waiting_task: Option<ExecutionId>,
     waiting_interactive_task: Option<ExecutionId>,
+    awaiting_effects: std::collections::BTreeSet<ExecutionId>,
     choice: Option<ChoiceState>,
     blocked: bool,
     terminated: bool,
@@ -81,6 +82,7 @@ pub enum StoryRuntimeEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryRuntimeSnapshot {
+    awaiting_effects: std::collections::BTreeSet<ExecutionId>,
     execution: ExecutionRuntimeSnapshot,
     host: StoryNativeHostSnapshot,
     active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
@@ -110,6 +112,7 @@ impl StoryRuntime {
             completed_groups: Default::default(),
             waiting_task: None,
             waiting_interactive_task: None,
+            awaiting_effects: Default::default(),
             choice: None,
             blocked: false,
             terminated: false,
@@ -122,6 +125,7 @@ impl StoryRuntime {
             return Err(StoryRuntimeError::NotAtSnapshotBoundary);
         }
         Ok(StoryRuntimeSnapshot {
+            awaiting_effects: self.awaiting_effects.clone(),
             execution: self.execution.snapshot(),
             host: self.host.snapshot(),
             active_task_effects: self.active_task_effects.clone(),
@@ -177,6 +181,7 @@ impl StoryRuntime {
             })
             .collect();
         let mut runtime = Self {
+            awaiting_effects: snapshot.awaiting_effects,
             execution: ExecutionRuntime::restore(bytecode, snapshot.execution)?,
             host: StoryNativeHost::restore(snapshot.host),
             pending,
@@ -203,6 +208,15 @@ impl StoryRuntime {
 
     pub fn globals(&self) -> &std::collections::BTreeMap<String, Value> {
         self.execution.globals()
+    }
+
+    pub(crate) fn voice_playback_mode(&self, task: ExecutionId) -> super::VoicePlaybackMode {
+        match self.execution.mode(task) {
+            Some(ExecutionMode::Parallel | ExecutionMode::Sequence) => {
+                super::VoicePlaybackMode::Concurrent
+            }
+            _ => super::VoicePlaybackMode::Exclusive,
+        }
     }
 
     /// Native handles and their retained state belong to the story session,
@@ -355,7 +369,9 @@ impl StoryRuntime {
             }
             return Ok(());
         }
-        if self.execution.mode(task) == Some(ExecutionMode::Sequence) {
+        if self.awaiting_effects.remove(&task)
+            || self.execution.mode(task) == Some(ExecutionMode::Sequence)
+        {
             let _ = self.execution.unpause(task);
         }
         if let Some(value) = self.deferred_task_completions.remove(&task) {
@@ -469,7 +485,7 @@ impl StoryRuntime {
                 ExecutionEvent::Statement { execution, value } if execution.is_main() => {
                     let statement = value;
                     self.host.handle_statement(&statement)?;
-                    self.enqueue_host_boundaries();
+                    self.enqueue_host_boundaries()?;
                     if let Some(event) = self.pending.pop_front() {
                         self.mark_host_boundary(&event);
                         return Ok(Some(event));
@@ -507,21 +523,43 @@ impl StoryRuntime {
         }
     }
 
-    fn enqueue_host_boundaries(&mut self) {
-        self.pending.extend(
-            self.host
-                .drain_effects()
-                .into_iter()
-                .map(|effect| match effect {
-                    StoryEffect::Delay { duration_ms } => {
-                        StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms })
-                    }
-                    effect => StoryRuntimeEvent::Effect(effect),
-                }),
-        );
+    fn enqueue_host_boundaries(&mut self) -> Result<(), StoryRuntimeError> {
+        let explicit = self.host.take_animation_await();
+        if explicit {
+            let task = ExecutionId::MAIN;
+            for effect in self.host.drain_effects() {
+                if animation_effect(&effect) {
+                    self.active_task_effects
+                        .entry(task)
+                        .or_default()
+                        .push(effect.clone());
+                    self.pending
+                        .push_back(StoryRuntimeEvent::TaskEffect { task, effect });
+                } else {
+                    self.pending.push_back(StoryRuntimeEvent::Effect(effect));
+                }
+            }
+            if self.active_task_effects.contains_key(&task) {
+                self.awaiting_effects.insert(task);
+                self.execution.pause(task)?;
+            }
+        } else {
+            self.pending.extend(
+                self.host
+                    .drain_effects()
+                    .into_iter()
+                    .map(|effect| match effect {
+                        StoryEffect::Delay { duration_ms } => {
+                            StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms })
+                        }
+                        effect => StoryRuntimeEvent::Effect(effect),
+                    }),
+            );
+        }
         if let Some(wait) = self.host.take_wait() {
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
+        Ok(())
     }
 
     fn handle_task_event(
@@ -656,6 +694,7 @@ impl StoryRuntime {
     }
 
     fn enqueue_task_boundaries(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
+        let explicit = self.host.take_animation_await();
         let mut interactive_delay = None;
         let task_mode = self.execution.mode(task);
         for effect in self.host.drain_effects() {
@@ -687,15 +726,8 @@ impl StoryRuntime {
                 StoryEffect::PlayVoice { .. }
                     | StoryEffect::PlaySfx { .. }
                     | StoryEffect::Delay { .. }
-            ) || (task_mode != Some(ExecutionMode::Interactive)
-                && matches!(
-                    effect,
-                    StoryEffect::SetCamera { .. }
-                        | StoryEffect::SetBackground { .. }
-                        | StoryEffect::ShowCharacter { .. }
-                        | StoryEffect::ActorMotion { .. }
-                        | StoryEffect::SetCurtain { .. }
-                ))
+            ) || ((explicit || task_mode != Some(ExecutionMode::Interactive))
+                && animation_effect(&effect))
                 || (dialogue && task_mode == Some(ExecutionMode::Sequence))
             {
                 self.active_task_effects
@@ -709,7 +741,7 @@ impl StoryRuntime {
             }
         }
         let wait = self.host.take_wait().or(interactive_delay);
-        if matches!(wait, Some(StoryWait::Movie { .. } | StoryWait::Curtain))
+        if matches!(wait, Some(StoryWait::Movie { .. }))
             && task_mode != Some(ExecutionMode::Interactive)
         {
             return Err(StoryRuntimeError::UnsupportedTaskWait(
@@ -723,13 +755,30 @@ impl StoryRuntime {
             self.waiting_interactive_task = Some(task);
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
-        if task_mode == Some(ExecutionMode::Sequence)
+        if (explicit || task_mode == Some(ExecutionMode::Sequence))
             && self.active_task_effects.contains_key(&task)
         {
+            self.awaiting_effects.insert(task);
             self.execution.pause(task)?;
         }
         Ok(())
     }
+}
+
+fn animation_effect(effect: &StoryEffect) -> bool {
+    matches!(
+        effect,
+        StoryEffect::SetCamera { .. }
+            | StoryEffect::SetBackground { .. }
+            | StoryEffect::ShowCharacter { .. }
+            | StoryEffect::HideCharacter { .. }
+            | StoryEffect::ActorMotion { .. }
+            | StoryEffect::SetCurtain { .. }
+            | StoryEffect::Picture(_)
+            | StoryEffect::PlayBgm { .. }
+            | StoryEffect::PlayVoice { .. }
+            | StoryEffect::PlaySfx { .. }
+    )
 }
 
 #[derive(Debug, Error)]

@@ -9,10 +9,13 @@ use crate::scene::pictures::PictureCommand;
 
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "SceneTransition", handle_type = 4)]
-struct SceneTransitionHandle(u64);
+pub(super) struct SceneTransitionHandle(u64);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum SceneVisualTarget {
+    HideCharacters {
+        duration_ms: u64,
+    },
     Picture(PictureCommand),
     Curtain {
         opacity: f32,
@@ -28,6 +31,12 @@ pub(super) struct SceneVisualState {
 }
 
 impl SceneVisualState {
+    pub(super) fn hide_characters(
+        &mut self,
+        duration_ms: u64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        self.begin(SceneVisualTarget::HideCharacters { duration_ms })
+    }
     fn begin(&mut self, target: SceneVisualTarget) -> Result<SceneTransitionHandle, NativeError> {
         self.next = self
             .next
@@ -40,6 +49,10 @@ impl SceneVisualState {
     pub(super) fn commit(&mut self, effects: &mut Vec<StoryEffect>) {
         for (_, (target, fade_ms)) in std::mem::take(&mut self.pending) {
             effects.push(match target {
+                SceneVisualTarget::HideCharacters { duration_ms } => StoryEffect::HideCharacter {
+                    actor_id: None,
+                    fade_ms: fade_ms.unwrap_or(duration_ms),
+                },
                 SceneVisualTarget::Picture(mut picture) => {
                     let seconds = fade_ms.unwrap_or(0) as f32 / 1000.0;
                     match &mut picture {
@@ -195,7 +208,7 @@ mod api {
         y: f64,
         seconds: f64,
         ease: String,
-    ) -> Result<(), NativeError> {
+    ) -> Result<SceneTransitionHandle, NativeError> {
         milliseconds(seconds)?;
         if ![x, y].iter().all(|n| n.is_finite() && n.abs() <= 100000.0)
             || !["linear", "easeOutQuad", "easeOutBack"].contains(&ease.as_str())
@@ -203,14 +216,13 @@ mod api {
             return Err(NativeError::message("invalid picture movement or easing"));
         }
         context
-            .commands
-            .push(StoryEffect::Picture(PictureCommand::Move {
+            .scene_visuals
+            .begin(SceneVisualTarget::Picture(PictureCommand::Move {
                 id,
                 position: [x as f32, y as f32],
                 seconds: seconds as f32,
                 ease,
-            }));
-        Ok(())
+            }))
     }
 
     #[hks(name = "clearPictures", selector = "scene")]
@@ -227,7 +239,7 @@ mod api {
         id: String,
         offsets: Vec<f64>,
         step_seconds: f64,
-    ) -> Result<(), NativeError> {
+    ) -> Result<SceneTransitionHandle, NativeError> {
         if offsets.is_empty()
             || offsets.len() > 4096
             || !offsets.iter().all(|n| n.is_finite() && n.abs() < 100000.0)
@@ -236,13 +248,12 @@ mod api {
             return Err(NativeError::message("invalid picture keyframes"));
         }
         context
-            .commands
-            .push(StoryEffect::Picture(PictureCommand::AnimateX {
+            .scene_visuals
+            .begin(SceneVisualTarget::Picture(PictureCommand::AnimateX {
                 id,
                 offsets: offsets.into_iter().map(|n| n as f32).collect(),
                 step_seconds: step_seconds as f32,
-            }));
-        Ok(())
+            }))
     }
 
     #[hks(name = "bg")]
@@ -312,21 +323,18 @@ mod api {
         Ok(SceneTransitionHandle(id))
     }
 
-    /// Join the curtain's loading and animation before continuing the story.
-    #[hks(name = "awaitCompletion", receiver)]
-    fn wait_curtain(
+    /// Join this statement's scene transition through the shared effect protocol.
+    #[hks(name = "await", selector = "SceneTransition", receiver)]
+    fn await_transition(
         context: &mut CharacterContext,
         SceneTransitionHandle(id): SceneTransitionHandle,
     ) -> Result<(), NativeError> {
-        if !matches!(
-            context.scene_visuals.pending.get(&id),
-            Some((SceneVisualTarget::Curtain { .. }, _))
-        ) {
+        if !context.scene_visuals.pending.contains_key(&id) {
             return Err(NativeError::message(
-                "awaitCompletion requires an uncommitted scene.curtain(...)",
+                "await requires a scene transition in the same statement",
             ));
         }
-        context.wait = Some(super::super::StoryWait::Curtain);
+        context.await_effects = true;
         Ok(())
     }
 
@@ -646,34 +654,141 @@ mod tests {
 
     #[test]
     fn curtain_wait_yields_after_commit_and_resumes_once() {
-        let source =
-            "scene.curtain(1).dissolve(\"transitions/blinds\").fade(900).awaitCompletion()";
+        let source = "scene.curtain(1).dissolve(\"transitions/blinds\").fade(900).await()";
         let mut runtime = runtime(source);
-        assert!(matches!(
-            event(&mut runtime),
-            StoryRuntimeEvent::Effect(StoryEffect::SetCurtain { .. })
-        ));
-        assert_eq!(
-            event(&mut runtime),
-            StoryRuntimeEvent::Wait(StoryWait::Curtain)
-        );
+        let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut runtime) else {
+            panic!("tracked curtain");
+        };
+        assert!(matches!(effect, StoryEffect::SetCurtain { .. }));
+        assert!(runtime.step().expect("await blocks").is_none());
         let snapshot = runtime.snapshot().expect("curtain boundary can be saved");
         let mut runtime = StoryRuntime::restore(
             compile_story_bytecode("test.hks", source).expect("deterministic recompile"),
             snapshot,
         )
         .expect("curtain wait restores");
-        assert_eq!(
-            runtime.restored_boundary_event(),
-            Some(StoryRuntimeEvent::Wait(StoryWait::Curtain))
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect { effect: restored, .. } if restored == effect)
         );
         runtime
-            .resume(Value::Unit)
-            .expect("curtain completion resumes host wait");
+            .complete_task_effect(task, &effect)
+            .expect("curtain completion resumes execution");
         assert!(matches!(
             event(&mut runtime),
             StoryRuntimeEvent::Completed(_)
         ));
+    }
+
+    #[test]
+    fn fluent_await_uses_effect_completions_for_every_builder() {
+        for source in [
+            "camera().zoom(1.2).time(1).await()",
+            "bg(\"room\").fade(300).await()",
+            "cg(\"still\").fade(300).await()",
+            "scene.hidePicture(\"still\").fade(300).await()",
+            "scene.blurPicture(\"room\", 12).fade(300).await()",
+            "scene.movePicture(\"room\", 50, 40, 1, \"linear\").await()",
+            "voice(\"voice/alice\").await()",
+            "sfx(\"sound/bell\").await()",
+            "bgm(\"music/theme\").fadeIn(500).await()",
+            "char(\"alice\").show().await()",
+            "char(\"alice\").hide(300).await()",
+            "scene.hideCharacters(300).await()",
+        ] {
+            let mut runtime = runtime(&format!("{source}\nlog(\"after\")"));
+            let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut runtime) else {
+                panic!("expected completion protocol for {source}");
+            };
+            assert!(
+                runtime.step().expect("await blocks execution").is_none(),
+                "{source}"
+            );
+            runtime
+                .complete_task_effect(task, &effect)
+                .expect("effect completes");
+            assert!(
+                matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text == "after"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn awaited_voice_is_not_replayed_after_load() {
+        let source = "voice(\"voice/alice\").await()\nlog(\"after\")";
+        let code = compile_story_bytecode("voice.hks", source).expect("voice compiles");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::PlayVoice { .. },
+                ..
+            }
+        ));
+        assert!(runtime.step().expect("voice waits").is_none());
+        let snapshot = runtime.snapshot().expect("voice save boundary");
+        let mut restored = StoryRuntime::restore(code, snapshot).expect("voice restores");
+        assert!(
+            matches!(event(&mut restored), StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text == "after")
+        );
+    }
+
+    #[test]
+    fn fluent_await_joins_every_effect_committed_by_the_statement() {
+        let mut runtime = runtime(
+            r#"
+            char("alice").show().offset(.pos(0, 20)).animation(.linear(1)).await()
+            log("after")
+        "#,
+        );
+        let StoryRuntimeEvent::TaskEffect { task, effect: show } = event(&mut runtime) else {
+            panic!("show effect");
+        };
+        let StoryRuntimeEvent::TaskEffect { effect: motion, .. } = event(&mut runtime) else {
+            panic!("offset effect");
+        };
+        assert!(matches!(show, StoryEffect::ShowCharacter { .. }));
+        assert!(matches!(motion, StoryEffect::ActorMotion { .. }));
+        runtime
+            .complete_task_effect(task, &show)
+            .expect("show finishes first");
+        assert!(runtime.step().expect("offset is still running").is_none());
+        runtime
+            .complete_task_effect(task, &motion)
+            .expect("offset finishes");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text == "after")
+        );
+    }
+
+    #[test]
+    fn explicit_await_also_pauses_parallel_execution() {
+        let mut runtime = runtime(
+            r#"
+            let group = par {
+                voice("voice/alice").await()
+                voice("voice/bob")
+            }
+            group.await()
+            log("joined")
+        "#,
+        );
+        let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut runtime) else {
+            panic!("first voice");
+        };
+        assert!(runtime.step().expect("explicit wait in par").is_none());
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("first completes");
+        let StoryRuntimeEvent::TaskEffect { effect, .. } = event(&mut runtime) else {
+            panic!("second voice");
+        };
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("second completes");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text == "joined")
+        );
     }
 
     #[test]

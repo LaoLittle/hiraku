@@ -511,6 +511,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     done,
                 });
             }
+            ScriptCommand::Animation(AnimationCommand::Scene { effect, done }) => {
+                commands.spawn(super::effect_wait::SceneEffectWait { effect, done });
+            }
             ScriptCommand::Animation(AnimationCommand::Wait { ids, done }) => {
                 if ids.iter().all(|id| animations.completed.contains(id)) {
                     commands.write_message(ScriptResponseMessage {

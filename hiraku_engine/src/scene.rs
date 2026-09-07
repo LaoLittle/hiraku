@@ -56,6 +56,7 @@ mod animation_runtime;
 mod audio_runtime;
 pub(crate) mod actor_motion;
 mod character;
+pub(crate) mod effect_wait;
 pub(crate) mod character_composite;
 mod choice;
 mod command_runtime;

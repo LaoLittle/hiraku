@@ -136,6 +136,10 @@ pub enum CharacterCommand {
 
 #[derive(Debug)]
 pub enum AnimationCommand {
+    Scene {
+        effect: crate::scene::effect_wait::SceneEffect,
+        done: ScriptRequestId,
+    },
     Delay {
         duration: Duration,
         done: ScriptRequestId,

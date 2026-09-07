@@ -13,6 +13,7 @@ struct AudioHandle(u64);
 enum Channel {
     Music,
     Sfx,
+    Voice,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +76,7 @@ impl SoundState {
                     volume,
                     fade_in_ms,
                 },
+                Channel::Voice => StoryEffect::PlayVoice { path, volume },
             });
         }
     }
@@ -199,6 +201,21 @@ mod api {
         context.sound.begin(Channel::Sfx, path)
     }
 
+    #[hks(name = "voice")]
+    fn voice(context: &mut CharacterContext, path: String) -> Result<AudioHandle, NativeError> {
+        context.sound.begin(Channel::Voice, path)
+    }
+
+    #[hks(name = "await", selector = "AudioPlayback", receiver)]
+    fn await_audio(
+        context: &mut CharacterContext,
+        AudioHandle(id): AudioHandle,
+    ) -> Result<(), NativeError> {
+        context.sound.pending(id)?;
+        context.await_effects = true;
+        Ok(())
+    }
+
     #[hks(name = "volume", receiver)]
     fn volume(
         context: &mut CharacterContext,
@@ -218,6 +235,9 @@ mod api {
         AudioHandle(id): AudioHandle,
         milliseconds: f64,
     ) -> Result<AudioHandle, NativeError> {
+        if context.sound.pending(id)?.channel == Channel::Voice {
+            return Err(NativeError::message("voice does not support fadeIn"));
+        }
         let duration = Duration::try_from_secs_f64(milliseconds / 1000.0).map_err(|_| {
             NativeError::message("audio fade duration must be finite and non-negative")
         })?;

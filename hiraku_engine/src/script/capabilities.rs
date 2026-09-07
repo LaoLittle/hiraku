@@ -112,7 +112,6 @@ pub enum StoryEffect {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoryWait {
-    Curtain,
     DialogueAdvance,
     Movie { path: String },
     Delay { duration_ms: u64 },
@@ -686,8 +685,13 @@ impl StoryNativeHost {
         self.context.wait.take()
     }
 
+    pub(crate) fn take_animation_await(&mut self) -> bool {
+        std::mem::take(&mut self.context.await_effects)
+    }
+
     pub fn snapshot(&self) -> StoryNativeHostSnapshot {
         StoryNativeHostSnapshot {
+            await_effects: self.context.await_effects,
             next_handle: self.context.next_handle,
             actors: self.context.actors.clone(),
             handles_by_name: self.context.handles_by_name.clone(),
@@ -714,6 +718,7 @@ impl StoryNativeHost {
         let controls = StoryControlBuiltins::new(&registry.manifest());
         Self {
             context: CharacterContext {
+                await_effects: snapshot.await_effects,
                 next_handle: snapshot.next_handle,
                 actors: snapshot.actors,
                 handles_by_name: snapshot.handles_by_name,
@@ -738,6 +743,7 @@ fn is_callable(value: &Value) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryNativeHostSnapshot {
+    await_effects: bool,
     scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
     actors: BTreeMap<u64, PendingActor>,
@@ -777,6 +783,7 @@ struct PendingCamera {
 
 #[derive(Default)]
 struct CharacterContext {
+    await_effects: bool,
     scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
     actors: BTreeMap<u64, PendingActor>,
@@ -1189,7 +1196,7 @@ mod native_api {
         context: &mut CharacterContext,
         actor: ActorHandle,
         fade_ms: Option<f64>,
-    ) -> Result<(), NativeError> {
+    ) -> Result<ActorHandle, NativeError> {
         let fade_ms = hide_duration(fade_ms)?;
         let pending = context
             .actor_mut(actor.0)
@@ -1201,24 +1208,20 @@ mod native_api {
             actor_id: Some(actor_id),
             fade_ms,
         });
-        Ok(())
+        Ok(actor)
     }
 
     #[hks(name = "hideCharacters", selector = "scene")]
     fn native_hide_characters(
         context: &mut CharacterContext,
         fade_ms: Option<f64>,
-    ) -> Result<(), NativeError> {
+    ) -> Result<scene_visuals::SceneTransitionHandle, NativeError> {
         let fade_ms = hide_duration(fade_ms)?;
         for actor in context.actors.values_mut() {
             actor.dirty = false;
             actor.visible = false;
         }
-        context.commands.push(StoryEffect::HideCharacter {
-            actor_id: None,
-            fade_ms,
-        });
-        Ok(())
+        context.scene_visuals.hide_characters(fade_ms)
     }
 
     #[hks(name = "save", selector = "story")]
@@ -1278,6 +1281,39 @@ mod native_api {
         updated.validate().map_err(NativeError::message)?;
         *transition = updated;
         Ok(ActorHandle(handle))
+    }
+
+    #[hks(name = "await", selector = "Actor", receiver)]
+    fn await_actor(
+        context: &mut CharacterContext,
+        ActorHandle(id): ActorHandle,
+    ) -> Result<(), NativeError> {
+        let actor = context
+            .actor_mut(id)
+            .map_err(|e| NativeError::message(e.to_string()))?;
+        let pending = actor.pending_offset.is_some() || (actor.dirty && actor.visible);
+        let instance = actor.instance.clone();
+        let hiding = context.commands.iter().any(|e| {
+            matches!(e,
+            StoryEffect::HideCharacter { actor_id: Some(id), .. } if id == &instance)
+        });
+        if !pending && !hiding {
+            return Err(NativeError::message(
+                "await requires an actor animation in the same statement",
+            ));
+        }
+        context.await_effects = true;
+        Ok(())
+    }
+
+    #[hks(name = "await", selector = "Camera", receiver)]
+    fn await_camera(
+        context: &mut CharacterContext,
+        CameraHandle(id): CameraHandle,
+    ) -> Result<(), NativeError> {
+        context.camera_mut(id)?;
+        context.await_effects = true;
+        Ok(())
     }
 
     #[hks(name = "at", receiver)]
@@ -1593,17 +1629,6 @@ mod native_api {
             native_say(context, speaker, TextTemplate(text.clone()))?;
         }
         Ok(Value::Unit)
-    }
-
-    #[hks]
-    fn native_voice(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
-        if path.trim().is_empty() {
-            return Err(NativeError::message("voice path must not be empty"));
-        }
-        context
-            .commands
-            .push(StoryEffect::PlayVoice { path, volume: 1.0 });
-        Ok(())
     }
 
     #[hks]

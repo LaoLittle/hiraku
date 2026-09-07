@@ -452,13 +452,6 @@ pub fn drive_story_runtime(
                     DialogueCommand::AwaitAdvance { done: request },
                 ));
             }
-            StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Curtain) => {
-                let request = runtime.allocate_request();
-                runtime.wait_request = Some(request);
-                pending_script_commands.enqueue(ScriptCommand::Stage(StageCommand::AwaitCurtain {
-                    done: request,
-                }));
-            }
             StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Delay {
                 duration_ms,
             }) => {
@@ -612,7 +605,12 @@ pub fn drive_story_runtime(
                         AudioCommand::PlayVoice {
                             path: definition.path.clone(),
                             volume,
-                            mode: VoicePlaybackMode::Concurrent,
+                            mode: runtime
+                                .story
+                                .as_ref()
+                                .map_or(VoicePlaybackMode::Exclusive, |story| {
+                                    story.voice_playback_mode(task)
+                                }),
                             animation_id: Some(animation_id.clone()),
                         },
                     ));
@@ -717,6 +715,50 @@ pub fn drive_story_runtime(
                     }
                 }
             }
+            StoryRuntimeEvent::TaskEffect {
+                task,
+                effect: effect @ crate::script::capabilities::StoryEffect::PlayBgm { .. },
+            } => {
+                let crate::script::capabilities::StoryEffect::PlayBgm {
+                    path,
+                    volume,
+                    fade_in_ms,
+                } = &effect
+                else {
+                    unreachable!()
+                };
+                if let Some(definition) = audio
+                    .as_deref()
+                    .and_then(|catalog| catalog.resolve_music(path))
+                {
+                    let request = runtime.allocate_request();
+                    let id = format!("hks-bgm-{}", request.0);
+                    pending_script_commands.enqueue(ScriptCommand::Audio(AudioCommand::PlayBgm {
+                        path: definition.path.clone(),
+                        prelude: definition.prelude.clone(),
+                        volume: *volume,
+                        fade_in: fade_in_ms.map(Duration::from_millis),
+                        animation_id: Some(id.clone()),
+                    }));
+                    runtime.task_requests.insert(request, (task, effect));
+                    pending_script_commands.enqueue(ScriptCommand::Animation(
+                        AnimationCommand::Wait {
+                            ids: vec![id],
+                            done: request,
+                        },
+                    ));
+                } else {
+                    warn!("music `{path}` is not defined");
+                    if let Some(story) = runtime.story.as_mut() {
+                        if let Err(error) = story.complete_task_effect(task, &effect) {
+                            crate::script::emit_script_diagnostic(
+                                "failed to complete missing music",
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                }
+            }
             StoryRuntimeEvent::TaskEffect { task, effect } => {
                 let mut command = match crate::script::script_command_from_effect(
                     effect.clone(),
@@ -737,7 +779,6 @@ pub fn drive_story_runtime(
                 let wait = match &mut command {
                     ScriptCommand::Camera(CameraCommand::Set { animation_id, .. })
                     | ScriptCommand::Stage(StageCommand::SetBackground { animation_id, .. })
-                    | ScriptCommand::Character(CharacterCommand::Show { animation_id, .. })
                     | ScriptCommand::Character(CharacterCommand::Motion { animation_id, .. })
                     | ScriptCommand::Dialogue(DialogueCommand::Say { animation_id, .. })
                     | ScriptCommand::Dialogue(DialogueCommand::Continue { animation_id, .. }) => {
@@ -749,6 +790,30 @@ pub fn drive_story_runtime(
                     }
                     ScriptCommand::Stage(StageCommand::SetCurtain { .. }) => {
                         ScriptCommand::Stage(StageCommand::AwaitCurtain { done: request })
+                    }
+                    ScriptCommand::Stage(StageCommand::Picture(picture)) => {
+                        ScriptCommand::Animation(AnimationCommand::Scene {
+                            effect: super::super::effect_wait::SceneEffect::Picture(
+                                picture.clone(),
+                            ),
+                            done: request,
+                        })
+                    }
+                    ScriptCommand::Character(CharacterCommand::Hide { actor_id, .. }) => {
+                        ScriptCommand::Animation(AnimationCommand::Scene {
+                            effect: super::super::effect_wait::SceneEffect::HideCharacter(
+                                actor_id.clone(),
+                            ),
+                            done: request,
+                        })
+                    }
+                    ScriptCommand::Character(CharacterCommand::Show { actor_id, .. }) => {
+                        ScriptCommand::Animation(AnimationCommand::Scene {
+                            effect: super::super::effect_wait::SceneEffect::ShowCharacter(
+                                actor_id.clone(),
+                            ),
+                            done: request,
+                        })
                     }
                     _ => {
                         crate::script::emit_script_diagnostic(

@@ -202,6 +202,12 @@ pub(crate) struct ActorPlacement {
     trajectory: Option<CharacterPlacementTween>,
 }
 
+impl ActorPlacement {
+    pub(super) fn is_animating(&self) -> bool {
+        self.trajectory.is_some()
+    }
+}
+
 // Derive one actor-space trajectory, then project it onto every part, including
 // newly appearing and outgoing expression layers. Part identity must not decide
 // whether placement animates or teleports.

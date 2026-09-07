@@ -1,5 +1,49 @@
 use super::*;
 
+fn retire_bgm(commands: &mut Commands, entity: Entity) {
+    commands.queue(move |world: &mut World| {
+        let completion = world
+            .get::<AudioFade>(entity)
+            .and_then(|fade| fade.animation_id.clone());
+        if let Some(id) = completion {
+            world.resource_mut::<AnimationState>().completed.insert(id);
+        }
+        if let Ok(entity) = world.get_entity_mut(entity) {
+            entity.despawn();
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn replacing_music_releases_its_fade_wait() {
+        let mut world = World::new();
+        world.init_resource::<AnimationState>();
+        let entity = world
+            .spawn(AudioFade {
+                from: 0.0,
+                to: 1.0,
+                timer: Timer::new(Duration::from_secs(1), TimerMode::Once),
+                animation_id: Some("fade-alice".into()),
+            })
+            .id();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        retire_bgm(&mut commands, entity);
+        queue.apply(&mut world);
+        assert!(world.get_entity(entity).is_err());
+        assert!(
+            world
+                .resource::<AnimationState>()
+                .completed
+                .contains("fade-alice")
+        );
+    }
+}
+
 pub(super) fn dispatch_audio_command(
     command: AudioCommand,
     commands: &mut Commands,
@@ -53,7 +97,7 @@ pub(super) fn dispatch_audio_command(
                 user_settings.bgm_volume * user_settings.master_volume,
             );
             if let Some(previous) = stage.bgm.take() {
-                commands.entity(previous).try_despawn();
+                retire_bgm(commands, previous);
             }
             let start_volume = if fade_in.is_some() {
                 0.0
@@ -102,7 +146,7 @@ pub(super) fn dispatch_audio_command(
         }
         AudioCommand::StopBgm => {
             if let Some(previous) = stage.bgm.take() {
-                commands.entity(previous).try_despawn();
+                retire_bgm(commands, previous);
             }
             shared_state.0.bgm = None;
         }
