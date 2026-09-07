@@ -28,6 +28,14 @@ impl PlatformStorage {
 }
 
 impl ByteStorage for PlatformStorage {
+    fn contains(&self, key: &str) -> Result<bool, StorageError> {
+        match std::fs::metadata(self.file_path(key)?) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         match std::fs::read(self.file_path(key)?) {
             Ok(payload) => Ok(Some(payload)),
@@ -67,8 +75,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hiraku-storage-test-{}", std::process::id()));
         let storage = PlatformStorage::new(&root, "test", "bin");
         storage.write("quick", b"save payload").expect("write succeeds");
+        assert!(storage.contains("quick").expect("existence query succeeds"));
+        assert!(storage.contains("../invalid").is_err());
         assert_eq!(storage.read("quick").expect("read succeeds"), Some(b"save payload".to_vec()));
         storage.remove("quick").expect("remove succeeds");
+        assert!(!storage.contains("quick").expect("missing key query succeeds"));
         assert_eq!(storage.read("quick").expect("missing read succeeds"), None);
         std::fs::remove_dir(root).expect("temporary directory is empty");
     }

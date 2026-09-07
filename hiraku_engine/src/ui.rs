@@ -30,6 +30,9 @@ pub enum UiEffect {
         slot: String,
     },
     NextDialogue,
+    SetVolume { channel: String, value: f32 },
+    SetPreference(crate::storage::PreferenceChange),
+    SetAutoDialogue(bool),
     Navigate(NavigationRequest),
 }
 
@@ -168,6 +171,8 @@ pub enum InputKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputNode {
+    #[serde(default)]
+    pub slider_skin: Option<[ScreenTexture; 3]>,
     pub kind: InputKind,
     pub value: StoredValue,
     pub enabled: bool,

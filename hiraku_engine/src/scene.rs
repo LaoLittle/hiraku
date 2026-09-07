@@ -39,7 +39,7 @@ use crate::{
         SceneSnapshot, SpriteSnapshot, StoredValue, TextEffectSnapshot,
     },
     storage::{UserSettings, load_save_data, read_user_settings, write_user_settings},
-    texture::{TextureAtlasCatalog, TextureCatalog, prepare_texture_atlases},
+    texture::{TextureCatalog, prepare_texture_catalog},
     ui::{
         BarNode, ButtonNode, ContainerNode, OverlayUiState, ScreenImageButtonNode, ScreenImageNode,
         ScreenLayout, ScreenNode, ScreenSpec, ScreenUiButton, ScreenUiButtonText,
@@ -62,6 +62,7 @@ mod runtime_menu;
 mod screen_ui;
 pub(crate) mod widgets;
 mod snapshot;
+pub(crate) mod pictures;
 mod video_runtime;
 
 pub use animation_runtime::{
@@ -72,11 +73,11 @@ pub use animation_runtime::{
 use animation_runtime::{PendingAnimationWait, VisualTween};
 pub(crate) use animation_runtime::{complete_missing_animation, tween_fraction};
 use audio_runtime::{
-    BgmChannel, BgmFade, BgmPrelude, SfxChannel, VoiceChannel, apply_volume_setting,
+    BgmChannel, AudioFade, BgmPrelude, SfxChannel, VoiceChannel, apply_volume_setting,
     finish_active_voice, finish_all_voices,
 };
 pub use audio_runtime::{
-    animate_bgm_fades, apply_live_audio_settings, poll_voice_playback, prepare_bgm_preludes,
+    animate_audio_fades, apply_live_audio_settings, poll_voice_playback, poll_sfx_playback, prepare_bgm_preludes,
     reconcile_restored_bgm,
 };
 
@@ -84,7 +85,7 @@ pub(crate) use character::apply_character_ease;
 pub use character::{
     animate_character_motion_effects, poll_pending_character_shows, reconcile_restored_characters,
 };
-use character::{queue_character_show, source_rect_from_corners, source_rect_to_corners};
+use character::{hide_character_entities, queue_character_show, source_rect_from_corners, source_rect_to_corners};
 pub(crate) use choice::ChoiceUi;
 use choice::clear_choice_ui;
 pub use choice::{ChoiceState, handle_choice_action_input, handle_choice_buttons};
@@ -404,7 +405,7 @@ pub fn setup_frontend(
     asset_server: Res<AssetServer>,
     vfs: Res<VfsResource>,
 ) {
-    prepare_texture_atlases(&mut commands, &asset_server, &vfs.0);
+    prepare_texture_catalog(&mut commands, &vfs.0);
     match load_audio_catalog(&vfs.0) {
         Ok(catalog) => commands.insert_resource(catalog),
         Err(error) => {

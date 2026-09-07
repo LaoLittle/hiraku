@@ -16,6 +16,8 @@ use hiraku_engine::{
 const PRESENTATION_LAYER: usize = 31;
 
 pub mod text_input;
+mod display;
+mod platform;
 
 #[derive(Component)]
 struct CanvasPresentation;
@@ -34,7 +36,8 @@ impl Plugin for HirakuPresentationPlugin {
             picking_mode: SpritePickingMode::BoundingBox,
         })
         .add_plugins(text_input::HirakuTextInputPlugin)
-        .add_systems(Update, (present_hiraku_canvas, bridge_host_actions));
+        .add_systems(Update, (present_hiraku_canvas, bridge_host_actions))
+        .add_systems(Update, display::apply_preferences.run_if(resource_exists::<hiraku_engine::UserSettings>));
     }
 }
 

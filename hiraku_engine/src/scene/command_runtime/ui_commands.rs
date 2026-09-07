@@ -5,7 +5,6 @@ pub(super) fn dispatch_ui_command(
     commands: &mut Commands,
     asset_server: &AssetServer,
     images: &Assets<Image>,
-    texture_atlases: &TextureAtlasCatalog,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     screen_state: &mut ScreenUiState,
@@ -16,7 +15,6 @@ pub(super) fn dispatch_ui_command(
             let spawned = spawn_screen_ui(
                 commands,
                 asset_server,
-                texture_atlases,
                 ui_fonts,
                 ui_style,
                 &screen,
@@ -52,7 +50,6 @@ pub(super) fn dispatch_ui_command(
             let spawned = spawn_screen_ui(
                 commands,
                 asset_server,
-                texture_atlases,
                 ui_fonts,
                 ui_style,
                 &screen,

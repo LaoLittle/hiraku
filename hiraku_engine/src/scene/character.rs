@@ -1,9 +1,91 @@
 use super::*;
 
+/// Hide logical actors while keeping their part entities available for reuse.
+/// Cancel pending image readiness so it cannot resurrect a hidden actor later.
+pub(super) fn hide_character_entities(
+    commands: &mut Commands,
+    stage: &mut StageState,
+    pending: &mut PendingCharacterShows,
+    animations: &mut AnimationState,
+    actor: Option<&str>,
+    fade_ms: u64,
+) {
+    let selected = |name: &str| actor.is_none_or(|actor| actor == name);
+    pending.items.retain_mut(|item| {
+        if !selected(&item.actor_id) {
+            return true;
+        }
+        complete_missing_animation(animations, item.animation_id.take());
+        false
+    });
+    let names = stage
+        .character_roots
+        .keys()
+        .filter(|name| selected(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in names {
+        let prefix = format!("character::{name}::");
+        for (id, entity) in &stage.sprites {
+            if id.starts_with(&prefix) {
+                let entity = *entity;
+                commands.queue(move |world: &mut World| {
+                    let previous = world.get::<VisualTween>(entity);
+                    let alpha = previous
+                        .and_then(|tween| {
+                            Some(
+                                tween.from_alpha?
+                                    + (tween.to_alpha? - tween.from_alpha?)
+                                        * tween_fraction(&tween.timer),
+                            )
+                        })
+                        .unwrap_or(1.0);
+                    let animation = previous.and_then(|tween| tween.animation_id.clone());
+                    if let Some(animation) = animation {
+                        world
+                            .resource_mut::<AnimationState>()
+                            .completed
+                            .insert(animation);
+                    }
+                    let Ok(mut entity) = world.get_entity_mut(entity) else {
+                        return;
+                    };
+                    entity.remove::<VisualTween>();
+                    if fade_ms == 0 || entity.get::<Visibility>() == Some(&Visibility::Hidden) {
+                        entity.insert(Visibility::Hidden).remove::<HideAfterTween>();
+                    } else {
+                        entity.insert((
+                            HideAfterTween,
+                            VisualTween {
+                                from_alpha: Some(alpha),
+                                to_alpha: Some(0.0),
+                                from_translation: None,
+                                to_translation: None,
+                                from_scale: None,
+                                to_scale: None,
+                                timer: Timer::new(
+                                    std::time::Duration::from_millis(fade_ms),
+                                    TimerMode::Once,
+                                ),
+                                animation_id: None,
+                                despawn_on_finish: false,
+                            },
+                        ));
+                    }
+                });
+            }
+        }
+        stage.character_active_parts.remove(&name);
+        stage.character_positions.remove(&name);
+    }
+    stage.pending_character_restore.retain(|part| {
+        actor.is_some_and(|name| !part.id.starts_with(&format!("character::{name}::")))
+    });
+}
+
 pub fn reconcile_restored_characters(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    texture_atlases: Res<TextureAtlasCatalog>,
     characters: Res<CharacterCatalog>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut alpha_mask_materials: ResMut<Assets<AlphaMaskMaterial>>,
@@ -68,7 +150,6 @@ pub fn reconcile_restored_characters(
         queue_character_show(
             &mut commands,
             &asset_server,
-            &texture_atlases,
             &mut meshes,
             &mut alpha_mask_materials,
             &mut multiply_materials,
@@ -342,7 +423,6 @@ fn set_character_part_alpha(
 pub(super) fn queue_character_show(
     commands: &mut Commands,
     asset_server: &AssetServer,
-    _texture_atlases: &TextureAtlasCatalog,
     meshes: &mut Assets<Mesh>,
     alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
     multiply_materials: &mut Assets<MultiplyMaterial>,
@@ -475,7 +555,7 @@ pub(super) fn queue_character_show(
                 translation: Vec3::new(
                     position.x + part.offset.x * scale,
                     position.y + part.offset.y * scale,
-                    STAGE_Z_SPRITE + part.layer,
+                    character_depth(part.layer),
                 ),
                 scale: Vec3::splat(scale),
                 ..default()
@@ -500,7 +580,7 @@ pub(super) fn queue_character_show(
             translation: Vec3::new(
                 position.x + part.offset.x * scale,
                 position.y + part.offset.y * scale,
-                STAGE_Z_SPRITE + part.layer,
+                character_depth(part.layer),
             ),
             scale: Vec3::splat(scale),
             ..default()
@@ -781,6 +861,12 @@ fn character_part_id(actor_id: &str, part: &CharacterPartDefinition) -> String {
     }
 }
 
+// Descriptor layers are local sorting units, not world-space distances.
+// Keep ordinary part orders within the character band below the scene curtain.
+fn character_depth(layer: f32) -> f32 {
+    STAGE_Z_SPRITE + layer * 0.001
+}
+
 fn character_part_sprite(image: Handle<Image>, part: &CharacterPartDefinition) -> WorldSprite {
     WorldSprite::from_image(image).with_rect(part.rect.map(source_rect_from_corners))
 }
@@ -796,6 +882,79 @@ pub(super) fn source_rect_to_corners(rect: [f32; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hiding_an_actor_keeps_cached_children_but_cancels_pending_reveal() {
+        let mut app = App::new();
+        app.init_resource::<StageState>()
+            .init_resource::<PendingCharacterShows>()
+            .init_resource::<AnimationState>();
+        let alice = app.world_mut().spawn(Visibility::Visible).id();
+        let bob = app.world_mut().spawn(Visibility::Visible).id();
+        let alice_root = app.world_mut().spawn_empty().id();
+        let bob_root = app.world_mut().spawn_empty().id();
+        {
+            let mut stage = app.world_mut().resource_mut::<StageState>();
+            stage
+                .character_roots
+                .extend([("alice".into(), alice_root), ("bob".into(), bob_root)]);
+            stage.sprites.extend([
+                ("character::alice::body".into(), alice),
+                ("character::bob::body".into(), bob),
+            ]);
+        }
+        app.world_mut()
+            .resource_mut::<PendingCharacterShows>()
+            .items
+            .push(PendingCharacterShow {
+                actor_id: "alice".into(),
+                entity_ids: vec!["character::alice::body".into()],
+                entities: vec![alice],
+                handles: vec![],
+                newly_spawned: vec![false],
+                outgoing: vec![],
+                fade: None,
+                animation_id: Some("reveal".into()),
+            });
+        app.add_systems(
+            Update,
+            |mut commands: Commands,
+             mut stage: ResMut<StageState>,
+             mut pending: ResMut<PendingCharacterShows>,
+             mut animations: ResMut<AnimationState>| {
+                hide_character_entities(
+                    &mut commands,
+                    &mut stage,
+                    &mut pending,
+                    &mut animations,
+                    Some("alice"),
+                    0,
+                );
+            },
+        );
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(alice),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(bob),
+            Some(&Visibility::Visible)
+        );
+        assert!(
+            app.world()
+                .resource::<PendingCharacterShows>()
+                .items
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<AnimationState>()
+                .completed
+                .contains("reveal")
+        );
+        assert!(character_depth(131.0) < STAGE_Z_OVERLAY);
+    }
 
     #[test]
     fn restored_character_ids_recover_the_logical_actor() {

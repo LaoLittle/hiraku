@@ -28,6 +28,7 @@ pub enum ScriptCommand {
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
+    SaveSlot(String),
     Log(String),
     Navigate(NavigationRequest),
     Exit,
@@ -35,6 +36,8 @@ pub enum RuntimeCommand {
 
 #[derive(Debug)]
 pub enum StageCommand {
+    Picture(crate::scene::pictures::PictureCommand),
+    SetCurtain { opacity: f32, fade: Option<Duration> },
     SetBackground {
         path: String,
         fade: Option<Duration>,
@@ -76,7 +79,10 @@ pub enum CameraCommand {
 
 #[derive(Debug)]
 pub enum SettingsCommand {
+    Preference(crate::storage::PreferenceChange),
+    AutoDialogue(bool),
     Adjust { name: String, delta: f32 },
+    Set { name: String, value: f32 },
 }
 
 #[derive(Debug)]
@@ -96,6 +102,7 @@ pub enum UiCommand {
 
 #[derive(Debug)]
 pub enum CharacterCommand {
+    Hide { actor_id: Option<String>, fade_ms: u64 },
     Show {
         actor_id: String,
         character_name: String,
@@ -110,6 +117,7 @@ pub enum CharacterCommand {
 
 #[derive(Debug)]
 pub enum AnimationCommand {
+    Delay { duration: Duration, done: ScriptRequestId },
     Wait {
         ids: Vec<String>,
         done: ScriptRequestId,
@@ -118,6 +126,7 @@ pub enum AnimationCommand {
 
 #[derive(Debug)]
 pub enum AudioCommand {
+    PlaySfx { path: String, volume: f32, fade_in: Option<Duration>, animation_id: Option<String> },
     PlayBgm {
         path: String,
         prelude: Option<String>,

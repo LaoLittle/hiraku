@@ -276,6 +276,21 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
         }
         for effect in effects {
             match &effect {
+                crate::ui::UiEffect::SetPreference(change) => {
+                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                        SettingsCommand::Preference(change.clone()),
+                    ));
+                }
+                crate::ui::UiEffect::SetAutoDialogue(enabled) => {
+                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                        SettingsCommand::AutoDialogue(*enabled),
+                    ));
+                }
+                crate::ui::UiEffect::SetVolume { channel, value } => {
+                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                        SettingsCommand::Set { name: channel.clone(), value: *value },
+                    ));
+                }
                 crate::ui::UiEffect::PlaySfx { .. } => {
                     ctx.effects
                         .write(super::screen_ui::UiEffectMessage(effect.clone()));

@@ -111,6 +111,7 @@ fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
 /// assets. No transform is rewritten, so animation state stays independent.
 pub fn sync_world_sprites(
     mut commands: Commands,
+    canvas: Option<Res<crate::HirakuCanvas>>,
     images: Res<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WorldSpriteMaterial>>,
@@ -119,9 +120,10 @@ pub fn sync_world_sprites(
         &mut WorldSprite,
         Option<&mut Mesh3d>,
         Option<&MeshMaterial3d<WorldSpriteMaterial>>,
+        Has<crate::scene::BackgroundLayer>,
     )>,
 ) {
-    for (entity, mut sprite, mesh, material_handle) in &mut sprites {
+    for (entity, mut sprite, mesh, material_handle, background) in &mut sprites {
         let size = sprite.custom_size.or_else(|| {
             sprite
                 .rect
@@ -133,6 +135,18 @@ pub fn sync_world_sprites(
                         .and_then(|handle| images.get(handle))
                         .map(|image| image.size_f32())
                 })
+        });
+        // Fit only the default natural size. Explicit sizing and the entity's
+        // story transform remain independent. Resolving here also covers lazy
+        // image loads, background transitions, and snapshot reconstruction.
+        let size = size.map(|size| {
+            if background && sprite.custom_size.is_none() {
+                canvas
+                    .as_ref()
+                    .map_or(size, |canvas| fit_background(size, canvas.size.as_vec2()))
+            } else {
+                size
+            }
         });
 
         if let Some(size) = size
@@ -157,6 +171,120 @@ pub fn sync_world_sprites(
             let material = materials.add(material_from_sprite(&sprite));
             commands.entity(entity).try_insert(MeshMaterial3d(material));
         }
+    }
+}
+
+fn fit_background(source: Vec2, viewport: Vec2) -> Vec2 {
+    if !source.is_finite()
+        || source.min_element() <= 0.0
+        || !viewport.is_finite()
+        || viewport.min_element() <= 0.0
+    {
+        return Vec2::ONE;
+    }
+    source * (viewport / source).min_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_fit_contains_image_without_distortion() {
+        let viewport = Vec2::new(1920.0, 1080.0);
+        assert_eq!(
+            fit_background(Vec2::new(3840.0, 2160.0), viewport),
+            viewport
+        );
+        assert_eq!(
+            fit_background(Vec2::new(4096.0, 2048.0), viewport),
+            Vec2::new(1920.0, 960.0)
+        );
+        assert_eq!(
+            fit_background(Vec2::new(100.0, 200.0), viewport),
+            Vec2::new(540.0, 1080.0)
+        );
+    }
+
+    #[test]
+    fn background_fit_handles_invalid_dimensions() {
+        assert_eq!(fit_background(Vec2::ZERO, Vec2::ONE), Vec2::ONE);
+        assert_eq!(fit_background(Vec2::ONE, Vec2::splat(f32::NAN)), Vec2::ONE);
+    }
+
+    #[test]
+    fn background_sync_preserves_story_transform_and_explicit_size() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<WorldSpriteMaterial>>()
+            .insert_resource(crate::HirakuCanvas {
+                image: Handle::default(),
+                size: UVec2::new(1920, 1080),
+            })
+            .add_systems(Update, sync_world_sprites);
+        let source =
+            WorldSprite::from_image(Handle::default()).with_rect(Some([0.0, 0.0, 4096.0, 2048.0]));
+        let transform = Transform::from_xyz(12.0, 34.0, -10.0).with_scale(Vec3::splat(2.0));
+        let background = app
+            .world_mut()
+            .spawn((
+                source.clone(),
+                crate::scene::BackgroundLayer {
+                    path: "background/room".into(),
+                },
+                transform,
+            ))
+            .id();
+        let actor = app.world_mut().spawn(source.clone()).id();
+        let mut sized = source;
+        sized.custom_size = Some(Vec2::new(320.0, 180.0));
+        let explicit = app
+            .world_mut()
+            .spawn((
+                sized,
+                crate::scene::BackgroundLayer {
+                    path: "background/detail".into(),
+                },
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<WorldSprite>(background)
+                .expect("background")
+                .resolved_size,
+            Some(Vec2::new(1920.0, 960.0))
+        );
+        assert_eq!(
+            *app.world()
+                .get::<Transform>(background)
+                .expect("story transform"),
+            transform
+        );
+        assert_eq!(
+            app.world()
+                .get::<WorldSprite>(actor)
+                .expect("actor")
+                .resolved_size,
+            Some(Vec2::new(4096.0, 2048.0))
+        );
+        assert_eq!(
+            app.world()
+                .get::<WorldSprite>(explicit)
+                .expect("explicit size")
+                .resolved_size,
+            Some(Vec2::new(320.0, 180.0))
+        );
+        app.world_mut().resource_mut::<crate::HirakuCanvas>().size = UVec2::new(960, 540);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<WorldSprite>(background)
+                .expect("resized background")
+                .resolved_size,
+            Some(Vec2::new(960.0, 480.0))
+        );
     }
 }
 

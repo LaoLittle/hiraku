@@ -8,11 +8,22 @@ use crate::state::StoredValue;
 #[derive(Clone, Debug, Default)]
 pub struct UiContext {
     story: BTreeMap<String, StoredValue>,
+    preferences: crate::storage::UserSettings,
 }
 
 impl UiContext {
     pub fn new(story: BTreeMap<String, StoredValue>) -> Self {
-        Self { story }
+        Self { story, ..Self::default() }
+    }
+
+    /// Host settings are native context, not implicit script global declarations.
+    pub fn with_preferences(mut self, preferences: crate::storage::UserSettings) -> Self {
+        self.preferences = preferences;
+        self
+    }
+
+    pub(crate) fn preferences(&self) -> &crate::storage::UserSettings {
+        &self.preferences
     }
 
     pub fn story_value(&self, key: &str) -> Option<&StoredValue> {

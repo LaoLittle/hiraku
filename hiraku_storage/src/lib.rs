@@ -27,6 +27,10 @@ pub enum StorageError {
 
 /// Durable storage of opaque byte payloads.
 pub trait ByteStorage: Send + Sync {
+    /// Test whether a key exists without decoding its payload.
+    fn contains(&self, key: &str) -> Result<bool, StorageError> {
+        Ok(self.read(key)?.is_some())
+    }
     fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
     fn write(&self, key: &str, payload: &[u8]) -> Result<(), StorageError>;
     fn remove(&self, key: &str) -> Result<(), StorageError>;

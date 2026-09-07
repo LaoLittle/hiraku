@@ -11,6 +11,33 @@ pub(super) fn dispatch_audio_command(
     voice_state: &mut VoiceState,
 ) {
     match command {
+        AudioCommand::PlaySfx {
+            path,
+            volume,
+            fade_in,
+            animation_id,
+        } => {
+            let target_volume = apply_volume_setting(volume, user_settings.sfx_volume * user_settings.master_volume);
+            let start_volume = if fade_in.is_some() {
+                0.0
+            } else {
+                target_volume
+            };
+            let mut entity = commands.spawn((
+                super::super::audio_runtime::SfxChannel { volume },
+                super::super::audio_runtime::SfxCompletion { animation_id },
+                AudioPlayer::new(asset_server.load(path)),
+                PlaybackSettings::ONCE.with_volume(Volume::Linear(start_volume)),
+            ));
+            if let Some(duration) = fade_in {
+                entity.insert(AudioFade {
+                    from: 0.0,
+                    to: volume,
+                    timer: Timer::new(duration, TimerMode::Once),
+                    animation_id: None,
+                });
+            }
+        }
         AudioCommand::PlayBgm {
             path,
             prelude,
@@ -18,7 +45,7 @@ pub(super) fn dispatch_audio_command(
             fade_in,
             animation_id,
         } => {
-            let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume);
+            let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume * user_settings.master_volume);
             if let Some(previous) = stage.bgm.take() {
                 commands.entity(previous).try_despawn();
             }
@@ -55,9 +82,9 @@ pub(super) fn dispatch_audio_command(
                     .id()
             };
             if let Some(fade_in) = fade_in {
-                commands.entity(bgm).insert(BgmFade {
-                    from: start_volume,
-                    to: playback_volume,
+                commands.entity(bgm).insert(AudioFade {
+                    from: 0.0,
+                    to: volume,
                     timer: Timer::new(fade_in, TimerMode::Once),
                     animation_id,
                 });
@@ -79,7 +106,7 @@ pub(super) fn dispatch_audio_command(
             mode,
             animation_id,
         } => {
-            let playback_volume = apply_volume_setting(volume, user_settings.voice_volume);
+            let playback_volume = apply_volume_setting(volume, user_settings.voice_volume * user_settings.master_volume);
             if mode == VoicePlaybackMode::Exclusive {
                 finish_active_voice(commands, animations, voice_state);
             }

@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 use crate::script::StoryRuntimeEvent;
 
 fn stored_to_hks(value: StoredValue) -> hiraku_script::Value {
@@ -105,18 +106,6 @@ fn evaluate_ui_at_with_arguments(
         .as_ref()
         .map(|story| hks_globals_to_stored(story.globals()))
         .unwrap_or_default();
-    values.insert(
-        "bgmVolume".to_string(),
-        StoredValue::Float(user_settings.bgm_volume as f64),
-    );
-    values.insert(
-        "voiceVolume".to_string(),
-        StoredValue::Float(user_settings.voice_volume as f64),
-    );
-    values.insert(
-        "sfxVolume".to_string(),
-        StoredValue::Float(user_settings.sfx_volume as f64),
-    );
     values.insert("dialogue".to_string(), default_dialogue_model());
     values.insert("history".to_string(), default_history_model());
     values.extend(extra_values);
@@ -126,7 +115,7 @@ fn evaluate_ui_at_with_arguments(
     evaluate_ui_component_named_with_args(
         target,
         &source,
-        UiContext::new(values),
+        UiContext::new(values).with_preferences(user_settings.clone()),
         textures,
         terms,
         arguments,
@@ -141,6 +130,7 @@ fn default_dialogue_model() -> StoredValue {
         ("visible".to_string(), StoredValue::Bool(false)),
         ("revealedCharacters".to_string(), StoredValue::Int(0)),
         ("canAdvance".to_string(), StoredValue::Bool(false)),
+        ("autoEnabled".to_string(), StoredValue::Bool(false)),
     ]))
 }
 
@@ -268,6 +258,13 @@ pub fn drive_story_runtime(
                 }
                 None => warn!("music `{path}` is not defined"),
             },
+            StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlaySfx { path, volume, fade_in_ms }) => {
+                if let Some(definition) = audio.as_deref().and_then(|catalog| catalog.resolve_sfx(&path)) {
+                    pending_script_commands.enqueue(ScriptCommand::Audio(AudioCommand::PlaySfx {
+                        path: definition.path.clone(), volume, fade_in: fade_in_ms.map(Duration::from_millis), animation_id: None,
+                    }));
+                } else { warn!("sound effect `{path}` is not defined"); }
+            }
             StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayVoice {
                 path,
                 volume,
@@ -443,6 +440,13 @@ pub fn drive_story_runtime(
                     DialogueCommand::AwaitAdvance { done: request },
                 ));
             }
+            StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Delay { duration_ms }) => {
+                let request = runtime.allocate_request();
+                runtime.wait_request = Some(request);
+                pending_script_commands.enqueue(ScriptCommand::Animation(AnimationCommand::Delay {
+                    duration: Duration::from_millis(duration_ms), done: request,
+                }));
+            }
             StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Movie { path }) => {
                 let target = movies
                     .as_deref()
@@ -596,6 +600,29 @@ pub fn drive_story_runtime(
                     }
                 }
             },
+            StoryRuntimeEvent::TaskEffect { task, effect: crate::script::capabilities::StoryEffect::Delay { duration_ms } } => {
+                let request = runtime.allocate_request();
+                runtime.task_requests.insert(request, task);
+                pending_script_commands.enqueue(ScriptCommand::Animation(AnimationCommand::Delay {
+                    duration: Duration::from_millis(duration_ms), done: request,
+                }));
+            }
+            StoryRuntimeEvent::TaskEffect { task, effect: crate::script::capabilities::StoryEffect::PlaySfx { path, volume, fade_in_ms } } => {
+                if let Some(definition) = audio.as_deref().and_then(|catalog| catalog.resolve_sfx(&path)) {
+                    let request = runtime.allocate_request();
+                    let animation_id = format!("hks-task-sfx-{}", request.0);
+                    runtime.task_requests.insert(request, task);
+                    pending_script_commands.enqueue(ScriptCommand::Audio(AudioCommand::PlaySfx {
+                        path: definition.path.clone(), volume, fade_in: fade_in_ms.map(Duration::from_millis), animation_id: Some(animation_id.clone()),
+                    }));
+                    pending_script_commands.enqueue(ScriptCommand::Animation(AnimationCommand::Wait { ids: vec![animation_id], done: request }));
+                } else {
+                    warn!("sound effect `{path}` is not defined");
+                    if let Some(story) = runtime.story.as_mut() && let Err(error) = story.resume_task(task) {
+                        crate::script::emit_script_diagnostic("failed to complete missing task sound", &error.to_string());
+                    }
+                }
+            }
             StoryRuntimeEvent::TaskEffect { task, effect } => {
                 warn!("unsupported HKS task effect for task {task}: {effect:?}");
                 if let Some(story) = runtime.story.as_mut()
@@ -615,7 +642,12 @@ pub fn drive_story_runtime(
                         .map(|story| story.globals().clone())
                         .unwrap_or_default();
                     let mut caller = frame.story;
-                    caller.set_globals(globals);
+                    let mut merged = caller.globals().clone();
+                    merged.extend(globals);
+                    caller.set_globals(merged);
+                    if let Some(callee) = runtime.story.as_ref() {
+                        caller.inherit_native_state(callee, false);
+                    }
                     runtime.story = Some(caller);
                     runtime.current_script = Some(frame.script);
                     runtime.task_requests.clear();

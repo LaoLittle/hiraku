@@ -139,8 +139,8 @@ impl StoryRuntime {
         for (task, effects) in &mut snapshot.active_task_effects {
             let had_voice = effects
                 .iter()
-                .any(|effect| matches!(effect, StoryEffect::PlayVoice { .. }));
-            effects.retain(|effect| !matches!(effect, StoryEffect::PlayVoice { .. }));
+                .any(|effect| matches!(effect, StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }));
+            effects.retain(|effect| !matches!(effect, StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }));
             if had_voice && effects.is_empty() {
                 completed_voice_tasks.push(*task);
             }
@@ -183,6 +183,15 @@ impl StoryRuntime {
 
     pub fn globals(&self) -> &std::collections::BTreeMap<String, Value> {
         self.execution.globals()
+    }
+
+    /// Native handles and their retained state belong to the story session,
+    /// not to an individual called file. VM wait state is deliberately not copied.
+    pub(crate) fn inherit_native_state(&mut self, previous: &Self, reset_presentation: bool) {
+        self.host = StoryNativeHost::restore(previous.host.snapshot());
+        if reset_presentation {
+            self.host.reset_presentation();
+        }
     }
 
     pub(crate) fn enqueue_event(&mut self, event: StoryRuntimeEvent) {
@@ -446,7 +455,10 @@ impl StoryRuntime {
             self.host
                 .drain_effects()
                 .into_iter()
-                .map(StoryRuntimeEvent::Effect),
+                .map(|effect| match effect {
+                    StoryEffect::Delay { duration_ms } => StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms }),
+                    effect => StoryRuntimeEvent::Effect(effect),
+                }),
         );
         if let Some(wait) = self.host.take_wait() {
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
@@ -584,8 +596,18 @@ impl StoryRuntime {
     }
 
     fn enqueue_task_boundaries(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
+        let mut has_delay = false;
+        let mut interactive_delay = None;
+        let task_mode = self.execution.mode(task);
         for effect in self.host.drain_effects() {
-            if matches!(effect, StoryEffect::PlayVoice { .. }) {
+            if let StoryEffect::Delay { duration_ms } = effect
+                && task_mode == Some(ExecutionMode::Interactive)
+            {
+                interactive_delay = Some(StoryWait::Delay { duration_ms });
+                continue;
+            }
+            has_delay |= matches!(effect, StoryEffect::Delay { .. });
+            if matches!(effect, StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. } | StoryEffect::Delay { .. }) {
                 self.active_task_effects
                     .entry(task)
                     .or_default()
@@ -596,8 +618,7 @@ impl StoryRuntime {
                 self.pending.push_back(StoryRuntimeEvent::Effect(effect));
             }
         }
-        let wait = self.host.take_wait();
-        let task_mode = self.execution.mode(task);
+        let wait = self.host.take_wait().or(interactive_delay);
         if matches!(wait, Some(StoryWait::Movie { .. }))
             && task_mode != Some(ExecutionMode::Interactive)
         {
@@ -614,7 +635,7 @@ impl StoryRuntime {
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
         if task_mode == Some(ExecutionMode::Sequence)
-            && has_wait
+            && (has_wait || has_delay)
             && self.active_task_effects.contains_key(&task)
         {
             self.execution.pause(task)?;
@@ -893,6 +914,26 @@ mod tests {
     }
 
     #[test]
+    fn called_file_preserves_global_actor_identity() {
+        let mut caller = StoryRuntime::new(compile_story_bytecode(
+            "memory://caller.hks",
+            "global let alice = char(\"alice\")\nglobal let bob = char(\"bob\")",
+        ).expect("caller compiles")).expect("caller starts");
+        assert!(matches!(caller.step().expect("declarations execute"), Some(StoryRuntimeEvent::Completed(_))));
+        let bob = caller.globals().get("bob").expect("global identity exists").clone();
+        let mut callee = StoryRuntime::new(compile_story_bytecode(
+            "memory://callee.hks",
+            "global let bob = char(\"bob\")\nbob: \"Hello\"",
+        ).expect("callee compiles")).expect("callee starts");
+        callee.inherit_native_state(&caller, false);
+        callee.set_globals(caller.globals().clone());
+        assert_eq!(callee.step().expect("dialogue executes"), Some(StoryRuntimeEvent::Effect(
+            StoryEffect::Say { speaker: "bob".into(), text: "Hello".into() },
+        )));
+        assert_eq!(callee.globals().get("bob"), Some(&bob));
+    }
+
+    #[test]
     fn whole_program_runtime_evaluates_dialogue_templates_from_globals() {
         let bytecode = compile_story_bytecode(
             "template.story.hks",
@@ -919,7 +960,7 @@ mod tests {
     #[test]
     fn direct_runtime_dispatches_native_calls_at_statement_boundaries() {
         let bytecode =
-            compile_story_bytecode("test.story.hks", r#"char("alice").e("happy").at(.right)"#)
+            compile_story_bytecode("test.story.hks", r#"char("alice").e("happy").at(.right).show()"#)
                 .expect("character story must compile");
         let mut runtime = ExecutionRuntime::new(bytecode).expect("script runtime must initialize");
         let mut host = StoryNativeHost::new();
@@ -968,8 +1009,8 @@ mod tests {
             "fluent.story.hks",
             r#"
                 bgm("music/theme").volume(0.75).fadeIn(600)
-                char("alice").focus()
-                char("bob").focus(false)
+                char("alice").focus().show()
+                char("bob").focus(false).show()
                 camera().blur(2)
                 camera(.canvas)
                     .offset(10, 20, 30)

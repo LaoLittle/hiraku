@@ -15,7 +15,7 @@ pub(crate) struct BgmPrelude {
 }
 
 #[derive(Component)]
-pub(crate) struct BgmFade {
+pub(crate) struct AudioFade {
     pub from: f32,
     pub to: f32,
     pub timer: Timer,
@@ -34,13 +34,41 @@ pub(crate) struct SfxChannel {
     pub volume: f32,
 }
 
-pub fn animate_bgm_fades(
+#[derive(Component)]
+pub(crate) struct SfxCompletion {
+    pub animation_id: Option<String>,
+}
+
+/// Playback owns its ECS entity. There are no threads/channels or blocking
+/// waits here; task joins observe completion through the animation tracker.
+pub fn poll_sfx_playback(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut animations: ResMut<AnimationState>,
+    sounds: Query<(Entity, &AudioPlayer, Option<&AudioSink>, &SfxCompletion)>,
+) {
+    for (entity, player, sink, completion) in &sounds {
+        let failed = matches!(
+            asset_server.get_load_state(player.0.id()),
+            Some(bevy::asset::LoadState::Failed(_))
+        );
+        if failed || sink.is_some_and(|sink| sink.empty()) {
+            if let Some(id) = &completion.animation_id {
+                animations.completed.insert(id.clone());
+            }
+            commands.entity(entity).try_despawn();
+        }
+    }
+}
+
+pub fn animate_audio_fades(
     mut commands: Commands,
     time: Res<Time>,
+    settings: Res<UserSettings>,
     mut animations: ResMut<AnimationState>,
-    mut bgms: Query<(Entity, Option<&mut AudioSink>, &mut BgmFade)>,
+    mut sources: Query<(Entity, Option<&mut AudioSink>, &mut AudioFade, Option<&BgmChannel>, Option<&VoiceChannel>, Option<&SfxChannel>)>,
 ) {
-    for (entity, sink, mut fade) in &mut bgms {
+    for (entity, sink, mut fade, bgm, voice, sfx) in &mut sources {
         let Some(mut sink) = sink else {
             // Asset loading is asynchronous. The fade starts with audible playback, not while
             // the source is still waiting to be decoded.
@@ -49,13 +77,17 @@ pub fn animate_bgm_fades(
         fade.timer.tick(time.delta());
         let fraction = tween_fraction(&fade.timer);
         let volume = fade.from + (fade.to - fade.from) * fraction;
-        sink.set_volume(Volume::Linear(volume));
+        let channel = if bgm.is_some() { settings.bgm_volume }
+            else if voice.is_some() { settings.voice_volume }
+            else if sfx.is_some() { settings.sfx_volume }
+            else { 1.0 };
+        sink.set_volume(Volume::Linear(apply_volume_setting(volume, channel * settings.master_volume)));
 
         if fade.timer.is_finished() {
             if let Some(animation_id) = fade.animation_id.take() {
                 animations.completed.insert(animation_id);
             }
-            commands.entity(entity).try_remove::<BgmFade>();
+            commands.entity(entity).try_remove::<AudioFade>();
         }
     }
 }
@@ -99,7 +131,7 @@ pub fn reconcile_restored_bgm(
     let Some(snapshot) = stage.pending_bgm_restore.take() else {
         return;
     };
-    let playback_volume = apply_volume_setting(snapshot.volume, user_settings.bgm_volume);
+    let playback_volume = apply_volume_setting(snapshot.volume, user_settings.bgm_volume * user_settings.master_volume);
     let loop_audio = asset_server.load(snapshot.path.clone());
     let entity = if let Some(prelude) = audio
         .resolve_music_path(&snapshot.path)
@@ -135,9 +167,9 @@ pub fn reconcile_restored_bgm(
 
 pub fn apply_live_audio_settings(
     user_settings: Res<UserSettings>,
-    mut bgms: Query<(&mut AudioSink, &BgmChannel), (Without<VoiceChannel>, Without<SfxChannel>)>,
-    mut voices: Query<(&mut AudioSink, &VoiceChannel), (Without<BgmChannel>, Without<SfxChannel>)>,
-    mut sfx: Query<(&mut AudioSink, &SfxChannel), (Without<BgmChannel>, Without<VoiceChannel>)>,
+    mut bgms: Query<(&mut AudioSink, &BgmChannel), (Without<VoiceChannel>, Without<SfxChannel>, Without<AudioFade>)>,
+    mut voices: Query<(&mut AudioSink, &VoiceChannel), (Without<BgmChannel>, Without<SfxChannel>, Without<AudioFade>)>,
+    mut sfx: Query<(&mut AudioSink, &SfxChannel), (Without<BgmChannel>, Without<VoiceChannel>, Without<AudioFade>)>,
 ) {
     if !user_settings.is_changed() {
         return;
@@ -146,19 +178,19 @@ pub fn apply_live_audio_settings(
     for (mut sink, channel) in &mut bgms {
         sink.set_volume(Volume::Linear(apply_volume_setting(
             channel.volume,
-            user_settings.bgm_volume,
+            user_settings.bgm_volume * user_settings.master_volume,
         )));
     }
     for (mut sink, channel) in &mut voices {
         sink.set_volume(Volume::Linear(apply_volume_setting(
             channel.volume,
-            user_settings.voice_volume,
+            user_settings.voice_volume * user_settings.master_volume,
         )));
     }
     for (mut sink, channel) in &mut sfx {
         sink.set_volume(Volume::Linear(apply_volume_setting(
             channel.volume,
-            user_settings.sfx_volume,
+            user_settings.sfx_volume * user_settings.master_volume,
         )));
     }
 }

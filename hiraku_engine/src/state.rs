@@ -123,6 +123,8 @@ impl Default for CameraSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
+    #[serde(default)]
+    pub pictures: BTreeMap<String, crate::scene::pictures::PictureState>,
     pub background: Option<ImageLayerSnapshot>,
     #[serde(default)]
     pub sprites: Vec<SpriteSnapshot>,

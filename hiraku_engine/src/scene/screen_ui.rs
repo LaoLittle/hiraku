@@ -92,7 +92,6 @@ pub(super) struct SpawnedScreenUi {
 pub(super) fn spawn_screen_ui(
     commands: &mut Commands,
     asset_server: &AssetServer,
-    texture_atlases: &TextureAtlasCatalog,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     screen: &ScreenSpec,
@@ -122,7 +121,6 @@ pub(super) fn spawn_screen_ui(
         commands,
         root,
         asset_server,
-        texture_atlases,
         ui_fonts,
         ui_style,
         screen,
@@ -140,7 +138,6 @@ fn build_screen_ui_children(
     commands: &mut Commands,
     root: Entity,
     asset_server: &AssetServer,
-    texture_atlases: &TextureAtlasCatalog,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     screen: &ScreenSpec,
@@ -149,16 +146,13 @@ fn build_screen_ui_children(
     let mut top_level = Vec::new();
 
     if let Some(texture) = screen.background_texture.as_ref() {
-        let image = texture_atlases
-            .resolve(&texture.path, texture.rect)
-            .map(|texture| texture.image.clone())
-            .unwrap_or_else(|| asset_server.load(texture.path.clone()));
+        let image = asset_server.load(texture.path.clone());
         image_handles.push(image.clone());
         let background = commands
             .spawn((
                 ScreenUiNode,
                 Pickable::IGNORE,
-                image_node(image, texture_atlases.resolve(&texture.path, texture.rect)),
+                image_node(image, texture.rect),
                 Node {
                     position_type: PositionType::Absolute,
                     left: px(0.0),
@@ -178,7 +172,6 @@ fn build_screen_ui_children(
                 commands,
                 root,
                 asset_server,
-                texture_atlases,
                 ui_fonts,
                 ui_style,
                 child,
@@ -238,7 +231,6 @@ fn build_screen_ui_children(
             commands,
             root,
             asset_server,
-            texture_atlases,
             ui_fonts,
             ui_style,
             child,
@@ -334,14 +326,13 @@ fn spawn_screen_node_entity(
     commands: &mut Commands,
     root: Entity,
     asset_server: &AssetServer,
-    texture_atlases: &TextureAtlasCatalog,
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
     node: &ScreenNode,
     image_handles: &mut Vec<Handle<Image>>,
 ) -> Entity {
     match node {
-        ScreenNode::Input(input) => super::widgets::spawn_input(commands, root, input, ui_fonts),
+        ScreenNode::Input(input) => super::widgets::spawn_input(commands, root, input, ui_fonts, asset_server, image_handles),
         ScreenNode::Text(TextNode {
             text,
             binding,
@@ -411,22 +402,8 @@ fn spawn_screen_node_entity(
             layout,
         }) => {
             let callback = on_click.clone();
-            let normal_texture_resolved = background_texture
-                .as_ref()
-                .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
-            let normal_texture = background_texture.as_ref().map(|texture| {
-                normal_texture_resolved
-                    .map(|texture| texture.image.clone())
-                    .unwrap_or_else(|| asset_server.load(texture.path.clone()))
-            });
-            let hovered_texture_resolved = hovered_background_texture
-                .as_ref()
-                .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
-            let hovered_texture = hovered_background_texture.as_ref().map(|texture| {
-                hovered_texture_resolved
-                    .map(|texture| texture.image.clone())
-                    .unwrap_or_else(|| asset_server.load(texture.path.clone()))
-            });
+            let normal_texture = background_texture.as_ref().map(|texture| asset_server.load(texture.path.clone()));
+            let hovered_texture = hovered_background_texture.as_ref().map(|texture| asset_server.load(texture.path.clone()));
             image_handles.extend(normal_texture.iter().cloned());
             image_handles.extend(hovered_texture.iter().cloned());
             // A textured button uses its image as the complete visual surface.
@@ -520,7 +497,7 @@ fn spawn_screen_node_entity(
             if let Some(image) = normal_texture.clone() {
                 commands
                     .entity(button)
-                    .insert(stretched_image_node(image, normal_texture_resolved));
+                    .insert(stretched_image_node(image, background_texture.as_ref().and_then(|texture| texture.rect)));
             }
             commands.entity(button).insert(ScreenUiButton {
                 root,
@@ -538,27 +515,11 @@ fn spawn_screen_node_entity(
                 hover_scale: *hover_scale,
                 press_scale: *press_scale,
                 normal_texture: normal_texture.clone(),
-                normal_atlas: normal_texture_resolved.map(|texture| texture.atlas.clone()),
-                normal_rect: normal_texture_resolved
-                    .is_none()
-                    .then(|| {
-                        background_texture
-                            .as_ref()
-                            .and_then(|texture| texture.rect)
-                            .map(texture_rect)
-                    })
-                    .flatten(),
+                normal_atlas: None,
+                normal_rect: background_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
                 hovered_texture,
-                hovered_atlas: hovered_texture_resolved.map(|texture| texture.atlas.clone()),
-                hovered_rect: hovered_texture_resolved
-                    .is_none()
-                    .then(|| {
-                        hovered_background_texture
-                            .as_ref()
-                            .and_then(|texture| texture.rect)
-                            .map(texture_rect)
-                    })
-                    .flatten(),
+                hovered_atlas: None,
+                hovered_rect: hovered_background_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
             });
             if let Some(signal) = enabled_binding {
                 commands.entity(button).insert(UiEnabledBinding {
@@ -583,10 +544,7 @@ fn spawn_screen_node_entity(
             button
         }
         ScreenNode::Image(ScreenImageNode { texture, layout }) => {
-            let resolved = texture_atlases.resolve(&texture.path, texture.rect);
-            let image = resolved
-                .map(|texture| texture.image.clone())
-                .unwrap_or_else(|| asset_server.load(texture.path.clone()));
+            let image = asset_server.load(texture.path.clone());
             image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
@@ -594,7 +552,7 @@ fn spawn_screen_node_entity(
                 .spawn((
                     ScreenUiNode,
                     Pickable::IGNORE,
-                    image_node(image, resolved),
+                    image_node(image, texture.rect),
                     node,
                 ))
                 .id();
@@ -616,18 +574,11 @@ fn spawn_screen_node_entity(
             layout,
         }) => {
             let callback = on_click.clone();
-            let resolved = texture_atlases.resolve(&texture.path, texture.rect);
-            let image = resolved
-                .map(|texture| texture.image.clone())
-                .unwrap_or_else(|| asset_server.load(texture.path.clone()));
+            let image = asset_server.load(texture.path.clone());
             image_handles.push(image.clone());
-            let hovered_resolved = hovered_texture
-                .as_ref()
-                .and_then(|texture| texture_atlases.resolve(&texture.path, texture.rect));
+
             let hovered_image = hovered_texture.as_ref().map(|texture| {
-                let image = hovered_resolved
-                    .map(|texture| texture.image.clone())
-                    .unwrap_or_else(|| asset_server.load(texture.path.clone()));
+                let image = asset_server.load(texture.path.clone());
                 image_handles.push(image.clone());
                 image
             });
@@ -639,16 +590,13 @@ fn spawn_screen_node_entity(
                 apply_screen_layout(&mut node, layout);
                 node
             });
-            let normal_rect = resolved
-                .is_none()
-                .then(|| texture.rect.map(texture_rect))
-                .flatten();
+            let normal_rect = texture.rect.map(texture_rect);
             let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Button,
                     BackgroundColor(Color::NONE),
-                    stretched_image_node(image.clone(), resolved),
+                    stretched_image_node(image.clone(), texture.rect),
                     node,
                     UiTransform::IDENTITY,
                     ScreenUiImageButton {
@@ -658,18 +606,10 @@ fn spawn_screen_node_entity(
                         hovered_when_disabled: *hovered_when_disabled,
                         normal_rect,
                         normal_texture: image,
-                        normal_atlas: resolved.map(|texture| texture.atlas.clone()),
-                        hovered_rect: hovered_resolved
-                            .is_none()
-                            .then(|| {
-                                hovered_texture
-                                    .as_ref()
-                                    .and_then(|texture| texture.rect)
-                                    .map(texture_rect)
-                            })
-                            .flatten(),
+                        normal_atlas: None,
+                        hovered_rect: hovered_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
                         hovered_texture: hovered_image,
-                        hovered_atlas: hovered_resolved.map(|texture| texture.atlas.clone()),
+                        hovered_atlas: None,
                         hovered_node,
                         normal_node,
                         hover_scale: *hover_scale,
@@ -818,7 +758,6 @@ fn spawn_screen_node_entity(
                         commands,
                         root,
                         asset_server,
-                        texture_atlases,
                         ui_fonts,
                         ui_style,
                         child,
@@ -875,7 +814,6 @@ fn spawn_screen_node_entity(
                         commands,
                         root,
                         asset_server,
-                        texture_atlases,
                         ui_fonts,
                         ui_style,
                         child,
@@ -913,7 +851,6 @@ fn spawn_screen_node_entity(
                         commands,
                         root,
                         asset_server,
-                        texture_atlases,
                         ui_fonts,
                         ui_style,
                         child,
@@ -928,33 +865,15 @@ fn spawn_screen_node_entity(
         ScreenNode::Toggle(toggle) => {
             let unchecked = &toggle.unchecked.texture;
             let checked = &toggle.checked.texture;
-            let unchecked_resolved = texture_atlases.resolve(&unchecked.path, unchecked.rect);
-            let checked_resolved = texture_atlases.resolve(&checked.path, checked.rect);
-            let unchecked_image = unchecked_resolved
-                .map(|texture| texture.image.clone())
-                .unwrap_or_else(|| asset_server.load(unchecked.path.clone()));
-            let checked_image = checked_resolved
-                .map(|texture| texture.image.clone())
-                .unwrap_or_else(|| asset_server.load(checked.path.clone()));
+            let unchecked_image = asset_server.load(unchecked.path.clone());
+            let checked_image = asset_server.load(checked.path.clone());
             image_handles.extend([unchecked_image.clone(), checked_image.clone()]);
-
             let mut unchecked_node = Node::default();
             apply_screen_layout(&mut unchecked_node, &toggle.unchecked.layout);
             let mut checked_node = Node::default();
             apply_screen_layout(&mut checked_node, &toggle.checked.layout);
-            // Authored sheet regions use ImageNode's source rectangle directly,
-            // keeping one stable image binding while a toggle changes visuals.
-            // Standalone packed images still use their generated atlas.
-            let unchecked_atlas = unchecked
-                .rect
-                .is_none()
-                .then(|| unchecked_resolved.map(|texture| texture.atlas.clone()))
-                .flatten();
-            let checked_atlas = checked
-                .rect
-                .is_none()
-                .then(|| checked_resolved.map(|texture| texture.atlas.clone()))
-                .flatten();
+            let unchecked_atlas: Option<TextureAtlas> = None;
+            let checked_atlas: Option<TextureAtlas> = None;
             let unchecked_rect = unchecked.rect.map(texture_rect);
             let checked_rect = checked.rect.map(texture_rect);
             let (initial_image, initial_atlas, initial_rect) = if toggle.value {
@@ -1122,19 +1041,14 @@ pub fn animate_screen_ui(
     }
 }
 
-fn image_node(image: Handle<Image>, atlas: Option<&crate::texture::AtlasTexture>) -> ImageNode {
-    if let Some(atlas) = atlas {
-        ImageNode::from_atlas_image(image, atlas.atlas.clone())
-    } else {
-        ImageNode::new(image)
-    }
+fn image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
+    let mut node = ImageNode::new(image);
+    node.rect = rect.map(texture_rect);
+    node
 }
 
-fn stretched_image_node(
-    image: Handle<Image>,
-    atlas: Option<&crate::texture::AtlasTexture>,
-) -> ImageNode {
-    let mut node = image_node(image, atlas).with_mode(NodeImageMode::Stretch);
+fn stretched_image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
+    let mut node = image_node(image, rect).with_mode(NodeImageMode::Stretch);
     node.visual_box = VisualBox::BorderBox;
     node
 }
@@ -1294,7 +1208,7 @@ pub fn process_ui_effects(
                     warn!("UI sound effect `{name}` is not defined");
                     continue;
                 };
-                let playback_volume = apply_volume_setting(*volume, user_settings.sfx_volume);
+                let playback_volume = apply_volume_setting(*volume, user_settings.sfx_volume * user_settings.master_volume);
                 commands.spawn((
                     SfxChannel { volume: *volume },
                     AudioPlayer::new(asset_server.load(definition.path.clone())),
@@ -1561,6 +1475,7 @@ pub fn update_builtin_ui_models(
             ),
             ("text".to_string(), StoredValue::String(text.to_string())),
             ("visible".to_string(), StoredValue::Bool(dialogue.is_some())),
+            ("autoEnabled".to_string(), StoredValue::Bool(dialogue_state.auto_enabled)),
             (
                 "revealedCharacters".to_string(),
                 StoredValue::Int(revealed as i64),
@@ -1948,6 +1863,19 @@ mod tests {
     }
 
     #[test]
+    fn ui_images_crop_authored_regions_without_generated_atlases() {
+        let region = Some([8.0, 16.0, 32.0, 48.0]);
+        for node in [
+            image_node(Handle::default(), region),
+            stretched_image_node(Handle::default(), region),
+        ] {
+            assert_eq!(node.rect, Some(Rect::from_corners(Vec2::new(8.0, 16.0), Vec2::new(40.0, 64.0))));
+            assert!(node.texture_atlas.is_none());
+        }
+        assert!(image_node(Handle::default(), None).rect.is_none());
+    }
+
+    #[test]
     fn scroll_targets_the_nearest_scrollable_ancestor() {
         let mut app = App::new();
         app.add_message::<Pointer<Scroll>>()
@@ -2160,6 +2088,9 @@ mod tests {
         ] {
             let mut app = App::new();
             app.init_resource::<DialogueState>()
+                .init_resource::<Time>()
+                .init_resource::<UserSettings>()
+                .init_resource::<VoiceState>()
                 .init_resource::<AnimationState>()
                 .init_resource::<ChoiceState>()
                 .init_resource::<ScreenUiState>()
@@ -2218,6 +2149,9 @@ mod tests {
     fn closing_a_modal_consumes_the_same_frame_dialogue_action() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
+            .init_resource::<Time>()
+            .init_resource::<UserSettings>()
+            .init_resource::<VoiceState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()
@@ -2266,6 +2200,9 @@ mod tests {
     fn blank_click_is_a_noop_while_a_declarative_screen_is_open() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
+            .init_resource::<Time>()
+            .init_resource::<UserSettings>()
+            .init_resource::<VoiceState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()
@@ -2318,6 +2255,9 @@ mod tests {
     fn toggle_without_change_handler_keeps_model_value_without_advancing_dialogue() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
+            .init_resource::<Time>()
+            .init_resource::<UserSettings>()
+            .init_resource::<VoiceState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()
@@ -2462,6 +2402,9 @@ mod tests {
     fn despawned_ui_targets_never_become_dialogue_clicks() {
         let mut app = App::new();
         app.init_resource::<DialogueState>()
+            .init_resource::<Time>()
+            .init_resource::<UserSettings>()
+            .init_resource::<VoiceState>()
             .init_resource::<AnimationState>()
             .init_resource::<ChoiceState>()
             .init_resource::<ScreenUiState>()

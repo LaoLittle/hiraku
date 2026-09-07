@@ -18,6 +18,7 @@ mod runtime;
 mod story_runtime;
 pub mod ui_runtime;
 mod ui_vm;
+pub(crate) use ui_vm::validate_ui_source;
 
 pub use animation::{AnimationPhase, AnimationSpec};
 pub(crate) use command::{
@@ -109,16 +110,30 @@ pub(crate) fn script_command_from_effect(
             ease: parse_camera_ease(&ease)?,
             animation_id: None,
         }),
-        StoryEffect::SetBackground { texture } => {
+        StoryEffect::Delay { .. } => return Err("delay must be dispatched through the story wait boundary".into()),
+        StoryEffect::SetCurtain { opacity, fade_ms } => ScriptCommand::Stage(StageCommand::SetCurtain {
+            opacity, fade: fade_ms.map(Duration::from_millis),
+        }),
+        StoryEffect::SetBackground { texture, fade_in_ms } => {
             let definition = textures
                 .and_then(|catalog| catalog.resolve(&texture))
                 .ok_or_else(|| format!("texture `{texture}` is not defined"))?;
             ScriptCommand::Stage(StageCommand::SetBackground {
                 path: definition.path.clone(),
-                fade: None,
+                fade: fade_in_ms.map(Duration::from_millis),
                 animation_id: None,
             })
         }
+        StoryEffect::Picture(mut picture) => {
+            if let crate::scene::pictures::PictureCommand::Show { path, rect, .. } = &mut picture {
+                let texture=textures.and_then(|catalog| catalog.resolve(path)).ok_or_else(|| format!("texture `{path}` is not defined"))?;
+                *path=texture.path.clone();
+                *rect=texture.rect;
+            }
+            ScriptCommand::Stage(StageCommand::Picture(picture))
+        }
+        StoryEffect::SaveSlot(slot) => ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)),
+        StoryEffect::HideCharacter { actor_id, fade_ms } => ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }),
         StoryEffect::ShowCharacter {
             actor_id,
             character_name,
@@ -140,6 +155,7 @@ pub(crate) fn script_command_from_effect(
         | StoryEffect::MountUiOverlay { .. }
         | StoryEffect::UnmountUiOverlay { .. }
         | StoryEffect::PlayBgm { .. }
+        | StoryEffect::PlaySfx { .. }
         | StoryEffect::PlayVoice { .. } => {
             return Err("effect requires script runtime asset resolution".to_string());
         }

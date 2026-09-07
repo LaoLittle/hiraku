@@ -91,6 +91,7 @@ pub(crate) struct InputControl {
     pub spec: InputNode,
     label: Entity,
     fill: Option<Entity>,
+    thumb: Option<Entity>,
     edit: TextEdit,
     drag: Option<PointerId>,
     proposal: Option<Value>,
@@ -188,6 +189,8 @@ pub(super) fn spawn_input(
     root: Entity,
     spec: &InputNode,
     fonts: &UiFonts,
+    assets: &AssetServer,
+    image_handles: &mut Vec<Handle<Image>>,
 ) -> Entity {
     let mut node = Node {
         width: px(320),
@@ -198,6 +201,10 @@ pub(super) fn spawn_input(
         ..default()
     };
     super::screen_ui::apply_screen_layout(&mut node, &spec.layout);
+    if spec.slider_skin.is_some() {
+        node.overflow = Overflow::visible();
+        node.padding = UiRect::ZERO;
+    }
     let entity = commands
         .spawn((
             ScreenUiNode,
@@ -241,6 +248,65 @@ pub(super) fn spawn_input(
     if let Some(fill) = fill {
         commands.entity(entity).add_child(fill);
     }
+    let thumb = spec.slider_skin.as_ref().map(|skin| {
+        commands.entity(entity).insert(BackgroundColor(Color::NONE));
+        commands.entity(label).insert(Visibility::Hidden);
+        let mut image = |texture: &crate::ui::ScreenTexture| {
+            let handle = assets.load(texture.path.clone());
+            image_handles.push(handle.clone());
+            let mut image = ImageNode::new(handle).with_mode(NodeImageMode::Stretch);
+            image.rect = texture.rect.map(|r| {
+                Rect::from_corners(Vec2::new(r[0], r[1]), Vec2::new(r[0] + r[2], r[1] + r[3]))
+            });
+            image
+        };
+        // Decoration is never a picking target: the input retains one hit area.
+        let track = commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    top: percent(22),
+                    width: percent(100),
+                    height: percent(56),
+                    ..default()
+                },
+                image(&skin[0]),
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(entity).insert_children(0, &[track]);
+        if let Some(fill) = fill {
+            commands.entity(fill).insert((
+                image(&skin[1]),
+                BackgroundColor(Color::NONE),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    top: percent(22),
+                    width: percent(0),
+                    height: percent(56),
+                    ..default()
+                },
+            ));
+        }
+        let thumb = commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: percent(0),
+                    top: px(0),
+                    height: percent(100),
+                    aspect_ratio: Some(1.0),
+                    ..default()
+                },
+                image(&skin[2]),
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.entity(entity).add_child(thumb);
+        thumb
+    });
     commands.entity(entity).add_child(label);
     let text = match &spec.value {
         StoredValue::String(text) => text.clone(),
@@ -252,6 +318,7 @@ pub(super) fn spawn_input(
         spec: spec.clone(),
         label,
         fill,
+        thumb,
         edit: TextEdit {
             cursor: text.len(),
             text,
@@ -487,7 +554,7 @@ fn propose_slider(
 
 pub(crate) fn sync_inputs(
     local_states: Query<&UiLocalState>,
-    mut controls: Query<(Entity, &mut InputControl)>,
+    mut controls: Query<(Entity, &mut InputControl, &ComputedNode)>,
     mut texts: Query<&mut Text>,
     mut nodes: Query<&mut Node>,
     runtime: Res<ScriptRuntimeState>,
@@ -499,7 +566,7 @@ pub(crate) fn sync_inputs(
         .as_ref()
         .map(|story| story.globals().clone())
         .unwrap_or_default();
-    for (entity, mut control) in &mut controls {
+    for (entity, mut control, computed) in &mut controls {
         let mut globals = globals.clone();
         if let Ok(local) = local_states.get(control.root) {
             globals.extend(local.0.clone());
@@ -556,6 +623,13 @@ pub(crate) fn sync_inputs(
                 if *value { "[x]" } else { "[ ]" }.into()
             }
             (InputKind::Slider { min, max }, StoredValue::Float(value)) => {
+                if let Some(thumb) = control.thumb
+                    && let Ok(mut node) = nodes.get_mut(thumb)
+                {
+                    node.left =
+                        percent(((value - min) / (max - min)).clamp(0.0, 1.0) as f32 * 100.0);
+                    node.margin.left = px(-0.5 * computed.size().y * computed.inverse_scale_factor());
+                }
                 if let Some(fill) = control.fill
                     && let Ok(mut node) = nodes.get_mut(fill)
                 {
@@ -636,6 +710,7 @@ mod tests {
             spec,
             label,
             fill: None,
+            thumb: None,
             edit: TextEdit {
                 text: "alice".into(),
                 cursor: 5,

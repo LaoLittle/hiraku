@@ -322,7 +322,7 @@ pub fn apply_animation_cancellations(
     mut voice_state: ResMut<VoiceState>,
     mut pending_characters: ResMut<PendingCharacterShows>,
     mut tweens: Query<(Entity, Option<&SpriteActor>, &mut VisualTween)>,
-    mut bgm_fades: Query<(Entity, &mut BgmFade)>,
+    mut bgm_fades: Query<(Entity, &mut AudioFade)>,
     mut motion_queries: ParamSet<(
         Query<'_, '_, &'static mut Transform, With<WorldCamera>>,
         Query<
@@ -451,7 +451,7 @@ pub fn apply_animation_cancellations(
             .is_some_and(|animation_id| cancelled.contains(animation_id))
         {
             complete_missing_animation(&mut animations, fade.animation_id.take());
-            commands.entity(entity).try_remove::<BgmFade>();
+            commands.entity(entity).try_remove::<AudioFade>();
         }
     }
 

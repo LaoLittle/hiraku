@@ -91,6 +91,7 @@ enum UiDraftKind {
 
 #[derive(Clone, Debug)]
 struct UiDraft {
+    slider_skin: Option<[String; 3]>,
     kind: UiDraftKind,
     content: Option<HksClosure>,
     hovered: Option<HksClosure>,
@@ -126,6 +127,7 @@ impl UiDraft {
     fn new(kind: UiDraftKind, content: Option<HksClosure>) -> Self {
         Self {
             kind,
+            slider_skin: None,
             content,
             hovered: None,
             checked: None,
@@ -278,6 +280,25 @@ mod native_ui {
             return Err(NativeError::message("slider requires finite min < max"));
         }
         Ok(context.insert(UiDraft::new(UiDraftKind::Slider(value, min, max), None)))
+    }
+
+    #[hks(name = "skin", receiver)]
+    fn slider_skin(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        track: String,
+        fill: String,
+        thumb: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context
+            .nodes
+            .get_mut(&node.0)
+            .ok_or_else(|| NativeError::message("unknown UI node"))?;
+        if !matches!(draft.kind, UiDraftKind::Slider(..)) {
+            return Err(NativeError::message("skin requires a slider"));
+        }
+        draft.slider_skin = Some([track, fill, thumb]);
+        Ok(node)
     }
 
     #[hks(name = "textInput")]
@@ -929,6 +950,12 @@ fn validate_ui_result(value: &Value) -> Result<(), NativeError> {
 mod storage_actions {
     use super::*;
 
+    #[hks(name = "exists")]
+    fn slot_exists(_context: &mut UiVmContext, slot: String) -> Result<bool, NativeError> {
+        crate::storage::save_slot_exists(&slot)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
+
     #[hks]
     fn native_save(context: &mut UiVmContext, slot: String) -> Result<UiEffectHandle, NativeError> {
         if slot.trim().is_empty() {
@@ -943,6 +970,123 @@ mod storage_actions {
             return Err(NativeError::message("save slot must not be empty"));
         }
         Ok(context.insert_effect(UiEffect::Load { slot }))
+    }
+}
+
+#[hiraku_script::hks_module("preferences")]
+mod preference_actions {
+    use super::*;
+    use crate::storage::{PreferenceChange, UserSettings};
+
+    fn change(context: &mut UiVmContext, value: PreferenceChange) -> Result<UiEffectHandle, NativeError> {
+        UserSettings::default().apply(&value).map_err(NativeError::message)?;
+        Ok(context.insert_effect(UiEffect::SetPreference(value)))
+    }
+
+    #[hks(name = "masterVolume")]
+    fn master_volume(context: &mut UiVmContext) -> Result<f64, NativeError> {
+        Ok(f64::from(context.values.preferences().master_volume))
+    }
+    #[hks(name = "textSpeed")]
+    fn text_speed(context: &mut UiVmContext) -> Result<f64, NativeError> {
+        Ok(f64::from(context.values.preferences().text_speed))
+    }
+    #[hks(name = "autoDelay")]
+    fn auto_delay(context: &mut UiVmContext) -> Result<f64, NativeError> {
+        Ok(f64::from(context.values.preferences().auto_delay))
+    }
+    #[hks(name = "fullscreen")]
+    fn fullscreen(context: &mut UiVmContext) -> Result<bool, NativeError> {
+        Ok(context.values.preferences().fullscreen)
+    }
+    #[hks(name = "displayAvailable")]
+    fn display_available(context: &mut UiVmContext) -> Result<bool, NativeError> {
+        Ok(context.values.preferences().display_available)
+    }
+    #[hks(name = "setMasterVolume")]
+    fn set_master_volume(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+        change(context, PreferenceChange::MasterVolume(value as f32))
+    }
+    #[hks(name = "setTextSpeed")]
+    fn set_text_speed(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+        change(context, PreferenceChange::TextSpeed(value as f32))
+    }
+    #[hks(name = "setAutoDelay")]
+    fn set_auto_delay(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+        change(context, PreferenceChange::AutoDelay(value as f32))
+    }
+    #[hks(name = "setFullscreen")]
+    fn set_fullscreen(context: &mut UiVmContext, value: bool) -> Result<UiEffectHandle, NativeError> {
+        change(context, PreferenceChange::Fullscreen(value))
+    }
+    #[hks(name = "setResolution")]
+    fn set_resolution(context: &mut UiVmContext, width: u32, height: u32) -> Result<UiEffectHandle, NativeError> {
+        change(context, PreferenceChange::Resolution { width, height })
+    }
+    #[hks(name = "setAutoDialogue")]
+    fn set_auto_dialogue(context: &mut UiVmContext, enabled: bool) -> Result<UiEffectHandle, NativeError> {
+        Ok(context.insert_effect(UiEffect::SetAutoDialogue(enabled)))
+    }
+}
+
+#[hiraku_script::hks_module("audio")]
+mod settings_actions {
+    use super::*;
+
+    fn current_volume(context: &UiVmContext, channel: &str) -> f64 {
+        let settings = context.values.preferences();
+        match channel {
+            "bgmVolume" => settings.bgm_volume.into(),
+            "voiceVolume" => settings.voice_volume.into(),
+            "sfxVolume" => settings.sfx_volume.into(),
+            _ => 1.0,
+        }
+    }
+
+    #[hks(name = "bgmVolume")]
+    fn bgm_volume(context: &mut UiVmContext) -> Result<f64, NativeError> {
+        Ok(current_volume(context, "bgmVolume"))
+    }
+
+    #[hks(name = "voiceVolume")]
+    fn voice_volume(context: &mut UiVmContext) -> Result<f64, NativeError> {
+        Ok(current_volume(context, "voiceVolume"))
+    }
+
+    #[hks(name = "sfxVolume")]
+    fn sfx_volume(context: &mut UiVmContext) -> Result<f64, NativeError> {
+        Ok(current_volume(context, "sfxVolume"))
+    }
+
+    fn volume(
+        context: &mut UiVmContext,
+        channel: &str,
+        value: f64,
+    ) -> Result<UiEffectHandle, NativeError> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(NativeError::message(
+                "volume must be finite and between 0 and 1",
+            ));
+        }
+        Ok(context.insert_effect(UiEffect::SetVolume {
+            channel: channel.into(),
+            value: value as f32,
+        }))
+    }
+
+    #[hks(name = "setBgmVolume")]
+    fn bgm(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+        volume(context, "bgmVolume", value)
+    }
+
+    #[hks(name = "setVoiceVolume")]
+    fn voice(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+        volume(context, "voiceVolume", value)
+    }
+
+    #[hks(name = "setSfxVolume")]
+    fn sfx(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+        volume(context, "sfxVolume", value)
     }
 }
 
@@ -1075,8 +1219,11 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
             },
         )
         .expect("UI close signature is registered");
+    preference_actions::register_hks(&mut registry).expect("preference API registers once");
     storage_actions::register_hks(&mut registry)
         .expect("storage actions must be internally consistent");
+    settings_actions::register_hks(&mut registry)
+        .expect("settings actions must be internally consistent");
     story_actions::register_hks(&mut registry)
         .expect("story actions must be internally consistent");
     registry
@@ -1122,6 +1269,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
                 ("visible".to_string(), ScriptType::Bool),
                 ("revealedCharacters".to_string(), ScriptType::Int),
                 ("canAdvance".to_string(), ScriptType::Bool),
+                ("autoEnabled".to_string(), ScriptType::Bool),
             ])),
         )
         .expect("built-in dialogue model must be defined once");
@@ -1326,6 +1474,45 @@ pub fn evaluate_ui_component_named_with_args(
         &mut context,
         textures,
     )
+}
+
+/// Offline type checking without constructing nodes or resolving image assets.
+pub(crate) fn validate_ui_source(path: &str, source: &str) -> Result<(), String> {
+    let manifest = ui_registry(&UiContext::default()).manifest();
+    hiraku_script::compile_project(
+        vec![
+            hiraku_script::ScriptSource {
+                path: UI_STDLIB_PATH.into(),
+                namespace: Some("ui.widgets".into()),
+                source: UI_STDLIB_SOURCE.into(),
+            },
+            hiraku_script::ScriptSource {
+                path: path.into(),
+                namespace: None,
+                source: source.into(),
+            },
+        ],
+        &manifest,
+    )
+    .map(|_| ())
+    .map_err(|errors| {
+        let mut sources = SourceMap::new();
+        let diagnostics = errors
+            .into_iter()
+            .map(|e| {
+                let id = sources.insert(
+                    &e.path,
+                    if e.path == path {
+                        source
+                    } else {
+                        UI_STDLIB_SOURCE
+                    },
+                );
+                e.error.diagnostic(id)
+            })
+            .collect::<Vec<_>>();
+        render_diagnostics(&diagnostics, &sources, RenderOptions::plain())
+    })
 }
 
 fn parse_module(path: &str, source: &str) -> Result<hiraku_script::Program, UiVmError> {
@@ -1820,6 +2007,7 @@ fn input_node(
         }
     };
     Ok(ScreenNode::Input(crate::ui::InputNode {
+        slider_skin: None,
         kind,
         value,
         enabled: draft.enabled,
@@ -1928,14 +2116,28 @@ fn materialize_node(
         }
         UiDraftKind::Slider(ref value, min, max) => {
             let (value, reactive_value) = input_value(value.clone(), program, registry, context)?;
-            input_node(
+            let mut node = input_node(
                 &draft,
                 crate::ui::InputKind::Slider { min, max },
                 value,
                 reactive_value,
                 program,
                 context,
-            )
+            )?;
+            if let ScreenNode::Input(input) = &mut node {
+                input.slider_skin = draft
+                    .slider_skin
+                    .as_ref()
+                    .map(|names| {
+                        Ok::<_, UiVmError>([
+                            resolve_texture(textures, &names[0])?,
+                            resolve_texture(textures, &names[1])?,
+                            resolve_texture(textures, &names[2])?,
+                        ])
+                    })
+                    .transpose()?;
+            }
+            Ok(node)
         }
         UiDraftKind::TextInput(ref value) => {
             let (value, reactive_value) = input_value(value.clone(), program, registry, context)?;
@@ -2780,6 +2982,67 @@ screen {
         )
         .expect_err("click budget must terminate evaluation");
         assert!(error.to_string().contains("instruction budget"));
+    }
+
+    #[test]
+    fn reusable_slot_buttons_keep_independent_callback_arguments() {
+        let screen = evaluate_ui_component_named(
+            "memory://slots.ui.hks",
+            r#"
+import ui.widgets.*
+fn slot(key: String) -> UiNode {
+    button { text(key) }.onClick { storage.save(key); ui.close() }
+}
+canvas {
+    slot("alice")
+    slot("bob")
+}
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        ).expect("reusable slot buttons must evaluate");
+        assert_eq!(screen.children.len(), 2);
+        for (node, key) in screen.children.iter().zip(["alice", "bob"]) {
+            let ScreenNode::Button(button) = node else { panic!("expected a slot button") };
+            let (effects, _) = evaluate_ui_callback(
+                button.on_click.as_ref().expect("callback retained"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default(),
+            ).expect("captured slot callback executes without writing storage");
+            assert_eq!(effects.first(), Some(&UiEffect::Save { slot: key.into() }));
+            assert!(matches!(effects.get(1), Some(UiEffect::CloseUi { .. })));
+            assert_eq!(effects.len(), 2);
+        }
+    }
+
+    #[test]
+    fn preference_getters_do_not_reserve_script_global_names() {
+        let preferences = crate::storage::UserSettings {
+            display_available: true, fullscreen: true, bgm_volume: 0.25,
+            ..Default::default()
+        };
+        let context = UiContext::default().with_preferences(preferences);
+        assert!(context.story_values().is_empty());
+        let screen = evaluate_ui_component_named(
+            "memory://preferences.ui.hks",
+            r#"import ui.widgets.*
+global let displayAvailable = preferences.displayAvailable()
+global let fullscreen = preferences.fullscreen()
+global let bgmVolume = audio.bgmVolume()
+canvas {
+    button { text("Settings") }.enabled(displayAvailable)
+    button { text("Fullscreen") }.enabled(fullscreen)
+    progress(bgmVolume)
+}"#,
+            context, &TextureCatalog::default(), &TermCatalog::default(),
+        ).expect("private host preferences must not collide with UI declarations");
+        for node in &screen.children[..2] {
+            let ScreenNode::Button(button) = node else { panic!("expected button") };
+            assert!(button.enabled);
+        }
+        let ScreenNode::Bar(bar) = &screen.children[2] else { panic!("expected progress") };
+        assert_eq!(bar.value, 0.25);
     }
 
     #[test]

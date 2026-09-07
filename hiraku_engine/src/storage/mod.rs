@@ -22,7 +22,7 @@ const SAVE_ROOT: &str = "saves";
 const SAVE_EXTENSION: &str = "sav";
 const SAVE_NAMESPACE: &str = "hiraku.save";
 mod user_settings;
-pub use user_settings::{UserSettings, read_user_settings, write_user_settings};
+pub use user_settings::{PreferenceChange, UserSettings, read_user_settings, write_user_settings};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -42,6 +42,10 @@ pub enum StorageError {
 
 pub fn save_root_path() -> PathBuf {
     workspace_base_path().join(SAVE_ROOT)
+}
+
+pub fn save_slot_exists(slot: &str) -> Result<bool, StorageError> {
+    Ok(save_storage(&save_root_path()).contains(sanitize_slot_name(slot)?)?)
 }
 
 pub fn load_save_data(slot: &str) -> Result<SaveGameData, StorageError> {
@@ -318,6 +322,7 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            pictures_hson: hson::to_vec(&scene.pictures).expect("picture state contains only serializable data"),
             background: scene.background.as_ref().map(Into::into),
             sprites: scene.sprites.iter().map(Into::into).collect(),
             character_positions: scene
@@ -343,6 +348,9 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
+            pictures: if scene.pictures_hson.is_empty() { BTreeMap::new() } else {
+                hson::from_slice(&scene.pictures_hson).map_err(|error| StorageError::InvalidSave(format!("invalid picture state: {error}")))?
+            },
             background: scene.background.map(Into::into),
             sprites: scene.sprites.into_iter().map(Into::into).collect(),
             character_positions: scene
@@ -575,6 +583,20 @@ mod tests {
                 .to_string()
                 .contains("incompatible with runtime version")
         );
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_scene_picture_motion() {
+        use crate::scene::pictures::{PictureFade, PictureMotion, PictureState};
+        let mut data = SaveGameData::default();
+        data.scene.pictures.insert("room".into(), PictureState {
+            id:"room".into(),path:"textures/room.png".into(),rect:Some([0.0,0.0,128.0,64.0]),
+            position:[60.0,40.0],scale:2.0,rotation:-10.0,layer:5.0,alpha:0.5,
+            motion:Some(PictureMotion {from:[50.0,50.0,2.0,-10.0,0.0],to:[70.0,30.0,2.0,-10.0,1.0],elapsed:0.2,seconds:0.4,ease:"easeOutQuad".into(),remove:false,offsets_x:Vec::new()}),
+            fade:Some(PictureFade {from:0.0,to:1.0,elapsed:0.15,seconds:0.3,remove:false}),
+        });
+        let restored=decode_save_data(&encode_save_data(&data)).expect("picture save decodes");
+        assert_eq!(restored.scene.pictures,data.scene.pictures);
     }
 
     #[test]

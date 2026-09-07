@@ -2,6 +2,8 @@ use super::*;
 
 #[derive(Resource, Default)]
 pub struct DialogueState {
+    pub auto_enabled: bool,
+    pub auto_elapsed: f32,
     pub waiting: Option<PendingDialogueAdvance>,
     pub span_entities: Vec<Entity>,
     pub reveal: Option<DialogueRevealState>,
@@ -86,6 +88,9 @@ pub fn advance_dialogue_on_input(
     screen_state: Res<ScreenUiState>,
     advance_surfaces: Query<(), With<DialogueAdvanceSurface>>,
     text_focus: Option<Res<crate::input::HirakuTextFocus>>,
+    time: Res<Time>,
+    preferences: Res<UserSettings>,
+    voices: Res<VoiceState>,
 ) {
     let action_advance = actions
         .read()
@@ -101,13 +106,24 @@ pub fn advance_dialogue_on_input(
 
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
-    if choice_state.waiting.is_some() || screen_state.active_root.is_some() {
+    if choice_state.waiting.is_some() || screen_state.active_root.is_some() || screen_state.pending_root.is_some() {
+        dialogue_state.auto_elapsed = 0.0;
         return;
+    }
+    let auto_ready = dialogue_state.auto_enabled
+        && dialogue_state.waiting.is_some()
+        && dialogue_state.reveal.is_none()
+        && voices.active.is_none()
+        && voices.concurrent.is_empty();
+    if auto_ready {
+        dialogue_state.auto_elapsed += time.delta_secs();
+    } else {
+        dialogue_state.auto_elapsed = 0.0;
     }
     let advance =
         (action_advance && text_focus.is_none_or(|focus| focus.0.is_none())) || pointer_advance;
 
-    if !advance {
+    if !advance && !(auto_ready && dialogue_state.auto_elapsed >= preferences.auto_delay) {
         return;
     }
 
@@ -125,6 +141,7 @@ pub(super) fn advance_dialogue(
     dialogue_chars: &mut Query<&mut DialogueCharSpan>,
     responses: &mut MessageWriter<ScriptResponseMessage>,
 ) {
+    dialogue_state.auto_elapsed = 0.0;
     if dialogue_reveal_has_hidden_chars(dialogue_state) {
         reveal_all_dialogue_chars(dialogue_state, dialogue_chars);
         return;
@@ -145,6 +162,7 @@ pub(super) fn advance_dialogue(
 
 pub fn animate_dialogue_text_reveal(
     time: Res<Time>,
+    preferences: Res<UserSettings>,
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,
     mut dialogue_chars: Query<(&mut TextColor, &mut DialogueCharSpan)>,
@@ -153,7 +171,7 @@ pub fn animate_dialogue_text_reveal(
         return;
     };
 
-    reveal.accumulator += time.delta_secs();
+    reveal.accumulator += time.delta_secs() * preferences.text_speed;
     while reveal.next_index < reveal.total_chars && reveal.accumulator >= reveal.interval {
         reveal.accumulator -= reveal.interval;
         if let Some(entity) = reveal.spans.get(reveal.next_index).copied()
@@ -436,5 +454,69 @@ pub(super) fn complete_dialogue_wait(
             request,
             response: ScriptResponse::Continue,
         });
+    }
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+
+    #[test]
+    fn auto_delay_pauses_in_a_modal_without_accumulating_catchup() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<ChoiceState>()
+            .init_resource::<ScreenUiState>()
+            .init_resource::<VoiceState>()
+            .init_resource::<UserSettings>()
+            .add_message::<crate::input::HirakuActionInput>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, advance_dialogue_on_input);
+        app.world_mut().resource_mut::<UserSettings>().auto_delay = 0.25;
+        {
+            let mut state = app.world_mut().resource_mut::<DialogueState>();
+            state.auto_enabled = true;
+            state.waiting = Some(PendingDialogueAdvance { request: None, animation_id: None });
+        }
+        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+        app.update();
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        let modal = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(modal);
+        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_secs(5));
+        app.update();
+        assert_eq!(app.world().resource::<DialogueState>().auto_elapsed, 0.0);
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = None;
+        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+        app.update();
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        app.update();
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        app.update();
+        assert!(app.world().resource::<DialogueState>().waiting.is_none());
+    }
+
+    #[test]
+    fn speed_preference_scales_reveal_without_overwriting_story_cps() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<UserSettings>()
+            .add_systems(Update, animate_dialogue_text_reveal);
+        app.world_mut().resource_mut::<UserSettings>().text_speed = 2.0;
+        {
+            let mut state = app.world_mut().resource_mut::<DialogueState>();
+            state.effect.cps = 10.0;
+            set_dialogue_model_reveal(&mut state, "abcdefghij", 0, None);
+        }
+        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+        app.update();
+        let state = app.world().resource::<DialogueState>();
+        assert_eq!(state.effect.cps, 10.0);
+        assert_eq!(state.reveal.as_ref().expect("reveal remains active").next_index, 2);
     }
 }

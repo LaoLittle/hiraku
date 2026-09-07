@@ -84,7 +84,6 @@ pub struct ScriptExecutionCommandContext<'w> {
 #[derive(SystemParam)]
 pub struct RenderAssetCommandContext<'w> {
     pub images: Res<'w, Assets<Image>>,
-    pub texture_atlases: Res<'w, TextureAtlasCatalog>,
     pub characters: Res<'w, CharacterCatalog>,
     pub meshes: ResMut<'w, Assets<Mesh>>,
     pub alpha_mask_materials: ResMut<'w, Assets<AlphaMaskMaterial>>,
@@ -120,7 +119,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut app_exit = ctx.app_exit;
     let asset_server = ctx.asset_server;
     let images = render_assets.images;
-    let texture_atlases = render_assets.texture_atlases;
     let vfs = ctx.vfs;
     let mut shared_state = ctx.shared_state;
     let characters = render_assets.characters;
@@ -164,6 +162,12 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
         }
 
         match command {
+            ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)) => {
+                if let Err(error)=save_runtime_slot(&slot,&script_runtime,&shared_state) { warn!("failed to save slot `{slot}`: {error}"); }
+            }
+            ScriptCommand::Stage(StageCommand::Picture(picture)) => {
+                if let Err(error)=pictures::apply_picture_command(&mut shared_state.0.pictures,picture) { warn!("{error}"); }
+            }
             ScriptCommand::Runtime(RuntimeCommand::Log(message)) => info!("[hks] {message}"),
             ScriptCommand::Stage(StageCommand::SetBackground {
                 path,
@@ -320,7 +324,27 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut animations,
                 );
             }
-            ScriptCommand::Settings(SettingsCommand::Adjust { name, delta }) => {
+            ScriptCommand::Settings(command) => {
+                match &command {
+                    SettingsCommand::Preference(change) => {
+                        if let Err(error) = user_settings.apply(change) {
+                            warn!("invalid preference: {error}");
+                        } else if let Err(error) = write_user_settings(&user_settings) {
+                            warn!("failed to write preferences: {error}");
+                        }
+                        continue;
+                    }
+                    SettingsCommand::AutoDialogue(enabled) => {
+                        dialogue_state.auto_enabled = *enabled;
+                        dialogue_state.auto_elapsed = 0.0;
+                        continue;
+                    }
+                    _ => {}
+                }
+                let name = match &command {
+                    SettingsCommand::Adjust { name, .. } | SettingsCommand::Set { name, .. } => name,
+                    _ => unreachable!("non-volume settings handled above"),
+                };
                 let volume = match name.as_str() {
                     "bgmVolume" => &mut user_settings.bgm_volume,
                     "voiceVolume" => &mut user_settings.voice_volume,
@@ -330,7 +354,11 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         continue;
                     }
                 };
-                *volume = adjusted_volume(*volume, delta);
+                *volume = match command {
+                    SettingsCommand::Adjust { delta, .. } => adjusted_volume(*volume, delta),
+                    SettingsCommand::Set { value, .. } => value.clamp(0.0, 1.0),
+                    _ => unreachable!("non-volume settings handled above"),
+                };
                 if let Err(error) = write_user_settings(user_settings.as_ref()) {
                     warn!("failed to write user settings: {error}");
                 }
@@ -340,12 +368,15 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 &mut commands,
                 &asset_server,
                 &images,
-                &texture_atlases,
                 &ui_fonts,
                 &ui_style,
                 &mut screen_state,
                 &mut overlay_state,
             ),
+            ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }) => {
+                hide_character_entities(&mut commands, &mut stage, &mut pending_characters,
+                    &mut animations, actor_id.as_deref(), fade_ms);
+            }
             ScriptCommand::Character(CharacterCommand::Show {
                 actor_id,
                 character_name,
@@ -374,7 +405,6 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 queue_character_show(
                     &mut commands,
                     &asset_server,
-                    &texture_atlases,
                     &mut meshes,
                     &mut alpha_mask_materials,
                     &mut multiply_materials,
@@ -389,6 +419,33 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     fade,
                     animation_id,
                 );
+            }
+            ScriptCommand::Stage(StageCommand::SetCurtain { opacity, fade }) => {
+                if let Some(overlay) = stage.overlay {
+                    commands.queue(move |world: &mut World| {
+                        let Some(mut sprite) = world.get_mut::<WorldSprite>(overlay) else { return; };
+                        let from = sprite.color.alpha();
+                        if let Some(duration) = fade {
+                            world.entity_mut(overlay).insert(VisualTween {
+                                from_alpha: Some(from), to_alpha: Some(opacity),
+                                from_translation: None, to_translation: None,
+                                from_scale: None, to_scale: None,
+                                timer: Timer::new(duration, TimerMode::Once),
+                                animation_id: None, despawn_on_finish: false,
+                            });
+                        } else {
+                            sprite.color = sprite.color.with_alpha(opacity);
+                            world.entity_mut(overlay).remove::<VisualTween>();
+                        }
+                    });
+                }
+            }
+            ScriptCommand::Animation(AnimationCommand::Delay { duration, done }) => {
+                waits.items.push(super::animation_runtime::PendingWait {
+                        timer: Timer::new(duration, TimerMode::Once),
+                        animation_id: None,
+                        done,
+                });
             }
             ScriptCommand::Animation(AnimationCommand::Wait { ids, done }) => {
                 if ids.iter().all(|id| animations.completed.contains(id)) {
@@ -454,6 +511,11 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 };
                 globals.extend(crate::script::capabilities::engine_globals(&user_settings));
                 next_story.set_globals(globals);
+                if navigation.reset != NavigationReset::Session
+                    && let Some(previous) = script_runtime.story.as_ref()
+                {
+                    next_story.inherit_native_state(previous, navigation.reset == NavigationReset::Presentation);
+                }
 
                 if navigation.kind == NavigationKind::Goto {
                     clear_choice_ui(&mut commands, &choice_ui_roots);

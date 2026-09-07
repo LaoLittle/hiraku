@@ -26,6 +26,13 @@ impl PlatformStorage {
 }
 
 impl ByteStorage for PlatformStorage {
+    fn contains(&self, key: &str) -> Result<bool, StorageError> {
+        let key = self.browser_key(key)?;
+        browser_storage()?.get_item(&key)
+            .map(|payload| payload.is_some())
+            .map_err(|error| StorageError::Browser(format!("cannot read `{key}`: {error:?}")))
+    }
+
     fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let key = self.browser_key(key)?;
         let Some(payload) = browser_storage()?.get_item(&key).map_err(|error| {

@@ -12,12 +12,65 @@ mod scene;
 mod script;
 mod state;
 mod storage;
+pub use storage::{PreferenceChange, UserSettings};
 mod texture;
 mod ui;
 mod vfs;
 
 pub use script::{UiContext, UiIntent};
 pub use ui::UiModels;
+
+/// Type-check a standalone story source against the engine capability schema.
+/// This does not launch Bevy, access assets, or execute script/native functions.
+pub fn validate_story_source(path: &str, source: &str) -> Result<(), String> {
+    script::compile_story_bytecode(path, source).map(|_| ())
+}
+
+/// Type-check a UI source with the standard widget module, without rendering.
+pub fn validate_ui_source(path: &str, source: &str) -> Result<(), String> {
+    script::validate_ui_source(path,source)
+}
+
+/// Build a declarative UI document against loose project descriptors, without
+/// rendering or dispatching its effects. Also checks textures and callbacks.
+/// Standard UI models are supplied as empty data; project-specific globals
+/// must be checked through the context-taking variant.
+pub fn validate_ui_document(root: &std::path::Path, settings: &str, path: &str) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    use state::StoredValue as V;
+    let context = UiContext::new(BTreeMap::from([
+        ("dialogue".into(), V::Map(BTreeMap::from([
+            ("speaker".into(), V::String(String::new())),
+            ("text".into(), V::String(String::new())),
+            ("visible".into(), V::Bool(false)),
+            ("revealedCharacters".into(), V::Int(0)),
+            ("canAdvance".into(), V::Bool(false)),
+            ("autoEnabled".into(), V::Bool(false)),
+        ]))),
+        ("history".into(), V::Map(BTreeMap::from([
+            ("text".into(), V::String(String::new())),
+            ("entries".into(), V::Array(Vec::new())),
+        ]))),
+        ("choice".into(), V::Map(BTreeMap::from([
+            ("prompt".into(), V::String(String::new())),
+            ("options".into(), V::Array(vec![V::String("Option".into())])),
+            ("enabled".into(), V::Array(vec![V::Bool(true)])),
+        ]))),
+    ]));
+    validate_ui_document_with_context(root, settings, path, context)
+}
+
+/// Offline UI validation with explicitly supplied model data.
+pub fn validate_ui_document_with_context(
+    root: &std::path::Path, settings: &str, path: &str, context: UiContext,
+) -> Result<(), String> {
+    let vfs = vfs::HdpVfs::new_with_config(root, settings, "startup.hks");
+    let source = vfs.read_text(path).map_err(|error| error.to_string())?;
+    let textures = texture::load_texture_catalog(&vfs).map_err(|error| error.to_string())?;
+    let terms = glossary::load_term_catalog(&vfs).map_err(|error| error.to_string())?;
+    script::evaluate_ui_component_named_with_args(path, &source, context, &textures, &terms, &[])
+        .map(|_| ()).map_err(|error| error.to_string())
+}
 
 use std::sync::Arc;
 
@@ -38,7 +91,7 @@ use effect::{blur::BlurEffectPlugin, custom::CustomScreenEffectMaterial};
 use render::camera::{animate_camera_shake, animate_camera_transition, assign_render_layers};
 use render::character_part::{AlphaMaskMaterial, MultiplyMaterial};
 use scene::{
-    advance_dialogue_on_input, animate_bgm_fades, animate_character_motion_effects,
+    advance_dialogue_on_input, animate_audio_fades, animate_character_motion_effects,
     animate_custom_effects, animate_dialogue_text_reveal, animate_rule_transitions,
     animate_screen_ui, animate_visual_tweens, apply_animation_cancellations,
     apply_live_audio_settings, cleanup_stale_screen_ui, complete_movie_waits, drive_story_runtime,
@@ -52,7 +105,6 @@ use scene::{
 };
 use script::{ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode};
 use state::SceneSharedState;
-use texture::{build_texture_atlases, texture_atlases_ready};
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
 
 #[derive(Clone, Debug, Resource)]
@@ -175,7 +227,6 @@ impl Plugin for HirakuPlugin {
             .init_asset::<TextureAtlasLayout>()
             .add_audio_source::<audio::PreludeLoopAudio>()
             .init_resource::<HdpVolumeLoads>()
-            .init_resource::<texture::TextureAtlasCatalog>()
             .add_message::<input::HirakuPointerInput>()
             .add_message::<input::HirakuScrollInput>()
             .add_message::<input::HirakuActionInput>()
@@ -198,14 +249,11 @@ impl Plugin for HirakuPlugin {
                     .run_if(runtime_content_ready)
                     .run_if(runtime_not_initialized),
             )
-            .add_systems(Update, build_texture_atlases)
             .add_systems(Update, assign_render_layers.after(process_script_commands))
             .configure_sets(Update, HirakuRuntimeSystems.run_if(runtime_initialized))
             .add_systems(
                 Update,
-                boot_runtime
-                    .after(build_texture_atlases)
-                    .run_if(texture_atlases_ready),
+                boot_runtime.run_if(runtime_initialized),
             )
             .add_systems(
                 Update,
@@ -354,8 +402,10 @@ impl Plugin for HirakuPlugin {
                 (
                     apply_animation_cancellations.in_set(HirakuRuntimeSystems),
                     animate_visual_tweens.in_set(HirakuRuntimeSystems),
-                    animate_bgm_fades.in_set(HirakuRuntimeSystems),
+                    animate_audio_fades.in_set(HirakuRuntimeSystems),
+                    scene::poll_sfx_playback.in_set(HirakuRuntimeSystems),
                     animate_custom_effects.in_set(HirakuRuntimeSystems),
+                    scene::pictures::sync_pictures.after(scene::process_script_commands).in_set(HirakuRuntimeSystems),
                     animate_rule_transitions.in_set(HirakuRuntimeSystems),
                     animate_camera_shake.in_set(HirakuRuntimeSystems),
                     animate_character_motion_effects.in_set(HirakuRuntimeSystems),

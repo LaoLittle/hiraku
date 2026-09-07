@@ -16,17 +16,34 @@ use crate::script::navigation::{NavigationOptions, NavigationRequest, Navigation
 use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
+mod scene_visuals;
+mod sound;
+
 /// Engine-facing effects produced by HKS native functions.
 ///
 /// Engine code dispatches these effects directly to ECS-facing systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
+    Picture(crate::scene::pictures::PictureCommand),
     Log(String),
     ClearDialogue,
+    SaveSlot(String),
+    HideCharacter {
+        actor_id: Option<String>,
+        fade_ms: u64,
+    },
     StopBgm,
     Exit,
     SetBackground {
         texture: String,
+        fade_in_ms: Option<u64>,
+    },
+    Delay {
+        duration_ms: u64,
+    },
+    SetCurtain {
+        opacity: f32,
+        fade_ms: Option<u64>,
     },
     Navigate(NavigationRequest),
     SetUiRole {
@@ -60,6 +77,11 @@ pub enum StoryEffect {
         path: String,
         volume: f32,
     },
+    PlaySfx {
+        path: String,
+        volume: f32,
+        fade_in_ms: Option<u64>,
+    },
     SetCamera {
         blur: Option<f32>,
         zoom: Option<f32>,
@@ -84,6 +106,7 @@ pub enum StoryEffect {
 pub enum StoryWait {
     DialogueAdvance,
     Movie { path: String },
+    Delay { duration_ms: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +143,6 @@ impl StoryCallOutcome {
 }
 
 const ACTOR_HANDLE_TYPE: u32 = 1;
-const BGM_HANDLE_TYPE: u32 = 2;
 const CAMERA_HANDLE_TYPE: u32 = 3;
 /// Manifest used by the direct whole-story HKS runtime. Async capabilities are
 /// registered here so the generic compiler can resolve them without engine AST lowering.
@@ -226,6 +248,8 @@ fn source_hash(path: &str, source: &str) -> u64 {
 
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
+    scene_visuals::register(&mut registry);
+    sound::register(&mut registry);
     Position::register_hks(&mut registry)
         .expect("Position API registration must be internally consistent");
     CameraScope::register_hks(&mut registry)
@@ -641,11 +665,20 @@ impl StoryNativeHost {
             handles_by_name: self.context.handles_by_name.clone(),
             last_speaker: self.context.last_speaker.clone(),
             dialogue_buffer: self.context.dialogue_buffer.clone(),
-            next_bgm_handle: self.context.next_bgm_handle,
-            pending_bgm: self.context.pending_bgm.clone(),
+            sound: self.context.sound.clone(),
             next_camera_handle: self.context.next_camera_handle,
             pending_cameras: self.context.pending_cameras.clone(),
+            scene_visuals: self.context.scene_visuals.clone(),
         }
+    }
+
+    pub fn reset_presentation(&mut self) {
+        for actor in self.context.actors.values_mut() {
+            actor.visible = false;
+            actor.dirty = false;
+        }
+        self.context.last_speaker = None;
+        self.context.dialogue_buffer = None;
     }
 
     pub fn restore(snapshot: StoryNativeHostSnapshot) -> Self {
@@ -660,10 +693,10 @@ impl StoryNativeHost {
                 wait: None,
                 last_speaker: snapshot.last_speaker,
                 dialogue_buffer: snapshot.dialogue_buffer,
-                next_bgm_handle: snapshot.next_bgm_handle,
-                pending_bgm: snapshot.pending_bgm,
+                sound: snapshot.sound,
                 next_camera_handle: snapshot.next_camera_handle,
                 pending_cameras: snapshot.pending_cameras,
+                scene_visuals: snapshot.scene_visuals,
             },
             registry,
             controls,
@@ -677,13 +710,13 @@ fn is_callable(value: &Value) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryNativeHostSnapshot {
+    scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
     actors: BTreeMap<u64, PendingActor>,
     handles_by_name: BTreeMap<String, u64>,
     last_speaker: Option<String>,
     dialogue_buffer: Option<String>,
-    next_bgm_handle: u64,
-    pending_bgm: BTreeMap<u64, PendingBgm>,
+    sound: sound::SoundState,
     next_camera_handle: u64,
     pending_cameras: BTreeMap<u64, PendingCamera>,
 }
@@ -696,14 +729,7 @@ struct PendingActor {
     scale: f32,
     dirty: bool,
     focused: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct PendingBgm {
-    path: String,
-    volume: f32,
-    fade_in_ms: Option<u64>,
-    dirty: bool,
+    visible: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -720,6 +746,7 @@ struct PendingCamera {
 
 #[derive(Default)]
 struct CharacterContext {
+    scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
     actors: BTreeMap<u64, PendingActor>,
     handles_by_name: BTreeMap<String, u64>,
@@ -727,8 +754,7 @@ struct CharacterContext {
     wait: Option<StoryWait>,
     last_speaker: Option<String>,
     dialogue_buffer: Option<String>,
-    next_bgm_handle: u64,
-    pending_bgm: BTreeMap<u64, PendingBgm>,
+    sound: sound::SoundState,
     next_camera_handle: u64,
     pending_cameras: BTreeMap<u64, PendingCamera>,
 }
@@ -748,8 +774,6 @@ impl CharacterContext {
 
     fn char(&mut self, name: String) -> Result<ActorHandle, CharacterCapabilityError> {
         if let Some(handle) = self.handles_by_name.get(&name).copied() {
-            self.flush(handle)?;
-            self.actors.insert(handle, pending_actor(&name));
             return Ok(ActorHandle(handle));
         }
         self.next_handle += 1;
@@ -765,6 +789,7 @@ impl CharacterContext {
         emotion: String,
     ) -> Result<ActorHandle, CharacterCapabilityError> {
         let pending = self.actor_mut(handle)?;
+        pending.expressions.retain(|previous| previous != &emotion);
         pending.expressions.push(emotion);
         pending.dirty = true;
         Ok(ActorHandle(handle))
@@ -805,30 +830,6 @@ impl CharacterContext {
         Ok(ActorHandle(handle))
     }
 
-    fn bgm(&mut self, path: String) -> Result<BgmHandle, NativeError> {
-        if path.trim().is_empty() {
-            return Err(NativeError::message("bgm path must not be empty"));
-        }
-        self.next_bgm_handle += 1;
-        let handle = self.next_bgm_handle;
-        self.pending_bgm.insert(
-            handle,
-            PendingBgm {
-                path,
-                volume: 1.0,
-                fade_in_ms: None,
-                dirty: true,
-            },
-        );
-        Ok(BgmHandle(handle))
-    }
-
-    fn bgm_mut(&mut self, handle: u64) -> Result<&mut PendingBgm, NativeError> {
-        self.pending_bgm
-            .get_mut(&handle)
-            .ok_or_else(|| NativeError::message(format!("unknown bgm handle {handle}")))
-    }
-
     fn camera(&mut self, scope: CameraScope) -> CameraHandle {
         self.next_camera_handle += 1;
         let handle = self.next_camera_handle;
@@ -866,7 +867,7 @@ impl CharacterContext {
     fn flush(&mut self, handle: u64) -> Result<(), CharacterCapabilityError> {
         let command = {
             let pending = self.actor_mut(handle)?;
-            if !pending.dirty {
+            if !pending.dirty || !pending.visible {
                 return Ok(());
             }
             pending.dirty = false;
@@ -884,20 +885,12 @@ impl CharacterContext {
     }
 
     fn commit(&mut self) -> Result<(), CharacterCapabilityError> {
+        self.scene_visuals.commit(&mut self.commands);
         let handles = self.actors.keys().copied().collect::<Vec<_>>();
         for handle in handles {
             self.flush(handle)?;
         }
-        let bgm = std::mem::take(&mut self.pending_bgm);
-        for (_, pending) in bgm {
-            if pending.dirty {
-                self.commands.push(StoryEffect::PlayBgm {
-                    path: pending.path,
-                    volume: pending.volume,
-                    fade_in_ms: pending.fade_in_ms,
-                });
-            }
-        }
+        self.sound.commit(&mut self.commands);
         let cameras = std::mem::take(&mut self.pending_cameras);
         for (_, pending) in cameras {
             if pending.blur.is_some()
@@ -930,10 +923,6 @@ pub(super) const CHOICE_OPTION_HANDLE_TYPE: u32 = 0x434f5054;
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "ChoiceOption", handle_type = CHOICE_OPTION_HANDLE_TYPE)]
 struct ChoiceOptionHandle(u64);
-
-#[derive(Clone, Copy, hiraku_script::HksHandle)]
-#[hks(name = "Bgm", handle_type = BGM_HANDLE_TYPE)]
-struct BgmHandle(u64);
 
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "Camera", handle_type = CAMERA_HANDLE_TYPE)]
@@ -1052,6 +1041,16 @@ impl Position {
     }
 }
 
+fn hide_duration(value: Option<f64>) -> Result<u64, NativeError> {
+    let value = value.unwrap_or(0.0);
+    if !value.is_finite() || !(0.0..=60_000.0).contains(&value) {
+        return Err(NativeError::message(
+            "hide fade duration must be between 0 and 60000 milliseconds",
+        ));
+    }
+    Ok(value.round() as u64)
+}
+
 #[hiraku_script::hks_module]
 mod native_api {
     use super::*;
@@ -1086,6 +1085,71 @@ mod native_api {
         context
             .emotion(actor, emotion)
             .map_err(|error| NativeError::message(error.to_string()))
+    }
+
+    #[hks(name = "show", receiver)]
+    pub(super) fn native_show(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+    ) -> Result<ActorHandle, NativeError> {
+        let pending = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?;
+        pending.visible = true;
+        pending.dirty = true;
+        Ok(actor)
+    }
+
+    #[hks(name = "hide", receiver)]
+    pub(super) fn native_hide(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        fade_ms: Option<f64>,
+    ) -> Result<(), NativeError> {
+        let fade_ms = hide_duration(fade_ms)?;
+        let pending = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?;
+        pending.dirty = false;
+        pending.visible = false;
+        let actor_id = pending.name.clone();
+        context.commands.push(StoryEffect::HideCharacter {
+            actor_id: Some(actor_id),
+            fade_ms,
+        });
+        Ok(())
+    }
+
+    #[hks(name = "hideCharacters", selector = "scene")]
+    fn native_hide_characters(
+        context: &mut CharacterContext,
+        fade_ms: Option<f64>,
+    ) -> Result<(), NativeError> {
+        let fade_ms = hide_duration(fade_ms)?;
+        for actor in context.actors.values_mut() {
+            actor.dirty = false;
+            actor.visible = false;
+        }
+        context.commands.push(StoryEffect::HideCharacter {
+            actor_id: None,
+            fade_ms,
+        });
+        Ok(())
+    }
+
+    #[hks(name = "save", selector = "story")]
+    fn native_save(context: &mut CharacterContext, slot: String) -> Result<(), NativeError> {
+        if slot.is_empty()
+            || !slot
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(NativeError::message(
+                "save slot must contain letters, digits, underscores or hyphens",
+            ));
+        }
+        context.commands.push(StoryEffect::SaveSlot(slot));
+        Ok(())
     }
 
     #[hks(name = "at", receiver)]
@@ -1148,14 +1212,6 @@ mod native_api {
     }
 
     #[hks]
-    fn native_bg(context: &mut CharacterContext, texture: String) -> Result<(), NativeError> {
-        context
-            .commands
-            .push(StoryEffect::SetBackground { texture });
-        Ok(())
-    }
-
-    #[hks]
     fn native_adjust_setting(
         context: &mut CharacterContext,
         name: String,
@@ -1166,39 +1222,6 @@ mod native_api {
             delta: delta as f32,
         });
         Ok(())
-    }
-
-    #[hks(name = "bgm")]
-    fn native_bgm(context: &mut CharacterContext, path: String) -> Result<BgmHandle, NativeError> {
-        context.bgm(path)
-    }
-
-    #[hks(name = "volume", receiver)]
-    fn native_bgm_volume(
-        context: &mut CharacterContext,
-        BgmHandle(handle): BgmHandle,
-        volume: f64,
-    ) -> Result<BgmHandle, NativeError> {
-        if !(0.0..=1.0).contains(&volume) {
-            return Err(NativeError::message("bgm volume must be between 0 and 1"));
-        }
-        context.bgm_mut(handle)?.volume = volume as f32;
-        Ok(BgmHandle(handle))
-    }
-
-    #[hks(name = "fadeIn", receiver)]
-    fn native_bgm_fade_in(
-        context: &mut CharacterContext,
-        BgmHandle(handle): BgmHandle,
-        fade_ms: f64,
-    ) -> Result<BgmHandle, NativeError> {
-        if !fade_ms.is_finite() || fade_ms < 0.0 {
-            return Err(NativeError::message(
-                "bgm fade-in duration must be a non-negative number of milliseconds",
-            ));
-        }
-        context.bgm_mut(handle)?.fade_in_ms = Some(fade_ms.round() as u64);
-        Ok(BgmHandle(handle))
     }
 
     #[hks(name = "camera")]
@@ -1476,8 +1499,9 @@ fn pending_actor(name: &str) -> PendingActor {
         expressions: Vec::new(),
         position: [0.0, 0.0],
         scale: 1.0,
-        dirty: true,
+        dirty: false,
         focused: false,
+        visible: false,
     }
 }
 
@@ -1494,6 +1518,38 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_identity_visibility_and_retained_state_survive_host_restore() {
+        let mut host = StoryNativeHost::new();
+        let alice = host.context.char("alice".into()).expect("actor handle");
+        host.context.scale(alice, 0.5).expect("scale");
+        host.context
+            .emotion(alice, "happy".into())
+            .expect("emotion");
+        host.context.commit().expect("commit hidden actor");
+        assert!(host.drain_effects().is_empty());
+        native_api::native_show(&mut host.context, alice).expect("show");
+        host.context.commit().expect("commit show");
+        host.drain_effects();
+        let mut host = StoryNativeHost::restore(host.snapshot());
+        assert_eq!(
+            host.context.char("alice".into()).expect("same actor").0,
+            alice.0
+        );
+        native_api::native_hide(&mut host.context, alice, None).expect("hide");
+        host.drain_effects();
+        host.context
+            .emotion(alice, "sad".into())
+            .expect("edit hidden actor");
+        host.context.commit().expect("commit while hidden");
+        assert!(host.drain_effects().is_empty());
+        native_api::native_show(&mut host.context, alice).expect("show retained actor");
+        host.context.commit().expect("commit");
+        assert!(
+            matches!(host.drain_effects().as_slice(),[StoryEffect::ShowCharacter {scale,expressions,..}] if *scale==0.5 && expressions==&["happy","sad"])
+        );
+    }
     use crate::script::execution_runtime::{ExecutionEvent, ExecutionRuntime};
 
     #[test]
@@ -1502,6 +1558,7 @@ mod tests {
             bgm_volume: 0.8,
             voice_volume: 0.7,
             sfx_volume: 0.6,
+            ..UserSettings::default()
         };
         let mut globals = engine_globals(&original);
         if let Some(Value::Map(settings)) = globals.get_mut("settings") {
@@ -1611,7 +1668,7 @@ not_actor.at(.left)"#,
         let bytecode = compile_story_bytecode(
             "dialogue.story.hks",
             r#"
-                let alice = char("alice")
+                global let alice = char("alice")
                 alice: "first"
                 ...: "continued"
                 "narration"
@@ -1641,9 +1698,10 @@ not_actor.at(.left)"#,
             }
         }
 
-        let dialogue = host
-            .drain_effects()
-            .into_iter()
+        let effects = host.drain_effects();
+        assert!(!effects.iter().any(|effect| matches!(effect, StoryEffect::ShowCharacter { .. })),
+            "speaker identities must not display an actor implicitly");
+        let dialogue = effects.into_iter()
             .filter_map(|effect| match effect {
                 StoryEffect::Say { speaker, text } => Some((false, speaker, text)),
                 StoryEffect::ContinueDialogue { text } => Some((true, String::new(), text)),

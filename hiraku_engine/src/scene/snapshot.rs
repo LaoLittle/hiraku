@@ -10,16 +10,21 @@ pub fn sync_scene_snapshot(
     background_layers: Query<&BackgroundLayer>,
     bgms: Query<&BgmChannel>,
     overlay: Query<&WorldSprite, With<OverlayMarker>>,
-    sprites: Query<(
-        &SpriteActor,
-        Option<&WorldSprite>,
-        Option<&MeshMaterial3d<AlphaMaskMaterial>>,
-        Option<&MeshMaterial3d<MultiplyMaterial>>,
-        Option<&CharacterPartVisual>,
-        Option<&FocusedActorPart>,
-        &Transform,
-        &Visibility,
-    )>,
+    // Outgoing crossfade parts are transient presentation, not the committed
+    // actor state. Restoring them would resurrect removed slots/hidden actors.
+    sprites: Query<
+        (
+            &SpriteActor,
+            Option<&WorldSprite>,
+            Option<&MeshMaterial3d<AlphaMaskMaterial>>,
+            Option<&MeshMaterial3d<MultiplyMaterial>>,
+            Option<&CharacterPartVisual>,
+            Option<&FocusedActorPart>,
+            &Transform,
+            &Visibility,
+        ),
+        Without<HideAfterTween>,
+    >,
 ) {
     let snapshot = &mut shared_state.0;
 
