@@ -252,6 +252,7 @@ pub struct StageState {
     pub character_roots: HashMap<String, Entity>,
     pub character_active_parts: HashMap<String, HashSet<String>>,
     pub character_positions: HashMap<String, Vec2>,
+    pub character_catalog_names: BTreeMap<String, String>,
     /// Logical restored parts waiting to be reconciled into render entities.
     /// This keeps mask/blend metadata intact while their assets are loading.
     pub pending_character_restore: Vec<SpriteSnapshot>,

@@ -80,6 +80,7 @@ pub fn sync_scene_snapshot(
             .collect::<Vec<_>>();
         sprite_snapshots.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.sprites = sprite_snapshots;
+        snapshot.character_catalog_names = stage.character_catalog_names.clone();
         snapshot.character_positions = stage
             .character_positions
             .iter()
@@ -152,6 +153,7 @@ pub(super) fn restore_scene_snapshot(
         commands.entity(entity).try_despawn();
     }
     stage.character_positions.clear();
+    stage.character_catalog_names.clear();
     stage.character_active_parts.clear();
     stage.pending_character_restore = snapshot
         .sprites
@@ -217,6 +219,7 @@ pub(super) fn restore_scene_snapshot(
         .iter()
         .map(|(actor_id, position)| (actor_id.clone(), Vec2::new(position[0], position[1])))
         .collect();
+    stage.character_catalog_names = snapshot.character_catalog_names.clone();
 
     if let Some(overlay) = stage.overlay {
         commands.entity(overlay).remove::<(

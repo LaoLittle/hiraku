@@ -128,6 +128,8 @@ pub mod stored_value {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SceneSnapshot {
+    #[prost(btree_map = "string, string", tag = "11")]
+    pub character_catalog_names: ::std::collections::BTreeMap<String, String>,
     #[prost(bytes = "vec", tag = "10")]
     pub curtain_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "9")]

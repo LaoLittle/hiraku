@@ -324,6 +324,7 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            character_catalog_names: scene.character_catalog_names.clone(),
             curtain_hson: hson::to_vec(&scene.curtain)
                 .expect("curtain state contains only serializable data"),
             pictures_hson: hson::to_vec(&scene.pictures)
@@ -367,6 +368,7 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
                     StorageError::InvalidSave(format!("invalid picture state: {error}"))
                 })?
             },
+            character_catalog_names: scene.character_catalog_names,
             background: scene.background.map(Into::into),
             sprites: scene.sprites.into_iter().map(Into::into).collect(),
             character_positions: scene
@@ -577,6 +579,25 @@ fn sanitize_slot_name(slot: &str) -> Result<&str, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_catalog_identity_survives_scene_storage() {
+        let mut scene = SceneSnapshot::default();
+        scene
+            .character_catalog_names
+            .insert("alice-middle".into(), "alice".into());
+        scene
+            .character_positions
+            .insert("alice-middle".into(), [100.0, -20.0]);
+        let wire = proto::SceneSnapshot::from(&scene).encode_to_vec();
+        let decoded = proto::SceneSnapshot::decode(wire.as_slice()).expect("scene wire format");
+        let restored = SceneSnapshot::try_from(decoded).expect("scene restore");
+        assert_eq!(
+            restored.character_catalog_names,
+            scene.character_catalog_names
+        );
+        assert_eq!(restored.character_positions, scene.character_positions);
+    }
 
     use crate::script::{StoryRuntime, StoryRuntimeEvent, compile_story_bytecode};
 

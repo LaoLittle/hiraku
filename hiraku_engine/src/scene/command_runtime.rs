@@ -420,6 +420,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 };
 
                 stage.character_positions.insert(actor_id.clone(), position);
+                stage
+                    .character_catalog_names
+                    .insert(actor_id.clone(), character_name);
                 queue_character_show(
                     &mut commands,
                     &asset_server,

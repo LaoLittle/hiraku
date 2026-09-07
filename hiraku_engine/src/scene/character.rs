@@ -96,7 +96,11 @@ pub fn reconcile_restored_characters(
     }
 
     for (actor_id, snapshots) in actors {
-        let Some(character) = characters.characters.get(&actor_id) else {
+        let catalog_name = stage
+            .character_catalog_names
+            .get(&actor_id)
+            .unwrap_or(&actor_id);
+        let Some(character) = characters.characters.get(catalog_name) else {
             warn!("restored character `{actor_id}` is not present in the character catalog");
             continue;
         };

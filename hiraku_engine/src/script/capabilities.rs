@@ -747,6 +747,7 @@ pub struct StoryNativeHostSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PendingActor {
     name: String,
+    instance: String,
     expressions: Vec<String>,
     position: [f32; 2],
     scale: f32,
@@ -796,13 +797,33 @@ impl CharacterContext {
     }
 
     fn char(&mut self, name: String) -> Result<ActorHandle, CharacterCapabilityError> {
-        if let Some(handle) = self.handles_by_name.get(&name).copied() {
+        self.character_instance(name.clone(), name)
+    }
+
+    fn character_instance(
+        &mut self,
+        name: String,
+        instance: String,
+    ) -> Result<ActorHandle, CharacterCapabilityError> {
+        if instance.is_empty() || instance.contains("::") {
+            return Err(CharacterCapabilityError::InvalidArguments(
+                "actor instance must be nonempty and cannot contain ::",
+            ));
+        }
+        if let Some(handle) = self.handles_by_name.get(&instance).copied() {
+            if self.actor_mut(handle)?.name != name {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "actor instance is already assigned to another character",
+                ));
+            }
             return Ok(ActorHandle(handle));
         }
         self.next_handle += 1;
         let handle = self.next_handle;
-        self.handles_by_name.insert(name.clone(), handle);
-        self.actors.insert(handle, pending_actor(&name));
+        self.handles_by_name.insert(instance.clone(), handle);
+        let mut actor = pending_actor(&name);
+        actor.instance = instance;
+        self.actors.insert(handle, actor);
         Ok(ActorHandle(handle))
     }
 
@@ -895,7 +916,7 @@ impl CharacterContext {
             }
             pending.dirty = false;
             StoryEffect::ShowCharacter {
-                actor_id: pending.name.clone(),
+                actor_id: pending.instance.clone(),
                 character_name: pending.name.clone(),
                 expressions: pending.expressions.clone(),
                 position: pending.position,
@@ -1099,6 +1120,22 @@ mod native_api {
             .map_err(|error| NativeError::message(error.to_string()))
     }
 
+    #[hks(name = "instance", receiver)]
+    fn native_instance(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        instance: String,
+    ) -> Result<ActorHandle, NativeError> {
+        let name = context
+            .actor_mut(actor.0)
+            .map_err(|e| NativeError::message(e.to_string()))?
+            .name
+            .clone();
+        context
+            .character_instance(name, instance)
+            .map_err(|e| NativeError::message(e.to_string()))
+    }
+
     #[hks(name = "e", receiver)]
     fn native_emotion(
         context: &mut CharacterContext,
@@ -1135,7 +1172,7 @@ mod native_api {
             .map_err(|error| NativeError::message(error.to_string()))?;
         pending.dirty = false;
         pending.visible = false;
-        let actor_id = pending.name.clone();
+        let actor_id = pending.instance.clone();
         context.commands.push(StoryEffect::HideCharacter {
             actor_id: Some(actor_id),
             fade_ms,
@@ -1539,6 +1576,7 @@ mod story_api {
 fn pending_actor(name: &str) -> PendingActor {
     PendingActor {
         name: name.to_string(),
+        instance: name.to_string(),
         expressions: Vec::new(),
         position: [0.0, 0.0],
         scale: 1.0,
@@ -1561,6 +1599,53 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_instances_have_independent_state_and_restore_identity() {
+        compile_story_bytecode("instances.hks", "let alice = char(\"alice\")\nlet middle = alice.instance(\"alice-middle\")\nmiddle.e(\"happy\").show()")
+            .expect("instance fluent API compiles");
+        let mut host = StoryNativeHost::new();
+        let base = host.context.char("alice".into()).expect("base");
+        let middle = host
+            .context
+            .character_instance("alice".into(), "alice-middle".into())
+            .expect("instance");
+        host.context
+            .emotion(middle, "happy".into())
+            .expect("expression");
+        native_api::native_show(&mut host.context, middle).expect("show instance");
+        host.context.commit().expect("commit");
+        assert!(
+            matches!(&host.drain_effects()[0], StoryEffect::ShowCharacter { actor_id, character_name, .. }
+            if actor_id == "alice-middle" && character_name == "alice")
+        );
+        assert!(
+            host.context
+                .actor_mut(base.0)
+                .expect("base")
+                .expressions
+                .is_empty()
+        );
+        let mut restored = StoryNativeHost::restore(host.snapshot());
+        assert_eq!(
+            restored
+                .context
+                .character_instance("alice".into(), "alice-middle".into())
+                .expect("restored handle")
+                .0,
+            middle.0
+        );
+        assert!(
+            restored
+                .context
+                .character_instance("bob".into(), "alice-middle".into())
+                .is_err()
+        );
+        native_api::native_hide(&mut restored.context, middle, None).expect("hide instance");
+        assert!(
+            matches!(&restored.drain_effects()[0], StoryEffect::HideCharacter {actor_id: Some(id), ..} if id == "alice-middle")
+        );
+    }
 
     #[test]
     fn actor_identity_visibility_and_retained_state_survive_host_restore() {

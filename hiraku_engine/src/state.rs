@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 13;
+pub const CURRENT_SAVE_VERSION: u32 = 14;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
@@ -132,6 +132,7 @@ pub struct SceneSnapshot {
     pub sprites: Vec<SpriteSnapshot>,
     #[serde(default)]
     pub character_positions: BTreeMap<String, [f32; 2]>,
+    pub character_catalog_names: BTreeMap<String, String>,
     pub overlay_alpha: f32,
     pub bgm: Option<AudioSnapshot>,
     pub dialogue: Option<DialogueSnapshot>,
