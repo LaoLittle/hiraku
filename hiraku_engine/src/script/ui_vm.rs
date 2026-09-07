@@ -95,6 +95,7 @@ struct UiDraft {
     kind: UiDraftKind,
     content: Option<HksClosure>,
     hovered: Option<HksClosure>,
+    pressed: Option<HksClosure>,
     checked: Option<HksClosure>,
     on_click: Option<HksClosure>,
     on_change: Option<HksCallable>,
@@ -108,6 +109,7 @@ struct UiDraft {
     visible_binding: Option<HksBinding<bool>>,
     hovered_when_disabled: bool,
     hover_scale: f32,
+    hover_active: Option<HksBinding<bool>>,
     press_scale: f32,
     scroll_speed: f32,
     gap: f32,
@@ -115,6 +117,7 @@ struct UiDraft {
     surface: Option<[f32; 4]>,
     text_size: Option<f32>,
     text_color: Option<[f32; 4]>,
+    text_align: Option<f32>,
     background_texture: Option<String>,
     button_background_texture: Option<String>,
     button_hovered_background_texture: Option<String>,
@@ -130,6 +133,7 @@ impl UiDraft {
             slider_skin: None,
             content,
             hovered: None,
+            pressed: None,
             checked: None,
             on_click: None,
             on_change: None,
@@ -143,6 +147,7 @@ impl UiDraft {
             visible_binding: None,
             hovered_when_disabled: false,
             hover_scale: 1.0,
+            hover_active: None,
             press_scale: 1.0,
             scroll_speed: 48.0,
             gap: 12.0,
@@ -150,6 +155,7 @@ impl UiDraft {
             surface: None,
             text_size: None,
             text_color: None,
+            text_align: None,
             background_texture: None,
             button_background_texture: None,
             button_hovered_background_texture: None,
@@ -556,6 +562,18 @@ mod native_ui {
         Ok(node)
     }
 
+    /// Horizontal text alignment: 0 = left, 0.5 = center, 1 = right.
+    #[hks(name = "textAlign", receiver)]
+    fn ui_text_align(context: &mut UiVmContext, node: UiNodeHandle, align: f64)
+        -> Result<UiNodeHandle, NativeError>
+    {
+        if !align.is_finite() || !(0.0..=1.0).contains(&align) {
+            return Err(NativeError::message("text alignment must be between 0 and 1"));
+        }
+        context.node_mut(node)?.text_align = Some(align as f32);
+        Ok(node)
+    }
+
     #[hks(name = "color", receiver)]
     fn ui_color(
         context: &mut UiVmContext,
@@ -711,6 +729,27 @@ mod native_ui {
         Ok(node)
     }
 
+    /// Moves a node and its descendants on hover; active optionally holds that pose.
+    #[hks(name = "hoverOffset", receiver)]
+    fn ui_hover_offset(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        x: f64,
+        y: f64,
+        active: Option<HksBindable<bool>>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        draft.layout.hover_offset = Some([finite_f32(x, "hover x")?, finite_f32(y, "hover y")?]);
+        match active.unwrap_or(HksBindable::Value(false)) {
+            HksBindable::Value(active) => {
+                draft.layout.hover_active = active;
+                draft.hover_active = None;
+            }
+            HksBindable::Binding(binding) => draft.hover_active = Some(binding),
+        }
+        Ok(node)
+    }
+
     #[hks(name = "pressScale", receiver)]
     fn ui_press_scale(
         context: &mut UiVmContext,
@@ -754,6 +793,20 @@ mod native_ui {
         content: HksClosure,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.hovered = Some(content);
+        Ok(node)
+    }
+
+    #[hks(name = "pressed", receiver)]
+    fn ui_pressed(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        content: HksClosure,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Button(_)) {
+            return Err(NativeError::message("pressed content is only valid on image buttons"));
+        }
+        draft.pressed = Some(content);
         Ok(node)
     }
 
@@ -2097,6 +2150,19 @@ fn materialize_node(
     draft.layout.hidden = !draft.visible;
     draft.layout.animation = draft.animation;
     draft.layout.phase_animation = draft.phase_animation.clone();
+    if draft.layout.hover_offset.is_some() && draft.phase_animation.is_some() {
+        return Err(UiVmError::Invalid("hoverOffset and a phase animation require separate nested nodes".into()));
+    }
+    if draft.layout.hover_offset.is_some() && draft.animation.is_some_and(|animation| animation.repeats()) {
+        return Err(UiVmError::Invalid("hoverOffset requires a non-repeating transition".into()));
+    }
+    if let Some(binding) = &draft.hover_active {
+        let reactive = reactive_binding(binding, program, context);
+        let value = evaluate_binding_value(&reactive, registry, context)?;
+        draft.layout.hover_active = bool::from_hks_value(&value)
+            .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+        draft.layout.reactive_hover_active = Some(reactive);
+    }
     draft.layout.visible_binding = None;
     if let Some(binding) = &draft.enabled_binding {
         let reactive = reactive_binding(binding, program, context);
@@ -2179,18 +2245,18 @@ fn materialize_node(
                     (value, Some(reactive))
                 }
             };
-            let is_template = text.contains("${");
-            let text = context
+            let is_template = reactive.is_none() && text.contains("${");
+            let text = if is_template { context
                 .values
                 .expand_binding(&text)
-                .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+                .map_err(|error| UiVmError::Invalid(error.to_string()))? } else { text };
             Ok(ScreenNode::Text(TextNode {
                 binding: is_template.then(|| text.clone()),
                 reactive_text: if is_template { None } else { reactive },
                 text,
                 size: draft.text_size.unwrap_or(28.0),
                 color: draft.text_color,
-                align: None,
+                align: draft.text_align,
                 layout: draft.layout,
             }))
         }
@@ -2415,6 +2481,9 @@ fn materialize_node(
                 )));
             }
             let normal = materialize_node(normal_handles[0], program, registry, context, textures)?;
+            if draft.pressed.is_some() && !matches!(&normal, ScreenNode::Image(_)) {
+                return Err(UiVmError::Invalid("pressed content is only valid on image buttons".into()));
+            }
             let value = if matches!(&value, Value::Unit) {
                 None
             } else {
@@ -2457,6 +2526,16 @@ fn materialize_node(
                     layout: draft.layout,
                 })),
                 ScreenNode::Image(image) => {
+                    let pressed = if let Some(content) = draft.pressed {
+                        let handles = closure_children(Some(content), program, registry, context)?;
+                        let [handle] = handles.as_slice() else {
+                            return Err(UiVmError::Invalid("pressed content must produce exactly one image node".into()));
+                        };
+                        let ScreenNode::Image(image) = materialize_node(*handle, program, registry, context, textures)? else {
+                            return Err(UiVmError::Invalid("pressed content must produce image(...)".into()));
+                        };
+                        Some(image)
+                    } else { None };
                     let hovered = closure_children(draft.hovered, program, registry, context)?;
                     let hovered = match hovered.as_slice() {
                         [] => None,
@@ -2479,6 +2558,8 @@ fn materialize_node(
                         None => (None, None),
                     };
                     Ok(ScreenNode::ImageButton(ScreenImageButtonNode {
+                        pressed_texture: pressed.as_ref().map(|image| image.texture.clone()),
+                        pressed_layout: pressed.map(|image| image.layout),
                         texture: image.texture,
                         hovered_texture,
                         hovered_layout,
@@ -2540,6 +2621,92 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_button_has_independent_pressed_artwork() {
+        let evaluate = |source: &str| evaluate_ui_component_named_with_args(
+            "memory://button.ui.hks", source, UiContext::default(),
+            &TextureCatalog::default(), &TermCatalog::default(), &[],
+        );
+        let screen = evaluate(r#"
+            import ui.widgets.*
+            canvas {
+                button { image("save-thumbnail://alice") }
+                    .hovered { image("save-thumbnail://bob") }
+                    .pressed { image("save-thumbnail://pressed").size(.abs(32, 24)) }
+            }
+        "#).expect("image states build");
+        let ScreenNode::ImageButton(button) = &screen.children[0] else { panic!("expected image button") };
+        assert_eq!(button.texture.path, "save-thumbnail://alice");
+        assert_eq!(button.hovered_texture.as_ref().expect("hover image").path, "save-thumbnail://bob");
+        assert_eq!(button.pressed_texture.as_ref().expect("press image").path, "save-thumbnail://pressed");
+        assert!(button.pressed_layout.is_some());
+        for content in ["", "text(\"invalid\")", "image(\"save-thumbnail://alice\"); image(\"save-thumbnail://bob\")"] {
+            let source = format!("import ui.widgets.*\ncanvas {{ button {{ image(\"save-thumbnail://alice\") }}.pressed {{ {content} }} }}");
+            assert!(evaluate(&source).is_err(), "invalid pressed content must be rejected");
+        }
+    }
+
+    #[test]
+    fn hover_offset_keeps_optional_reactive_selection() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://tabs.ui.hks",
+            r#"
+                import ui.widgets.*
+                global var selected: Bool = true
+                canvas {
+                    column { text("alice") }
+                        .hoverOffset(-84, 0, ${selected}).animation(.linear(0.2))
+                    column { text("bob") }.hoverOffset(-20, 0)
+                }
+            "#,
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("hover UI builds with optional closure arguments");
+        let ScreenNode::Column(column) = &screen.children[0] else { panic!("expected column") };
+        assert_eq!(column.layout.hover_offset, Some([-84.0, 0.0]));
+        assert!(column.layout.hover_active);
+        let mut binding = column.layout.reactive_hover_active.clone().expect("selection is reactive");
+        binding.globals.insert("selected".into(), Value::Bool(false));
+        assert_eq!(evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
+            .expect("selection reevaluates"), Value::Bool(false));
+        let ScreenNode::Column(column) = &screen.children[1] else { panic!("expected column") };
+        assert!(!column.layout.hover_active);
+    }
+
+    #[test]
+    fn numeric_label_helper_keeps_its_reactive_dependency() {
+        let source = r#"
+            import ui.widgets.*
+            global var level: Float = 0.54
+            fn label(value: Float) -> String {
+                let tenths = value * 10 + 0.5
+                let rounded = tenths.toInt().toFloat() / 10
+                rounded.toString()
+            }
+            canvas { text(${label(level)}) }
+        "#;
+        let screen = evaluate_ui_component_named_with_args("memory://numeric.ui.hks", source,
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[])
+            .expect("numeric UI builds");
+        let ScreenNode::Text(text) = &screen.children[0] else { panic!("expected text") };
+        assert_eq!(text.text, "0.5");
+        let mut binding = text.reactive_text.clone().expect("reactive expression retained");
+        binding.globals.insert("level".into(), Value::Number(0.87));
+        assert_eq!(evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
+            .expect("updated label evaluates"), Value::String("0.9".into()));
+    }
+
+    #[test]
+    fn text_alignment_is_script_owned_and_validated() {
+        let evaluate = |source: &str| evaluate_ui_component_named_with_args(
+            "memory://alignment.ui.hks", source, UiContext::default(),
+            &TextureCatalog::default(), &TermCatalog::default(), &[],
+        );
+        let screen = evaluate("import ui.widgets.*\ncanvas { text(\"alice\").textAlign(0.5) }")
+            .expect("centered text compiles");
+        assert!(matches!(&screen.children[0], ScreenNode::Text(text) if text.align == Some(0.5)));
+        assert!(evaluate("import ui.widgets.*\ncanvas { text(\"bob\").textAlign(2) }").is_err());
+    }
 
     #[test]
     fn save_thumbnail_sources_do_not_require_a_texture_descriptor() {

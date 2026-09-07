@@ -424,25 +424,21 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     animation_id,
                 );
             }
-            ScriptCommand::Stage(StageCommand::SetCurtain { opacity, fade }) => {
+            ScriptCommand::Stage(StageCommand::SetCurtain { opacity, fade, mask, softness }) => {
                 if let Some(overlay) = stage.overlay {
-                    commands.queue(move |world: &mut World| {
-                        let Some(mut sprite) = world.get_mut::<WorldSprite>(overlay) else { return; };
-                        let from = sprite.color.alpha();
-                        if let Some(duration) = fade {
-                            world.entity_mut(overlay).insert(VisualTween {
-                                from_alpha: Some(from), to_alpha: Some(opacity),
-                                from_translation: None, to_translation: None,
-                                from_scale: None, to_scale: None,
-                                timer: Timer::new(duration, TimerMode::Once),
-                                animation_id: None, despawn_on_finish: false,
-                            });
-                        } else {
-                            sprite.color = sprite.color.with_alpha(opacity);
-                            world.entity_mut(overlay).remove::<VisualTween>();
-                        }
+                    let mask = mask.map(|path| crate::render::world_sprite::DissolveMask {
+                        image: asset_server.load_builder().with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+                            settings.is_srgb = false;
+                        }).load(path.clone()),
+                        path, softness, canvas_size: Vec2::ONE, reversed: false,
+                    });
+                    commands.entity(overlay).remove::<(VisualTween, super::curtain::CurtainFailed)>().try_insert(super::curtain::PendingCurtain {
+                        opacity, duration: fade, mask,
                     });
                 }
+            }
+            ScriptCommand::Stage(StageCommand::AwaitCurtain { done }) => {
+                commands.spawn(super::curtain::CurtainWait(done));
             }
             ScriptCommand::Animation(AnimationCommand::Delay { duration, done }) => {
                 waits.items.push(super::animation_runtime::PendingWait {

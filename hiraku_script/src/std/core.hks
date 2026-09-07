@@ -8,11 +8,21 @@ fn unreachable() -> Never { panic("entered unreachable code") }
 fn todo() -> Never { panic("not yet implemented") }
 
 impl Float {
+    fn toString(self) -> String { __builtin_to_string(self) }
     fn toFloat(self) -> Float { self }
     fn toInt(self) -> Int { __builtin_f2i(self) }
 }
 
 impl Int {
+    fn toString(self) -> String { __builtin_to_string(self) }
     fn toFloat(self) -> Float { __builtin_i2f(self) }
     fn toInt(self) -> Int { self }
+}
+
+impl Bool {
+    fn toString(self) -> String { __builtin_to_string(self) }
+}
+
+impl String {
+    fn toString(self) -> String { self }
 }

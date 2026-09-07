@@ -324,6 +324,7 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            curtain_hson: hson::to_vec(&scene.curtain).expect("curtain state contains only serializable data"),
             pictures_hson: hson::to_vec(&scene.pictures).expect("picture state contains only serializable data"),
             background: scene.background.as_ref().map(Into::into),
             sprites: scene.sprites.iter().map(Into::into).collect(),
@@ -350,6 +351,9 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
+            curtain: if scene.curtain_hson.is_empty() { None } else {
+                hson::from_slice(&scene.curtain_hson).map_err(|error| StorageError::InvalidSave(format!("invalid curtain state: {error}")))?
+            },
             pictures: if scene.pictures_hson.is_empty() { BTreeMap::new() } else {
                 hson::from_slice(&scene.pictures_hson).map_err(|error| StorageError::InvalidSave(format!("invalid picture state: {error}")))?
             },

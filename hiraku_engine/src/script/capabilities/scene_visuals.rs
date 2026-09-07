@@ -15,7 +15,7 @@ struct SceneTransitionHandle(u64);
 enum SceneVisualTarget {
     Picture(PictureCommand),
     Background(String),
-    Curtain(f32),
+    Curtain { opacity: f32, mask: Option<String>, softness: f32 },
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ impl SceneVisualState {
                     texture,
                     fade_in_ms: fade_ms,
                 },
-                SceneVisualTarget::Curtain(opacity) => StoryEffect::SetCurtain { opacity, fade_ms },
+                SceneVisualTarget::Curtain { opacity, mask, softness } => StoryEffect::SetCurtain { opacity, fade_ms, mask, softness },
             });
         }
     }
@@ -240,7 +240,40 @@ mod api {
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Curtain(opacity as f32))
+            .begin(SceneVisualTarget::Curtain { opacity: opacity as f32, mask: None, softness: 0.0 })
+    }
+
+    /// A red-channel threshold mask, sampled as linear data across the canvas.
+    #[hks(name = "dissolve", receiver)]
+    fn dissolve(
+        context: &mut CharacterContext,
+        SceneTransitionHandle(id): SceneTransitionHandle,
+        texture: String,
+        softness: Option<f64>,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let softness = softness.unwrap_or(0.0);
+        if texture.trim().is_empty() || !(0.0..=1.0).contains(&softness) {
+            return Err(NativeError::message("dissolve needs a texture and softness between 0 and 1"));
+        }
+        let Some((SceneVisualTarget::Curtain { mask, softness: edge, .. }, _)) = context.scene_visuals.pending.get_mut(&id) else {
+            return Err(NativeError::message("dissolve requires an uncommitted scene.curtain(...)"));
+        };
+        *mask = Some(texture);
+        *edge = softness as f32;
+        Ok(SceneTransitionHandle(id))
+    }
+
+    /// Join the curtain's loading and animation before continuing the story.
+    #[hks(name = "awaitCompletion", receiver)]
+    fn wait_curtain(
+        context: &mut CharacterContext,
+        SceneTransitionHandle(id): SceneTransitionHandle,
+    ) -> Result<(), NativeError> {
+        if !matches!(context.scene_visuals.pending.get(&id), Some((SceneVisualTarget::Curtain { .. }, _))) {
+            return Err(NativeError::message("awaitCompletion requires an uncommitted scene.curtain(...)"));
+        }
+        context.wait = Some(super::super::StoryWait::Curtain);
+        Ok(())
     }
 
     /// Milliseconds, matching Bgm.fadeIn. The builder commits at statement end.
@@ -375,12 +408,37 @@ mod tests {
             StoryRuntimeEvent::Effect(StoryEffect::SetCurtain {
                 opacity: 0.0,
                 fade_ms: Some(1200),
+                mask: None,
+                softness: 0.0,
             })
         );
         assert!(matches!(
             event(&mut runtime),
             StoryRuntimeEvent::Completed(_)
         ));
+    }
+
+    #[test]
+    fn curtain_dissolve_is_data_driven_and_statement_scoped() {
+        let mut runtime = runtime("scene.curtain(1).dissolve(\"transitions/blinds\", 0.1).fade(900)");
+        assert_eq!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::SetCurtain {
+            opacity: 1.0, fade_ms: Some(900), mask: Some("transitions/blinds".into()), softness: 0.1,
+        }));
+        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Completed(_)));
+    }
+
+    #[test]
+    fn curtain_wait_yields_after_commit_and_resumes_once() {
+        let source = "scene.curtain(1).dissolve(\"transitions/blinds\").fade(900).awaitCompletion()";
+        let mut runtime = runtime(source);
+        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::SetCurtain { .. })));
+        assert_eq!(event(&mut runtime), StoryRuntimeEvent::Wait(StoryWait::Curtain));
+        let snapshot = runtime.snapshot().expect("curtain boundary can be saved");
+        let mut runtime = StoryRuntime::restore(compile_story_bytecode("test.hks", source).expect("deterministic recompile"), snapshot)
+            .expect("curtain wait restores");
+        assert_eq!(runtime.restored_boundary_event(), Some(StoryRuntimeEvent::Wait(StoryWait::Curtain)));
+        runtime.resume(Value::Unit).expect("curtain completion resumes host wait");
+        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Completed(_)));
     }
 
     #[test]

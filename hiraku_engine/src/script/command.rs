@@ -36,8 +36,9 @@ pub enum RuntimeCommand {
 
 #[derive(Debug)]
 pub enum StageCommand {
+    AwaitCurtain { done: ScriptRequestId },
     Picture(crate::scene::pictures::PictureCommand),
-    SetCurtain { opacity: f32, fade: Option<Duration> },
+    SetCurtain { opacity: f32, fade: Option<Duration>, mask: Option<String>, softness: f32 },
     SetBackground {
         path: String,
         fade: Option<Duration>,

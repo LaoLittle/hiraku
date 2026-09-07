@@ -64,6 +64,8 @@ pub(crate) mod widgets;
 mod snapshot;
 pub(crate) mod pictures;
 pub(crate) mod save_preview;
+pub(crate) mod ui_hover;
+pub(crate) mod curtain;
 mod video_runtime;
 
 pub use animation_runtime::{

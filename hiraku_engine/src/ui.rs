@@ -196,6 +196,12 @@ pub struct InputNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    #[serde(default)]
+    pub hover_offset: Option<[f32; 2]>,
+    #[serde(default)]
+    pub hover_active: bool,
+    #[serde(skip)]
+    pub reactive_hover_active: Option<UiReactiveBinding>,
     /// Static visibility used before or instead of a live visibility binding.
     #[serde(default)]
     pub hidden: bool,
@@ -530,6 +536,10 @@ pub struct ScreenTexture {
 pub struct ScreenImageButtonNode {
     pub texture: ScreenTexture,
     #[serde(default)]
+    pub pressed_texture: Option<ScreenTexture>,
+    #[serde(default)]
+    pub pressed_layout: Option<ScreenLayout>,
+    #[serde(default)]
     pub hovered_texture: Option<ScreenTexture>,
     /// Size and absolute positioning while the pointer hovers the button.
     #[serde(default)]
@@ -749,6 +759,9 @@ pub struct ScreenUiButtonText;
 /// Runtime interaction state for a texture-backed screen button.
 #[derive(Component, Clone)]
 pub struct ScreenUiImageButton {
+    pub pressed_texture: Option<Handle<Image>>,
+    pub pressed_rect: Option<Rect>,
+    pub pressed_node: Option<Node>,
     /// Root this button belongs to; stale and pending roots are ignored.
     pub root: Entity,
     /// Intent value returned to the story runtime when pressed.

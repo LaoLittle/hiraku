@@ -22,3 +22,6 @@ thiserror.workspace = true
 uuid.workspace = true
 time.workspace = true
 rand_pcg.workspace = true
+
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }

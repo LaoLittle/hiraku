@@ -7,6 +7,7 @@ pub enum Intrinsic {
     Panic,
     FloatToInt,
     IntToFloat,
+    ValueToString,
 }
 
 pub struct IntrinsicDefinition {
@@ -17,6 +18,12 @@ pub struct IntrinsicDefinition {
 }
 
 pub static DEFINITIONS: &[IntrinsicDefinition] = &[
+    IntrinsicDefinition {
+        name: "__builtin_to_string",
+        operation: Intrinsic::ValueToString,
+        parameter: ScriptType::Any,
+        result: ScriptType::String,
+    },
     IntrinsicDefinition {
         name: "__builtin_i2f",
         operation: Intrinsic::IntToFloat,

@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 17;
+pub const BYTECODE_VERSION: u16 = 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -87,6 +87,10 @@ pub enum Instruction {
         dst: Register,
         global: u32,
     },
+    GlobalInitialized {
+        dst: Register,
+        global: u32,
+    },
     StoreGlobal {
         global: u32,
         src: Register,
@@ -104,6 +108,10 @@ pub enum Instruction {
         value: Register,
     },
     UnaryMinus {
+        dst: Register,
+        value: Register,
+    },
+    ToString {
         dst: Register,
         value: Register,
     },
@@ -469,6 +477,12 @@ fn emit_function(
                     dst: register(*dst),
                     global: global.0,
                 },
+                MirInstruction::GlobalInitialized { dst, global } => {
+                    Instruction::GlobalInitialized {
+                        dst: register(*dst),
+                        global: global.0,
+                    }
+                }
                 MirInstruction::StoreGlobal { global, src } => Instruction::StoreGlobal {
                     global: global.0,
                     src: register(*src),
@@ -496,6 +510,10 @@ fn emit_function(
                     value: register(*value),
                 },
                 MirInstruction::UnaryMinus { dst, value } => Instruction::UnaryMinus {
+                    dst: register(*dst),
+                    value: register(*value),
+                },
+                MirInstruction::ToString { dst, value } => Instruction::ToString {
                     dst: register(*dst),
                     value: register(*value),
                 },
@@ -1155,6 +1173,10 @@ impl Vm {
                     let value = self.read(src)?.clone();
                     *self.global_mut(global)? = value;
                 }
+                Instruction::GlobalInitialized { dst, global } => {
+                    let initialized = *self.global_slot(global)? != Value::Uninitialized;
+                    self.write(dst, Value::Bool(initialized))?;
+                }
                 Instruction::GetMember {
                     dst,
                     object,
@@ -1186,6 +1208,17 @@ impl Vm {
                         return Err(VmError::TypeMismatch("unary minus expects Number"));
                     };
                     self.write(dst, Value::Number(-value))?;
+                }
+                Instruction::ToString { dst, value } => {
+                    let text = match self.read(value)? {
+                        Value::Number(number) => number.to_string(),
+                        Value::Bool(value) => value.to_string(),
+                        Value::String(value) => value.clone(),
+                        _ => {
+                            return Err(VmError::TypeMismatch("toString expects a primitive value"));
+                        }
+                    };
+                    self.write(dst, Value::String(text))?;
                 }
                 Instruction::Cast {
                     dst,
@@ -3101,6 +3134,22 @@ mod tests {
     }
 
     #[test]
+    fn primitive_to_string_runs_in_the_script_call_frame() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let mut vm = Vm::new(compile(
+            "fn label(value: Float) -> String { let rounded = value * 2; rounded.toString() }\nglobal let result = label(0.25)\nglobal let integer = 12.toString()\nglobal let flag = true.toString()",
+            &manifest,
+        )).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("string conversion succeeds"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::String("0.5".into())));
+        assert_eq!(vm.global("integer"), Some(&Value::String("12".into())));
+        assert_eq!(vm.global("flag"), Some(&Value::String("true".into())));
+    }
+
+    #[test]
     fn explicit_to_int_truncates_and_rejects_invalid_values() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let mut vm = Vm::new(compile(
@@ -3517,6 +3566,54 @@ mod tests {
         vm.resume(Value::Unit)
             .expect("simulate a faulty host returning from Never");
         assert!(matches!(vm.step(), Err(VmError::UndefinedInstruction(_))));
+    }
+
+    #[test]
+    fn inherited_globals_skip_initializers_and_preserve_null() {
+        let manifest = BuiltinManifest::new([("initialize", BuiltinId(0))]).with_type_metadata(
+            SymbolManifest::default(),
+            BTreeMap::from([(
+                BuiltinId(0),
+                crate::FunctionSignature {
+                    receiver: None,
+                    parameters: vec![],
+                    variadic: None,
+                    result: crate::ScriptType::String,
+                },
+            )]),
+            vec![],
+        );
+        for source in [
+            "global let name: String? = initialize()",
+            "global var name: String? = initialize()",
+        ] {
+            let code = compile(source, &manifest);
+            let mut inherited = Vm::new(code.clone()).expect("VM initializes");
+            inherited
+                .set_global_values(vec![Value::Optional(None)])
+                .expect("inherit initialized null");
+            assert!(matches!(
+                inherited.step().expect("initializer is skipped"),
+                Some(VmEvent::Completed(_))
+            ));
+            assert_eq!(inherited.global("name"), Some(&Value::Optional(None)));
+            let mut fresh = Vm::new(code).expect("fresh session");
+            assert!(matches!(
+                fresh.step().expect("initializer executes in fresh session"),
+                Some(VmEvent::Call(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn global_declarations_do_not_replace_inherited_state_but_assignments_do() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile("global var score = 1\nscore += 1", &manifest);
+        let mut vm = Vm::new(code).expect("VM initializes");
+        vm.set_global_values(vec![Value::Number(40.0)])
+            .expect("inherit score");
+        while !matches!(vm.step().expect("execute"), Some(VmEvent::Completed(_))) {}
+        assert_eq!(vm.global("score"), Some(&Value::Number(41.0)));
     }
 
     #[test]

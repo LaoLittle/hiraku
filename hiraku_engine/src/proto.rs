@@ -128,6 +128,8 @@ pub mod stored_value {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SceneSnapshot {
+    #[prost(bytes = "vec", tag = "10")]
+    pub curtain_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "9")]
     pub pictures_hson: Vec<u8>,
     #[prost(message, optional, tag = "1")]

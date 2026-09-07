@@ -124,6 +124,8 @@ impl Default for CameraSnapshot {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
     #[serde(default)]
+    pub curtain: Option<CurtainSnapshot>,
+    #[serde(default)]
     pub pictures: BTreeMap<String, crate::scene::pictures::PictureState>,
     pub background: Option<ImageLayerSnapshot>,
     #[serde(default)]
@@ -137,6 +139,14 @@ pub struct SceneSnapshot {
     pub text_effect: TextEffectSnapshot,
     #[serde(default)]
     pub camera: CameraSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CurtainSnapshot {
+    pub mask: Option<String>,
+    pub softness: f32,
+    pub target: f32,
+    pub remaining_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

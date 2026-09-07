@@ -304,6 +304,7 @@ impl Plugin for HirakuPlugin {
                     update_ui_text_bindings,
                     update_ui_reactive_bindings,
                     animate_screen_ui,
+                    scene::ui_hover::animate_hover,
                 )
                     .chain()
                     .after(process_script_commands)
@@ -403,6 +404,8 @@ impl Plugin for HirakuPlugin {
                 (
                     apply_animation_cancellations.in_set(HirakuRuntimeSystems),
                     animate_visual_tweens.in_set(HirakuRuntimeSystems),
+                    scene::curtain::update_curtains.after(process_script_commands).before(animate_visual_tweens).in_set(HirakuRuntimeSystems),
+                    scene::curtain::complete_curtain_waits.after(animate_visual_tweens).after(scene::curtain::update_curtains).in_set(HirakuRuntimeSystems),
                     animate_audio_fades.in_set(HirakuRuntimeSystems),
                     scene::poll_sfx_playback.in_set(HirakuRuntimeSystems),
                     animate_custom_effects.in_set(HirakuRuntimeSystems),

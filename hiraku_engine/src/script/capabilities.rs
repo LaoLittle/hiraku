@@ -44,6 +44,8 @@ pub enum StoryEffect {
     SetCurtain {
         opacity: f32,
         fade_ms: Option<u64>,
+        mask: Option<String>,
+        softness: f32,
     },
     Navigate(NavigationRequest),
     SetUiRole {
@@ -104,6 +106,7 @@ pub enum StoryEffect {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoryWait {
+    Curtain,
     DialogueAdvance,
     Movie { path: String },
     Delay { duration_ms: u64 },
@@ -323,6 +326,20 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
     registry
         .register_raw_fn("wait", async_capability_placeholder)
         .expect("built-in `wait` registration must be unique");
+    let await_task = registry
+        .register_raw_fn("await", async_capability_placeholder)
+        .expect("await registration must be unique");
+    registry
+        .set_signature(
+            await_task,
+            hiraku_script::FunctionSignature {
+                receiver: Some(ScriptType::Task),
+                parameters: vec![],
+                variadic: None,
+                result: ScriptType::Unit,
+            },
+        )
+        .expect("await has a typed task receiver");
     for name in ["seq", "par"] {
         let builtin = registry
             .register_raw_fn(name, async_capability_placeholder)
@@ -450,6 +467,7 @@ struct StoryControlBuiltins {
     open_ui: BuiltinId,
     open_ui_any: BuiltinId,
     wait: BuiltinId,
+    await_task: BuiltinId,
 }
 
 impl StoryControlBuiltins {
@@ -478,6 +496,9 @@ impl StoryControlBuiltins {
             wait: manifest
                 .resolve("wait")
                 .expect("wait builtin is registered"),
+            await_task: manifest
+                .resolve("await")
+                .expect("await builtin is registered"),
         }
     }
 }
@@ -618,11 +639,12 @@ impl StoryNativeHost {
                     .collect(),
             }));
         }
-        if call.builtin == self.controls.wait {
+        if call.builtin == self.controls.wait || call.builtin == self.controls.await_task {
             let task = call
-                .arguments
-                .first()
-                .and_then(|argument| match &argument.value {
+                .receiver
+                .as_ref()
+                .or_else(|| call.arguments.first().map(|argument| &argument.value))
+                .and_then(|value| match value {
                     Value::Task(task) => Some(*task),
                     _ => None,
                 })
@@ -1699,9 +1721,14 @@ not_actor.at(.left)"#,
         }
 
         let effects = host.drain_effects();
-        assert!(!effects.iter().any(|effect| matches!(effect, StoryEffect::ShowCharacter { .. })),
-            "speaker identities must not display an actor implicitly");
-        let dialogue = effects.into_iter()
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, StoryEffect::ShowCharacter { .. })),
+            "speaker identities must not display an actor implicitly"
+        );
+        let dialogue = effects
+            .into_iter()
             .filter_map(|effect| match effect {
                 StoryEffect::Say { speaker, text } => Some((false, speaker, text)),
                 StoryEffect::ContinueDialogue { text } => Some((true, String::new(), text)),

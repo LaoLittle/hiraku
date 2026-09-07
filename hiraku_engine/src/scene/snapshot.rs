@@ -9,7 +9,7 @@ pub fn sync_scene_snapshot(
     dialogue_state: Res<DialogueState>,
     background_layers: Query<&BackgroundLayer>,
     bgms: Query<&BgmChannel>,
-    overlay: Query<&WorldSprite, With<OverlayMarker>>,
+    overlay: Query<(&WorldSprite, Option<&VisualTween>, Option<&super::curtain::PendingCurtain>), With<OverlayMarker>>,
     // Outgoing crossfade parts are transient presentation, not the committed
     // actor state. Restoring them would resurrect removed slots/hidden actors.
     sprites: Query<
@@ -92,8 +92,18 @@ pub fn sync_scene_snapshot(
         });
     }
 
-    if let Ok(overlay_sprite) = overlay.single() {
+    if let Ok((overlay_sprite, tween, pending)) = overlay.single() {
         snapshot.overlay_alpha = overlay_sprite.color.alpha();
+        let mask = pending.map(|pending| pending.mask.as_ref()).unwrap_or(overlay_sprite.dissolve.as_ref());
+        snapshot.curtain = Some(crate::state::CurtainSnapshot {
+            mask: mask.map(|mask| mask.path.clone()),
+            softness: mask.map_or(0.0, |mask| mask.softness),
+            target: pending.map(|pending| pending.opacity)
+                .or_else(|| tween.and_then(|tween| tween.to_alpha)).unwrap_or(snapshot.overlay_alpha),
+            remaining_ms: pending.map(|pending| pending.duration.unwrap_or_default())
+                .or_else(|| tween.map(|tween| tween.timer.remaining()))
+                .unwrap_or_default().as_millis() as u64,
+        });
     }
 
     snapshot.text_effect = text_effect_snapshot(&dialogue_state.effect);
@@ -196,10 +206,24 @@ pub(super) fn restore_scene_snapshot(
         .collect();
 
     if let Some(overlay) = stage.overlay {
+        commands.entity(overlay).remove::<(VisualTween, super::curtain::PendingCurtain, super::curtain::CurtainFailed)>();
         commands.entity(overlay).insert(WorldSprite::from_color(
             Color::BLACK.with_alpha(snapshot.overlay_alpha),
             Vec2::new(6000.0, 6000.0),
         ));
+        if let Some(curtain) = snapshot.curtain {
+            let mask = curtain.mask.map(|path| crate::render::world_sprite::DissolveMask {
+                image: asset_server.load_builder().with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+                    settings.is_srgb = false;
+                }).load(path.clone()),
+                path, softness: curtain.softness, canvas_size: Vec2::ONE, reversed: false,
+            });
+            commands.entity(overlay).insert(super::curtain::PendingCurtain {
+                opacity: curtain.target,
+                duration: (curtain.remaining_ms > 0).then(|| std::time::Duration::from_millis(curtain.remaining_ms)),
+                mask,
+            });
+        }
     }
 
     match snapshot.dialogue {

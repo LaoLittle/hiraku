@@ -587,6 +587,8 @@ fn spawn_screen_node_entity(
             entity
         }
         ScreenNode::ImageButton(ScreenImageButtonNode {
+            pressed_texture,
+            pressed_layout,
             texture,
             hovered_texture,
             hovered_layout,
@@ -609,6 +611,16 @@ fn spawn_screen_node_entity(
                 image_handles.push(image.clone());
                 image
             });
+            let pressed_image = pressed_texture.as_ref().map(|texture| {
+                let image = asset_server.load(texture.path.clone());
+                image_handles.push(image.clone());
+                image
+            });
+            let pressed_node = pressed_layout.as_ref().map(|layout| {
+                let mut node = Node::default();
+                apply_screen_layout(&mut node, layout);
+                node
+            });
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
             let normal_node = node.clone();
@@ -627,6 +639,9 @@ fn spawn_screen_node_entity(
                     node,
                     UiTransform::IDENTITY,
                     ScreenUiImageButton {
+                        pressed_texture: pressed_image,
+                        pressed_rect: pressed_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
+                        pressed_node,
                         root,
                         value: value.clone(),
                         enabled: *enabled,
@@ -993,7 +1008,9 @@ pub(super) fn apply_live_layout_bindings(
             rendered_revision: u64::MAX,
         });
     }
-    if let Some(timeline) = &layout.phase_animation {
+    if layout.hover_offset.is_some() {
+        commands.entity(entity).insert((UiTransform::IDENTITY, super::ui_hover::HoverMotion::new(layout)));
+    } else if let Some(timeline) = &layout.phase_animation {
         commands.entity(entity).insert((
             UiTransform::IDENTITY,
             UiAnimationPlayer {
@@ -1290,6 +1307,13 @@ pub fn handle_screen_image_buttons(
         match *interaction {
             PickingInteraction::Pressed if button.enabled => {
                 transform.scale = Vec2::splat(button.press_scale);
+                if let Some(texture) = &button.pressed_texture {
+                    image.image = texture.clone();
+                    image.texture_atlas = None;
+                    image.rect = button.pressed_rect;
+                    *node = button.pressed_node.clone().unwrap_or_else(|| button.normal_node.clone());
+                    continue;
+                }
                 image.image = button
                     .hovered_texture
                     .clone()
@@ -1770,7 +1794,7 @@ pub fn update_ui_reactive_bindings(
     }
 }
 
-fn refresh_local_binding(
+pub(super) fn refresh_local_binding(
     mut entity: Entity,
     expression: &mut crate::ui::UiReactiveBinding,
     parents: &Query<&ChildOf>,
@@ -2170,6 +2194,44 @@ mod tests {
         app.update();
 
         assert_eq!(app.world().resource::<ScreenUiState>().waiting, None);
+    }
+
+    #[test]
+    fn image_button_restores_artwork_after_press_and_cancel() {
+        let mut app = App::new();
+        app.init_resource::<ScreenUiState>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, handle_screen_image_buttons);
+        let root = app.world_mut().spawn_empty().id();
+        let normal_rect = Some(Rect::from_corners(Vec2::ZERO, Vec2::splat(20.0)));
+        let hover_rect = Some(Rect::from_corners(Vec2::splat(20.0), Vec2::splat(40.0)));
+        let normal_node = Node { width: Val::Px(100.0), ..default() };
+        let button = app.world_mut().spawn((
+            PickingInteraction::None, ImageNode::default(), normal_node.clone(), UiTransform::IDENTITY,
+            ScreenUiImageButton {
+                root, value: None, enabled: true, hovered_when_disabled: false,
+                normal_rect, normal_texture: Handle::default(), normal_atlas: None,
+                hovered_rect: hover_rect, hovered_texture: Some(Handle::default()),
+                hovered_atlas: None, hovered_node: None,
+                pressed_texture: Some(Handle::default()), pressed_rect: None,
+                pressed_node: Some(Node { width: Val::Px(80.0), ..default() }),
+                normal_node, hover_scale: 1.0, press_scale: 1.0,
+            },
+        )).id();
+        for (interaction, rect, width) in [
+            (PickingInteraction::Hovered, hover_rect, 100.0),
+            (PickingInteraction::Pressed, None, 80.0),
+            (PickingInteraction::Hovered, hover_rect, 100.0),
+            (PickingInteraction::Pressed, None, 80.0),
+            (PickingInteraction::None, normal_rect, 100.0),
+        ] {
+            *app.world_mut().get_mut::<PickingInteraction>(button).expect("button interaction") = interaction;
+            app.update();
+            assert_eq!(app.world().get::<ImageNode>(button).expect("button image").rect, rect);
+            assert_eq!(app.world().get::<Node>(button).expect("button layout").width, Val::Px(width));
+            assert_eq!(app.world().get::<UiTransform>(button).expect("button transform").scale, Vec2::ONE);
+        }
     }
 
     #[test]

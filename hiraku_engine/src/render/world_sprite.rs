@@ -7,12 +7,26 @@ use bevy::{
     shader::ShaderRef,
 };
 
+#[cfg(test)]
+mod dissolve_shader_tests {
+    #[test]
+    fn sprite_dissolve_shader_parses_and_validates_without_a_gpu() {
+        let source = include_str!("shaders/world_sprite.wgsl")
+            .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };")
+            .replace("#{MATERIAL_BIND_GROUP}", "2");
+        let module = naga::front::wgsl::parse_str(&source).expect("sprite WGSL parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module).expect("sprite WGSL validates");
+    }
+}
+
 /// Authoring data for a flat image rendered by Hiraku's 3D world camera.
 ///
 /// The component deliberately owns image-space concerns while `Transform`
 /// remains available for story-level position, scale and animation.
 #[derive(Component, Clone, Debug)]
 pub struct WorldSprite {
+    pub dissolve: Option<DissolveMask>,
     pub image: Option<Handle<Image>>,
     /// Source rectangle as `[left, top, width, height]` in pixels.
     pub rect: Option<[f32; 4]>,
@@ -21,9 +35,19 @@ pub struct WorldSprite {
     resolved_size: Option<Vec2>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DissolveMask {
+    pub reversed: bool,
+    pub canvas_size: Vec2,
+    pub image: Handle<Image>,
+    pub path: String,
+    pub softness: f32,
+}
+
 impl WorldSprite {
     pub fn from_image(image: Handle<Image>) -> Self {
         Self {
+            dissolve: None,
             image: Some(image),
             rect: None,
             color: Color::WHITE,
@@ -34,6 +58,7 @@ impl WorldSprite {
 
     pub fn from_color(color: Color, size: Vec2) -> Self {
         Self {
+            dissolve: None,
             image: None,
             rect: None,
             color,
@@ -52,6 +77,10 @@ impl WorldSprite {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, WorldSpriteUniform)]
 pub struct WorldSpriteMaterial {
+    #[texture(3)]
+    #[sampler(4)]
+    pub dissolve_mask: Option<Handle<Image>>,
+    pub dissolve: Vec4,
     #[texture(1)]
     #[sampler(2)]
     pub image: Option<Handle<Image>>,
@@ -61,6 +90,7 @@ pub struct WorldSpriteMaterial {
 
 #[derive(Clone, Debug, ShaderType)]
 pub struct WorldSpriteUniform {
+    dissolve: Vec4,
     tint: Vec4,
     rect: Vec4,
 }
@@ -68,6 +98,7 @@ pub struct WorldSpriteUniform {
 impl From<&WorldSpriteMaterial> for WorldSpriteUniform {
     fn from(material: &WorldSpriteMaterial) -> Self {
         Self {
+            dissolve: material.dissolve,
             tint: material.tint,
             rect: material.rect,
         }
@@ -101,6 +132,8 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
+        dissolve_mask: sprite.dissolve.as_ref().map(|mask| mask.image.clone()),
+        dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| Vec4::new(if mask.reversed { -1.0 } else { 1.0 }, mask.softness, mask.canvas_size.x, mask.canvas_size.y)),
         image: sprite.image.clone(),
         tint: sprite.color.to_linear().to_f32_array().into(),
         rect: sprite.rect.map(Vec4::from_array).unwrap_or(Vec4::ZERO),

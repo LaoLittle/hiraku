@@ -59,6 +59,10 @@ pub enum MirInstruction {
         dst: VirtualRegister,
         global: crate::HirGlobalId,
     },
+    GlobalInitialized {
+        dst: VirtualRegister,
+        global: crate::HirGlobalId,
+    },
     StoreGlobal {
         global: crate::HirGlobalId,
         src: VirtualRegister,
@@ -84,6 +88,10 @@ pub enum MirInstruction {
         value: VirtualRegister,
         target: crate::ScriptType,
         mode: crate::CastMode,
+    },
+    ToString {
+        dst: VirtualRegister,
+        value: VirtualRegister,
     },
     MakeOptional {
         dst: VirtualRegister,
@@ -141,10 +149,12 @@ impl MirInstruction {
             | Self::MakeClosure { dst, .. }
             | Self::LoadLocal { dst, .. }
             | Self::LoadGlobal { dst, .. }
+            | Self::GlobalInitialized { dst, .. }
             | Self::GetMember { dst, .. }
             | Self::SetMember { dst, .. }
             | Self::UnaryMinus { dst, .. }
             | Self::Cast { dst, .. }
+            | Self::ToString { dst, .. }
             | Self::MakeOptional { dst, .. }
             | Self::Binary { dst, .. }
             | Self::MakeTuple { dst, .. }
@@ -168,12 +178,14 @@ impl MirInstruction {
             | Self::Constant { .. }
             | Self::MakeClosure { .. }
             | Self::LoadLocal { .. }
-            | Self::LoadGlobal { .. } => Vec::new(),
+            | Self::LoadGlobal { .. }
+            | Self::GlobalInitialized { .. } => Vec::new(),
             Self::StoreLocal { src, .. } | Self::StoreGlobal { src, .. } => vec![*src],
             Self::GetMember { object, .. } => vec![*object],
             Self::SetMember { object, value, .. } => vec![*object, *value],
             Self::UnaryMinus { value, .. }
             | Self::Cast { value, .. }
+            | Self::ToString { value, .. }
             | Self::MakeOptional { value, .. }
             | Self::AssertNonNull { value, .. } => vec![*value],
             Self::Binary { left, right, .. } => vec![*left, *right],
@@ -417,6 +429,22 @@ impl<'types> MirBuilder<'types> {
                 Some(value)
             }
             HirStmtKind::Global { global, value } => {
+                // A declaration initializes session state; it is not an
+                // assignment. Guard the entire initializer, including calls
+                // and their side effects, when the host supplies existing state.
+                let initialized = self.register();
+                self.push(MirInstruction::GlobalInitialized {
+                    dst: initialized,
+                    global,
+                });
+                let initialize = self.new_block();
+                let join = self.new_block();
+                self.current_block_mut().terminator = MirTerminator::Branch {
+                    condition: initialized,
+                    then_block: join,
+                    else_block: initialize,
+                };
+                self.current = initialize;
                 let value = match value {
                     Some(value) => self.lower_expression(value, errors)?,
                     None => self.constant(MirConstant::Uninitialized),
@@ -427,7 +455,9 @@ impl<'types> MirBuilder<'types> {
                     string: false,
                     emit_value: false,
                 });
-                Some(value)
+                self.jump_if_unset(join);
+                self.current = join;
+                None
             }
             HirStmtKind::Assign { target, value } => {
                 let value = self.lower_expression(value, errors)?;
@@ -506,6 +536,11 @@ impl<'types> MirBuilder<'types> {
             } => {
                 let value = self.lower_expression(argument, errors)?;
                 match operation {
+                    crate::intrinsics::Intrinsic::ValueToString => {
+                        let dst = self.register();
+                        self.push(MirInstruction::ToString { dst, value });
+                        Some(dst)
+                    }
                     crate::intrinsics::Intrinsic::Panic => {
                         self.push(MirInstruction::Panic {
                             message: value,

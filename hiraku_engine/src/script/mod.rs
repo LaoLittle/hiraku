@@ -111,8 +111,14 @@ pub(crate) fn script_command_from_effect(
             animation_id: None,
         }),
         StoryEffect::Delay { .. } => return Err("delay must be dispatched through the story wait boundary".into()),
-        StoryEffect::SetCurtain { opacity, fade_ms } => ScriptCommand::Stage(StageCommand::SetCurtain {
-            opacity, fade: fade_ms.map(Duration::from_millis),
+        StoryEffect::SetCurtain { opacity, fade_ms, mask, softness } => ScriptCommand::Stage(StageCommand::SetCurtain {
+            opacity, fade: fade_ms.map(Duration::from_millis), softness,
+            mask: mask.map(|name| {
+                let definition = textures.and_then(|catalog| catalog.resolve(&name))
+                    .ok_or_else(|| format!("dissolve texture `{name}` is not defined"))?;
+                if definition.rect.is_some() { return Err("dissolve masks must use a standalone texture".to_string()); }
+                Ok(definition.path.clone())
+            }).transpose()?,
         }),
         StoryEffect::SetBackground { texture, fade_in_ms } => {
             let definition = textures

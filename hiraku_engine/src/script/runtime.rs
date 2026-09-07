@@ -44,7 +44,7 @@ pub struct ScriptRuntimeState {
     /// reconstructed after restoring a save.
     pub mounted_ui_overlays: BTreeMap<String, String>,
     pub response_inbox: BTreeMap<ScriptRequestId, ScriptResponse>,
-    pub task_requests: BTreeMap<ScriptRequestId, ExecutionId>,
+    pub task_requests: BTreeMap<ScriptRequestId, (ExecutionId, super::capabilities::StoryEffect)>,
     next_request_id: u64,
 }
 

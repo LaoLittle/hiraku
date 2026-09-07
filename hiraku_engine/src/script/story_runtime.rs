@@ -25,6 +25,8 @@ pub struct StoryRuntime {
     pending: VecDeque<StoryRuntimeEvent>,
     active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
     deferred_task_completions: BTreeMap<ExecutionId, Value>,
+    deferred_dialogue: BTreeMap<ExecutionId, Vec<StoryEffect>>,
+    completed_groups: std::collections::BTreeSet<ExecutionId>,
     waiting_task: Option<ExecutionId>,
     waiting_interactive_task: Option<ExecutionId>,
     choice: Option<ChoiceState>,
@@ -83,6 +85,10 @@ pub struct StoryRuntimeSnapshot {
     host: StoryNativeHostSnapshot,
     active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
     deferred_task_completions: BTreeMap<ExecutionId, Value>,
+    #[serde(default)]
+    deferred_dialogue: BTreeMap<ExecutionId, Vec<StoryEffect>>,
+    #[serde(default)]
+    completed_groups: std::collections::BTreeSet<ExecutionId>,
     waiting_task: Option<ExecutionId>,
     waiting_interactive_task: Option<ExecutionId>,
     choice: Option<ChoiceState>,
@@ -100,6 +106,8 @@ impl StoryRuntime {
             pending: VecDeque::new(),
             active_task_effects: BTreeMap::new(),
             deferred_task_completions: BTreeMap::new(),
+            deferred_dialogue: BTreeMap::new(),
+            completed_groups: Default::default(),
             waiting_task: None,
             waiting_interactive_task: None,
             choice: None,
@@ -118,6 +126,8 @@ impl StoryRuntime {
             host: self.host.snapshot(),
             active_task_effects: self.active_task_effects.clone(),
             deferred_task_completions: self.deferred_task_completions.clone(),
+            deferred_dialogue: self.deferred_dialogue.clone(),
+            completed_groups: self.completed_groups.clone(),
             waiting_task: self.waiting_task,
             waiting_interactive_task: self.waiting_interactive_task,
             choice: self.choice.clone(),
@@ -137,10 +147,18 @@ impl StoryRuntime {
         // complete that effect without emitting PlayVoice again.
         let mut completed_voice_tasks = Vec::new();
         for (task, effects) in &mut snapshot.active_task_effects {
-            let had_voice = effects
-                .iter()
-                .any(|effect| matches!(effect, StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }));
-            effects.retain(|effect| !matches!(effect, StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }));
+            let had_voice = effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }
+                )
+            });
+            effects.retain(|effect| {
+                !matches!(
+                    effect,
+                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }
+                )
+            });
             if had_voice && effects.is_empty() {
                 completed_voice_tasks.push(*task);
             }
@@ -164,6 +182,8 @@ impl StoryRuntime {
             pending,
             active_task_effects: snapshot.active_task_effects,
             deferred_task_completions: snapshot.deferred_task_completions,
+            deferred_dialogue: snapshot.deferred_dialogue,
+            completed_groups: snapshot.completed_groups,
             waiting_task: snapshot.waiting_task,
             waiting_interactive_task: snapshot.waiting_interactive_task,
             choice: snapshot.choice,
@@ -288,14 +308,23 @@ impl StoryRuntime {
         self.blocked
     }
 
-    pub fn resume_task(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
+    /// Completes the dispatched effect, not the most recently submitted effect.
+    /// Identical outstanding effects are interchangeable; distinct effects must
+    /// remain associated with their own ECS completion request across snapshots.
+    pub fn complete_task_effect(
+        &mut self,
+        task: ExecutionId,
+        completed: &StoryEffect,
+    ) -> Result<(), StoryRuntimeError> {
         let effects = self
             .active_task_effects
             .get_mut(&task)
             .ok_or(StoryRuntimeError::UnknownTaskEffect(task))?;
-        effects
-            .pop()
+        let index = effects
+            .iter()
+            .position(|effect| effect == completed)
             .ok_or(StoryRuntimeError::UnknownTaskEffect(task))?;
+        effects.remove(index);
         if effects.is_empty() {
             self.active_task_effects.remove(&task);
             self.finish_task_effects(task)?;
@@ -303,11 +332,34 @@ impl StoryRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn resume_task(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
+        let effect = self
+            .active_task_effects
+            .get(&task)
+            .and_then(|effects| effects.first())
+            .cloned()
+            .ok_or(StoryRuntimeError::UnknownTaskEffect(task))?;
+        self.complete_task_effect(task, &effect)
+    }
+
     fn finish_task_effects(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
+        if let Some(dialogue) = self.deferred_dialogue.remove(&task) {
+            for effect in dialogue {
+                self.active_task_effects
+                    .entry(task)
+                    .or_default()
+                    .push(effect.clone());
+                self.pending
+                    .push_back(StoryRuntimeEvent::TaskEffect { task, effect });
+            }
+            return Ok(());
+        }
         if self.execution.mode(task) == Some(ExecutionMode::Sequence) {
             let _ = self.execution.unpause(task);
         }
         if let Some(value) = self.deferred_task_completions.remove(&task) {
+            self.completed_groups.insert(task);
             if self.waiting_task == Some(task) {
                 self.waiting_task = None;
                 self.execution.resume(ExecutionId::MAIN, value)?;
@@ -399,7 +451,12 @@ impl StoryRuntime {
                             return Ok(Some(StoryRuntimeEvent::OpenUi { path, arguments }));
                         }
                         StoryCallOutcome::Control(StoryControl::WaitTask { task }) => {
-                            self.waiting_task = Some(ExecutionId::from_task_handle(task));
+                            let task = ExecutionId::from_task_handle(task);
+                            if self.completed_groups.contains(&task) {
+                                self.execution.resume(ExecutionId::MAIN, Value::Unit)?;
+                            } else {
+                                self.waiting_task = Some(task);
+                            }
                         }
                         StoryCallOutcome::Control(
                             control @ (StoryControl::AddChoiceOption { .. }
@@ -456,7 +513,9 @@ impl StoryRuntime {
                 .drain_effects()
                 .into_iter()
                 .map(|effect| match effect {
-                    StoryEffect::Delay { duration_ms } => StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms }),
+                    StoryEffect::Delay { duration_ms } => {
+                        StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms })
+                    }
                     effect => StoryRuntimeEvent::Effect(effect),
                 }),
         );
@@ -553,6 +612,7 @@ impl StoryRuntime {
                     self.deferred_task_completions.insert(task, value);
                     return Ok(None);
                 }
+                self.completed_groups.insert(task);
                 if let Some(ChoiceState::Collecting {
                     builder_task,
                     prompt,
@@ -600,6 +660,23 @@ impl StoryRuntime {
         let mut interactive_delay = None;
         let task_mode = self.execution.mode(task);
         for effect in self.host.drain_effects() {
+            let dialogue = matches!(
+                effect,
+                StoryEffect::Say { .. } | StoryEffect::ContinueDialogue { .. }
+            );
+            if dialogue && task_mode == Some(ExecutionMode::Parallel) {
+                bevy::log::warn!(
+                    "say/narrate and dialogue continuation are not allowed in par; statement skipped"
+                );
+                continue;
+            }
+            if dialogue
+                && task_mode == Some(ExecutionMode::Sequence)
+                && self.active_task_effects.contains_key(&task)
+            {
+                self.deferred_dialogue.entry(task).or_default().push(effect);
+                continue;
+            }
             if let StoryEffect::Delay { duration_ms } = effect
                 && task_mode == Some(ExecutionMode::Interactive)
             {
@@ -607,7 +684,21 @@ impl StoryRuntime {
                 continue;
             }
             has_delay |= matches!(effect, StoryEffect::Delay { .. });
-            if matches!(effect, StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. } | StoryEffect::Delay { .. }) {
+            if matches!(
+                effect,
+                StoryEffect::PlayVoice { .. }
+                    | StoryEffect::PlaySfx { .. }
+                    | StoryEffect::Delay { .. }
+            ) || (task_mode != Some(ExecutionMode::Interactive)
+                && matches!(
+                    effect,
+                    StoryEffect::SetCamera { .. }
+                        | StoryEffect::SetBackground { .. }
+                        | StoryEffect::ShowCharacter { .. }
+                        | StoryEffect::SetCurtain { .. }
+                ))
+                || (dialogue && task_mode == Some(ExecutionMode::Sequence))
+            {
                 self.active_task_effects
                     .entry(task)
                     .or_default()
@@ -619,11 +710,11 @@ impl StoryRuntime {
             }
         }
         let wait = self.host.take_wait().or(interactive_delay);
-        if matches!(wait, Some(StoryWait::Movie { .. }))
+        if matches!(wait, Some(StoryWait::Movie { .. } | StoryWait::Curtain))
             && task_mode != Some(ExecutionMode::Interactive)
         {
             return Err(StoryRuntimeError::UnsupportedTaskWait(
-                wait.expect("the movie wait was matched"),
+                wait.expect("an interactive-only wait was matched"),
             ));
         }
         let has_wait = wait.is_some();
@@ -676,6 +767,117 @@ mod tests {
     use crate::script::capabilities::{
         StoryEffect, StoryNativeHost, compile_story_bytecode, story_manifest,
     };
+
+    #[test]
+    fn out_of_order_completions_preserve_the_correct_snapshot_effects() {
+        let bytecode = compile_story_bytecode(
+            "test.hks",
+            r#"
+            let group = par { voice("voice/alice") voice("voice/bob") }
+            group.await()
+        "#,
+        )
+        .expect("parallel voices compile");
+        let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime initializes");
+        let Some(StoryRuntimeEvent::TaskEffect {
+            task,
+            effect: first,
+        }) = runtime.step().expect("first voice")
+        else {
+            panic!("expected first voice");
+        };
+        let Some(StoryRuntimeEvent::TaskEffect { effect: second, .. }) =
+            runtime.step().expect("second voice")
+        else {
+            panic!("expected second voice");
+        };
+        assert_eq!(runtime.step().expect("group waits"), None);
+        runtime
+            .complete_task_effect(task, &first)
+            .expect("first voice finishes first");
+        let snapshot = runtime.snapshot().expect("snapshot pending second voice");
+        assert_eq!(snapshot.active_task_effects[&task], vec![second]);
+        assert!(
+            runtime.complete_task_effect(task, &first).is_err(),
+            "duplicate completion is rejected"
+        );
+        let mut restored =
+            StoryRuntime::restore(bytecode, snapshot).expect("restore skips transient voice");
+        assert!(matches!(
+            restored.step().expect("join finishes"),
+            Some(StoryRuntimeEvent::Completed(_))
+        ));
+    }
+
+    #[test]
+    fn restore_preserves_sequence_dialogue_deferred_by_voice() {
+        let bytecode = compile_story_bytecode(
+            "test.hks",
+            r#"
+            let group = seq { voice("voice/alice") "after voice" }
+            group.await()
+        "#,
+        )
+        .expect("sequence compiles");
+        let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime initializes");
+        assert!(matches!(
+            runtime.step().expect("voice starts"),
+            Some(StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::PlayVoice { .. },
+                ..
+            })
+        ));
+        assert_eq!(runtime.step().expect("dialogue is deferred"), None);
+        let mut restored = StoryRuntime::restore(bytecode, runtime.snapshot().expect("snapshot"))
+            .expect("restore");
+        let Some(StoryRuntimeEvent::TaskEffect {
+            task,
+            effect: StoryEffect::Say { text, .. },
+        }) = restored.step().expect("deferred dialogue")
+        else {
+            panic!("restore must emit deferred dialogue without replaying voice");
+        };
+        assert_eq!(text, "after voice");
+        assert_eq!(restored.step().expect("wait for reveal"), None);
+        restored.resume_task(task).expect("reveal completes");
+        assert!(matches!(
+            restored.step().expect("join finishes"),
+            Some(StoryRuntimeEvent::Completed(_))
+        ));
+    }
+
+    #[test]
+    fn script_handoff_reuses_session_globals_without_running_initializers() {
+        let source = r#"
+            fn initialScore() -> Int { log("initialized") 1 }
+            global var score: Int = initialScore()
+            score += 1
+        "#;
+        let bytecode = compile_story_bytecode("chapter.hks", source).expect("script compiles");
+        let mut first = StoryRuntime::new(bytecode.clone()).expect("first entry");
+        assert!(matches!(
+            first.step().expect("initialize"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Log(_)))
+        ));
+        assert!(matches!(
+            first.step().expect("complete"),
+            Some(StoryRuntimeEvent::Completed(_))
+        ));
+        assert_eq!(first.globals().get("score"), Some(&Value::Number(2.0)));
+        let mut next = StoryRuntime::new(bytecode.clone()).expect("next entry");
+        next.inherit_native_state(&first, false);
+        next.set_globals(first.globals().clone());
+        assert!(matches!(
+            next.step().expect("skip initializer"),
+            Some(StoryRuntimeEvent::Completed(_))
+        ));
+        assert_eq!(next.globals().get("score"), Some(&Value::Number(3.0)));
+        let mut reset = StoryRuntime::new(bytecode).expect("new session");
+        assert!(matches!(
+            reset.step().expect("initialize again"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Log(_)))
+        ));
+    }
 
     #[test]
     fn terminal_navigation_cancels_the_source_including_child_executions() {
@@ -915,21 +1117,40 @@ mod tests {
 
     #[test]
     fn called_file_preserves_global_actor_identity() {
-        let mut caller = StoryRuntime::new(compile_story_bytecode(
-            "memory://caller.hks",
-            "global let alice = char(\"alice\")\nglobal let bob = char(\"bob\")",
-        ).expect("caller compiles")).expect("caller starts");
-        assert!(matches!(caller.step().expect("declarations execute"), Some(StoryRuntimeEvent::Completed(_))));
-        let bob = caller.globals().get("bob").expect("global identity exists").clone();
-        let mut callee = StoryRuntime::new(compile_story_bytecode(
-            "memory://callee.hks",
-            "global let bob = char(\"bob\")\nbob: \"Hello\"",
-        ).expect("callee compiles")).expect("callee starts");
+        let mut caller = StoryRuntime::new(
+            compile_story_bytecode(
+                "memory://caller.hks",
+                "global let alice = char(\"alice\")\nglobal let bob = char(\"bob\")",
+            )
+            .expect("caller compiles"),
+        )
+        .expect("caller starts");
+        assert!(matches!(
+            caller.step().expect("declarations execute"),
+            Some(StoryRuntimeEvent::Completed(_))
+        ));
+        let bob = caller
+            .globals()
+            .get("bob")
+            .expect("global identity exists")
+            .clone();
+        let mut callee = StoryRuntime::new(
+            compile_story_bytecode(
+                "memory://callee.hks",
+                "global let bob = char(\"bob\")\nbob: \"Hello\"",
+            )
+            .expect("callee compiles"),
+        )
+        .expect("callee starts");
         callee.inherit_native_state(&caller, false);
         callee.set_globals(caller.globals().clone());
-        assert_eq!(callee.step().expect("dialogue executes"), Some(StoryRuntimeEvent::Effect(
-            StoryEffect::Say { speaker: "bob".into(), text: "Hello".into() },
-        )));
+        assert_eq!(
+            callee.step().expect("dialogue executes"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say {
+                speaker: "bob".into(),
+                text: "Hello".into()
+            },))
+        );
         assert_eq!(callee.globals().get("bob"), Some(&bob));
     }
 
@@ -959,9 +1180,11 @@ mod tests {
 
     #[test]
     fn direct_runtime_dispatches_native_calls_at_statement_boundaries() {
-        let bytecode =
-            compile_story_bytecode("test.story.hks", r#"char("alice").e("happy").at(.right).show()"#)
-                .expect("character story must compile");
+        let bytecode = compile_story_bytecode(
+            "test.story.hks",
+            r#"char("alice").e("happy").at(.right).show()"#,
+        )
+        .expect("character story must compile");
         let mut runtime = ExecutionRuntime::new(bytecode).expect("script runtime must initialize");
         let mut host = StoryNativeHost::new();
 
@@ -1393,23 +1616,128 @@ mod tests {
             }) if path == "voice/first" => task,
             event => panic!("unexpected first sequence event: {event:?}"),
         };
-        assert!(matches!(
-            runtime.step().expect("the first line must be displayed immediately"),
-            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. })) if text == "first line"
-        ));
         assert_eq!(
-            runtime.step().expect("sequence must remain suspended"),
+            runtime
+                .step()
+                .expect("line must wait for the preceding voice"),
             None
         );
         runtime
             .resume_task(first)
             .expect("first audio completion must resume the task");
+        assert!(
+            matches!(runtime.step().expect("line follows voice completion"),
+            Some(StoryRuntimeEvent::TaskEffect { effect: StoryEffect::Say { ref text, .. }, .. }) if text == "first line")
+        );
+        assert_eq!(
+            runtime
+                .step()
+                .expect("line reveal must complete before next voice"),
+            None
+        );
+        runtime
+            .resume_task(first)
+            .expect("line reveal completes automatically");
         assert!(matches!(
             runtime.step().expect("second voice must follow completion"),
             Some(StoryRuntimeEvent::TaskEffect {
                 effect: StoryEffect::PlayVoice { ref path, .. },
                 ..
             }) if path == "voice/second"
+        ));
+    }
+
+    #[test]
+    fn parallel_dialogue_is_skipped_but_other_effects_and_join_still_run() {
+        let code = compile_story_bytecode(
+            "parallel.hks",
+            r#"
+            let group = par {
+                "not shown"
+                narrate("also not shown")
+                char("alice"): "not shown either"
+                ...: "not appended"
+                voice("voice/alice")
+            }
+            group.await()
+            group.await()
+            "after group"
+        "#,
+        )
+        .expect("parallel story compiles");
+        let mut runtime = StoryRuntime::new(code).expect("runtime starts");
+        let task = match runtime.step().expect("parallel voice starts") {
+            Some(StoryRuntimeEvent::TaskEffect {
+                task,
+                effect: StoryEffect::PlayVoice { .. },
+            }) => task,
+            other => panic!("dialogue must not be emitted: {other:?}"),
+        };
+        assert!(runtime.step().expect("group waits for voice").is_none());
+        runtime.resume_task(task).expect("voice completes");
+        assert!(matches!(runtime.step().expect("both joins complete"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. })) if text == "after group"));
+    }
+
+    #[test]
+    fn sequence_waits_for_camera_and_voice_before_emitting_dialogue() {
+        let code = compile_story_bytecode(
+            "sequence.hks",
+            r#"
+            let group = seq {
+                camera().zoom(1.2).time(1)
+                voice("voice/alice")
+                "after effects"
+            }
+            group.await()
+        "#,
+        )
+        .expect("sequence story compiles");
+        let mut runtime = StoryRuntime::new(code).expect("runtime starts");
+        let task = match runtime.step().expect("camera starts") {
+            Some(StoryRuntimeEvent::TaskEffect {
+                task,
+                effect: StoryEffect::SetCamera { .. },
+            }) => task,
+            other => panic!("expected tracked camera: {other:?}"),
+        };
+        assert!(matches!(
+            runtime.step().expect("voice starts without blocking"),
+            Some(StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::PlayVoice { .. },
+                ..
+            })
+        ));
+        assert!(runtime.step().expect("dialogue waits").is_none());
+        runtime.resume_task(task).expect("one effect completes");
+        assert!(
+            runtime
+                .step()
+                .expect("other effect still running")
+                .is_none()
+        );
+        runtime
+            .resume_task(task)
+            .expect("all preceding effects complete");
+        assert!(matches!(
+            runtime.step().expect("dialogue now appears"),
+            Some(StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::Say { .. },
+                ..
+            })
+        ));
+        assert!(
+            runtime
+                .step()
+                .expect("group includes dialogue reveal")
+                .is_none()
+        );
+        runtime
+            .resume_task(task)
+            .expect("dialogue reveal completes");
+        assert!(matches!(
+            runtime.step().expect("group finishes"),
+            Some(StoryRuntimeEvent::Completed(_))
         ));
     }
 
@@ -1422,7 +1750,7 @@ mod tests {
                     voice("voice/first")
                     voice("voice/second")
                 }
-                wait(voices)
+                voices.await()
                 "after voices"
             "#,
         )
