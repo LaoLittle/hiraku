@@ -11,7 +11,7 @@ pub(super) fn dispatch_ui_command(
     overlay_state: &mut OverlayUiState,
 ) {
     match command {
-        UiCommand::ShowScreen { screen, done } => {
+        UiCommand::ShowScreen { screen, done, push } => {
             let spawned = spawn_screen_ui(
                 commands,
                 asset_server,
@@ -21,18 +21,29 @@ pub(super) fn dispatch_ui_command(
                 true,
             );
             let root = spawned.root;
-            let previous = screen_state.active_root.take();
+            let mut previous = screen_state.active_root.take();
+            if push {
+                if let Some(root) = previous.take() {
+                    screen_state.stack.push((root, screen_state.waiting.take()));
+                }
+                for (index, (root, _)) in screen_state.stack.iter().enumerate() {
+                    commands.entity(*root).insert(GlobalZIndex(
+                        SCREEN_MODAL_ACTIVE_Z + index as i32 * 3,
+                    ));
+                }
+            }
+            let depth_offset = screen_state.stack.len() as i32 * 3;
             let images_ready = screen_images_ready(images, &spawned.image_handles);
             if previous.is_none() && images_ready {
                 commands
                     .entity(root)
-                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z)));
+                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + depth_offset)));
                 screen_state.active_root = Some(root);
                 screen_state.waiting = done;
             } else {
                 commands
                     .entity(root)
-                    .insert((Visibility::Hidden, GlobalZIndex(SCREEN_MODAL_PENDING_Z)));
+                    .insert((Visibility::Hidden, GlobalZIndex(SCREEN_MODAL_PENDING_Z + depth_offset)));
                 screen_state.pending_root = Some(crate::ui::PendingScreenRoot {
                     entity: root,
                     previous,

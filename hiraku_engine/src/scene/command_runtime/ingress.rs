@@ -507,6 +507,7 @@ pub fn drive_story_runtime(
                         pending_script_commands.enqueue(ScriptCommand::Ui(UiCommand::ShowScreen {
                             screen,
                             done: Some(request),
+                            push: false,
                         }));
                     }
                     Err(error) => {
@@ -550,6 +551,7 @@ pub fn drive_story_runtime(
                         pending_script_commands.enqueue(ScriptCommand::Ui(UiCommand::ShowScreen {
                             screen,
                             done: Some(request),
+                            push: false,
                         }));
                     }
                     Err(error) => {

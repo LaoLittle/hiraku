@@ -10,6 +10,10 @@ use bevy::{
 pub struct UiEffectMessage(pub UiEffect);
 
 pub(super) fn clear_screen_ui(commands: &mut Commands, screen_state: &mut ScreenUiState) {
+    for (root, _) in screen_state.stack.drain(..) {
+        commands.entity(root).try_despawn();
+    }
+    screen_state.waiting = None;
     if let Some(root) = screen_state.active_root.take() {
         commands.entity(root).try_despawn();
     }
@@ -24,6 +28,19 @@ pub(super) fn clear_screen_ui(commands: &mut Commands, screen_state: &mut Screen
     }
 }
 
+pub(super) fn close_screen_ui(commands: &mut Commands, screen_state: &mut ScreenUiState) {
+    let stack = std::mem::take(&mut screen_state.stack);
+    clear_screen_ui(commands, screen_state);
+    screen_state.stack = stack;
+    if let Some((root, waiting)) = screen_state.stack.pop() {
+        commands.entity(root).insert((Visibility::Inherited, GlobalZIndex(
+            SCREEN_MODAL_ACTIVE_Z + screen_state.stack.len() as i32 * 3,
+        )));
+        screen_state.active_root = Some(root);
+        screen_state.waiting = waiting;
+    }
+}
+
 pub(super) fn clear_overlay_ui(commands: &mut Commands, overlay_state: &mut OverlayUiState) {
     for (_, root) in overlay_state.roots.drain() {
         commands.entity(root).try_despawn();
@@ -35,16 +52,17 @@ pub fn cleanup_stale_screen_ui(
     images: Res<Assets<Image>>,
     mut screen_state: ResMut<ScreenUiState>,
 ) {
+    let depth_offset = screen_state.stack.len() as i32 * 3;
     if let Some(mut pending) = screen_state.pending_root.take() {
         if screen_images_ready(&images, &pending.wait_images) && pending.ready_frames_remaining == 0
         {
             commands
                 .entity(pending.entity)
-                .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z)));
+                .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + depth_offset)));
             if let Some(previous) = pending.previous {
                 commands
                     .entity(previous)
-                    .insert(GlobalZIndex(SCREEN_MODAL_STALE_Z));
+                    .insert(GlobalZIndex(SCREEN_MODAL_STALE_Z + depth_offset));
                 screen_state.stale_roots.push(StaleScreenRoot {
                     entity: previous,
                     frames_remaining: 2,
@@ -57,7 +75,7 @@ pub fn cleanup_stale_screen_ui(
             if screen_images_ready(&images, &pending.wait_images) {
                 commands
                     .entity(pending.entity)
-                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_PENDING_Z)));
+                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_PENDING_Z + depth_offset)));
                 pending.ready_frames_remaining = pending.ready_frames_remaining.saturating_sub(1);
             }
             screen_state.pending_root = Some(pending);
@@ -252,8 +270,8 @@ fn screen_root_node(screen: &ScreenSpec) -> Node {
         right: px(0.0),
         top: px(0.0),
         bottom: px(0.0),
-        justify_content: justify_from_align(screen.yalign),
-        align_items: align_items_from_align(screen.xalign),
+        justify_content: if screen.panel { justify_from_align(screen.yalign) } else { JustifyContent::Start },
+        align_items: if screen.panel { align_items_from_align(screen.xalign) } else { AlignItems::Start },
         padding: UiRect::all(px(if screen.panel { 24.0 } else { 0.0 })),
         ..default()
     }
@@ -1816,6 +1834,72 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn closing_modal_restores_parent_entity_and_its_story_wait() {
+        let mut world = World::new();
+        let title = world.spawn_empty().id();
+        let phone = world.spawn_empty().id();
+        let settings = world.spawn_empty().id();
+        let request = ScriptRequestId(42);
+        let mut state = ScreenUiState {
+            active_root: Some(settings),
+            stack: vec![(title, Some(request)), (phone, None)],
+            ..default()
+        };
+        let overlays = OverlayUiState { roots: HashMap::from([("dialogue".into(), title)]) };
+        assert!(state.accepts_input(settings, &overlays));
+        assert!(!state.accepts_input(phone, &overlays));
+        assert!(!state.accepts_input(title, &overlays));
+        close_screen_ui(&mut world.commands(), &mut state);
+        world.flush();
+        assert!(world.get_entity(settings).is_err());
+        assert!(world.get_entity(phone).is_ok());
+        assert_eq!(state.active_root, Some(phone));
+        assert_eq!(state.waiting, None);
+        assert_eq!(world.get::<GlobalZIndex>(phone).expect("active layer").0, SCREEN_MODAL_ACTIVE_Z + 3);
+
+        close_screen_ui(&mut world.commands(), &mut state);
+        world.flush();
+        assert!(world.get_entity(phone).is_err());
+        assert_eq!(state.active_root, Some(title));
+        assert_eq!(state.waiting, Some(request));
+        assert!(state.stack.is_empty());
+
+        clear_screen_ui(&mut world.commands(), &mut state);
+        world.flush();
+        assert!(world.get_entity(title).is_err());
+        assert_eq!(state.waiting, None);
+    }
+
+    #[test]
+    fn clearing_modal_stack_also_removes_suspended_roots() {
+        let mut world = World::new();
+        let parent = world.spawn_empty().id();
+        let child = world.spawn_empty().id();
+        let mut state = ScreenUiState {
+            active_root: Some(child),
+            stack: vec![(parent, Some(ScriptRequestId(42)))],
+            ..default()
+        };
+        clear_screen_ui(&mut world.commands(), &mut state);
+        world.flush();
+        assert!(world.get_entity(parent).is_err());
+        assert!(world.get_entity(child).is_err());
+        assert!(state.stack.is_empty());
+    }
+
+    #[test]
+    fn canvas_groups_start_at_top_left_instead_of_center() {
+        let source = "import ui.widgets.*\ncanvas { column { text(\"alice\").at(.rel(10, 20)) } }";
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://layout.ui.hks", source, UiContext::default(),
+            &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("valid canvas");
+        let node = screen_root_node(&screen);
+        assert_eq!(node.justify_content, JustifyContent::Start);
+        assert_eq!(node.align_items, AlignItems::Start);
+    }
 
     #[test]
     fn scroll_limits_match_physical_layout_and_disabled_axes() {

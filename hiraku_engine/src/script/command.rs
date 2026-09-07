@@ -90,6 +90,7 @@ pub enum UiCommand {
     ShowScreen {
         screen: ScreenSpec,
         done: Option<ScriptRequestId>,
+        push: bool,
     },
     ShowOverlay {
         name: String,

@@ -111,7 +111,7 @@ pub use screen_ui::{
     update_builtin_ui_models, update_ui_reactive_bindings, update_ui_text_bindings,
 };
 use screen_ui::{
-    clear_overlay_ui, clear_screen_ui, screen_images_ready,
+    clear_overlay_ui, clear_screen_ui, close_screen_ui, screen_images_ready,
     should_clear_stale_screen_before_command, spawn_screen_ui,
 };
 use snapshot::restore_scene_snapshot;

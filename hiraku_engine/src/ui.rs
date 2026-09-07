@@ -643,6 +643,8 @@ pub struct SpacerNode {
 /// replacement never exposes an empty frame while images are loading.
 #[derive(Resource, Default)]
 pub struct ScreenUiState {
+    /// Suspended modal screens, retaining their UI state and story continuation.
+    pub stack: Vec<(Entity, Option<crate::script::ScriptRequestId>)>,
     /// Currently interactive screen root.
     pub active_root: Option<Entity>,
     /// Newly spawned root waiting for image readiness and warm-up frames.
@@ -658,6 +660,16 @@ pub struct ScreenUiState {
 pub struct OverlayUiState {
     /// Overlay roots keyed by script-provided name.
     pub roots: HashMap<String, Entity>,
+}
+
+impl ScreenUiState {
+    /// Only the top modal receives input; overlays are interactive without a modal.
+    pub(crate) fn accepts_input(&self, root: Entity, overlays: &OverlayUiState) -> bool {
+        self.pending_root.is_none() && self.active_root.map_or_else(
+            || self.stack.is_empty() && overlays.roots.values().any(|entity| *entity == root),
+            |active| active == root,
+        )
+    }
 }
 
 /// A screen root that has been spawned but is not interactive yet.

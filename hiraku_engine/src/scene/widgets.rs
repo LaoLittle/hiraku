@@ -335,10 +335,7 @@ pub(super) fn spawn_input(
 
 fn is_active(root: Entity, screen: &ScreenUiState, overlays: &OverlayUiState) -> bool {
     // Modal screens block interaction with underlying overlays.
-    screen.active_root.map_or_else(
-        || overlays.roots.values().any(|candidate| *candidate == root),
-        |active| active == root,
-    )
+    screen.accepts_input(root, overlays)
 }
 
 fn request(

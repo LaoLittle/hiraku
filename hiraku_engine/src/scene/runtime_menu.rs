@@ -77,8 +77,7 @@ pub fn update_runtime_menu_button_visuals(
 ) {
     for (interaction, mut color, button, screen_button, image_button) in &mut buttons {
         if let Some(root) = button.screen_root
-            && Some(root) != screen_state.active_root
-            && !overlay_state.roots.values().any(|overlay| *overlay == root)
+            && !screen_state.accepts_input(root, &overlay_state)
         {
             continue;
         }
@@ -155,12 +154,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
             continue;
         };
         if let Some(root) = button.screen_root
-            && Some(root) != ctx.screen_state.active_root
-            && !ctx
-                .overlay_state
-                .roots
-                .values()
-                .any(|overlay| *overlay == root)
+            && !ctx.screen_state.accepts_input(root, &ctx.overlay_state)
         {
             continue;
         }
@@ -213,15 +207,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
     }
     for request in ctx.widget_callbacks.read() {
         if ctx.entities.contains(request.entity)
-            && ctx.screen_state.active_root.map_or_else(
-                || {
-                    ctx.overlay_state
-                        .roots
-                        .values()
-                        .any(|root| *root == request.root)
-                },
-                |root| root == request.root,
-            )
+            && ctx.screen_state.accepts_input(request.root, &ctx.overlay_state)
         {
             invocations.push((
                 Some(request.root),
@@ -232,12 +218,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
     }
     for (root, callback, arguments) in invocations {
         if let Some(root) = root
-            && Some(root) != ctx.screen_state.active_root
-            && !ctx
-                .overlay_state
-                .roots
-                .values()
-                .any(|overlay| *overlay == root)
+            && !ctx.screen_state.accepts_input(root, &ctx.overlay_state)
         {
             continue;
         }
@@ -368,7 +349,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     ) {
                         Ok(screen) => {
                             ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
-                                UiCommand::ShowScreen { screen, done: None },
+                                UiCommand::ShowScreen { screen, done: None, push: true },
                             ));
                         }
                         Err(error) => crate::script::emit_script_diagnostic(
@@ -384,7 +365,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             response: ScriptResponse::UiResult(value.clone()),
                         });
                     }
-                    clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                    close_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
                 }
                 crate::ui::UiEffect::Navigate(navigation) => {
                     ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
