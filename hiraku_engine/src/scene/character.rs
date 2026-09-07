@@ -173,6 +173,37 @@ fn restored_character_actor_id(id: &str) -> Option<&str> {
         .map(|(actor, _)| actor)
 }
 
+/// Placement interpolation is independent from per-part opacity transitions.
+#[derive(Component)]
+pub(crate) struct CharacterPlacementTween {
+    from: Transform,
+    to: Transform,
+    timer: Timer,
+}
+
+fn update_character_placement(world: &mut World, entity: Entity, target: Transform, animate: bool) {
+    let Ok(mut entity) = world.get_entity_mut(entity) else {
+        return;
+    };
+    if entity
+        .get::<CharacterPlacementTween>()
+        .is_some_and(|tween| tween.to == target)
+    {
+        return;
+    }
+    let from = entity.get::<Transform>().copied().unwrap_or(target);
+    if animate && from != target {
+        entity.insert(CharacterPlacementTween {
+            from,
+            to: target,
+            timer: Timer::new(std::time::Duration::from_millis(300), TimerMode::Once),
+        });
+    } else {
+        entity.remove::<CharacterPlacementTween>();
+        entity.insert(target);
+    }
+}
+
 pub fn animate_character_motion_effects(
     mut commands: Commands,
     time: Res<Time>,
@@ -185,16 +216,46 @@ pub fn animate_character_motion_effects(
             Option<&'static mut CharacterJumpEffect>,
             Option<&'static mut CharacterShakeEffect>,
             Option<&'static mut CharacterTimelineEffect>,
+            Option<&'static mut CharacterPlacementTween>,
         ),
-        Without<WorldCamera>,
+        (
+            Without<WorldCamera>,
+            Or<(
+                With<CharacterJumpEffect>,
+                With<CharacterShakeEffect>,
+                With<CharacterTimelineEffect>,
+                With<CharacterPlacementTween>,
+            )>,
+        ),
     >,
 ) {
-    for (entity, mut transform, jump, shake, timeline) in &mut movers {
+    for (entity, mut transform, mut jump, mut shake, timeline, placement) in &mut movers {
+        let mut placement_origin = None;
+        if let Some(mut placement) = placement {
+            placement.timer.tick(time.delta());
+            let t = 1.0 - (1.0 - placement.timer.fraction()).powi(3);
+            let origin = placement.from.translation.lerp(placement.to.translation, t);
+            transform.scale = placement.from.scale.lerp(placement.to.scale, t);
+            transform.rotation = placement.from.rotation.slerp(placement.to.rotation, t);
+            placement_origin = Some(origin);
+            if let Some(effect) = jump.as_mut() {
+                effect.origin = origin;
+            }
+            if let Some(effect) = shake.as_mut() {
+                effect.origin = origin;
+            }
+            if placement.timer.is_finished() {
+                commands
+                    .entity(entity)
+                    .try_remove::<CharacterPlacementTween>();
+            }
+        }
         let base_origin = timeline
             .as_ref()
             .map(|effect| effect.origin)
             .or_else(|| jump.as_ref().map(|effect| effect.origin))
             .or_else(|| shake.as_ref().map(|effect| effect.origin))
+            .or(placement_origin)
             .unwrap_or(transform.translation);
 
         let mut translation = base_origin;
@@ -550,8 +611,7 @@ pub(super) fn queue_character_show(
         let sprite_id = character_part_id(&actor_id, part);
         if let Some(entity) = stage.sprites.get(&sprite_id).copied() {
             commands.entity(root).add_child(entity);
-            let mut entity_commands = commands.entity(entity);
-            entity_commands.try_insert(Transform {
+            let target = Transform {
                 translation: Vec3::new(
                     position.x + part.offset.x * scale,
                     position.y + part.offset.y * scale,
@@ -559,7 +619,12 @@ pub(super) fn queue_character_show(
                 ),
                 scale: Vec3::splat(scale),
                 ..default()
+            };
+            let animate = active_ids.contains(&sprite_id);
+            commands.queue(move |world: &mut World| {
+                update_character_placement(world, entity, target, animate)
             });
+            let mut entity_commands = commands.entity(entity);
             if focused {
                 entity_commands.try_insert((FocusedActorPart, focus_layer()));
             } else {
@@ -954,6 +1019,47 @@ mod tests {
                 .contains("reveal")
         );
         assert!(character_depth(131.0) < STAGE_Z_OVERLAY);
+    }
+
+    #[test]
+    fn placement_uses_ease_out_and_repeated_commits_do_not_restart_it() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .init_resource::<AnimationState>()
+            .init_resource::<StageState>()
+            .add_systems(Update, animate_character_motion_effects);
+        let entity = app.world_mut().spawn(Transform::default()).id();
+        let target = Transform::from_xyz(100.0, 0.0, 0.0);
+        update_character_placement(app.world_mut(), entity, target, true);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(150));
+        app.update();
+        let position = app
+            .world()
+            .get::<Transform>(entity)
+            .expect("transform")
+            .translation
+            .x;
+        assert!((position - 87.5).abs() < 0.01);
+        update_character_placement(app.world_mut(), entity, target, true);
+        assert_eq!(
+            app.world()
+                .get::<CharacterPlacementTween>(entity)
+                .expect("same tween")
+                .timer
+                .elapsed(),
+            std::time::Duration::from_millis(150)
+        );
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Transform>(entity)
+                .expect("target transform")
+                .translation,
+            target.translation
+        );
+        assert!(app.world().get::<CharacterPlacementTween>(entity).is_none());
     }
 
     #[test]

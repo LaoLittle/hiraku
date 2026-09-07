@@ -14,8 +14,11 @@ struct SceneTransitionHandle(u64);
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum SceneVisualTarget {
     Picture(PictureCommand),
-    Background(String),
-    Curtain { opacity: f32, mask: Option<String>, softness: f32 },
+    Curtain {
+        opacity: f32,
+        mask: Option<String>,
+        softness: f32,
+    },
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,11 +53,16 @@ impl SceneVisualState {
                     }
                     StoryEffect::Picture(picture)
                 }
-                SceneVisualTarget::Background(texture) => StoryEffect::SetBackground {
-                    texture,
-                    fade_in_ms: fade_ms,
+                SceneVisualTarget::Curtain {
+                    opacity,
+                    mask,
+                    softness,
+                } => StoryEffect::SetCurtain {
+                    opacity,
+                    fade_ms,
+                    mask,
+                    softness,
                 },
-                SceneVisualTarget::Curtain { opacity, mask, softness } => StoryEffect::SetCurtain { opacity, fade_ms, mask, softness },
             });
         }
     }
@@ -218,12 +226,15 @@ mod api {
         context: &mut CharacterContext,
         texture: String,
     ) -> Result<SceneTransitionHandle, NativeError> {
-        if texture.trim().is_empty() {
-            return Err(NativeError::message("background texture must not be empty"));
-        }
-        context
-            .scene_visuals
-            .begin(SceneVisualTarget::Background(texture))
+        picture(context, "Backgrounds".into(), texture)
+    }
+
+    #[hks(name = "cg")]
+    fn cg(
+        context: &mut CharacterContext,
+        texture: String,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        picture(context, "Stills".into(), texture)
     }
 
     /// A scene-space blackout, below script-owned UI. Independent of background
@@ -238,9 +249,11 @@ mod api {
                 "curtain opacity must be between 0 and 1",
             ));
         }
-        context
-            .scene_visuals
-            .begin(SceneVisualTarget::Curtain { opacity: opacity as f32, mask: None, softness: 0.0 })
+        context.scene_visuals.begin(SceneVisualTarget::Curtain {
+            opacity: opacity as f32,
+            mask: None,
+            softness: 0.0,
+        })
     }
 
     /// A red-channel threshold mask, sampled as linear data across the canvas.
@@ -253,10 +266,22 @@ mod api {
     ) -> Result<SceneTransitionHandle, NativeError> {
         let softness = softness.unwrap_or(0.0);
         if texture.trim().is_empty() || !(0.0..=1.0).contains(&softness) {
-            return Err(NativeError::message("dissolve needs a texture and softness between 0 and 1"));
+            return Err(NativeError::message(
+                "dissolve needs a texture and softness between 0 and 1",
+            ));
         }
-        let Some((SceneVisualTarget::Curtain { mask, softness: edge, .. }, _)) = context.scene_visuals.pending.get_mut(&id) else {
-            return Err(NativeError::message("dissolve requires an uncommitted scene.curtain(...)"));
+        let Some((
+            SceneVisualTarget::Curtain {
+                mask,
+                softness: edge,
+                ..
+            },
+            _,
+        )) = context.scene_visuals.pending.get_mut(&id)
+        else {
+            return Err(NativeError::message(
+                "dissolve requires an uncommitted scene.curtain(...)",
+            ));
         };
         *mask = Some(texture);
         *edge = softness as f32;
@@ -269,8 +294,13 @@ mod api {
         context: &mut CharacterContext,
         SceneTransitionHandle(id): SceneTransitionHandle,
     ) -> Result<(), NativeError> {
-        if !matches!(context.scene_visuals.pending.get(&id), Some((SceneVisualTarget::Curtain { .. }, _))) {
-            return Err(NativeError::message("awaitCompletion requires an uncommitted scene.curtain(...)"));
+        if !matches!(
+            context.scene_visuals.pending.get(&id),
+            Some((SceneVisualTarget::Curtain { .. }, _))
+        ) {
+            return Err(NativeError::message(
+                "awaitCompletion requires an uncommitted scene.curtain(...)",
+            ));
         }
         context.wait = Some(super::super::StoryWait::Curtain);
         Ok(())
@@ -335,18 +365,26 @@ mod tests {
 
     #[test]
     fn actor_identity_is_silent_and_visible_actors_retain_their_state() {
-        let mut runtime=runtime(r#"
+        let mut runtime = runtime(
+            r#"
             global let alice = char("alice")
             alice.at(.pos(120, 80)).scale(0.5).e("happy")
             alice: "Not on stage yet"
             alice.show()
             char("alice").e("sad")
-        "#);
-        assert!(matches!(event(&mut runtime),StoryRuntimeEvent::Effect(StoryEffect::Say { speaker, .. }) if speaker == "alice"));
-        assert!(matches!(event(&mut runtime),StoryRuntimeEvent::Wait(_)));
+        "#,
+        );
+        assert!(
+            matches!(event(&mut runtime),StoryRuntimeEvent::Effect(StoryEffect::Say { speaker, .. }) if speaker == "alice")
+        );
+        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Wait(_)));
         runtime.resume(Value::Unit).expect("advance dialogue");
-        assert!(matches!(event(&mut runtime),StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { position:[120.0,80.0],scale, .. }) if scale==0.5));
-        assert!(matches!(event(&mut runtime),StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { position:[120.0,80.0],scale,expressions,.. }) if scale==0.5 && expressions==["happy","sad"]));
+        assert!(
+            matches!(event(&mut runtime),StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { position:[120.0,80.0],scale, .. }) if scale==0.5)
+        );
+        assert!(
+            matches!(event(&mut runtime),StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { position:[120.0,80.0],scale,expressions,.. }) if scale==0.5 && expressions==["happy","sad"])
+        );
     }
 
     #[test]
@@ -420,25 +458,69 @@ mod tests {
 
     #[test]
     fn curtain_dissolve_is_data_driven_and_statement_scoped() {
-        let mut runtime = runtime("scene.curtain(1).dissolve(\"transitions/blinds\", 0.1).fade(900)");
-        assert_eq!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::SetCurtain {
-            opacity: 1.0, fade_ms: Some(900), mask: Some("transitions/blinds".into()), softness: 0.1,
-        }));
-        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Completed(_)));
+        let mut runtime =
+            runtime("scene.curtain(1).dissolve(\"transitions/blinds\", 0.1).fade(900)");
+        assert_eq!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::SetCurtain {
+                opacity: 1.0,
+                fade_ms: Some(900),
+                mask: Some("transitions/blinds".into()),
+                softness: 0.1,
+            })
+        );
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Completed(_)
+        ));
     }
 
     #[test]
     fn curtain_wait_yields_after_commit_and_resumes_once() {
-        let source = "scene.curtain(1).dissolve(\"transitions/blinds\").fade(900).awaitCompletion()";
+        let source =
+            "scene.curtain(1).dissolve(\"transitions/blinds\").fade(900).awaitCompletion()";
         let mut runtime = runtime(source);
-        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::SetCurtain { .. })));
-        assert_eq!(event(&mut runtime), StoryRuntimeEvent::Wait(StoryWait::Curtain));
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::SetCurtain { .. })
+        ));
+        assert_eq!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Wait(StoryWait::Curtain)
+        );
         let snapshot = runtime.snapshot().expect("curtain boundary can be saved");
-        let mut runtime = StoryRuntime::restore(compile_story_bytecode("test.hks", source).expect("deterministic recompile"), snapshot)
-            .expect("curtain wait restores");
-        assert_eq!(runtime.restored_boundary_event(), Some(StoryRuntimeEvent::Wait(StoryWait::Curtain)));
-        runtime.resume(Value::Unit).expect("curtain completion resumes host wait");
-        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Completed(_)));
+        let mut runtime = StoryRuntime::restore(
+            compile_story_bytecode("test.hks", source).expect("deterministic recompile"),
+            snapshot,
+        )
+        .expect("curtain wait restores");
+        assert_eq!(
+            runtime.restored_boundary_event(),
+            Some(StoryRuntimeEvent::Wait(StoryWait::Curtain))
+        );
+        runtime
+            .resume(Value::Unit)
+            .expect("curtain completion resumes host wait");
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn picture_shortcuts_use_the_same_builder_as_explicit_picture_calls() {
+        for (short, explicit) in [("bg", "Backgrounds"), ("cg", "Stills")] {
+            let suffix = ".frame(50, 40, 1.2, 5, 2).fade(300)";
+            let mut shorthand = runtime(&format!("{short}(\"alice/image\"){suffix}"));
+            let mut original = runtime(&format!(
+                "scene.picture(\"{explicit}\", \"alice/image\"){suffix}"
+            ));
+            assert_eq!(event(&mut shorthand), event(&mut original));
+            assert!(matches!(
+                event(&mut shorthand),
+                StoryRuntimeEvent::Completed(_)
+            ));
+        }
     }
 
     #[test]
@@ -447,10 +529,16 @@ mod tests {
         let mut runtime = runtime(source);
         assert_eq!(
             event(&mut runtime),
-            StoryRuntimeEvent::Effect(StoryEffect::SetBackground {
-                texture: "alice/background".into(),
-                fade_in_ms: Some(1200),
-            })
+            StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                id: "Backgrounds".into(),
+                path: "alice/background".into(),
+                rect: None,
+                position: [50.0, 50.0],
+                scale: 1.0,
+                rotation: 0.0,
+                layer: 1.0,
+                seconds: 1.2,
+            }))
         );
         let wait = StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms: 1800 });
         assert_eq!(event(&mut runtime), wait);

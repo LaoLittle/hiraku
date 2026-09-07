@@ -12,7 +12,7 @@ members = [
     "hiraku_storage", 
     "hiraku_media",
     "hiraku"
-]
+, "hiraku_sprite3d"]
 
 [workspace.package]
 version = "0.1.0"
