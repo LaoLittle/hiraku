@@ -1,0 +1,13 @@
+[package]
+name = "hiraku-sprite3d"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }
