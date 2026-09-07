@@ -57,13 +57,13 @@ impl MediaDecoder {
             first_timestamp: None,
         })
     }
-    
+
     /// Nonblocking. Queue limits bound decode-ahead even while playback is paused.
     pub fn poll(&mut self) {
         if self.failed {
             return;
         }
-        
+
         if let Err(error) = self.pump() {
             self.failed = true;
             self.video_decoder.close();
@@ -72,13 +72,13 @@ impl MediaDecoder {
             let _ = self.audio_sender.send(AudioEvent::End);
         }
     }
-    
+
     fn pump(&mut self) -> Result<(), CodecError> {
         while self.video.len() < 3 {
             let Some(event) = self.video_decoder.poll() else {
                 break;
             };
-            
+
             match event {
                 DecoderEvent::Output(mut frame) => {
                     let first = *self.first_timestamp.get_or_insert(frame.timestamp);
@@ -91,7 +91,7 @@ impl MediaDecoder {
                 DecoderEvent::Error(e) => return Err(e),
             }
         }
-        
+
         while self.audio.len() < 24 {
             let Some(event) = self.audio_decoder.poll() else {
                 break;
@@ -114,11 +114,11 @@ impl MediaDecoder {
                 DecoderEvent::Error(e) => return Err(e),
             }
         }
-        
+
         if self.flushing {
             return Ok(());
         }
-        
+
         // Keep demux work bounded per ECS update as well as decoder queue size.
         for _ in 0..128 {
             if self.pending.is_none() {
@@ -127,14 +127,14 @@ impl MediaDecoder {
                     .next_chunk()
                     .map_err(|e| CodecError::Operation(e.to_string()))?;
             }
-            
+
             let Some(chunk) = self.pending.as_ref() else {
                 self.video_decoder.flush()?;
                 self.audio_decoder.flush()?;
                 self.flushing = true;
                 return Ok(());
             };
-            
+
             let full = match chunk {
                 DemuxedChunk::Video(_) => {
                     self.video.len()
@@ -149,17 +149,17 @@ impl MediaDecoder {
                         >= 24
                 }
             };
-            
+
             if full {
                 return Ok(());
             }
-            
+
             match self.pending.take().expect("pending chunk was inspected") {
                 DemuxedChunk::Video(chunk) => self.video_decoder.decode(chunk)?,
                 DemuxedChunk::Audio(chunk) => self.audio_decoder.decode(chunk)?,
             }
         }
-        
+
         Ok(())
     }
 }

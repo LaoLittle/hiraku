@@ -71,6 +71,9 @@ pub(crate) fn script_command_from_effect(
     Ok(match effect {
         StoryEffect::Log(message) => ScriptCommand::Runtime(RuntimeCommand::Log(message)),
         StoryEffect::ClearDialogue => ScriptCommand::Dialogue(DialogueCommand::Clear),
+        StoryEffect::DialogueSpeed(multiplier) => {
+            ScriptCommand::Dialogue(DialogueCommand::Speed(multiplier))
+        }
         StoryEffect::StopBgm => ScriptCommand::Audio(AudioCommand::StopBgm),
         StoryEffect::Exit => ScriptCommand::Runtime(RuntimeCommand::Exit),
         StoryEffect::Navigate(navigation) => {
@@ -110,17 +113,34 @@ pub(crate) fn script_command_from_effect(
             ease: parse_camera_ease(&ease)?,
             animation_id: None,
         }),
-        StoryEffect::Delay { .. } => return Err("delay must be dispatched through the story wait boundary".into()),
-        StoryEffect::SetCurtain { opacity, fade_ms, mask, softness } => ScriptCommand::Stage(StageCommand::SetCurtain {
-            opacity, fade: fade_ms.map(Duration::from_millis), softness,
-            mask: mask.map(|name| {
-                let definition = textures.and_then(|catalog| catalog.resolve(&name))
-                    .ok_or_else(|| format!("dissolve texture `{name}` is not defined"))?;
-                if definition.rect.is_some() { return Err("dissolve masks must use a standalone texture".to_string()); }
-                Ok(definition.path.clone())
-            }).transpose()?,
+        StoryEffect::Delay { .. } => {
+            return Err("delay must be dispatched through the story wait boundary".into());
+        }
+        StoryEffect::SetCurtain {
+            opacity,
+            fade_ms,
+            mask,
+            softness,
+        } => ScriptCommand::Stage(StageCommand::SetCurtain {
+            opacity,
+            fade: fade_ms.map(Duration::from_millis),
+            softness,
+            mask: mask
+                .map(|name| {
+                    let definition = textures
+                        .and_then(|catalog| catalog.resolve(&name))
+                        .ok_or_else(|| format!("dissolve texture `{name}` is not defined"))?;
+                    if definition.rect.is_some() {
+                        return Err("dissolve masks must use a standalone texture".to_string());
+                    }
+                    Ok(definition.path.clone())
+                })
+                .transpose()?,
         }),
-        StoryEffect::SetBackground { texture, fade_in_ms } => {
+        StoryEffect::SetBackground {
+            texture,
+            fade_in_ms,
+        } => {
             let definition = textures
                 .and_then(|catalog| catalog.resolve(&texture))
                 .ok_or_else(|| format!("texture `{texture}` is not defined"))?;
@@ -132,14 +152,18 @@ pub(crate) fn script_command_from_effect(
         }
         StoryEffect::Picture(mut picture) => {
             if let crate::scene::pictures::PictureCommand::Show { path, rect, .. } = &mut picture {
-                let texture=textures.and_then(|catalog| catalog.resolve(path)).ok_or_else(|| format!("texture `{path}` is not defined"))?;
-                *path=texture.path.clone();
-                *rect=texture.rect;
+                let texture = textures
+                    .and_then(|catalog| catalog.resolve(path))
+                    .ok_or_else(|| format!("texture `{path}` is not defined"))?;
+                *path = texture.path.clone();
+                *rect = texture.rect;
             }
             ScriptCommand::Stage(StageCommand::Picture(picture))
         }
         StoryEffect::SaveSlot(slot) => ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)),
-        StoryEffect::HideCharacter { actor_id, fade_ms } => ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }),
+        StoryEffect::HideCharacter { actor_id, fade_ms } => {
+            ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms })
+        }
         StoryEffect::ShowCharacter {
             actor_id,
             character_name,

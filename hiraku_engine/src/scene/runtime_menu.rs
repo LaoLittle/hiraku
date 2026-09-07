@@ -208,7 +208,9 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
     }
     for request in ctx.widget_callbacks.read() {
         if ctx.entities.contains(request.entity)
-            && ctx.screen_state.accepts_input(request.root, &ctx.overlay_state)
+            && ctx
+                .screen_state
+                .accepts_input(request.root, &ctx.overlay_state)
         {
             invocations.push((
                 Some(request.root),
@@ -270,7 +272,10 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 }
                 crate::ui::UiEffect::SetVolume { channel, value } => {
                     ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
-                        SettingsCommand::Set { name: channel.clone(), value: *value },
+                        SettingsCommand::Set {
+                            name: channel.clone(),
+                            value: *value,
+                        },
                     ));
                 }
                 crate::ui::UiEffect::PlaySfx { .. } => {
@@ -278,10 +283,16 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                         .write(super::screen_ui::UiEffectMessage(effect.clone()));
                 }
                 crate::ui::UiEffect::Save { slot } => {
-                    if let Err(error) =
-                        save_runtime_slot(slot, &ctx.script_runtime, &ctx.shared_state,
-                            if ctx.screen_state.active_root.is_some() { &ctx.preview.png } else { &[] })
-                    {
+                    if let Err(error) = save_runtime_slot(
+                        slot,
+                        &ctx.script_runtime,
+                        &ctx.shared_state,
+                        if ctx.screen_state.active_root.is_some() {
+                            &ctx.preview.png
+                        } else {
+                            &[]
+                        },
+                    ) {
                         warn!("failed to save slot `{slot}`: {error}");
                     }
                 }
@@ -351,7 +362,11 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     ) {
                         Ok(screen) => {
                             ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
-                                UiCommand::ShowScreen { screen, done: None, push: true },
+                                UiCommand::ShowScreen {
+                                    screen,
+                                    done: None,
+                                    push: true,
+                                },
                             ));
                         }
                         Err(error) => crate::script::emit_script_diagnostic(

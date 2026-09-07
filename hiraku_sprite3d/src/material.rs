@@ -34,7 +34,15 @@ pub struct Sprite3dMaterial {
     pub image: Option<Handle<Image>>,
 }
 impl Sprite3dMaterial {
-    pub(crate) fn from_sprite(sprite: &Sprite3d) -> Self {
+    /// Resolve layout assets without altering the authoring component.
+    pub fn from_sprite(
+        sprite: &Sprite3d,
+        atlases: &Assets<TextureAtlasLayout>,
+    ) -> Result<Self, crate::Sprite3dError> {
+        let rects = sprite.resolve_rects(atlases)?;
+        Ok(Self::from_resolved(sprite, &rects))
+    }
+    pub(crate) fn from_resolved(sprite: &Sprite3d, rects: &[Option<Rect>; MAX_LAYERS]) -> Self {
         let mut layers = [LayerUniform::default(); MAX_LAYERS];
         let fallback = [SpriteLayer::default()];
         let source = if sprite.layers.is_empty() {
@@ -42,10 +50,15 @@ impl Sprite3dMaterial {
         } else {
             &sprite.layers
         };
-        for (out, layer) in layers.iter_mut().zip(source) {
+        for ((out, layer), rect) in layers.iter_mut().zip(source).zip(rects) {
             let (mode, reference, cutoff) = match layer.mask {
                 MaskMode::None => (0, 0, 0.0),
                 MaskMode::Read(reference) => (1, reference, 0.0),
+                MaskMode::StencilWrite {
+                    reference,
+                    cutoff,
+                    visible,
+                } => (if visible { 5 } else { 4 }, reference, cutoff),
                 MaskMode::Write {
                     reference,
                     cutoff,
@@ -53,9 +66,7 @@ impl Sprite3dMaterial {
                 } => (if visible { 3 } else { 2 }, reference, cutoff),
             };
             *out = LayerUniform {
-                rect: layer
-                    .rect
-                    .map_or(Vec4::ZERO, |r| r.min.extend(r.width()).extend(r.height())),
+                rect: rect.map_or(Vec4::ZERO, |r| r.min.extend(r.width()).extend(r.height())),
                 bounds: layer
                     .bounds
                     .min
@@ -94,8 +105,7 @@ impl Sprite3dMaterial {
 impl TryFrom<&Sprite3d> for Sprite3dMaterial {
     type Error = crate::Sprite3dError;
     fn try_from(sprite: &Sprite3d) -> Result<Self, Self::Error> {
-        sprite.validate()?;
-        Ok(Self::from_sprite(sprite))
+        Self::from_sprite(sprite, &Assets::default())
     }
 }
 impl Material for Sprite3dMaterial {

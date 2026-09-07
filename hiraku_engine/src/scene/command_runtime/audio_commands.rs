@@ -17,7 +17,10 @@ pub(super) fn dispatch_audio_command(
             fade_in,
             animation_id,
         } => {
-            let target_volume = apply_volume_setting(volume, user_settings.sfx_volume * user_settings.master_volume);
+            let target_volume = apply_volume_setting(
+                volume,
+                user_settings.sfx_volume * user_settings.master_volume,
+            );
             let start_volume = if fade_in.is_some() {
                 0.0
             } else {
@@ -45,7 +48,10 @@ pub(super) fn dispatch_audio_command(
             fade_in,
             animation_id,
         } => {
-            let playback_volume = apply_volume_setting(volume, user_settings.bgm_volume * user_settings.master_volume);
+            let playback_volume = apply_volume_setting(
+                volume,
+                user_settings.bgm_volume * user_settings.master_volume,
+            );
             if let Some(previous) = stage.bgm.take() {
                 commands.entity(previous).try_despawn();
             }
@@ -106,7 +112,10 @@ pub(super) fn dispatch_audio_command(
             mode,
             animation_id,
         } => {
-            let playback_volume = apply_volume_setting(volume, user_settings.voice_volume * user_settings.master_volume);
+            let playback_volume = apply_volume_setting(
+                volume,
+                user_settings.voice_volume * user_settings.master_volume,
+            );
             if mode == VoicePlaybackMode::Exclusive {
                 finish_active_voice(commands, animations, voice_state);
             }

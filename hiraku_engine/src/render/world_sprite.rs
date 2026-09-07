@@ -15,8 +15,12 @@ mod dissolve_shader_tests {
             .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };")
             .replace("#{MATERIAL_BIND_GROUP}", "2");
         let module = naga::front::wgsl::parse_str(&source).expect("sprite WGSL parses");
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-            .validate(&module).expect("sprite WGSL validates");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("sprite WGSL validates");
     }
 }
 
@@ -133,7 +137,14 @@ pub fn world_sprite_render_components(
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
         dissolve_mask: sprite.dissolve.as_ref().map(|mask| mask.image.clone()),
-        dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| Vec4::new(if mask.reversed { -1.0 } else { 1.0 }, mask.softness, mask.canvas_size.x, mask.canvas_size.y)),
+        dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| {
+            Vec4::new(
+                if mask.reversed { -1.0 } else { 1.0 },
+                mask.softness,
+                mask.canvas_size.x,
+                mask.canvas_size.y,
+            )
+        }),
         image: sprite.image.clone(),
         tint: sprite.color.to_linear().to_f32_array().into(),
         rect: sprite.rect.map(Vec4::from_array).unwrap_or(Vec4::ZERO),
@@ -142,19 +153,22 @@ fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
 
 /// Resolves natural image sizes lazily and mirrors authoring changes into GPU
 /// assets. No transform is rewritten, so animation state stays independent.
-pub fn sync_world_sprites(
+pub(crate) fn sync_world_sprites(
     mut commands: Commands,
     canvas: Option<Res<crate::HirakuCanvas>>,
     images: Res<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WorldSpriteMaterial>>,
-    mut sprites: Query<(
-        Entity,
-        &mut WorldSprite,
-        Option<&mut Mesh3d>,
-        Option<&MeshMaterial3d<WorldSpriteMaterial>>,
-        Has<crate::scene::BackgroundLayer>,
-    )>,
+    mut sprites: Query<
+        (
+            Entity,
+            &mut WorldSprite,
+            Option<&mut Mesh3d>,
+            Option<&MeshMaterial3d<WorldSpriteMaterial>>,
+            Has<crate::scene::BackgroundLayer>,
+        ),
+        Without<crate::scene::character_composite::LogicalCharacterPart>,
+    >,
 ) {
     for (entity, mut sprite, mesh, material_handle, background) in &mut sprites {
         let size = sprite.custom_size.or_else(|| {

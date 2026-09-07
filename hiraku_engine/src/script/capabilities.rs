@@ -27,6 +27,7 @@ pub enum StoryEffect {
     Picture(crate::scene::pictures::PictureCommand),
     Log(String),
     ClearDialogue,
+    DialogueSpeed(f32),
     SaveSlot(String),
     HideCharacter {
         actor_id: Option<String>,
@@ -1413,6 +1414,26 @@ mod native_api {
         Ok(())
     }
 
+    /// Story-authored speed, independent of the user's text-speed preference.
+    #[hks(name = "speed", selector = "printer")]
+    fn native_printer_speed(
+        context: &mut CharacterContext,
+        multiplier: f64,
+    ) -> Result<(), NativeError> {
+        if !multiplier.is_finite()
+            || (multiplier as f32) <= 0.0
+            || multiplier > f32::MAX as f64 / 30.0
+        {
+            return Err(NativeError::message(
+                "printer.speed requires a finite positive multiplier",
+            ));
+        }
+        context
+            .commands
+            .push(StoryEffect::DialogueSpeed(multiplier as f32));
+        Ok(())
+    }
+
     #[hks]
     fn native_say(
         context: &mut CharacterContext,
@@ -1774,5 +1795,30 @@ not_actor.at(.left)"#,
             "camera().zoom(1.2).animation(.easeInOut(0.5))",
         )
         .expect("camera animation spec should type-check");
+    }
+
+    #[test]
+    fn printer_speed_is_a_validated_native_effect() {
+        for (source, expected) in [
+            ("printer.speed(0.05)", Some(0.05)),
+            ("printer.speed(0)", None),
+        ] {
+            let bytecode = compile_story_bytecode("printer.hks", source).expect("speed signature");
+            let mut runtime = ExecutionRuntime::new(bytecode).expect("runtime");
+            let Some(ExecutionEvent::Call { call, .. }) = runtime.step().expect("call") else {
+                panic!("expected native call");
+            };
+            let mut host = StoryNativeHost::new();
+            let result = host.call(&call);
+            if let Some(value) = expected {
+                result.expect("valid speed");
+                assert_eq!(
+                    host.drain_effects(),
+                    vec![StoryEffect::DialogueSpeed(value)]
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 }

@@ -36,9 +36,16 @@ pub enum RuntimeCommand {
 
 #[derive(Debug)]
 pub enum StageCommand {
-    AwaitCurtain { done: ScriptRequestId },
+    AwaitCurtain {
+        done: ScriptRequestId,
+    },
     Picture(crate::scene::pictures::PictureCommand),
-    SetCurtain { opacity: f32, fade: Option<Duration>, mask: Option<String>, softness: f32 },
+    SetCurtain {
+        opacity: f32,
+        fade: Option<Duration>,
+        mask: Option<String>,
+        softness: f32,
+    },
     SetBackground {
         path: String,
         fade: Option<Duration>,
@@ -48,6 +55,7 @@ pub enum StageCommand {
 
 #[derive(Debug)]
 pub enum DialogueCommand {
+    Speed(f32),
     Say {
         speaker: String,
         text: String,
@@ -104,7 +112,10 @@ pub enum UiCommand {
 
 #[derive(Debug)]
 pub enum CharacterCommand {
-    Hide { actor_id: Option<String>, fade_ms: u64 },
+    Hide {
+        actor_id: Option<String>,
+        fade_ms: u64,
+    },
     Show {
         actor_id: String,
         character_name: String,
@@ -119,7 +130,10 @@ pub enum CharacterCommand {
 
 #[derive(Debug)]
 pub enum AnimationCommand {
-    Delay { duration: Duration, done: ScriptRequestId },
+    Delay {
+        duration: Duration,
+        done: ScriptRequestId,
+    },
     Wait {
         ids: Vec<String>,
         done: ScriptRequestId,
@@ -128,7 +142,12 @@ pub enum AnimationCommand {
 
 #[derive(Debug)]
 pub enum AudioCommand {
-    PlaySfx { path: String, volume: f32, fade_in: Option<Duration>, animation_id: Option<String> },
+    PlaySfx {
+        path: String,
+        volume: f32,
+        fade_in: Option<Duration>,
+        animation_id: Option<String>,
+    },
     PlayBgm {
         path: String,
         prelude: Option<String>,

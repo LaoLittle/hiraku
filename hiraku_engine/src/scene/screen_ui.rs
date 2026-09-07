@@ -33,9 +33,10 @@ pub(super) fn close_screen_ui(commands: &mut Commands, screen_state: &mut Screen
     clear_screen_ui(commands, screen_state);
     screen_state.stack = stack;
     if let Some((root, waiting)) = screen_state.stack.pop() {
-        commands.entity(root).insert((Visibility::Inherited, GlobalZIndex(
-            SCREEN_MODAL_ACTIVE_Z + screen_state.stack.len() as i32 * 3,
-        )));
+        commands.entity(root).insert((
+            Visibility::Inherited,
+            GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + screen_state.stack.len() as i32 * 3),
+        ));
         screen_state.active_root = Some(root);
         screen_state.waiting = waiting;
     }
@@ -53,9 +54,13 @@ pub fn cleanup_stale_screen_ui(
     mut screen_state: ResMut<ScreenUiState>,
     preview: Option<ResMut<super::save_preview::SavePreview>>,
 ) {
-    if let Some(mut preview) = preview && preview.capture.is_some() {
+    if let Some(mut preview) = preview
+        && preview.capture.is_some()
+    {
         preview.waiting_frames += 1;
-        if preview.waiting_frames < 180 { return; }
+        if preview.waiting_frames < 180 {
+            return;
+        }
         if let Some(entity) = preview.capture.take() {
             commands.entity(entity).try_despawn();
         }
@@ -65,9 +70,10 @@ pub fn cleanup_stale_screen_ui(
     if let Some(mut pending) = screen_state.pending_root.take() {
         if screen_images_ready(&images, &pending.wait_images) && pending.ready_frames_remaining == 0
         {
-            commands
-                .entity(pending.entity)
-                .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + depth_offset)));
+            commands.entity(pending.entity).insert((
+                Visibility::Inherited,
+                GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + depth_offset),
+            ));
             if let Some(previous) = pending.previous {
                 commands
                     .entity(previous)
@@ -82,9 +88,10 @@ pub fn cleanup_stale_screen_ui(
             screen_state.waiting = pending.done;
         } else {
             if screen_images_ready(&images, &pending.wait_images) {
-                commands
-                    .entity(pending.entity)
-                    .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_PENDING_Z + depth_offset)));
+                commands.entity(pending.entity).insert((
+                    Visibility::Inherited,
+                    GlobalZIndex(SCREEN_MODAL_PENDING_Z + depth_offset),
+                ));
                 pending.ready_frames_remaining = pending.ready_frames_remaining.saturating_sub(1);
             }
             screen_state.pending_root = Some(pending);
@@ -279,8 +286,16 @@ fn screen_root_node(screen: &ScreenSpec) -> Node {
         right: px(0.0),
         top: px(0.0),
         bottom: px(0.0),
-        justify_content: if screen.panel { justify_from_align(screen.yalign) } else { JustifyContent::Start },
-        align_items: if screen.panel { align_items_from_align(screen.xalign) } else { AlignItems::Start },
+        justify_content: if screen.panel {
+            justify_from_align(screen.yalign)
+        } else {
+            JustifyContent::Start
+        },
+        align_items: if screen.panel {
+            align_items_from_align(screen.xalign)
+        } else {
+            AlignItems::Start
+        },
         padding: UiRect::all(px(if screen.panel { 24.0 } else { 0.0 })),
         ..default()
     }
@@ -359,7 +374,14 @@ fn spawn_screen_node_entity(
     image_handles: &mut Vec<Handle<Image>>,
 ) -> Entity {
     match node {
-        ScreenNode::Input(input) => super::widgets::spawn_input(commands, root, input, ui_fonts, asset_server, image_handles),
+        ScreenNode::Input(input) => super::widgets::spawn_input(
+            commands,
+            root,
+            input,
+            ui_fonts,
+            asset_server,
+            image_handles,
+        ),
         ScreenNode::Text(TextNode {
             text,
             binding,
@@ -429,8 +451,12 @@ fn spawn_screen_node_entity(
             layout,
         }) => {
             let callback = on_click.clone();
-            let normal_texture = background_texture.as_ref().map(|texture| asset_server.load(texture.path.clone()));
-            let hovered_texture = hovered_background_texture.as_ref().map(|texture| asset_server.load(texture.path.clone()));
+            let normal_texture = background_texture
+                .as_ref()
+                .map(|texture| asset_server.load(texture.path.clone()));
+            let hovered_texture = hovered_background_texture
+                .as_ref()
+                .map(|texture| asset_server.load(texture.path.clone()));
             image_handles.extend(normal_texture.iter().cloned());
             image_handles.extend(hovered_texture.iter().cloned());
             // A textured button uses its image as the complete visual surface.
@@ -522,9 +548,10 @@ fn spawn_screen_node_entity(
                 ))
                 .id();
             if let Some(image) = normal_texture.clone() {
-                commands
-                    .entity(button)
-                    .insert(stretched_image_node(image, background_texture.as_ref().and_then(|texture| texture.rect)));
+                commands.entity(button).insert(stretched_image_node(
+                    image,
+                    background_texture.as_ref().and_then(|texture| texture.rect),
+                ));
             }
             commands.entity(button).insert(ScreenUiButton {
                 root,
@@ -543,10 +570,16 @@ fn spawn_screen_node_entity(
                 press_scale: *press_scale,
                 normal_texture: normal_texture.clone(),
                 normal_atlas: None,
-                normal_rect: background_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
+                normal_rect: background_texture
+                    .as_ref()
+                    .and_then(|texture| texture.rect)
+                    .map(texture_rect),
                 hovered_texture,
                 hovered_atlas: None,
-                hovered_rect: hovered_background_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
+                hovered_rect: hovered_background_texture
+                    .as_ref()
+                    .and_then(|texture| texture.rect)
+                    .map(texture_rect),
             });
             if let Some(signal) = enabled_binding {
                 commands.entity(button).insert(UiEnabledBinding {
@@ -640,7 +673,10 @@ fn spawn_screen_node_entity(
                     UiTransform::IDENTITY,
                     ScreenUiImageButton {
                         pressed_texture: pressed_image,
-                        pressed_rect: pressed_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
+                        pressed_rect: pressed_texture
+                            .as_ref()
+                            .and_then(|texture| texture.rect)
+                            .map(texture_rect),
                         pressed_node,
                         root,
                         value: value.clone(),
@@ -649,7 +685,10 @@ fn spawn_screen_node_entity(
                         normal_rect,
                         normal_texture: image,
                         normal_atlas: None,
-                        hovered_rect: hovered_texture.as_ref().and_then(|texture| texture.rect).map(texture_rect),
+                        hovered_rect: hovered_texture
+                            .as_ref()
+                            .and_then(|texture| texture.rect)
+                            .map(texture_rect),
                         hovered_texture: hovered_image,
                         hovered_atlas: None,
                         hovered_node,
@@ -1009,7 +1048,10 @@ pub(super) fn apply_live_layout_bindings(
         });
     }
     if layout.hover_offset.is_some() {
-        commands.entity(entity).insert((UiTransform::IDENTITY, super::ui_hover::HoverMotion::new(layout)));
+        commands.entity(entity).insert((
+            UiTransform::IDENTITY,
+            super::ui_hover::HoverMotion::new(layout),
+        ));
     } else if let Some(timeline) = &layout.phase_animation {
         commands.entity(entity).insert((
             UiTransform::IDENTITY,
@@ -1252,7 +1294,10 @@ pub fn process_ui_effects(
                     warn!("UI sound effect `{name}` is not defined");
                     continue;
                 };
-                let playback_volume = apply_volume_setting(*volume, user_settings.sfx_volume * user_settings.master_volume);
+                let playback_volume = apply_volume_setting(
+                    *volume,
+                    user_settings.sfx_volume * user_settings.master_volume,
+                );
                 commands.spawn((
                     SfxChannel { volume: *volume },
                     AudioPlayer::new(asset_server.load(definition.path.clone())),
@@ -1311,7 +1356,10 @@ pub fn handle_screen_image_buttons(
                     image.image = texture.clone();
                     image.texture_atlas = None;
                     image.rect = button.pressed_rect;
-                    *node = button.pressed_node.clone().unwrap_or_else(|| button.normal_node.clone());
+                    *node = button
+                        .pressed_node
+                        .clone()
+                        .unwrap_or_else(|| button.normal_node.clone());
                     continue;
                 }
                 image.image = button
@@ -1526,7 +1574,10 @@ pub fn update_builtin_ui_models(
             ),
             ("text".to_string(), StoredValue::String(text.to_string())),
             ("visible".to_string(), StoredValue::Bool(dialogue.is_some())),
-            ("autoEnabled".to_string(), StoredValue::Bool(dialogue_state.auto_enabled)),
+            (
+                "autoEnabled".to_string(),
+                StoredValue::Bool(dialogue_state.auto_enabled),
+            ),
             (
                 "revealedCharacters".to_string(),
                 StoredValue::Int(revealed as i64),
@@ -1880,7 +1931,9 @@ mod tests {
             stack: vec![(title, Some(request)), (phone, None)],
             ..default()
         };
-        let overlays = OverlayUiState { roots: HashMap::from([("dialogue".into(), title)]) };
+        let overlays = OverlayUiState {
+            roots: HashMap::from([("dialogue".into(), title)]),
+        };
         assert!(state.accepts_input(settings, &overlays));
         assert!(!state.accepts_input(phone, &overlays));
         assert!(!state.accepts_input(title, &overlays));
@@ -1890,7 +1943,10 @@ mod tests {
         assert!(world.get_entity(phone).is_ok());
         assert_eq!(state.active_root, Some(phone));
         assert_eq!(state.waiting, None);
-        assert_eq!(world.get::<GlobalZIndex>(phone).expect("active layer").0, SCREEN_MODAL_ACTIVE_Z + 3);
+        assert_eq!(
+            world.get::<GlobalZIndex>(phone).expect("active layer").0,
+            SCREEN_MODAL_ACTIVE_Z + 3
+        );
 
         close_screen_ui(&mut world.commands(), &mut state);
         world.flush();
@@ -1926,9 +1982,14 @@ mod tests {
     fn canvas_groups_start_at_top_left_instead_of_center() {
         let source = "import ui.widgets.*\ncanvas { column { text(\"alice\").at(.rel(10, 20)) } }";
         let screen = evaluate_ui_component_named_with_args(
-            "memory://layout.ui.hks", source, UiContext::default(),
-            &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("valid canvas");
+            "memory://layout.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("valid canvas");
         let node = screen_root_node(&screen);
         assert_eq!(node.justify_content, JustifyContent::Start);
         assert_eq!(node.align_items, AlignItems::Start);
@@ -1986,7 +2047,13 @@ mod tests {
             image_node(Handle::default(), region),
             stretched_image_node(Handle::default(), region),
         ] {
-            assert_eq!(node.rect, Some(Rect::from_corners(Vec2::new(8.0, 16.0), Vec2::new(40.0, 64.0))));
+            assert_eq!(
+                node.rect,
+                Some(Rect::from_corners(
+                    Vec2::new(8.0, 16.0),
+                    Vec2::new(40.0, 64.0)
+                ))
+            );
             assert!(node.texture_atlas.is_none());
         }
         assert!(image_node(Handle::default(), None).rect.is_none());
@@ -2206,19 +2273,41 @@ mod tests {
         let root = app.world_mut().spawn_empty().id();
         let normal_rect = Some(Rect::from_corners(Vec2::ZERO, Vec2::splat(20.0)));
         let hover_rect = Some(Rect::from_corners(Vec2::splat(20.0), Vec2::splat(40.0)));
-        let normal_node = Node { width: Val::Px(100.0), ..default() };
-        let button = app.world_mut().spawn((
-            PickingInteraction::None, ImageNode::default(), normal_node.clone(), UiTransform::IDENTITY,
-            ScreenUiImageButton {
-                root, value: None, enabled: true, hovered_when_disabled: false,
-                normal_rect, normal_texture: Handle::default(), normal_atlas: None,
-                hovered_rect: hover_rect, hovered_texture: Some(Handle::default()),
-                hovered_atlas: None, hovered_node: None,
-                pressed_texture: Some(Handle::default()), pressed_rect: None,
-                pressed_node: Some(Node { width: Val::Px(80.0), ..default() }),
-                normal_node, hover_scale: 1.0, press_scale: 1.0,
-            },
-        )).id();
+        let normal_node = Node {
+            width: Val::Px(100.0),
+            ..default()
+        };
+        let button = app
+            .world_mut()
+            .spawn((
+                PickingInteraction::None,
+                ImageNode::default(),
+                normal_node.clone(),
+                UiTransform::IDENTITY,
+                ScreenUiImageButton {
+                    root,
+                    value: None,
+                    enabled: true,
+                    hovered_when_disabled: false,
+                    normal_rect,
+                    normal_texture: Handle::default(),
+                    normal_atlas: None,
+                    hovered_rect: hover_rect,
+                    hovered_texture: Some(Handle::default()),
+                    hovered_atlas: None,
+                    hovered_node: None,
+                    pressed_texture: Some(Handle::default()),
+                    pressed_rect: None,
+                    pressed_node: Some(Node {
+                        width: Val::Px(80.0),
+                        ..default()
+                    }),
+                    normal_node,
+                    hover_scale: 1.0,
+                    press_scale: 1.0,
+                },
+            ))
+            .id();
         for (interaction, rect, width) in [
             (PickingInteraction::Hovered, hover_rect, 100.0),
             (PickingInteraction::Pressed, None, 80.0),
@@ -2226,11 +2315,31 @@ mod tests {
             (PickingInteraction::Pressed, None, 80.0),
             (PickingInteraction::None, normal_rect, 100.0),
         ] {
-            *app.world_mut().get_mut::<PickingInteraction>(button).expect("button interaction") = interaction;
+            *app.world_mut()
+                .get_mut::<PickingInteraction>(button)
+                .expect("button interaction") = interaction;
             app.update();
-            assert_eq!(app.world().get::<ImageNode>(button).expect("button image").rect, rect);
-            assert_eq!(app.world().get::<Node>(button).expect("button layout").width, Val::Px(width));
-            assert_eq!(app.world().get::<UiTransform>(button).expect("button transform").scale, Vec2::ONE);
+            assert_eq!(
+                app.world()
+                    .get::<ImageNode>(button)
+                    .expect("button image")
+                    .rect,
+                rect
+            );
+            assert_eq!(
+                app.world()
+                    .get::<Node>(button)
+                    .expect("button layout")
+                    .width,
+                Val::Px(width)
+            );
+            assert_eq!(
+                app.world()
+                    .get::<UiTransform>(button)
+                    .expect("button transform")
+                    .scale,
+                Vec2::ONE
+            );
         }
     }
 

@@ -30,7 +30,10 @@ pub enum UiEffect {
         slot: String,
     },
     NextDialogue,
-    SetVolume { channel: String, value: f32 },
+    SetVolume {
+        channel: String,
+        value: f32,
+    },
     SetPreference(crate::storage::PreferenceChange),
     SetAutoDialogue(bool),
     Navigate(NavigationRequest),
@@ -675,10 +678,11 @@ pub struct OverlayUiState {
 impl ScreenUiState {
     /// Only the top modal receives input; overlays are interactive without a modal.
     pub(crate) fn accepts_input(&self, root: Entity, overlays: &OverlayUiState) -> bool {
-        self.pending_root.is_none() && self.active_root.map_or_else(
-            || self.stack.is_empty() && overlays.roots.values().any(|entity| *entity == root),
-            |active| active == root,
-        )
+        self.pending_root.is_none()
+            && self.active_root.map_or_else(
+                || self.stack.is_empty() && overlays.roots.values().any(|entity| *entity == root),
+                |active| active == root,
+            )
     }
 }
 

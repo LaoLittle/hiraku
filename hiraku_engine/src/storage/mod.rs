@@ -324,8 +324,10 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
-            curtain_hson: hson::to_vec(&scene.curtain).expect("curtain state contains only serializable data"),
-            pictures_hson: hson::to_vec(&scene.pictures).expect("picture state contains only serializable data"),
+            curtain_hson: hson::to_vec(&scene.curtain)
+                .expect("curtain state contains only serializable data"),
+            pictures_hson: hson::to_vec(&scene.pictures)
+                .expect("picture state contains only serializable data"),
             background: scene.background.as_ref().map(Into::into),
             sprites: scene.sprites.iter().map(Into::into).collect(),
             character_positions: scene
@@ -351,11 +353,19 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
-            curtain: if scene.curtain_hson.is_empty() { None } else {
-                hson::from_slice(&scene.curtain_hson).map_err(|error| StorageError::InvalidSave(format!("invalid curtain state: {error}")))?
+            curtain: if scene.curtain_hson.is_empty() {
+                None
+            } else {
+                hson::from_slice(&scene.curtain_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid curtain state: {error}"))
+                })?
             },
-            pictures: if scene.pictures_hson.is_empty() { BTreeMap::new() } else {
-                hson::from_slice(&scene.pictures_hson).map_err(|error| StorageError::InvalidSave(format!("invalid picture state: {error}")))?
+            pictures: if scene.pictures_hson.is_empty() {
+                BTreeMap::new()
+            } else {
+                hson::from_slice(&scene.pictures_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid picture state: {error}"))
+                })?
             },
             background: scene.background.map(Into::into),
             sprites: scene.sprites.into_iter().map(Into::into).collect(),
@@ -593,11 +603,15 @@ mod tests {
 
     #[test]
     fn save_roundtrip_preserves_thumbnail_and_overwrite_can_clear_it() {
-        let mut data = SaveGameData { thumbnail_png: vec![137, 80, 78, 71], ..Default::default() };
+        let mut data = SaveGameData {
+            thumbnail_png: vec![137, 80, 78, 71],
+            ..Default::default()
+        };
         let restored = decode_save_data(&encode_save_data(&data)).expect("save decodes");
         assert_eq!(restored.thumbnail_png, data.thumbnail_png);
         data.thumbnail_png.clear();
-        let restored = decode_save_data(&encode_save_data(&data)).expect("save without preview decodes");
+        let restored =
+            decode_save_data(&encode_save_data(&data)).expect("save without preview decodes");
         assert!(restored.thumbnail_png.is_empty());
     }
 
@@ -605,14 +619,37 @@ mod tests {
     fn save_roundtrip_preserves_scene_picture_motion() {
         use crate::scene::pictures::{PictureFade, PictureMotion, PictureState};
         let mut data = SaveGameData::default();
-        data.scene.pictures.insert("room".into(), PictureState {
-            id:"room".into(),path:"textures/room.png".into(),rect:Some([0.0,0.0,128.0,64.0]),
-            position:[60.0,40.0],scale:2.0,rotation:-10.0,layer:5.0,alpha:0.5,
-            motion:Some(PictureMotion {from:[50.0,50.0,2.0,-10.0,0.0],to:[70.0,30.0,2.0,-10.0,1.0],elapsed:0.2,seconds:0.4,ease:"easeOutQuad".into(),remove:false,offsets_x:Vec::new()}),
-            fade:Some(PictureFade {from:0.0,to:1.0,elapsed:0.15,seconds:0.3,remove:false}),
-        });
-        let restored=decode_save_data(&encode_save_data(&data)).expect("picture save decodes");
-        assert_eq!(restored.scene.pictures,data.scene.pictures);
+        data.scene.pictures.insert(
+            "room".into(),
+            PictureState {
+                id: "room".into(),
+                path: "textures/room.png".into(),
+                rect: Some([0.0, 0.0, 128.0, 64.0]),
+                position: [60.0, 40.0],
+                scale: 2.0,
+                rotation: -10.0,
+                layer: 5.0,
+                alpha: 0.5,
+                motion: Some(PictureMotion {
+                    from: [50.0, 50.0, 2.0, -10.0, 0.0],
+                    to: [70.0, 30.0, 2.0, -10.0, 1.0],
+                    elapsed: 0.2,
+                    seconds: 0.4,
+                    ease: "easeOutQuad".into(),
+                    remove: false,
+                    offsets_x: Vec::new(),
+                }),
+                fade: Some(PictureFade {
+                    from: 0.0,
+                    to: 1.0,
+                    elapsed: 0.15,
+                    seconds: 0.3,
+                    remove: false,
+                }),
+            },
+        );
+        let restored = decode_save_data(&encode_save_data(&data)).expect("picture save decodes");
+        assert_eq!(restored.scene.pictures, data.scene.pictures);
     }
 
     #[test]

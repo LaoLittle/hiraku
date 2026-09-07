@@ -564,11 +564,15 @@ mod native_ui {
 
     /// Horizontal text alignment: 0 = left, 0.5 = center, 1 = right.
     #[hks(name = "textAlign", receiver)]
-    fn ui_text_align(context: &mut UiVmContext, node: UiNodeHandle, align: f64)
-        -> Result<UiNodeHandle, NativeError>
-    {
+    fn ui_text_align(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        align: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
         if !align.is_finite() || !(0.0..=1.0).contains(&align) {
-            return Err(NativeError::message("text alignment must be between 0 and 1"));
+            return Err(NativeError::message(
+                "text alignment must be between 0 and 1",
+            ));
         }
         context.node_mut(node)?.text_align = Some(align as f32);
         Ok(node)
@@ -804,7 +808,9 @@ mod native_ui {
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Button(_)) {
-            return Err(NativeError::message("pressed content is only valid on image buttons"));
+            return Err(NativeError::message(
+                "pressed content is only valid on image buttons",
+            ));
         }
         draft.pressed = Some(content);
         Ok(node)
@@ -1005,10 +1011,13 @@ mod storage_actions {
 
     #[hks]
     fn thumbnail(_context: &mut UiVmContext, slot: String) -> Result<Option<String>, NativeError> {
-        if !crate::storage::save_slot_exists(&slot).map_err(|e| NativeError::message(e.to_string()))? {
+        if !crate::storage::save_slot_exists(&slot)
+            .map_err(|e| NativeError::message(e.to_string()))?
+        {
             return Ok(None);
         }
-        let data = crate::storage::load_save_data(&slot).map_err(|e| NativeError::message(e.to_string()))?;
+        let data = crate::storage::load_save_data(&slot)
+            .map_err(|e| NativeError::message(e.to_string()))?;
         Ok((!data.thumbnail_png.is_empty()).then(|| format!("save-thumbnail://{slot}")))
     }
 
@@ -1040,8 +1049,13 @@ mod preference_actions {
     use super::*;
     use crate::storage::{PreferenceChange, UserSettings};
 
-    fn change(context: &mut UiVmContext, value: PreferenceChange) -> Result<UiEffectHandle, NativeError> {
-        UserSettings::default().apply(&value).map_err(NativeError::message)?;
+    fn change(
+        context: &mut UiVmContext,
+        value: PreferenceChange,
+    ) -> Result<UiEffectHandle, NativeError> {
+        UserSettings::default()
+            .apply(&value)
+            .map_err(NativeError::message)?;
         Ok(context.insert_effect(UiEffect::SetPreference(value)))
     }
 
@@ -1066,27 +1080,46 @@ mod preference_actions {
         Ok(context.values.preferences().display_available)
     }
     #[hks(name = "setMasterVolume")]
-    fn set_master_volume(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+    fn set_master_volume(
+        context: &mut UiVmContext,
+        value: f64,
+    ) -> Result<UiEffectHandle, NativeError> {
         change(context, PreferenceChange::MasterVolume(value as f32))
     }
     #[hks(name = "setTextSpeed")]
-    fn set_text_speed(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+    fn set_text_speed(
+        context: &mut UiVmContext,
+        value: f64,
+    ) -> Result<UiEffectHandle, NativeError> {
         change(context, PreferenceChange::TextSpeed(value as f32))
     }
     #[hks(name = "setAutoDelay")]
-    fn set_auto_delay(context: &mut UiVmContext, value: f64) -> Result<UiEffectHandle, NativeError> {
+    fn set_auto_delay(
+        context: &mut UiVmContext,
+        value: f64,
+    ) -> Result<UiEffectHandle, NativeError> {
         change(context, PreferenceChange::AutoDelay(value as f32))
     }
     #[hks(name = "setFullscreen")]
-    fn set_fullscreen(context: &mut UiVmContext, value: bool) -> Result<UiEffectHandle, NativeError> {
+    fn set_fullscreen(
+        context: &mut UiVmContext,
+        value: bool,
+    ) -> Result<UiEffectHandle, NativeError> {
         change(context, PreferenceChange::Fullscreen(value))
     }
     #[hks(name = "setResolution")]
-    fn set_resolution(context: &mut UiVmContext, width: u32, height: u32) -> Result<UiEffectHandle, NativeError> {
+    fn set_resolution(
+        context: &mut UiVmContext,
+        width: u32,
+        height: u32,
+    ) -> Result<UiEffectHandle, NativeError> {
         change(context, PreferenceChange::Resolution { width, height })
     }
     #[hks(name = "setAutoDialogue")]
-    fn set_auto_dialogue(context: &mut UiVmContext, enabled: bool) -> Result<UiEffectHandle, NativeError> {
+    fn set_auto_dialogue(
+        context: &mut UiVmContext,
+        enabled: bool,
+    ) -> Result<UiEffectHandle, NativeError> {
         Ok(context.insert_effect(UiEffect::SetAutoDialogue(enabled)))
     }
 }
@@ -2151,16 +2184,22 @@ fn materialize_node(
     draft.layout.animation = draft.animation;
     draft.layout.phase_animation = draft.phase_animation.clone();
     if draft.layout.hover_offset.is_some() && draft.phase_animation.is_some() {
-        return Err(UiVmError::Invalid("hoverOffset and a phase animation require separate nested nodes".into()));
+        return Err(UiVmError::Invalid(
+            "hoverOffset and a phase animation require separate nested nodes".into(),
+        ));
     }
-    if draft.layout.hover_offset.is_some() && draft.animation.is_some_and(|animation| animation.repeats()) {
-        return Err(UiVmError::Invalid("hoverOffset requires a non-repeating transition".into()));
+    if draft.layout.hover_offset.is_some()
+        && draft.animation.is_some_and(|animation| animation.repeats())
+    {
+        return Err(UiVmError::Invalid(
+            "hoverOffset requires a non-repeating transition".into(),
+        ));
     }
     if let Some(binding) = &draft.hover_active {
         let reactive = reactive_binding(binding, program, context);
         let value = evaluate_binding_value(&reactive, registry, context)?;
-        draft.layout.hover_active = bool::from_hks_value(&value)
-            .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+        draft.layout.hover_active =
+            bool::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?;
         draft.layout.reactive_hover_active = Some(reactive);
     }
     draft.layout.visible_binding = None;
@@ -2246,10 +2285,14 @@ fn materialize_node(
                 }
             };
             let is_template = reactive.is_none() && text.contains("${");
-            let text = if is_template { context
-                .values
-                .expand_binding(&text)
-                .map_err(|error| UiVmError::Invalid(error.to_string()))? } else { text };
+            let text = if is_template {
+                context
+                    .values
+                    .expand_binding(&text)
+                    .map_err(|error| UiVmError::Invalid(error.to_string()))?
+            } else {
+                text
+            };
             Ok(ScreenNode::Text(TextNode {
                 binding: is_template.then(|| text.clone()),
                 reactive_text: if is_template { None } else { reactive },
@@ -2482,7 +2525,9 @@ fn materialize_node(
             }
             let normal = materialize_node(normal_handles[0], program, registry, context, textures)?;
             if draft.pressed.is_some() && !matches!(&normal, ScreenNode::Image(_)) {
-                return Err(UiVmError::Invalid("pressed content is only valid on image buttons".into()));
+                return Err(UiVmError::Invalid(
+                    "pressed content is only valid on image buttons".into(),
+                ));
             }
             let value = if matches!(&value, Value::Unit) {
                 None
@@ -2529,13 +2574,21 @@ fn materialize_node(
                     let pressed = if let Some(content) = draft.pressed {
                         let handles = closure_children(Some(content), program, registry, context)?;
                         let [handle] = handles.as_slice() else {
-                            return Err(UiVmError::Invalid("pressed content must produce exactly one image node".into()));
+                            return Err(UiVmError::Invalid(
+                                "pressed content must produce exactly one image node".into(),
+                            ));
                         };
-                        let ScreenNode::Image(image) = materialize_node(*handle, program, registry, context, textures)? else {
-                            return Err(UiVmError::Invalid("pressed content must produce image(...)".into()));
+                        let ScreenNode::Image(image) =
+                            materialize_node(*handle, program, registry, context, textures)?
+                        else {
+                            return Err(UiVmError::Invalid(
+                                "pressed content must produce image(...)".into(),
+                            ));
                         };
                         Some(image)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let hovered = closure_children(draft.hovered, program, registry, context)?;
                     let hovered = match hovered.as_slice() {
                         [] => None,
@@ -2607,7 +2660,10 @@ fn stored_value(value: Value) -> Result<StoredValue, UiVmError> {
 fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTexture, UiVmError> {
     if let Some(slot) = name.strip_prefix("save-thumbnail://") {
         hiraku_storage::validate_key(slot).map_err(|e| UiVmError::Invalid(e.to_string()))?;
-        return Ok(ScreenTexture { path: name.into(), rect: None });
+        return Ok(ScreenTexture {
+            path: name.into(),
+            rect: None,
+        });
     }
     let texture = textures
         .resolve(name)
@@ -2624,26 +2680,52 @@ mod tests {
 
     #[test]
     fn image_button_has_independent_pressed_artwork() {
-        let evaluate = |source: &str| evaluate_ui_component_named_with_args(
-            "memory://button.ui.hks", source, UiContext::default(),
-            &TextureCatalog::default(), &TermCatalog::default(), &[],
-        );
-        let screen = evaluate(r#"
+        let evaluate = |source: &str| {
+            evaluate_ui_component_named_with_args(
+                "memory://button.ui.hks",
+                source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+                &[],
+            )
+        };
+        let screen = evaluate(
+            r#"
             import ui.widgets.*
             canvas {
                 button { image("save-thumbnail://alice") }
                     .hovered { image("save-thumbnail://bob") }
                     .pressed { image("save-thumbnail://pressed").size(.abs(32, 24)) }
             }
-        "#).expect("image states build");
-        let ScreenNode::ImageButton(button) = &screen.children[0] else { panic!("expected image button") };
+        "#,
+        )
+        .expect("image states build");
+        let ScreenNode::ImageButton(button) = &screen.children[0] else {
+            panic!("expected image button")
+        };
         assert_eq!(button.texture.path, "save-thumbnail://alice");
-        assert_eq!(button.hovered_texture.as_ref().expect("hover image").path, "save-thumbnail://bob");
-        assert_eq!(button.pressed_texture.as_ref().expect("press image").path, "save-thumbnail://pressed");
+        assert_eq!(
+            button.hovered_texture.as_ref().expect("hover image").path,
+            "save-thumbnail://bob"
+        );
+        assert_eq!(
+            button.pressed_texture.as_ref().expect("press image").path,
+            "save-thumbnail://pressed"
+        );
         assert!(button.pressed_layout.is_some());
-        for content in ["", "text(\"invalid\")", "image(\"save-thumbnail://alice\"); image(\"save-thumbnail://bob\")"] {
-            let source = format!("import ui.widgets.*\ncanvas {{ button {{ image(\"save-thumbnail://alice\") }}.pressed {{ {content} }} }}");
-            assert!(evaluate(&source).is_err(), "invalid pressed content must be rejected");
+        for content in [
+            "",
+            "text(\"invalid\")",
+            "image(\"save-thumbnail://alice\"); image(\"save-thumbnail://bob\")",
+        ] {
+            let source = format!(
+                "import ui.widgets.*\ncanvas {{ button {{ image(\"save-thumbnail://alice\") }}.pressed {{ {content} }} }}"
+            );
+            assert!(
+                evaluate(&source).is_err(),
+                "invalid pressed content must be rejected"
+            );
         }
     }
 
@@ -2660,16 +2742,33 @@ mod tests {
                     column { text("bob") }.hoverOffset(-20, 0)
                 }
             "#,
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("hover UI builds with optional closure arguments");
-        let ScreenNode::Column(column) = &screen.children[0] else { panic!("expected column") };
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("hover UI builds with optional closure arguments");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("expected column")
+        };
         assert_eq!(column.layout.hover_offset, Some([-84.0, 0.0]));
         assert!(column.layout.hover_active);
-        let mut binding = column.layout.reactive_hover_active.clone().expect("selection is reactive");
-        binding.globals.insert("selected".into(), Value::Bool(false));
-        assert_eq!(evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
-            .expect("selection reevaluates"), Value::Bool(false));
-        let ScreenNode::Column(column) = &screen.children[1] else { panic!("expected column") };
+        let mut binding = column
+            .layout
+            .reactive_hover_active
+            .clone()
+            .expect("selection is reactive");
+        binding
+            .globals
+            .insert("selected".into(), Value::Bool(false));
+        assert_eq!(
+            evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
+                .expect("selection reevaluates"),
+            Value::Bool(false)
+        );
+        let ScreenNode::Column(column) = &screen.children[1] else {
+            panic!("expected column")
+        };
         assert!(!column.layout.hover_active);
     }
 
@@ -2685,23 +2784,43 @@ mod tests {
             }
             canvas { text(${label(level)}) }
         "#;
-        let screen = evaluate_ui_component_named_with_args("memory://numeric.ui.hks", source,
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[])
-            .expect("numeric UI builds");
-        let ScreenNode::Text(text) = &screen.children[0] else { panic!("expected text") };
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://numeric.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("numeric UI builds");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("expected text")
+        };
         assert_eq!(text.text, "0.5");
-        let mut binding = text.reactive_text.clone().expect("reactive expression retained");
+        let mut binding = text
+            .reactive_text
+            .clone()
+            .expect("reactive expression retained");
         binding.globals.insert("level".into(), Value::Number(0.87));
-        assert_eq!(evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
-            .expect("updated label evaluates"), Value::String("0.9".into()));
+        assert_eq!(
+            evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
+                .expect("updated label evaluates"),
+            Value::String("0.9".into())
+        );
     }
 
     #[test]
     fn text_alignment_is_script_owned_and_validated() {
-        let evaluate = |source: &str| evaluate_ui_component_named_with_args(
-            "memory://alignment.ui.hks", source, UiContext::default(),
-            &TextureCatalog::default(), &TermCatalog::default(), &[],
-        );
+        let evaluate = |source: &str| {
+            evaluate_ui_component_named_with_args(
+                "memory://alignment.ui.hks",
+                source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+                &[],
+            )
+        };
         let screen = evaluate("import ui.widgets.*\ncanvas { text(\"alice\").textAlign(0.5) }")
             .expect("centered text compiles");
         assert!(matches!(&screen.children[0], ScreenNode::Text(text) if text.align == Some(0.5)));
@@ -2711,7 +2830,8 @@ mod tests {
     #[test]
     fn save_thumbnail_sources_do_not_require_a_texture_descriptor() {
         let textures = TextureCatalog::default();
-        let source = resolve_texture(&textures, "save-thumbnail://manual-1").expect("valid thumbnail source");
+        let source = resolve_texture(&textures, "save-thumbnail://manual-1")
+            .expect("valid thumbnail source");
         assert_eq!(source.path, "save-thumbnail://manual-1");
         assert!(resolve_texture(&textures, "save-thumbnail://../alice").is_err());
     }
@@ -3189,15 +3309,19 @@ canvas {
             UiContext::default(),
             &TextureCatalog::default(),
             &TermCatalog::default(),
-        ).expect("reusable slot buttons must evaluate");
+        )
+        .expect("reusable slot buttons must evaluate");
         assert_eq!(screen.children.len(), 2);
         for (node, key) in screen.children.iter().zip(["alice", "bob"]) {
-            let ScreenNode::Button(button) = node else { panic!("expected a slot button") };
+            let ScreenNode::Button(button) = node else {
+                panic!("expected a slot button")
+            };
             let (effects, _) = evaluate_ui_callback(
                 button.on_click.as_ref().expect("callback retained"),
                 &BTreeMap::new(),
                 &crate::ui::UiModels::default(),
-            ).expect("captured slot callback executes without writing storage");
+            )
+            .expect("captured slot callback executes without writing storage");
             assert_eq!(effects.first(), Some(&UiEffect::Save { slot: key.into() }));
             assert!(matches!(effects.get(1), Some(UiEffect::CloseUi { .. })));
             assert_eq!(effects.len(), 2);
@@ -3207,7 +3331,9 @@ canvas {
     #[test]
     fn preference_getters_do_not_reserve_script_global_names() {
         let preferences = crate::storage::UserSettings {
-            display_available: true, fullscreen: true, bgm_volume: 0.25,
+            display_available: true,
+            fullscreen: true,
+            bgm_volume: 0.25,
             ..Default::default()
         };
         let context = UiContext::default().with_preferences(preferences);
@@ -3223,13 +3349,20 @@ canvas {
     button { text("Fullscreen") }.enabled(fullscreen)
     progress(bgmVolume)
 }"#,
-            context, &TextureCatalog::default(), &TermCatalog::default(),
-        ).expect("private host preferences must not collide with UI declarations");
+            context,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("private host preferences must not collide with UI declarations");
         for node in &screen.children[..2] {
-            let ScreenNode::Button(button) = node else { panic!("expected button") };
+            let ScreenNode::Button(button) = node else {
+                panic!("expected button")
+            };
             assert!(button.enabled);
         }
-        let ScreenNode::Bar(bar) = &screen.children[2] else { panic!("expected progress") };
+        let ScreenNode::Bar(bar) = &screen.children[2] else {
+            panic!("expected progress")
+        };
         assert_eq!(bar.value, 0.25);
     }
 

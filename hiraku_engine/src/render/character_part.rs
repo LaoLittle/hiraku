@@ -44,7 +44,9 @@ pub struct AlphaMaskKey {
 
 impl From<&AlphaMaskMaterial> for AlphaMaskKey {
     fn from(material: &AlphaMaskMaterial) -> Self {
-        Self { multiply: material.multiply }
+        Self {
+            multiply: material.multiply,
+        }
     }
 }
 
@@ -93,9 +95,12 @@ impl Material for AlphaMaskMaterial {
         key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         if key.bind_group_data.multiply {
-            descriptor.fragment.as_mut()
+            descriptor
+                .fragment
+                .as_mut()
                 .expect("character material requires a fragment stage")
-                .shader_defs.push("MASK_MULTIPLY".into());
+                .shader_defs
+                .push("MASK_MULTIPLY".into());
             specialize_multiply_blend(descriptor);
         }
         Ok(())
@@ -170,12 +175,12 @@ fn specialize_multiply_blend(descriptor: &mut RenderPipelineDescriptor) {
 
 fn multiply_blend_state() -> BlendState {
     BlendState {
-            color: BlendComponent {
-                src_factor: BlendFactor::Dst,
-                dst_factor: BlendFactor::OneMinusSrcAlpha,
-                operation: BlendOperation::Add,
-            },
-            alpha: BlendComponent::OVER,
+        color: BlendComponent {
+            src_factor: BlendFactor::Dst,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            operation: BlendOperation::Add,
+        },
+        alpha: BlendComponent::OVER,
     }
 }
 
@@ -200,9 +205,15 @@ mod tests {
     #[test]
     fn mask_blend_mode_is_part_of_pipeline_key_not_uniform_layout() {
         let mut material = AlphaMaskMaterial {
-            texture: Handle::default(), mask_texture: Handle::default(),
-            tint: Vec4::ONE, main_rect: Vec4::ONE, mask_rect: Vec4::ONE,
-            offsets: Vec4::ZERO, opacity: 0.5, mask_enabled: 1.0, multiply: false,
+            texture: Handle::default(),
+            mask_texture: Handle::default(),
+            tint: Vec4::ONE,
+            main_rect: Vec4::ONE,
+            mask_rect: Vec4::ONE,
+            offsets: Vec4::ZERO,
+            opacity: 0.5,
+            mask_enabled: 1.0,
+            multiply: false,
         };
         let normal = material.bind_group_data();
         material.multiply = true;

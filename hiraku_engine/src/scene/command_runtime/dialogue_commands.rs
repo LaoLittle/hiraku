@@ -16,6 +16,10 @@ pub(super) fn dispatch_dialogue_command(
     ui_style: &UiStyle,
 ) {
     match command {
+        DialogueCommand::Speed(multiplier) => {
+            dialogue_state.effect.cps =
+                super::super::dialogue::DialogueTextEffect::default().cps * multiplier;
+        }
         DialogueCommand::Say {
             speaker,
             text,

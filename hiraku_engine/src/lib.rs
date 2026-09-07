@@ -28,48 +28,65 @@ pub fn validate_story_source(path: &str, source: &str) -> Result<(), String> {
 
 /// Type-check a UI source with the standard widget module, without rendering.
 pub fn validate_ui_source(path: &str, source: &str) -> Result<(), String> {
-    script::validate_ui_source(path,source)
+    script::validate_ui_source(path, source)
 }
 
 /// Build a declarative UI document against loose project descriptors, without
 /// rendering or dispatching its effects. Also checks textures and callbacks.
 /// Standard UI models are supplied as empty data; project-specific globals
 /// must be checked through the context-taking variant.
-pub fn validate_ui_document(root: &std::path::Path, settings: &str, path: &str) -> Result<(), String> {
-    use std::collections::BTreeMap;
+pub fn validate_ui_document(
+    root: &std::path::Path,
+    settings: &str,
+    path: &str,
+) -> Result<(), String> {
     use state::StoredValue as V;
+    use std::collections::BTreeMap;
     let context = UiContext::new(BTreeMap::from([
-        ("dialogue".into(), V::Map(BTreeMap::from([
-            ("speaker".into(), V::String(String::new())),
-            ("text".into(), V::String(String::new())),
-            ("visible".into(), V::Bool(false)),
-            ("revealedCharacters".into(), V::Int(0)),
-            ("canAdvance".into(), V::Bool(false)),
-            ("autoEnabled".into(), V::Bool(false)),
-        ]))),
-        ("history".into(), V::Map(BTreeMap::from([
-            ("text".into(), V::String(String::new())),
-            ("entries".into(), V::Array(Vec::new())),
-        ]))),
-        ("choice".into(), V::Map(BTreeMap::from([
-            ("prompt".into(), V::String(String::new())),
-            ("options".into(), V::Array(vec![V::String("Option".into())])),
-            ("enabled".into(), V::Array(vec![V::Bool(true)])),
-        ]))),
+        (
+            "dialogue".into(),
+            V::Map(BTreeMap::from([
+                ("speaker".into(), V::String(String::new())),
+                ("text".into(), V::String(String::new())),
+                ("visible".into(), V::Bool(false)),
+                ("revealedCharacters".into(), V::Int(0)),
+                ("canAdvance".into(), V::Bool(false)),
+                ("autoEnabled".into(), V::Bool(false)),
+            ])),
+        ),
+        (
+            "history".into(),
+            V::Map(BTreeMap::from([
+                ("text".into(), V::String(String::new())),
+                ("entries".into(), V::Array(Vec::new())),
+            ])),
+        ),
+        (
+            "choice".into(),
+            V::Map(BTreeMap::from([
+                ("prompt".into(), V::String(String::new())),
+                ("options".into(), V::Array(vec![V::String("Option".into())])),
+                ("enabled".into(), V::Array(vec![V::Bool(true)])),
+            ])),
+        ),
     ]));
     validate_ui_document_with_context(root, settings, path, context)
 }
 
 /// Offline UI validation with explicitly supplied model data.
 pub fn validate_ui_document_with_context(
-    root: &std::path::Path, settings: &str, path: &str, context: UiContext,
+    root: &std::path::Path,
+    settings: &str,
+    path: &str,
+    context: UiContext,
 ) -> Result<(), String> {
     let vfs = vfs::HdpVfs::new_with_config(root, settings, "startup.hks");
     let source = vfs.read_text(path).map_err(|error| error.to_string())?;
     let textures = texture::load_texture_catalog(&vfs).map_err(|error| error.to_string())?;
     let terms = glossary::load_term_catalog(&vfs).map_err(|error| error.to_string())?;
     script::evaluate_ui_component_named_with_args(path, &source, context, &textures, &terms, &[])
-        .map(|_| ()).map_err(|error| error.to_string())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 use std::sync::Arc;
@@ -218,6 +235,7 @@ impl Plugin for HirakuPlugin {
         effect::transition::load_internal_shaders(app);
         render::character_part::load_internal_shaders(app);
         render::world_sprite::install(app);
+        scene::character_composite::install(app);
 
         let archive_path = archive_path_from_config(app.world().resource::<RuntimeLaunchConfig>());
         let archive_store = app.world().resource::<HdpArchiveStore>().clone();
@@ -251,10 +269,7 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(Update, assign_render_layers.after(process_script_commands))
             .configure_sets(Update, HirakuRuntimeSystems.run_if(runtime_initialized))
-            .add_systems(
-                Update,
-                boot_runtime.run_if(runtime_initialized),
-            )
+            .add_systems(Update, boot_runtime.run_if(runtime_initialized))
             .add_systems(
                 Update,
                 reconcile_restored_characters
@@ -403,23 +418,38 @@ impl Plugin for HirakuPlugin {
                 Update,
                 (
                     apply_animation_cancellations.in_set(HirakuRuntimeSystems),
-                    animate_visual_tweens.in_set(HirakuRuntimeSystems),
-                    scene::curtain::update_curtains.after(process_script_commands).before(animate_visual_tweens).in_set(HirakuRuntimeSystems),
-                    scene::curtain::complete_curtain_waits.after(animate_visual_tweens).after(scene::curtain::update_curtains).in_set(HirakuRuntimeSystems),
+                    animate_visual_tweens
+                        .after(poll_pending_character_shows)
+                        .in_set(HirakuRuntimeSystems),
+                    scene::curtain::update_curtains
+                        .after(process_script_commands)
+                        .before(animate_visual_tweens)
+                        .in_set(HirakuRuntimeSystems),
+                    scene::curtain::complete_curtain_waits
+                        .after(animate_visual_tweens)
+                        .after(scene::curtain::update_curtains)
+                        .in_set(HirakuRuntimeSystems),
                     animate_audio_fades.in_set(HirakuRuntimeSystems),
                     scene::poll_sfx_playback.in_set(HirakuRuntimeSystems),
                     animate_custom_effects.in_set(HirakuRuntimeSystems),
-                    scene::pictures::sync_pictures.after(scene::process_script_commands).in_set(HirakuRuntimeSystems),
+                    scene::pictures::sync_pictures
+                        .after(scene::process_script_commands)
+                        .in_set(HirakuRuntimeSystems),
                     animate_rule_transitions.in_set(HirakuRuntimeSystems),
                     animate_camera_shake.in_set(HirakuRuntimeSystems),
-                    animate_character_motion_effects.in_set(HirakuRuntimeSystems),
+                    animate_character_motion_effects
+                        .after(poll_pending_character_shows)
+                        .in_set(HirakuRuntimeSystems),
                     poll_voice_playback.in_set(HirakuRuntimeSystems),
                     poll_pending_character_shows
                         .after(reconcile_restored_characters)
+                        .after(process_script_commands)
                         .in_set(HirakuRuntimeSystems),
                     tick_animation_waits.in_set(HirakuRuntimeSystems),
                     sync_scene_snapshot
                         .after(poll_pending_character_shows)
+                        .after(animate_character_motion_effects)
+                        .after(animate_visual_tweens)
                         .after(reconcile_restored_bgm)
                         .in_set(HirakuRuntimeSystems),
                 ),

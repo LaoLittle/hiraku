@@ -165,10 +165,16 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
 
         match command {
             ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)) => {
-                if let Err(error)=save_runtime_slot(&slot,&script_runtime,&shared_state,&[]) { warn!("failed to save slot `{slot}`: {error}"); }
+                if let Err(error) = save_runtime_slot(&slot, &script_runtime, &shared_state, &[]) {
+                    warn!("failed to save slot `{slot}`: {error}");
+                }
             }
             ScriptCommand::Stage(StageCommand::Picture(picture)) => {
-                if let Err(error)=pictures::apply_picture_command(&mut shared_state.0.pictures,picture) { warn!("{error}"); }
+                if let Err(error) =
+                    pictures::apply_picture_command(&mut shared_state.0.pictures, picture)
+                {
+                    warn!("{error}");
+                }
             }
             ScriptCommand::Runtime(RuntimeCommand::Log(message)) => info!("[hks] {message}"),
             ScriptCommand::Stage(StageCommand::SetBackground {
@@ -344,7 +350,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     _ => {}
                 }
                 let name = match &command {
-                    SettingsCommand::Adjust { name, .. } | SettingsCommand::Set { name, .. } => name,
+                    SettingsCommand::Adjust { name, .. } | SettingsCommand::Set { name, .. } => {
+                        name
+                    }
                     _ => unreachable!("non-volume settings handled above"),
                 };
                 let volume = match name.as_str() {
@@ -378,8 +386,14 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 &mut render_assets.preview,
             ),
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }) => {
-                hide_character_entities(&mut commands, &mut stage, &mut pending_characters,
-                    &mut animations, actor_id.as_deref(), fade_ms);
+                hide_character_entities(
+                    &mut commands,
+                    &mut stage,
+                    &mut pending_characters,
+                    &mut animations,
+                    actor_id.as_deref(),
+                    fade_ms,
+                );
             }
             ScriptCommand::Character(CharacterCommand::Show {
                 actor_id,
@@ -424,17 +438,33 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     animation_id,
                 );
             }
-            ScriptCommand::Stage(StageCommand::SetCurtain { opacity, fade, mask, softness }) => {
+            ScriptCommand::Stage(StageCommand::SetCurtain {
+                opacity,
+                fade,
+                mask,
+                softness,
+            }) => {
                 if let Some(overlay) = stage.overlay {
                     let mask = mask.map(|path| crate::render::world_sprite::DissolveMask {
-                        image: asset_server.load_builder().with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
-                            settings.is_srgb = false;
-                        }).load(path.clone()),
-                        path, softness, canvas_size: Vec2::ONE, reversed: false,
+                        image: asset_server
+                            .load_builder()
+                            .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+                                settings.is_srgb = false;
+                            })
+                            .load(path.clone()),
+                        path,
+                        softness,
+                        canvas_size: Vec2::ONE,
+                        reversed: false,
                     });
-                    commands.entity(overlay).remove::<(VisualTween, super::curtain::CurtainFailed)>().try_insert(super::curtain::PendingCurtain {
-                        opacity, duration: fade, mask,
-                    });
+                    commands
+                        .entity(overlay)
+                        .remove::<(VisualTween, super::curtain::CurtainFailed)>()
+                        .try_insert(super::curtain::PendingCurtain {
+                            opacity,
+                            duration: fade,
+                            mask,
+                        });
                 }
             }
             ScriptCommand::Stage(StageCommand::AwaitCurtain { done }) => {
@@ -442,9 +472,9 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             }
             ScriptCommand::Animation(AnimationCommand::Delay { duration, done }) => {
                 waits.items.push(super::animation_runtime::PendingWait {
-                        timer: Timer::new(duration, TimerMode::Once),
-                        animation_id: None,
-                        done,
+                    timer: Timer::new(duration, TimerMode::Once),
+                    animation_id: None,
+                    done,
                 });
             }
             ScriptCommand::Animation(AnimationCommand::Wait { ids, done }) => {
@@ -514,7 +544,10 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 if navigation.reset != NavigationReset::Session
                     && let Some(previous) = script_runtime.story.as_ref()
                 {
-                    next_story.inherit_native_state(previous, navigation.reset == NavigationReset::Presentation);
+                    next_story.inherit_native_state(
+                        previous,
+                        navigation.reset == NavigationReset::Presentation,
+                    );
                 }
 
                 if navigation.kind == NavigationKind::Goto {

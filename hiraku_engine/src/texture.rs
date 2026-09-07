@@ -29,9 +29,14 @@ impl TextureCatalog {
 /// when a picture, character part or UI image is actually instantiated.
 pub fn prepare_texture_catalog(commands: &mut Commands, vfs: &HdpVfs) {
     match load_texture_catalog(vfs) {
-        Ok(catalog) => { commands.insert_resource(catalog); }
+        Ok(catalog) => {
+            commands.insert_resource(catalog);
+        }
         Err(error) => {
-            crate::script::emit_script_diagnostic("failed to load texture catalog", &error.to_string());
+            crate::script::emit_script_diagnostic(
+                "failed to load texture catalog",
+                &error.to_string(),
+            );
             commands.insert_resource(TextureCatalog::default());
         }
     }
@@ -136,31 +141,48 @@ mod tests {
 
     #[test]
     fn startup_reads_descriptors_without_an_asset_server_or_image_payload() {
-        use hiraku_hdp::{Archive, PackageBuilder, PackOptions};
+        use hiraku_hdp::{Archive, PackOptions, PackageBuilder};
         use std::{path::PathBuf, sync::Arc};
         let mut package = PackageBuilder::new();
-        package.add_file("settings.hson", br#".{ texturesDir: "textures" }"#)
+        package
+            .add_file("settings.hson", br#".{ texturesDir: "textures" }"#)
             .expect("settings fixture");
-        package.add_file("textures/alice.texture.hson", br#".{
+        package
+            .add_file(
+                "textures/alice.texture.hson",
+                br#".{
             image: "alice.png", regions: .{ "alice/face": (8, 16, 32, 48) }
-        }"#).expect("descriptor fixture");
+        }"#,
+            )
+            .expect("descriptor fixture");
         // Intentionally omit alice.png. Merely indexing it must not request,
         // decode, or require the image to be present.
-        let bytes = package.build(PackOptions::default()).expect("fixture package");
+        let bytes = package
+            .build(PackOptions::default())
+            .expect("fixture package");
         let archive = Archive::from_bytes(Arc::<[u8]>::from(bytes.volumes[0].clone()))
             .expect("fixture archive");
         let store = crate::vfs::HdpArchiveStore::default();
-        store.publish(Arc::new(archive), PathBuf::from("fixture.hdp"))
+        store
+            .publish(Arc::new(archive), PathBuf::from("fixture.hdp"))
             .expect("publish fixture once");
         let vfs = HdpVfs::new_with_config_and_store(
-            "unused", "hdp://fixture.hdp/settings.hson", "startup.hks", store,
+            "unused",
+            "hdp://fixture.hdp/settings.hson",
+            "startup.hks",
+            store,
         );
         let mut app = App::new();
-        app.add_systems(Update, move |mut commands: Commands| prepare_texture_catalog(&mut commands, &vfs));
+        app.add_systems(Update, move |mut commands: Commands| {
+            prepare_texture_catalog(&mut commands, &vfs)
+        });
         app.update();
         assert!(!app.world().contains_resource::<AssetServer>());
         assert!(!app.world().contains_resource::<Assets<Image>>());
-        let entry = app.world().resource::<TextureCatalog>().resolve("alice/face")
+        let entry = app
+            .world()
+            .resource::<TextureCatalog>()
+            .resolve("alice/face")
             .expect("descriptor registered");
         assert_eq!(entry.rect, Some([8.0, 16.0, 32.0, 48.0]));
         assert!(entry.path.ends_with("textures/alice.png"));

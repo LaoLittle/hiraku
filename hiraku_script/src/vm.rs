@@ -1215,7 +1215,9 @@ impl Vm {
                         Value::Bool(value) => value.to_string(),
                         Value::String(value) => value.clone(),
                         _ => {
-                            return Err(VmError::TypeMismatch("toString expects a primitive value"));
+                            return Err(VmError::TypeMismatch(
+                                "toString expects a primitive value",
+                            ));
                         }
                     };
                     self.write(dst, Value::String(text))?;

@@ -55,18 +55,19 @@ use crate::{
 mod animation_runtime;
 mod audio_runtime;
 mod character;
+pub(crate) mod character_composite;
 mod choice;
 mod command_runtime;
-mod dialogue;
-mod runtime_menu;
-mod screen_ui;
-pub(crate) mod widgets;
-mod snapshot;
-pub(crate) mod pictures;
-pub(crate) mod save_preview;
-pub(crate) mod ui_hover;
 pub(crate) mod curtain;
+mod dialogue;
+pub(crate) mod pictures;
+mod runtime_menu;
+pub(crate) mod save_preview;
+mod screen_ui;
+mod snapshot;
+pub(crate) mod ui_hover;
 mod video_runtime;
+pub(crate) mod widgets;
 
 pub use animation_runtime::{
     AnimationState, PendingAnimationCancels, PendingWaits, animate_custom_effects,
@@ -76,19 +77,21 @@ pub use animation_runtime::{
 use animation_runtime::{PendingAnimationWait, VisualTween};
 pub(crate) use animation_runtime::{complete_missing_animation, tween_fraction};
 use audio_runtime::{
-    BgmChannel, AudioFade, BgmPrelude, SfxChannel, VoiceChannel, apply_volume_setting,
+    AudioFade, BgmChannel, BgmPrelude, SfxChannel, VoiceChannel, apply_volume_setting,
     finish_active_voice, finish_all_voices,
 };
 pub use audio_runtime::{
-    animate_audio_fades, apply_live_audio_settings, poll_voice_playback, poll_sfx_playback, prepare_bgm_preludes,
-    reconcile_restored_bgm,
+    animate_audio_fades, apply_live_audio_settings, poll_sfx_playback, poll_voice_playback,
+    prepare_bgm_preludes, reconcile_restored_bgm,
 };
 
 pub(crate) use character::apply_character_ease;
 pub use character::{
     animate_character_motion_effects, poll_pending_character_shows, reconcile_restored_characters,
 };
-use character::{hide_character_entities, queue_character_show, source_rect_from_corners, source_rect_to_corners};
+use character::{
+    hide_character_entities, queue_character_show, source_rect_from_corners, source_rect_to_corners,
+};
 pub(crate) use choice::ChoiceUi;
 use choice::clear_choice_ui;
 pub use choice::{ChoiceState, handle_choice_action_input, handle_choice_buttons};
@@ -273,6 +276,7 @@ pub struct ActiveVoice {
 }
 
 pub struct PendingCharacterShow {
+    pub whole_actor: bool,
     pub actor_id: String,
     pub entity_ids: Vec<String>,
     pub entities: Vec<Entity>,

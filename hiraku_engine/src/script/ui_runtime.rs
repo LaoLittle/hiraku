@@ -13,7 +13,10 @@ pub struct UiContext {
 
 impl UiContext {
     pub fn new(story: BTreeMap<String, StoredValue>) -> Self {
-        Self { story, ..Self::default() }
+        Self {
+            story,
+            ..Self::default()
+        }
     }
 
     /// Host settings are native context, not implicit script global declarations.

@@ -625,7 +625,8 @@ pub(crate) fn sync_inputs(
                 {
                     node.left =
                         percent(((value - min) / (max - min)).clamp(0.0, 1.0) as f32 * 100.0);
-                    node.margin.left = px(-0.5 * computed.size().y * computed.inverse_scale_factor());
+                    node.margin.left =
+                        px(-0.5 * computed.size().y * computed.inverse_scale_factor());
                 }
                 if let Some(fill) = control.fill
                     && let Ok(mut node) = nodes.get_mut(fill)

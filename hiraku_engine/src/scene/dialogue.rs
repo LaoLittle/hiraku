@@ -106,7 +106,10 @@ pub fn advance_dialogue_on_input(
 
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
-    if choice_state.waiting.is_some() || screen_state.active_root.is_some() || screen_state.pending_root.is_some() {
+    if choice_state.waiting.is_some()
+        || screen_state.active_root.is_some()
+        || screen_state.pending_root.is_some()
+    {
         dialogue_state.auto_elapsed = 0.0;
         return;
     }
@@ -238,7 +241,7 @@ pub(super) fn set_dialogue_model_reveal(
         total_chars,
         next_index: visible_prefix_chars,
         accumulator: 0.0,
-        interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+        interval: 1.0 / dialogue_state.effect.cps.max(f32::MIN_POSITIVE),
         fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
         animation_id,
     });
@@ -265,7 +268,7 @@ pub(super) fn append_dialogue_model_reveal(
             total_chars,
             next_index: previous_chars,
             accumulator: 0.0,
-            interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+            interval: 1.0 / dialogue_state.effect.cps.max(f32::MIN_POSITIVE),
             fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
             animation_id,
         });
@@ -323,7 +326,7 @@ pub(super) fn set_dialogue_line_text(
             total_chars: chars.len(),
             next_index: visible_prefix_chars,
             accumulator: 0.0,
-            interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+            interval: 1.0 / dialogue_state.effect.cps.max(f32::MIN_POSITIVE),
             fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
             animation_id,
         });
@@ -383,7 +386,7 @@ pub(super) fn append_dialogue_line_text(
                 total_chars: dialogue_state.span_entities.len(),
                 next_index: start_index,
                 accumulator: 0.0,
-                interval: (1.0 / dialogue_state.effect.cps.max(1.0)).max(0.0),
+                interval: 1.0 / dialogue_state.effect.cps.max(f32::MIN_POSITIVE),
                 fade_seconds: dialogue_state.effect.fade_seconds.max(0.0),
                 animation_id,
             });
@@ -479,18 +482,27 @@ mod preference_tests {
         {
             let mut state = app.world_mut().resource_mut::<DialogueState>();
             state.auto_enabled = true;
-            state.waiting = Some(PendingDialogueAdvance { request: None, animation_id: None });
+            state.waiting = Some(PendingDialogueAdvance {
+                request: None,
+                animation_id: None,
+            });
         }
-        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(100));
         app.update();
         assert!(app.world().resource::<DialogueState>().waiting.is_some());
         let modal = app.world_mut().spawn_empty().id();
         app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(modal);
-        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_secs(5));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(5));
         app.update();
         assert_eq!(app.world().resource::<DialogueState>().auto_elapsed, 0.0);
         app.world_mut().resource_mut::<ScreenUiState>().active_root = None;
-        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(100));
         app.update();
         assert!(app.world().resource::<DialogueState>().waiting.is_some());
         app.update();
@@ -513,10 +525,19 @@ mod preference_tests {
             state.effect.cps = 10.0;
             set_dialogue_model_reveal(&mut state, "abcdefghij", 0, None);
         }
-        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(100));
         app.update();
         let state = app.world().resource::<DialogueState>();
         assert_eq!(state.effect.cps, 10.0);
-        assert_eq!(state.reveal.as_ref().expect("reveal remains active").next_index, 2);
+        assert_eq!(
+            state
+                .reveal
+                .as_ref()
+                .expect("reveal remains active")
+                .next_index,
+            2
+        );
     }
 }

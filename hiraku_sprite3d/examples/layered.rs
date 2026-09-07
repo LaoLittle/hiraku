@@ -17,7 +17,11 @@ fn main() {
         .run();
 }
 
-fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+fn setup(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    mut layouts: ResMut<Assets<TextureAtlasLayout>>,
+) {
     let camera = commands
         .spawn((
             Camera3d::default(),
@@ -48,6 +52,13 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     ));
+    let layout = layouts.add(TextureAtlasLayout::from_grid(
+        UVec2::splat(32),
+        2,
+        1,
+        None,
+        None,
+    ));
     for (index, mode) in [
         BillboardMode::ScreenAligned,
         BillboardMode::Spherical,
@@ -62,11 +73,17 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                 custom_size: Some(Vec2::splat(2.0)),
                 layers: vec![
                     SpriteLayer {
-                        rect: Some(Rect::new(0.0, 0.0, 32.0, 32.0)),
+                        texture_atlas: Some(TextureAtlas {
+                            layout: layout.clone(),
+                            index: 0,
+                        }),
                         ..default()
                     },
                     SpriteLayer {
-                        rect: Some(Rect::new(32.0, 0.0, 64.0, 32.0)),
+                        texture_atlas: Some(TextureAtlas {
+                            layout: layout.clone(),
+                            index: 1,
+                        }),
                         mask: MaskMode::Write {
                             reference: 1,
                             cutoff: 0.0,
@@ -75,7 +92,10 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                         ..default()
                     },
                     SpriteLayer {
-                        rect: Some(Rect::new(32.0, 0.0, 64.0, 32.0)),
+                        texture_atlas: Some(TextureAtlas {
+                            layout: layout.clone(),
+                            index: 1,
+                        }),
                         blend: BlendMode::Multiply,
                         mask: MaskMode::Read(1),
                         ..default()

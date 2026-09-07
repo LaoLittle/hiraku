@@ -29,16 +29,17 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
         let size = select(layer.rect.zw, dimensions, layer.rect.z <= 0.0);
         // Clamp to source texel centers, avoiding adjacent atlas entries.
         let sample_uv = (origin + clamp(uv * size, vec2<f32>(0.5), max(size - 0.5, vec2<f32>(0.5)))) / dimensions;
-        let sample_color = textureSampleLevel(atlas, atlas_sampler, sample_uv, 0.0) * layer.tint;
+        let texel = textureSampleLevel(atlas, atlas_sampler, sample_uv, 0.0);
+        let sample_color = texel * layer.tint;
         var alpha = sample_color.a;
         let mode = u32(layer.modes.y);
         let reference = u32(layer.modes.z);
         if mode != 0u && reference >= 1u && reference <= 8u {
             if mode == 1u { alpha *= masks[reference - 1u]; }
             else {
-                let coverage = select(0.0, alpha, alpha > layer.modes.w);
+                let coverage = select(select(0.0, alpha, alpha > layer.modes.w), select(0.0, 1.0, texel.a > layer.modes.w), mode >= 4u);
                 masks[reference - 1u] = max(masks[reference - 1u], coverage);
-                if mode == 2u { continue; }
+                if mode == 2u || mode == 4u { continue; }
             }
         }
         result = compose(result, vec4<f32>(sample_color.rgb * alpha, alpha), layer.modes.x > 0.0);

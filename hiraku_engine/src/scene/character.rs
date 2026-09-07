@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 /// Hide logical actors while keeping their part entities available for reuse.
 /// Cancel pending image readiness so it cannot resurrect a hidden actor later.
@@ -25,22 +26,23 @@ pub(super) fn hide_character_entities(
         .cloned()
         .collect::<Vec<_>>();
     for name in names {
+        if let Some(root) = stage.character_roots.get(&name).copied() {
+            super::character_composite::fade_group(
+                commands,
+                root,
+                0.0,
+                Duration::from_millis(fade_ms),
+                None,
+            );
+        }
         let prefix = format!("character::{name}::");
         for (id, entity) in &stage.sprites {
             if id.starts_with(&prefix) {
                 let entity = *entity;
                 commands.queue(move |world: &mut World| {
-                    let previous = world.get::<VisualTween>(entity);
-                    let alpha = previous
-                        .and_then(|tween| {
-                            Some(
-                                tween.from_alpha?
-                                    + (tween.to_alpha? - tween.from_alpha?)
-                                        * tween_fraction(&tween.timer),
-                            )
-                        })
-                        .unwrap_or(1.0);
-                    let animation = previous.and_then(|tween| tween.animation_id.clone());
+                    let animation = world
+                        .get::<VisualTween>(entity)
+                        .and_then(|tween| tween.animation_id.clone());
                     if let Some(animation) = animation {
                         world
                             .resource_mut::<AnimationState>()
@@ -51,26 +53,9 @@ pub(super) fn hide_character_entities(
                         return;
                     };
                     entity.remove::<VisualTween>();
-                    if fade_ms == 0 || entity.get::<Visibility>() == Some(&Visibility::Hidden) {
-                        entity.insert(Visibility::Hidden).remove::<HideAfterTween>();
-                    } else {
-                        entity.insert((
-                            HideAfterTween,
-                            VisualTween {
-                                from_alpha: Some(alpha),
-                                to_alpha: Some(0.0),
-                                from_translation: None,
-                                to_translation: None,
-                                from_scale: None,
-                                to_scale: None,
-                                timer: Timer::new(
-                                    std::time::Duration::from_millis(fade_ms),
-                                    TimerMode::Once,
-                                ),
-                                animation_id: None,
-                                despawn_on_finish: false,
-                            },
-                        ));
+                    entity.insert(HideAfterTween);
+                    if fade_ms == 0 {
+                        entity.insert(Visibility::Hidden);
                     }
                 });
             }
@@ -173,34 +158,131 @@ fn restored_character_actor_id(id: &str) -> Option<&str> {
         .map(|(actor, _)| actor)
 }
 
+/// A group fade-out may be interrupted by show. Its completion callback is then
+/// replaced, so obsolete children must be retired before reversing group alpha.
+fn reconcile_group_reveal(world: &mut World, root: Entity, desired: &HashSet<Entity>) {
+    use super::character_composite::LogicalCharacterPart;
+    let children = world
+        .get::<Children>(root)
+        .map(|children| children.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for child in children {
+        if world.get::<LogicalCharacterPart>(child).is_none() {
+            continue;
+        }
+        let animation = world
+            .get_mut::<VisualTween>(child)
+            .and_then(|mut tween| tween.animation_id.take());
+        if let Ok(mut part) = world.get_entity_mut(child) {
+            part.remove::<(VisualTween, HideAfterTween)>();
+            if !desired.contains(&child) {
+                part.insert(Visibility::Hidden);
+            }
+        }
+        complete_missing_animation(&mut world.resource_mut::<AnimationState>(), animation);
+    }
+}
+
 /// Placement interpolation is independent from per-part opacity transitions.
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub(crate) struct CharacterPlacementTween {
     from: Transform,
     to: Transform,
     timer: Timer,
 }
 
-fn update_character_placement(world: &mut World, entity: Entity, target: Transform, animate: bool) {
-    let Ok(mut entity) = world.get_entity_mut(entity) else {
-        return;
+/// Authoritative placement survives replacement of every expression part.
+#[derive(Component, Clone)]
+pub(crate) struct ActorPlacement {
+    current: Transform,
+    trajectory: Option<CharacterPlacementTween>,
+}
+
+// Derive one actor-space trajectory, then project it onto every part, including
+// newly appearing and outgoing expression layers. Part identity must not decide
+// whether placement animates or teleports.
+fn update_actor_placement(
+    world: &mut World,
+    root: Entity,
+    reference: Option<Entity>,
+    position: Vec2,
+    scale: f32,
+) {
+    use super::character_composite::LogicalCharacterPart;
+    let anchor = |transform: Transform, offset: Vec2| Transform {
+        translation: (transform.translation.truncate() - offset * transform.scale.x).extend(0.0),
+        scale: transform.scale,
+        ..default()
     };
-    if entity
-        .get::<CharacterPlacementTween>()
-        .is_some_and(|tween| tween.to == target)
-    {
-        return;
-    }
-    let from = entity.get::<Transform>().copied().unwrap_or(target);
-    if animate && from != target {
-        entity.insert(CharacterPlacementTween {
-            from,
-            to: target,
-            timer: Timer::new(std::time::Duration::from_millis(300), TimerMode::Once),
+    let target = Transform::from_translation(position.extend(0.0)).with_scale(Vec3::splat(scale));
+    let source = world
+        .get::<ActorPlacement>(root)
+        .map(|placement| (placement.current, placement.trajectory.clone()))
+        .or_else(|| {
+            reference.and_then(|entity| {
+                let offset = world.get::<LogicalCharacterPart>(entity)?.0.offset;
+                let current = anchor(*world.get::<Transform>(entity)?, offset);
+                let tween = world.get::<CharacterPlacementTween>(entity).map(|tween| {
+                    CharacterPlacementTween {
+                        from: anchor(tween.from, offset),
+                        to: anchor(tween.to, offset),
+                        timer: tween.timer.clone(),
+                    }
+                });
+                Some((current, tween))
+            })
         });
+    let (current, previous) = source.unwrap_or((target, None));
+    let at_target = |value: Transform| {
+        value.translation.abs_diff_eq(target.translation, 0.0001)
+            && value.scale.abs_diff_eq(target.scale, 0.0001)
+    };
+    let trajectory = if let Some(tween) = previous.filter(|tween| at_target(tween.to)) {
+        Some(tween)
+    } else if !at_target(current) {
+        Some(CharacterPlacementTween {
+            from: current,
+            to: target,
+            timer: Timer::new(Duration::from_millis(300), TimerMode::Once),
+        })
     } else {
-        entity.remove::<CharacterPlacementTween>();
-        entity.insert(target);
+        None
+    };
+    world.entity_mut(root).insert(ActorPlacement {
+        current,
+        trajectory: trajectory.clone(),
+    });
+    let children = world
+        .get::<Children>(root)
+        .map(|c| c.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for child in children {
+        let Some(part) = world.get::<LogicalCharacterPart>(child) else {
+            continue;
+        };
+        let offset = part.0.offset;
+        let depth = character_depth(part.0.layer);
+        let project = |actor: Transform| Transform {
+            translation: (actor.translation.truncate() + offset * actor.scale.x).extend(depth),
+            scale: actor.scale,
+            ..default()
+        };
+        let Ok(mut entity) = world.get_entity_mut(child) else {
+            continue;
+        };
+        if let Some(tween) = &trajectory {
+            entity.insert((
+                project(current),
+                CharacterPlacementTween {
+                    from: project(tween.from),
+                    to: project(tween.to),
+                    timer: tween.timer.clone(),
+                },
+            ));
+        } else {
+            entity.remove::<CharacterPlacementTween>();
+            entity.insert(project(target));
+        }
     }
 }
 
@@ -209,6 +291,7 @@ pub fn animate_character_motion_effects(
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
     mut stage: ResMut<StageState>,
+    mut placements: Query<&mut ActorPlacement>,
     mut movers: Query<
         (
             Entity,
@@ -229,6 +312,22 @@ pub fn animate_character_motion_effects(
         ),
     >,
 ) {
+    for mut placement in &mut placements {
+        if let Some(tween) = placement.trajectory.as_mut() {
+            tween.timer.tick(time.delta());
+            let t = 1.0 - (1.0 - tween.timer.fraction()).powi(3);
+            let current = Transform {
+                translation: tween.from.translation.lerp(tween.to.translation, t),
+                scale: tween.from.scale.lerp(tween.to.scale, t),
+                ..default()
+            };
+            let finished = tween.timer.is_finished();
+            placement.current = current;
+            if finished {
+                placement.trajectory = None;
+            }
+        }
+    }
     for (entity, mut transform, mut jump, mut shake, timeline, placement) in &mut movers {
         let mut placement_origin = None;
         if let Some(mut placement) = placement {
@@ -320,6 +419,7 @@ pub fn poll_pending_character_shows(
                 Option<&WorldSprite>,
                 Option<&Mesh3d>,
                 Option<&MeshMaterial3d<WorldSpriteMaterial>>,
+                Has<super::character_composite::LogicalCharacterPart>,
             ),
             (With<CharacterPartVisual>, With<Visibility>),
         >,
@@ -377,14 +477,16 @@ pub fn poll_pending_character_shows(
             if !item.entities.iter().all(|entity| {
                 visual_entities
                     .get(*entity)
-                    .is_ok_and(|(sprite, mesh, material)| {
-                        sprite.is_none() || (mesh.is_some() && material.is_some())
+                    .is_ok_and(|(sprite, mesh, material, logical)| {
+                        logical || sprite.is_none() || (mesh.is_some() && material.is_some())
                     })
             }) {
                 return true;
             }
 
             completed.push((
+                item.actor_id.clone(),
+                item.whole_actor,
                 item.entities.clone(),
                 std::mem::take(&mut item.outgoing),
                 item.fade,
@@ -395,14 +497,44 @@ pub fn poll_pending_character_shows(
     }
 
     let mut visuals = visual_queries.p1();
-    for (entities, outgoing, fade, animation_id) in completed {
+    for (actor_id, whole_actor, entities, outgoing, fade, animation_id) in completed {
         let mut pending_animation = animation_id;
+        if whole_actor {
+            if let Some(root) = stage.character_roots.get(&actor_id).copied() {
+                let desired = stage
+                    .character_active_parts
+                    .get(&actor_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| stage.sprites.get(id).copied())
+                    .collect();
+                commands
+                    .queue(move |world: &mut World| reconcile_group_reveal(world, root, &desired));
+                super::character_composite::fade_group(
+                    &mut commands,
+                    root,
+                    1.0,
+                    fade.unwrap_or(Duration::ZERO),
+                    pending_animation.take(),
+                );
+            }
+        }
         for (index, entity) in entities.into_iter().enumerate() {
             if let Ok((visual, sprite, alpha_mask, multiply, mut visibility)) =
                 visuals.get_mut(entity)
             {
                 *visibility = Visibility::Visible;
-                if let Some(fade) = fade {
+                if whole_actor {
+                    set_character_part_alpha(
+                        visual,
+                        sprite,
+                        alpha_mask,
+                        multiply,
+                        &mut alpha_mask_materials,
+                        &mut multiply_materials,
+                        1.0,
+                    );
+                } else if let Some(fade) = fade {
                     set_character_part_alpha(
                         visual,
                         sprite,
@@ -427,7 +559,15 @@ pub fn poll_pending_character_shows(
             }
         }
 
-        for (_id, entity) in outgoing {
+        for (id, entity) in outgoing {
+            // A later commit may have selected this part again while loading.
+            if stage
+                .character_active_parts
+                .get(&actor_id)
+                .is_some_and(|ids| ids.contains(&id))
+            {
+                continue;
+            }
             if let Some(fade) = fade {
                 commands.entity(entity).try_insert((
                     HideAfterTween,
@@ -484,9 +624,9 @@ fn set_character_part_alpha(
 pub(super) fn queue_character_show(
     commands: &mut Commands,
     asset_server: &AssetServer,
-    meshes: &mut Assets<Mesh>,
-    alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
-    multiply_materials: &mut Assets<MultiplyMaterial>,
+    _meshes: &mut Assets<Mesh>,
+    _alpha_mask_materials: &mut Assets<AlphaMaskMaterial>,
+    _multiply_materials: &mut Assets<MultiplyMaterial>,
     stage: &mut StageState,
     pending: &mut PendingCharacterShows,
     animations: &mut AnimationState,
@@ -511,6 +651,7 @@ pub(super) fn queue_character_show(
                     CharacterRoot {
                         actor_id: actor_id.clone(),
                     },
+                    super::character_composite::CharacterGroup::default(),
                     Transform::default(),
                     Visibility::Inherited,
                 ))
@@ -527,9 +668,22 @@ pub(super) fn queue_character_show(
         .get(&actor_id)
         .cloned()
         .unwrap_or_default();
+    // A newer statement may replace the initial show before its atlas loads.
+    // Preserve the group fade-in even if that pending show loses every part.
+    let whole_actor = active_ids.is_empty()
+        || pending
+            .items
+            .iter()
+            .any(|item| item.actor_id == actor_id && item.whole_actor);
+    let reference = active_ids
+        .iter()
+        .filter_map(|id| stage.sprites.get(id).map(|entity| (id, *entity)))
+        .min_by_key(|(id, _)| *id)
+        .map(|(_, entity)| entity);
 
     // A previous statement can still be waiting for its images. Retain only
     // parts that are also present in the newly committed actor state.
+    let mut superseded_outgoing = Vec::new();
     pending.items.retain_mut(|item| {
         if item.actor_id != actor_id {
             return true;
@@ -552,6 +706,7 @@ pub(super) fn queue_character_show(
             }
         }
         if item.entities.is_empty() {
+            superseded_outgoing.append(&mut item.outgoing);
             complete_missing_animation(animations, item.animation_id.take());
             false
         } else {
@@ -559,14 +714,14 @@ pub(super) fn queue_character_show(
         }
     });
 
-    let existing_ids = active_ids.iter().cloned().collect::<Vec<_>>();
+    let existing_ids = active_ids
+        .iter()
+        .cloned()
+        .chain(superseded_outgoing.into_iter().map(|(id, _)| id))
+        .collect::<HashSet<_>>();
     let new_part_count = parts
         .iter()
-        .filter(|part| {
-            !stage
-                .sprites
-                .contains_key(&character_part_id(&actor_id, part))
-        })
+        .filter(|part| !active_ids.contains(&character_part_id(&actor_id, part)))
         .count();
     let mut pending_animation = animation_id;
     let mut outgoing = Vec::new();
@@ -611,19 +766,6 @@ pub(super) fn queue_character_show(
         let sprite_id = character_part_id(&actor_id, part);
         if let Some(entity) = stage.sprites.get(&sprite_id).copied() {
             commands.entity(root).add_child(entity);
-            let target = Transform {
-                translation: Vec3::new(
-                    position.x + part.offset.x * scale,
-                    position.y + part.offset.y * scale,
-                    character_depth(part.layer),
-                ),
-                scale: Vec3::splat(scale),
-                ..default()
-            };
-            let animate = active_ids.contains(&sprite_id);
-            commands.queue(move |world: &mut World| {
-                update_character_placement(world, entity, target, animate)
-            });
             let mut entity_commands = commands.entity(entity);
             if focused {
                 entity_commands.try_insert((FocusedActorPart, focus_layer()));
@@ -635,6 +777,17 @@ pub(super) fn queue_character_show(
                 continue;
             }
             entity_commands.try_remove::<HideAfterTween>();
+            // Cancel an interrupted fade-out before reusing the cached part.
+            // Removing only HideAfterTween would leave a tween driving alpha to 0.
+            commands.queue(move |world: &mut World| {
+                let old = world
+                    .get_mut::<VisualTween>(entity)
+                    .and_then(|mut tween| tween.animation_id.take());
+                if let Ok(mut part) = world.get_entity_mut(entity) {
+                    part.remove::<VisualTween>();
+                }
+                complete_missing_animation(&mut world.resource_mut::<AnimationState>(), old);
+            });
             entities.push(entity);
             entity_ids.push(sprite_id);
             handles.push(asset_server.load(part.path.clone()));
@@ -657,124 +810,22 @@ pub(super) fn queue_character_show(
             rect: part.rect,
         };
 
-        let reads_mask = part
-            .mask
-            .is_some_and(|mask| mask.kind == CharacterMaskKind::Read);
-        let requires_material = reads_mask || part.blend != CharacterBlendMode::Normal;
         let handle = asset_server.load(part.path.clone());
-        let entity = if requires_material {
-            match part.rect {
-                None => {
-                    warn!(
-                        "character part `{}` requires an atlas rect for mask/blend rendering; using a normal sprite",
-                        part.id
-                    );
-                    let mut sprite = character_part_sprite(handle.clone(), part);
-                    sprite.color = color;
-                    commands
-                        .spawn((
-                            SpriteActor {
-                                id: sprite_id.clone(),
-                                path: part.path.clone(),
-                            },
-                            sprite,
-                            visual,
-                            Visibility::Hidden,
-                            transform,
-                        ))
-                        .id()
-                }
-                Some(rect) => {
-                    let width = rect[2] - rect[0];
-                    let height = rect[3] - rect[1];
-                    let mesh = meshes.add(Rectangle::new(width, height));
-                    if reads_mask {
-                        let writer = mask_writer_for_part(&parts, part);
-                        if writer.is_none() {
-                            let reference = part
-                                .mask
-                                .expect("a mask reader must carry mask metadata")
-                                .reference;
-                            warn!(
-                                "character part `{}` reads mask ref `{reference}` but no selected writer exists",
-                                part.id,
-                            );
-                        }
-                        let writer = writer.unwrap_or(part);
-                        let mask_rect = writer.rect.unwrap_or(rect);
-                        let material = alpha_mask_materials.add(AlphaMaskMaterial {
-                            texture: handle.clone(),
-                            mask_texture: asset_server.load(writer.path.clone()),
-                            tint: crate::render::character_part::rgba8_linear(part.color),
-                            main_rect: Vec4::new(rect[0], rect[1], width, height),
-                            mask_rect: Vec4::new(
-                                mask_rect[0],
-                                mask_rect[1],
-                                mask_rect[2] - mask_rect[0],
-                                mask_rect[3] - mask_rect[1],
-                            ),
-                            offsets: Vec4::new(
-                                part.offset.x,
-                                part.offset.y,
-                                writer.offset.x,
-                                writer.offset.y,
-                            ),
-                            opacity: 1.0,
-                            mask_enabled: (writer.id != part.id) as u8 as f32,
-                            multiply: part.blend == CharacterBlendMode::Multiply,
-                        });
-                        commands
-                            .spawn((
-                                SpriteActor {
-                                    id: sprite_id.clone(),
-                                    path: part.path.clone(),
-                                },
-                                Mesh3d(mesh),
-                                MeshMaterial3d(material),
-                                visual,
-                                Visibility::Hidden,
-                                transform,
-                            ))
-                            .id()
-                    } else {
-                        let material = multiply_materials.add(MultiplyMaterial {
-                            texture: handle.clone(),
-                            tint: crate::render::character_part::rgba8_linear(part.color),
-                            rect: Vec4::new(rect[0], rect[1], width, height),
-                            opacity: 1.0,
-                        });
-                        commands
-                            .spawn((
-                                SpriteActor {
-                                    id: sprite_id.clone(),
-                                    path: part.path.clone(),
-                                },
-                                Mesh3d(mesh),
-                                MeshMaterial3d(material),
-                                visual,
-                                Visibility::Hidden,
-                                transform,
-                            ))
-                            .id()
-                    }
-                }
-            }
-        } else {
-            let mut sprite = character_part_sprite(handle.clone(), part);
-            sprite.color = color;
-            commands
-                .spawn((
-                    SpriteActor {
-                        id: sprite_id.clone(),
-                        path: part.path.clone(),
-                    },
-                    sprite,
-                    visual,
-                    Visibility::Hidden,
-                    transform,
-                ))
-                .id()
-        };
+        let mut sprite = character_part_sprite(handle.clone(), part);
+        sprite.color = color;
+        let entity = commands
+            .spawn((
+                SpriteActor {
+                    id: sprite_id.clone(),
+                    path: part.path.clone(),
+                },
+                sprite,
+                visual,
+                super::character_composite::LogicalCharacterPart(part.clone()),
+                Visibility::Hidden,
+                transform,
+            ))
+            .id();
 
         stage.sprites.insert(sprite_id.clone(), entity);
         commands.entity(root).add_child(entity);
@@ -791,6 +842,9 @@ pub(super) fn queue_character_show(
         newly_spawned.push(true);
     }
 
+    commands.queue(move |world: &mut World| {
+        update_actor_placement(world, root, reference, position, scale)
+    });
     if entities.is_empty() {
         stage.character_active_parts.insert(actor_id, desired_ids);
         complete_missing_animation(animations, pending_animation);
@@ -801,6 +855,7 @@ pub(super) fn queue_character_show(
         .character_active_parts
         .insert(actor_id.clone(), desired_ids);
     pending.items.push(PendingCharacterShow {
+        whole_actor,
         actor_id,
         entity_ids,
         entities,
@@ -812,6 +867,7 @@ pub(super) fn queue_character_show(
     });
 }
 
+#[cfg(test)]
 fn mask_writer_for_part<'a>(
     parts: &'a [CharacterPartDefinition],
     reader: &CharacterPartDefinition,
@@ -972,6 +1028,7 @@ mod tests {
             .resource_mut::<PendingCharacterShows>()
             .items
             .push(PendingCharacterShow {
+                whole_actor: false,
                 actor_id: "alice".into(),
                 entity_ids: vec!["character::alice::body".into()],
                 entities: vec![alice],
@@ -1028,9 +1085,16 @@ mod tests {
             .init_resource::<AnimationState>()
             .init_resource::<StageState>()
             .add_systems(Update, animate_character_motion_effects);
-        let entity = app.world_mut().spawn(Transform::default()).id();
+        let root = app.world_mut().spawn_empty().id();
+        let entity = spawn_placement_part(app.world_mut(), root, "alice/body", Vec2::ZERO, 0.0);
         let target = Transform::from_xyz(100.0, 0.0, 0.0);
-        update_character_placement(app.world_mut(), entity, target, true);
+        update_actor_placement(
+            app.world_mut(),
+            root,
+            Some(entity),
+            target.translation.truncate(),
+            1.0,
+        );
         app.world_mut()
             .resource_mut::<Time>()
             .advance_by(std::time::Duration::from_millis(150));
@@ -1042,7 +1106,42 @@ mod tests {
             .translation
             .x;
         assert!((position - 87.5).abs() < 0.01);
-        update_character_placement(app.world_mut(), entity, target, true);
+        // An incoming expression and its fading predecessor must both inherit
+        // the same elapsed trajectory rather than appearing at the destination.
+        let incoming = spawn_placement_part(
+            app.world_mut(),
+            root,
+            "alice/eyes",
+            Vec2::new(10.0, 20.0),
+            100.0,
+        );
+        app.world_mut().entity_mut(entity).insert(HideAfterTween);
+        update_actor_placement(
+            app.world_mut(),
+            root,
+            Some(entity),
+            target.translation.truncate(),
+            1.0,
+        );
+        let incoming_position = app
+            .world()
+            .get::<Transform>(incoming)
+            .expect("incoming part")
+            .translation;
+        assert!((incoming_position.x - 97.5).abs() < 0.01);
+        assert_eq!(incoming_position.y, 20.0);
+        assert_eq!(
+            app.world()
+                .get::<CharacterPlacementTween>(incoming)
+                .expect("inherited tween")
+                .timer
+                .elapsed(),
+            Duration::from_millis(150)
+        );
+        assert!(
+            app.world().get::<VisualTween>(incoming).is_none(),
+            "placement must not create alpha fades"
+        );
         assert_eq!(
             app.world()
                 .get::<CharacterPlacementTween>(entity)
@@ -1057,9 +1156,205 @@ mod tests {
                 .get::<Transform>(entity)
                 .expect("target transform")
                 .translation,
-            target.translation
+            Vec3::new(100.0, 0.0, character_depth(0.0))
+        );
+        assert_eq!(
+            app.world()
+                .get::<Transform>(incoming)
+                .expect("incoming target")
+                .translation,
+            Vec3::new(110.0, 20.0, character_depth(0.0))
         );
         assert!(app.world().get::<CharacterPlacementTween>(entity).is_none());
+    }
+
+    fn spawn_placement_part(
+        world: &mut World,
+        root: Entity,
+        id: &str,
+        offset: Vec2,
+        actor_x: f32,
+    ) -> Entity {
+        world
+            .spawn((
+                super::super::character_composite::LogicalCharacterPart(CharacterPartDefinition {
+                    id: id.into(),
+                    slot: None,
+                    path: "atlas.png".into(),
+                    atlas_rect: None,
+                    offset,
+                    layer: 0.0,
+                    rect: None,
+                    mask: None,
+                    blend: CharacterBlendMode::Normal,
+                    color: [255; 4],
+                }),
+                Transform::from_xyz(actor_x + offset.x, offset.y, character_depth(0.0)),
+                ChildOf(root),
+            ))
+            .id()
+    }
+
+    #[test]
+    fn show_during_group_hide_retires_obsolete_expression_layers() {
+        use bevy::ecs::world::CommandQueue;
+        let mut app = App::new();
+        app.init_resource::<AnimationState>();
+        let root = app
+            .world_mut()
+            .spawn(super::super::character_composite::CharacterGroup::default())
+            .id();
+        let body = spawn_placement_part(app.world_mut(), root, "alice/body", Vec2::ZERO, 0.0);
+        let old = spawn_placement_part(app.world_mut(), root, "alice/eyes_a", Vec2::ZERO, 0.0);
+        let new = spawn_placement_part(app.world_mut(), root, "alice/eyes_b", Vec2::ZERO, 0.0);
+        for entity in [body, old] {
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(Visibility::Visible);
+        }
+        app.world_mut().entity_mut(new).insert(Visibility::Hidden);
+        let mut stage = StageState::default();
+        stage.character_roots.insert("alice".into(), root);
+        for (name, entity) in [("body", body), ("eyes_a", old), ("eyes_b", new)] {
+            stage
+                .sprites
+                .insert(format!("character::alice::{name}"), entity);
+        }
+        stage.character_active_parts.insert(
+            "alice".into(),
+            HashSet::from([
+                "character::alice::body".into(),
+                "character::alice::eyes_a".into(),
+            ]),
+        );
+        let mut queue = CommandQueue::default();
+        hide_character_entities(
+            &mut Commands::new(&mut queue, app.world()),
+            &mut stage,
+            &mut PendingCharacterShows::default(),
+            &mut AnimationState::default(),
+            None,
+            300,
+        );
+        queue.apply(app.world_mut());
+        assert_eq!(
+            *app.world()
+                .get::<Visibility>(old)
+                .expect("outgoing visibility"),
+            Visibility::Visible
+        );
+        assert!(app.world().get::<HideAfterTween>(old).is_some());
+        assert!(!stage.character_active_parts.contains_key("alice"));
+
+        // The new show is ready before the 300 ms group fade has completed.
+        // Shared parts stay visible, but no old expression can be resurrected.
+        reconcile_group_reveal(app.world_mut(), root, &HashSet::from([body, new]));
+        assert_eq!(
+            *app.world()
+                .get::<Visibility>(old)
+                .expect("retired visibility"),
+            Visibility::Hidden
+        );
+        assert_eq!(
+            *app.world()
+                .get::<Visibility>(body)
+                .expect("shared visibility"),
+            Visibility::Visible
+        );
+        for entity in [body, old, new] {
+            assert!(app.world().get::<HideAfterTween>(entity).is_none());
+            assert!(app.world().get::<VisualTween>(entity).is_none());
+        }
+        assert!(
+            app.world().get_entity(old).is_ok(),
+            "retired parts remain cached"
+        );
+    }
+
+    #[test]
+    fn replacing_pending_expression_retains_retirement_and_actor_trajectory() {
+        use super::super::character_composite::LogicalCharacterPart;
+        use bevy::ecs::world::CommandQueue;
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_resource::<AnimationState>();
+        let root = app.world_mut().spawn_empty().id();
+        let first = spawn_placement_part(app.world_mut(), root, "alice/eyes_a", Vec2::ZERO, 0.0);
+        let first_part = app
+            .world()
+            .get::<LogicalCharacterPart>(first)
+            .expect("part")
+            .0
+            .clone();
+        let first_id = character_part_id("alice", &first_part);
+        let mut stage = StageState::default();
+        stage.character_roots.insert("alice".into(), root);
+        stage.sprites.insert(first_id.clone(), first);
+        stage
+            .character_active_parts
+            .insert("alice".into(), HashSet::from([first_id.clone()]));
+        let server = app.world().resource::<AssetServer>().clone();
+        let mut pending = PendingCharacterShows::default();
+        let mut animations = AnimationState::default();
+        let mut meshes = Assets::<Mesh>::default();
+        let mut masks = Assets::<AlphaMaskMaterial>::default();
+        let mut blends = Assets::<MultiplyMaterial>::default();
+        for name in ["alice/eyes_b", "alice/eyes_c"] {
+            let mut part = first_part.clone();
+            part.id = name.into();
+            let mut queue = CommandQueue::default();
+            let mut commands = Commands::new(&mut queue, app.world());
+            queue_character_show(
+                &mut commands,
+                &server,
+                &mut meshes,
+                &mut masks,
+                &mut blends,
+                &mut stage,
+                &mut pending,
+                &mut animations,
+                "alice".into(),
+                vec![part],
+                Vec2::new(100.0, 0.0),
+                1.0,
+                false,
+                None,
+                None,
+            );
+            queue.apply(app.world_mut());
+        }
+        assert_eq!(pending.items.len(), 1);
+        assert_eq!(pending.items[0].outgoing, vec![(first_id, first)]);
+        let placement = app
+            .world()
+            .get::<ActorPlacement>(root)
+            .expect("actor owns motion");
+        assert_eq!(placement.current.translation.x, 0.0);
+        assert_eq!(
+            placement
+                .trajectory
+                .as_ref()
+                .expect("still moving")
+                .to
+                .translation
+                .x,
+            100.0
+        );
+        let incoming = pending.items[0].entities[0];
+        assert_eq!(
+            app.world()
+                .get::<Transform>(incoming)
+                .expect("incoming")
+                .translation
+                .x,
+            0.0
+        );
+        assert!(
+            app.world()
+                .get::<CharacterPlacementTween>(incoming)
+                .is_some()
+        );
     }
 
     #[test]

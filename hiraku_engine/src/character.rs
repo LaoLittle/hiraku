@@ -600,15 +600,29 @@ mod tests {
             .expect("synthetic character config should deserialize");
         let vfs = HdpVfs::new_with_config(".", "settings.hson", "startup.hks");
         let alice = character_definition_from_config(
-            &vfs, &TextureCatalog::default(), "alice".into(),
-            "characters".into(), "characters/alice.char.hson".into(), config,
-        ).expect("mask coverage and multiply blending must be composable");
-        let visible = alice.parts_for_expressions(&[]).expect("basis should resolve");
+            &vfs,
+            &TextureCatalog::default(),
+            "alice".into(),
+            "characters".into(),
+            "characters/alice.char.hson".into(),
+            config,
+        )
+        .expect("mask coverage and multiply blending must be composable");
+        let visible = alice
+            .parts_for_expressions(&[])
+            .expect("basis should resolve");
         assert_eq!(visible.len(), 2);
-        let shade = visible.iter().find(|part| part.id == "shade").expect("shade must exist");
-        assert_eq!(shade.mask, Some(CharacterMaskDefinition {
-            kind: CharacterMaskKind::Read, reference: 2,
-        }));
+        let shade = visible
+            .iter()
+            .find(|part| part.id == "shade")
+            .expect("shade must exist");
+        assert_eq!(
+            shade.mask,
+            Some(CharacterMaskDefinition {
+                kind: CharacterMaskKind::Read,
+                reference: 2,
+            })
+        );
         assert_eq!(shade.blend, CharacterBlendMode::Multiply);
         assert_eq!(shade.color, [255, 128, 64, 96]);
     }

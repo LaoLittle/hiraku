@@ -94,9 +94,13 @@ pub(super) fn apply_picture_command(
         } => {
             // Only an update to the same visible image may interpolate its pose.
             // Replacement images and a new show during hide own a fresh entrance.
-            let old = pictures.get(&id)
-                .filter(|picture| picture.path == path && picture.rect == rect
-                    && !picture.fade.as_ref().is_some_and(|fade| fade.remove))
+            let old = pictures
+                .get(&id)
+                .filter(|picture| {
+                    picture.path == path
+                        && picture.rect == rect
+                        && !picture.fade.as_ref().is_some_and(|fade| fade.remove)
+                })
                 .map(values);
             let target = [position[0], position[1], scale, rotation, 1.0];
             let start = old.unwrap_or([position[0], position[1], scale, rotation, 0.0]);
@@ -223,7 +227,8 @@ pub fn sync_pictures(
         .filter_map(|(_, marker, sprite, _)| {
             let image = sprite.image.as_ref()?;
             let picture = pictures.get(&marker.0)?;
-            (images.contains(image.id()) && sprite.rect == picture.rect
+            (images.contains(image.id())
+                && sprite.rect == picture.rect
                 && image
                     .path()
                     .is_some_and(|path| path.to_string() == picture.path))
@@ -243,7 +248,10 @@ pub fn sync_pictures(
             continue;
         };
         existing.insert(marker.0.clone());
-        if !sprite.image.as_ref().and_then(|image| image.path())
+        if !sprite
+            .image
+            .as_ref()
+            .and_then(|image| image.path())
             .is_some_and(|path| path.to_string() == picture.path)
         {
             sprite.image = Some(assets.load(picture.path.clone()));
@@ -347,22 +355,41 @@ mod tests {
                 size: UVec2::new(1920, 1080),
             })
             .add_systems(Update, sync_pictures);
-        app.world_mut().resource_mut::<SceneSharedState>().0.pictures = shown();
-        let outgoing = app.world_mut().spawn((
-            PictureEntity("room".into()),
-            BackgroundLayer { path: "background/room".into() },
-            WorldSprite::from_image(Handle::default()),
-            Transform::default(),
-        )).id();
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .pictures = shown();
+        let outgoing = app
+            .world_mut()
+            .spawn((
+                PictureEntity("room".into()),
+                BackgroundLayer {
+                    path: "background/room".into(),
+                },
+                WorldSprite::from_image(Handle::default()),
+                Transform::default(),
+            ))
+            .id();
 
         apply_picture_command(
-            &mut app.world_mut().resource_mut::<SceneSharedState>().0.pictures,
+            &mut app
+                .world_mut()
+                .resource_mut::<SceneSharedState>()
+                .0
+                .pictures,
             PictureCommand::Clear,
-        ).expect("clear presentation layers");
+        )
+        .expect("clear presentation layers");
         app.update();
 
         assert!(app.world().get_entity(outgoing).is_err());
-        assert!(app.world().resource::<SceneSharedState>().0.pictures.is_empty());
+        assert!(
+            app.world()
+                .resource::<SceneSharedState>()
+                .0
+                .pictures
+                .is_empty()
+        );
     }
 
     fn shown() -> BTreeMap<String, PictureState> {
@@ -463,14 +490,26 @@ mod tests {
     #[test]
     fn hide_cancels_shake_and_fades_from_the_current_pose() {
         let mut pictures = shown();
-        apply_picture_command(&mut pictures, PictureCommand::AnimateX {
-            id: "room".into(), offsets: vec![-4.0, 4.0, 0.0], step_seconds: 1.0,
-        }).expect("shake starts");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::AnimateX {
+                id: "room".into(),
+                offsets: vec![-4.0, 4.0, 0.0],
+                step_seconds: 1.0,
+            },
+        )
+        .expect("shake starts");
         tick_picture(pictures.get_mut("room").expect("picture"), 0.15);
         let position = pictures["room"].position;
         let alpha = pictures["room"].alpha;
-        apply_picture_command(&mut pictures, PictureCommand::Hide { id: "room".into(), seconds: 1.0 })
-            .expect("hide starts");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Hide {
+                id: "room".into(),
+                seconds: 1.0,
+            },
+        )
+        .expect("hide starts");
         let picture = pictures.get_mut("room").expect("picture fades");
         assert!(picture.motion.is_none());
         assert!(tick_picture(picture, 0.5));
@@ -483,10 +522,20 @@ mod tests {
     fn replacing_a_still_does_not_replay_the_previous_pose() {
         let mut pictures = shown();
         tick_picture(pictures.get_mut("room").expect("old picture"), 0.3);
-        apply_picture_command(&mut pictures, PictureCommand::Show {
-            id: "room".into(), path: "pictures/bob.png".into(), rect: None,
-            position: [50.0, 50.0], scale: 1.0, rotation: 0.0, layer: 5.0, seconds: 1.0,
-        }).expect("replacement starts");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Show {
+                id: "room".into(),
+                path: "pictures/bob.png".into(),
+                rect: None,
+                position: [50.0, 50.0],
+                scale: 1.0,
+                rotation: 0.0,
+                layer: 5.0,
+                seconds: 1.0,
+            },
+        )
+        .expect("replacement starts");
         let picture = pictures.get_mut("room").expect("new picture");
         assert_eq!(picture.position, [50.0, 50.0]);
         assert_eq!(picture.scale, 1.0);

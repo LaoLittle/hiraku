@@ -166,7 +166,7 @@ macro_rules! decoder {
             key_required: bool,
             next_flush: u64,
         }
-        
+
         impl $name {
             pub fn new() -> Result<Self, CodecError> {
                 Ok(Self {
@@ -176,7 +176,7 @@ macro_rules! decoder {
                     next_flush: 0,
                 })
             }
-            
+
             pub async fn is_config_supported(
                 config: &$config,
             ) -> Result<ConfigSupport<$config>, CodecError> {
@@ -186,7 +186,7 @@ macro_rules! decoder {
                     config: config.clone(),
                 })
             }
-            
+
             pub fn configure(&mut self, config: $config) -> Result<(), CodecError> {
                 if self.state == CodecState::Closed {
                     return Err(CodecError::InvalidState("decoder is closed"));
@@ -197,19 +197,19 @@ macro_rules! decoder {
                 self.key_required = true;
                 Ok(())
             }
-            
+
             pub fn state(&self) -> CodecState {
                 self.state
             }
-            
+
             pub fn decode_queue_size(&self) -> usize {
                 self.backend.decode_queue_size()
             }
-            
+
             pub fn pending_output(&self) -> usize {
                 self.backend.pending_output()
             }
-            
+
             pub fn decode(&mut self, chunk: $chunk) -> Result<(), CodecError> {
                 self.require_configured()?;
                 if self.key_required && chunk.0.kind != ChunkType::Key {
@@ -222,7 +222,7 @@ macro_rules! decoder {
                 self.key_required = false;
                 Ok(())
             }
-            
+
             /// Enqueue a drain barrier. Observe DecoderEvent::Flushed without
             /// blocking a thread. Decode calls after this require a key chunk.
             pub fn flush(&mut self) -> Result<FlushId, CodecError> {
@@ -236,7 +236,7 @@ macro_rules! decoder {
                 self.key_required = true;
                 Ok(id)
             }
-            
+
             pub fn poll(&mut self) -> Option<DecoderEvent<$frame>> {
                 let event = self.backend.poll()?;
                 if matches!(event, DecoderEvent::Error(_)) {
@@ -245,7 +245,7 @@ macro_rules! decoder {
                 }
                 Some(event)
             }
-            
+
             /// Discard queued work, output and pending flush barriers.
             /// The next operation must configure the decoder again.
             pub fn reset(&mut self) -> Result<(), CodecError> {
@@ -257,12 +257,12 @@ macro_rules! decoder {
                 self.key_required = true;
                 Ok(())
             }
-            
+
             pub fn close(&mut self) {
                 self.backend.close();
                 self.state = CodecState::Closed;
             }
-            
+
             fn require_configured(&self) -> Result<(), CodecError> {
                 if self.state != CodecState::Configured {
                     Err(CodecError::InvalidState("decoder is not configured"))
@@ -271,7 +271,7 @@ macro_rules! decoder {
                 }
             }
         }
-        
+
         impl Drop for $name {
             fn drop(&mut self) {
                 self.backend.close();

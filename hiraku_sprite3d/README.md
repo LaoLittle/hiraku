@@ -40,10 +40,40 @@ crate directory, independently of the launch directory.
 
 ## Layer composition
 
+Bevy's `TextureAtlas` / `TextureAtlasLayout` are supported directly:
+
+```rust,no_run
+use bevy::prelude::*;
+use hiraku_sprite3d::Sprite3d;
+
+fn spawn_sheet(mut commands: Commands, assets: Res<AssetServer>,
+    mut layouts: ResMut<Assets<TextureAtlasLayout>>) {
+    let layout = layouts.add(TextureAtlasLayout::from_grid(
+        UVec2::new(32, 48), 4, 2, None, None));
+    commands.spawn(Sprite3d::from_atlas(
+        assets.load("sheet.png"), TextureAtlas { layout, index: 0 }));
+}
+```
+
+Use `if let Some(atlas) = &mut sprite.texture_atlas { atlas.index = 1; }`
+to switch cells. `SpriteLayer.texture_atlas`
+can override the sprite's default selection. All layouts still reference the
+same sprite image. Source cropping is defined exclusively by the selected
+`TextureAtlasLayout` cell; there is no separate public `rect` field.
+
+Layout edits/hot reload update resolved UVs and natural size even without a
+Sprite3d change. Missing layouts defer rendering; invalid indices remove stale
+rendering and report a diagnostic instead of sampling the entire atlas. The
+`layered` example uses Bevy atlas layouts for every composed layer.
+
+For explicit material construction with atlas references, use
+`Sprite3dMaterial::from_sprite(&sprite, &layouts)`. The `TryFrom<&Sprite3d>`
+convenience constructor only resolves sources that need no layout assets.
+
 - One atlas per sprite; up to 32 layers, ordered back-to-front.
 - Atlas rectangles use top-left pixel coordinates. Layer bounds use normalized
   top-left coordinates inside the quad. The quad is centered, with normal +Z.
-- None for a layer's source rect samples the full atlas. A single full-quad atlas
+- With no atlas selection, a layer samples the full image. A single full-quad atlas
   layer uses its source rectangle's natural size (`Sprite3d::from_atlas`). Multiple
   layers default to the atlas size; use `custom_size` for a composed sprite.
 - Normal source-over and multiply blending preserve per-layer alpha. Multiply
@@ -52,6 +82,9 @@ crate directory, independently of the launch directory.
   Writers union coverage using max; cutoff discards low-alpha coverage without
   converting surviving coverage to opaque. Writers can optionally also render.
   Read + multiply is supported. These are alpha masks, not stencil emulation.
+  `StencilWrite` additionally supports binary coverage from untinted source
+  alpha at an explicit cutoff, for sprite-based stencil-style masks; it does
+  not allocate or use a GPU stencil attachment.
 - Overall `Sprite3d.color` tint and alpha apply **after** composition, then the
   result is blended with the scene as premultiplied alpha. A translucent face
   remains translucent; fading the entire character does not expose its lower

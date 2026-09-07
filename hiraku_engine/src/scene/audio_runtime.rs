@@ -66,7 +66,14 @@ pub fn animate_audio_fades(
     time: Res<Time>,
     settings: Res<UserSettings>,
     mut animations: ResMut<AnimationState>,
-    mut sources: Query<(Entity, Option<&mut AudioSink>, &mut AudioFade, Option<&BgmChannel>, Option<&VoiceChannel>, Option<&SfxChannel>)>,
+    mut sources: Query<(
+        Entity,
+        Option<&mut AudioSink>,
+        &mut AudioFade,
+        Option<&BgmChannel>,
+        Option<&VoiceChannel>,
+        Option<&SfxChannel>,
+    )>,
 ) {
     for (entity, sink, mut fade, bgm, voice, sfx) in &mut sources {
         let Some(mut sink) = sink else {
@@ -77,11 +84,19 @@ pub fn animate_audio_fades(
         fade.timer.tick(time.delta());
         let fraction = tween_fraction(&fade.timer);
         let volume = fade.from + (fade.to - fade.from) * fraction;
-        let channel = if bgm.is_some() { settings.bgm_volume }
-            else if voice.is_some() { settings.voice_volume }
-            else if sfx.is_some() { settings.sfx_volume }
-            else { 1.0 };
-        sink.set_volume(Volume::Linear(apply_volume_setting(volume, channel * settings.master_volume)));
+        let channel = if bgm.is_some() {
+            settings.bgm_volume
+        } else if voice.is_some() {
+            settings.voice_volume
+        } else if sfx.is_some() {
+            settings.sfx_volume
+        } else {
+            1.0
+        };
+        sink.set_volume(Volume::Linear(apply_volume_setting(
+            volume,
+            channel * settings.master_volume,
+        )));
 
         if fade.timer.is_finished() {
             if let Some(animation_id) = fade.animation_id.take() {
@@ -131,7 +146,10 @@ pub fn reconcile_restored_bgm(
     let Some(snapshot) = stage.pending_bgm_restore.take() else {
         return;
     };
-    let playback_volume = apply_volume_setting(snapshot.volume, user_settings.bgm_volume * user_settings.master_volume);
+    let playback_volume = apply_volume_setting(
+        snapshot.volume,
+        user_settings.bgm_volume * user_settings.master_volume,
+    );
     let loop_audio = asset_server.load(snapshot.path.clone());
     let entity = if let Some(prelude) = audio
         .resolve_music_path(&snapshot.path)
@@ -167,9 +185,26 @@ pub fn reconcile_restored_bgm(
 
 pub fn apply_live_audio_settings(
     user_settings: Res<UserSettings>,
-    mut bgms: Query<(&mut AudioSink, &BgmChannel), (Without<VoiceChannel>, Without<SfxChannel>, Without<AudioFade>)>,
-    mut voices: Query<(&mut AudioSink, &VoiceChannel), (Without<BgmChannel>, Without<SfxChannel>, Without<AudioFade>)>,
-    mut sfx: Query<(&mut AudioSink, &SfxChannel), (Without<BgmChannel>, Without<VoiceChannel>, Without<AudioFade>)>,
+    mut bgms: Query<
+        (&mut AudioSink, &BgmChannel),
+        (
+            Without<VoiceChannel>,
+            Without<SfxChannel>,
+            Without<AudioFade>,
+        ),
+    >,
+    mut voices: Query<
+        (&mut AudioSink, &VoiceChannel),
+        (Without<BgmChannel>, Without<SfxChannel>, Without<AudioFade>),
+    >,
+    mut sfx: Query<
+        (&mut AudioSink, &SfxChannel),
+        (
+            Without<BgmChannel>,
+            Without<VoiceChannel>,
+            Without<AudioFade>,
+        ),
+    >,
 ) {
     if !user_settings.is_changed() {
         return;
