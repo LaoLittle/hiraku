@@ -656,7 +656,6 @@ impl StoryRuntime {
     }
 
     fn enqueue_task_boundaries(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
-        let mut has_delay = false;
         let mut interactive_delay = None;
         let task_mode = self.execution.mode(task);
         for effect in self.host.drain_effects() {
@@ -683,7 +682,6 @@ impl StoryRuntime {
                 interactive_delay = Some(StoryWait::Delay { duration_ms });
                 continue;
             }
-            has_delay |= matches!(effect, StoryEffect::Delay { .. });
             if matches!(
                 effect,
                 StoryEffect::PlayVoice { .. }
@@ -695,6 +693,7 @@ impl StoryRuntime {
                     StoryEffect::SetCamera { .. }
                         | StoryEffect::SetBackground { .. }
                         | StoryEffect::ShowCharacter { .. }
+                        | StoryEffect::ActorMotion { .. }
                         | StoryEffect::SetCurtain { .. }
                 ))
                 || (dialogue && task_mode == Some(ExecutionMode::Sequence))
@@ -717,7 +716,6 @@ impl StoryRuntime {
                 wait.expect("an interactive-only wait was matched"),
             ));
         }
-        let has_wait = wait.is_some();
         if let Some(wait) = wait
             && task_mode == Some(ExecutionMode::Interactive)
         {
@@ -726,7 +724,6 @@ impl StoryRuntime {
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
         if task_mode == Some(ExecutionMode::Sequence)
-            && (has_wait || has_delay)
             && self.active_task_effects.contains_key(&task)
         {
             self.execution.pause(task)?;
@@ -1701,24 +1698,17 @@ mod tests {
             }) => task,
             other => panic!("expected tracked camera: {other:?}"),
         };
+        assert!(runtime.step().expect("voice waits for camera").is_none());
+        runtime.resume_task(task).expect("camera completes");
         assert!(matches!(
-            runtime.step().expect("voice starts without blocking"),
+            runtime.step().expect("voice starts after camera"),
             Some(StoryRuntimeEvent::TaskEffect {
                 effect: StoryEffect::PlayVoice { .. },
                 ..
             })
         ));
         assert!(runtime.step().expect("dialogue waits").is_none());
-        runtime.resume_task(task).expect("one effect completes");
-        assert!(
-            runtime
-                .step()
-                .expect("other effect still running")
-                .is_none()
-        );
-        runtime
-            .resume_task(task)
-            .expect("all preceding effects complete");
+        runtime.resume_task(task).expect("voice completes");
         assert!(matches!(
             runtime.step().expect("dialogue now appears"),
             Some(StoryRuntimeEvent::TaskEffect {

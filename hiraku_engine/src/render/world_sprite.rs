@@ -30,6 +30,8 @@ mod dissolve_shader_tests {
 /// remains available for story-level position, scale and animation.
 #[derive(Component, Clone, Debug)]
 pub struct WorldSprite {
+    /// Sampling radius in source-image pixels; independent of camera effects.
+    pub blur_radius: f32,
     pub dissolve: Option<DissolveMask>,
     pub image: Option<Handle<Image>>,
     /// Source rectangle as `[left, top, width, height]` in pixels.
@@ -51,6 +53,7 @@ pub struct DissolveMask {
 impl WorldSprite {
     pub fn from_image(image: Handle<Image>) -> Self {
         Self {
+            blur_radius: 0.0,
             dissolve: None,
             image: Some(image),
             rect: None,
@@ -62,6 +65,7 @@ impl WorldSprite {
 
     pub fn from_color(color: Color, size: Vec2) -> Self {
         Self {
+            blur_radius: 0.0,
             dissolve: None,
             image: None,
             rect: None,
@@ -81,6 +85,7 @@ impl WorldSprite {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, WorldSpriteUniform)]
 pub struct WorldSpriteMaterial {
+    pub effects: Vec4,
     #[texture(3)]
     #[sampler(4)]
     pub dissolve_mask: Option<Handle<Image>>,
@@ -94,6 +99,7 @@ pub struct WorldSpriteMaterial {
 
 #[derive(Clone, Debug, ShaderType)]
 pub struct WorldSpriteUniform {
+    effects: Vec4,
     dissolve: Vec4,
     tint: Vec4,
     rect: Vec4,
@@ -102,6 +108,7 @@ pub struct WorldSpriteUniform {
 impl From<&WorldSpriteMaterial> for WorldSpriteUniform {
     fn from(material: &WorldSpriteMaterial) -> Self {
         Self {
+            effects: material.effects,
             dissolve: material.dissolve,
             tint: material.tint,
             rect: material.rect,
@@ -136,6 +143,7 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
+        effects: Vec4::new(sprite.blur_radius, 0.0, 0.0, 0.0),
         dissolve_mask: sprite.dissolve.as_ref().map(|mask| mask.image.clone()),
         dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| {
             Vec4::new(

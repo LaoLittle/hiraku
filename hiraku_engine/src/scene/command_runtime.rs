@@ -385,7 +385,38 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 &render_assets.canvas,
                 &mut render_assets.preview,
             ),
+            ScriptCommand::Character(CharacterCommand::Motion {
+                actor_id,
+                revision,
+                transition,
+                animation_id,
+            }) => {
+                let restoring = stage
+                    .pending_character_restore
+                    .iter()
+                    .any(|part| part.id.starts_with(&format!("character::{actor_id}::")));
+                if !stage.character_active_parts.contains_key(&actor_id) && !restoring {
+                    warn!("cannot animate character `{actor_id}`: character is not shown");
+                    complete_missing_animation(&mut animations, animation_id);
+                    continue;
+                }
+                actor_motion::start(
+                    &mut shared_state.0.actor_motions,
+                    &mut animations,
+                    actor_id,
+                    revision,
+                    transition,
+                    animation_id,
+                );
+            }
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }) => {
+                for (id, motion) in &mut shared_state.0.actor_motions {
+                    if actor_id.as_ref().is_none_or(|actor| actor == id) {
+                        motion.finished = true;
+                        motion.offset = [0.0; 2];
+                        complete_missing_animation(&mut animations, motion.animation_id.take());
+                    }
+                }
                 hide_character_entities(
                     &mut commands,
                     &mut stage,

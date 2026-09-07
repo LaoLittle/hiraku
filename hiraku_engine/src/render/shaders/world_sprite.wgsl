@@ -1,6 +1,7 @@
 #import bevy_pbr::forward_io::VertexOutput
 
 struct WorldSpriteMaterial {
+    effects: vec4<f32>,
     dissolve: vec4<f32>,
     tint: vec4<f32>,
     // `[left, top, width, height]`; a zero size selects the full image.
@@ -22,7 +23,26 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         mesh.uv,
         full_image,
     );
-    var color = textureSample(color_texture, color_sampler, uv) * material.tint;
+    var sampled = textureSample(color_texture, color_sampler, uv);
+    if material.effects.x > 0.0 {
+        let origin = select(material.rect.xy, vec2<f32>(0.0), full_image);
+        let size = select(material.rect.zw, texture_size, full_image);
+        let low = (origin + vec2<f32>(0.5)) / texture_size;
+        let high = (origin + size - vec2<f32>(0.5)) / texture_size;
+        let weights = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
+        var sum = vec4<f32>(0.0);
+        for (var y = 0u; y < 5u; y += 1u) {
+            for (var x = 0u; x < 5u; x += 1u) {
+                let offset = (vec2<f32>(f32(x), f32(y)) - vec2<f32>(2.0)) * material.effects.x * 0.5 / texture_size;
+                let tap = textureSampleLevel(color_texture, color_sampler, clamp(uv + offset, low, high), 0.0);
+                // Filter premultiplied color to avoid dark fringes at transparent edges.
+                sum += vec4<f32>(tap.rgb * tap.a, tap.a) * weights[x] * weights[y];
+            }
+        }
+        let alpha = sum.a / 256.0;
+        sampled = vec4<f32>(sum.rgb / max(sum.a, 0.000001), alpha);
+    }
+    var color = sampled * material.tint;
     if material.dissolve.x != 0.0 {
         // Screen coordinates keep a full-canvas mask independent of the large
         // scene-covering quad and of camera zoom/projection.

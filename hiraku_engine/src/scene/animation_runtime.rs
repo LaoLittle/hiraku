@@ -313,6 +313,7 @@ pub(crate) fn tween_fraction(timer: &Timer) -> f32 {
 #[allow(clippy::too_many_arguments)]
 pub fn apply_animation_cancellations(
     mut commands: Commands,
+    mut shared: ResMut<SceneSharedState>,
     mut stage: ResMut<StageState>,
     mut waits: ResMut<PendingWaits>,
     mut dialogue_state: ResMut<DialogueState>,
@@ -346,6 +347,16 @@ pub fn apply_animation_cancellations(
     }
 
     let cancelled = pending_cancels.ids.drain(..).collect::<HashSet<_>>();
+    for motion in shared.0.actor_motions.values_mut() {
+        if motion
+            .animation_id
+            .as_ref()
+            .is_some_and(|id| cancelled.contains(id))
+        {
+            motion.advance(f32::MAX);
+            complete_missing_animation(&mut animations, motion.animation_id.take());
+        }
+    }
     for id in &cancelled {
         animations.completed.insert(id.clone());
     }

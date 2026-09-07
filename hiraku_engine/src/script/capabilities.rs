@@ -24,6 +24,11 @@ mod sound;
 /// Engine code dispatches these effects directly to ECS-facing systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
+    ActorMotion {
+        actor_id: String,
+        revision: u64,
+        transition: super::actor_motion::ActorOffset,
+    },
     Picture(crate::scene::pictures::PictureCommand),
     Log(String),
     ClearDialogue,
@@ -748,6 +753,8 @@ pub struct StoryNativeHostSnapshot {
 struct PendingActor {
     name: String,
     instance: String,
+    motion_revision: u64,
+    pending_offset: Option<super::actor_motion::ActorOffset>,
     expressions: Vec<String>,
     position: [f32; 2],
     scale: f32,
@@ -933,6 +940,23 @@ impl CharacterContext {
         let handles = self.actors.keys().copied().collect::<Vec<_>>();
         for handle in handles {
             self.flush(handle)?;
+            let actor = self.actor_mut(handle)?;
+            if let Some(transition) = actor.pending_offset.take() {
+                if !actor.visible {
+                    return Err(CharacterCapabilityError::InvalidArguments(
+                        "offset requires a shown character",
+                    ));
+                }
+                actor.motion_revision = actor.motion_revision.checked_add(1).ok_or(
+                    CharacterCapabilityError::InvalidArguments("actor motion revisions exhausted"),
+                )?;
+                let effect = StoryEffect::ActorMotion {
+                    actor_id: actor.instance.clone(),
+                    revision: actor.motion_revision,
+                    transition,
+                };
+                self.commands.push(effect);
+            }
         }
         self.sound.commit(&mut self.commands);
         let cameras = std::mem::take(&mut self.pending_cameras);
@@ -1210,6 +1234,50 @@ mod native_api {
         }
         context.commands.push(StoryEffect::SaveSlot(slot));
         Ok(())
+    }
+
+    #[hks(name = "offset", selector = "Actor", receiver)]
+    fn native_actor_offset(
+        context: &mut CharacterContext,
+        ActorHandle(handle): ActorHandle,
+        position: Position,
+    ) -> Result<ActorHandle, NativeError> {
+        let Position::Absolute(x, y) = position else {
+            return Err(NativeError::message(
+                "offset uses pixel coordinates: .pos(x, y)",
+            ));
+        };
+        let transition = super::super::actor_motion::ActorOffset {
+            target: [x as f32, y as f32],
+            animation: AnimationSpec::EaseOut(0.3, false),
+        };
+        transition.validate().map_err(NativeError::message)?;
+        let actor = context
+            .actor_mut(handle)
+            .map_err(|e| NativeError::message(e.to_string()))?;
+        actor.pending_offset = Some(transition);
+        Ok(ActorHandle(handle))
+    }
+
+    #[hks(name = "animation", selector = "Actor", receiver)]
+    fn native_actor_animation(
+        context: &mut CharacterContext,
+        ActorHandle(handle): ActorHandle,
+        animation: AnimationSpec,
+    ) -> Result<ActorHandle, NativeError> {
+        let actor = context
+            .actor_mut(handle)
+            .map_err(|e| NativeError::message(e.to_string()))?;
+        let transition = actor.pending_offset.as_mut().ok_or_else(|| {
+            NativeError::message("actor animation requires offset in the same statement")
+        })?;
+        let updated = super::super::actor_motion::ActorOffset {
+            animation,
+            ..*transition
+        };
+        updated.validate().map_err(NativeError::message)?;
+        *transition = updated;
+        Ok(ActorHandle(handle))
     }
 
     #[hks(name = "at", receiver)]
@@ -1577,6 +1645,8 @@ fn pending_actor(name: &str) -> PendingActor {
     PendingActor {
         name: name.to_string(),
         instance: name.to_string(),
+        motion_revision: 0,
+        pending_offset: None,
         expressions: Vec::new(),
         position: [0.0, 0.0],
         scale: 1.0,

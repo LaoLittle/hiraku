@@ -54,6 +54,7 @@ use crate::{
 
 mod animation_runtime;
 mod audio_runtime;
+pub(crate) mod actor_motion;
 mod character;
 pub(crate) mod character_composite;
 mod choice;

@@ -9,6 +9,7 @@ use crate::{
     vfs::VfsResource,
 };
 
+pub(crate) mod actor_motion;
 mod animation;
 pub(crate) mod capabilities;
 mod command;
@@ -160,6 +161,16 @@ pub(crate) fn script_command_from_effect(
             }
             ScriptCommand::Stage(StageCommand::Picture(picture))
         }
+        StoryEffect::ActorMotion {
+            actor_id,
+            revision,
+            transition,
+        } => ScriptCommand::Character(CharacterCommand::Motion {
+            actor_id,
+            revision,
+            transition,
+            animation_id: None,
+        }),
         StoryEffect::SaveSlot(slot) => ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)),
         StoryEffect::HideCharacter { actor_id, fade_ms } => {
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms })

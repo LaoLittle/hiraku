@@ -738,6 +738,7 @@ pub fn drive_story_runtime(
                     ScriptCommand::Camera(CameraCommand::Set { animation_id, .. })
                     | ScriptCommand::Stage(StageCommand::SetBackground { animation_id, .. })
                     | ScriptCommand::Character(CharacterCommand::Show { animation_id, .. })
+                    | ScriptCommand::Character(CharacterCommand::Motion { animation_id, .. })
                     | ScriptCommand::Dialogue(DialogueCommand::Say { animation_id, .. })
                     | ScriptCommand::Dialogue(DialogueCommand::Continue { animation_id, .. }) => {
                         *animation_id = Some(id.clone());

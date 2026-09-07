@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PictureState {
+    #[serde(default)]
+    pub blur_radius: f32,
+    #[serde(default)]
+    pub blur_tween: Option<PictureBlur>,
     pub id: String,
     pub path: String,
     pub rect: Option<[f32; 4]>,
@@ -16,6 +20,14 @@ pub struct PictureState {
     pub motion: Option<PictureMotion>,
     #[serde(default)]
     pub fade: Option<PictureFade>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PictureBlur {
+    pub from: f32,
+    pub to: f32,
+    pub elapsed: f32,
+    pub seconds: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -41,6 +53,11 @@ pub struct PictureMotion {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PictureCommand {
+    Blur {
+        id: String,
+        radius: f32,
+        seconds: f32,
+    },
     Show {
         id: String,
         path: String,
@@ -81,6 +98,31 @@ pub(super) fn apply_picture_command(
     command: PictureCommand,
 ) -> Result<(), String> {
     match command {
+        PictureCommand::Blur {
+            id,
+            radius,
+            seconds,
+        } => {
+            if !radius.is_finite()
+                || !(0.0..=128.0).contains(&radius)
+                || !seconds.is_finite()
+                || seconds < 0.0
+            {
+                return Err("invalid picture blur radius or duration".into());
+            }
+            let picture = pictures
+                .get_mut(&id)
+                .ok_or_else(|| format!("picture `{id}` is not shown"))?;
+            picture.blur_tween = (seconds > 0.0).then_some(PictureBlur {
+                from: picture.blur_radius,
+                to: radius,
+                elapsed: 0.0,
+                seconds,
+            });
+            if seconds == 0.0 {
+                picture.blur_radius = radius;
+            }
+        }
         PictureCommand::Clear => pictures.clear(),
         PictureCommand::Show {
             id,
@@ -93,6 +135,10 @@ pub(super) fn apply_picture_command(
             seconds,
         } => {
             // Only an update to the same visible image may interpolate its pose.
+            let blur = pictures
+                .get(&id)
+                .map(|p| (p.blur_radius, p.blur_tween.clone()))
+                .unwrap_or_default();
             // Replacement images and a new show during hide own a fresh entrance.
             let old = pictures
                 .get(&id)
@@ -124,6 +170,8 @@ pub(super) fn apply_picture_command(
             pictures.insert(
                 id.clone(),
                 PictureState {
+                    blur_radius: blur.0,
+                    blur_tween: blur.1,
                     id,
                     path,
                     rect,
@@ -259,6 +307,9 @@ pub fn sync_pictures(
         if sprite.rect != picture.rect {
             sprite.rect = picture.rect;
         }
+        if sprite.blur_radius != picture.blur_radius {
+            sprite.blur_radius = picture.blur_radius;
+        }
         if sprite.color.alpha() != picture.alpha {
             sprite.color.set_alpha(picture.alpha);
         }
@@ -270,6 +321,7 @@ pub fn sync_pictures(
     for (id, picture) in pictures.iter().filter(|(id, _)| !existing.contains(*id)) {
         let mut sprite = WorldSprite::from_image(assets.load(picture.path.clone()));
         sprite.rect = picture.rect;
+        sprite.blur_radius = picture.blur_radius;
         sprite.color.set_alpha(picture.alpha);
         commands.spawn((
             PictureEntity(id.clone()),
@@ -283,6 +335,13 @@ pub fn sync_pictures(
 }
 
 fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
+    if let Some(blur) = &mut picture.blur_tween {
+        blur.elapsed = (blur.elapsed + delta).min(blur.seconds);
+        picture.blur_radius = blur.from + (blur.to - blur.from) * (blur.elapsed / blur.seconds);
+        if blur.elapsed >= blur.seconds {
+            picture.blur_tween = None;
+        }
+    }
     if let Some(motion) = &mut picture.motion {
         motion.elapsed = (motion.elapsed + delta).min(motion.seconds);
         let p = (motion.elapsed / motion.seconds).clamp(0.0, 1.0);
@@ -343,6 +402,62 @@ fn picture_transform(p: &PictureState, canvas: Vec2) -> Transform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_blur_is_independent_retargetable_and_restorable() {
+        let mut pictures = shown();
+        pictures.insert("other".into(), pictures["room"].clone());
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Blur {
+                id: "room".into(),
+                radius: 16.0,
+                seconds: 1.0,
+            },
+        )
+        .expect("blur");
+        tick_picture(pictures.get_mut("room").expect("room"), 0.5);
+        assert_eq!(pictures["room"].blur_radius, 8.0);
+        assert_eq!(pictures["other"].blur_radius, 0.0);
+        let saved = hiraku_script::hson::to_vec(&pictures).expect("snapshot");
+        let mut restored: BTreeMap<String, PictureState> =
+            hiraku_script::hson::from_slice(&saved).expect("restore");
+        tick_picture(restored.get_mut("room").expect("room"), 0.5);
+        assert_eq!(restored["room"].blur_radius, 16.0);
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Blur {
+                id: "room".into(),
+                radius: 0.0,
+                seconds: 1.0,
+            },
+        )
+        .expect("retarget");
+        tick_picture(pictures.get_mut("room").expect("room"), 0.5);
+        assert_eq!(pictures["room"].blur_radius, 4.0);
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Blur {
+                id: "room".into(),
+                radius: 0.0,
+                seconds: 0.0,
+            },
+        )
+        .expect("disable");
+        assert_eq!(pictures["room"].blur_radius, 0.0);
+        assert!(pictures["room"].blur_tween.is_none());
+        assert!(
+            apply_picture_command(
+                &mut pictures,
+                PictureCommand::Blur {
+                    id: "missing".into(),
+                    radius: 1.0,
+                    seconds: 0.0
+                }
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn clearing_pictures_removes_render_entities_before_the_next_scene() {

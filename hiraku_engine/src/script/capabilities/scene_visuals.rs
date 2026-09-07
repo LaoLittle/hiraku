@@ -48,6 +48,9 @@ impl SceneVisualState {
                         }
                         | PictureCommand::Hide {
                             seconds: duration, ..
+                        }
+                        | PictureCommand::Blur {
+                            seconds: duration, ..
                         } => *duration = seconds,
                         _ => {}
                     }
@@ -148,6 +151,27 @@ mod api {
         *angle = rotation as f32;
         *z = layer as f32;
         Ok(SceneTransitionHandle(id))
+    }
+
+    /// Radius is in source-image pixels, not a global camera blur amount.
+    #[hks(name = "blurPicture", selector = "scene")]
+    fn blur_picture(
+        context: &mut CharacterContext,
+        id: String,
+        radius: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if id.trim().is_empty() || !radius.is_finite() || !(0.0..=128.0).contains(&radius) {
+            return Err(NativeError::message(
+                "blurPicture requires an identity and radius in 0..=128 pixels",
+            ));
+        }
+        context
+            .scene_visuals
+            .begin(SceneVisualTarget::Picture(PictureCommand::Blur {
+                id,
+                radius: radius as f32,
+                seconds: 0.0,
+            }))
     }
 
     #[hks(name = "hidePicture", selector = "scene")]
@@ -364,6 +388,141 @@ mod tests {
     }
 
     #[test]
+    fn actor_motion_is_typed_and_joins_sequence_effects() {
+        let mut runtime = runtime(
+            r#"
+            let alice = char("alice")
+            alice.show()
+            let task = seq {
+                alice.offset(.pos(0, 20)).animation(.easeOut(0.2))
+                alice.offset(.pos(0, 0)).animation(.easeIn(0.2))
+            }
+            wait(task)
+        "#,
+        );
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { .. })
+        ));
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect {
+            effect: StoryEffect::ActorMotion { actor_id, revision: 1, transition }, ..
+        } if actor_id == "alice" && transition.target == [0.0, 20.0])
+        );
+    }
+
+    #[test]
+    fn atomic_sequence_restores_without_prefetching_the_next_translation() {
+        let code = compile_story_bytecode(
+            "sequence.hks",
+            r#"
+            let alice = char("alice")
+            alice.show()
+            let jump = seq {
+                alice.offset(.pos(0, 20)).animation(.easeOut(0.2))
+                alice.offset(.pos(0, 0)).animation(.easeIn(0.2))
+            }
+            jump.await()
+            log("joined")
+        "#,
+        )
+        .expect("sequence compiles");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { .. })
+        ));
+        let StoryRuntimeEvent::TaskEffect {
+            task,
+            effect: first,
+        } = event(&mut runtime)
+        else {
+            panic!("first translation");
+        };
+        for _ in 0..8 {
+            assert!(runtime.step().expect("paused sequence").is_none());
+        }
+        let snapshot = runtime.snapshot().expect("snapshot while moving");
+        let mut runtime = StoryRuntime::restore(code, snapshot).expect("restored sequence");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect { effect, .. } if effect == first)
+        );
+        assert!(
+            runtime
+                .step()
+                .expect("still awaiting first motion")
+                .is_none()
+        );
+        runtime
+            .complete_task_effect(task, &first)
+            .expect("first completes");
+        let StoryRuntimeEvent::TaskEffect { effect: second, .. } = event(&mut runtime) else {
+            panic!("second translation");
+        };
+        assert!(
+            matches!(&second, StoryEffect::ActorMotion { revision: 2, transition, .. } if transition.target == [0.0, 0.0])
+        );
+        assert!(runtime.step().expect("join waits for second").is_none());
+        runtime
+            .complete_task_effect(task, &second)
+            .expect("second completes");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text == "joined")
+        );
+    }
+
+    #[test]
+    fn parallel_atomic_translations_join_all_completions_out_of_order() {
+        let mut runtime = runtime(
+            r#"
+            let alice = char("alice")
+            let bob = char("bob")
+            alice.show()
+            bob.show()
+            let group = par {
+                alice.offset(.pos(0, 20)).animation(.linear(2))
+                bob.offset(.pos(0, 10)).animation(.linear(1))
+            }
+            log("launched")
+            group.await()
+            log("joined")
+        "#,
+        );
+        let mut effects = Vec::new();
+        let mut launched = false;
+        for _ in 0..5 {
+            match event(&mut runtime) {
+                StoryRuntimeEvent::TaskEffect { task, effect } => effects.push((task, effect)),
+                StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text == "launched" => {
+                    launched = true
+                }
+                StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { .. }) => {}
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(launched);
+        assert_eq!(effects.len(), 2);
+        runtime
+            .complete_task_effect(effects[1].0, &effects[1].1)
+            .expect("short animation completes");
+        assert!(runtime.step().expect("long animation remains").is_none());
+        runtime
+            .complete_task_effect(effects[0].0, &effects[0].1)
+            .expect("long animation completes");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text == "joined")
+        );
+    }
+
+    #[test]
+    fn actor_animation_is_statement_scoped_and_rejects_invalid_duration() {
+        assert!(compile_story_bytecode("legacy.hks", r#"char("alice").motion([])"#).is_err());
+        let mut runtime =
+            runtime(r#"char("alice").show().offset(.pos(0, 2)).animation(.linear(-1))"#);
+        assert!(runtime.step().is_err());
+    }
+
+    #[test]
     fn actor_identity_is_silent_and_visible_actors_retain_their_state() {
         let mut runtime = runtime(
             r#"
@@ -408,6 +567,16 @@ mod tests {
             event(&mut runtime),
             StoryRuntimeEvent::Completed(_)
         ));
+    }
+
+    #[test]
+    fn picture_blur_commits_a_scoped_transition() {
+        let mut runtime = runtime("scene.blurPicture(\"room-middle\", 12).fade(300)");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Picture(
+            PictureCommand::Blur { id, radius: 12.0, seconds }
+        )) if id == "room-middle" && (seconds - 0.3).abs() < 0.001)
+        );
     }
 
     #[test]

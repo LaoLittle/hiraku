@@ -112,6 +112,12 @@ pub enum UiCommand {
 
 #[derive(Debug)]
 pub enum CharacterCommand {
+    Motion {
+        actor_id: String,
+        revision: u64,
+        transition: super::actor_motion::ActorOffset,
+        animation_id: Option<String>,
+    },
     Hide {
         actor_id: Option<String>,
         fade_ms: u64,

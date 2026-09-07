@@ -198,7 +198,7 @@ pub(crate) struct CharacterPlacementTween {
 /// Authoritative placement survives replacement of every expression part.
 #[derive(Component, Clone)]
 pub(crate) struct ActorPlacement {
-    current: Transform,
+    pub(super) current: Transform,
     trajectory: Option<CharacterPlacementTween>,
 }
 
@@ -1197,6 +1197,86 @@ mod tests {
                 ChildOf(root),
             ))
             .id()
+    }
+
+    #[test]
+    fn relative_motion_projects_all_parts_without_accumulating_or_restarting() {
+        use crate::script::actor_motion::{ActorMotion, ActorOffset};
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<StageState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<SceneSharedState>()
+            .add_systems(Update, super::super::actor_motion::animate);
+        let root = app
+            .world_mut()
+            .spawn(ActorPlacement {
+                current: Transform::from_xyz(100.0, 20.0, 0.0),
+                trajectory: None,
+            })
+            .id();
+        let outgoing = spawn_placement_part(app.world_mut(), root, "old", Vec2::ZERO, 100.0);
+        let incoming =
+            spawn_placement_part(app.world_mut(), root, "new", Vec2::new(5.0, 10.0), 100.0);
+        {
+            let mut stage = app.world_mut().resource_mut::<StageState>();
+            stage.character_roots.insert("alice".into(), root);
+            stage
+                .character_active_parts
+                .entry("alice".into())
+                .or_default();
+        }
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .actor_motions
+            .insert(
+                "alice".into(),
+                ActorMotion::new(
+                    1,
+                    ActorOffset {
+                        target: [0.0, 20.0],
+                        animation: crate::script::AnimationSpec::Linear(1.0, false),
+                    },
+                    [0.0; 2],
+                ),
+            );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(0.25));
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Transform>(outgoing)
+                .expect("outgoing part")
+                .translation
+                .y,
+            25.0
+        );
+        assert_eq!(
+            app.world()
+                .get::<Transform>(incoming)
+                .expect("incoming part")
+                .translation
+                .y,
+            35.0
+        );
+        // A base move and a newly mounted expression must sample the same clock.
+        app.world_mut()
+            .get_mut::<ActorPlacement>(root)
+            .expect("placement")
+            .current
+            .translation
+            .x = 140.0;
+        let added = spawn_placement_part(app.world_mut(), root, "added", Vec2::ZERO, 140.0);
+        app.update();
+        for entity in [outgoing, added] {
+            let transform = app
+                .world()
+                .get::<Transform>(entity)
+                .expect("projected part");
+            assert_eq!(transform.translation.truncate(), Vec2::new(140.0, 30.0));
+        }
     }
 
     #[test]

@@ -440,6 +440,9 @@ impl Plugin for HirakuPlugin {
                     animate_character_motion_effects
                         .after(poll_pending_character_shows)
                         .in_set(HirakuRuntimeSystems),
+                    scene::actor_motion::animate
+                        .after(animate_character_motion_effects)
+                        .in_set(HirakuRuntimeSystems),
                     poll_voice_playback.in_set(HirakuRuntimeSystems),
                     poll_pending_character_shows
                         .after(reconcile_restored_characters)
@@ -447,6 +450,7 @@ impl Plugin for HirakuPlugin {
                         .in_set(HirakuRuntimeSystems),
                     tick_animation_waits.in_set(HirakuRuntimeSystems),
                     sync_scene_snapshot
+                        .after(scene::actor_motion::animate)
                         .after(poll_pending_character_shows)
                         .after(animate_character_motion_effects)
                         .after(animate_visual_tweens)

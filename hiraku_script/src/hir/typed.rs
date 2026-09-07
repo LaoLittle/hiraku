@@ -1378,6 +1378,20 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 }
                 let mut receiver = None;
                 if let HirExprKind::Member { object, member, .. } = callee.kind {
+                    // Receiver-qualified native methods do not share a global
+                    // method name. Resolve using the statically known owner,
+                    // including receivers produced by fluent calls.
+                    if let ScriptType::Named(owner) = self.expression_type(object)
+                        && let Some(manifest) = self.manifest
+                        && let Some(owner_name) = self.symbols.resolve(*owner)
+                        && let Some(member_name) = self.symbols.resolve(member)
+                        && let Some(builtin) = manifest.resolve_selector(owner_name, member_name)
+                        && manifest
+                            .signature(builtin)
+                            .is_some_and(|s| s.receiver.is_some())
+                    {
+                        function = ResolvedFunction::Builtin(builtin);
+                    }
                     if self.static_methods.contains_key(&(object.ty, member)) {
                         self.error(
                             "static methods must be called on their type, not an instance",
