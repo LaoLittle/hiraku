@@ -51,7 +51,16 @@ pub fn cleanup_stale_screen_ui(
     mut commands: Commands,
     images: Res<Assets<Image>>,
     mut screen_state: ResMut<ScreenUiState>,
+    preview: Option<ResMut<super::save_preview::SavePreview>>,
 ) {
+    if let Some(mut preview) = preview && preview.capture.is_some() {
+        preview.waiting_frames += 1;
+        if preview.waiting_frames < 180 { return; }
+        if let Some(entity) = preview.capture.take() {
+            commands.entity(entity).try_despawn();
+        }
+        warn!("save thumbnail capture timed out; opening UI without a preview");
+    }
     let depth_offset = screen_state.stack.len() as i32 * 3;
     if let Some(mut pending) = screen_state.pending_root.take() {
         if screen_images_ready(&images, &pending.wait_images) && pending.ready_frames_remaining == 0
@@ -562,7 +571,7 @@ fn spawn_screen_node_entity(
             button
         }
         ScreenNode::Image(ScreenImageNode { texture, layout }) => {
-            let image = asset_server.load(texture.path.clone());
+            let image = super::save_preview::load_image(asset_server, &texture.path);
             image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);

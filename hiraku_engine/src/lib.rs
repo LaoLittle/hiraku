@@ -270,6 +270,7 @@ impl Plugin for HirakuPlugin {
             .add_message::<scene::widgets::UiCallbackRequest>()
             .add_message::<input::HirakuTextInput>()
             .init_resource::<input::HirakuTextFocus>()
+            .init_resource::<scene::save_preview::SavePreview>()
             .add_systems(
                 Update,
                 scene::widgets::input_events

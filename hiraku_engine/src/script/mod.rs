@@ -313,6 +313,7 @@ pub fn save_runtime_slot(
     slot: &str,
     runtime: &ScriptRuntimeState,
     shared_state: &SceneSharedState,
+    thumbnail: &[u8],
 ) -> Result<(), StorageError> {
     let current_script = runtime.current_script.clone().unwrap_or_default();
     let values = runtime
@@ -341,6 +342,7 @@ pub fn save_runtime_slot(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let data = SaveGameData {
+        thumbnail_png: thumbnail.to_vec(),
         version: crate::state::CURRENT_SAVE_VERSION,
         resume_script: current_script,
         script_stack: script_call_stack

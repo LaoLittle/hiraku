@@ -9,9 +9,16 @@ pub(super) fn dispatch_ui_command(
     ui_style: &UiStyle,
     screen_state: &mut ScreenUiState,
     overlay_state: &mut OverlayUiState,
+    canvas: &crate::HirakuCanvas,
+    preview: &mut crate::scene::save_preview::SavePreview,
 ) {
     match command {
         UiCommand::ShowScreen { screen, done, push } => {
+            if screen_state.active_root.is_none() && screen_state.pending_root.is_none()
+                && screen_state.stack.is_empty()
+            {
+                crate::scene::save_preview::capture(commands, canvas, preview);
+            }
             let spawned = spawn_screen_ui(
                 commands,
                 asset_server,
@@ -34,7 +41,7 @@ pub(super) fn dispatch_ui_command(
             }
             let depth_offset = screen_state.stack.len() as i32 * 3;
             let images_ready = screen_images_ready(images, &spawned.image_handles);
-            if previous.is_none() && images_ready {
+            if previous.is_none() && images_ready && preview.capture.is_none() {
                 commands
                     .entity(root)
                     .insert((Visibility::Inherited, GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + depth_offset)));

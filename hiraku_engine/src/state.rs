@@ -141,6 +141,8 @@ pub struct SceneSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveGameData {
+    #[serde(default)]
+    pub thumbnail_png: Vec<u8>,
     #[serde(default = "default_save_version")]
     pub version: u32,
     pub resume_script: String,
@@ -185,6 +187,7 @@ fn default_save_version() -> u32 {
 impl Default for SaveGameData {
     fn default() -> Self {
         Self {
+            thumbnail_png: Vec::new(),
             version: CURRENT_SAVE_VERSION,
             resume_script: String::new(),
             random_seed: 0,

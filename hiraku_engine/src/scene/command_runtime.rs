@@ -83,6 +83,8 @@ pub struct ScriptExecutionCommandContext<'w> {
 
 #[derive(SystemParam)]
 pub struct RenderAssetCommandContext<'w> {
+    pub canvas: Res<'w, crate::HirakuCanvas>,
+    pub preview: ResMut<'w, super::save_preview::SavePreview>,
     pub images: Res<'w, Assets<Image>>,
     pub characters: Res<'w, CharacterCatalog>,
     pub meshes: ResMut<'w, Assets<Mesh>>,
@@ -114,7 +116,7 @@ pub struct SceneCommandContext<'w, 's> {
 pub fn process_script_commands(ctx: SceneCommandContext) {
     let ui = ctx.ui;
     let execution = ctx.execution;
-    let render_assets = ctx.render_assets;
+    let mut render_assets = ctx.render_assets;
     let mut commands = ctx.commands;
     let mut app_exit = ctx.app_exit;
     let asset_server = ctx.asset_server;
@@ -163,7 +165,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
 
         match command {
             ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)) => {
-                if let Err(error)=save_runtime_slot(&slot,&script_runtime,&shared_state) { warn!("failed to save slot `{slot}`: {error}"); }
+                if let Err(error)=save_runtime_slot(&slot,&script_runtime,&shared_state,&[]) { warn!("failed to save slot `{slot}`: {error}"); }
             }
             ScriptCommand::Stage(StageCommand::Picture(picture)) => {
                 if let Err(error)=pictures::apply_picture_command(&mut shared_state.0.pictures,picture) { warn!("{error}"); }
@@ -372,6 +374,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 &ui_style,
                 &mut screen_state,
                 &mut overlay_state,
+                &render_assets.canvas,
+                &mut render_assets.preview,
             ),
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }) => {
                 hide_character_entities(&mut commands, &mut stage, &mut pending_characters,

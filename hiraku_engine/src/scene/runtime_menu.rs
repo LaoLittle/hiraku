@@ -13,6 +13,7 @@ pub struct RuntimeMenuButton {
 
 #[derive(SystemParam)]
 pub struct RuntimeMenuContext<'w, 's> {
+    pub preview: Res<'w, super::save_preview::SavePreview>,
     pub local_states: Query<'w, 's, &'static mut super::widgets::UiLocalState>,
     pub commands: Commands<'w, 's>,
     pub asset_server: Res<'w, AssetServer>,
@@ -278,7 +279,8 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 }
                 crate::ui::UiEffect::Save { slot } => {
                     if let Err(error) =
-                        save_runtime_slot(slot, &ctx.script_runtime, &ctx.shared_state)
+                        save_runtime_slot(slot, &ctx.script_runtime, &ctx.shared_state,
+                            if ctx.screen_state.active_root.is_some() { &ctx.preview.png } else { &[] })
                     {
                         warn!("failed to save slot `{slot}`: {error}");
                     }

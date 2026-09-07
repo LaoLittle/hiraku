@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 bevy.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 event-listener.workspace = true
 futures-lite.workspace = true
 hiraku-hdp.workspace = true

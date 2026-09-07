@@ -63,6 +63,7 @@ mod screen_ui;
 pub(crate) mod widgets;
 mod snapshot;
 pub(crate) mod pictures;
+pub(crate) mod save_preview;
 mod video_runtime;
 
 pub use animation_runtime::{

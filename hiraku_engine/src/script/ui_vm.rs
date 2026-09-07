@@ -950,6 +950,15 @@ fn validate_ui_result(value: &Value) -> Result<(), NativeError> {
 mod storage_actions {
     use super::*;
 
+    #[hks]
+    fn thumbnail(_context: &mut UiVmContext, slot: String) -> Result<Option<String>, NativeError> {
+        if !crate::storage::save_slot_exists(&slot).map_err(|e| NativeError::message(e.to_string()))? {
+            return Ok(None);
+        }
+        let data = crate::storage::load_save_data(&slot).map_err(|e| NativeError::message(e.to_string()))?;
+        Ok((!data.thumbnail_png.is_empty()).then(|| format!("save-thumbnail://{slot}")))
+    }
+
     #[hks(name = "exists")]
     fn slot_exists(_context: &mut UiVmContext, slot: String) -> Result<bool, NativeError> {
         crate::storage::save_slot_exists(&slot)
@@ -2515,6 +2524,10 @@ fn stored_value(value: Value) -> Result<StoredValue, UiVmError> {
 }
 
 fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTexture, UiVmError> {
+    if let Some(slot) = name.strip_prefix("save-thumbnail://") {
+        hiraku_storage::validate_key(slot).map_err(|e| UiVmError::Invalid(e.to_string()))?;
+        return Ok(ScreenTexture { path: name.into(), rect: None });
+    }
     let texture = textures
         .resolve(name)
         .ok_or_else(|| UiVmError::Invalid(format!("texture `{name}` is not defined")))?;
@@ -2527,6 +2540,14 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_thumbnail_sources_do_not_require_a_texture_descriptor() {
+        let textures = TextureCatalog::default();
+        let source = resolve_texture(&textures, "save-thumbnail://manual-1").expect("valid thumbnail source");
+        assert_eq!(source.path, "save-thumbnail://manual-1");
+        assert!(resolve_texture(&textures, "save-thumbnail://../alice").is_err());
+    }
 
     #[test]
     fn ui_close_returns_owned_data_and_preserves_unit_and_null() {

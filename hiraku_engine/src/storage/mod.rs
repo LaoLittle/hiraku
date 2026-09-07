@@ -85,6 +85,7 @@ fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
 impl From<&SaveGameData> for proto::SaveGameData {
     fn from(data: &SaveGameData) -> Self {
         Self {
+            thumbnail_png: data.thumbnail_png.clone(),
             version: data.version,
             resume_script: data.resume_script.clone(),
             random_seed: data.random_seed,
@@ -125,6 +126,7 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
             )));
         }
         Ok(Self {
+            thumbnail_png: data.thumbnail_png,
             version: data.version,
             resume_script: data.resume_script,
             random_seed: data.random_seed,
@@ -583,6 +585,16 @@ mod tests {
                 .to_string()
                 .contains("incompatible with runtime version")
         );
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_thumbnail_and_overwrite_can_clear_it() {
+        let mut data = SaveGameData { thumbnail_png: vec![137, 80, 78, 71], ..Default::default() };
+        let restored = decode_save_data(&encode_save_data(&data)).expect("save decodes");
+        assert_eq!(restored.thumbnail_png, data.thumbnail_png);
+        data.thumbnail_png.clear();
+        let restored = decode_save_data(&encode_save_data(&data)).expect("save without preview decodes");
+        assert!(restored.thumbnail_png.is_empty());
     }
 
     #[test]
