@@ -97,6 +97,7 @@ pub(crate) fn script_command_from_effect(
         StoryEffect::SetCamera {
             blur,
             zoom,
+            zoom_view_space,
             offset,
             rotation,
             projection,
@@ -106,6 +107,7 @@ pub(crate) fn script_command_from_effect(
         } => ScriptCommand::Camera(CameraCommand::Set {
             blur_intensity: blur,
             zoom,
+            zoom_view_space,
             offset: offset.map(Vec3::from_array),
             rotation: rotation.map(Vec3::from_array),
             projection,
@@ -176,6 +178,7 @@ pub(crate) fn script_command_from_effect(
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms })
         }
         StoryEffect::ShowCharacter {
+            placement_animation,
             actor_id,
             character_name,
             expressions,
@@ -183,13 +186,15 @@ pub(crate) fn script_command_from_effect(
             scale,
             focused,
         } => ScriptCommand::Character(CharacterCommand::Show {
+            placement_animation,
             actor_id,
             character_name,
             expressions,
             position: Vec2::new(position[0], position[1]),
             scale,
             focused,
-            fade: None,
+            fade: placement_animation
+                .map(|animation| std::time::Duration::from_secs_f32(animation.duration())),
             animation_id: None,
         }),
         StoryEffect::SetUiRole { .. }

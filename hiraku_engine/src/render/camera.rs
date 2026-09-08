@@ -101,6 +101,7 @@ pub struct CameraTweenState {
 }
 
 pub struct CameraTween {
+    pub zoom_view_space: bool,
     pub blur: Option<CameraScalarTween>,
     pub zoom: Option<CameraScalarTween>,
     pub offset: Option<CameraVectorTween>,
@@ -275,6 +276,7 @@ pub(crate) fn start_camera_tween(
     tweens: &mut CameraTweenState,
     blur_intensity: Option<f32>,
     zoom: Option<f32>,
+    zoom_view_space: bool,
     offset: Option<Vec3>,
     rotation: Option<Vec3>,
     projection: Option<CameraProjectionMode>,
@@ -328,6 +330,7 @@ pub(crate) fn start_camera_tween(
     }
 
     let tween = tweens.active.get_or_insert_with(|| CameraTween {
+        zoom_view_space: false,
         blur: None,
         zoom: None,
         offset: None,
@@ -351,6 +354,7 @@ pub(crate) fn start_camera_tween(
         });
     }
     if let Some(to) = zoom {
+        tween.zoom_view_space = zoom_view_space;
         tween.zoom = Some(CameraScalarTween {
             from: camera.zoom,
             to,
@@ -406,6 +410,14 @@ fn cancel_camera_completions(
     tween.completions = retained;
 }
 
+fn interpolate_zoom(from: f32, to: f32, progress: f32, view_space: bool) -> f32 {
+    if view_space {
+        from.recip().lerp(to.recip(), progress).recip()
+    } else {
+        from.lerp(to, progress)
+    }
+}
+
 pub fn animate_camera_transition(
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
@@ -433,9 +445,11 @@ pub fn animate_camera_transition(
         }
         if let Some(zoom_tween) = tween.zoom.as_mut() {
             zoom_tween.timer.tick(time.delta());
-            camera_state.zoom = zoom_tween.from.lerp(
+            camera_state.zoom = interpolate_zoom(
+                zoom_tween.from,
                 zoom_tween.to,
                 apply_character_ease(zoom_tween.ease, tween_fraction(&zoom_tween.timer)),
+                tween.zoom_view_space,
             );
         }
         if let Some(offset_tween) = tween.offset.as_mut() {
@@ -551,6 +565,13 @@ pub fn animate_camera_transition(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn view_scale_interpolates_visible_extent_not_magnification() {
+        assert!((super::interpolate_zoom(1.0, 2.5, 0.5, true) - 1.0 / 0.7).abs() < 0.00001);
+        assert_eq!(super::interpolate_zoom(1.0, 2.5, 0.5, false), 1.75);
+        assert!((super::interpolate_zoom(1.0, 2.5, 1.0, true) - 2.5).abs() < 0.00001);
+    }
+
     use super::*;
 
     #[test]

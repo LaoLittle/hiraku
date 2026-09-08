@@ -134,20 +134,20 @@ fn compose_groups(
             }
             continue;
         }
-        let (image, rects, mut layers, size, center, depth) = match build_layers(&selected, &images)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                if group.error.as_ref() != Some(&error) {
-                    warn!("character composition failed: {error}");
-                    group.error = Some(error);
+        let (image, rects, mut layers, size, center, _depth) =
+            match build_layers(&selected, &images) {
+                Ok(value) => value,
+                Err(error) => {
+                    if group.error.as_ref() != Some(&error) {
+                        warn!("character composition failed: {error}");
+                        group.error = Some(error);
+                    }
+                    if let Some(e) = group.display {
+                        commands.entity(e).try_insert(Visibility::Hidden);
+                    }
+                    continue;
                 }
-                if let Some(e) = group.display {
-                    commands.entity(e).try_insert(Visibility::Hidden);
-                }
-                continue;
-            }
-        };
+            };
         group.error = None;
         let atlas_size = images
             .get(&image)
@@ -187,7 +187,9 @@ fn compose_groups(
             color: Color::linear_rgba(1.0, 1.0, 1.0, group.alpha),
             ..default()
         };
-        let transform = Transform::from_xyz(center.x, center.y, depth);
+        // Per-part layers order composition only. Actor ordering belongs to
+        // the root and must not change when a high-layer expression is swapped.
+        let transform = Transform::from_xyz(center.x, center.y, super::STAGE_Z_SPRITE);
         let render_layers = if selected.iter().any(|p| p.4) {
             focus_layer()
         } else {

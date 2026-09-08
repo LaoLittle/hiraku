@@ -322,6 +322,11 @@ impl StoryRuntime {
         self.blocked
     }
 
+    /// A movie owns interaction until its matching host completion arrives.
+    pub fn blocks_ui_input(&self) -> bool {
+        self.blocked && matches!(self.blocked_wait, Some(StoryWait::Movie { .. }))
+    }
+
     /// Completes the dispatched effect, not the most recently submitted effect.
     /// Identical outstanding effects are interchangeable; distinct effects must
     /// remain associated with their own ECS completion request across snapshots.
@@ -1574,13 +1579,18 @@ mod tests {
             }))
         );
         let snapshot = runtime.snapshot().expect("movie wait must be saveable");
-        let restored = StoryRuntime::restore(bytecode, snapshot).expect("movie wait must restore");
+        assert!(runtime.blocks_ui_input());
+        let mut restored =
+            StoryRuntime::restore(bytecode, snapshot).expect("movie wait must restore");
+        assert!(restored.blocks_ui_input());
         assert_eq!(
             restored.restored_boundary_event(),
             Some(StoryRuntimeEvent::Wait(StoryWait::Movie {
                 path: "movies/opening.mkv".into(),
             }))
         );
+        restored.resume(Value::Unit).expect("movie completion");
+        assert!(!restored.blocks_ui_input());
     }
 
     #[test]

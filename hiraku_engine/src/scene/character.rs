@@ -152,6 +152,7 @@ pub fn reconcile_restored_characters(
             focused,
             Some(std::time::Duration::ZERO),
             None,
+            None,
         );
     }
 }
@@ -190,6 +191,7 @@ fn reconcile_group_reveal(world: &mut World, root: Entity, desired: &HashSet<Ent
 /// Placement interpolation is independent from per-part opacity transitions.
 #[derive(Component, Clone)]
 pub(crate) struct CharacterPlacementTween {
+    animation: Option<crate::script::AnimationSpec>,
     from: Transform,
     to: Transform,
     timer: Timer,
@@ -211,12 +213,24 @@ impl ActorPlacement {
 // Derive one actor-space trajectory, then project it onto every part, including
 // newly appearing and outgoing expression layers. Part identity must not decide
 // whether placement animates or teleports.
+#[cfg(test)]
 fn update_actor_placement(
     world: &mut World,
     root: Entity,
     reference: Option<Entity>,
     position: Vec2,
     scale: f32,
+) {
+    update_actor_placement_with_animation(world, root, reference, position, scale, None);
+}
+
+fn update_actor_placement_with_animation(
+    world: &mut World,
+    root: Entity,
+    reference: Option<Entity>,
+    position: Vec2,
+    scale: f32,
+    animation: Option<crate::script::AnimationSpec>,
 ) {
     use super::character_composite::LogicalCharacterPart;
     let anchor = |transform: Transform, offset: Vec2| Transform {
@@ -234,6 +248,7 @@ fn update_actor_placement(
                 let current = anchor(*world.get::<Transform>(entity)?, offset);
                 let tween = world.get::<CharacterPlacementTween>(entity).map(|tween| {
                     CharacterPlacementTween {
+                        animation: tween.animation,
                         from: anchor(tween.from, offset),
                         to: anchor(tween.to, offset),
                         timer: tween.timer.clone(),
@@ -251,9 +266,15 @@ fn update_actor_placement(
         Some(tween)
     } else if !at_target(current) {
         Some(CharacterPlacementTween {
+            animation,
             from: current,
             to: target,
-            timer: Timer::new(Duration::from_millis(300), TimerMode::Once),
+            timer: Timer::new(
+                animation
+                    .map(|a| Duration::from_secs_f32(a.duration()))
+                    .unwrap_or(Duration::from_millis(300)),
+                TimerMode::Once,
+            ),
         })
     } else {
         None
@@ -284,6 +305,7 @@ fn update_actor_placement(
             entity.insert((
                 project(current),
                 CharacterPlacementTween {
+                    animation: tween.animation,
                     from: project(tween.from),
                     to: project(tween.to),
                     timer: tween.timer.clone(),
@@ -325,7 +347,10 @@ pub fn animate_character_motion_effects(
     for mut placement in &mut placements {
         if let Some(tween) = placement.trajectory.as_mut() {
             tween.timer.tick(time.delta());
-            let t = 1.0 - (1.0 - tween.timer.fraction()).powi(3);
+            let t = tween
+                .animation
+                .map(|a| a.sample(tween.timer.fraction()))
+                .unwrap_or_else(|| 1.0 - (1.0 - tween.timer.fraction()).powi(3));
             let current = Transform {
                 translation: tween.from.translation.lerp(tween.to.translation, t),
                 scale: tween.from.scale.lerp(tween.to.scale, t),
@@ -342,7 +367,10 @@ pub fn animate_character_motion_effects(
         let mut placement_origin = None;
         if let Some(mut placement) = placement {
             placement.timer.tick(time.delta());
-            let t = 1.0 - (1.0 - placement.timer.fraction()).powi(3);
+            let t = placement
+                .animation
+                .map(|a| a.sample(placement.timer.fraction()))
+                .unwrap_or_else(|| 1.0 - (1.0 - placement.timer.fraction()).powi(3));
             let origin = placement.from.translation.lerp(placement.to.translation, t);
             transform.scale = placement.from.scale.lerp(placement.to.scale, t);
             transform.rotation = placement.from.rotation.slerp(placement.to.rotation, t);
@@ -647,10 +675,20 @@ pub(super) fn queue_character_show(
     focused: bool,
     fade: Option<std::time::Duration>,
     animation_id: Option<String>,
+    placement_animation: Option<crate::script::AnimationSpec>,
 ) {
     const DEFAULT_CHARACTER_FADE: std::time::Duration = std::time::Duration::from_millis(120);
 
-    let fade = fade.or(Some(DEFAULT_CHARACTER_FADE));
+    let reentering = stage.character_roots.contains_key(&actor_id)
+        && stage
+            .character_active_parts
+            .get(&actor_id)
+            .is_none_or(|parts| parts.is_empty());
+    let fade = fade.or(Some(if reentering {
+        Duration::ZERO
+    } else {
+        DEFAULT_CHARACTER_FADE
+    }));
     let root = stage
         .character_roots
         .get(&actor_id)
@@ -678,6 +716,32 @@ pub(super) fn queue_character_show(
         .get(&actor_id)
         .cloned()
         .unwrap_or_default();
+    if active_ids.is_empty() {
+        stage.character_order.retain(|name| name != &actor_id);
+        stage.character_order.push(actor_id.clone());
+        let count = stage.character_order.len().max(1) as f32;
+        for (index, id) in stage.character_order.iter().enumerate() {
+            if let Some(entity) = stage.character_roots.get(id).copied() {
+                let depth = index as f32 / count;
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut transform) = world.get_mut::<Transform>(entity) {
+                        transform.translation.z = depth;
+                    }
+                });
+            }
+        }
+        // A re-entry has no visible source pose to interpolate from.
+        commands.entity(root).remove::<ActorPlacement>();
+        let retained = stage
+            .sprites
+            .iter()
+            .filter(|(id, _)| id.starts_with(&format!("character::{actor_id}::")))
+            .map(|(_, entity)| *entity)
+            .collect::<Vec<_>>();
+        for entity in retained {
+            commands.entity(entity).remove::<CharacterPlacementTween>();
+        }
+    }
     // A newer statement may replace the initial show before its atlas loads.
     // Preserve the group fade-in even if that pending show loses every part.
     let whole_actor = active_ids.is_empty()
@@ -853,7 +917,14 @@ pub(super) fn queue_character_show(
     }
 
     commands.queue(move |world: &mut World| {
-        update_actor_placement(world, root, reference, position, scale)
+        update_actor_placement_with_animation(
+            world,
+            root,
+            reference,
+            position,
+            scale,
+            placement_animation,
+        )
     });
     if entities.is_empty() {
         stage.character_active_parts.insert(actor_id, desired_ids);
@@ -1086,6 +1157,44 @@ mod tests {
                 .contains("reveal")
         );
         assert!(character_depth(131.0) < STAGE_Z_OVERLAY);
+    }
+
+    #[test]
+    fn explicit_placement_animation_interpolates_position_and_scale_together() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .init_resource::<AnimationState>()
+            .init_resource::<StageState>()
+            .add_systems(Update, animate_character_motion_effects);
+        let root = app.world_mut().spawn_empty().id();
+        let part = spawn_placement_part(app.world_mut(), root, "alice/body", Vec2::ZERO, 0.0);
+        update_actor_placement_with_animation(
+            app.world_mut(),
+            root,
+            Some(part),
+            Vec2::new(100.0, 200.0),
+            2.0,
+            Some(crate::script::AnimationSpec::Linear(1.2, false)),
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(600));
+        app.update();
+        let pose = app.world().get::<ActorPlacement>(root).expect("placement");
+        assert!((pose.current.translation.x - 50.0).abs() < 0.001);
+        assert!((pose.current.translation.y - 100.0).abs() < 0.001);
+        assert!((pose.current.scale.x - 1.5).abs() < 0.001);
+        assert!(pose.is_animating());
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(601));
+        app.update();
+        assert!(
+            !app.world()
+                .get::<ActorPlacement>(root)
+                .expect("placement")
+                .is_animating()
+        );
     }
 
     #[test]
@@ -1409,6 +1518,7 @@ mod tests {
                 Vec2::new(100.0, 0.0),
                 1.0,
                 false,
+                None,
                 None,
                 None,
             );

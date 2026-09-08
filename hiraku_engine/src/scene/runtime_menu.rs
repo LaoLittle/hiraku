@@ -141,6 +141,17 @@ fn start_frontend_session(
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
+    if ctx
+        .script_runtime
+        .story
+        .as_ref()
+        .is_some_and(|story| story.blocks_ui_input())
+    {
+        // Consume, rather than defer, clicks made behind an unskippable movie.
+        ctx.clicks.clear();
+        ctx.widget_callbacks.clear();
+        return;
+    }
     let mut invocations = Vec::new();
     for click in ctx.clicks.read() {
         if click.button != PointerButton::Primary {

@@ -285,6 +285,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             ScriptCommand::Camera(CameraCommand::Set {
                 blur_intensity,
                 zoom,
+                zoom_view_space,
                 offset,
                 rotation,
                 projection,
@@ -322,6 +323,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     &mut camera_tweens,
                     blur_intensity,
                     zoom,
+                    zoom_view_space,
                     offset,
                     rotation,
                     projection,
@@ -427,6 +429,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 );
             }
             ScriptCommand::Character(CharacterCommand::Show {
+                placement_animation,
                 actor_id,
                 character_name,
                 expressions,
@@ -470,6 +473,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     focused,
                     fade,
                     animation_id,
+                    placement_animation,
                 );
             }
             ScriptCommand::Stage(StageCommand::SetCurtain {

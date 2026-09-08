@@ -64,6 +64,9 @@ impl SceneVisualState {
                         }
                         | PictureCommand::Blur {
                             seconds: duration, ..
+                        }
+                        | PictureCommand::Tint {
+                            seconds: duration, ..
                         } => *duration = seconds,
                         _ => {}
                     }
@@ -164,6 +167,31 @@ mod api {
         *angle = rotation as f32;
         *z = layer as f32;
         Ok(SceneTransitionHandle(id))
+    }
+
+    /// Change only a shown picture's tint; channels use sRGB bytes.
+    #[hks(name = "tintPicture", selector = "scene")]
+    fn tint_picture(
+        context: &mut CharacterContext,
+        id: String,
+        r: i32,
+        g: i32,
+        b: i32,
+        a: i32,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let bytes = [r, g, b, a];
+        if id.trim().is_empty() || !bytes.iter().all(|v| (0..=255).contains(v)) {
+            return Err(NativeError::message(
+                "tintPicture requires an identity and RGBA channels in 0..=255",
+            ));
+        }
+        context
+            .scene_visuals
+            .begin(SceneVisualTarget::Picture(PictureCommand::Tint {
+                id,
+                color: bytes.map(|v| v as f32 / 255.0),
+                seconds: 0.0,
+            }))
     }
 
     /// Radius is in source-image pixels, not a global camera blur amount.
@@ -578,6 +606,17 @@ mod tests {
     }
 
     #[test]
+    fn picture_tint_commits_byte_channels_and_supports_await() {
+        let mut runtime =
+            runtime("scene.tintPicture(\"room\", 0, 128, 255, 255).fade(300).await()");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect { effect: StoryEffect::Picture(
+            PictureCommand::Tint { id, color, seconds }
+        ), .. } if id == "room" && color == [0.0, 128.0 / 255.0, 1.0, 1.0] && (seconds - 0.3).abs() < 0.001)
+        );
+    }
+
+    #[test]
     fn picture_blur_commits_a_scoped_transition() {
         let mut runtime = runtime("scene.blurPicture(\"room-middle\", 12).fade(300)");
         assert!(
@@ -687,11 +726,13 @@ mod tests {
             "cg(\"still\").fade(300).await()",
             "scene.hidePicture(\"still\").fade(300).await()",
             "scene.blurPicture(\"room\", 12).fade(300).await()",
+            "scene.tintPicture(\"room\", 0, 0, 0, 255).fade(300).await()",
             "scene.movePicture(\"room\", 50, 40, 1, \"linear\").await()",
             "voice(\"voice/alice\").await()",
             "sfx(\"sound/bell\").await()",
             "bgm(\"music/theme\").fadeIn(500).await()",
             "char(\"alice\").show().await()",
+            "char(\"alice\").show().at(.pos(10, 20)).scale(1.2).animation(.linear(0.9)).await()",
             "char(\"alice\").hide(300).await()",
             "scene.hideCharacters(300).await()",
         ] {

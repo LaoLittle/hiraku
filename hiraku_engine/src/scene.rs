@@ -52,16 +52,16 @@ use crate::{
     vfs::VfsResource,
 };
 
+pub(crate) mod actor_motion;
 mod animation_runtime;
 mod audio_runtime;
-pub(crate) mod actor_motion;
 mod character;
-pub(crate) mod effect_wait;
 pub(crate) mod character_composite;
 mod choice;
 mod command_runtime;
 pub(crate) mod curtain;
 mod dialogue;
+pub(crate) mod effect_wait;
 pub(crate) mod pictures;
 mod runtime_menu;
 pub(crate) mod save_preview;
@@ -252,6 +252,7 @@ pub struct StageState {
     pub screen_effect: Option<Entity>,
     pub sprites: HashMap<String, Entity>,
     pub character_roots: HashMap<String, Entity>,
+    pub character_order: Vec<String>,
     pub character_active_parts: HashMap<String, HashSet<String>>,
     pub character_positions: HashMap<String, Vec2>,
     pub character_catalog_names: BTreeMap<String, String>,

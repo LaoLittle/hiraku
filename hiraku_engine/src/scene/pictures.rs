@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PictureState {
+    pub tint: [f32; 4],
+    pub tint_tween: Option<PictureTint>,
     #[serde(default)]
     pub blur_radius: f32,
     #[serde(default)]
@@ -20,6 +22,14 @@ pub struct PictureState {
     pub motion: Option<PictureMotion>,
     #[serde(default)]
     pub fade: Option<PictureFade>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PictureTint {
+    pub from: [f32; 4],
+    pub to: [f32; 4],
+    pub elapsed: f32,
+    pub seconds: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,6 +63,11 @@ pub struct PictureMotion {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PictureCommand {
+    Tint {
+        id: String,
+        color: [f32; 4],
+        seconds: f32,
+    },
     Blur {
         id: String,
         radius: f32,
@@ -98,6 +113,28 @@ pub(super) fn apply_picture_command(
     command: PictureCommand,
 ) -> Result<(), String> {
     match command {
+        PictureCommand::Tint { id, color, seconds } => {
+            if !color
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                || !seconds.is_finite()
+                || seconds < 0.0
+            {
+                return Err("invalid picture tint or duration".into());
+            }
+            let picture = pictures
+                .get_mut(&id)
+                .ok_or_else(|| format!("picture `{id}` is not shown"))?;
+            picture.tint_tween = (seconds > 0.0).then_some(PictureTint {
+                from: picture.tint,
+                to: color,
+                elapsed: 0.0,
+                seconds,
+            });
+            if seconds == 0.0 {
+                picture.tint = color;
+            }
+        }
         PictureCommand::Blur {
             id,
             radius,
@@ -139,6 +176,10 @@ pub(super) fn apply_picture_command(
                 .get(&id)
                 .map(|p| (p.blur_radius, p.blur_tween.clone()))
                 .unwrap_or_default();
+            let (tint, tint_tween) = pictures
+                .get(&id)
+                .map(|p| (p.tint, p.tint_tween.clone()))
+                .unwrap_or(([1.0; 4], None));
             // Replacement images and a new show during hide own a fresh entrance.
             let old = pictures
                 .get(&id)
@@ -170,6 +211,8 @@ pub(super) fn apply_picture_command(
             pictures.insert(
                 id.clone(),
                 PictureState {
+                    tint,
+                    tint_tween,
                     blur_radius: blur.0,
                     blur_tween: blur.1,
                     id,
@@ -310,8 +353,9 @@ pub fn sync_pictures(
         if sprite.blur_radius != picture.blur_radius {
             sprite.blur_radius = picture.blur_radius;
         }
-        if sprite.color.alpha() != picture.alpha {
-            sprite.color.set_alpha(picture.alpha);
+        let color = picture_color(picture);
+        if sprite.color != color {
+            sprite.color = color;
         }
         let next = picture_transform(picture, canvas.size.as_vec2());
         if *transform != next {
@@ -322,7 +366,7 @@ pub fn sync_pictures(
         let mut sprite = WorldSprite::from_image(assets.load(picture.path.clone()));
         sprite.rect = picture.rect;
         sprite.blur_radius = picture.blur_radius;
-        sprite.color.set_alpha(picture.alpha);
+        sprite.color = picture_color(picture);
         commands.spawn((
             PictureEntity(id.clone()),
             BackgroundLayer {
@@ -334,7 +378,21 @@ pub fn sync_pictures(
     }
 }
 
+fn picture_color(picture: &PictureState) -> Color {
+    let [r, g, b, a] = picture.tint;
+    Color::srgba(r, g, b, a * picture.alpha)
+}
+
 fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
+    if let Some(tint) = &mut picture.tint_tween {
+        tint.elapsed = (tint.elapsed + delta).min(tint.seconds);
+        picture.tint = std::array::from_fn(|i| {
+            tint.from[i] + (tint.to[i] - tint.from[i]) * (tint.elapsed / tint.seconds)
+        });
+        if tint.elapsed >= tint.seconds {
+            picture.tint_tween = None;
+        }
+    }
     if let Some(blur) = &mut picture.blur_tween {
         blur.elapsed = (blur.elapsed + delta).min(blur.seconds);
         picture.blur_radius = blur.from + (blur.to - blur.from) * (blur.elapsed / blur.seconds);
@@ -402,6 +460,52 @@ fn picture_transform(p: &PictureState, canvas: Vec2) -> Transform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tint_preserves_pose_and_restores_mid_transition() {
+        let mut pictures = shown();
+        let position = pictures["room"].position;
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Tint {
+                id: "room".into(),
+                color: [0.0, 0.0, 0.0, 0.5],
+                seconds: 1.0,
+            },
+        )
+        .expect("tint");
+        tick_picture(pictures.get_mut("room").expect("picture"), 0.5);
+        assert_eq!(pictures["room"].tint, [0.5, 0.5, 0.5, 0.75]);
+        assert_eq!(pictures["room"].position, position);
+        assert_eq!(pictures["room"].path, "background/room");
+        let encoded = hiraku_script::hson::to_vec(&pictures).expect("snapshot");
+        let mut restored: BTreeMap<String, PictureState> =
+            hiraku_script::hson::from_slice(&encoded).expect("restore");
+        tick_picture(restored.get_mut("room").expect("picture"), 0.5);
+        assert_eq!(restored["room"].tint, [0.0, 0.0, 0.0, 0.5]);
+        assert!(restored["room"].tint_tween.is_none());
+        apply_picture_command(
+            &mut restored,
+            PictureCommand::Hide {
+                id: "room".into(),
+                seconds: 1.0,
+            },
+        )
+        .expect("hide");
+        tick_picture(restored.get_mut("room").expect("picture"), 0.5);
+        assert_eq!(picture_color(&restored["room"]).alpha(), 0.25);
+        assert!(
+            apply_picture_command(
+                &mut restored,
+                PictureCommand::Tint {
+                    id: "missing".into(),
+                    color: [1.0; 4],
+                    seconds: 0.0
+                }
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn local_blur_is_independent_retargetable_and_restorable() {

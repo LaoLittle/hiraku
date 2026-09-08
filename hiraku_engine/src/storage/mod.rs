@@ -659,6 +659,8 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                tint: [0.5, 0.75, 1.0, 1.0],
+                tint_tween: None,
                 blur_radius: 8.0,
                 blur_tween: Some(crate::scene::pictures::PictureBlur {
                     from: 0.0,

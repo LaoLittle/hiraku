@@ -93,6 +93,7 @@ pub enum StoryEffect {
     SetCamera {
         blur: Option<f32>,
         zoom: Option<f32>,
+        zoom_view_space: bool,
         offset: Option<[f32; 3]>,
         rotation: Option<[f32; 3]>,
         projection: Option<CameraProjectionMode>,
@@ -101,6 +102,7 @@ pub enum StoryEffect {
         ease: String,
     },
     ShowCharacter {
+        placement_animation: Option<AnimationSpec>,
         actor_id: String,
         character_name: String,
         expressions: Vec<String>,
@@ -757,6 +759,8 @@ pub struct StoryNativeHostSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PendingActor {
+    display_instance: String,
+    placement_animation: Option<AnimationSpec>,
     name: String,
     instance: String,
     motion_revision: u64,
@@ -773,6 +777,7 @@ struct PendingActor {
 struct PendingCamera {
     blur: Option<f32>,
     zoom: Option<f32>,
+    zoom_view_space: bool,
     offset: Option<[f32; 3]>,
     rotation: Option<[f32; 3]>,
     projection: Option<CameraProjectionMode>,
@@ -837,6 +842,7 @@ impl CharacterContext {
         self.handles_by_name.insert(instance.clone(), handle);
         let mut actor = pending_actor(&name);
         actor.instance = instance;
+        actor.display_instance = actor.instance.clone();
         self.actors.insert(handle, actor);
         Ok(ActorHandle(handle))
     }
@@ -896,6 +902,7 @@ impl CharacterContext {
             PendingCamera {
                 blur: None,
                 zoom: None,
+                zoom_view_space: false,
                 offset: None,
                 rotation: None,
                 projection: None,
@@ -930,7 +937,8 @@ impl CharacterContext {
             }
             pending.dirty = false;
             StoryEffect::ShowCharacter {
-                actor_id: pending.instance.clone(),
+                placement_animation: pending.placement_animation.take(),
+                actor_id: pending.display_instance.clone(),
                 character_name: pending.name.clone(),
                 expressions: pending.expressions.clone(),
                 position: pending.position,
@@ -947,6 +955,12 @@ impl CharacterContext {
         let handles = self.actors.keys().copied().collect::<Vec<_>>();
         for handle in handles {
             self.flush(handle)?;
+            let next_revision = self
+                .actors
+                .values()
+                .map(|actor| actor.motion_revision)
+                .max()
+                .unwrap_or(0);
             let actor = self.actor_mut(handle)?;
             if let Some(transition) = actor.pending_offset.take() {
                 if !actor.visible {
@@ -954,11 +968,11 @@ impl CharacterContext {
                         "offset requires a shown character",
                     ));
                 }
-                actor.motion_revision = actor.motion_revision.checked_add(1).ok_or(
+                actor.motion_revision = next_revision.checked_add(1).ok_or(
                     CharacterCapabilityError::InvalidArguments("actor motion revisions exhausted"),
                 )?;
                 let effect = StoryEffect::ActorMotion {
-                    actor_id: actor.instance.clone(),
+                    actor_id: actor.display_instance.clone(),
                     revision: actor.motion_revision,
                     transition,
                 };
@@ -977,6 +991,7 @@ impl CharacterContext {
                 self.commands.push(StoryEffect::SetCamera {
                     blur: pending.blur,
                     zoom: pending.zoom,
+                    zoom_view_space: pending.zoom_view_space,
                     offset: pending.offset,
                     rotation: pending.rotation,
                     projection: pending.projection,
@@ -1151,8 +1166,8 @@ mod native_api {
             .map_err(|error| NativeError::message(error.to_string()))
     }
 
-    #[hks(name = "instance", receiver)]
-    fn native_instance(
+    #[hks(name = "clone", receiver)]
+    pub(super) fn native_clone(
         context: &mut CharacterContext,
         actor: ActorHandle,
         instance: String,
@@ -1162,9 +1177,57 @@ mod native_api {
             .map_err(|e| NativeError::message(e.to_string()))?
             .name
             .clone();
+        if let Some(handle) = context.handles_by_name.get(&instance).copied() {
+            let pending = context
+                .actor_mut(handle)
+                .map_err(|e| NativeError::message(e.to_string()))?;
+            if pending.display_instance != instance {
+                return Err(NativeError::message(
+                    "actor clone name is already used by an alias",
+                ));
+            }
+        }
         context
             .character_instance(name, instance)
             .map_err(|e| NativeError::message(e.to_string()))
+    }
+
+    #[hks(name = "alias", receiver)]
+    pub(super) fn native_alias(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        alias: String,
+    ) -> Result<ActorHandle, NativeError> {
+        let display = context
+            .actor_mut(actor.0)
+            .map_err(|e| NativeError::message(e.to_string()))?
+            .display_instance
+            .clone();
+        let name = context
+            .actor_mut(actor.0)
+            .map_err(|e| NativeError::message(e.to_string()))?
+            .name
+            .clone();
+        if let Some(handle) = context.handles_by_name.get(&alias).copied() {
+            if context
+                .actor_mut(handle)
+                .map_err(|e| NativeError::message(e.to_string()))?
+                .display_instance
+                != display
+            {
+                return Err(NativeError::message(
+                    "actor alias name is already assigned to another display",
+                ));
+            }
+        }
+        let handle = context
+            .character_instance(name, alias)
+            .map_err(|e| NativeError::message(e.to_string()))?;
+        let pending = context
+            .actor_mut(handle.0)
+            .map_err(|e| NativeError::message(e.to_string()))?;
+        pending.display_instance = display;
+        Ok(handle)
     }
 
     #[hks(name = "e", receiver)]
@@ -1183,6 +1246,17 @@ mod native_api {
         context: &mut CharacterContext,
         actor: ActorHandle,
     ) -> Result<ActorHandle, NativeError> {
+        let display = context
+            .actor_mut(actor.0)
+            .map_err(|e| NativeError::message(e.to_string()))?
+            .display_instance
+            .clone();
+        for (id, pending) in &mut context.actors {
+            if *id != actor.0 && pending.display_instance == display {
+                pending.visible = false;
+                pending.pending_offset = None;
+            }
+        }
         let pending = context
             .actor_mut(actor.0)
             .map_err(|error| NativeError::message(error.to_string()))?;
@@ -1203,7 +1277,15 @@ mod native_api {
             .map_err(|error| NativeError::message(error.to_string()))?;
         pending.dirty = false;
         pending.visible = false;
-        let actor_id = pending.instance.clone();
+        let actor_id = pending.display_instance.clone();
+        for pending in context
+            .actors
+            .values_mut()
+            .filter(|pending| pending.display_instance == actor_id)
+        {
+            pending.visible = false;
+            pending.pending_offset = None;
+        }
         context.commands.push(StoryEffect::HideCharacter {
             actor_id: Some(actor_id),
             fade_ms,
@@ -1271,9 +1353,20 @@ mod native_api {
         let actor = context
             .actor_mut(handle)
             .map_err(|e| NativeError::message(e.to_string()))?;
-        let transition = actor.pending_offset.as_mut().ok_or_else(|| {
-            NativeError::message("actor animation requires offset in the same statement")
-        })?;
+        let Some(transition) = actor.pending_offset.as_mut() else {
+            let validation = super::super::actor_motion::ActorOffset {
+                target: [0.0; 2],
+                animation,
+            };
+            validation.validate().map_err(NativeError::message)?;
+            if !actor.dirty {
+                return Err(NativeError::message(
+                    "actor animation requires an uncommitted position or scale",
+                ));
+            }
+            actor.placement_animation = Some(animation);
+            return Ok(ActorHandle(handle));
+        };
         let updated = super::super::actor_motion::ActorOffset {
             animation,
             ..*transition
@@ -1292,7 +1385,7 @@ mod native_api {
             .actor_mut(id)
             .map_err(|e| NativeError::message(e.to_string()))?;
         let pending = actor.pending_offset.is_some() || (actor.dirty && actor.visible);
-        let instance = actor.instance.clone();
+        let instance = actor.display_instance.clone();
         let hiding = context.commands.iter().any(|e| {
             matches!(e,
             StoryEffect::HideCharacter { actor_id: Some(id), .. } if id == &instance)
@@ -1421,6 +1514,26 @@ mod native_api {
             return Err(NativeError::message("camera zoom must be positive"));
         }
         context.camera_mut(handle)?.zoom = Some(zoom as f32);
+        context.camera_mut(handle)?.zoom_view_space = false;
+        Ok(CameraHandle(handle))
+    }
+
+    /// Scale of the visible camera area relative to the default view.
+    /// Unlike zoom(), transitions interpolate view size, not magnification.
+    #[hks(name = "viewScale", receiver)]
+    fn native_camera_view_scale(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        scale: f64,
+    ) -> Result<CameraHandle, NativeError> {
+        if !scale.is_finite() || !(0.0001..=100.0).contains(&scale) {
+            return Err(NativeError::message(
+                "camera viewScale must be in 0.0001..=100",
+            ));
+        }
+        let camera = context.camera_mut(handle)?;
+        camera.zoom = Some((1.0 / scale) as f32);
+        camera.zoom_view_space = true;
         Ok(CameraHandle(handle))
     }
 
@@ -1668,8 +1781,10 @@ mod story_api {
 
 fn pending_actor(name: &str) -> PendingActor {
     PendingActor {
+        placement_animation: None,
         name: name.to_string(),
         instance: name.to_string(),
+        display_instance: name.to_string(),
         motion_revision: 0,
         pending_offset: None,
         expressions: Vec::new(),
@@ -1696,8 +1811,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aliases_share_display_but_preserve_state_and_clones_remain_visible() {
+        compile_story_bytecode(
+            "aliases.hks",
+            "let alice = char(\"alice\")\nlet middle = alice.alias(\"middle\")\nmiddle.show()",
+        )
+        .expect("alias API compiles");
+        let mut host = StoryNativeHost::new();
+        let alice = host.context.char("alice".into()).expect("actor");
+        let middle =
+            native_api::native_alias(&mut host.context, alice, "middle".into()).expect("alias");
+        let copy =
+            native_api::native_clone(&mut host.context, alice, "copy".into()).expect("clone");
+        host.context
+            .emotion(alice, "happy".into())
+            .expect("expression");
+        host.context
+            .emotion(middle, "sad".into())
+            .expect("expression");
+        native_api::native_show(&mut host.context, alice).expect("show");
+        native_api::native_show(&mut host.context, copy).expect("show clone");
+        native_api::native_show(&mut host.context, middle).expect("switch alias");
+        assert!(!host.context.actors[&alice.0].visible);
+        assert!(host.context.actors[&middle.0].visible);
+        assert!(host.context.actors[&copy.0].visible);
+        assert_eq!(host.context.actors[&alice.0].expressions, ["happy"]);
+        assert_eq!(host.context.actors[&middle.0].expressions, ["sad"]);
+        host.context.commit().expect("commit");
+        let effects = host.drain_effects();
+        let mut displays = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                StoryEffect::ShowCharacter { actor_id, .. } => Some(actor_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        displays.sort();
+        assert_eq!(displays, ["alice", "copy"]);
+        let mut restored = StoryNativeHost::restore(host.snapshot());
+        assert_eq!(restored.context.actors[&middle.0].display_instance, "alice");
+        native_api::native_hide(&mut restored.context, alice, None).expect("hide shared display");
+        assert!(!restored.context.actors[&middle.0].visible);
+        assert!(restored.context.actors[&copy.0].visible);
+        assert!(native_api::native_clone(&mut restored.context, alice, "middle".into()).is_err());
+        assert!(native_api::native_alias(&mut restored.context, alice, "copy".into()).is_err());
+    }
+
+    #[test]
     fn actor_instances_have_independent_state_and_restore_identity() {
-        compile_story_bytecode("instances.hks", "let alice = char(\"alice\")\nlet middle = alice.instance(\"alice-middle\")\nmiddle.e(\"happy\").show()")
+        compile_story_bytecode("instances.hks", "let alice = char(\"alice\")\nlet middle = alice.clone(\"alice-middle\")\nmiddle.e(\"happy\").show()")
             .expect("instance fluent API compiles");
         let mut host = StoryNativeHost::new();
         let base = host.context.char("alice".into()).expect("base");
@@ -1975,6 +2137,11 @@ not_actor.at(.left)"#,
             "camera().zoom(1.2).animation(.easeInOut(0.5))",
         )
         .expect("camera animation spec should type-check");
+        compile_story_bytecode(
+            "camera.hks",
+            "camera().offset(800, 0, 0).viewScale(0.4).time(0.9).easing(.ease).await()",
+        )
+        .expect("view-scale transitions should support the shared await API");
     }
 
     #[test]

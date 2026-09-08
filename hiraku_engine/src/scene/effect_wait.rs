@@ -58,6 +58,7 @@ pub fn complete(
                 | P::Hide { id, .. }
                 | P::Move { id, .. }
                 | P::AnimateX { id, .. }
+                | P::Tint { id, .. }
                 | P::Blur { id, .. }) = command
                 else {
                     unreachable!()
@@ -85,6 +86,7 @@ pub fn complete(
                         }
                         P::Hide { .. } => picture.fade.is_some(),
                         P::Blur { .. } => picture.blur_tween.is_some(),
+                        P::Tint { .. } => picture.tint_tween.is_some(),
                         P::Move { .. } | P::AnimateX { .. } => picture.motion.is_some(),
                         P::Clear => false,
                     }

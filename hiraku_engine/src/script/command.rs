@@ -76,6 +76,7 @@ pub enum CameraCommand {
     Set {
         blur_intensity: Option<f32>,
         zoom: Option<f32>,
+        zoom_view_space: bool,
         offset: Option<Vec3>,
         rotation: Option<Vec3>,
         projection: Option<CameraProjectionMode>,
@@ -123,6 +124,7 @@ pub enum CharacterCommand {
         fade_ms: u64,
     },
     Show {
+        placement_animation: Option<super::animation::AnimationSpec>,
         actor_id: String,
         character_name: String,
         expressions: Vec<String>,
