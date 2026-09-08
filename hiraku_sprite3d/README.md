@@ -92,7 +92,7 @@ convenience constructor only resolves sources that need no layout assets.
 - Textures should contain straight-alpha color. Use sRGB image formats for color
   atlases so sampling converts RGB to linear space. Do not premultiply atlas data.
 - Single quad, single material, single atlas sampler. No additional camera or
-  offscreen target. The bounded uniform data needs 2608 bytes. Invalid layer
+  offscreen target. The bounded uniform data needs 2640 bytes. Invalid layer
   counts/geometry are rejected, never silently truncated. Sampling uses mip 0
   and clamps to texel centers to prevent adjacent atlas entries bleeding.
 
@@ -116,7 +116,17 @@ Use positively and uniformly scaled, non-sheared parents. Billboard owns rotatio
 put independent model rotation on a child or use `roll`. A missing camera or
 degenerate direction leaves the previous rotation unchanged.
 
-This crate is not yet wired into Hiraku's character renderer. Scene snapshots,
-expression crossfades and existing stencil-style mask semantics must be mapped
-explicitly during that migration. Unit/shader validation tests need no GPU;
-actual visual verification remains separate.
+Hiraku's character renderer composes logical parts through this crate. The
+engine owns scene snapshots and expression transitions; this crate does not
+depend on those concepts. Unit/shader validation tests need no GPU; actual
+visual verification remains separate.
+
+## World-space clipping
+
+`Sprite3d.clip = Some(ClipRect::new(center, size, degrees)?)` clips the final
+composed surface against an oriented rectangle in world XY. `None` disables
+clipping. Geometry must be finite and both dimensions positive. Reuse the same
+rectangle for multiple sprites to give them a shared window, independently of
+their transforms, atlas cells, intrinsic part alpha or stencil-style masks.
+This is not a camera-space scissor and does not add a border or a render pass.
+Picking still uses the whole quad.

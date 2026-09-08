@@ -324,6 +324,8 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            clips_hson: hson::to_vec(&scene.clips)
+                .expect("clip state contains only serializable data"),
             actor_motions_hson: hson::to_vec(&scene.actor_motions)
                 .expect("actor motion state contains only serializable data"),
             character_catalog_names: scene.character_catalog_names.clone(),
@@ -337,6 +339,11 @@ impl From<&SceneSnapshot> for proto::SceneSnapshot {
                 .character_positions
                 .iter()
                 .map(|(actor_id, position)| proto::CharacterPosition {
+                    rotation: scene
+                        .character_rotations
+                        .get(actor_id)
+                        .copied()
+                        .unwrap_or(0.0),
                     actor_id: actor_id.clone(),
                     x: position[0],
                     y: position[1],
@@ -356,6 +363,9 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
+            clips: hson::from_slice(&scene.clips_hson).map_err(|error| {
+                StorageError::InvalidSave(format!("invalid clip state: {error}"))
+            })?,
             actor_motions: hson::from_slice(&scene.actor_motions_hson).map_err(|error| {
                 StorageError::InvalidSave(format!("invalid actor motion state: {error}"))
             })?,
@@ -376,6 +386,11 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
             character_catalog_names: scene.character_catalog_names,
             background: scene.background.map(Into::into),
             sprites: scene.sprites.into_iter().map(Into::into).collect(),
+            character_rotations: scene
+                .character_positions
+                .iter()
+                .map(|p| (p.actor_id.clone(), p.rotation))
+                .collect(),
             character_positions: scene
                 .character_positions
                 .into_iter()
@@ -604,6 +619,9 @@ mod tests {
         scene
             .character_positions
             .insert("alice-middle".into(), [100.0, -20.0]);
+        scene
+            .character_rotations
+            .insert("alice-middle".into(), 40.0);
         let wire = proto::SceneSnapshot::from(&scene).encode_to_vec();
         let decoded = proto::SceneSnapshot::decode(wire.as_slice()).expect("scene wire format");
         let restored = SceneSnapshot::try_from(decoded).expect("scene restore");
@@ -612,6 +630,7 @@ mod tests {
             scene.character_catalog_names
         );
         assert_eq!(restored.character_positions, scene.character_positions);
+        assert_eq!(restored.character_rotations, scene.character_rotations);
         assert_eq!(restored.actor_motions, scene.actor_motions);
     }
 
@@ -659,6 +678,8 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                size: Some([640.0, 320.0]),
+                slice: Some([20.0; 4]),
                 tint: [0.5, 0.75, 1.0, 1.0],
                 tint_tween: None,
                 blur_radius: 8.0,
@@ -696,6 +717,43 @@ mod tests {
         );
         let restored = decode_save_data(&encode_save_data(&data)).expect("picture save decodes");
         assert_eq!(restored.scene.pictures, data.scene.pictures);
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_shared_actor_picture_clip() {
+        use crate::scene::clipping::{ClipCommand, ClipRegion};
+        let mut data = SaveGameData::default();
+        data.scene
+            .clips
+            .apply(ClipCommand::Define {
+                name: "window".into(),
+                region: ClipRegion {
+                    center: [120.0, -20.0],
+                    size: [400.0, 800.0],
+                    rotation: -10.0,
+                },
+            })
+            .expect("define clip");
+        data.scene
+            .clips
+            .apply(ClipCommand::Actor {
+                id: "alice".into(),
+                region: Some("window".into()),
+            })
+            .expect("clip actor");
+        data.scene
+            .clips
+            .apply(ClipCommand::Picture {
+                id: "room".into(),
+                region: Some("window".into()),
+            })
+            .expect("clip picture");
+        let restored = decode_save_data(&encode_save_data(&data)).expect("clip save decodes");
+        assert_eq!(restored.scene.clips, data.scene.clips);
+        assert_eq!(
+            restored.scene.clips.actor("alice"),
+            restored.scene.clips.picture("room")
+        );
     }
 
     #[test]

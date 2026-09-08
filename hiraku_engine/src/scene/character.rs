@@ -62,6 +62,7 @@ pub(super) fn hide_character_entities(
         }
         stage.character_active_parts.remove(&name);
         stage.character_positions.remove(&name);
+        stage.character_rotations.remove(&name);
     }
     stage.pending_character_restore.retain(|part| {
         actor.is_some_and(|name| !part.id.starts_with(&format!("character::{name}::")))
@@ -221,7 +222,15 @@ fn update_actor_placement(
     position: Vec2,
     scale: f32,
 ) {
-    update_actor_placement_with_animation(world, root, reference, position, scale, None);
+    let rotation = world
+        .get::<ActorPlacement>(root)
+        .map(|p| {
+            p.trajectory
+                .as_ref()
+                .map_or(p.current.rotation, |t| t.to.rotation)
+        })
+        .unwrap_or(Quat::IDENTITY);
+    update_actor_placement_with_animation(world, root, reference, position, scale, rotation, None);
 }
 
 fn update_actor_placement_with_animation(
@@ -230,6 +239,7 @@ fn update_actor_placement_with_animation(
     reference: Option<Entity>,
     position: Vec2,
     scale: f32,
+    rotation: Quat,
     animation: Option<crate::script::AnimationSpec>,
 ) {
     use super::character_composite::LogicalCharacterPart;
@@ -238,7 +248,9 @@ fn update_actor_placement_with_animation(
         scale: transform.scale,
         ..default()
     };
-    let target = Transform::from_translation(position.extend(0.0)).with_scale(Vec3::splat(scale));
+    let target = Transform::from_translation(position.extend(0.0))
+        .with_scale(Vec3::splat(scale))
+        .with_rotation(rotation);
     let source = world
         .get::<ActorPlacement>(root)
         .map(|placement| (placement.current, placement.trajectory.clone()))
@@ -261,6 +273,7 @@ fn update_actor_placement_with_animation(
     let at_target = |value: Transform| {
         value.translation.abs_diff_eq(target.translation, 0.0001)
             && value.scale.abs_diff_eq(target.scale, 0.0001)
+            && value.rotation.abs_diff_eq(target.rotation, 0.0001)
     };
     let trajectory = if let Some(tween) = previous.filter(|tween| at_target(tween.to)) {
         Some(tween)
@@ -354,6 +367,7 @@ pub fn animate_character_motion_effects(
             let current = Transform {
                 translation: tween.from.translation.lerp(tween.to.translation, t),
                 scale: tween.from.scale.lerp(tween.to.scale, t),
+                rotation: tween.from.rotation.slerp(tween.to.rotation, t),
                 ..default()
             };
             let finished = tween.timer.is_finished();
@@ -679,16 +693,8 @@ pub(super) fn queue_character_show(
 ) {
     const DEFAULT_CHARACTER_FADE: std::time::Duration = std::time::Duration::from_millis(120);
 
-    let reentering = stage.character_roots.contains_key(&actor_id)
-        && stage
-            .character_active_parts
-            .get(&actor_id)
-            .is_none_or(|parts| parts.is_empty());
-    let fade = fade.or(Some(if reentering {
-        Duration::ZERO
-    } else {
-        DEFAULT_CHARACTER_FADE
-    }));
+    // Re-entry resets placement below, but opacity still transitions normally.
+    let fade = fade.or(Some(DEFAULT_CHARACTER_FADE));
     let root = stage
         .character_roots
         .get(&actor_id)
@@ -916,6 +922,14 @@ pub(super) fn queue_character_show(
         newly_spawned.push(true);
     }
 
+    let rotation = Quat::from_rotation_z(
+        stage
+            .character_rotations
+            .get(&actor_id)
+            .copied()
+            .unwrap_or(0.0)
+            .to_radians(),
+    );
     commands.queue(move |world: &mut World| {
         update_actor_placement_with_animation(
             world,
@@ -923,6 +937,7 @@ pub(super) fn queue_character_show(
             reference,
             position,
             scale,
+            rotation,
             placement_animation,
         )
     });
@@ -1174,6 +1189,7 @@ mod tests {
             Some(part),
             Vec2::new(100.0, 200.0),
             2.0,
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
             Some(crate::script::AnimationSpec::Linear(1.2, false)),
         );
         app.world_mut()
@@ -1181,6 +1197,11 @@ mod tests {
             .advance_by(Duration::from_millis(600));
         app.update();
         let pose = app.world().get::<ActorPlacement>(root).expect("placement");
+        assert!(
+            pose.current
+                .rotation
+                .abs_diff_eq(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4), 0.001)
+        );
         assert!((pose.current.translation.x - 50.0).abs() < 0.001);
         assert!((pose.current.translation.y - 100.0).abs() < 0.001);
         assert!((pose.current.scale.x - 1.5).abs() < 0.001);

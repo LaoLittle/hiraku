@@ -19,6 +19,7 @@ mod runtime;
 mod story_runtime;
 pub mod ui_runtime;
 mod ui_vm;
+pub(crate) use ui_vm::UiComposition;
 pub(crate) use ui_vm::validate_ui_source;
 
 pub use animation::{AnimationPhase, AnimationSpec};
@@ -120,11 +121,13 @@ pub(crate) fn script_command_from_effect(
             return Err("delay must be dispatched through the story wait boundary".into());
         }
         StoryEffect::SetCurtain {
+            color,
             opacity,
             fade_ms,
             mask,
             softness,
         } => ScriptCommand::Stage(StageCommand::SetCurtain {
+            color,
             opacity,
             fade: fade_ms.map(Duration::from_millis),
             softness,
@@ -153,6 +156,7 @@ pub(crate) fn script_command_from_effect(
                 animation_id: None,
             })
         }
+        StoryEffect::Clip(clip) => ScriptCommand::Stage(StageCommand::Clip(clip)),
         StoryEffect::Picture(mut picture) => {
             if let crate::scene::pictures::PictureCommand::Show { path, rect, .. } = &mut picture {
                 let texture = textures
@@ -178,6 +182,7 @@ pub(crate) fn script_command_from_effect(
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms })
         }
         StoryEffect::ShowCharacter {
+            rotation,
             placement_animation,
             actor_id,
             character_name,
@@ -186,6 +191,7 @@ pub(crate) fn script_command_from_effect(
             scale,
             focused,
         } => ScriptCommand::Character(CharacterCommand::Show {
+            rotation,
             placement_animation,
             actor_id,
             character_name,

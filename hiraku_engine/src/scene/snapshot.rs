@@ -3,6 +3,7 @@ use super::*;
 pub fn sync_scene_snapshot(
     mut shared_state: ResMut<SceneSharedState>,
     stage: Res<StageState>,
+    placements: Query<(&CharacterRoot, &super::character::ActorPlacement)>,
     pending_characters: Res<PendingCharacterShows>,
     alpha_mask_materials: Res<Assets<AlphaMaskMaterial>>,
     multiply_materials: Res<Assets<MultiplyMaterial>>,
@@ -81,6 +82,15 @@ pub fn sync_scene_snapshot(
         sprite_snapshots.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.sprites = sprite_snapshots;
         snapshot.character_catalog_names = stage.character_catalog_names.clone();
+        snapshot.character_rotations = placements
+            .iter()
+            .map(|(root, p)| {
+                (
+                    root.actor_id.clone(),
+                    p.current.rotation.to_euler(EulerRot::XYZ).2.to_degrees(),
+                )
+            })
+            .collect();
         snapshot.character_positions = stage
             .character_positions
             .iter()
@@ -106,6 +116,14 @@ pub fn sync_scene_snapshot(
             .map(|pending| pending.mask.as_ref())
             .unwrap_or(overlay_sprite.dissolve.as_ref());
         snapshot.curtain = Some(crate::state::CurtainSnapshot {
+            color: {
+                let [r, g, b, _] = overlay_sprite.color.to_srgba().to_u8_array();
+                [r, g, b]
+            },
+            target_color: pending.map(|pending| pending.color).unwrap_or_else(|| {
+                let [r, g, b, _] = overlay_sprite.color.to_srgba().to_u8_array();
+                [r, g, b]
+            }),
             mask: mask.map(|mask| mask.path.clone()),
             softness: mask.map_or(0.0, |mask| mask.softness),
             target: pending
@@ -153,6 +171,7 @@ pub(super) fn restore_scene_snapshot(
         commands.entity(entity).try_despawn();
     }
     stage.character_positions.clear();
+    stage.character_rotations.clear();
     stage.character_catalog_names.clear();
     stage.character_active_parts.clear();
     stage.pending_character_restore = snapshot
@@ -214,6 +233,11 @@ pub(super) fn restore_scene_snapshot(
         stage.sprites.insert(sprite.id.clone(), entity);
     }
 
+    stage.character_rotations = snapshot
+        .character_rotations
+        .iter()
+        .map(|(id, angle)| (id.clone(), *angle))
+        .collect();
     stage.character_positions = snapshot
         .character_positions
         .iter()
@@ -228,7 +252,13 @@ pub(super) fn restore_scene_snapshot(
             super::curtain::CurtainFailed,
         )>();
         commands.entity(overlay).insert(WorldSprite::from_color(
-            Color::BLACK.with_alpha(snapshot.overlay_alpha),
+            snapshot
+                .curtain
+                .as_ref()
+                .map_or(Color::BLACK, |curtain| {
+                    Color::srgb_u8(curtain.color[0], curtain.color[1], curtain.color[2])
+                })
+                .with_alpha(snapshot.overlay_alpha),
             Vec2::new(6000.0, 6000.0),
         ));
         if let Some(curtain) = snapshot.curtain {
@@ -249,6 +279,7 @@ pub(super) fn restore_scene_snapshot(
             commands
                 .entity(overlay)
                 .insert(super::curtain::PendingCurtain {
+                    color: curtain.target_color,
                     opacity: curtain.target,
                     duration: (curtain.remaining_ms > 0)
                         .then(|| std::time::Duration::from_millis(curtain.remaining_ms)),

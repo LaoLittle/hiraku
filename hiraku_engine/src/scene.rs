@@ -58,6 +58,7 @@ mod audio_runtime;
 mod character;
 pub(crate) mod character_composite;
 mod choice;
+pub(crate) mod clipping;
 mod command_runtime;
 pub(crate) mod curtain;
 mod dialogue;
@@ -116,7 +117,8 @@ pub use runtime_menu::{
 pub use screen_ui::{
     UiEffectMessage, animate_screen_ui, cleanup_stale_screen_ui, handle_screen_buttons,
     handle_screen_image_buttons, handle_screen_scroll, handle_screen_toggles, process_ui_effects,
-    update_builtin_ui_models, update_ui_reactive_bindings, update_ui_text_bindings,
+    recompose_screen_ui, update_builtin_ui_models, update_ui_reactive_bindings,
+    update_ui_text_bindings,
 };
 use screen_ui::{
     clear_overlay_ui, clear_screen_ui, close_screen_ui, screen_images_ready,
@@ -255,6 +257,7 @@ pub struct StageState {
     pub character_order: Vec<String>,
     pub character_active_parts: HashMap<String, HashSet<String>>,
     pub character_positions: HashMap<String, Vec2>,
+    pub character_rotations: HashMap<String, f32>,
     pub character_catalog_names: BTreeMap<String, String>,
     /// Logical restored parts waiting to be reconciled into render entities.
     /// This keeps mask/blend metadata intact while their assets are loading.

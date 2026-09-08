@@ -332,6 +332,8 @@ impl Default for SpriteLayer {
 #[reflect(Component)]
 #[require(Transform, Visibility)]
 pub struct Sprite3d {
+    /// Optional world-space clipping, applied after the sprite's layer composition.
+    pub clip: Option<crate::ClipRect>,
     pub image: Option<Handle<Image>>,
     /// Bevy atlas cell selection, inherited by layers without their own atlas.
     pub texture_atlas: Option<TextureAtlas>,
@@ -348,6 +350,7 @@ pub struct Sprite3d {
 impl Default for Sprite3d {
     fn default() -> Self {
         Self {
+            clip: None,
             image: None,
             texture_atlas: None,
             color: Color::WHITE,

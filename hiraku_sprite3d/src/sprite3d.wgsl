@@ -2,7 +2,7 @@
 struct Layer {
     rect: vec4<f32>, bounds: vec4<f32>, tint: vec4<f32>, modes: vec4<f32>, flip: vec4<f32>,
 };
-struct Sprite { tint: vec4<f32>, backface_tint: vec4<f32>, count: vec4<u32>, layers: array<Layer, 32>, };
+struct Sprite { clip_bounds: vec4<f32>, clip_axes: vec4<f32>, tint: vec4<f32>, backface_tint: vec4<f32>, count: vec4<u32>, layers: array<Layer, 32>, };
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> sprite: Sprite;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var atlas: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var atlas_sampler: sampler;
@@ -17,6 +17,9 @@ fn compose(dst: vec4<f32>, src: vec4<f32>, multiply: bool) -> vec4<f32> {
 }
 @fragment
 fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let delta = mesh.world_position.xy - sprite.clip_bounds.xy;
+    let local = vec2<f32>(dot(delta, sprite.clip_axes.xy), dot(delta, vec2<f32>(-sprite.clip_axes.y, sprite.clip_axes.x)));
+    let outside = sprite.clip_axes.z > 0.0 && any(abs(local) > sprite.clip_bounds.zw);
     let dimensions = vec2<f32>(textureDimensions(atlas));
     var masks: array<f32, 8>;
     var result = vec4<f32>(0.0);
@@ -46,5 +49,6 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
     }
     // Apply group opacity only after internal overlaps have been resolved.
     let tint = sprite.tint * select(sprite.backface_tint, vec4<f32>(1.0), front);
+    if outside { discard; }
     return vec4<f32>(result.rgb * tint.rgb * tint.a, result.a * tint.a);
 }

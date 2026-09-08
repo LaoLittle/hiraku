@@ -79,6 +79,9 @@ pub struct UiPhaseAnimation {
 /// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSpec {
+    /// Ephemeral compiled renderer; scene saves rebuild UI from its source.
+    #[serde(skip)]
+    pub(crate) composition: Option<std::sync::Arc<crate::script::UiComposition>>,
     /// Optional title rendered by the default panel mode.
     pub title: Option<String>,
     /// When `true`, wraps children in the default centered panel.
@@ -224,10 +227,10 @@ pub struct ScreenLayout {
     /// Fixed height in logical pixels.
     #[serde(default)]
     pub height: Option<f32>,
-    /// Width as a percent of the parent.
+    /// Width as a percent of the UI viewport (not the parent node).
     #[serde(default)]
     pub width_percent: Option<f32>,
-    /// Height as a percent of the parent.
+    /// Height as a percent of the UI viewport (not the parent node).
     #[serde(default)]
     pub height_percent: Option<f32>,
     /// Minimum width in logical pixels.
@@ -236,25 +239,25 @@ pub struct ScreenLayout {
     /// Absolute left inset in logical pixels.
     #[serde(default)]
     pub left: Option<f32>,
-    /// Absolute left inset as a percent of the parent width.
+    /// Absolute left inset measured in percent of the UI viewport width.
     #[serde(default)]
     pub left_percent: Option<f32>,
     /// Absolute right inset in logical pixels.
     #[serde(default)]
     pub right: Option<f32>,
-    /// Absolute right inset as a percent of the parent width.
+    /// Absolute right inset measured in percent of the UI viewport width.
     #[serde(default)]
     pub right_percent: Option<f32>,
     /// Absolute top inset in logical pixels.
     #[serde(default)]
     pub top: Option<f32>,
-    /// Absolute top inset as a percent of the parent height.
+    /// Absolute top inset measured in percent of the UI viewport height.
     #[serde(default)]
     pub top_percent: Option<f32>,
     /// Absolute bottom inset in logical pixels.
     #[serde(default)]
     pub bottom: Option<f32>,
-    /// Absolute bottom inset as a percent of the parent height.
+    /// Absolute bottom inset measured in percent of the UI viewport height.
     #[serde(default)]
     pub bottom_percent: Option<f32>,
 }

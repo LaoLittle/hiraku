@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 21;
+pub const CURRENT_SAVE_VERSION: u32 = 24;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
@@ -123,6 +123,7 @@ impl Default for CameraSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
+    pub clips: crate::scene::clipping::ClipState,
     pub actor_motions: BTreeMap<String, crate::script::actor_motion::ActorMotion>,
     #[serde(default)]
     pub curtain: Option<CurtainSnapshot>,
@@ -133,6 +134,7 @@ pub struct SceneSnapshot {
     pub sprites: Vec<SpriteSnapshot>,
     #[serde(default)]
     pub character_positions: BTreeMap<String, [f32; 2]>,
+    pub character_rotations: BTreeMap<String, f32>,
     pub character_catalog_names: BTreeMap<String, String>,
     pub overlay_alpha: f32,
     pub bgm: Option<AudioSnapshot>,
@@ -145,6 +147,8 @@ pub struct SceneSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CurtainSnapshot {
+    pub color: [u8; 3],
+    pub target_color: [u8; 3],
     pub mask: Option<String>,
     pub softness: f32,
     pub target: f32,

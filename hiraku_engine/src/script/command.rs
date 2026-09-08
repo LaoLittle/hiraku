@@ -36,11 +36,13 @@ pub enum RuntimeCommand {
 
 #[derive(Debug)]
 pub enum StageCommand {
+    Clip(crate::scene::clipping::ClipCommand),
     AwaitCurtain {
         done: ScriptRequestId,
     },
     Picture(crate::scene::pictures::PictureCommand),
     SetCurtain {
+        color: [u8; 3],
         opacity: f32,
         fade: Option<Duration>,
         mask: Option<String>,
@@ -124,6 +126,7 @@ pub enum CharacterCommand {
         fade_ms: u64,
     },
     Show {
+        rotation: f32,
         placement_animation: Option<super::animation::AnimationSpec>,
         actor_id: String,
         character_name: String,

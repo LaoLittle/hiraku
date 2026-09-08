@@ -1,6 +1,10 @@
 #import bevy_pbr::forward_io::VertexOutput
 
 struct WorldSpriteMaterial {
+    slice_borders: vec4<f32>,
+    slice_size: vec4<f32>,
+    clip_bounds: vec4<f32>,
+    clip_axes: vec4<f32>,
     effects: vec4<f32>,
     dissolve: vec4<f32>,
     tint: vec4<f32>,
@@ -14,13 +18,32 @@ struct WorldSpriteMaterial {
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var dissolve_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var dissolve_sampler: sampler;
 
+// Keep corners at source-pixel size, shrinking proportionally when the target
+// is smaller than both borders combined. Only the center strip stretches.
+fn slice_axis(uv: f32, source: f32, destination: f32, before: f32, after: f32) -> f32 {
+    let borders = vec2<f32>(before, after) * min(1.0, source / max(before + after, 0.0001));
+    let screen = borders * min(1.0, destination / max(borders.x + borders.y, 0.0001));
+    let p = uv * destination;
+    if p < screen.x { return p / max(screen.x, 0.0001) * borders.x / source; }
+    if p > destination - screen.y { return 1.0 - (destination - p) / max(screen.y, 0.0001) * borders.y / source; }
+    return (borders.x + (p - screen.x) / max(destination - screen.x - screen.y, 0.0001) * (source - borders.x - borders.y)) / source;
+}
+
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let texture_size = vec2<f32>(textureDimensions(color_texture));
     let full_image = material.rect.z <= 0.0 || material.rect.w <= 0.0;
+    let source_size = select(material.rect.zw, texture_size, full_image);
+    var local_uv = mesh.uv;
+    if material.slice_size.z > 0.0 {
+        local_uv = vec2<f32>(
+            slice_axis(mesh.uv.x, source_size.x, material.slice_size.x, material.slice_borders.x, material.slice_borders.z),
+            slice_axis(mesh.uv.y, source_size.y, material.slice_size.y, material.slice_borders.y, material.slice_borders.w),
+        );
+    }
     let uv = select(
-        (material.rect.xy + mesh.uv * material.rect.zw) / texture_size,
-        mesh.uv,
+        (material.rect.xy + clamp(local_uv * source_size, vec2<f32>(0.5), source_size - vec2<f32>(0.5))) / texture_size,
+        local_uv,
         full_image,
     );
     var sampled = textureSample(color_texture, color_sampler, uv);
@@ -60,7 +83,10 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         coverage = select(coverage, 1.0, progress >= 1.0);
         color.a = select(coverage, 1.0 - coverage, reversed);
     }
-    if color.a <= 0.0001 {
+    let delta = mesh.world_position.xy - material.clip_bounds.xy;
+    let local = vec2<f32>(dot(delta, material.clip_axes.xy), dot(delta, vec2<f32>(-material.clip_axes.y, material.clip_axes.x)));
+    let outside = material.clip_axes.z > 0.0 && any(abs(local) > material.clip_bounds.zw);
+    if outside || color.a <= 0.0001 {
         discard;
     }
     return color;

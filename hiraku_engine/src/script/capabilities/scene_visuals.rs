@@ -5,7 +5,12 @@ use hiraku_script::native::{NativeError, NativeRegistry};
 use serde::{Deserialize, Serialize};
 
 use super::{CharacterContext, StoryEffect};
+use crate::scene::clipping::{ClipCommand, ClipRegion};
 use crate::scene::pictures::PictureCommand;
+
+#[derive(Clone, Copy, hiraku_script::HksHandle)]
+#[hks(name = "SceneClip", handle_type = 5)]
+pub(super) struct SceneClipHandle(u64);
 
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "SceneTransition", handle_type = 4)]
@@ -13,11 +18,16 @@ pub(super) struct SceneTransitionHandle(u64);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum SceneVisualTarget {
+    Clip {
+        name: String,
+        region: ClipRegion,
+    },
     HideCharacters {
         duration_ms: u64,
     },
     Picture(PictureCommand),
     Curtain {
+        color: [u8; 3],
         opacity: f32,
         mask: Option<String>,
         softness: f32,
@@ -49,6 +59,9 @@ impl SceneVisualState {
     pub(super) fn commit(&mut self, effects: &mut Vec<StoryEffect>) {
         for (_, (target, fade_ms)) in std::mem::take(&mut self.pending) {
             effects.push(match target {
+                SceneVisualTarget::Clip { name, region } => {
+                    StoryEffect::Clip(ClipCommand::Define { name, region })
+                }
                 SceneVisualTarget::HideCharacters { duration_ms } => StoryEffect::HideCharacter {
                     actor_id: None,
                     fade_ms: fade_ms.unwrap_or(duration_ms),
@@ -73,10 +86,12 @@ impl SceneVisualState {
                     StoryEffect::Picture(picture)
                 }
                 SceneVisualTarget::Curtain {
+                    color,
                     opacity,
                     mask,
                     softness,
                 } => StoryEffect::SetCurtain {
+                    color,
                     opacity,
                     fade_ms,
                     mask,
@@ -104,6 +119,91 @@ fn milliseconds(seconds: f64) -> Result<u64, NativeError> {
 mod api {
     use super::*;
 
+    /// Dimensions and position are world-space canvas units, not percentages.
+    #[hks(name = "clipRect", selector = "scene")]
+    fn clip_rect(
+        context: &mut CharacterContext,
+        name: String,
+        width: f64,
+        height: f64,
+    ) -> Result<SceneClipHandle, NativeError> {
+        if name.trim().is_empty() {
+            return Err(NativeError::message("clip name must not be empty"));
+        }
+        let region = ClipRegion {
+            center: [0.0; 2],
+            size: [width as f32, height as f32],
+            rotation: 0.0,
+        };
+        region.rect().map_err(NativeError::message)?;
+        let handle = context
+            .scene_visuals
+            .begin(SceneVisualTarget::Clip { name, region })?;
+        Ok(SceneClipHandle(handle.0))
+    }
+
+    #[hks(name = "at", selector = "SceneClip", receiver)]
+    fn clip_at(
+        context: &mut CharacterContext,
+        handle: SceneClipHandle,
+        position: super::super::Position,
+    ) -> Result<SceneClipHandle, NativeError> {
+        let super::super::Position::Absolute(x, y) = position else {
+            return Err(NativeError::message(
+                "clip position requires .pos(x, y) in world-space canvas units",
+            ));
+        };
+        let Some((SceneVisualTarget::Clip { region, .. }, _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("clip builder has already committed"));
+        };
+        let mut next = region.clone();
+        next.center = [x as f32, y as f32];
+        next.rect().map_err(NativeError::message)?;
+        *region = next;
+        Ok(handle)
+    }
+
+    #[hks(name = "rotation", selector = "SceneClip", receiver)]
+    fn clip_rotation(
+        context: &mut CharacterContext,
+        handle: SceneClipHandle,
+        degrees: f64,
+    ) -> Result<SceneClipHandle, NativeError> {
+        let Some((SceneVisualTarget::Clip { region, .. }, _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("clip builder has already committed"));
+        };
+        let mut next = region.clone();
+        next.rotation = degrees as f32;
+        next.rect().map_err(NativeError::message)?;
+        *region = next;
+        Ok(handle)
+    }
+
+    #[hks(name = "removeClip", selector = "scene")]
+    fn remove_clip(context: &mut CharacterContext, name: String) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::Clip(ClipCommand::Remove { name }));
+        Ok(())
+    }
+
+    /// Attach independently of picture visibility; replacement retains the clip.
+    #[hks(name = "clipPicture", selector = "scene")]
+    fn clip_picture(
+        context: &mut CharacterContext,
+        id: String,
+        region: Option<String>,
+    ) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::Clip(ClipCommand::Picture { id, region }));
+        Ok(())
+    }
+
     #[hks(name = "picture", selector = "scene")]
     fn picture(
         context: &mut CharacterContext,
@@ -118,6 +218,9 @@ mod api {
         context
             .scene_visuals
             .begin(SceneVisualTarget::Picture(PictureCommand::Show {
+                size: None,
+                slice: None,
+                color: None,
                 id,
                 path: texture,
                 rect: None,
@@ -167,6 +270,81 @@ mod api {
         *angle = rotation as f32;
         *z = layer as f32;
         Ok(SceneTransitionHandle(id))
+    }
+
+    #[hks(name = "size", selector = "SceneTransition", receiver)]
+    fn picture_size(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        width: f64,
+        height: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if ![width, height]
+            .iter()
+            .all(|n| n.is_finite() && *n > 0.0 && *n <= 100000.0)
+        {
+            return Err(NativeError::message(
+                "picture dimensions must be finite and in (0, 100000]",
+            ));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { size, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("size requires an uncommitted picture"));
+        };
+        *size = Some([width as f32, height as f32]);
+        Ok(handle)
+    }
+
+    #[hks(name = "slice", selector = "SceneTransition", receiver)]
+    fn picture_slice(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        left: f64,
+        top: f64,
+        right: f64,
+        bottom: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let borders = [left, top, right, bottom];
+        if !borders
+            .iter()
+            .all(|n| n.is_finite() && *n >= 0.0 && *n <= 100000.0)
+        {
+            return Err(NativeError::message(
+                "slice borders must be finite and in [0, 100000]",
+            ));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { slice, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "slice requires an uncommitted picture",
+            ));
+        };
+        *slice = Some(borders.map(|n| n as f32));
+        Ok(handle)
+    }
+
+    #[hks(name = "tint", selector = "SceneTransition", receiver)]
+    fn picture_tint(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        red: i32,
+        green: i32,
+        blue: i32,
+        alpha: i32,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let channels = [red, green, blue, alpha];
+        if !channels.iter().all(|n| (0..=255).contains(n)) {
+            return Err(NativeError::message("picture tint requires RGBA bytes"));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { color, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("tint requires an uncommitted picture"));
+        };
+        *color = Some(channels.map(|n| n as f32 / 255.0));
+        Ok(handle)
     }
 
     /// Change only a shown picture's tint; channels use sRGB bytes.
@@ -313,10 +491,39 @@ mod api {
             ));
         }
         context.scene_visuals.begin(SceneVisualTarget::Curtain {
+            color: [0; 3],
             opacity: opacity as f32,
             mask: None,
             softness: 0.0,
         })
+    }
+
+    /// Select the curtain pigment; fade controls its opacity independently.
+    #[hks(name = "color", receiver)]
+    fn color(
+        context: &mut CharacterContext,
+        SceneTransitionHandle(id): SceneTransitionHandle,
+        red: i32,
+        green: i32,
+        blue: i32,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if ![red, green, blue]
+            .iter()
+            .all(|value| (0..=255).contains(value))
+        {
+            return Err(NativeError::message(
+                "curtain color requires RGB bytes in 0..=255",
+            ));
+        }
+        let Some((SceneVisualTarget::Curtain { color, .. }, _)) =
+            context.scene_visuals.pending.get_mut(&id)
+        else {
+            return Err(NativeError::message(
+                "color requires an uncommitted scene.curtain(...)",
+            ));
+        };
+        *color = [red as u8, green as u8, blue as u8];
+        Ok(SceneTransitionHandle(id))
     }
 
     /// A red-channel threshold mask, sampled as linear data across the canvas.
@@ -421,6 +628,108 @@ mod tests {
         for value in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
             assert!(milliseconds(value).is_err());
         }
+    }
+
+    #[test]
+    fn sliced_picture_commits_style_and_joins_its_fade() {
+        let mut runtime = runtime(
+            r#"
+            scene.picture("panel", "textures/border").size(640, 320)
+                .slice(20, 30, 20, 30).tint(0, 0, 0, 204).fade(300).await()
+            log("finished")
+        "#,
+        );
+        let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut runtime) else {
+            panic!("expected styled picture");
+        };
+        let StoryEffect::Picture(PictureCommand::Show {
+            size,
+            slice,
+            color,
+            seconds,
+            ..
+        }) = &effect
+        else {
+            panic!("expected picture effect");
+        };
+        assert_eq!(*size, Some([640.0, 320.0]));
+        assert_eq!(*slice, Some([20.0, 30.0, 20.0, 30.0]));
+        assert_eq!(*color, Some([0.0, 0.0, 0.0, 0.8]));
+        assert!((seconds - 0.3).abs() < 0.0001);
+        assert!(runtime.step().expect("waiting for fade").is_none());
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("fade completes");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(message)) if message == "finished")
+        );
+    }
+
+    #[test]
+    fn named_clip_builders_commit_in_order_and_share_actor_picture_coordinates() {
+        let mut runtime = runtime(
+            r#"
+            scene.clipRect("window", 400, 800).at(.pos(100, 20)).rotation(-10)
+            scene.clipPicture("room", "window")
+            char("alice").clip("window")
+            scene.removeClip("window")
+        "#,
+        );
+        let mut state = crate::scene::clipping::ClipState::default();
+        for index in 0..4 {
+            let StoryRuntimeEvent::Effect(StoryEffect::Clip(command)) = event(&mut runtime) else {
+                panic!("expected clip event");
+            };
+            state.apply(command).expect("valid command");
+            if index == 2 {
+                assert!(state.actor("alice").is_some());
+                assert_eq!(state.actor("alice"), state.picture("room"));
+            }
+        }
+        assert!(state.actor("alice").is_none());
+        assert!(state.picture("room").is_none());
+    }
+
+    #[test]
+    fn sequence_removes_clip_only_after_border_fade_and_restore() {
+        let code = compile_story_bytecode(
+            "clip.hks",
+            r#"
+            seq {
+                scene.hidePicture("border").fade(200).await()
+                scene.removeClip("window")
+            }.await()
+            log("finished")
+        "#,
+        )
+        .expect("compile");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+        let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut runtime) else {
+            panic!("border fade");
+        };
+        assert!(runtime.step().expect("fade is pending").is_none());
+        let snapshot = runtime.snapshot().expect("save during border exit");
+        let mut runtime = StoryRuntime::restore(code, snapshot).expect("restore border exit");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect { effect: replay, .. } if replay == effect)
+        );
+        assert!(
+            runtime
+                .step()
+                .expect("restored fade still pending")
+                .is_none()
+        );
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("finish fade");
+        // Clip edits have no animated lifetime: they must not create a task
+        // completion request that the ECS dispatcher cannot fulfill.
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Clip(ClipCommand::Remove { name })) if name == "window")
+        );
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(message)) if message == "finished")
+        );
     }
 
     #[test]
@@ -583,6 +892,25 @@ mod tests {
     }
 
     #[test]
+    fn actor_rotation_commits_with_show_and_does_not_conflict_with_camera() {
+        let mut runtime = runtime(
+            "let alice = char(\"alice\")\nalice.rotation(40).show()\nalice.e(\"happy\")\ncamera().rotation(0, 0, 10)",
+        );
+        for _ in 0..2 {
+            assert!(
+                matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter { rotation, .. }) if rotation == 40.0)
+            );
+        }
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::SetCamera {
+                rotation: Some([0.0, 0.0, 10.0]),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn hiding_accepts_a_fade_without_flushing_a_new_actor() {
         let mut runtime = runtime("char(\"alice\").hide(300)\nscene.hideCharacters(600)");
         assert_eq!(
@@ -655,11 +983,29 @@ mod tests {
     }
 
     #[test]
+    fn curtain_color_uses_byte_channels_and_keeps_await_semantics() {
+        let mut runtime = runtime("scene.curtain(1).color(255, 32, 0).fade(200).await()");
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::SetCurtain {
+                    color: [255, 32, 0],
+                    fade_ms: Some(200),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(runtime.step().expect("curtain waits").is_none());
+    }
+
+    #[test]
     fn curtain_uses_a_scene_selector_and_commits_a_single_transition() {
         let mut runtime = runtime("scene.curtain(0).fade(1200)");
         assert_eq!(
             event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::SetCurtain {
+                color: [0; 3],
                 opacity: 0.0,
                 fade_ms: Some(1200),
                 mask: None,
@@ -679,6 +1025,7 @@ mod tests {
         assert_eq!(
             event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::SetCurtain {
+                color: [0; 3],
                 opacity: 1.0,
                 fade_ms: Some(900),
                 mask: Some("transitions/blinds".into()),
@@ -856,6 +1203,9 @@ mod tests {
             event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
                 id: "Backgrounds".into(),
+                size: None,
+                slice: None,
+                color: None,
                 path: "alice/background".into(),
                 rect: None,
                 position: [50.0, 50.0],

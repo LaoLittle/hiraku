@@ -12,7 +12,7 @@ mod dissolve_shader_tests {
     #[test]
     fn sprite_dissolve_shader_parses_and_validates_without_a_gpu() {
         let source = include_str!("shaders/world_sprite.wgsl")
-            .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };")
+            .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) world_position: vec4<f32>, };")
             .replace("#{MATERIAL_BIND_GROUP}", "2");
         let module = naga::front::wgsl::parse_str(&source).expect("sprite WGSL parses");
         naga::valid::Validator::new(
@@ -30,6 +30,9 @@ mod dissolve_shader_tests {
 /// remains available for story-level position, scale and animation.
 #[derive(Component, Clone, Debug)]
 pub struct WorldSprite {
+    /// Nine-slice borders in source pixels: left, top, right, bottom.
+    pub slice: Option<[f32; 4]>,
+    pub clip: Option<hiraku_sprite3d::ClipRect>,
     /// Sampling radius in source-image pixels; independent of camera effects.
     pub blur_radius: f32,
     pub dissolve: Option<DissolveMask>,
@@ -53,6 +56,8 @@ pub struct DissolveMask {
 impl WorldSprite {
     pub fn from_image(image: Handle<Image>) -> Self {
         Self {
+            slice: None,
+            clip: None,
             blur_radius: 0.0,
             dissolve: None,
             image: Some(image),
@@ -65,6 +70,8 @@ impl WorldSprite {
 
     pub fn from_color(color: Color, size: Vec2) -> Self {
         Self {
+            slice: None,
+            clip: None,
             blur_radius: 0.0,
             dissolve: None,
             image: None,
@@ -85,6 +92,10 @@ impl WorldSprite {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, WorldSpriteUniform)]
 pub struct WorldSpriteMaterial {
+    pub slice_borders: Vec4,
+    pub slice_size: Vec4,
+    pub clip_bounds: Vec4,
+    pub clip_axes: Vec4,
     pub effects: Vec4,
     #[texture(3)]
     #[sampler(4)]
@@ -99,6 +110,10 @@ pub struct WorldSpriteMaterial {
 
 #[derive(Clone, Debug, ShaderType)]
 pub struct WorldSpriteUniform {
+    slice_borders: Vec4,
+    slice_size: Vec4,
+    clip_bounds: Vec4,
+    clip_axes: Vec4,
     effects: Vec4,
     dissolve: Vec4,
     tint: Vec4,
@@ -108,6 +123,10 @@ pub struct WorldSpriteUniform {
 impl From<&WorldSpriteMaterial> for WorldSpriteUniform {
     fn from(material: &WorldSpriteMaterial) -> Self {
         Self {
+            slice_borders: material.slice_borders,
+            slice_size: material.slice_size,
+            clip_bounds: material.clip_bounds,
+            clip_axes: material.clip_axes,
             effects: material.effects,
             dissolve: material.dissolve,
             tint: material.tint,
@@ -143,6 +162,20 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
+        slice_borders: sprite.slice.map(Vec4::from_array).unwrap_or(Vec4::ZERO),
+        slice_size: sprite.slice.map_or(Vec4::ZERO, |_| {
+            sprite
+                .resolved_size
+                .unwrap_or(Vec2::ONE)
+                .extend(1.0)
+                .extend(0.0)
+        }),
+        clip_bounds: sprite
+            .clip
+            .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[0]),
+        clip_axes: sprite
+            .clip
+            .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[1]),
         effects: Vec4::new(sprite.blur_radius, 0.0, 0.0, 0.0),
         dissolve_mask: sprite.dissolve.as_ref().map(|mask| mask.image.clone()),
         dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| {

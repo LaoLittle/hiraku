@@ -45,6 +45,34 @@ fn install_runtime_systems(app: &mut App) {
             .before(Sprite3dSync),
     );
 }
+fn composite_transform(center: Vec2, placement: Option<Transform>) -> Transform {
+    let (center, rotation) = placement
+        .map(|p| {
+            let pivot = p.translation.truncate().extend(0.0);
+            (
+                (pivot + p.rotation * (center.extend(0.0) - pivot)).truncate(),
+                p.rotation,
+            )
+        })
+        .unwrap_or((center, Quat::IDENTITY));
+    Transform::from_xyz(center.x, center.y, super::STAGE_Z_SPRITE).with_rotation(rotation)
+}
+
+#[test]
+fn composite_rotates_about_actor_origin_not_bounds_center() {
+    let pose = Transform::from_xyz(100.0, 50.0, 0.0)
+        .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+    let result = composite_transform(Vec2::new(120.0, 50.0), Some(pose));
+    assert!(
+        result
+            .translation
+            .truncate()
+            .abs_diff_eq(Vec2::new(100.0, 70.0), 0.001)
+    );
+    assert!(result.rotation.abs_diff_eq(pose.rotation, 0.001));
+    assert_eq!(result.scale, Vec3::ONE);
+}
+
 pub(super) fn fade_group(
     commands: &mut Commands,
     root: Entity,
@@ -101,9 +129,16 @@ fn advance_group_fades(
 }
 fn compose_groups(
     mut commands: Commands,
+    shared: Res<super::SceneSharedState>,
     images: Res<Assets<Image>>,
     mut atlases: ResMut<Assets<TextureAtlasLayout>>,
-    mut roots: Query<(Entity, &Children, &mut CharacterGroup)>,
+    mut roots: Query<(
+        Entity,
+        &Children,
+        &mut CharacterGroup,
+        &super::CharacterRoot,
+        Option<&super::character::ActorPlacement>,
+    )>,
     parts: Query<(
         &LogicalCharacterPart,
         &WorldSprite,
@@ -116,7 +151,7 @@ fn compose_groups(
         (With<CompositeDisplay>, Without<LogicalCharacterPart>),
     >,
 ) {
-    for (root, children, mut group) in &mut roots {
+    for (root, children, mut group, identity, placement) in &mut roots {
         let mut selected = children
             .iter()
             .filter_map(|e| parts.get(e).ok())
@@ -181,6 +216,7 @@ fn compose_groups(
             });
         }
         let sprite = Sprite3d {
+            clip: shared.0.clips.actor(&identity.actor_id),
             image: Some(image),
             layers,
             custom_size: Some(size),
@@ -189,7 +225,9 @@ fn compose_groups(
         };
         // Per-part layers order composition only. Actor ordering belongs to
         // the root and must not change when a high-layer expression is swapped.
-        let transform = Transform::from_xyz(center.x, center.y, super::STAGE_Z_SPRITE);
+        // Rotate the composed surface, not each part: mask coordinates and
+        // premultiplied composition remain in their shared unrotated plane.
+        let transform = composite_transform(center, placement.map(|p| p.current));
         let render_layers = if selected.iter().any(|p| p.4) {
             focus_layer()
         } else {
@@ -354,6 +392,7 @@ mod tests {
         app.update();
         app.update();
         app.init_resource::<Time>()
+            .init_resource::<super::super::SceneSharedState>()
             .init_resource::<AnimationState>()
             .init_resource::<Assets<Image>>()
             .init_resource::<Assets<TextureAtlasLayout>>()
@@ -456,6 +495,7 @@ mod tests {
     fn group_fade_preserves_intrinsic_part_alpha_and_hides_children() {
         let mut app = App::new();
         app.init_resource::<Time>()
+            .init_resource::<super::super::SceneSharedState>()
             .init_resource::<AnimationState>()
             .init_resource::<Assets<Image>>()
             .init_resource::<Assets<TextureAtlasLayout>>()
@@ -491,6 +531,39 @@ mod tests {
             ))
             .id();
         app.world_mut()
+            .entity_mut(root)
+            .insert(super::super::CharacterRoot {
+                actor_id: "bob".into(),
+            });
+        let region = super::super::clipping::ClipRegion {
+            center: [10.0, 20.0],
+            size: [40.0, 80.0],
+            rotation: 30.0,
+        };
+        let expected_clip = region.rect().expect("valid rectangle");
+        {
+            use super::super::clipping::ClipCommand;
+            let mut shared = app
+                .world_mut()
+                .resource_mut::<super::super::SceneSharedState>();
+            shared
+                .0
+                .clips
+                .apply(ClipCommand::Define {
+                    name: "window".into(),
+                    region,
+                })
+                .expect("define clip");
+            shared
+                .0
+                .clips
+                .apply(ClipCommand::Actor {
+                    id: "bob".into(),
+                    region: Some("window".into()),
+                })
+                .expect("attach clip");
+        }
+        app.world_mut()
             .resource_mut::<Time>()
             .advance_by(Duration::from_millis(500));
         app.update();
@@ -505,6 +578,7 @@ mod tests {
             .get::<Sprite3d>(display)
             .expect("one composed sprite");
         assert_eq!(composed.color.alpha(), 0.5);
+        assert_eq!(composed.clip, Some(expected_clip));
         assert_eq!(composed.layers[0].color.alpha(), 0.4);
         assert_eq!(
             app.world().get::<CharacterGroup>(root).expect("root").alpha,

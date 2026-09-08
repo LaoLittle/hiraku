@@ -128,6 +128,8 @@ pub mod stored_value {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SceneSnapshot {
+    #[prost(bytes = "vec", tag = "13")]
+    pub clips_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "12")]
     pub actor_motions_hson: Vec<u8>,
     #[prost(btree_map = "string, string", tag = "11")]
@@ -206,6 +208,8 @@ pub struct CharacterPosition {
     pub x: f32,
     #[prost(float, tag = "3")]
     pub y: f32,
+    #[prost(float, tag = "4")]
+    pub rotation: f32,
 }
 
 #[derive(Clone, PartialEq, Message)]

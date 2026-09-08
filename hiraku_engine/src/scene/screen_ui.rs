@@ -123,6 +123,87 @@ pub(super) struct SpawnedScreenUi {
     pub(super) image_handles: Vec<Handle<Image>>,
 }
 
+#[derive(Component)]
+pub(crate) struct ScreenComposition {
+    renderer: std::sync::Arc<crate::script::UiComposition>,
+    rendered: BTreeMap<String, hiraku_script::Value>,
+}
+
+/// Re-evaluate structural branches only when this mount's local state changes.
+/// Keep the modal root and its waiting request: rebuilding content is not ui.open.
+pub fn recompose_screen_ui(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    textures: Res<TextureCatalog>,
+    terms: Res<TermCatalog>,
+    fonts: Res<UiFonts>,
+    style: Res<UiStyle>,
+    focus: Res<crate::input::HirakuTextFocus>,
+    interactions: Query<(Entity, &PickingInteraction)>,
+    parents: Query<&ChildOf>,
+    mut screens: Query<(
+        Entity,
+        &Children,
+        &super::widgets::UiLocalState,
+        &mut ScreenComposition,
+    )>,
+) {
+    for (root, children, local, mut composition) in &mut screens {
+        if composition.rendered == local.0 {
+            continue;
+        }
+        let belongs_to_root = |mut entity: Entity| {
+            loop {
+                if entity == root {
+                    return true;
+                }
+                let Ok(parent) = parents.get(entity) else {
+                    return false;
+                };
+                entity = parent.parent();
+            }
+        };
+        // Never invalidate an active drag or text-edit session. Existing
+        // property updates continue; structural changes commit after release.
+        if focus.0.is_some_and(belongs_to_root)
+            || interactions.iter().any(|(entity, interaction)| {
+                *interaction == PickingInteraction::Pressed && belongs_to_root(entity)
+            })
+        {
+            continue;
+        }
+        // Do not retry a failed state every frame or overwrite the visible UI.
+        composition.rendered = local.0.clone();
+        let screen = match composition.renderer.render(&local.0, &textures, &terms) {
+            Ok(screen) => screen,
+            Err(error) => {
+                crate::script::emit_script_diagnostic(
+                    "UI recomposition failed",
+                    &error.to_string(),
+                );
+                continue;
+            }
+        };
+        let mut handles = Vec::new();
+        let next = build_screen_ui_children(
+            &mut commands,
+            root,
+            &assets,
+            &fonts,
+            &style,
+            &screen,
+            &mut handles,
+        );
+        for child in children.iter() {
+            commands.entity(child).try_despawn();
+        }
+        commands.entity(root).add_children(&next);
+        commands
+            .entity(root)
+            .insert((screen_root_node(&screen), screen_root_background(&screen)));
+    }
+}
+
 pub(super) fn spawn_screen_ui(
     commands: &mut Commands,
     asset_server: &AssetServer,
@@ -151,6 +232,15 @@ pub(super) fn spawn_screen_ui(
         .id();
 
     let mut image_handles = Vec::new();
+    if let Some(renderer) = &screen.composition {
+        commands.entity(root).insert((
+            super::widgets::UiLocalState(renderer.globals.clone()),
+            ScreenComposition {
+                renderer: renderer.clone(),
+                rendered: renderer.globals.clone(),
+            },
+        ));
+    }
     let children = build_screen_ui_children(
         commands,
         root,
@@ -1979,6 +2069,35 @@ mod tests {
     }
 
     #[test]
+    fn nested_surface_size_uses_pixels_unless_viewport_units_are_requested() {
+        let mut surface = Node::default();
+        apply_screen_layout(
+            &mut surface,
+            &ScreenLayout {
+                width: Some(320.0),
+                height: Some(80.0),
+                left: Some(0.0),
+                top: Some(0.0),
+                ..default()
+            },
+        );
+        assert_eq!(surface.width, px(320));
+        assert_eq!(surface.height, px(80));
+        assert_eq!(surface.position_type, PositionType::Absolute);
+        let mut viewport = Node::default();
+        apply_screen_layout(
+            &mut viewport,
+            &ScreenLayout {
+                width_percent: Some(100.0),
+                height_percent: Some(100.0),
+                ..default()
+            },
+        );
+        assert_eq!(viewport.width, vw(100));
+        assert_eq!(viewport.height, vh(100));
+    }
+
+    #[test]
     fn canvas_groups_start_at_top_left_instead_of_center() {
         let source = "import ui.widgets.*\ncanvas { column { text(\"alice\").at(.rel(10, 20)) } }";
         let screen = evaluate_ui_component_named_with_args(
@@ -1993,6 +2112,69 @@ mod tests {
         let node = screen_root_node(&screen);
         assert_eq!(node.justify_content, JustifyContent::Start);
         assert_eq!(node.align_items, AlignItems::Start);
+    }
+
+    #[test]
+    fn recomposition_preserves_modal_root_wait_and_active_edit_session() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://tabs.ui.hks",
+            "import ui.widgets.*\nglobal var showBob = false\ncanvas { if showBob { text(\"Bob\") } else { text(\"Alice\") } }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("screen");
+        let renderer = screen.composition.expect("composition");
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_resource::<TextureCatalog>()
+            .init_resource::<TermCatalog>()
+            .init_resource::<UiStyle>()
+            .init_resource::<crate::input::HirakuTextFocus>()
+            .init_resource::<ScreenUiState>()
+            .insert_resource(UiFonts {
+                regular: Handle::default(),
+                _fonts: vec![],
+            })
+            .add_systems(Update, recompose_screen_ui);
+        let old = app.world_mut().spawn(Text::new("Alice")).id();
+        let mut local = renderer.globals.clone();
+        local.insert("showBob".into(), hiraku_script::Value::Bool(true));
+        let root = app
+            .world_mut()
+            .spawn((
+                ScreenUiRoot,
+                Node::default(),
+                super::super::widgets::UiLocalState(local),
+                ScreenComposition {
+                    rendered: renderer.globals.clone(),
+                    renderer,
+                },
+            ))
+            .add_child(old)
+            .id();
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(root);
+        app.world_mut().resource_mut::<ScreenUiState>().waiting = Some(ScriptRequestId(17));
+        app.world_mut()
+            .resource_mut::<crate::input::HirakuTextFocus>()
+            .0 = Some(old);
+        app.update();
+        assert!(
+            app.world().get_entity(old).is_ok(),
+            "editing must retain its target"
+        );
+        app.world_mut()
+            .resource_mut::<crate::input::HirakuTextFocus>()
+            .0 = None;
+        app.update();
+        assert!(app.world().get_entity(old).is_err());
+        assert_eq!(
+            app.world().resource::<ScreenUiState>().active_root,
+            Some(root)
+        );
+        assert_eq!(
+            app.world().resource::<ScreenUiState>().waiting,
+            Some(ScriptRequestId(17))
+        );
+        let mut texts = app.world_mut().query::<&Text>();
+        assert!(texts.iter(app.world()).any(|text| text.0 == "Bob"));
     }
 
     #[test]

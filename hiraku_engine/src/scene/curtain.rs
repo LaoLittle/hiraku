@@ -5,6 +5,7 @@ use std::time::Duration;
 
 #[derive(Component)]
 pub struct PendingCurtain {
+    pub color: [u8; 3],
     pub opacity: f32,
     pub duration: Option<Duration>,
     pub mask: Option<DissolveMask>,
@@ -86,6 +87,8 @@ pub fn update_curtains(
             }
         }
         let from = sprite.color.alpha();
+        sprite.color = Color::srgba_u8(pending.color[0], pending.color[1], pending.color[2], 255)
+            .with_alpha(from);
         sprite.dissolve = pending.mask.clone();
         if let Some(mask) = &mut sprite.dissolve {
             mask.canvas_size = canvas.size.as_vec2();
@@ -131,6 +134,7 @@ mod tests {
             .spawn((
                 OverlayMarker,
                 PendingCurtain {
+                    color: [0; 3],
                     opacity: 1.0,
                     duration: None,
                     mask: None,
@@ -203,6 +207,7 @@ mod tests {
             .spawn((
                 WorldSprite::from_color(Color::BLACK.with_alpha(0.0), Vec2::splat(6000.0)),
                 PendingCurtain {
+                    color: [255, 32, 0],
                     opacity: 1.0,
                     duration: Some(Duration::from_millis(900)),
                     mask: Some(DissolveMask {
@@ -218,12 +223,28 @@ mod tests {
         app.update();
         assert!(app.world().get::<PendingCurtain>(entity).is_some());
         assert!(app.world().get::<VisualTween>(entity).is_none());
+        assert_eq!(
+            app.world()
+                .get::<WorldSprite>(entity)
+                .expect("curtain")
+                .color
+                .to_srgba()
+                .red,
+            0.0
+        );
         app.world_mut()
             .resource_mut::<Assets<Image>>()
             .insert(image.id(), Image::default())
             .expect("reserved mask inserted");
         app.update();
         assert!(app.world().get::<PendingCurtain>(entity).is_none());
+        let color = app
+            .world()
+            .get::<WorldSprite>(entity)
+            .expect("curtain")
+            .color
+            .to_srgba();
+        assert_eq!(color.to_u8_array(), [255, 32, 0, 0]);
         let tween = app
             .world()
             .get::<VisualTween>(entity)
@@ -246,6 +267,8 @@ mod tests {
         let original = crate::state::SceneSnapshot {
             overlay_alpha: 0.4,
             curtain: Some(crate::state::CurtainSnapshot {
+                color: [255, 0, 0],
+                target_color: [0, 0, 255],
                 mask: Some("textures/mask.png".into()),
                 softness: 0.05,
                 target: 1.0,
@@ -258,6 +281,8 @@ mod tests {
             crate::state::SceneSnapshot::try_from(encoded).expect("curtain snapshot round trips");
         assert_eq!(restored.overlay_alpha, 0.4);
         let curtain = restored.curtain.expect("saved curtain");
+        assert_eq!(curtain.color, [255, 0, 0]);
+        assert_eq!(curtain.target_color, [0, 0, 255]);
         assert_eq!(curtain.mask.as_deref(), Some("textures/mask.png"));
         assert_eq!(curtain.target, 1.0);
         assert_eq!(curtain.remaining_ms, 540);

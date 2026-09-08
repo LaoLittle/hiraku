@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PictureState {
+    #[serde(default)]
+    pub size: Option<[f32; 2]>,
+    #[serde(default)]
+    pub slice: Option<[f32; 4]>,
     pub tint: [f32; 4],
     pub tint_tween: Option<PictureTint>,
     #[serde(default)]
@@ -74,6 +78,9 @@ pub enum PictureCommand {
         seconds: f32,
     },
     Show {
+        size: Option<[f32; 2]>,
+        slice: Option<[f32; 4]>,
+        color: Option<[f32; 4]>,
         id: String,
         path: String,
         rect: Option<[f32; 4]>,
@@ -162,6 +169,9 @@ pub(super) fn apply_picture_command(
         }
         PictureCommand::Clear => pictures.clear(),
         PictureCommand::Show {
+            size,
+            slice,
+            color,
             id,
             path,
             rect,
@@ -176,10 +186,12 @@ pub(super) fn apply_picture_command(
                 .get(&id)
                 .map(|p| (p.blur_radius, p.blur_tween.clone()))
                 .unwrap_or_default();
-            let (tint, tint_tween) = pictures
-                .get(&id)
-                .map(|p| (p.tint, p.tint_tween.clone()))
-                .unwrap_or(([1.0; 4], None));
+            let (tint, tint_tween) = color.map(|color| (color, None)).unwrap_or_else(|| {
+                pictures
+                    .get(&id)
+                    .map(|p| (p.tint, p.tint_tween.clone()))
+                    .unwrap_or(([1.0; 4], None))
+            });
             // Replacement images and a new show during hide own a fresh entrance.
             let old = pictures
                 .get(&id)
@@ -211,6 +223,8 @@ pub(super) fn apply_picture_command(
             pictures.insert(
                 id.clone(),
                 PictureState {
+                    size,
+                    slice,
                     tint,
                     tint_tween,
                     blur_radius: blur.0,
@@ -310,7 +324,9 @@ pub fn sync_pictures(
     mut shared: ResMut<SceneSharedState>,
     mut entities: Query<(Entity, &PictureEntity, &mut WorldSprite, &mut Transform)>,
 ) {
-    let pictures = &mut shared.0.pictures;
+    let crate::state::SceneSnapshot {
+        pictures, clips, ..
+    } = &mut shared.0;
     // Keep the first visible frame at the start of its animation: loading a
     // large picture must not consume the entire entrance before it is ready.
     let ready: HashSet<_> = entities
@@ -339,6 +355,17 @@ pub fn sync_pictures(
             continue;
         };
         existing.insert(marker.0.clone());
+        let size = picture.size.map(Vec2::from_array);
+        if sprite.custom_size != size {
+            sprite.custom_size = size;
+        }
+        if sprite.slice != picture.slice {
+            sprite.slice = picture.slice;
+        }
+        let clip = clips.picture(&marker.0);
+        if sprite.clip != clip {
+            sprite.clip = clip;
+        }
         if !sprite
             .image
             .as_ref()
@@ -364,6 +391,9 @@ pub fn sync_pictures(
     }
     for (id, picture) in pictures.iter().filter(|(id, _)| !existing.contains(*id)) {
         let mut sprite = WorldSprite::from_image(assets.load(picture.path.clone()));
+        sprite.custom_size = picture.size.map(Vec2::from_array);
+        sprite.slice = picture.slice;
+        sprite.clip = clips.picture(id);
         sprite.rect = picture.rect;
         sprite.blur_radius = picture.blur_radius;
         sprite.color = picture_color(picture);
@@ -618,6 +648,9 @@ mod tests {
             PictureCommand::Show {
                 id: "room".into(),
                 path: "background/room".into(),
+                size: None,
+                slice: None,
+                color: None,
                 rect: None,
                 position: [80.0, -35.0],
                 scale: 3.0,
@@ -746,6 +779,9 @@ mod tests {
             PictureCommand::Show {
                 id: "room".into(),
                 path: "pictures/bob.png".into(),
+                size: None,
+                slice: None,
+                color: None,
                 rect: None,
                 position: [50.0, 50.0],
                 scale: 1.0,

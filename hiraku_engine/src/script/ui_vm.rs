@@ -1520,55 +1520,107 @@ pub fn evaluate_ui_component_named_with_args(
             })
         })
         .transpose()?;
-    let program = project.program;
-    let materialize_program = program.clone();
-    let mut context = UiVmContext::new(values, terms.clone()).with_navigation_origin(path);
-    context.owned_globals = owned_globals;
-    if entry_symbol.is_some() {
-        let initializer = LinkedVm::new(program.clone(), entry)
-            .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-        if !collect_nodes(initializer, &registry, &mut context)?.is_empty() {
+    let composition = UiComposition {
+        program: project.program,
+        entry,
+        entry_symbol,
+        values,
+        path: path.to_owned(),
+        arguments: arguments.to_vec(),
+        owned_globals,
+        globals: BTreeMap::new(),
+    };
+    composition.render(&BTreeMap::new(), textures, terms)
+}
+
+/// Compiled UI code plus per-mount inputs. Recomposition never recompiles source
+/// or imports local state into the story namespace.
+#[derive(Clone, Debug)]
+pub(crate) struct UiComposition {
+    program: hiraku_script::LinkedProgram,
+    entry: hiraku_script::ModuleId,
+    entry_symbol: Option<hiraku_script::SymbolId>,
+    values: UiContext,
+    path: String,
+    arguments: Vec<StoredValue>,
+    owned_globals: std::collections::BTreeSet<String>,
+    pub(crate) globals: BTreeMap<String, Value>,
+}
+
+impl UiComposition {
+    pub(crate) fn render(
+        &self,
+        globals: &BTreeMap<String, Value>,
+        textures: &TextureCatalog,
+        terms: &TermCatalog,
+    ) -> Result<ScreenSpec, UiVmError> {
+        let registry = ui_registry(&self.values);
+        let program = self.program.clone();
+        let entry = self.entry;
+        let entry_symbol = self.entry_symbol;
+        let arguments = &self.arguments;
+        let materialize_program = program.clone();
+        let mut context =
+            UiVmContext::new(self.values.clone(), terms.clone()).with_navigation_origin(&self.path);
+        context.owned_globals = self.owned_globals.clone();
+        context.local_globals = self.globals.clone();
+        context.local_globals.extend(
+            globals
+                .iter()
+                .filter(|(name, _)| self.owned_globals.contains(*name))
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        if entry_symbol.is_some() {
+            let initializer = LinkedVm::new(program.clone(), entry)
+                .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+            if !collect_nodes(initializer, &registry, &mut context)?.is_empty() {
+                return Err(UiVmError::Invalid(
+                    "an @ui document must emit nodes inside its entrypoint, not at module scope"
+                        .into(),
+                ));
+            }
+        }
+        let mut vm = if let Some(symbol) = entry_symbol {
+            let callable = Value::Function {
+                module: Some(entry.0),
+                symbol,
+            };
+            LinkedVm::from_callable(
+                program,
+                &callable,
+                arguments.iter().map(stored_to_hks).collect(),
+            )
+        } else if arguments.is_empty() {
+            // Temporary migration path for existing UI modules. New UI modules
+            // may expose one explicit @ui function when it needs parameters.
+            LinkedVm::new(program, entry)
+        } else {
             return Err(UiVmError::Invalid(
-                "an @ui document must emit nodes inside its entrypoint, not at module scope".into(),
+                "parameterized UI modules require an `@ui global fn` entrypoint".into(),
             ));
         }
-    }
-    let mut vm = if let Some(symbol) = entry_symbol {
-        let callable = Value::Function {
-            module: Some(entry.0),
-            symbol,
-        };
-        LinkedVm::from_callable(
-            program,
-            &callable,
-            arguments.iter().map(stored_to_hks).collect(),
-        )
-    } else if arguments.is_empty() {
-        // Temporary migration path for existing UI modules. New UI modules
-        // may expose one explicit @ui function when it needs parameters.
-        LinkedVm::new(program, entry)
-    } else {
-        return Err(UiVmError::Invalid(
-            "parameterized UI modules require an `@ui global fn` entrypoint".into(),
-        ));
-    }
-    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-    vm.freeze_invocation_inputs()
         .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-    let roots = collect_nodes(vm, &registry, &mut context)?;
-    if roots.len() != 1 {
-        return Err(UiVmError::Invalid(format!(
-            "a UI document must produce exactly one root node, got {}",
-            roots.len()
-        )));
+        vm.freeze_invocation_inputs()
+            .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+        let roots = collect_nodes(vm, &registry, &mut context)?;
+        if roots.len() != 1 {
+            return Err(UiVmError::Invalid(format!(
+                "a UI document must produce exactly one root node, got {}",
+                roots.len()
+            )));
+        }
+        let mut screen = materialize_screen(
+            roots[0],
+            &materialize_program,
+            &registry,
+            &mut context,
+            textures,
+        )?;
+        let mut next = self.clone();
+        next.globals = context.local_globals;
+        screen.composition = Some(std::sync::Arc::new(next));
+        Ok(screen)
     }
-    materialize_screen(
-        roots[0],
-        &materialize_program,
-        &registry,
-        &mut context,
-        textures,
-    )
 }
 
 /// Offline type checking without constructing nodes or resolving image assets.
@@ -2000,6 +2052,7 @@ fn materialize_screen(
         .map(|name| resolve_texture(textures, name))
         .transpose()?;
     Ok(ScreenSpec {
+        composition: None,
         title: None,
         panel: draft.panel,
         width: draft.layout.width,
@@ -3141,6 +3194,68 @@ global var name: String = "alice"
     }
 
     #[test]
+    fn local_tab_callback_recomposes_branches_without_resetting_state() {
+        let screen = evaluate_ui_component_named(
+            "memory://tabs.ui.hks",
+            r#"
+            import ui.widgets.*
+            global var category = "alice"
+            fn tab(value: String) -> UiNode {
+                button { text(value) }.onClick { category = value }
+            }
+            @ui
+            global fn main() -> UiNode {
+                canvas {
+                    if category == "alice" { text("Alice panel") }
+                    if category == "bob" { column { text("Bob panel") } }
+                    tab("bob")
+                }
+            }
+        "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("tabs compile");
+        let ScreenNode::Button(button) = &screen.children[1] else {
+            panic!("tab button");
+        };
+        let callback = button.on_click.as_ref().expect("click callback");
+        let renderer = screen.composition.as_ref().expect("compiled composition");
+        let (effects, globals) = evaluate_ui_callback_with_args(
+            callback,
+            &renderer.globals,
+            &crate::ui::UiModels::default(),
+            vec![],
+        )
+        .expect("click");
+        assert!(effects.is_empty());
+        let next = renderer
+            .render(
+                &globals,
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("recompose");
+        let ScreenNode::Column(panel) = &next.children[0] else {
+            panic!("selected branch must change");
+        };
+        let ScreenNode::Text(text) = &panel.children[0] else {
+            panic!("panel text");
+        };
+        assert_eq!(text.text, "Bob panel");
+        assert_eq!(
+            next.composition.as_ref().expect("state").globals["category"],
+            Value::String("bob".into())
+        );
+        assert_eq!(
+            renderer.globals["category"],
+            Value::String("alice".into()),
+            "another mount's initial state remains independent"
+        );
+    }
+
+    #[test]
     fn evaluates_script_defined_compose_ui() {
         let source = r#"
 import ui.widgets.*
@@ -3229,6 +3344,50 @@ global fn card(label: String, count: Int) -> UiNode {
         };
         assert!(matches!(&column.children[0], ScreenNode::Text(text) if text.text == "Items"));
         assert!(matches!(&column.children[1], ScreenNode::Bar(bar) if bar.value == 3.0));
+    }
+
+    #[test]
+    fn detail_buttons_capture_each_function_invocation_independently() {
+        let screen = evaluate_ui_component_named(
+            "memory://details.ui.hks",
+            r#"import ui.widgets.*
+global var selectedTitle: String = ""
+global var selectedBody: String = ""
+fn entryButton(title: String, body: String) -> UiNode {
+    button { text(title) }.onClick {
+        selectedTitle = title
+        selectedBody = body
+    }
+}
+screen {
+    entryButton("Alice", "First entry")
+    entryButton("Bob", "Second entry")
+}"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("detail screen mounts without invoking handlers");
+        for (index, title, body) in [(0, "Alice", "First entry"), (1, "Bob", "Second entry")] {
+            let ScreenNode::Button(button) = &screen.children[index] else {
+                panic!("expected detail button");
+            };
+            let (effects, globals) = evaluate_ui_callback(
+                button.on_click.as_ref().expect("detail handler"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default(),
+            )
+            .expect("captured parameters remain available after return");
+            assert!(effects.is_empty());
+            assert_eq!(
+                globals.get("selectedTitle"),
+                Some(&Value::String(title.into()))
+            );
+            assert_eq!(
+                globals.get("selectedBody"),
+                Some(&Value::String(body.into()))
+            );
+        }
     }
 
     #[test]

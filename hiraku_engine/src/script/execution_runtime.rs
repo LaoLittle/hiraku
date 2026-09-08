@@ -198,6 +198,11 @@ impl ExecutionRuntime {
         }
     }
 
+    /// Drop a child continuation. External effects remain owned by the host.
+    pub fn cancel_child(&mut self, execution: ExecutionId) -> bool {
+        !execution.is_main() && self.executions.remove(&execution).is_some()
+    }
+
     pub fn spawn(
         &mut self,
         closure: &Value,

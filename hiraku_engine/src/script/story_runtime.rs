@@ -344,6 +344,19 @@ impl StoryRuntime {
             .position(|effect| effect == completed)
             .ok_or(StoryRuntimeError::UnknownTaskEffect(task))?;
         effects.remove(index);
+        // Hiding/replacing an actor cancels its old animation continuation,
+        // not just the current ECS tween. Never let the next offset target a
+        // hidden actor or a newly shown incarnation of the same display.
+        if self.execution.mode(task) == Some(ExecutionMode::Sequence)
+            && let StoryEffect::ActorMotion {
+                actor_id, revision, ..
+            } = completed
+            && !self.host.actor_motion_is_current(actor_id, *revision)
+        {
+            self.execution.cancel_child(task);
+            self.deferred_dialogue.remove(&task);
+            self.deferred_task_completions.insert(task, Value::Unit);
+        }
         if effects.is_empty() {
             self.active_task_effects.remove(&task);
             self.finish_task_effects(task)?;
@@ -818,6 +831,147 @@ mod tests {
     use crate::script::capabilities::{
         StoryEffect, StoryNativeHost, compile_story_bytecode, story_manifest,
     };
+
+    #[test]
+    fn modal_result_loop_reopens_after_back_and_can_navigate_without_falling_through() {
+        let bytecode = compile_story_bytecode(
+            "menu.hks",
+            r#"
+            while true {
+                let destination = ui.open("menu.ui.hks") as! String
+                if destination == "load" {
+                    ui.open("load.ui.hks")
+                } else {
+                    story.goto("title.hks", .{ reset: .presentation })
+                }
+            }
+        "#,
+        )
+        .expect("typed modal loop compiles");
+        let mut runtime = StoryRuntime::new(bytecode).expect("runtime");
+        fn next_modal(runtime: &mut StoryRuntime) -> String {
+            for _ in 0..32 {
+                if let Some(StoryRuntimeEvent::OpenUi { path, .. }) =
+                    runtime.step().expect("modal loop advances")
+                {
+                    return path;
+                }
+            }
+            panic!("modal was not reached");
+        }
+        assert_eq!(next_modal(&mut runtime), "menu.ui.hks");
+        runtime
+            .resume(Value::String("load".into()))
+            .expect("select load");
+        assert_eq!(next_modal(&mut runtime), "load.ui.hks");
+        runtime
+            .resume(Value::Unit)
+            .expect("close load without loading");
+        assert_eq!(next_modal(&mut runtime), "menu.ui.hks");
+        runtime
+            .resume(Value::String("title".into()))
+            .expect("select title");
+        for _ in 0..32 {
+            if matches!(
+                runtime.step().expect("navigate"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(_)))
+            ) {
+                assert_eq!(runtime.step().expect("source terminated"), None);
+                return;
+            }
+        }
+        panic!("title navigation was not reached");
+    }
+
+    #[test]
+    fn hiding_and_reshowing_cancels_old_offset_sequence_and_resolves_join() {
+        for replacement in [
+            "scene.hideCharacters(0)",
+            "alice.hide(0)",
+            "scene.hideCharacters(0)\nalice.show()",
+            "alice.alias(\"middle\").show()",
+        ] {
+            let bytecode = compile_story_bytecode(
+                "cancel.hks",
+                &r#"
+            let alice = char("alice").show()
+            let jump = seq {
+                alice.offset(.pos(0, 20)).animation(.linear(1.0))
+                alice.offset(.pos(0, 0)).animation(.linear(1.0))
+            }
+            "First"
+            REPLACE_ACTOR
+            jump.await()
+            "Second"
+        "#
+                .replace("REPLACE_ACTOR", replacement),
+            )
+            .expect("fixture compiles");
+            for restore in [false, true] {
+                let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime");
+                let mut motion = None;
+                for _ in 0..32 {
+                    if let Some(StoryRuntimeEvent::TaskEffect {
+                        task,
+                        effect: effect @ StoryEffect::ActorMotion { .. },
+                    }) = runtime.step().expect("first dialogue and animation")
+                    {
+                        motion = Some((task, effect));
+                        break;
+                    }
+                }
+                let (task, effect) = motion.expect("sequence starts while dialogue is waiting");
+                runtime.resume(Value::Unit).expect("advance dialogue early");
+                for _ in 0..32 {
+                    if runtime.step().expect("hide and re-show").is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(runtime.waiting_task, Some(task));
+                if restore {
+                    runtime = StoryRuntime::restore(
+                        bytecode.clone(),
+                        runtime.snapshot().expect("snapshot"),
+                    )
+                    .expect("restore interrupted animation");
+                    assert_eq!(
+                        runtime.step().expect("rebuild pending ECS effect"),
+                        Some(StoryRuntimeEvent::TaskEffect {
+                            task,
+                            effect: effect.clone()
+                        })
+                    );
+                }
+                runtime
+                    .complete_task_effect(task, &effect)
+                    .expect("cancelled tween completion");
+                assert!(runtime.completed_groups.contains(&task));
+                assert_eq!(runtime.waiting_task, None);
+                let mut reached_dialogue = false;
+                for _ in 0..32 {
+                    let event = runtime.step().expect("continue after cancelled sequence");
+                    assert!(
+                        !matches!(
+                            event,
+                            Some(StoryRuntimeEvent::TaskEffect {
+                                effect: StoryEffect::ActorMotion { .. },
+                                ..
+                            })
+                        ),
+                        "cancelled sequence must not emit another offset"
+                    );
+                    if matches!(event, Some(StoryRuntimeEvent::Wait(_))) {
+                        reached_dialogue = true;
+                        break;
+                    }
+                }
+                assert!(
+                    reached_dialogue,
+                    "cancelled join must reach the next dialogue"
+                );
+            }
+        }
+    }
 
     #[test]
     fn out_of_order_completions_preserve_the_correct_snapshot_effects() {

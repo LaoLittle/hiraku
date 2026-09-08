@@ -169,6 +169,11 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     warn!("failed to save slot `{slot}`: {error}");
                 }
             }
+            ScriptCommand::Stage(StageCommand::Clip(clip)) => {
+                if let Err(error) = shared_state.0.clips.apply(clip) {
+                    warn!("{error}");
+                }
+            }
             ScriptCommand::Stage(StageCommand::Picture(picture)) => {
                 if let Err(error) =
                     pictures::apply_picture_command(&mut shared_state.0.pictures, picture)
@@ -429,6 +434,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 );
             }
             ScriptCommand::Character(CharacterCommand::Show {
+                rotation,
                 placement_animation,
                 actor_id,
                 character_name,
@@ -454,6 +460,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 };
 
                 stage.character_positions.insert(actor_id.clone(), position);
+                stage.character_rotations.insert(actor_id.clone(), rotation);
                 stage
                     .character_catalog_names
                     .insert(actor_id.clone(), character_name);
@@ -477,6 +484,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                 );
             }
             ScriptCommand::Stage(StageCommand::SetCurtain {
+                color,
                 opacity,
                 fade,
                 mask,
@@ -499,6 +507,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         .entity(overlay)
                         .remove::<(VisualTween, super::curtain::CurtainFailed)>()
                         .try_insert(super::curtain::PendingCurtain {
+                            color,
                             opacity,
                             duration: fade,
                             mask,

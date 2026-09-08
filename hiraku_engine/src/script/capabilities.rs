@@ -30,6 +30,7 @@ pub enum StoryEffect {
         transition: super::actor_motion::ActorOffset,
     },
     Picture(crate::scene::pictures::PictureCommand),
+    Clip(crate::scene::clipping::ClipCommand),
     Log(String),
     ClearDialogue,
     DialogueSpeed(f32),
@@ -48,6 +49,7 @@ pub enum StoryEffect {
         duration_ms: u64,
     },
     SetCurtain {
+        color: [u8; 3],
         opacity: f32,
         fade_ms: Option<u64>,
         mask: Option<String>,
@@ -102,6 +104,7 @@ pub enum StoryEffect {
         ease: String,
     },
     ShowCharacter {
+        rotation: f32,
         placement_animation: Option<AnimationSpec>,
         actor_id: String,
         character_name: String,
@@ -517,6 +520,12 @@ impl Default for StoryNativeHost {
 }
 
 impl StoryNativeHost {
+    pub(super) fn actor_motion_is_current(&self, display: &str, revision: u64) -> bool {
+        self.context.actors.values().any(|actor| {
+            actor.display_instance == display && actor.visible && actor.motion_revision == revision
+        })
+    }
+
     pub fn new() -> Self {
         let registry = story_registry();
         let controls = StoryControlBuiltins::new(&registry.manifest());
@@ -759,6 +768,7 @@ pub struct StoryNativeHostSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PendingActor {
+    rotation: f32,
     display_instance: String,
     placement_animation: Option<AnimationSpec>,
     name: String,
@@ -923,6 +933,26 @@ impl CharacterContext {
             .ok_or_else(|| NativeError::message(format!("unknown camera handle {handle}")))
     }
 
+    fn invalidate_actor_motions(&mut self, display: Option<&str>) -> Result<(), NativeError> {
+        let revision = self
+            .actors
+            .values()
+            .map(|actor| actor.motion_revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| NativeError::message("actor motion revisions exhausted"))?;
+        for actor in self
+            .actors
+            .values_mut()
+            .filter(|actor| display.is_none_or(|id| actor.display_instance == id))
+        {
+            actor.motion_revision = revision;
+            actor.pending_offset = None;
+        }
+        Ok(())
+    }
+
     fn actor_mut(&mut self, handle: u64) -> Result<&mut PendingActor, CharacterCapabilityError> {
         self.actors
             .get_mut(&handle)
@@ -937,6 +967,7 @@ impl CharacterContext {
             }
             pending.dirty = false;
             StoryEffect::ShowCharacter {
+                rotation: pending.rotation,
                 placement_animation: pending.placement_animation.take(),
                 actor_id: pending.display_instance.clone(),
                 character_name: pending.name.clone(),
@@ -1251,6 +1282,11 @@ mod native_api {
             .map_err(|e| NativeError::message(e.to_string()))?
             .display_instance
             .clone();
+        if context.actors.iter().any(|(id, pending)| {
+            *id != actor.0 && pending.visible && pending.display_instance == display
+        }) {
+            context.invalidate_actor_motions(Some(&display))?;
+        }
         for (id, pending) in &mut context.actors {
             if *id != actor.0 && pending.display_instance == display {
                 pending.visible = false;
@@ -1278,6 +1314,7 @@ mod native_api {
         pending.dirty = false;
         pending.visible = false;
         let actor_id = pending.display_instance.clone();
+        context.invalidate_actor_motions(Some(&actor_id))?;
         for pending in context
             .actors
             .values_mut()
@@ -1299,6 +1336,7 @@ mod native_api {
         fade_ms: Option<f64>,
     ) -> Result<scene_visuals::SceneTransitionHandle, NativeError> {
         let fade_ms = hide_duration(fade_ms)?;
+        context.invalidate_actor_motions(None)?;
         for actor in context.actors.values_mut() {
             actor.dirty = false;
             actor.visible = false;
@@ -1429,6 +1467,41 @@ mod native_api {
         context
             .scale(actor, scale)
             .map_err(|error| NativeError::message(error.to_string()))
+    }
+
+    #[hks(name = "rotation", selector = "Actor", receiver)]
+    pub(super) fn native_actor_rotation(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        degrees: f64,
+    ) -> Result<ActorHandle, NativeError> {
+        if !degrees.is_finite() || !(degrees as f32).is_finite() {
+            return Err(NativeError::message("actor rotation must be finite"));
+        }
+        let pending = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?;
+        pending.rotation = degrees as f32;
+        pending.dirty = true;
+        Ok(actor)
+    }
+
+    /// Clipping belongs to the display identity, shared by aliases but not clones.
+    #[hks(name = "clip", selector = "Actor", receiver)]
+    fn native_actor_clip(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        region: Option<String>,
+    ) -> Result<ActorHandle, NativeError> {
+        let id = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?
+            .display_instance
+            .clone();
+        context.commands.push(StoryEffect::Clip(
+            crate::scene::clipping::ClipCommand::Actor { id, region },
+        ));
+        Ok(actor)
     }
 
     #[hks(name = "focus", receiver)]
@@ -1781,6 +1854,7 @@ mod story_api {
 
 fn pending_actor(name: &str) -> PendingActor {
     PendingActor {
+        rotation: 0.0,
         placement_animation: None,
         name: name.to_string(),
         instance: name.to_string(),
@@ -1908,6 +1982,8 @@ mod tests {
     fn actor_identity_visibility_and_retained_state_survive_host_restore() {
         let mut host = StoryNativeHost::new();
         let alice = host.context.char("alice".into()).expect("actor handle");
+        native_api::native_actor_rotation(&mut host.context, alice, 40.0).expect("rotation");
+        assert!(native_api::native_actor_rotation(&mut host.context, alice, f64::NAN).is_err());
         host.context.scale(alice, 0.5).expect("scale");
         host.context
             .emotion(alice, "happy".into())
@@ -1918,6 +1994,13 @@ mod tests {
         host.context.commit().expect("commit show");
         host.drain_effects();
         let mut host = StoryNativeHost::restore(host.snapshot());
+        assert_eq!(
+            host.context
+                .actor_mut(alice.0)
+                .expect("restored actor")
+                .rotation,
+            40.0
+        );
         assert_eq!(
             host.context.char("alice".into()).expect("same actor").0,
             alice.0

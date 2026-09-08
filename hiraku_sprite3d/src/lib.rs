@@ -1,10 +1,12 @@
 //! Unlit atlas sprites in 3D. No story, character, or camera creation policy.
 mod billboard;
+mod clip;
 mod material;
 mod sprite;
 
 use bevy::prelude::*;
 pub use billboard::{Billboard, BillboardMode, BillboardPlugin};
+pub use clip::ClipRect;
 pub use material::Sprite3dMaterial;
 pub use sprite::{
     BlendMode, MAX_LAYERS, MAX_MASKS, MaskMode, Sprite3d, Sprite3dError, SpriteLayer,

@@ -295,7 +295,11 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
-                (scene::widgets::sync_inputs, scene::widgets::sync_toggles)
+                (
+                    scene::widgets::sync_inputs,
+                    scene::widgets::sync_toggles,
+                    scene::recompose_screen_ui,
+                )
                     .after(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )

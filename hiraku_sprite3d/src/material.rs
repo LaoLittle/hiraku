@@ -20,6 +20,8 @@ pub struct LayerUniform {
 }
 #[derive(Clone, Debug, ShaderType)]
 pub struct SpriteUniform {
+    clip_bounds: Vec4,
+    clip_axes: Vec4,
     tint: Vec4,
     backface_tint: Vec4,
     count: UVec4,
@@ -94,6 +96,12 @@ impl Sprite3dMaterial {
         Self {
             image: sprite.image.clone(),
             uniform: SpriteUniform {
+                clip_bounds: sprite
+                    .clip
+                    .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[0]),
+                clip_axes: sprite
+                    .clip
+                    .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[1]),
                 tint: sprite.color.to_linear().to_f32_array().into(),
                 backface_tint: sprite.backface_color.to_linear().to_f32_array().into(),
                 count: UVec4::new(source.len() as u32, 0, 0, 0),
@@ -136,7 +144,7 @@ mod tests {
     #[test]
     fn shader_parses_and_validates_without_a_gpu() {
         let source = include_str!("sprite3d.wgsl")
-            .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };")
+            .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) world_position: vec4<f32>, };")
             .replace("#{MATERIAL_BIND_GROUP}", "2");
         let module = naga::front::wgsl::parse_str(&source).expect("sprite WGSL parses");
         naga::valid::Validator::new(
