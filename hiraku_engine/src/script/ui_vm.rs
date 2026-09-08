@@ -684,6 +684,25 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "clip", receiver)]
+    fn ui_clip(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.layout.clip = true;
+        Ok(node)
+    }
+
+    #[hks(name = "flipX", receiver)]
+    fn ui_flip_x(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Image(_)) {
+            return Err(NativeError::message("flipX requires an image node"));
+        }
+        draft.layout.flip_x = true;
+        Ok(node)
+    }
+
     #[hks(name = "range", receiver)]
     fn ui_range(
         context: &mut UiVmContext,
@@ -2588,41 +2607,54 @@ fn materialize_node(
                 Some(stored_value(value)?)
             };
             match normal {
-                ScreenNode::Text(text) => Ok(ScreenNode::Button(ButtonNode {
-                    text: text.text,
-                    value,
-                    on_click,
-                    enabled,
-                    enabled_binding: None,
-                    reactive_enabled,
-                    size: text.size,
-                    color: None,
-                    hovered_color: None,
-                    pressed_color: None,
-                    insensitive_color: None,
-                    background: None,
-                    border: None,
-                    hovered_background: None,
-                    pressed_background: None,
-                    background_texture: draft
-                        .button_background_texture
-                        .as_deref()
-                        .map(|name| resolve_texture(textures, name))
-                        .transpose()?,
-                    hovered_background_texture: draft
-                        .button_hovered_background_texture
-                        .as_deref()
-                        .map(|name| resolve_texture(textures, name))
-                        .transpose()?,
-                    hover_scale: draft.hover_scale,
-                    press_scale: draft.press_scale,
-                    align: text.align,
-                    padding_x: None,
-                    padding_y: None,
-                    border_width: None,
-                    radius: None,
-                    layout: draft.layout,
-                })),
+                normal @ (ScreenNode::Text(_) | ScreenNode::Column(_) | ScreenNode::Row(_)) => {
+                    if draft.hovered.is_some() {
+                        return Err(UiVmError::Invalid(
+                            "hovered artwork requires an image button".into(),
+                        ));
+                    }
+                    let (text, size, align, children) = match normal {
+                        ScreenNode::Text(text) => (text.text, text.size, text.align, Vec::new()),
+                        content => (String::new(), 16.0, None, vec![content]),
+                    };
+                    let custom_content = !children.is_empty();
+                    Ok(ScreenNode::Button(ButtonNode {
+                        children,
+                        text,
+                        value,
+                        on_click,
+                        enabled,
+                        enabled_binding: None,
+                        reactive_enabled,
+                        size,
+                        color: None,
+                        hovered_color: None,
+                        pressed_color: None,
+                        insensitive_color: None,
+                        background: custom_content.then_some([0.0; 4]),
+                        border: custom_content.then_some([0.0; 4]),
+                        hovered_background: custom_content.then_some([0.0; 4]),
+                        pressed_background: custom_content.then_some([0.0; 4]),
+                        background_texture: draft
+                            .button_background_texture
+                            .as_deref()
+                            .map(|name| resolve_texture(textures, name))
+                            .transpose()?,
+                        hovered_background_texture: draft
+                            .button_hovered_background_texture
+                            .as_deref()
+                            .map(|name| resolve_texture(textures, name))
+                            .transpose()?,
+                        hover_scale: draft.hover_scale,
+                        press_scale: draft.press_scale,
+                        align,
+                        padding_x: custom_content.then_some(0.0),
+                        padding_y: custom_content.then_some(0.0),
+                        border_width: custom_content.then_some(0.0),
+                        radius: custom_content.then_some(0.0),
+                        layout: draft.layout,
+                    }))
+                }
                 ScreenNode::Image(image) => {
                     let pressed = if let Some(content) = draft.pressed {
                         let handles = closure_children(Some(content), program, registry, context)?;
@@ -2780,6 +2812,75 @@ mod tests {
                 "invalid pressed content must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn button_container_keeps_hit_bounds_separate_from_artwork() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://controls.ui.hks",
+            r#"
+                import ui.widgets.*
+                canvas {
+                    button {
+                        column {
+                            image("save-thumbnail://alice").at(.abs(8, 6)).size(.abs(40, 30))
+                        }.size(.abs(64, 48))
+                    }.at(.abs(100, 20)).size(.abs(64, 48))
+                        .onClick { sfx("ui/confirm"); ui.close() }
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("container button compiles");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected content button");
+        };
+        assert_eq!(button.layout.left, Some(100.0));
+        assert_eq!(button.layout.width, Some(64.0));
+        assert_eq!(button.background, Some([0.0; 4]));
+        assert!(button.on_click.is_some());
+        let ScreenNode::Column(column) = &button.children[0] else {
+            panic!("expected column");
+        };
+        let ScreenNode::Image(image) = &column.children[0] else {
+            panic!("expected image");
+        };
+        assert_eq!(image.layout.left, Some(8.0));
+        assert_eq!(image.layout.width, Some(40.0));
+    }
+
+    #[test]
+    fn clipped_container_preserves_mirrored_image_layout() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://portrait.ui.hks",
+            r#"
+                import ui.widgets.*
+                canvas {
+                    column {
+                        image("save-thumbnail://alice").at(.abs(-10, -8))
+                            .size(.abs(100, 100)).flipX()
+                    }.size(.abs(80, 84)).clip()
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("clipped image UI compiles");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("expected clipping container");
+        };
+        assert!(column.layout.clip);
+        let ScreenNode::Image(image) = &column.children[0] else {
+            panic!("expected image");
+        };
+        assert!(image.layout.flip_x);
+        assert_eq!(image.layout.left, Some(-10.0));
+        assert_eq!(image.layout.top, Some(-8.0));
     }
 
     #[test]

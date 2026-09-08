@@ -16,6 +16,12 @@ pub struct HoverMotion {
 }
 
 impl HoverMotion {
+    pub(super) fn transform(&self) -> UiTransform {
+        UiTransform {
+            translation: Val2::px(self.current.x, self.current.y),
+            ..UiTransform::IDENTITY
+        }
+    }
     pub fn new(layout: &ScreenLayout) -> Self {
         let offset = Vec2::from_array(layout.hover_offset.unwrap_or_default());
         let initial = if layout.hover_active {
@@ -120,6 +126,16 @@ pub fn animate_hover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_mount_starts_at_its_selected_position() {
+        let motion = HoverMotion::new(&ScreenLayout {
+            hover_offset: Some([-84.0, 0.0]),
+            hover_active: true,
+            ..default()
+        });
+        assert_eq!(motion.transform().translation, Val2::px(-84.0, 0.0));
+    }
 
     #[test]
     fn virtual_pointer_moves_subtree_and_respects_modal_input() {

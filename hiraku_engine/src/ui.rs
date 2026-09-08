@@ -202,6 +202,11 @@ pub struct InputNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    /// Clip descendants to this node's bounds without creating a scroll area.
+    #[serde(default)]
+    pub clip: bool,
+    #[serde(default)]
+    pub flip_x: bool,
     #[serde(default)]
     pub hover_offset: Option<[f32; 2]>,
     #[serde(default)]
@@ -441,6 +446,9 @@ pub(crate) struct UiAnimationPlayer {
 /// the existing ergonomic map shape.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ButtonNode {
+    /// Declarative visual content, positioned inside the button's hit bounds.
+    #[serde(default)]
+    pub children: Vec<ScreenNode>,
     /// Label shown inside the button.
     pub text: String,
     /// Value returned from `screen(...)` when the button is pressed.

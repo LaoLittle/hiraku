@@ -401,6 +401,9 @@ fn screen_root_background(screen: &ScreenSpec) -> BackgroundColor {
 }
 
 pub(super) fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
+    if layout.clip {
+        node.overflow = Overflow::clip();
+    }
     if let Some(width) = layout.width {
         node.width = px(width);
     }
@@ -514,6 +517,7 @@ fn spawn_screen_node_entity(
             entity
         }
         ScreenNode::Button(ButtonNode {
+            children,
             text,
             value,
             on_click,
@@ -690,6 +694,18 @@ fn spawn_screen_node_entity(
                 });
             }
             commands.entity(button).add_child(text);
+            for child in children {
+                let child = spawn_screen_node_entity(
+                    commands,
+                    root,
+                    asset_server,
+                    ui_fonts,
+                    ui_style,
+                    child,
+                    image_handles,
+                );
+                commands.entity(button).add_child(child);
+            }
             apply_live_layout_bindings(commands, button, layout);
             button
         }
@@ -698,13 +714,10 @@ fn spawn_screen_node_entity(
             image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
+            let mut image = image_node(image, texture.rect);
+            image.flip_x = layout.flip_x;
             let entity = commands
-                .spawn((
-                    ScreenUiNode,
-                    Pickable::IGNORE,
-                    image_node(image, texture.rect),
-                    node,
-                ))
+                .spawn((ScreenUiNode, Pickable::IGNORE, image, node))
                 .id();
             apply_live_layout_bindings(commands, entity, layout);
             entity
@@ -753,12 +766,14 @@ fn spawn_screen_node_entity(
                 node
             });
             let normal_rect = texture.rect.map(texture_rect);
+            let mut artwork = stretched_image_node(image.clone(), texture.rect);
+            artwork.flip_x = layout.flip_x;
             let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Button,
                     BackgroundColor(Color::NONE),
-                    stretched_image_node(image.clone(), texture.rect),
+                    artwork,
                     node,
                     UiTransform::IDENTITY,
                     ScreenUiImageButton {
@@ -1138,10 +1153,8 @@ pub(super) fn apply_live_layout_bindings(
         });
     }
     if layout.hover_offset.is_some() {
-        commands.entity(entity).insert((
-            UiTransform::IDENTITY,
-            super::ui_hover::HoverMotion::new(layout),
-        ));
+        let motion = super::ui_hover::HoverMotion::new(layout);
+        commands.entity(entity).insert((motion.transform(), motion));
     } else if let Some(timeline) = &layout.phase_animation {
         commands.entity(entity).insert((
             UiTransform::IDENTITY,
