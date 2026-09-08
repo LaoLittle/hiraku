@@ -281,7 +281,7 @@ fn build_screen_ui_children(
     let mut top_level = Vec::new();
 
     if let Some(texture) = screen.background_texture.as_ref() {
-        let image = asset_server.load(texture.path.clone());
+        let image = super::save_preview::load_image(asset_server, &texture.path);
         image_handles.push(image.clone());
         let background = commands
             .spawn((
@@ -558,10 +558,10 @@ fn spawn_screen_node_entity(
             let callback = on_click.clone();
             let normal_texture = background_texture
                 .as_ref()
-                .map(|texture| asset_server.load(texture.path.clone()));
+                .map(|texture| super::save_preview::load_image(asset_server, &texture.path));
             let hovered_texture = hovered_background_texture
                 .as_ref()
-                .map(|texture| asset_server.load(texture.path.clone()));
+                .map(|texture| super::save_preview::load_image(asset_server, &texture.path));
             image_handles.extend(normal_texture.iter().cloned());
             image_handles.extend(hovered_texture.iter().cloned());
             // A textured button uses its image as the complete visual surface.
@@ -750,16 +750,16 @@ fn spawn_screen_node_entity(
             layout,
         }) => {
             let callback = on_click.clone();
-            let image = asset_server.load(texture.path.clone());
+            let image = super::save_preview::load_image(asset_server, &texture.path);
             image_handles.push(image.clone());
 
             let hovered_image = hovered_texture.as_ref().map(|texture| {
-                let image = asset_server.load(texture.path.clone());
+                let image = super::save_preview::load_image(asset_server, &texture.path);
                 image_handles.push(image.clone());
                 image
             });
             let pressed_image = pressed_texture.as_ref().map(|texture| {
-                let image = asset_server.load(texture.path.clone());
+                let image = super::save_preview::load_image(asset_server, &texture.path);
                 image_handles.push(image.clone());
                 image
             });
@@ -1062,8 +1062,8 @@ fn spawn_screen_node_entity(
         ScreenNode::Toggle(toggle) => {
             let unchecked = &toggle.unchecked.texture;
             let checked = &toggle.checked.texture;
-            let unchecked_image = asset_server.load(unchecked.path.clone());
-            let checked_image = asset_server.load(checked.path.clone());
+            let unchecked_image = super::save_preview::load_image(asset_server, &unchecked.path);
+            let checked_image = super::save_preview::load_image(asset_server, &checked.path);
             image_handles.extend([unchecked_image.clone(), checked_image.clone()]);
             let mut unchecked_node = Node::default();
             apply_screen_layout(&mut unchecked_node, &toggle.unchecked.layout);

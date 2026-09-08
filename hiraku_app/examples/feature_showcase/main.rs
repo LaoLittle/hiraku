@@ -6,5 +6,6 @@ fn main() {
         "/examples/feature_showcase/assets"
     ));
     config.window_title = "Hiraku — UI and Glossary".to_string();
+    config.storage_namespace = "hiraku-example-feature_showcase".to_string();
     hiraku_app::run_app(config);
 }

@@ -20,7 +20,10 @@ mod runtime;
 mod story_runtime;
 pub mod ui_runtime;
 mod ui_vm;
+mod project;
+pub(crate) use project::{StoryProgram, compile_story_program};
 pub(crate) use ui_vm::UiComposition;
+pub(crate) use ui_vm::ui_argument_to_stored;
 pub(crate) use ui_vm::validate_ui_source;
 
 pub use animation::{AnimationPhase, AnimationSpec};
@@ -304,7 +307,7 @@ pub fn start_story_runtime(
         .0
         .read_text(&startup_script)
         .map_err(|error| error.to_string())?;
-    let bytecode = compile_story_bytecode(&startup_script, &source)?;
+    let bytecode = compile_story_program(&vfs.0, &startup_script, &source)?;
     let mut story = if let Some(snapshot) = snapshot {
         StoryRuntime::restore(bytecode, snapshot).map_err(|error| error.to_string())?
     } else {
@@ -319,11 +322,13 @@ pub fn start_story_runtime(
     let call_stack = call_stack
         .into_iter()
         .map(|frame| {
-            let source = vfs
-                .0
-                .read_text(&frame.script)
-                .map_err(|error| error.to_string())?;
-            let bytecode = compile_story_bytecode(&frame.script, &source)?;
+            let bytecode = match story.program_for_path(&frame.script) {
+                Some(code) => code,
+                None => {
+                    let source = vfs.0.read_text(&frame.script).map_err(|error| error.to_string())?;
+                    compile_story_program(&vfs.0, &frame.script, &source)?
+                }
+            };
             let story = StoryRuntime::restore(bytecode, frame.snapshot)
                 .map_err(|error| error.to_string())?;
             Ok(ScriptCallFrame {

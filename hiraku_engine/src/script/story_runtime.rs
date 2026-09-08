@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use hiraku_script::{Bytecode, Value};
+use hiraku_script::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -101,7 +101,11 @@ pub struct StoryRuntimeSnapshot {
 }
 
 impl StoryRuntime {
-    pub fn new(bytecode: Bytecode) -> Result<Self, StoryRuntimeError> {
+    pub fn program_for_path(&self, path: &str) -> Option<super::StoryProgram> {
+        self.execution.program_for_path(path)
+    }
+
+    pub fn new(bytecode: impl Into<super::StoryProgram>) -> Result<Self, StoryRuntimeError> {
         Ok(Self {
             execution: ExecutionRuntime::new(bytecode)?,
             host: StoryNativeHost::new(),
@@ -142,7 +146,7 @@ impl StoryRuntime {
     }
 
     pub fn restore(
-        bytecode: Bytecode,
+        bytecode: impl Into<super::StoryProgram>,
         mut snapshot: StoryRuntimeSnapshot,
     ) -> Result<Self, StoryRuntimeError> {
         // Voice playback is transient output rather than durable story state.
@@ -881,6 +885,45 @@ mod tests {
             }
         }
         panic!("title navigation was not reached");
+    }
+
+    #[test]
+    fn hidden_actor_sequence_commits_final_offsets_without_tween_or_deadlock() {
+        for hide in ["alice.hide(0)", "scene.hideCharacters(0)"] {
+            let source = format!(r#"
+                let alice = char("alice").show()
+                let jump = seq {{
+                    alice.offset(.pos(0, 20)).animation(.linear(1.0))
+                    alice.offset(.pos(0, 0)).animation(.linear(1.0))
+                }}
+                {hide}
+                jump.await()
+                "Done"
+            "#);
+            let code = compile_story_bytecode("hidden.hks", &source).expect("fixture");
+            let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+            let mut targets = Vec::new();
+            let mut reached_dialogue = false;
+            for _ in 0..128 {
+                match runtime.step().expect("hidden offsets are valid") {
+                    Some(StoryRuntimeEvent::TaskEffect { task, effect: effect @ StoryEffect::ActorMotion { .. } }) => {
+                        let StoryEffect::ActorMotion { transition, .. } = &effect else { unreachable!() };
+                        assert_eq!(transition.animation.duration(), 0.0);
+                        targets.push(transition.target);
+                        runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("snapshot")).expect("restore hidden sequence");
+                        assert!(matches!(runtime.step().expect("reattach"), Some(StoryRuntimeEvent::TaskEffect { .. })));
+                        runtime.complete_task_effect(task, &effect).expect("immediate completion");
+                    }
+                    Some(StoryRuntimeEvent::Wait(_)) if targets.len() == 2 => {
+                        reached_dialogue = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(targets, [[0.0, 20.0], [0.0, 0.0]]);
+            assert!(reached_dialogue, "join must finish after hidden motions");
+        }
     }
 
     #[test]

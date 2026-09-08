@@ -938,12 +938,56 @@ mod native_ui {
 mod ui_actions {
     use super::*;
 
-    #[hks]
-    fn native_open(context: &mut UiVmContext, role: String) -> Result<UiEffectHandle, NativeError> {
+    #[hks(raw)]
+    fn native_open(
+        context: &mut UiVmContext,
+        call: &hiraku_script::BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        let Some(first) = call.arguments.first() else {
+            return Err(NativeError::message(
+                "ui.open requires a role or component path",
+            ));
+        };
+        let role = String::from_hks_value(&first.value)?;
         if role.trim().is_empty() {
             return Err(NativeError::message("UI role must not be empty"));
         }
-        Ok(context.insert_effect(UiEffect::OpenUi { role }))
+        let arguments = call
+            .arguments
+            .iter()
+            .skip(1)
+            .map(|argument| ui_argument_to_stored(&argument.value))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(context
+            .insert_effect(UiEffect::OpenUi {
+                role,
+                origin: context.navigation_origin.clone(),
+                arguments,
+            })
+            .into_hks_value())
+    }
+}
+
+/// The current persisted UI input boundary accepts plain data. Never silently
+/// drop unsupported list elements or fields, or erase nominal type metadata.
+pub(crate) fn ui_argument_to_stored(value: &Value) -> Result<StoredValue, NativeError> {
+    match value {
+        Value::Bool(value) => Ok(StoredValue::Bool(*value)),
+        Value::Number(value) => Ok(StoredValue::Float(*value)),
+        Value::String(value) => Ok(StoredValue::String(value.clone())),
+        Value::List(values) => values
+            .iter()
+            .map(ui_argument_to_stored)
+            .collect::<Result<Vec<_>, _>>()
+            .map(StoredValue::Array),
+        Value::Map(fields) => fields
+            .iter()
+            .map(|(key, value)| ui_argument_to_stored(value).map(|value| (key.clone(), value)))
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(StoredValue::Map),
+        _ => Err(NativeError::message(
+            "UI arguments currently require plain String/Bool/number/List/record data; optional, tuple, nominal values, functions and live handles require a richer transport",
+        )),
     }
 }
 
@@ -1002,7 +1046,7 @@ mod storage_actions {
         }
         match crate::storage::load_save_metadata(&slot) {
             Ok(data) => {
-                Ok((!data.thumbnail_png.is_empty()).then(|| format!("save-thumbnail://{slot}")))
+                Ok(data.has_thumbnail.then(|| format!("save-thumbnail://{slot}")))
             }
             Err(error) => {
                 bevy::log::warn!("cannot read preview for slot `{slot}`: {error}");
@@ -1011,8 +1055,8 @@ mod storage_actions {
         }
     }
 
-    /// A browsing diagnostic, not permission to restore. Fingerprints and
-    /// replay coverage are checked only when a load is actually requested.
+    /// Validate the snapshot independently of its metadata and preview.
+    /// Runtime fingerprints are still checked when restoration is requested.
     #[hks]
     fn problem(_context: &mut UiVmContext, slot: String) -> Result<Option<String>, NativeError> {
         if !crate::storage::save_slot_exists(&slot)
@@ -1021,9 +1065,11 @@ mod storage_actions {
             return Ok(None);
         }
         Ok(match crate::storage::load_save_metadata(&slot) {
-            Ok(data) if data.version == crate::state::CURRENT_SAVE_VERSION => None,
+            Ok(data) if data.version == crate::state::CURRENT_SAVE_VERSION => {
+                crate::storage::load_save_data(&slot).err().map(|error| error.to_string())
+            }
             Ok(data) => Some(format!(
-                "Save version {} requires replay validation",
+                "Incompatible save version {}",
                 data.version
             )),
             Err(error) => Some(error.to_string()),
@@ -1309,6 +1355,18 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     native_ui::register_hks(&mut registry)
         .expect("UI native primitives must be internally consistent");
     ui_actions::register_hks(&mut registry).expect("UI actions must be internally consistent");
+    profile_api::register_hks(&mut registry).expect("profile API must register once");
+    registry
+        .set_signature(
+            hiraku_script::native::stable_builtin_id("ui.open"),
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: vec![ScriptType::String],
+                variadic: Some(ScriptType::Any),
+                result: ScriptType::Named(ui_effect),
+            },
+        )
+        .expect("UI open primitive is registered");
     let close = registry
         .register_selector_raw_fn("ui", "close", close_ui)
         .expect("UI close primitive is unique");
@@ -2310,7 +2368,7 @@ fn materialize_node(
             let normal_handles = closure_children(draft.content, program, registry, context)?;
             if normal_handles.len() != 1 {
                 return Err(UiVmError::Invalid(format!(
-                    "button content must produce exactly one text or image node, got {}",
+                    "button content must produce exactly one text, image, row, column, or spacer node, got {}",
                     normal_handles.len()
                 )));
             }
@@ -2326,7 +2384,7 @@ fn materialize_node(
                 Some(stored_value(value)?)
             };
             match normal {
-                normal @ (ScreenNode::Text(_) | ScreenNode::Column(_) | ScreenNode::Row(_)) => {
+                normal @ (ScreenNode::Text(_) | ScreenNode::Column(_) | ScreenNode::Row(_) | ScreenNode::Spacer(_)) => {
                     if draft.hovered.is_some() {
                         return Err(UiVmError::Invalid(
                             "hovered artwork requires an image button".into(),
@@ -2432,7 +2490,7 @@ fn materialize_node(
                     }))
                 }
                 _ => Err(UiVmError::Invalid(
-                    "button content must be text(...) or image(...)".into(),
+                    "button content must be text(...), image(...), row {...}, column {...}, or spacer(...)".into(),
                 )),
             }
         }
@@ -3169,6 +3227,168 @@ screen {
                 name: "ui/confirm".into(),
                 volume: 1.0,
             }]
+        );
+    }
+
+    #[test]
+    fn slot_button_accepts_empty_and_thumbnail_branches() {
+        for thumbnail in ["null", "\"save-thumbnail://alice\""] {
+            let source = format!(
+                r#"
+import ui.widgets.*
+fn slot(preview: String?) -> UiNode {{
+    button {{
+        if preview != null {{
+            image(preview!).size(.abs(240, 135))
+        }} else {{
+            spacer().size(.abs(240, 135))
+        }}
+    }}.size(.abs(260, 155)).onClick {{ storage.save("alice") }}
+}}
+canvas {{ slot({thumbnail}) }}
+"#
+            );
+            let screen = evaluate_ui_component_named(
+                "memory://slots.ui.hks",
+                &source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("both slot branches must materialize");
+            let callback = match &screen.children[0] {
+                ScreenNode::Button(button) => {
+                    assert_eq!(thumbnail, "null");
+                    assert!(button.text.is_empty());
+                    assert!(matches!(
+                        button.children.as_slice(),
+                        [ScreenNode::Spacer(_)]
+                    ));
+                    button.on_click.as_ref().expect("empty slot callback")
+                }
+                ScreenNode::ImageButton(button) => {
+                    assert_ne!(thumbnail, "null");
+                    assert_eq!(button.texture.path, "save-thumbnail://alice");
+                    button.on_click.as_ref().expect("thumbnail slot callback")
+                }
+                _ => panic!("expected slot button"),
+            };
+            let (effects, _) =
+                evaluate_ui_callback(callback, &BTreeMap::new(), &crate::ui::UiModels::default())
+                    .expect("slot click produces an effect without writing storage");
+            assert_eq!(
+                effects,
+                vec![UiEffect::Save {
+                    slot: "alice".into()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn ui_callback_passes_image_arguments_to_another_document() {
+        let source = r#"
+import ui.widgets.*
+@ui
+global fn main(imageName: String) -> UiNode {
+    canvas {
+        button { text("View") }.onClick { ui.open("viewer.ui.hks", imageName, "Alice") }
+    }
+}
+"#;
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://ui/gallery.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[StoredValue::String("save-thumbnail://alice".into())],
+        )
+        .expect("compile gallery");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("click callback"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+        )
+        .expect("capture parameterized open effect");
+        let UiEffect::OpenUi {
+            role,
+            origin,
+            arguments,
+        } = &effects[0]
+        else {
+            panic!("expected open")
+        };
+        assert_eq!(role, "viewer.ui.hks");
+        assert_eq!(origin.as_deref(), Some("memory://ui/gallery.ui.hks"));
+        assert_eq!(
+            arguments,
+            &vec![
+                StoredValue::String("save-thumbnail://alice".into()),
+                StoredValue::String("Alice".into())
+            ]
+        );
+        let viewer = r#"
+import ui.widgets.*
+@ui
+global fn viewer(imageName: String, title: String) -> UiNode {
+    canvas { image(imageName); text(title) }
+}
+"#;
+        let view = evaluate_ui_component_named_with_args(
+            "memory://ui/viewer.ui.hks",
+            viewer,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            arguments,
+        )
+        .expect("typed viewer receives captured arguments");
+        assert_eq!(view.children.len(), 2);
+        let ScreenNode::Image(image) = &view.children[0] else {
+            panic!("expected image")
+        };
+        assert_eq!(image.texture.path, "save-thumbnail://alice");
+        assert!(
+            evaluate_ui_component_named_with_args(
+                "memory://ui/viewer.ui.hks",
+                viewer,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+                &[
+                    StoredValue::Bool(false),
+                    StoredValue::String("Alice".into())
+                ],
+            )
+            .is_err(),
+            "incorrect entry argument types must fail"
+        );
+    }
+
+    #[test]
+    fn ui_arguments_never_silently_drop_unsupported_nested_values() {
+        assert!(
+            ui_argument_to_stored(&Value::List(vec![
+                Value::String("alice".into()),
+                Value::Unit
+            ]))
+            .is_err()
+        );
+        assert!(
+            ui_argument_to_stored(&Value::Map(BTreeMap::from([
+                ("name".into(), Value::String("alice".into())),
+                ("unsupported".into(), Value::Unit),
+            ])))
+            .is_err()
+        );
+        assert_eq!(
+            ui_argument_to_stored(&Value::List(vec![Value::String("bob".into())]))
+                .expect("plain list"),
+            StoredValue::Array(vec![StoredValue::String("bob".into())])
         );
     }
 
@@ -4024,5 +4244,19 @@ screen {
             matches!(error, UiVmError::Invalid(ref message) if message.contains("alice/")),
             "the fluent closure should execute before texture resolution: {error}"
         );
+    }
+}
+#[hiraku_script::hks_module("profile")]
+mod profile_api {
+    use super::*;
+    #[hks(name = "readBool")]
+    fn read_bool(_context: &mut UiVmContext, key: String) -> Result<bool, NativeError> {
+        crate::storage::profile::read_bool(&key)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
+    #[hks(name = "writeBool")]
+    fn write_bool(_context: &mut UiVmContext, key: String, value: bool) -> Result<(), NativeError> {
+        crate::storage::profile::write_bool(&key, value)
+            .map_err(|error| NativeError::message(error.to_string()))
     }
 }

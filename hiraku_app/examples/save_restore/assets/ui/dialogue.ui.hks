@@ -1,11 +1,11 @@
 import ui.widgets.*
 
 @ui
-global fn main() -> UiNode {
+global fn main(title: String, line: String) -> UiNode {
 screen {
     column {
-        text($dialogueTitle).pulse(1.4)
-        text($dialogueLine)
+        text(title).pulse(1.4)
+        text(line)
 
         row {
             button { text("Quick Save") }.onClick { storage.save("save_restore_example") }
@@ -14,6 +14,14 @@ screen {
         }
             .size(.rel(70, 16))
             .gap(12)
+        row {
+            button { text("Save slots") }.onClick {
+                ui.open("slots.ui.hks", "example_1", "example_2", "example_3", false)
+            }
+            button { text("Load slots") }.onClick {
+                ui.open("slots.ui.hks", "example_1", "example_2", "example_3", true)
+            }
+        }.gap(12)
     }
         .size(.rel(72, 48))
         .gap(18)

@@ -352,7 +352,7 @@ pub enum LinkedVmError {
     UnboundFunctionModule,
 }
 
-fn bind_value_module(value: Value, module: ModuleId) -> Value {
+pub fn bind_value_module(value: Value, module: ModuleId) -> Value {
     match value {
         Value::Optional(value) => {
             Value::Optional(value.map(|value| Box::new(bind_value_module(*value, module))))

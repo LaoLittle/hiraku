@@ -19,6 +19,8 @@ global fn main() -> UiNode {
     screen {
         column {
             text("Widget Showcase").fontSize(42)
+            button { text("Open parameterized image viewer") }
+                .onClick { ui.open("viewer.ui.hks", "swatch/on", "Palette preview") }
             text("Values flow into controls. onChange updates this screen's own state.").fontSize(22)
 
             row {

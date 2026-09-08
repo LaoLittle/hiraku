@@ -11,8 +11,12 @@ members = [
     "hiraku_video", 
     "hiraku_storage", 
     "hiraku_media",
-    "hiraku"
-, "hiraku_sprite3d", "hiraku_ui"]
+    "hiraku",
+    "hiraku_sprite3d",
+    "hiraku_ui",
+    "hiraku_uastc",
+    "hiraku_uastc/build"
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -81,3 +85,10 @@ strip = true
 lto = true
 panic = "abort"
 codegen-units = 1
+
+# Keep host-side image encoding optimized in tests and downstream build tools.
+[profile.dev.package.basis-universal-sys]
+opt-level = 3
+
+[profile.release.package.basis-universal-sys]
+opt-level = 3

@@ -252,7 +252,7 @@ pub(super) fn spawn_input(
         commands.entity(entity).insert(BackgroundColor(Color::NONE));
         commands.entity(label).insert(Visibility::Hidden);
         let mut image = |texture: &crate::ui::ScreenTexture| {
-            let handle = assets.load(texture.path.clone());
+            let handle = super::save_preview::load_image(assets, &texture.path);
             image_handles.push(handle.clone());
             let mut image = ImageNode::new(handle).with_mode(NodeImageMode::Stretch);
             image.rect = texture.rect.map(|r| {

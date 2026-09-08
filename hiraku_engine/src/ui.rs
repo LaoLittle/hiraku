@@ -19,6 +19,8 @@ pub enum UiEffect {
     },
     OpenUi {
         role: String,
+        origin: Option<String>,
+        arguments: Vec<StoredValue>,
     },
     CloseUi {
         value: hiraku_script::Value,

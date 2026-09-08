@@ -28,6 +28,11 @@ pub(super) fn start(
     motions.insert(actor, motion);
 }
 
+pub(super) fn finish(motion: &mut ActorMotion, animations: &mut AnimationState) {
+    motion.finish();
+    complete_missing_animation(animations, motion.animation_id.take());
+}
+
 pub(crate) fn animate(
     time: Res<Time>,
     mut shared: ResMut<SceneSharedState>,
@@ -37,16 +42,18 @@ pub(crate) fn animate(
     mut parts: Query<(&character_composite::LogicalCharacterPart, &mut Transform)>,
 ) {
     for (actor, motion) in &mut shared.0.actor_motions {
+        if !stage.character_active_parts.contains_key(actor)
+            && !stage.pending_character_restore.iter().any(|part| part.id.starts_with(&format!("character::{actor}::")))
+        {
+            finish(motion, &mut animations);
+        }
         let Some(root) = stage.character_roots.get(actor) else {
             continue;
         };
         let Ok((placement, children)) = roots.get(*root) else {
             continue;
         };
-        if !stage.character_active_parts.contains_key(actor) {
-            motion.finished = true;
-            motion.offset = [0.0; 2];
-        } else {
+        if stage.character_active_parts.contains_key(actor) {
             motion.advance(time.delta_secs());
         }
         if motion.finished {
@@ -71,6 +78,27 @@ pub(crate) fn animate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_motion_without_render_root_finishes_at_target_and_releases_wait() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<SceneSharedState>()
+            .init_resource::<StageState>()
+            .init_resource::<AnimationState>()
+            .add_systems(Update, animate);
+        let mut motion = ActorMotion::new(1, ActorOffset {
+            target: [4.0, 8.0],
+            animation: crate::script::AnimationSpec::Linear(1.0, false),
+        }, [0.0; 2]);
+        motion.animation_id = Some("alice-motion".into());
+        app.world_mut().resource_mut::<SceneSharedState>().0.actor_motions.insert("alice".into(), motion);
+        app.update();
+        let shared = app.world().resource::<SceneSharedState>();
+        assert_eq!(shared.0.actor_motions["alice"].offset, [4.0, 8.0]);
+        assert!(shared.0.actor_motions["alice"].finished);
+        assert!(app.world().resource::<AnimationState>().completed.contains("alice-motion"));
+    }
 
     #[test]
     fn restored_completion_reattaches_and_retarget_completes_old_request() {

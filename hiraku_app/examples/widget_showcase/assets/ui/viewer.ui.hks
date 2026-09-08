@@ -1,0 +1,13 @@
+import ui.widgets.*
+
+// The caller chooses the image; there is no engine-owned gallery state.
+@ui
+global fn viewer(imageName: String, title: String) -> UiNode {
+    canvas {
+        column {
+            text(title).fontSize(32)
+            image(imageName).size(.abs(480, 480))
+            button { text("Close") }.onClick { ui.close() }
+        }.gap(20).size(.rel(70, 80))
+    }.overlay(0.0, 0.0, 0.0, 0.9)
+}

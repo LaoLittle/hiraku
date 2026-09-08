@@ -44,6 +44,12 @@ pub struct ActorMotion {
 }
 
 impl ActorMotion {
+    pub(crate) fn finish(&mut self) {
+        self.offset = self.transition.target;
+        self.elapsed = self.transition.animation.duration();
+        self.finished = true;
+    }
+
     pub(crate) fn new(revision: u64, transition: ActorOffset, origin: [f32; 2]) -> Self {
         Self {
             revision,

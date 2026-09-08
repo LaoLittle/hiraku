@@ -6,5 +6,6 @@ fn main() {
         "/examples/save_restore/assets"
     ));
     config.window_title = "Hiraku — Save and Restore".to_string();
+    config.storage_namespace = "hiraku-example-save_restore".to_string();
     hiraku_app::run_app(config);
 }

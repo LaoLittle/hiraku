@@ -76,7 +76,7 @@ fn encode_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn decode_hex(value: &str) -> Result<Vec<u8>, StorageError> {
+pub(super) fn decode_hex(value: &str) -> Result<Vec<u8>, StorageError> {
     if !value.len().is_multiple_of(2) {
         return Err(StorageError::Corrupt("hexadecimal payload has an odd length".into()));
     }

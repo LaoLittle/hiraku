@@ -1,6 +1,6 @@
 use bevy::prelude::Resource;
 use hiraku_script::hson;
-use hiraku_storage::{ByteStorage, PlatformStorage};
+use hiraku_storage::BufferedStorage as PlatformStorage;
 use serde::{Deserialize, Serialize};
 
 use super::StorageError;
@@ -125,11 +125,11 @@ pub fn write_user_settings(settings: &UserSettings) -> Result<(), StorageError> 
     settings.validate().map_err(StorageError::HsonData)?;
     let payload =
         hson::to_string(settings).map_err(|error| StorageError::HsonData(error.to_string()))?;
-    settings_storage().write(USER_SETTINGS_KEY, payload.as_bytes())?;
+    settings_storage().enqueue_write(USER_SETTINGS_KEY, payload.as_bytes())?;
     Ok(())
 }
 
-fn settings_storage() -> PlatformStorage {
+pub(super) fn settings_storage() -> PlatformStorage {
     PlatformStorage::new(
         workspace_base_path().join("config"),
         "hiraku.config",

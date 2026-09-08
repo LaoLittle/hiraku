@@ -309,6 +309,7 @@ fn registry() -> NativeRegistry<CharacterContext> {
 
 fn story_registry() -> NativeRegistry<CharacterContext> {
     let mut registry = registry();
+    profile_api::register_hks(&mut registry).expect("profile API must register once");
     ui_api::register_hks(&mut registry)
         .expect("story UI API registration must be internally consistent");
     registry
@@ -522,7 +523,7 @@ impl Default for StoryNativeHost {
 impl StoryNativeHost {
     pub(super) fn actor_motion_is_current(&self, display: &str, revision: u64) -> bool {
         self.context.actors.values().any(|actor| {
-            actor.display_instance == display && actor.visible && actor.motion_revision == revision
+            actor.display_instance == display && actor.motion_revision == revision
         })
     }
 
@@ -993,11 +994,12 @@ impl CharacterContext {
                 .max()
                 .unwrap_or(0);
             let actor = self.actor_mut(handle)?;
-            if let Some(transition) = actor.pending_offset.take() {
+            if let Some(mut transition) = actor.pending_offset.take() {
                 if !actor.visible {
-                    return Err(CharacterCapabilityError::InvalidArguments(
-                        "offset requires a shown character",
-                    ));
+                    // A child sequence can reach its first offset after the
+                    // root story has hidden the actor. Commit the target and
+                    // complete normally, without resurrecting the actor.
+                    transition.animation = super::AnimationSpec::Linear(0.0, false);
                 }
                 actor.motion_revision = next_revision.checked_add(1).ok_or(
                     CharacterCapabilityError::InvalidArguments("actor motion revisions exhausted"),
@@ -2250,5 +2252,23 @@ not_actor.at(.left)"#,
                 assert!(result.is_err());
             }
         }
+    }
+}
+#[hiraku_script::hks_module("profile")]
+mod profile_api {
+    use super::*;
+    #[hks(name = "readBool")]
+    fn read_bool(_context: &mut CharacterContext, key: String) -> Result<bool, NativeError> {
+        crate::storage::profile::read_bool(&key)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
+    #[hks(name = "writeBool")]
+    fn write_bool(
+        _context: &mut CharacterContext,
+        key: String,
+        value: bool,
+    ) -> Result<(), NativeError> {
+        crate::storage::profile::write_bool(&key, value)
+            .map_err(|error| NativeError::message(error.to_string()))
     }
 }

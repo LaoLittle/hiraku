@@ -120,7 +120,7 @@ use scene::{
     tick_animation_waits, tick_pending_waits, update_builtin_ui_models,
     update_runtime_menu_button_visuals, update_ui_reactive_bindings, update_ui_text_bindings,
 };
-use script::{ScriptResponseMessage, ScriptRuntimeState, StoryRuntime, compile_story_bytecode};
+use script::{ScriptResponseMessage, ScriptRuntimeState, StoryRuntime};
 use state::SceneSharedState;
 use vfs::{HDP_SOURCE_ID, HdpArchiveStore, VfsResource, hdp_asset_source_builder};
 
@@ -133,6 +133,8 @@ pub struct RuntimeLaunchConfig {
     pub settings_path: String,
     pub default_startup_script: String,
     pub window_title: String,
+    /// Stable project ID for browser storage, independent of window title.
+    pub storage_namespace: String,
     /// Fixed logical resolution rendered by Hiraku before presentation by the host game.
     pub canvas_size: UVec2,
     pub camera_order: isize,
@@ -167,6 +169,7 @@ impl Default for RuntimeLaunchConfig {
             settings_path: vfs::DEFAULT_SETTINGS_PATH.to_string(),
             default_startup_script: vfs::DEFAULT_STARTUP_SCRIPT.to_string(),
             window_title: "hiraku".to_string(),
+            storage_namespace: "hiraku".to_string(),
             canvas_size: UVec2::new(1920, 1080),
             camera_order: -1,
             camera_clear_color: ClearColorConfig::Default,
@@ -224,6 +227,7 @@ struct HirakuRuntimeSystems;
 impl Plugin for HirakuPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
+            hiraku_uastc::UastcPlugin,
             hiraku_video::HirakuVideoPlugin,
             MaterialPlugin::<CustomScreenEffectMaterial>::default(),
             MaterialPlugin::<RuleTransitionMaterial>::default(),
@@ -253,6 +257,8 @@ impl Plugin for HirakuPlugin {
                 input::bridge_virtual_pointers.before(bevy::picking::PickingSystems::Input),
             )
             .add_systems(Last, input::cleanup_touch_pointers)
+            .add_systems(PreStartup, storage::initialize_runtime_storage)
+            .add_systems(First, storage::poll_runtime_storage)
             .init_resource::<ScriptRuntimeState>()
             .init_resource::<UiModels>()
             .init_resource::<scene::PendingMovieWaits>()
@@ -266,11 +272,12 @@ impl Plugin for HirakuPlugin {
                 (setup_frontend, setup_stage)
                     .chain()
                     .run_if(runtime_content_ready)
+                    .run_if(storage::storage_ready)
                     .run_if(runtime_not_initialized),
             )
             .add_systems(Update, assign_render_layers.after(process_script_commands))
             .configure_sets(Update, HirakuRuntimeSystems.run_if(runtime_initialized))
-            .add_systems(Update, boot_runtime.run_if(runtime_initialized))
+            .add_systems(Update, boot_runtime.run_if(runtime_initialized).run_if(storage::storage_ready))
             .add_systems(
                 Update,
                 reconcile_restored_characters
@@ -543,7 +550,7 @@ fn boot_runtime(
                 .0
                 .read_text(&startup_script)
                 .map_err(|error| error.to_string())
-                .and_then(|source| compile_story_bytecode(&startup_script, &source))
+                .and_then(|source| script::compile_story_program(&vfs.0, &startup_script, &source))
                 .and_then(|bytecode| {
                     StoryRuntime::new(bytecode).map_err(|error| error.to_string())
                 });

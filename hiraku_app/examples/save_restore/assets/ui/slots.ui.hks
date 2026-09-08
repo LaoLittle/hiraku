@@ -1,0 +1,41 @@
+import ui.widgets.*
+
+fn slot(key: String, loadMode: Bool) -> UiNode {
+    var enabled = true
+    if loadMode { enabled = storage.exists(key) }
+    button {
+        column {
+            let thumbnail = storage.thumbnail(key)
+            if thumbnail != null {
+                image(thumbnail!).size(.abs(240, 135))
+            } else {
+                spacer().size(.abs(240, 135))
+            }
+        }.gap(0)
+    }.size(.abs(260, 155))
+        .enabled(enabled)
+        .onClick {
+            if loadMode {
+                storage.load(key)
+            } else {
+                storage.save(key)
+                ui.close()
+            }
+        }
+}
+
+// Slot identifiers, layout, and save/load policy all belong to this script.
+@ui
+global fn slots(first: String, second: String, third: String, loadMode: Bool) -> UiNode {
+    screen {
+        column {
+            if loadMode { text("Load") } else { text("Save") }
+            row {
+                slot(first, loadMode)
+                slot(second, loadMode)
+                slot(third, loadMode)
+            }.gap(16)
+            button { text("Close") }.onClick { ui.close() }
+        }.gap(20).size(.rel(88, 70))
+    }.overlay(0.0, 0.0, 0.0, 0.85)
+}

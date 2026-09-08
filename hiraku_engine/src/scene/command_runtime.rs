@@ -10,6 +10,7 @@ use audio_commands::dispatch_audio_command;
 use dialogue_commands::dispatch_dialogue_command;
 pub use ingress::drive_story_runtime;
 pub(super) use ingress::evaluate_ui_at;
+pub(super) use ingress::evaluate_ui_at_with_arguments;
 #[cfg(test)]
 pub(crate) use ingress::resolve_ui_component_path;
 use ui_commands::dispatch_ui_command;
@@ -154,7 +155,8 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut line_text = ui.line_text;
     let line_text_entity = ui.line_text_entity;
 
-    while let Some(queued) = pending_script_commands.dispatch_next() {
+    while crate::storage::storage_ready()
+        && let Some(queued) = pending_script_commands.dispatch_next() {
         let command = queued.command;
         if screen_state.active_root.is_some()
             && screen_state.waiting.is_none()
@@ -402,26 +404,23 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                     .pending_character_restore
                     .iter()
                     .any(|part| part.id.starts_with(&format!("character::{actor_id}::")));
-                if !stage.character_active_parts.contains_key(&actor_id) && !restoring {
-                    warn!("cannot animate character `{actor_id}`: character is not shown");
-                    complete_missing_animation(&mut animations, animation_id);
-                    continue;
-                }
+                let hidden = !stage.character_active_parts.contains_key(&actor_id) && !restoring;
                 actor_motion::start(
                     &mut shared_state.0.actor_motions,
                     &mut animations,
-                    actor_id,
+                    actor_id.clone(),
                     revision,
                     transition,
                     animation_id,
                 );
+                if hidden && let Some(motion) = shared_state.0.actor_motions.get_mut(&actor_id) {
+                    actor_motion::finish(motion, &mut animations);
+                }
             }
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }) => {
                 for (id, motion) in &mut shared_state.0.actor_motions {
                     if actor_id.as_ref().is_none_or(|actor| actor == id) {
-                        motion.finished = true;
-                        motion.offset = [0.0; 2];
-                        complete_missing_animation(&mut animations, motion.animation_id.take());
+                        actor_motion::finish(motion, &mut animations);
                     }
                 }
                 hide_character_entities(
@@ -561,11 +560,12 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
                         .or(script_runtime.current_script.as_deref()),
                     &navigation.path,
                 );
-                let prepared = vfs
+                let cached = script_runtime.story.as_ref().and_then(|story| story.program_for_path(&target));
+                let prepared = cached.map(Ok).unwrap_or_else(|| vfs
                     .0
                     .read_text(&target)
                     .map_err(|error| error.to_string())
-                    .and_then(|source| compile_story_bytecode(&target, &source))
+                    .and_then(|source| crate::script::compile_story_program(&vfs.0, &target, &source)))
                     .and_then(|bytecode| {
                         StoryRuntime::new(bytecode).map_err(|error| error.to_string())
                     });

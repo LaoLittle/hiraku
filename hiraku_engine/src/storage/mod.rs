@@ -4,7 +4,7 @@ use std::{
 };
 
 use hiraku_script::hson;
-use hiraku_storage::{ByteStorage, PlatformStorage};
+use hiraku_storage::BufferedStorage as PlatformStorage;
 use prost::Message;
 use thiserror::Error;
 
@@ -21,7 +21,12 @@ use crate::{
 const SAVE_ROOT: &str = "saves";
 const SAVE_EXTENSION: &str = "sav";
 const SAVE_NAMESPACE: &str = "hiraku.save";
+pub(crate) mod profile;
 mod user_settings;
+mod runtime;
+mod slots;
+pub use slots::{save_slot_exists, load_save_data, load_save_data_from_root, load_save_metadata, load_save_thumbnail, write_save_data_to_root};
+pub(crate) use runtime::{initialize_runtime_storage, poll_runtime_storage, storage_ready};
 pub use user_settings::{PreferenceChange, UserSettings, read_user_settings, write_user_settings};
 
 #[derive(Debug, Error)]
@@ -44,56 +49,11 @@ pub fn save_root_path() -> PathBuf {
     workspace_base_path().join(SAVE_ROOT)
 }
 
-pub fn save_slot_exists(slot: &str) -> Result<bool, StorageError> {
-    Ok(save_storage(&save_root_path()).contains(sanitize_slot_name(slot)?)?)
-}
-
-pub fn load_save_data(slot: &str) -> Result<SaveGameData, StorageError> {
-    load_save_data_from_root(&save_root_path(), slot)
-}
-
-pub fn load_save_data_from_root(root: &Path, slot: &str) -> Result<SaveGameData, StorageError> {
-    decode_save_data(&read_slot_payload(root, slot)?)
-}
-
-fn read_slot_payload(root: &Path, slot: &str) -> Result<Vec<u8>, StorageError> {
-    let slot = sanitize_slot_name(slot)?;
-    save_storage(root)
-        .read(slot)?
-        .ok_or_else(|| StorageError::MissingSlot(slot.to_string()))
-}
-
-/// Browsing a slot must not deserialize its VM, scene or replay history.
-/// Keep these protobuf field numbers stable across save schema versions.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct SaveSlotMetadata {
-    #[prost(uint32, tag = "1")]
-    pub version: u32,
-    #[prost(string, tag = "2")]
-    pub resume_script: String,
-    #[prost(bytes = "vec", tag = "19")]
-    pub thumbnail_png: Vec<u8>,
-}
-
-pub fn load_save_metadata(slot: &str) -> Result<SaveSlotMetadata, StorageError> {
-    let payload = read_slot_payload(&save_root_path(), slot)?;
-    Ok(SaveSlotMetadata::decode(payload.as_slice())?)
-}
-
-pub fn write_save_data_to_root(
-    root: &Path,
-    slot: &str,
-    data: &SaveGameData,
-) -> Result<(), StorageError> {
-    let slot = sanitize_slot_name(slot)?;
-    save_storage(root).write(slot, &encode_save_data(data))?;
-    Ok(())
-}
-
 fn save_storage(root: &Path) -> PlatformStorage {
     PlatformStorage::new(root, SAVE_NAMESPACE, SAVE_EXTENSION)
 }
 
+#[cfg(test)]
 fn encode_save_data(data: &SaveGameData) -> Vec<u8> {
     proto::SaveGameData::from(data).encode_to_vec()
 }
@@ -105,7 +65,6 @@ fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
 impl From<&SaveGameData> for proto::SaveGameData {
     fn from(data: &SaveGameData) -> Self {
         Self {
-            thumbnail_png: data.thumbnail_png.clone(),
             version: data.version,
             resume_script: data.resume_script.clone(),
             replay_hson: hiraku_script::hson::to_vec(&data.replay)
@@ -148,7 +107,7 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
             )));
         }
         Ok(Self {
-            thumbnail_png: data.thumbnail_png,
+            thumbnail_png: Vec::new(),
             version: data.version,
             resume_script: data.resume_script,
             replay: if data.replay_hson.is_empty() {
@@ -688,31 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn slot_metadata_ignores_incompatible_vm_and_scene_payloads() {
-        let encoded = proto::SaveGameData {
-            version: CURRENT_SAVE_VERSION + 10,
-            resume_script: "memory://alice.hks".into(),
-            thumbnail_png: vec![1, 2, 3],
-            vm_snapshot_hson: b"not valid HSON".to_vec(),
-            replay_hson: b"not valid HSON either".to_vec(),
-            ..Default::default()
-        }
-        .encode_to_vec();
-        let metadata = SaveSlotMetadata::decode(encoded.as_slice())
-            .expect("metadata does not interpret VM state");
-        assert_eq!(metadata.version, CURRENT_SAVE_VERSION + 10);
-        assert_eq!(metadata.thumbnail_png, vec![1, 2, 3]);
-        assert!(
-            decode_save_data(&encoded).is_err(),
-            "browsing does not authorize restore"
-        );
-        assert!(
-            SaveSlotMetadata::decode(&[0xff][..]).is_err(),
-            "damaged slot remains a local preview error"
-        );
-    }
-
-    #[test]
     fn a_save_without_a_checkpoint_must_not_restart_the_script() {
         let data = SaveGameData {
             resume_script: "memory://alice.hks".into(),
@@ -745,16 +679,12 @@ mod tests {
     }
 
     #[test]
-    fn save_roundtrip_preserves_thumbnail_and_overwrite_can_clear_it() {
-        let mut data = SaveGameData {
+    fn snapshot_does_not_embed_thumbnail() {
+        let data = SaveGameData {
             thumbnail_png: vec![137, 80, 78, 71],
             ..Default::default()
         };
         let restored = decode_save_data(&encode_save_data(&data)).expect("save decodes");
-        assert_eq!(restored.thumbnail_png, data.thumbnail_png);
-        data.thumbnail_png.clear();
-        let restored =
-            decode_save_data(&encode_save_data(&data)).expect("save without preview decodes");
         assert!(restored.thumbnail_png.is_empty());
     }
 

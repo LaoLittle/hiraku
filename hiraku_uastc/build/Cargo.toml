@@ -1,0 +1,18 @@
+[package]
+name = "hiraku-uastc-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+basis-universal = "=0.3.1"
+hiraku-hdp.workspace = true
+hiraku-script.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tga"] }
+blake3 = "1"
+
+[dev-dependencies]
+hiraku-uastc = { path = ".." }
+bevy.workspace = true
+tempfile = "3"

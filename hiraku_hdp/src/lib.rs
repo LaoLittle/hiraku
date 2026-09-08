@@ -16,6 +16,7 @@ pub use error::HdpError;
 pub use format::{ChunkDescriptor, FORMAT_VERSION, FileEntry, HEADER_SIZE, MAGIC, PackageIndex};
 pub use reader::Archive;
 pub use writer::{
+    StreamPackageBuilder,
     FileOptions, PackOptions, PackageBuilder, PackageOutput, WrittenPackage, pack_directory,
     pack_directory_to, pack_directory_to_with, pack_directory_with, write_package,
 };

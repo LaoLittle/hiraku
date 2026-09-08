@@ -132,7 +132,20 @@ fn restore_frontend_scene(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
+pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext, mut deferred: Local<Vec<crate::ui::UiEffect>>) {
+    if !crate::storage::storage_ready() {
+        ctx.clicks.clear();
+        ctx.widget_callbacks.clear();
+        if matches!(hiraku_storage::runtime_status(), hiraku_storage::RuntimeStorageStatus::Failed(_)) { deferred.clear(); }
+        return;
+    }
+    if !deferred.is_empty() {
+        let effects = std::mem::take(&mut *deferred);
+        dispatch_ui_effects(&mut ctx, effects, &mut deferred);
+        ctx.clicks.clear();
+        ctx.widget_callbacks.clear();
+        return;
+    }
     if ctx
         .script_runtime
         .story
@@ -261,7 +274,18 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                 }
             }
         }
-        for effect in effects {
+        dispatch_ui_effects(&mut ctx, effects, &mut deferred);
+        if !crate::storage::storage_ready() { return; }
+    }
+}
+
+fn dispatch_ui_effects(ctx: &mut RuntimeMenuContext, effects: Vec<crate::ui::UiEffect>, deferred: &mut Vec<crate::ui::UiEffect>) {
+    if !crate::storage::storage_ready() {
+        deferred.extend(effects);
+        return;
+    }
+    let mut effects = effects.into_iter();
+    while let Some(effect) = effects.next() {
             match &effect {
                 crate::ui::UiEffect::SetPreference(change) => {
                     ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
@@ -297,6 +321,8 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                         },
                     ) {
                         warn!("failed to save slot `{slot}`: {error}");
+                        ctx.frontend.notice = Some(format!("Failed to save slot {slot}: {error}"));
+                        break;
                     }
                 }
                 crate::ui::UiEffect::Load { slot } => {
@@ -361,18 +387,26 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     // Remaining effects belong to the pre-load UI invocation.
                     break;
                 }
-                crate::ui::UiEffect::OpenUi { role } => {
-                    let Some(target) = ctx.script_runtime.ui_registry.get(role).cloned() else {
-                        warn!("UI action route references unregistered role `{role}`");
-                        continue;
-                    };
-                    match evaluate_ui_at(
+                crate::ui::UiEffect::OpenUi {
+                    role,
+                    origin,
+                    arguments,
+                } => {
+                    let target = ctx
+                        .script_runtime
+                        .ui_registry
+                        .get(role)
+                        .cloned()
+                        .unwrap_or_else(|| ctx.vfs.0.resolve_path(origin.as_deref(), role));
+                    match super::command_runtime::evaluate_ui_at_with_arguments(
                         &target,
                         &ctx.script_runtime,
                         &ctx.vfs,
                         &ctx.user_settings,
                         Some(&ctx.textures),
                         Some(&ctx.terms),
+                        Default::default(),
+                        arguments,
                     ) {
                         Ok(screen) => {
                             ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
@@ -412,8 +446,11 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     );
                 }
             }
+        if !crate::storage::storage_ready() {
+            deferred.extend(effects);
+            break;
         }
-    }
+        }
 }
 
 /// Swapping artwork must not discard stretching, tint, flips or visual-box

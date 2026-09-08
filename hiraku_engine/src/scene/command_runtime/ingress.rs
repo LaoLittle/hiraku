@@ -171,7 +171,7 @@ fn evaluate_ui_at_with(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn evaluate_ui_at_with_arguments(
+pub(crate) fn evaluate_ui_at_with_arguments(
     target: &str,
     runtime: &ScriptRuntimeState,
     vfs: &VfsResource,
@@ -270,6 +270,8 @@ pub fn drive_story_runtime(
             runtime.accept_response(message.clone());
         }
     }
+
+    if !crate::storage::storage_ready() { return; }
 
     if let Some(request) = runtime.wait_request
         && let Some(response) = runtime.take_response(request)
@@ -629,12 +631,15 @@ pub fn drive_story_runtime(
                 });
                 let arguments = arguments
                     .iter()
-                    .map(hks_to_stored)
-                    .collect::<Option<Vec<_>>>();
-                let Some(arguments) = arguments else {
-                    warn!("ui.open arguments must contain only persistable values");
-                    runtime.story = None;
-                    return;
+                    .map(crate::script::ui_argument_to_stored)
+                    .collect::<Result<Vec<_>, _>>();
+                let arguments = match arguments {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        warn!("invalid ui.open arguments: {error}");
+                        runtime.story = None;
+                        return;
+                    }
                 };
                 let screen = evaluate_ui_at_with_arguments(
                     &target,

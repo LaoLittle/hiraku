@@ -106,7 +106,8 @@ pub fn advance_dialogue_on_input(
 
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
-    if choice_state.waiting.is_some()
+    if !crate::storage::storage_ready()
+        || choice_state.waiting.is_some()
         || screen_state.active_root.is_some()
         || screen_state.pending_root.is_some()
     {

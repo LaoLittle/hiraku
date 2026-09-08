@@ -6,13 +6,11 @@
 use std::{collections::BTreeMap, fmt};
 
 use hiraku_script::{
-    BuiltinCall, Bytecode, LinkedBytecode, LinkedFunction, StatementValue, SymbolCall,
-    TemplateError, Value, Vm, VmError, VmEvent, VmSnapshot, VmStatus, link_bytecode,
+    BuiltinCall, Bytecode, LinkedBytecode, LinkedFunction, StatementValue, TemplateError, Value,
+    Vm, VmError, VmEvent, VmSnapshot, VmStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-use crate::script::capabilities::story_manifest;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -80,6 +78,8 @@ impl ExecutionEvent {
 
 struct ExecutionState {
     vm: Vm,
+    module: hiraku_script::ModuleId,
+    callers: Vec<(hiraku_script::ModuleId, Vm)>,
     mode: ExecutionMode,
     paused: bool,
 }
@@ -87,6 +87,8 @@ struct ExecutionState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ExecutionSnapshot {
     vm: VmSnapshot,
+    module: hiraku_script::ModuleId,
+    callers: Vec<(hiraku_script::ModuleId, VmSnapshot)>,
     mode: ExecutionMode,
     paused: bool,
 }
@@ -96,31 +98,55 @@ pub struct ExecutionRuntimeSnapshot {
     objects: hiraku_script::ObjectHeap,
     /// The save contains state only. Code must be recompiled and match exactly.
     pub program: hiraku_script::ProgramFingerprint,
+    modules: Vec<hiraku_script::ProgramFingerprint>,
     next_execution: u64,
     executions: BTreeMap<ExecutionId, ExecutionSnapshot>,
-    shared_globals: Vec<Value>,
+    module_globals: BTreeMap<String, Value>,
 }
 
 pub struct ExecutionRuntime {
     objects: hiraku_script::ObjectHeap,
     linked: LinkedBytecode,
+    program: hiraku_script::LinkedProgram,
+    entry: hiraku_script::ModuleId,
+    module_globals: BTreeMap<String, Value>,
     executions: BTreeMap<ExecutionId, ExecutionState>,
     next_execution: u64,
-    shared_globals: Vec<Value>,
     globals: BTreeMap<String, Value>,
 }
 
 impl ExecutionRuntime {
-    pub fn new(bytecode: Bytecode) -> Result<Self, ExecutionRuntimeError> {
-        let linked =
-            link_bytecode(bytecode, &story_manifest()).map_err(ExecutionRuntimeError::Link)?;
+    pub fn program_for_path(&self, path: &str) -> Option<super::StoryProgram> {
+        let entry = self
+            .program
+            .modules
+            .iter()
+            .find(|module| {
+                module
+                    .bytecode
+                    .debug
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.path == path)
+            })?
+            .id;
+        Some(super::StoryProgram::Project {
+            program: self.program.clone(),
+            entry,
+        })
+    }
+
+    pub fn new(code: impl Into<super::StoryProgram>) -> Result<Self, ExecutionRuntimeError> {
+        let (program, entry) = code.into().link()?;
+        let linked = program.modules[entry.0 as usize].clone();
         let bytecode = linked.bytecode.clone();
-        let shared_globals = vec![Value::Uninitialized; bytecode.globals.len()];
         let mut executions = BTreeMap::new();
         executions.insert(
             ExecutionId::MAIN,
             ExecutionState {
                 vm: Vm::new(bytecode)?,
+                module: entry,
+                callers: Vec::new(),
                 mode: ExecutionMode::Main,
                 paused: false,
             },
@@ -128,32 +154,61 @@ impl ExecutionRuntime {
         Ok(Self {
             objects: hiraku_script::ObjectHeap::default(),
             linked,
+            program,
+            entry,
+            module_globals: BTreeMap::new(),
             executions,
             next_execution: 1,
-            shared_globals,
             globals: BTreeMap::new(),
         })
     }
 
     pub fn restore(
-        bytecode: Bytecode,
+        code: impl Into<super::StoryProgram>,
         snapshot: ExecutionRuntimeSnapshot,
     ) -> Result<Self, ExecutionRuntimeError> {
-        let linked =
-            link_bytecode(bytecode, &story_manifest()).map_err(ExecutionRuntimeError::Link)?;
-        if linked.fingerprint != snapshot.program {
+        let (program, entry) = code.into().link()?;
+        let linked = program.modules[entry.0 as usize].clone();
+        if linked.fingerprint != snapshot.program
+            || program
+                .modules
+                .iter()
+                .map(|module| module.fingerprint.clone())
+                .collect::<Vec<_>>()
+                != snapshot.modules
+        {
             return Err(VmError::ProgramFingerprintMismatch.into());
         }
-        let bytecode = linked.bytecode.clone();
         let executions = snapshot
             .executions
             .into_iter()
             .map(|(id, state)| {
-                Vm::restore(bytecode.clone(), state.vm).map(|vm| {
+                let code = program
+                    .modules
+                    .get(state.module.0 as usize)
+                    .ok_or(VmError::ProgramFingerprintMismatch)?
+                    .bytecode
+                    .clone();
+                let callers = state
+                    .callers
+                    .into_iter()
+                    .map(|(module, snapshot)| {
+                        let code = program
+                            .modules
+                            .get(module.0 as usize)
+                            .ok_or(VmError::ProgramFingerprintMismatch)?
+                            .bytecode
+                            .clone();
+                        Ok((module, Vm::restore(code, snapshot)?))
+                    })
+                    .collect::<Result<Vec<_>, VmError>>()?;
+                Vm::restore(code, state.vm).map(|vm| {
                     (
                         id,
                         ExecutionState {
                             vm,
+                            module: state.module,
+                            callers,
                             mode: state.mode,
                             paused: state.paused,
                         },
@@ -161,16 +216,20 @@ impl ExecutionRuntime {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let globals = globals_from_values(&bytecode, &snapshot.shared_globals)
+        let globals = snapshot
+            .module_globals
+            .clone()
             .into_iter()
             .map(|(key, value)| Ok((key, snapshot.objects.export(&value)?)))
             .collect::<Result<_, hiraku_script::VmError>>()?;
         Ok(Self {
             linked,
+            program,
+            entry,
+            module_globals: snapshot.module_globals,
             executions,
             next_execution: snapshot.next_execution,
             objects: snapshot.objects,
-            shared_globals: snapshot.shared_globals,
             globals,
         })
     }
@@ -179,6 +238,13 @@ impl ExecutionRuntime {
         ExecutionRuntimeSnapshot {
             objects: self.objects.clone(),
             program: self.linked.fingerprint.clone(),
+            modules: self
+                .program
+                .modules
+                .iter()
+                .map(|module| module.fingerprint.clone())
+                .collect(),
+            module_globals: self.module_globals.clone(),
             next_execution: self.next_execution,
             executions: self
                 .executions
@@ -188,13 +254,18 @@ impl ExecutionRuntime {
                         *id,
                         ExecutionSnapshot {
                             vm: state.vm.snapshot(),
+                            module: state.module,
+                            callers: state
+                                .callers
+                                .iter()
+                                .map(|(module, vm)| (*module, vm.snapshot()))
+                                .collect(),
                             mode: state.mode,
                             paused: state.paused,
                         },
                     )
                 })
                 .collect(),
-            shared_globals: self.shared_globals.clone(),
         }
     }
 
@@ -219,12 +290,32 @@ impl ExecutionRuntime {
         // Import portable captures into the execution-owned heap before creating
         // the child. All story executions must address the same object table.
         let closure = self.objects.import(closure.clone());
-        let mut vm = Vm::from_callable(self.linked.bytecode.clone(), &closure, Vec::new())?;
-        vm.set_global_values(self.shared_globals.clone())?;
+        let module = match &closure {
+            Value::Closure {
+                module: Some(module),
+                ..
+            }
+            | Value::Function {
+                module: Some(module),
+                ..
+            } => hiraku_script::ModuleId(*module),
+            _ => self.entry,
+        };
+        let code = self
+            .program
+            .modules
+            .get(module.0 as usize)
+            .ok_or(VmError::ProgramFingerprintMismatch)?
+            .bytecode
+            .clone();
+        let mut vm = Vm::from_callable(code.clone(), &closure, Vec::new())?;
+        vm.set_global_values(values_from_globals(&code, &self.module_globals))?;
         self.executions.insert(
             execution,
             ExecutionState {
                 vm,
+                module,
+                callers: Vec::new(),
                 mode,
                 paused: false,
             },
@@ -310,56 +401,134 @@ impl ExecutionRuntime {
         execution: ExecutionId,
         budget: &mut u32,
     ) -> Result<Option<ExecutionEvent>, ExecutionRuntimeError> {
-        let event = {
-            let state = self
-                .executions
-                .get_mut(&execution)
-                .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
-            if state.paused {
-                return Ok(None);
-            }
-            state.vm.set_global_values(self.shared_globals.clone())?;
-            state.vm.step_with_budget(budget)?
-        };
-        let Some(event) = event else {
-            return Ok(None);
-        };
-
-        match event {
-            VmEvent::BudgetExhausted => {
-                self.capture_globals(execution)?;
-                Ok(None)
-            }
-            VmEvent::Call(call) => {
-                self.capture_globals(execution)?;
-                let mut call = self.link_call(call)?;
+        loop {
+            let event = {
                 let state = self
                     .executions
-                    .get(&execution)
+                    .get_mut(&execution)
                     .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
-                evaluate_call_templates(&mut call, |text| state.vm.eval_template(text))?;
-                Ok(Some(ExecutionEvent::Call { execution, call }))
-            }
-            VmEvent::Statement(value) => {
-                let value = {
+                if state.paused {
+                    return Ok(None);
+                }
+                state.vm.set_global_values(values_from_globals(
+                    state.vm.bytecode(),
+                    &self.module_globals,
+                ))?;
+                state.vm.step_with_budget(budget).map_err(|mut error| {
+                    if let VmError::Panic { frames, .. } = &mut error {
+                        for (_, caller) in state.callers.iter().rev() {
+                            frames.extend(caller.stack_trace());
+                        }
+                    }
+                    error
+                })?
+            };
+            let Some(event) = event else {
+                return Ok(None);
+            };
+
+            return match event {
+                VmEvent::BudgetExhausted => {
+                    self.capture_globals(execution)?;
+                    Ok(None)
+                }
+                VmEvent::Call(call) => {
+                    self.capture_globals(execution)?;
                     let state = self
                         .executions
                         .get_mut(&execution)
                         .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
-                    evaluate_statement_template(&mut state.vm, value)?
-                };
-                self.capture_globals(execution)?;
-                Ok(Some(ExecutionEvent::Statement { execution, value }))
-            }
-            VmEvent::Completed(value) => {
-                let mut state = self
-                    .executions
-                    .remove(&execution)
-                    .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
-                self.shared_globals = state.vm.globals().to_vec();
-                state.vm.swap_objects(&mut self.objects);
-                Ok(Some(ExecutionEvent::Completed { execution, value }))
-            }
+                    let module = &self.program.modules[state.module.0 as usize];
+                    let target = module
+                        .resolve(call.function)
+                        .ok_or(ExecutionRuntimeError::UnlinkedCall(call.function))?;
+                    let bind =
+                        |value| hiraku_script::linked_vm::bind_value_module(value, state.module);
+                    let mut call = match target {
+                        LinkedFunction::Native(builtin) => BuiltinCall {
+                            builtin,
+                            receiver: call.receiver.map(bind),
+                            arguments: call
+                                .arguments
+                                .into_iter()
+                                .map(|mut arg| {
+                                    arg.value = bind(arg.value);
+                                    arg
+                                })
+                                .collect(),
+                        },
+                        LinkedFunction::Script { module, function } => {
+                            if call.receiver.is_some() {
+                                return Err(VmError::TypeMismatch(
+                                    "external script function cannot have a native receiver",
+                                )
+                                .into());
+                            }
+                            let code = self.program.modules[module.0 as usize].bytecode.clone();
+                            let mut callee = Vm::from_function(
+                                code.clone(),
+                                function,
+                                call.arguments
+                                    .into_iter()
+                                    .map(|arg| bind(arg.value))
+                                    .collect(),
+                            )?;
+                            callee.set_type_bindings(call.type_bindings);
+                            callee.set_global_values(values_from_globals(
+                                &code,
+                                &self.module_globals,
+                            ))?;
+                            // The current VM owns the shared heap during this step.
+                            state.vm.swap_objects(&mut self.objects);
+                            callee.swap_objects(&mut self.objects);
+                            let caller = std::mem::replace(&mut state.vm, callee);
+                            state.callers.push((state.module, caller));
+                            state.module = module;
+                            continue;
+                        }
+                    };
+                    let state = self
+                        .executions
+                        .get(&execution)
+                        .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
+                    evaluate_call_templates(&mut call, |text| state.vm.eval_template(text))?;
+                    Ok(Some(ExecutionEvent::Call { execution, call }))
+                }
+                VmEvent::Statement(value) => {
+                    let value = {
+                        let state = self
+                            .executions
+                            .get_mut(&execution)
+                            .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
+                        evaluate_statement_template(&mut state.vm, value)?
+                    };
+                    self.capture_globals(execution)?;
+                    Ok(Some(ExecutionEvent::Statement { execution, value }))
+                }
+                VmEvent::Completed(value) => {
+                    self.capture_globals(execution)?;
+                    let state = self
+                        .executions
+                        .get_mut(&execution)
+                        .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
+                    if let Some((module, mut caller)) = state.callers.pop() {
+                        let value =
+                            hiraku_script::linked_vm::bind_value_module(value, state.module);
+                        state.vm.swap_objects(&mut self.objects);
+                        caller.swap_objects(&mut self.objects);
+                        caller.resume(value)?;
+                        state.vm = caller;
+                        state.module = module;
+                        continue;
+                    }
+                    let mut state = self
+                        .executions
+                        .remove(&execution)
+                        .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
+                    state.vm.swap_objects(&mut self.objects);
+                    Ok(Some(ExecutionEvent::Completed { execution, value }))
+                }
+            };
         }
     }
 
@@ -406,35 +575,35 @@ impl ExecutionRuntime {
     }
 
     pub fn set_globals(&mut self, globals: BTreeMap<String, Value>) {
-        let incoming = values_from_globals(&self.linked.bytecode, &globals);
-        let changed = self
-            .shared_globals
-            .iter()
-            .zip(incoming)
-            .map(|(old, new)| {
-                let same = self.objects.export(old).is_ok_and(|value| value == new);
-                (old.clone(), new, same)
-            })
-            .collect::<Vec<_>>();
-        self.shared_globals = changed
-            .into_iter()
-            .map(|(old, new, same)| {
-                if same {
-                    old
-                } else {
-                    self.objects
-                        .update(&old, new)
-                        .expect("host global updates target valid objects")
-                }
-            })
-            .collect();
+        for (name, value) in globals {
+            let old = self
+                .module_globals
+                .get(&name)
+                .cloned()
+                .unwrap_or(Value::Uninitialized);
+            let value = if self
+                .objects
+                .export(&old)
+                .is_ok_and(|current| current == value)
+            {
+                old
+            } else {
+                self.objects
+                    .update(&old, value)
+                    .expect("host globals refer to live objects")
+            };
+            self.module_globals.insert(name, value);
+        }
         for state in self.executions.values_mut() {
             state
                 .vm
-                .set_global_values(self.shared_globals.clone())
+                .set_global_values(values_from_globals(
+                    state.vm.bytecode(),
+                    &self.module_globals,
+                ))
                 .expect("compiled global frame shape must match its bytecode");
         }
-        self.globals = globals;
+        self.refresh_globals();
     }
 
     pub fn globals(&self) -> &BTreeMap<String, Value> {
@@ -453,8 +622,13 @@ impl ExecutionRuntime {
             self.objects.collect(
                 self.executions
                     .values()
-                    .flat_map(|state| state.vm.object_roots())
-                    .chain(self.shared_globals.iter())
+                    .flat_map(|state| {
+                        state
+                            .vm
+                            .object_roots()
+                            .chain(state.callers.iter().flat_map(|(_, vm)| vm.object_roots()))
+                    })
+                    .chain(self.module_globals.values())
                     .chain(host_roots.iter().copied()),
             )?;
         }
@@ -462,32 +636,23 @@ impl ExecutionRuntime {
     }
 
     fn capture_globals(&mut self, execution: ExecutionId) -> Result<(), ExecutionRuntimeError> {
-        self.shared_globals = self
+        let vm = &self
             .executions
             .get(&execution)
             .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?
-            .vm
-            .globals()
-            .to_vec();
+            .vm;
+        self.module_globals
+            .extend(globals_from_values(vm.bytecode(), vm.globals()));
         Ok(())
     }
 
     fn refresh_globals(&mut self) {
-        self.globals = globals_from_values(&self.linked.bytecode, &self.shared_globals)
+        self.globals = self
+            .module_globals
+            .clone()
             .into_iter()
             .map(|(key, value)| (key, self.objects.export(&value).unwrap_or(value)))
             .collect();
-    }
-
-    fn link_call(&self, call: SymbolCall) -> Result<BuiltinCall, ExecutionRuntimeError> {
-        let Some(LinkedFunction::Native(builtin)) = self.linked.resolve(call.function) else {
-            return Err(ExecutionRuntimeError::UnlinkedCall(call.function));
-        };
-        Ok(BuiltinCall {
-            builtin,
-            receiver: call.receiver,
-            arguments: call.arguments,
-        })
     }
 }
 

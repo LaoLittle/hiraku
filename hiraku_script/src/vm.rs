@@ -1681,7 +1681,7 @@ impl Vm {
         self.read_only_globals = names;
     }
 
-    pub(crate) fn set_type_bindings(&mut self, bindings: BTreeMap<SymbolId, crate::ScriptType>) {
+    pub fn set_type_bindings(&mut self, bindings: BTreeMap<SymbolId, crate::ScriptType>) {
         self.type_bindings = bindings;
     }
 
@@ -1795,7 +1795,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn stack_trace(&self) -> Vec<crate::debug::StackTraceFrame> {
+    pub fn stack_trace(&self) -> Vec<crate::debug::StackTraceFrame> {
         let source = self.bytecode.debug.source.clone().map(Arc::new);
         std::iter::once((self.location, self.pc))
             .chain(

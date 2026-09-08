@@ -6,6 +6,8 @@ use std::{
 };
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+mod stream;
+pub use stream::StreamPackageBuilder;
 
 use crate::{
     ChunkDescriptor, CompressionMethod, CompressionOptions, EncryptionMethod, FileEntry, HdpError,
@@ -902,12 +904,12 @@ mod tests {
 
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
-    struct TestDirectory {
-        path: PathBuf,
+    pub(super) struct TestDirectory {
+        pub(super) path: PathBuf,
     }
 
     impl TestDirectory {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("test clock must follow the Unix epoch")

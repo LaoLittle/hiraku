@@ -46,15 +46,24 @@ fn encode(image: &Image) -> Result<Vec<u8>, String> {
 }
 
 pub fn load_image(server: &AssetServer, path: &str) -> Handle<Image> {
+    load_image_with(server, path, |slot| {
+        crate::storage::load_save_thumbnail(slot)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn load_image_with(
+    server: &AssetServer,
+    path: &str,
+    read_preview: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+) -> Handle<Image> {
     let Some(slot) = path.strip_prefix("save-thumbnail://") else {
         return server.load(path.to_owned());
     };
-    let decoded = crate::storage::load_save_metadata(slot)
-        .map_err(|error| error.to_string())
-        .and_then(|data| {
-            image::load_from_memory_with_format(&data.thumbnail_png, image::ImageFormat::Png)
-                .map_err(|error| error.to_string())
-        });
+    let decoded = read_preview(slot).and_then(|png| {
+        image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .map_err(|error| error.to_string())
+    });
     match decoded {
         Ok(image) => server.add(Image::from_dynamic(image, true, default())),
         Err(error) => {
@@ -71,6 +80,38 @@ pub fn load_image(server: &AssetServer, path: &str) -> Handle<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn corrupt_png_returns_transparent_asset_without_panicking() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default())).init_asset::<Image>();
+        let server = app.world().resource::<AssetServer>();
+        let handle = load_image_with(server, "save-thumbnail://bob", |_| Ok(vec![0xff]));
+        assert!(handle.path().is_none());
+        app.update();
+        let assets = app.world().resource::<Assets<Image>>();
+        let image = assets.get(&handle).expect("fallback asset");
+        assert_eq!(image.data.as_deref(), Some(&[0, 0, 0, 0][..]));
+    }
+    #[test]
+    fn thumbnail_is_an_in_memory_asset_not_a_named_asset_source() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<Image>();
+        let server = app.world().resource::<AssetServer>();
+        let source = Image::from_dynamic(image::DynamicImage::new_rgb8(16, 9), true, default());
+        let png = encode(&source).expect("encode synthetic preview");
+        let mut read = false;
+        let handle = load_image_with(server, "save-thumbnail://alice", |slot| {
+            assert_eq!(slot, "alice");
+            read = true;
+            Ok(png)
+        });
+        assert!(read);
+        assert!(
+            handle.path().is_none(),
+            "preview must not be sent to an asset source"
+        );
+    }
     #[test]
     fn thumbnail_is_bounded_and_png_encoded() {
         let source =

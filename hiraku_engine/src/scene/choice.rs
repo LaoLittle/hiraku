@@ -55,7 +55,7 @@ pub fn handle_choice_action_input(
         crate::input::HirakuAction::Choice(index) => Some(index),
         _ => None,
     });
-    if choice_state.waiting.is_none() || text_focus.is_some_and(|focus| focus.0.is_some()) {
+    if !crate::storage::storage_ready() || choice_state.waiting.is_none() || text_focus.is_some_and(|focus| focus.0.is_some()) {
         return;
     }
     if let Some(index) = selected {
