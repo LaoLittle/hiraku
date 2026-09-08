@@ -152,6 +152,17 @@ pub fn recompose_screen_ui(
         if composition.rendered == local.0 {
             continue;
         }
+        if !composition
+            .renderer
+            .document
+            .plan
+            .structural_globals
+            .iter()
+            .any(|name| composition.rendered.get(name) != local.0.get(name))
+        {
+            composition.rendered = local.0.clone();
+            continue;
+        }
         let belongs_to_root = |mut entity: Entity| {
             loop {
                 if entity == root {
@@ -1848,7 +1859,8 @@ pub fn update_ui_reactive_bindings(
             continue;
         }
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
-            Ok(hiraku_script::Value::String(value)) => text.0 = value,
+            Ok(hiraku_script::Value::String(value)) if text.0 != value => text.0 = value,
+            Ok(hiraku_script::Value::String(_)) => {}
             Ok(value) => warn!("reactive UI text returned {value:?}, expected String"),
             Err(error) => {
                 crate::script::emit_script_diagnostic("reactive UI text failed", &error.to_string())
@@ -1950,7 +1962,7 @@ pub fn update_ui_reactive_bindings(
 
 pub(super) fn refresh_local_binding(
     mut entity: Entity,
-    expression: &mut crate::ui::UiReactiveBinding,
+    expression: &mut crate::ui::PropertyComputation,
     parents: &Query<&ChildOf>,
     local_states: &Query<&super::widgets::UiLocalState>,
 ) -> bool {
@@ -2125,6 +2137,75 @@ mod tests {
         let node = screen_root_node(&screen);
         assert_eq!(node.justify_content, JustifyContent::Start);
         assert_eq!(node.align_items, AlignItems::Start);
+    }
+
+    #[test]
+    fn property_changes_update_text_without_replacing_entities() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://counter.ui.hks",
+            "import ui.widgets.*\nglobal var count = 1\ncanvas { text(count.toString()) }",
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("screen");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("expected text");
+        };
+        let expression = text.reactive_text.clone().expect("compiler property");
+        let renderer = screen.composition.expect("composition");
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_resource::<TextureCatalog>()
+            .init_resource::<TermCatalog>()
+            .init_resource::<UiStyle>()
+            .init_resource::<UiModels>()
+            .init_resource::<crate::input::HirakuTextFocus>()
+            .insert_resource(UiFonts {
+                regular: Handle::default(),
+                _fonts: vec![],
+            })
+            .add_systems(
+                Update,
+                (recompose_screen_ui, update_ui_reactive_bindings).chain(),
+            );
+        let child = app
+            .world_mut()
+            .spawn((
+                Text::new("1"),
+                UiReactiveTextBinding {
+                    expression,
+                    rendered_revision: u64::MAX,
+                },
+            ))
+            .id();
+        let mut local = renderer.globals.clone();
+        local.insert("count".into(), hiraku_script::Value::Number(2.0));
+        let root = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                super::super::widgets::UiLocalState(local),
+                ScreenComposition {
+                    rendered: renderer.globals.clone(),
+                    renderer,
+                },
+            ))
+            .add_child(child)
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Text>(child)
+                .expect("original entity remains")
+                .0,
+            "2"
+        );
+        assert_eq!(
+            app.world().get::<Children>(root).expect("same children")[0],
+            child
+        );
     }
 
     #[test]

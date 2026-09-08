@@ -33,8 +33,24 @@ pub struct ProjectError {
 }
 
 pub fn compile_project(
+    sources: Vec<ScriptSource>,
+    natives: &BuiltinManifest,
+) -> Result<CompiledProject, Vec<ProjectError>> {
+    compile_project_impl(sources, natives, None)
+}
+
+pub fn compile_project_with_hir_pass(
+    sources: Vec<ScriptSource>,
+    natives: &BuiltinManifest,
+    pass: &mut dyn crate::hir::HirPass,
+) -> Result<CompiledProject, Vec<ProjectError>> {
+    compile_project_impl(sources, natives, Some(pass))
+}
+
+fn compile_project_impl(
     mut sources: Vec<ScriptSource>,
     natives: &BuiltinManifest,
+    mut pass: Option<&mut dyn crate::hir::HirPass>,
 ) -> Result<CompiledProject, Vec<ProjectError>> {
     sources.sort_by(|a, b| a.path.cmp(&b.path));
     let mut errors = Vec::new();
@@ -106,7 +122,13 @@ pub fn compile_project(
                 .try_into()
                 .expect("hash has eight bytes"),
         );
-        match crate::vm::compile_with_project_interface(program, source_hash, natives, &interface) {
+        let compiled = if let Some(pass) = pass.as_deref_mut() {
+            pass.begin_module(&source.path);
+            crate::vm::compile_with_hir_pass(program, source_hash, natives, &interface, pass)
+        } else {
+            crate::vm::compile_with_project_interface(program, source_hash, natives, &interface)
+        };
+        match compiled {
             Ok(mut bytecode) => {
                 bytecode.debug.source = Some(crate::debug::DebugSource {
                     path: source.path.clone(),

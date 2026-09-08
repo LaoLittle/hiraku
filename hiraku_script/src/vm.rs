@@ -230,7 +230,7 @@ pub fn compile_with_manifest(
     source_hash: u64,
     manifest: &BuiltinManifest,
 ) -> Result<Bytecode, Vec<CompileError>> {
-    compile_program(program, source_hash, manifest, None)
+    compile_program(program, source_hash, manifest, None, None)
 }
 
 pub fn compile_with_project_interface(
@@ -239,7 +239,17 @@ pub fn compile_with_project_interface(
     manifest: &BuiltinManifest,
     interface: &crate::project::ProjectInterface,
 ) -> Result<Bytecode, Vec<CompileError>> {
-    compile_program(program, source_hash, manifest, Some(interface))
+    compile_program(program, source_hash, manifest, Some(interface), None)
+}
+
+pub fn compile_with_hir_pass(
+    program: &Program,
+    source_hash: u64,
+    manifest: &BuiltinManifest,
+    interface: &crate::project::ProjectInterface,
+    pass: &mut dyn crate::hir::HirPass,
+) -> Result<Bytecode, Vec<CompileError>> {
+    compile_program(program, source_hash, manifest, Some(interface), Some(pass))
 }
 
 fn compile_program(
@@ -247,9 +257,10 @@ fn compile_program(
     source_hash: u64,
     manifest: &BuiltinManifest,
     interface: Option<&crate::project::ProjectInterface>,
+    pass: Option<&mut dyn crate::hir::HirPass>,
 ) -> Result<Bytecode, Vec<CompileError>> {
     let arena = HirArena::new();
-    let hir = match interface {
+    let mut hir = match interface {
         Some(interface) => {
             crate::hir::lower_with_project_interface(&arena, program, manifest, interface)
         }
@@ -264,6 +275,9 @@ fn compile_program(
             })
             .collect::<Vec<_>>()
     })?;
+    if let Some(pass) = pass {
+        pass.run(&arena, &mut hir, manifest)?;
+    }
     let mir = lower_hir_to_mir(&hir).map_err(|errors| {
         errors
             .into_iter()

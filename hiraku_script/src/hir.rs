@@ -7,6 +7,18 @@ mod types;
 pub use typed::*;
 pub use types::{ScriptType, TypeId, TypeTable};
 
+/// An embedding-owned, typed compiler pass. No embedding concepts belong in
+/// the parser or VM. Allocated nodes must live in the compilation's arena.
+pub trait HirPass {
+    fn begin_module(&mut self, _path: &str) {}
+    fn run<'hir>(
+        &mut self,
+        arena: &'hir HirArena,
+        program: &mut HirProgram<'hir>,
+        manifest: &crate::BuiltinManifest,
+    ) -> Result<(), Vec<crate::CompileError>>;
+}
+
 use serde::{Deserialize, Serialize};
 
 use crate::{

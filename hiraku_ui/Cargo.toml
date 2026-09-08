@@ -6,3 +6,5 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+hiraku-script.workspace = true
+thiserror.workspace = true

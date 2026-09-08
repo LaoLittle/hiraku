@@ -4,10 +4,7 @@ use hiraku_script::native::{
     FromHksValue, HksBindable, HksBinding, HksCallable, HksClosure, IntoHksValue, NativeError,
     NativeRegistry,
 };
-use hiraku_script::{
-    LinkedVm, LinkedVmEvent, RenderOptions, ScriptType, SourceMap, StatementValue, Value,
-    parse_program, render_diagnostics,
-};
+use hiraku_script::{LinkedVm, LinkedVmEvent, RenderOptions, ScriptType, StatementValue, Value};
 use thiserror::Error;
 
 use crate::{
@@ -15,9 +12,9 @@ use crate::{
     state::StoredValue,
     texture::TextureCatalog,
     ui::{
-        BarNode, ButtonNode, ContainerNode, ScreenImageButtonNode, ScreenImageNode, ScreenLayout,
-        ScreenNode, ScreenSpec, ScreenTexture, ScrollableNode, SpacerNode, TextNode, ToggleNode,
-        UiCallback, UiEffect, UiPhaseAnimation, UiReactiveBinding,
+        BarNode, ButtonNode, ContainerNode, PropertyComputation, ScreenImageButtonNode,
+        ScreenImageNode, ScreenLayout, ScreenNode, ScreenSpec, ScreenTexture, ScrollableNode,
+        SpacerNode, TextNode, ToggleNode, UiCallback, UiEffect, UiPhaseAnimation,
     },
 };
 
@@ -388,38 +385,6 @@ mod native_ui {
         characters: u32,
     ) -> Result<String, NativeError> {
         Ok(value.chars().take(characters as usize).collect())
-    }
-
-    /// Creates a writable binding from ordinary script functions. The getter
-    /// takes no arguments; the setter takes the new value. The tuple is a
-    /// save-safe pair of script callable IDs/closures, never native pointers.
-    #[hks(name = "binding", raw)]
-    fn ui_binding(
-        _context: &mut UiVmContext,
-        call: &hiraku_script::BuiltinCall,
-    ) -> Result<Value, NativeError> {
-        let [getter, setter] = call.arguments.as_slice() else {
-            return Err(NativeError::Arity {
-                expected: 2,
-                actual: call.arguments.len(),
-            });
-        };
-        hiraku_script::native::HksCallable::from_hks_value(&getter.value).map_err(|_| {
-            NativeError::message(format!(
-                "binding getter must be a script function, got {:?}",
-                getter.value
-            ))
-        })?;
-        hiraku_script::native::HksCallable::from_hks_value(&setter.value).map_err(|_| {
-            NativeError::message(format!(
-                "binding setter must be a script function, got {:?}",
-                setter.value
-            ))
-        })?;
-        Ok(Value::Tuple(vec![
-            getter.value.clone(),
-            setter.value.clone(),
-        ]))
     }
 
     #[hks(name = "__uiTerm")]
@@ -1367,17 +1332,6 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
         .expect("story actions must be internally consistent");
     registry
         .set_signature(
-            hiraku_script::native::stable_builtin_id("binding"),
-            hiraku_script::FunctionSignature {
-                receiver: None,
-                parameters: vec![ScriptType::Function, ScriptType::Function],
-                variadic: None,
-                result: ScriptType::Binding(Box::new(ScriptType::Any)),
-            },
-        )
-        .expect("binding signature must target its raw native implementation");
-    registry
-        .set_signature(
             hiraku_script::native::stable_builtin_id("button"),
             hiraku_script::FunctionSignature {
                 receiver: None,
@@ -1449,8 +1403,6 @@ fn stored_value_type(value: &StoredValue) -> ScriptType {
 
 #[derive(Debug, Error)]
 pub enum UiVmError {
-    #[error("failed to compile declarative UI: {0}")]
-    Compile(String),
     #[error("declarative UI runtime failed: {0}")]
     Runtime(String),
     #[error("invalid declarative UI: {0}")]
@@ -1477,101 +1429,18 @@ pub fn evaluate_ui_component_named_with_args(
     arguments: &[StoredValue],
 ) -> Result<ScreenSpec, UiVmError> {
     let registry = ui_registry(&values);
-    let manifest = registry.manifest();
-    let parsed = parse_module(path, source)?;
-    let entries = parsed
-        .statements
-        .iter()
-        .filter_map(|statement| {
-            let hiraku_script::Stmt::Function {
-                attributes,
-                exported,
-                name,
-                ..
-            } = statement
-            else {
-                return None;
-            };
-            attributes
-                .iter()
-                .any(|attribute| attribute.name == "ui")
-                .then_some((*exported, name.clone()))
-        })
-        .collect::<Vec<_>>();
-    if entries.len() > 1 {
-        return Err(UiVmError::Invalid(
-            "a UI module may declare only one `@ui` entrypoint".into(),
-        ));
-    }
-    if entries.first().is_some_and(|(exported, _)| !exported) {
-        return Err(UiVmError::Invalid(
-            "the `@ui` entrypoint must be declared with `global fn`".into(),
-        ));
-    }
-    let project = hiraku_script::compile_project(
-        vec![
-            hiraku_script::ScriptSource {
-                path: UI_STDLIB_PATH.into(),
-                namespace: Some("ui.widgets".into()),
-                source: UI_STDLIB_SOURCE.into(),
-            },
-            hiraku_script::ScriptSource {
-                path: path.into(),
-                namespace: None,
-                source: source.into(),
-            },
-        ],
-        &manifest,
+    let document = hiraku_ui::UiDocument::compile(
+        path,
+        ui_sources(path, source),
+        &registry.manifest(),
+        RenderOptions::terminal(),
     )
-    .map_err(|errors| {
-        let mut sources = SourceMap::new();
-        sources.insert(UI_STDLIB_PATH, UI_STDLIB_SOURCE);
-        sources.insert(path, source);
-        let diagnostics = errors
-            .into_iter()
-            .map(|error| {
-                let id = sources.insert(
-                    &error.path,
-                    if error.path == path {
-                        source
-                    } else {
-                        UI_STDLIB_SOURCE
-                    },
-                );
-                error.error.diagnostic(id)
-            })
-            .collect::<Vec<_>>();
-        UiVmError::Invalid(render_diagnostics(
-            &diagnostics,
-            &sources,
-            RenderOptions::terminal(),
-        ))
-    })?;
-    let entry = project.paths[path];
-    let document = &project.program.modules[entry.0 as usize].bytecode;
-    let owned_globals = document
-        .globals
-        .iter()
-        .filter_map(|symbol| document.symbols.resolve(*symbol))
-        .filter(|name| !manifest.globals().contains_key(*name))
-        .map(str::to_owned)
-        .collect();
-    let entry_symbol = entries
-        .first()
-        .map(|(_, name)| {
-            document.symbols.find(name).ok_or_else(|| {
-                UiVmError::Invalid(format!("UI entrypoint `{name}` was not interned"))
-            })
-        })
-        .transpose()?;
+    .map_err(|error| UiVmError::Invalid(error.to_string()))?;
     let composition = UiComposition {
-        program: project.program,
-        entry,
-        entry_symbol,
+        document,
         values,
         path: path.to_owned(),
         arguments: arguments.to_vec(),
-        owned_globals,
         globals: BTreeMap::new(),
     };
     composition.render(&BTreeMap::new(), textures, terms)
@@ -1581,13 +1450,10 @@ pub fn evaluate_ui_component_named_with_args(
 /// or imports local state into the story namespace.
 #[derive(Clone, Debug)]
 pub(crate) struct UiComposition {
-    program: hiraku_script::LinkedProgram,
-    entry: hiraku_script::ModuleId,
-    entry_symbol: Option<hiraku_script::SymbolId>,
+    pub(crate) document: hiraku_ui::UiDocument,
     values: UiContext,
     path: String,
     arguments: Vec<StoredValue>,
-    owned_globals: std::collections::BTreeSet<String>,
     pub(crate) globals: BTreeMap<String, Value>,
 }
 
@@ -1599,24 +1465,22 @@ impl UiComposition {
         terms: &TermCatalog,
     ) -> Result<ScreenSpec, UiVmError> {
         let registry = ui_registry(&self.values);
-        let program = self.program.clone();
-        let entry = self.entry;
-        let entry_symbol = self.entry_symbol;
-        let arguments = &self.arguments;
-        let materialize_program = program.clone();
+        let materialize_program = self.document.program.clone();
         let mut context =
             UiVmContext::new(self.values.clone(), terms.clone()).with_navigation_origin(&self.path);
-        context.owned_globals = self.owned_globals.clone();
+        context.owned_globals = self.document.owned_globals.clone();
         context.local_globals = self.globals.clone();
         context.local_globals.extend(
             globals
                 .iter()
-                .filter(|(name, _)| self.owned_globals.contains(*name))
+                .filter(|(name, _)| self.document.owned_globals.contains(*name))
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
-        if entry_symbol.is_some() {
-            let initializer = LinkedVm::new(program.clone(), entry)
-                .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+        if let Some(initializer) = self
+            .document
+            .initializer()
+            .map_err(|error| UiVmError::Runtime(error.to_string()))?
+        {
             if !collect_nodes(initializer, &registry, &mut context)?.is_empty() {
                 return Err(UiVmError::Invalid(
                     "an @ui document must emit nodes inside its entrypoint, not at module scope"
@@ -1624,27 +1488,9 @@ impl UiComposition {
                 ));
             }
         }
-        let mut vm = if let Some(symbol) = entry_symbol {
-            let callable = Value::Function {
-                module: Some(entry.0),
-                symbol,
-            };
-            LinkedVm::from_callable(
-                program,
-                &callable,
-                arguments.iter().map(stored_to_hks).collect(),
-            )
-        } else if arguments.is_empty() {
-            // Temporary migration path for existing UI modules. New UI modules
-            // may expose one explicit @ui function when it needs parameters.
-            LinkedVm::new(program, entry)
-        } else {
-            return Err(UiVmError::Invalid(
-                "parameterized UI modules require an `@ui global fn` entrypoint".into(),
-            ));
-        }
-        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-        vm.freeze_invocation_inputs()
+        let vm = self
+            .document
+            .invocation(self.arguments.iter().map(stored_to_hks).collect())
             .map_err(|error| UiVmError::Runtime(error.to_string()))?;
         let roots = collect_nodes(vm, &registry, &mut context)?;
         if roots.len() != 1 {
@@ -1667,145 +1513,57 @@ impl UiComposition {
     }
 }
 
-/// Offline type checking without constructing nodes or resolving image assets.
-pub(crate) fn validate_ui_source(path: &str, source: &str) -> Result<(), String> {
-    let manifest = ui_registry(&UiContext::default()).manifest();
-    hiraku_script::compile_project(
-        vec![
-            hiraku_script::ScriptSource {
-                path: UI_STDLIB_PATH.into(),
-                namespace: Some("ui.widgets".into()),
-                source: UI_STDLIB_SOURCE.into(),
-            },
-            hiraku_script::ScriptSource {
-                path: path.into(),
-                namespace: None,
-                source: source.into(),
-            },
-        ],
-        &manifest,
-    )
-    .map(|_| ())
-    .map_err(|errors| {
-        let mut sources = SourceMap::new();
-        let diagnostics = errors
-            .into_iter()
-            .map(|e| {
-                let id = sources.insert(
-                    &e.path,
-                    if e.path == path {
-                        source
-                    } else {
-                        UI_STDLIB_SOURCE
-                    },
-                );
-                e.error.diagnostic(id)
-            })
-            .collect::<Vec<_>>();
-        render_diagnostics(&diagnostics, &sources, RenderOptions::plain())
-    })
+fn ui_sources(path: &str, source: &str) -> Vec<hiraku_script::ScriptSource> {
+    vec![
+        hiraku_script::ScriptSource {
+            path: UI_STDLIB_PATH.into(),
+            namespace: Some("ui.widgets".into()),
+            source: UI_STDLIB_SOURCE.into(),
+        },
+        hiraku_script::ScriptSource {
+            path: path.into(),
+            namespace: None,
+            source: source.into(),
+        },
+    ]
 }
 
-fn parse_module(path: &str, source: &str) -> Result<hiraku_script::Program, UiVmError> {
-    let mut sources = SourceMap::new();
-    let source_id = sources.insert(path, source);
-    parse_program(source).map_err(|errors| {
-        UiVmError::Compile(render_diagnostics(
-            &errors
-                .into_iter()
-                .map(|error| error.diagnostic(source_id.clone()))
-                .collect::<Vec<_>>(),
-            &sources,
-            RenderOptions::terminal(),
-        ))
-    })
+/// Offline validation uses the same compiler and entrypoint rules as mounting.
+pub(crate) fn validate_ui_source(path: &str, source: &str) -> Result<(), String> {
+    hiraku_ui::UiDocument::compile(
+        path,
+        ui_sources(path, source),
+        &ui_registry(&UiContext::default()).manifest(),
+        RenderOptions::plain(),
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn collect_nodes(
-    mut vm: LinkedVm,
+    vm: LinkedVm,
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
 ) -> Result<Vec<UiNodeHandle>, UiVmError> {
     let globals = context_globals(context);
-    vm.set_current_globals(&globals)
-        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-    vm.set_read_only_globals(
-        globals
-            .keys()
-            .filter(|name| !context.owned_globals.contains(*name))
-            .cloned()
-            .collect(),
-    );
+    let owned = context.owned_globals.clone();
     let mut nodes = Vec::new();
-    // Statement boundaries seal drafts allocated by this invocation. A fluent
-    // return value is only a handle, never an instruction to emit a node.
     let mut committed_node = context.next_node;
-    let mut budget = 100_000;
-    loop {
-        let event = match vm.step_with_budget(&mut budget) {
-            Ok(event) => event,
-            Err(error) => {
-                if matches!(
-                    error,
-                    hiraku_script::LinkedVmError::Vm(hiraku_script::VmError::Panic { .. })
-                ) {
-                    return Err(UiVmError::Runtime(error.to_string()));
-                }
-                let snapshot = vm.snapshot();
-                let frame = snapshot.frames.last();
-                return Err(UiVmError::Runtime(match frame {
-                    Some(frame) => format!(
-                        "{error:?} in module {} at {:?}:{} with registers {:?}",
-                        frame.module.0,
-                        frame.vm.location,
-                        frame.vm.pc.saturating_sub(1),
-                        frame.vm.registers,
-                    ),
-                    None => error.to_string(),
-                }));
-            }
-        };
-        match event {
-            Some(LinkedVmEvent::BudgetExhausted) => {
-                return Err(UiVmError::Runtime(
-                    "UI invocation exceeded its instruction budget".into(),
-                ));
-            }
-            Some(LinkedVmEvent::Call(call)) => {
-                let value = registry
-                    .call(context, &call)
-                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-                vm.resume(value)
-                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-            }
-            Some(LinkedVmEvent::Statement(StatementValue::Value(_) | StatementValue::Commit)) => {
-                nodes.extend(((committed_node + 1)..=context.next_node).map(UiNodeHandle));
-                committed_node = context.next_node;
-            }
-            Some(LinkedVmEvent::Statement(
-                StatementValue::String(_) | StatementValue::TextTemplate(_),
-            )) => {
-                return Err(UiVmError::Invalid(
-                    "bare strings are not UI nodes; wrap the value with text(...)".into(),
-                ));
-            }
-            Some(LinkedVmEvent::Completed(_)) => {
-                // Value-returning helper tails need not emit a statement event.
-                for (name, value) in vm.current_globals() {
-                    if context.owned_globals.contains(&name) && value != Value::Uninitialized {
-                        context.local_globals.insert(name, value);
-                    }
-                }
-                nodes.extend(((committed_node + 1)..=context.next_node).map(UiNodeHandle));
-                return Ok(nodes);
-            }
-            None => {
-                return Err(UiVmError::Runtime(
-                    "UI VM stopped without completing or requesting a native call".into(),
-                ));
-            }
-        }
-    }
+    let state = hiraku_ui::compose(
+        vm,
+        registry,
+        context,
+        &globals,
+        &owned,
+        100_000,
+        |context| {
+            nodes.extend(((committed_node + 1)..=context.next_node).map(UiNodeHandle));
+            committed_node = context.next_node;
+        },
+    )
+    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
+    context.local_globals.extend(state);
+    Ok(nodes)
 }
 
 fn closure_children(
@@ -1971,89 +1729,25 @@ fn reactive_binding<T>(
     binding: &HksBinding<T>,
     program: &hiraku_script::LinkedProgram,
     context: &UiVmContext,
-) -> UiReactiveBinding {
-    UiReactiveBinding {
+) -> PropertyComputation {
+    PropertyComputation {
         program: program.clone(),
         getter: binding.getter().value().clone(),
-        setter: binding.setter().map(|setter| setter.value().clone()),
         globals: context_globals(context),
     }
 }
 
 fn evaluate_binding_value(
-    binding: &UiReactiveBinding,
+    binding: &PropertyComputation,
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
 ) -> Result<Value, UiVmError> {
-    evaluate_binding_callable(binding, &binding.getter, Vec::new(), registry, context)
+    binding
+        .evaluate(registry, context, 100_000)
+        .map_err(|error| UiVmError::Runtime(error.to_string()))
 }
-
-fn evaluate_binding_callable(
-    binding: &UiReactiveBinding,
-    callable: &Value,
-    arguments: Vec<Value>,
-    registry: &NativeRegistry<UiVmContext>,
-    context: &mut UiVmContext,
-) -> Result<Value, UiVmError> {
-    let mut vm = LinkedVm::from_callable(binding.program.clone(), callable, arguments)
-        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-    vm.set_current_globals(&binding.globals)
-        .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-    vm.set_read_only_globals(binding.globals.keys().cloned().collect());
-    let mut budget = 100_000;
-    loop {
-        match vm
-            .step_with_budget(&mut budget)
-            .map_err(|error| UiVmError::Runtime(error.to_string()))?
-        {
-            Some(LinkedVmEvent::BudgetExhausted) => {
-                return Err(UiVmError::Runtime(
-                    "UI invocation exceeded its instruction budget".into(),
-                ));
-            }
-            Some(LinkedVmEvent::Call(call)) => {
-                let value = registry
-                    .call(context, &call)
-                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-                vm.resume(value)
-                    .map_err(|error| UiVmError::Runtime(error.to_string()))?;
-            }
-            Some(LinkedVmEvent::Completed(value)) => return Ok(value),
-            Some(LinkedVmEvent::Statement(_)) => {}
-            None => {
-                return Err(UiVmError::Runtime(
-                    "reactive UI expression stopped without returning a value".into(),
-                ));
-            }
-        }
-    }
-}
-
-/// Invokes the script-defined setter of a writable UI binding. Controls call
-/// this at their commit boundary; pointer motion never mutates script state.
-pub(crate) fn evaluate_ui_binding_setter(
-    binding: &UiReactiveBinding,
-    models: &crate::ui::UiModels,
-    value: Value,
-) -> Result<Value, UiVmError> {
-    let setter = binding
-        .setter
-        .as_ref()
-        .ok_or_else(|| UiVmError::Invalid("the UI binding is read-only".into()))?;
-    let mut binding = binding.clone();
-    for (name, value) in models.roots() {
-        binding
-            .globals
-            .insert(name.to_string(), stored_to_hks(value));
-    }
-    let values = UiContext::default();
-    let registry = ui_registry(&values);
-    let mut context = UiVmContext::new(values, TermCatalog::default());
-    evaluate_binding_callable(&binding, setter, vec![value], &registry, &mut context)
-}
-
 pub(crate) fn evaluate_ui_reactive_binding(
-    binding: &UiReactiveBinding,
+    binding: &PropertyComputation,
     models: &crate::ui::UiModels,
 ) -> Result<Value, UiVmError> {
     let mut binding = binding.clone();
@@ -2157,7 +1851,7 @@ fn input_value<T: IntoHksValue + hiraku_script::native::HksScriptType>(
     program: &hiraku_script::LinkedProgram,
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
-) -> Result<(Value, Option<UiReactiveBinding>), UiVmError> {
+) -> Result<(Value, Option<PropertyComputation>), UiVmError> {
     match value {
         HksBindable::Value(value) => Ok((value.into_hks_value(), None)),
         HksBindable::Binding(binding) => {
@@ -2172,7 +1866,7 @@ fn input_node(
     draft: &UiDraft,
     kind: crate::ui::InputKind,
     value: Value,
-    reactive_value: Option<UiReactiveBinding>,
+    reactive_value: Option<PropertyComputation>,
     program: &hiraku_script::LinkedProgram,
     context: &UiVmContext,
 ) -> Result<ScreenNode, UiVmError> {
@@ -4148,14 +3842,72 @@ canvas {
     }
 
     #[test]
-    fn script_functions_form_a_writable_binding_delegate() {
+    fn plain_property_expressions_are_live_without_binding_syntax() {
+        let screen = evaluate_ui_component_named(
+            "memory://properties.ui.hks",
+            r#"import ui.widgets.*
+global var count = 1
+global var shown = true
+canvas {
+    text(count.toString()).visible(shown)
+    button { text("Increment") }.onClick { count += 1 }
+}"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("ordinary expressions compile");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(text.text, "1");
+        let mut property = text
+            .reactive_text
+            .clone()
+            .expect("compiler extracted property");
+        property.globals.insert("count".into(), Value::Number(2.0));
+        assert_eq!(
+            evaluate_ui_reactive_binding(&property, &crate::ui::UiModels::default())
+                .expect("recompute"),
+            Value::String("2".into())
+        );
+        let mut visible = text
+            .layout
+            .reactive_visibility
+            .clone()
+            .expect("live visibility");
+        visible.globals.insert("shown".into(), Value::Bool(false));
+        assert_eq!(
+            evaluate_ui_reactive_binding(&visible, &crate::ui::UiModels::default())
+                .expect("recompute"),
+            Value::Bool(false)
+        );
+        let plan = &screen
+            .composition
+            .as_ref()
+            .expect("composition")
+            .document
+            .plan;
+        assert!(
+            !plan.structural_globals.contains("count"),
+            "callback writes do not trigger rebuilding"
+        );
+        assert!(!plan.structural_globals.contains("shown"));
+        assert!(
+            plan.sites
+                .iter()
+                .any(|site| site.kind == hiraku_ui::RegionKind::Property)
+        );
+    }
+
+    #[test]
+    fn ordinary_script_calls_compute_live_properties() {
         let screen = evaluate_ui_component_named(
             "memory://delegate.ui.hks",
             r#"import ui.widgets.*
 fn readHealth() -> Float { player.health }
-fn writeHealth(value: Float) { () }
 canvas {
-    progress(binding(readHealth, writeHealth)).range(0, 100)
+    progress(readHealth()).range(0, 100)
 }"#,
             UiContext::new(BTreeMap::from([(
                 "player".to_string(),
@@ -4167,7 +3919,7 @@ canvas {
             &TextureCatalog::default(),
             &TermCatalog::default(),
         )
-        .expect("script getter/setter functions should form a binding");
+        .expect("script call should become a property computation");
 
         let ScreenNode::Bar(progress) = &screen.children[0] else {
             panic!("binding consumer should be a progress bar")
@@ -4176,10 +3928,6 @@ canvas {
             .reactive_value
             .as_ref()
             .expect("binding getter should be retained");
-        assert!(
-            binding.setter.is_some(),
-            "binding setter should be retained"
-        );
 
         let mut models = crate::ui::UiModels::default();
         models.set(
@@ -4193,11 +3941,6 @@ canvas {
             evaluate_ui_reactive_binding(binding, &models)
                 .expect("script getter should evaluate against the latest model"),
             Value::Number(30.0),
-        );
-        assert_eq!(
-            evaluate_ui_binding_setter(binding, &models, Value::Number(42.0))
-                .expect("script setter should be independently invokable"),
-            Value::Unit,
         );
     }
 

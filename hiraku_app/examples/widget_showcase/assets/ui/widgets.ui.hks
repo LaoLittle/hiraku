@@ -27,24 +27,24 @@ global fn main() -> UiNode {
                         text("INPUT CONTROLS").fontSize(28).color(0.4, 0.8, 1.0, 1.0)
 
                         text("Text input — edit, select all, or use IME; Enter submits.").fontSize(20)
-                        textInput(${playerName})
+                        textInput(playerName)
                             .size(.abs(660, 52))
                             .placeholder("Player name")
                             .onChange { value: String -> playerName = value }
                             .onCommit { value: String -> submittedName = value }
                         text("Last submitted name (read-only text input)").fontSize(18)
-                        textInput(${submittedName}).size(.abs(660, 48)).enabled(false)
+                        textInput(submittedName).size(.abs(660, 48)).enabled(false)
 
                         text("Checkbox — the script accepts the proposed Bool.").fontSize(20)
-                        checkbox(${notifications}).size(.abs(140, 48))
+                        checkbox(notifications).size(.abs(140, 48))
                             .onChange { value: Bool -> notifications = value }
 
                         text("Slider — updates while dragging; commits on release.").fontSize(20)
-                        slider(${volume}, 0.0, 1.0).size(.abs(660, 52))
+                        slider(volume, 0.0, 1.0).size(.abs(660, 52))
                             .onChange(acceptVolume)
                             .onCommit { value: Float -> committedVolume = value }
                         text("Last committed value (disabled slider)").fontSize(18)
-                        slider(${committedVolume}, 0.0, 1.0)
+                        slider(committedVolume, 0.0, 1.0)
                             .size(.abs(660, 40)).enabled(false)
 
                         text("Ignored edit — onChange does not accept the proposal.").fontSize(20)
@@ -52,7 +52,7 @@ global fn main() -> UiNode {
                             .onChange { value: Bool -> status = "Proposal ignored; checkbox stays unchecked." }
 
                         text("Image toggle — gray is off; green is on.").fontSize(20)
-                        toggle(${imageToggle}) {
+                        toggle(imageToggle) {
                             image("swatch/off").size(.abs(140, 52))
                         }.checked {
                             image("swatch/on").size(.abs(140, 52))
@@ -107,7 +107,7 @@ global fn main() -> UiNode {
 
             // Input properties currently refresh from live story globals. This
             // disabled input also demonstrates a model-driven status display.
-            textInput(${status}).size(.abs(1460, 48)).enabled(false)
+            textInput(status).size(.abs(1460, 48)).enabled(false)
             row {
                 button { text("Reset values") }.onClick {
                     playerName = "alice"

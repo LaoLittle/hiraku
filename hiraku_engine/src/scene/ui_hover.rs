@@ -11,7 +11,7 @@ pub struct HoverMotion {
     elapsed: f32,
     animation: crate::script::AnimationSpec,
     selected: bool,
-    binding: Option<crate::ui::UiReactiveBinding>,
+    binding: Option<crate::ui::PropertyComputation>,
     revision: u64,
 }
 

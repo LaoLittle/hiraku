@@ -46,13 +46,7 @@ fn default_ui_effect_volume() -> f32 {
 /// Runtime metadata for an ordinary HKS expression captured by a declarative
 /// UI property. It is skipped by serialization; UI authors never manipulate
 /// this type or a signal handle directly.
-#[derive(Clone, Debug)]
-pub struct UiReactiveBinding {
-    pub(crate) program: hiraku_script::LinkedProgram,
-    pub(crate) getter: hiraku_script::Value,
-    pub(crate) setter: Option<hiraku_script::Value>,
-    pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
-}
+pub use hiraku_ui::PropertyComputation;
 
 /// Recreated when a screen is mounted; pending click execution is not saved.
 #[derive(Clone, Debug)]
@@ -163,7 +157,7 @@ pub struct ToggleNode {
     pub checked: ScreenImageNode,
     pub value: bool,
     #[serde(skip)]
-    pub reactive_value: Option<UiReactiveBinding>,
+    pub reactive_value: Option<PropertyComputation>,
     #[serde(skip)]
     pub on_change: Option<UiCallback>,
 }
@@ -183,13 +177,13 @@ pub struct InputNode {
     pub value: StoredValue,
     pub enabled: bool,
     #[serde(skip)]
-    pub reactive_enabled: Option<UiReactiveBinding>,
+    pub reactive_enabled: Option<PropertyComputation>,
     pub layout: ScreenLayout,
     pub text_size: Option<f32>,
     pub text_color: Option<[f32; 4]>,
     pub background: Option<[f32; 4]>,
     #[serde(skip)]
-    pub reactive_value: Option<UiReactiveBinding>,
+    pub reactive_value: Option<PropertyComputation>,
     #[serde(skip)]
     pub on_change: Option<UiCallback>,
     #[serde(skip)]
@@ -212,7 +206,7 @@ pub struct ScreenLayout {
     #[serde(default)]
     pub hover_active: bool,
     #[serde(skip)]
-    pub reactive_hover_active: Option<UiReactiveBinding>,
+    pub reactive_hover_active: Option<PropertyComputation>,
     /// Static visibility used before or instead of a live visibility binding.
     #[serde(default)]
     pub hidden: bool,
@@ -220,7 +214,7 @@ pub struct ScreenLayout {
     #[serde(default)]
     pub visible_binding: Option<String>,
     #[serde(skip)]
-    pub reactive_visibility: Option<UiReactiveBinding>,
+    pub reactive_visibility: Option<PropertyComputation>,
     /// Optional engine-owned entrance/timeline animation specification.
     #[serde(default)]
     pub animation: Option<crate::script::AnimationSpec>,
@@ -277,7 +271,7 @@ pub struct TextNode {
     #[serde(default)]
     pub binding: Option<String>,
     #[serde(skip)]
-    pub reactive_text: Option<UiReactiveBinding>,
+    pub reactive_text: Option<PropertyComputation>,
     /// Font size in logical pixels.
     #[serde(default = "default_text_size")]
     pub size: f32,
@@ -407,25 +401,25 @@ pub(crate) struct UiProgressBinding {
 
 #[derive(Component)]
 pub(crate) struct UiReactiveTextBinding {
-    pub(crate) expression: UiReactiveBinding,
+    pub(crate) expression: PropertyComputation,
     pub(crate) rendered_revision: u64,
 }
 
 #[derive(Component)]
 pub(crate) struct UiReactiveVisibilityBinding {
-    pub(crate) expression: UiReactiveBinding,
+    pub(crate) expression: PropertyComputation,
     pub(crate) rendered_revision: u64,
 }
 
 #[derive(Component)]
 pub(crate) struct UiReactiveEnabledBinding {
-    pub(crate) expression: UiReactiveBinding,
+    pub(crate) expression: PropertyComputation,
     pub(crate) rendered_revision: u64,
 }
 
 #[derive(Component)]
 pub(crate) struct UiReactiveProgressBinding {
-    pub(crate) expression: UiReactiveBinding,
+    pub(crate) expression: PropertyComputation,
     pub(crate) min: f32,
     pub(crate) max: f32,
     pub(crate) rendered_revision: u64,
@@ -469,7 +463,7 @@ pub struct ButtonNode {
     #[serde(default)]
     pub enabled_binding: Option<String>,
     #[serde(skip)]
-    pub reactive_enabled: Option<UiReactiveBinding>,
+    pub reactive_enabled: Option<PropertyComputation>,
     /// Label font size in logical pixels.
     #[serde(default = "default_button_size")]
     pub size: f32,
@@ -576,7 +570,7 @@ pub struct ScreenImageButtonNode {
     #[serde(default)]
     pub enabled_binding: Option<String>,
     #[serde(skip)]
-    pub reactive_enabled: Option<UiReactiveBinding>,
+    pub reactive_enabled: Option<PropertyComputation>,
     /// Whether a disabled button still displays its hover artwork.
     #[serde(default)]
     pub hovered_when_disabled: bool,
@@ -593,7 +587,7 @@ pub struct BarNode {
     #[serde(default)]
     pub binding: Option<String>,
     #[serde(skip)]
-    pub reactive_value: Option<UiReactiveBinding>,
+    pub reactive_value: Option<PropertyComputation>,
     /// Minimum value.
     #[serde(default)]
     pub min: f32,

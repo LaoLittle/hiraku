@@ -36,11 +36,11 @@ impl HirArena {
         Self::default()
     }
 
-    fn alloc<T>(&self, value: T) -> &T {
+    pub fn alloc<T>(&self, value: T) -> &T {
         self.bump.alloc(value)
     }
 
-    fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> &[T] {
+    pub fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> &[T] {
         self.bump.alloc_slice_copy(values)
     }
 

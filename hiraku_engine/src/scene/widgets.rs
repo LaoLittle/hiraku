@@ -17,7 +17,7 @@ pub(crate) struct UiLocalState(pub BTreeMap<String, Value>);
 pub(crate) struct ToggleCallback {
     pub root: Entity,
     pub callback: Option<UiCallback>,
-    pub binding: Option<crate::ui::UiReactiveBinding>,
+    pub binding: Option<crate::ui::PropertyComputation>,
     pub revision: u64,
     pub globals: BTreeMap<String, Value>,
 }
