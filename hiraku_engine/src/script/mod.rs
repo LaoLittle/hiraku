@@ -15,6 +15,7 @@ pub(crate) mod capabilities;
 mod command;
 mod execution_runtime;
 pub(crate) mod navigation;
+pub mod replay;
 mod runtime;
 mod story_runtime;
 pub mod ui_runtime;
@@ -250,6 +251,7 @@ pub struct ScriptResponseMessage {
 
 #[derive(Clone, Debug)]
 pub struct ScriptBootstrap {
+    pub replay: Option<replay::ReplayJournal>,
     pub startup_script: String,
     pub values: BTreeMap<String, StoredValue>,
     pub snapshot: Option<StoryRuntimeSnapshot>,
@@ -261,11 +263,15 @@ pub struct ScriptBootstrap {
 }
 
 impl ScriptBootstrap {
-    pub fn from_save(data: &SaveGameData) -> Self {
+    pub fn from_save(data: &SaveGameData) -> Result<Self, String> {
+        if data.vm_snapshot.is_none() {
+            return Err("save has no restorable VM checkpoint; complete session replay is not available; the save was not loaded".into());
+        }
         let mut values = data.globals.clone();
         values.extend(data.scope.clone());
-        Self {
+        Ok(Self {
             startup_script: data.resume_script.clone(),
+            replay: data.replay.clone(),
             values,
             snapshot: data.vm_snapshot.clone(),
             call_stack: data.script_call_stack.clone(),
@@ -273,7 +279,7 @@ impl ScriptBootstrap {
             pending_ui_arguments: data.pending_ui_arguments.clone(),
             ui_registry: data.ui_registry.clone(),
             mounted_ui_overlays: data.mounted_ui_overlays.clone(),
-        }
+        })
     }
 }
 
@@ -284,6 +290,7 @@ pub fn start_story_runtime(
     user_settings: &crate::storage::UserSettings,
 ) -> Result<(), String> {
     let ScriptBootstrap {
+        replay,
         startup_script,
         values,
         snapshot,
@@ -349,6 +356,8 @@ pub fn start_story_runtime(
         });
     }
     runtime.story = Some(story);
+    runtime.replay = replay;
+    runtime.replay_dialogue.clear();
     runtime.current_script = Some(startup_script);
     runtime.call_stack = call_stack;
     runtime.wait_request = None;
@@ -394,6 +403,7 @@ pub fn save_runtime_slot(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let data = SaveGameData {
+        replay: runtime.replay.clone(),
         thumbnail_png: thumbnail.to_vec(),
         version: crate::state::CURRENT_SAVE_VERSION,
         resume_script: current_script,
@@ -461,5 +471,93 @@ fn hks_value_to_stored(value: &hiraku_script::Value) -> Option<StoredValue> {
         )),
         hiraku_script::Value::Typed { value, .. } => hks_value_to_stored(value),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use std::{path::PathBuf, sync::Arc};
+
+    #[test]
+    fn a_changed_caller_does_not_replace_the_live_runtime() {
+        let snapshot = |path: &str, source: &str| {
+            StoryRuntime::new(compile_story_bytecode(path, source).expect("compile fixture"))
+                .expect("fixture runtime")
+                .snapshot()
+                .expect("fixture snapshot")
+        };
+        let mut package = hiraku_hdp::PackageBuilder::new();
+        package
+            .add_file("alice.hks", b"let value = 1")
+            .expect("add callee");
+        package
+            .add_file("bob.hks", b"let value = 3")
+            .expect("add changed caller");
+        let package = package
+            .build(hiraku_hdp::PackOptions::default())
+            .expect("pack fixture");
+        let archive =
+            hiraku_hdp::Archive::from_bytes(Arc::<[u8]>::from(package.volumes[0].clone()))
+                .expect("fixture archive");
+        let store = crate::vfs::HdpArchiveStore::default();
+        store
+            .publish(Arc::new(archive), PathBuf::from("main.hdp"))
+            .expect("publish fixture");
+        let vfs = VfsResource(
+            crate::vfs::HdpVfs::new_with_config_and_store(
+                PathBuf::new(),
+                "settings.hson",
+                "startup.hks",
+                store,
+            )
+            .into(),
+        );
+        let saved = SaveGameData {
+            resume_script: "hdp://main.hdp/alice.hks".into(),
+            vm_snapshot: Some(snapshot("hdp://main.hdp/alice.hks", "let value = 1")),
+            script_call_stack: vec![crate::state::ScriptCallFrameSnapshot {
+                script: "hdp://main.hdp/bob.hks".into(),
+                snapshot: snapshot("hdp://main.hdp/bob.hks", "let value = 2"),
+            }],
+            ..Default::default()
+        };
+        let mut live = ScriptRuntimeState::default();
+        live.story = Some(
+            StoryRuntime::new(
+                compile_story_bytecode("memory://active.hks", "let active = 42")
+                    .expect("active bytecode"),
+            )
+            .expect("active runtime"),
+        );
+        live.current_script = Some("memory://active.hks".into());
+        live.wait_request = Some(ScriptRequestId(7));
+        live.ui_registry
+            .insert("dialogue".into(), "memory://dialogue.ui.hks".into());
+        let before = live
+            .story
+            .as_ref()
+            .expect("live runtime")
+            .snapshot()
+            .expect("live snapshot");
+        let error = start_story_runtime(
+            &vfs,
+            &mut live,
+            ScriptBootstrap::from_save(&saved).expect("saved checkpoint"),
+            &crate::storage::UserSettings::default(),
+        )
+        .expect_err("caller fingerprint changed");
+        assert!(error.contains("fingerprint"));
+        assert_eq!(live.current_script.as_deref(), Some("memory://active.hks"));
+        assert_eq!(live.wait_request, Some(ScriptRequestId(7)));
+        assert_eq!(live.ui_registry["dialogue"], "memory://dialogue.ui.hks");
+        assert_eq!(
+            live.story
+                .as_ref()
+                .expect("still running")
+                .snapshot()
+                .expect("snapshot"),
+            before
+        );
     }
 }

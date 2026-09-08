@@ -36,6 +36,11 @@ pub fn normalize_program_symbols(
 
 fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
     match statement {
+        Stmt::Return { value, .. } => {
+            if let Some(value) = value {
+                intern_expression(value, symbols);
+            }
+        }
         Stmt::Property {
             name,
             ty,

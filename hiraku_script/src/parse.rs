@@ -429,6 +429,22 @@ impl Parser {
                 "global" => return self.parse_global(),
                 "if" => return self.parse_if(),
                 "while" => return self.parse_while(),
+                "return" => {
+                    let start = self.current().span;
+                    self.advance();
+                    let value = if matches!(
+                        self.current().kind,
+                        TokenKind::Newline | TokenKind::Semi | TokenKind::RBrace | TokenKind::Eof
+                    ) {
+                        None
+                    } else {
+                        Some(self.parse_expression())
+                    };
+                    let span = value
+                        .as_ref()
+                        .map_or(start, |value| Span::join(&start, &value.span));
+                    return Stmt::Return { value, span };
+                }
                 _ => {}
             }
         }

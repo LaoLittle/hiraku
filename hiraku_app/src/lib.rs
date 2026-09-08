@@ -7,7 +7,7 @@ use bevy::{
     window::WindowPlugin,
 };
 use bevy::{input::mouse::MouseScrollUnit, picking::events::Scroll};
-use hiraku_engine::input::{HirakuScrollInput, HirakuScrollUnit};
+use hiraku_engine::input::{HirakuPointerId, HirakuScrollInput, HirakuScrollUnit};
 use hiraku_engine::{
     HirakuCanvas, HirakuPluginGroup, RuntimeLaunchConfig, configure_runtime_app,
     input::{HirakuAction, HirakuActionInput, HirakuPointerInput, HirakuPointerPhase},
@@ -113,10 +113,10 @@ fn bridge_host_actions(
     }
 }
 
-fn host_pointer_id(id: PointerId) -> Option<u64> {
+fn host_pointer_id(id: PointerId) -> Option<HirakuPointerId> {
     match id {
-        PointerId::Mouse => Some(0),
-        PointerId::Touch(id) => Some(id + 1),
+        PointerId::Mouse => Some(HirakuPointerId::Pointer(0)),
+        PointerId::Touch(id) => Some(HirakuPointerId::Touch(id)),
         PointerId::Custom(_) => None,
     }
 }
@@ -243,6 +243,46 @@ fn forward_canvas_scroll(
     event.propagate(false);
 }
 
+fn forward_canvas_cancel(
+    mut event: On<Pointer<Cancel>>,
+    targets: Query<&GlobalTransform, With<CanvasPresentation>>,
+    canvas: Option<Res<HirakuCanvas>>,
+    mut output: MessageWriter<HirakuPointerInput>,
+) {
+    if forward_pointer(
+        event.pointer_id,
+        event.event_target(),
+        &event.hit,
+        HirakuPointerPhase::Cancel,
+        &targets,
+        &canvas,
+        &mut output,
+    ) {
+        event.propagate(false);
+    }
+}
+
+fn forward_canvas_out(
+    mut event: On<Pointer<Out>>,
+    targets: Query<&GlobalTransform, With<CanvasPresentation>>,
+    canvas: Option<Res<HirakuCanvas>>,
+    mut output: MessageWriter<HirakuPointerInput>,
+) {
+    if matches!(event.pointer_id, PointerId::Touch(_))
+        && forward_pointer(
+            event.pointer_id,
+            event.event_target(),
+            &event.hit,
+            HirakuPointerPhase::Cancel,
+            &targets,
+            &canvas,
+            &mut output,
+        )
+    {
+        event.propagate(false);
+    }
+}
+
 fn present_hiraku_canvas(
     mut commands: Commands,
     canvas: Option<Res<HirakuCanvas>>,
@@ -266,6 +306,8 @@ fn present_hiraku_canvas(
         .observe(forward_canvas_move)
         .observe(forward_canvas_press)
         .observe(forward_canvas_release)
+        .observe(forward_canvas_cancel)
+        .observe(forward_canvas_out)
         .observe(forward_canvas_scroll);
     commands.spawn((
         PresentationCamera,
@@ -293,6 +335,66 @@ mod tests {
         camera::NormalizedRenderTarget,
         picking::{backend::HitData, pointer::Location},
     };
+
+    #[test]
+    fn canvas_touch_move_and_cancel_preserve_identity_and_uv() {
+        let mut app = App::new();
+        app.insert_resource(HirakuCanvas {
+            image: Handle::default(),
+            size: UVec2::new(800, 600),
+        })
+        .add_message::<HirakuPointerInput>();
+        let surface = app
+            .world_mut()
+            .spawn((CanvasPresentation, GlobalTransform::IDENTITY))
+            .observe(forward_canvas_move)
+            .observe(forward_canvas_cancel)
+            .id();
+        let location = Location {
+            target: NormalizedRenderTarget::None {
+                width: 800,
+                height: 600,
+            },
+            position: Vec2::ZERO,
+        };
+        let hit = HitData {
+            camera: surface,
+            depth: 0.0,
+            position: Some(Vec3::new(200.0, 150.0, 0.0)),
+            normal: None,
+            extra: None,
+        };
+        for id in [0, u64::MAX] {
+            app.world_mut().trigger(Pointer::new(
+                PointerId::Touch(id),
+                location.clone(),
+                Move {
+                    hit: hit.clone(),
+                    delta: Vec2::new(1.0, 2.0),
+                },
+                surface,
+            ));
+            app.world_mut().trigger(Pointer::new(
+                PointerId::Touch(id),
+                location.clone(),
+                Cancel { hit: hit.clone() },
+                surface,
+            ));
+        }
+        let events = app
+            .world_mut()
+            .resource_mut::<Messages<HirakuPointerInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        for (pair, id) in events.chunks_exact(2).zip([0, u64::MAX]) {
+            assert_eq!(pair[0].pointer, HirakuPointerId::Touch(id));
+            assert_eq!(pair[1].pointer, HirakuPointerId::Touch(id));
+            assert_eq!(pair[0].phase, HirakuPointerPhase::Move);
+            assert_eq!(pair[1].phase, HirakuPointerPhase::Cancel);
+            assert_eq!(pair[0].uv, Vec2::new(0.75, 0.25));
+        }
+    }
 
     #[test]
     fn canvas_scroll_observer_forwards_physical_input_but_not_virtual_input() {
@@ -339,8 +441,8 @@ mod tests {
             .drain()
             .collect::<Vec<_>>();
         assert_eq!(forwarded.len(), 2);
-        assert_eq!(forwarded[0].pointer, 0);
-        assert_eq!(forwarded[1].pointer, 4);
+        assert_eq!(forwarded[0].pointer, HirakuPointerId::Pointer(0));
+        assert_eq!(forwarded[1].pointer, HirakuPointerId::Touch(3));
         for event in forwarded {
             assert_eq!(event.uv, Vec2::splat(0.5));
             assert_eq!(event.delta, Vec2::new(0.0, -2.0));

@@ -200,7 +200,7 @@ impl Collector<'_> {
                 }
             }
             Stmt::Let { value, .. } | Stmt::Expr(value) => self.expression(value),
-            Stmt::Global { value, .. } => {
+            Stmt::Global { value, .. } | Stmt::Return { value, .. } => {
                 if let Some(value) = value {
                     self.expression(value);
                 }
@@ -362,6 +362,7 @@ fn statement_span(statement: &Stmt) -> &Span {
     match statement {
         Stmt::Import { span, .. } | Stmt::TypeAlias { span, .. } => span,
         Stmt::Function { span, .. }
+        | Stmt::Return { span, .. }
         | Stmt::Const { span, .. }
         | Stmt::Impl { span, .. }
         | Stmt::Property { span, .. }

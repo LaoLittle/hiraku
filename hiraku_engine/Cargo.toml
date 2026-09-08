@@ -22,6 +22,7 @@ serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 time.workspace = true
+blake3 = "1"
 rand_pcg.workspace = true
 
 [dev-dependencies]

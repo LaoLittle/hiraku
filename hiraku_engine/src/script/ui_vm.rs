@@ -1035,9 +1035,34 @@ mod storage_actions {
         {
             return Ok(None);
         }
-        let data = crate::storage::load_save_data(&slot)
-            .map_err(|e| NativeError::message(e.to_string()))?;
-        Ok((!data.thumbnail_png.is_empty()).then(|| format!("save-thumbnail://{slot}")))
+        match crate::storage::load_save_metadata(&slot) {
+            Ok(data) => {
+                Ok((!data.thumbnail_png.is_empty()).then(|| format!("save-thumbnail://{slot}")))
+            }
+            Err(error) => {
+                bevy::log::warn!("cannot read preview for slot `{slot}`: {error}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// A browsing diagnostic, not permission to restore. Fingerprints and
+    /// replay coverage are checked only when a load is actually requested.
+    #[hks]
+    fn problem(_context: &mut UiVmContext, slot: String) -> Result<Option<String>, NativeError> {
+        if !crate::storage::save_slot_exists(&slot)
+            .map_err(|e| NativeError::message(e.to_string()))?
+        {
+            return Ok(None);
+        }
+        Ok(match crate::storage::load_save_metadata(&slot) {
+            Ok(data) if data.version == crate::state::CURRENT_SAVE_VERSION => None,
+            Ok(data) => Some(format!(
+                "Save version {} requires replay validation",
+                data.version
+            )),
+            Err(error) => Some(error.to_string()),
+        })
     }
 
     #[hks(name = "exists")]
@@ -2924,6 +2949,43 @@ mod tests {
             panic!("expected column")
         };
         assert!(!column.layout.hover_active);
+    }
+
+    #[test]
+    fn reactive_name_fallback_clears_ids_when_custom_names_are_shown() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://names.ui.hks",
+            r#"
+                import ui.widgets.*
+                global var speaker = "alice"
+                fn fallback(name: String) -> String {
+                    if name == "alice" { return "" }
+                    if name == "bob" { return "" }
+                    return name
+                }
+                canvas { text(${fallback(speaker)}) }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("name UI compiles");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("expected text")
+        };
+        assert_eq!(text.text, "");
+        let mut binding = text.reactive_text.clone().expect("reactive name");
+        for (speaker, expected) in [("bob", ""), ("guest", "guest"), ("alice", "")] {
+            binding
+                .globals
+                .insert("speaker".into(), Value::String(speaker.into()));
+            assert_eq!(
+                evaluate_ui_reactive_binding(&binding, &crate::ui::UiModels::default())
+                    .expect("name evaluates"),
+                Value::String(expected.into())
+            );
+        }
     }
 
     #[test]

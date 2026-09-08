@@ -49,7 +49,7 @@ pub fn load_image(server: &AssetServer, path: &str) -> Handle<Image> {
     let Some(slot) = path.strip_prefix("save-thumbnail://") else {
         return server.load(path.to_owned());
     };
-    let decoded = crate::storage::load_save_data(slot)
+    let decoded = crate::storage::load_save_metadata(slot)
         .map_err(|error| error.to_string())
         .and_then(|data| {
             image::load_from_memory_with_format(&data.thumbnail_png, image::ImageFormat::Png)

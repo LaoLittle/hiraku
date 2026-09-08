@@ -2360,6 +2360,7 @@ impl std::fmt::Display for VmError {
             return formatter.write_str(&rendered);
         }
         match self {
+            Self::ProgramFingerprintMismatch => formatter.write_str("compiled program fingerprint does not match the saved program; restoring its program counter is unsafe"),
             Self::ReadOnlyValue => formatter.write_str("cannot modify a read-only value; request changes through an explicitly provided callback"),
             Self::Panic { message, span, .. } => write!(
                 formatter,
@@ -3002,6 +3003,83 @@ mod tests {
             binding.step().expect("binding expression returns"),
             Some(VmEvent::Completed(Value::Bool(true)))
         );
+    }
+
+    #[test]
+    fn explicit_returns_exit_only_the_current_callable_and_restore() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let bytecode = Arc::new(compile(
+            r#"
+            fn name(value: String) -> String {
+                if value == "alice" { return "" }
+                return value
+            }
+            fn number() -> Int {
+                var i = 0
+                while i < 4 {
+                    if i == 2 { return i }
+                    i += 1
+                }
+                9
+            }
+            fn outer() -> Int {
+                let inner: () -> String = { return "bob" }
+                let label = inner()
+                return number()
+            }
+            fn inferred() { return 7 }
+            fn varied(flag: Bool) -> Any {
+                if flag { return 1 }
+                return "alice"
+            }
+            fn branching(flag: Bool) -> Int {
+                if flag { return 3 } else { return 4 }
+            }
+            fn noop() -> Unit { return; unreachable() }
+            noop()
+            global let result = outer()
+            global let label = name("alice")
+            global let inferredResult = inferred()
+            global let branch = branching(false)
+            global let flexible: Any = varied(false)
+        "#,
+            &manifest,
+        ));
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        loop {
+            let snapshot = vm.snapshot();
+            vm = Vm::restore(bytecode.clone(), snapshot).expect("return frame restores");
+            if matches!(
+                vm.step_with_budget(&mut 1).expect("return executes"),
+                Some(VmEvent::Completed(_))
+            ) {
+                break;
+            }
+        }
+        assert_eq!(vm.global("result"), Some(&Value::Number(2.0)));
+        assert_eq!(vm.global("label"), Some(&Value::String(String::new())));
+        assert_eq!(vm.global("inferredResult"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("branch"), Some(&Value::Number(4.0)));
+        assert_eq!(vm.global("flexible"), Some(&Value::String("alice".into())));
+    }
+
+    #[test]
+    fn explicit_returns_require_the_declared_type_and_all_paths() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for source in [
+            "return 1",
+            "fn invalid() -> String { return 1 }",
+            "fn invalid() -> Int { return }",
+            "fn invalid() -> Never { return }",
+            "fn invalid(flag: Bool) -> Int { if flag { return 1 } }",
+            "let f: () -> Int = { return \"alice\" }",
+        ] {
+            let ast = parse_program(source).expect("return syntax parses");
+            assert!(
+                compile_with_manifest(&ast, 91, &manifest).is_err(),
+                "{source}"
+            );
+        }
     }
 
     #[test]

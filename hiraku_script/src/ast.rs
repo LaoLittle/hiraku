@@ -22,6 +22,10 @@ pub struct Attribute {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
     Const {
         exported: bool,
         name: String,

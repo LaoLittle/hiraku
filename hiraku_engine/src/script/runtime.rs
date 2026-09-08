@@ -31,6 +31,8 @@ pub enum CameraProjectionMode {
 /// keeps the request/response boundary needed to coordinate the VM with Bevy systems.
 #[derive(Default, Resource)]
 pub struct ScriptRuntimeState {
+    pub replay: Option<super::replay::ReplayJournal>,
+    pub replay_dialogue: String,
     pub story: Option<StoryRuntime>,
     pub wait_request: Option<ScriptRequestId>,
     pub current_script: Option<String>,

@@ -97,10 +97,9 @@ pub fn update_runtime_menu_button_visuals(
     }
 }
 
-fn start_frontend_session(
+fn restore_frontend_scene(
     commands: &mut Commands,
     asset_server: &AssetServer,
-    vfs: &VfsResource,
     shared_state: &mut SceneSharedState,
     stage: &mut StageState,
     dialogue_state: &mut DialogueState,
@@ -111,8 +110,6 @@ fn start_frontend_session(
     line_text: &mut Query<&mut Text, (With<LineText>, Without<SpeakerText>)>,
     user_settings: &UserSettings,
     frontend: &mut FrontendState,
-    script_runtime: &mut ScriptRuntimeState,
-    bootstrap: ScriptBootstrap,
     snapshot: SceneSnapshot,
 ) {
     clear_choice_ui(commands, choice_ui);
@@ -132,11 +129,6 @@ fn start_frontend_session(
 
     frontend.notice = None;
     frontend.runtime_started = true;
-
-    if let Err(error) = start_story_runtime(vfs, script_runtime, bootstrap, user_settings) {
-        frontend.notice = Some(format!("Failed to start HKS runtime: {error}"));
-        frontend.runtime_started = false;
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -314,9 +306,28 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                             warn!("failed to load slot `{slot}`: {error}");
                             ctx.frontend.notice =
                                 Some(format!("Failed to load slot {slot}: {error}"));
-                            continue;
+                            break;
                         }
                     };
+                    // Compile and validate every saved continuation before
+                    // touching the visible scene, modal stack or active waits.
+                    // start_story_runtime commits only after all validation succeeds.
+                    let prepared = ScriptBootstrap::from_save(&save_data).and_then(|bootstrap| {
+                        start_story_runtime(
+                            &ctx.vfs,
+                            &mut ctx.script_runtime,
+                            bootstrap,
+                            &ctx.user_settings,
+                        )
+                    });
+                    if let Err(error) = prepared {
+                        crate::script::emit_script_diagnostic(
+                            &format!("failed to restore slot `{slot}`"),
+                            &error,
+                        );
+                        ctx.frontend.notice = Some(format!("Failed to load slot {slot}: {error}"));
+                        break;
+                    }
                     abort_runtime_waiters(
                         &mut ctx.commands,
                         &mut ctx.waits,
@@ -331,10 +342,9 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                     );
                     ctx.dialogue_history.entries.clear();
                     clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                    start_frontend_session(
+                    restore_frontend_scene(
                         &mut ctx.commands,
                         &ctx.asset_server,
-                        &ctx.vfs,
                         &mut ctx.shared_state,
                         &mut ctx.stage,
                         &mut ctx.dialogue_state,
@@ -345,18 +355,11 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext) {
                         &mut ctx.line_text,
                         &ctx.user_settings,
                         &mut ctx.frontend,
-                        &mut ctx.script_runtime,
-                        ScriptBootstrap::from_save(&save_data),
                         save_data.scene.clone(),
                     );
-                    if let Some(error) = ctx.frontend.notice.as_deref() {
-                        crate::script::emit_script_diagnostic(
-                            &format!("failed to restore slot `{slot}`"),
-                            &error.to_string(),
-                        );
-                    } else {
-                        info!("loaded save slot `{slot}`");
-                    }
+                    info!("loaded save slot `{slot}`");
+                    // Remaining effects belong to the pre-load UI invocation.
+                    break;
                 }
                 crate::ui::UiEffect::OpenUi { role } => {
                     let Some(target) = ctx.script_runtime.ui_registry.get(role).cloned() else {

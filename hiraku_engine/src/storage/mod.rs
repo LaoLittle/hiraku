@@ -53,11 +53,31 @@ pub fn load_save_data(slot: &str) -> Result<SaveGameData, StorageError> {
 }
 
 pub fn load_save_data_from_root(root: &Path, slot: &str) -> Result<SaveGameData, StorageError> {
+    decode_save_data(&read_slot_payload(root, slot)?)
+}
+
+fn read_slot_payload(root: &Path, slot: &str) -> Result<Vec<u8>, StorageError> {
     let slot = sanitize_slot_name(slot)?;
-    let payload = save_storage(root)
+    save_storage(root)
         .read(slot)?
-        .ok_or_else(|| StorageError::MissingSlot(slot.to_string()))?;
-    decode_save_data(&payload)
+        .ok_or_else(|| StorageError::MissingSlot(slot.to_string()))
+}
+
+/// Browsing a slot must not deserialize its VM, scene or replay history.
+/// Keep these protobuf field numbers stable across save schema versions.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SaveSlotMetadata {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(string, tag = "2")]
+    pub resume_script: String,
+    #[prost(bytes = "vec", tag = "19")]
+    pub thumbnail_png: Vec<u8>,
+}
+
+pub fn load_save_metadata(slot: &str) -> Result<SaveSlotMetadata, StorageError> {
+    let payload = read_slot_payload(&save_root_path(), slot)?;
+    Ok(SaveSlotMetadata::decode(payload.as_slice())?)
 }
 
 pub fn write_save_data_to_root(
@@ -88,6 +108,8 @@ impl From<&SaveGameData> for proto::SaveGameData {
             thumbnail_png: data.thumbnail_png.clone(),
             version: data.version,
             resume_script: data.resume_script.clone(),
+            replay_hson: hiraku_script::hson::to_vec(&data.replay)
+                .expect("replay journals contain serializable input data"),
             random_seed: data.random_seed,
             time_seed: data.time_seed,
             rng_state: data.rng_state.as_ref().map(Into::into),
@@ -121,7 +143,7 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
     fn try_from(data: proto::SaveGameData) -> Result<Self, Self::Error> {
         if data.version != CURRENT_SAVE_VERSION {
             return Err(StorageError::InvalidSave(format!(
-                "save format version {} is incompatible with runtime version {}; create a new save after script API changes",
+                "save format version {} is incompatible with runtime version {}; no supported session replay is available, so this save was not loaded",
                 data.version, CURRENT_SAVE_VERSION
             )));
         }
@@ -129,6 +151,13 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
             thumbnail_png: data.thumbnail_png,
             version: data.version,
             resume_script: data.resume_script,
+            replay: if data.replay_hson.is_empty() {
+                None
+            } else {
+                hiraku_script::hson::from_slice(&data.replay_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid replay journal: {error}"))
+                })?
+            },
             random_seed: data.random_seed,
             rng_state: data.rng_state.map(Into::into),
             time_seed: data.time_seed,
@@ -635,6 +664,64 @@ mod tests {
     }
 
     use crate::script::{StoryRuntime, StoryRuntimeEvent, compile_story_bytecode};
+
+    #[test]
+    fn replay_history_survives_storage_without_a_vm_snapshot() {
+        use crate::script::replay::{InputKind, ReplayJournal, ReplayPoint};
+        let mut journal = ReplayJournal::new("memory://entry.hks".into(), 42);
+        journal.input(
+            InputKind::Random,
+            ReplayPoint {
+                script: "memory://scene.hks".into(),
+                signature: "rand(10)".into(),
+            },
+            StoredValue::Int(7),
+        );
+        let data = SaveGameData {
+            replay: Some(journal),
+            ..Default::default()
+        };
+        let restored = decode_save_data(&encode_save_data(&data)).expect("journal roundtrip");
+        assert_eq!(restored.replay, data.replay);
+        assert!(restored.vm_snapshot.is_none());
+        assert!(!restored.replay.expect("journal").complete);
+    }
+
+    #[test]
+    fn slot_metadata_ignores_incompatible_vm_and_scene_payloads() {
+        let encoded = proto::SaveGameData {
+            version: CURRENT_SAVE_VERSION + 10,
+            resume_script: "memory://alice.hks".into(),
+            thumbnail_png: vec![1, 2, 3],
+            vm_snapshot_hson: b"not valid HSON".to_vec(),
+            replay_hson: b"not valid HSON either".to_vec(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let metadata = SaveSlotMetadata::decode(encoded.as_slice())
+            .expect("metadata does not interpret VM state");
+        assert_eq!(metadata.version, CURRENT_SAVE_VERSION + 10);
+        assert_eq!(metadata.thumbnail_png, vec![1, 2, 3]);
+        assert!(
+            decode_save_data(&encoded).is_err(),
+            "browsing does not authorize restore"
+        );
+        assert!(
+            SaveSlotMetadata::decode(&[0xff][..]).is_err(),
+            "damaged slot remains a local preview error"
+        );
+    }
+
+    #[test]
+    fn a_save_without_a_checkpoint_must_not_restart_the_script() {
+        let data = SaveGameData {
+            resume_script: "memory://alice.hks".into(),
+            ..Default::default()
+        };
+        let error =
+            crate::script::ScriptBootstrap::from_save(&data).expect_err("no implicit restart");
+        assert!(error.contains("not loaded"));
+    }
 
     #[test]
     fn new_save_data_defaults_to_the_current_format() {

@@ -2,6 +2,8 @@ use prost::Message;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SaveGameData {
+    #[prost(bytes = "vec", tag = "20")]
+    pub replay_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "19")]
     pub thumbnail_png: Vec<u8>,
     #[prost(uint32, tag = "1")]

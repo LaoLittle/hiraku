@@ -356,7 +356,11 @@ impl<'types> MirBuilder<'types> {
             for statement in preceding {
                 builder.lower_statement(statement, errors);
             }
-            builder.lower_expression(expression, errors)
+            if matches!(builder.current_block().terminator, MirTerminator::Unset) {
+                builder.lower_expression(expression, errors)
+            } else {
+                None
+            }
         } else {
             builder.lower_block(block, errors)
         };
@@ -417,6 +421,9 @@ impl<'types> MirBuilder<'types> {
         statement: &crate::HirStmt<'_>,
         errors: &mut Vec<MirLoweringError>,
     ) -> Option<VirtualRegister> {
+        if !matches!(self.current_block().terminator, MirTerminator::Unset) {
+            return None;
+        }
         match statement.kind {
             HirStmtKind::Let { local, value } => {
                 let value = self.lower_expression(value, errors)?;
@@ -477,6 +484,11 @@ impl<'types> MirBuilder<'types> {
                     emit_value: true,
                 });
                 Some(value)
+            }
+            HirStmtKind::Return(value) => {
+                let value = value.and_then(|value| self.lower_expression(value, errors));
+                self.current_block_mut().terminator = MirTerminator::Return(value);
+                None
             }
             HirStmtKind::If {
                 condition,

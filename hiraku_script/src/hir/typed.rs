@@ -163,6 +163,7 @@ pub struct HirStmt<'hir> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HirStmtKind<'hir> {
+    Return(Option<&'hir HirExpr<'hir>>),
     Let {
         local: HirLocalId,
         value: &'hir HirExpr<'hir>,
@@ -359,6 +360,7 @@ struct Lowerer<'hir, 'manifest> {
     named_imports: BTreeMap<String, String>,
     wildcard_import: Option<String>,
     current_function: Option<HirFunctionId>,
+    return_context: Vec<Option<ScriptType>>,
     refinements: Vec<BTreeMap<HirLocalId, ScriptType>>,
     errors: Vec<LoweringError>,
     numeric_hints: BTreeSet<usize>,
@@ -438,6 +440,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             named_imports,
             wildcard_import,
             current_function: None,
+            return_context: Vec::new(),
             refinements: Vec::new(),
             errors: import_errors,
             numeric_hints: BTreeSet::new(),
@@ -703,6 +706,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 ));
             }
             let expected_result = self.functions[function_id.0 as usize].result.clone();
+            self.return_context
+                .push(return_type.as_ref().map(|_| expected_result.clone()));
             let body = if return_type.is_some()
                 && !matches!(expected_result, ScriptType::Unit | ScriptType::Never)
             {
@@ -733,19 +738,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             } else {
                 self.lower_block(body, false)
             };
+            self.return_context.pop();
+            let inferred_result =
+                self.checked_callable_result(body, return_type.as_ref().map(|_| &expected_result));
+            if return_type.is_some() && expected_result != ScriptType::Unit {
+                self.check_assignment(&expected_result, &inferred_result, body.span);
+            }
             if return_type.is_none() {
-                let inferred = if self.block_diverges(body) {
-                    ScriptType::Never
-                } else {
-                    body.statements
-                        .last()
-                        .and_then(|statement| match statement.kind {
-                            HirStmtKind::Expr(value) => Some(self.expression_type(value).clone()),
-                            _ => None,
-                        })
-                        .unwrap_or(ScriptType::Unit)
-                };
-                self.functions[function_id.0 as usize].result = inferred;
+                self.functions[function_id.0 as usize].result = inferred_result;
             }
             if self.functions[function_id.0 as usize].result == ScriptType::Never
                 && !self.block_diverges(body)
@@ -776,6 +776,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             .iter()
             .any(|statement| match statement.kind {
                 HirStmtKind::Expr(value)
+                | HirStmtKind::Return(Some(value))
                 | HirStmtKind::Let { value, .. }
                 | HirStmtKind::Assign { value, .. } => {
                     self.expression_type(value) == &ScriptType::Never
@@ -843,6 +844,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn lower_statement(&mut self, statement: &Stmt) -> Option<&'hir HirStmt<'hir>> {
         let (kind, span) = match statement {
+            Stmt::Return { value, span } => {
+                let expected = self.return_context.last().cloned().flatten();
+                if self.return_context.is_empty() {
+                    self.error("return is only allowed inside a function or closure", *span);
+                }
+                let value = value
+                    .as_ref()
+                    .map(|value| self.lower_expression_expected(value, expected.as_ref()));
+                if let Some(expected) = expected {
+                    let actual = value
+                        .map(|value| self.expression_type(value).clone())
+                        .unwrap_or(ScriptType::Unit);
+                    self.check_assignment(&expected, &actual, *span);
+                }
+                (HirStmtKind::Return(value), *span)
+            }
             Stmt::Import { span, .. } => {
                 self.error("imports are only allowed at module scope", *span);
                 return None;
@@ -1493,7 +1510,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     );
                 }
                 if let Some(block) = trailing_block {
+                    self.return_context.push(None);
                     let block = self.lower_block(block, true);
+                    self.return_context.pop();
                     let closure = self.alloc_expression(
                         HirExprKind::Block(block),
                         ScriptType::Function,
@@ -1625,6 +1644,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 (HirExprKind::Map { type_name, fields }, ty)
             }
             ExprKind::Lambda { parameters, body } => {
+                self.return_context.push(None);
                 self.scopes.push(BTreeMap::new());
                 let parameters = parameters
                     .iter()
@@ -1638,8 +1658,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     })
                     .collect::<Vec<_>>();
                 let body = self.lower_block(body, false);
+                self.return_context.pop();
                 self.scopes.pop();
-                let result = self.closure_result(body);
+                let result = self.checked_callable_result(body, None);
                 let signature = ScriptType::Callable {
                     parameters: parameters
                         .iter()
@@ -1665,8 +1686,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 )
             }
             ExprKind::Block(block) => {
+                self.return_context.push(None);
                 let block = self.lower_block(block, true);
-                let result = self.closure_result(block);
+                self.return_context.pop();
+                let result = self.checked_callable_result(block, None);
                 (
                     HirExprKind::Block(block),
                     ScriptType::Callable {
@@ -1837,6 +1860,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 })
                 .collect::<Vec<_>>();
             let mut statements = Vec::new();
+            self.return_context.push(Some((**result).clone()));
             for (index, statement) in body.statements.iter().enumerate() {
                 if index + 1 == body.statements.len()
                     && **result != ScriptType::Unit
@@ -1856,8 +1880,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 statements: self.arena.alloc_slice_copy(&statements),
                 span: body.span,
             });
+            self.return_context.pop();
             if **result != ScriptType::Unit {
-                self.check_assignment(result, &self.closure_result(body), body.span);
+                let actual = self.checked_callable_result(body, Some(result));
+                self.check_assignment(result, &actual, body.span);
             }
             self.scopes.pop();
             return self.alloc_expression(
@@ -2168,7 +2194,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             })
             .collect::<Vec<_>>();
         if let Some(block) = trailing_block {
+            self.return_context.push(None);
             let block = self.lower_block(block, true);
+            self.return_context.pop();
             lowered_arguments.push(HirArgument {
                 label: None,
                 value: self.alloc_expression(
@@ -3043,6 +3071,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     }
 
     fn closure_result(&self, body: &HirBlock<'hir>) -> ScriptType {
+        let mut results = Vec::new();
+        self.collect_returns(body, &mut results);
+        if let Some(result) = results.into_iter().find(|ty| *ty != ScriptType::Never) {
+            return result;
+        }
         if self.block_diverges(body) {
             return ScriptType::Never;
         }
@@ -3053,6 +3086,80 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 _ => None,
             })
             .unwrap_or(ScriptType::Unit)
+    }
+
+    // Returns are local to this callable: never descend into expression closures.
+    // The boolean records whether control can reach the end of this block.
+    fn collect_returns(&self, body: &HirBlock<'hir>, results: &mut Vec<ScriptType>) -> bool {
+        for statement in body.statements {
+            match statement.kind {
+                HirStmtKind::Return(value) => {
+                    results.push(
+                        value
+                            .map(|v| self.expression_type(v).clone())
+                            .unwrap_or(ScriptType::Unit),
+                    );
+                    return false;
+                }
+                HirStmtKind::If {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    let then_falls = self.collect_returns(then_block, results);
+                    let else_falls =
+                        else_block.map_or(true, |block| self.collect_returns(block, results));
+                    if !then_falls && !else_falls {
+                        return false;
+                    }
+                }
+                HirStmtKind::While { condition, body } => {
+                    self.collect_returns(body, results);
+                    if matches!(condition.kind, HirExprKind::Literal(HirLiteral::Bool(true))) {
+                        return false;
+                    }
+                }
+                HirStmtKind::Expr(value) if self.expression_type(value) == &ScriptType::Never => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn checked_callable_result(
+        &mut self,
+        body: &HirBlock<'hir>,
+        expected: Option<&ScriptType>,
+    ) -> ScriptType {
+        let mut results = Vec::new();
+        if self.collect_returns(body, &mut results) {
+            let tail = body
+                .statements
+                .last()
+                .and_then(|s| match s.kind {
+                    HirStmtKind::Expr(value) => Some(self.expression_type(value).clone()),
+                    _ => None,
+                })
+                .unwrap_or(ScriptType::Unit);
+            results.push(if expected == Some(&ScriptType::Unit) {
+                ScriptType::Unit
+            } else {
+                tail
+            });
+        }
+        let result = expected.cloned().unwrap_or_else(|| {
+            results
+                .iter()
+                .find(|ty| **ty != ScriptType::Never)
+                .cloned()
+                .unwrap_or(ScriptType::Never)
+        });
+        for actual in results {
+            self.check_assignment(&result, &actual, body.span);
+        }
+        result
     }
 
     fn expression_type(&self, expression: &HirExpr<'hir>) -> &ScriptType {
@@ -3366,6 +3473,7 @@ fn source_end(program: &Program) -> usize {
 
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
+        Stmt::Return { span, .. } => *span,
         Stmt::Import { span, .. }
         | Stmt::TypeAlias { span, .. }
         | Stmt::Impl { span, .. }

@@ -135,6 +135,9 @@ fn statements_in_scope(
                 block(body, &scope)?;
             }
             Stmt::Expr(value) => expression(value, constants)?,
+            Stmt::Return {
+                value: Some(value), ..
+            } => expression(value, constants)?,
             Stmt::Assign { target, value, .. } => {
                 expression(target, constants)?;
                 expression(value, constants)?;

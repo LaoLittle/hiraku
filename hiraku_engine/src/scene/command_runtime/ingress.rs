@@ -1,6 +1,86 @@
 use super::*;
 use crate::script::StoryRuntimeEvent;
+use crate::script::replay::{InputKind, ReplayJournal, ReplayPoint};
 use std::time::Duration;
+
+fn replay_signature(kind: &str, value: &impl serde::Serialize) -> Option<String> {
+    match hiraku_script::hson::to_string(value) {
+        Ok(value) => Some(format!("{kind}:{value}")),
+        Err(error) => {
+            warn!("could not encode replay boundary: {error}");
+            None
+        }
+    }
+}
+
+fn observe_replay_boundary(runtime: &mut ScriptRuntimeState, event: &StoryRuntimeEvent) {
+    let script = runtime.current_script.clone().unwrap_or_default();
+    let journal = runtime
+        .replay
+        .get_or_insert_with(|| ReplayJournal::new(script.clone(), 0));
+    use crate::script::capabilities::{StoryEffect, StoryWait};
+    let signature = match event {
+        StoryRuntimeEvent::Effect(StoryEffect::Say { speaker, text }) => {
+            runtime.replay_dialogue = replay_signature("say", &(speaker, text)).unwrap_or_default();
+            None
+        }
+        StoryRuntimeEvent::Effect(StoryEffect::ContinueDialogue { text }) => {
+            runtime.replay_dialogue = replay_signature("append", text).unwrap_or_default();
+            None
+        }
+        StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance) => {
+            Some(format!("dialogue:{}", runtime.replay_dialogue))
+        }
+        StoryRuntimeEvent::Choice {
+            prompt,
+            options,
+            enabled,
+        } => replay_signature("choice", &(prompt, options, enabled)),
+        StoryRuntimeEvent::OpenUi { path, arguments } => replay_signature("ui", &(path, arguments)),
+        _ => None,
+    };
+    if journal.destination.is_none() {
+        if let Some(signature) = signature {
+            journal.destination = Some(ReplayPoint { script, signature });
+        }
+    }
+}
+
+fn record_replay_response(runtime: &mut ScriptRuntimeState, response: &ScriptResponse) {
+    let Some(journal) = runtime.replay.as_mut() else {
+        return;
+    };
+    let Some(point) = journal.destination.clone() else {
+        return;
+    };
+    match response {
+        ScriptResponse::Continue if point.signature.starts_with("dialogue:") => {
+            if let Err(error) = journal.dialogue(&point) {
+                journal.complete = false;
+                warn!("could not record dialogue continuation: {error}");
+            }
+        }
+        ScriptResponse::Choice(value) => {
+            let kind = if point.signature.starts_with("choice:") {
+                InputKind::Choice
+            } else {
+                InputKind::UiResult
+            };
+            journal.input(kind, point, value.clone());
+        }
+        ScriptResponse::UiResult(value) => {
+            if let Some(value) = hks_to_stored(value) {
+                journal.input(InputKind::UiResult, point, value);
+            } else {
+                journal.destination = None;
+                journal.complete = false;
+            }
+        }
+        _ => {
+            journal.destination = None;
+        }
+    }
+}
 
 fn stored_to_hks(value: StoredValue) -> hiraku_script::Value {
     match value {
@@ -209,6 +289,7 @@ pub fn drive_story_runtime(
         runtime.pending_ui_screen = None;
         runtime.pending_ui_arguments.clear();
         runtime.wait_request = None;
+        let mut accepted = false;
         if let Some(story) = runtime.story.as_mut() {
             if !story.is_waiting_for_host_response() {
                 // Host completions are asynchronous. Navigation, load, or a
@@ -221,7 +302,12 @@ pub fn drive_story_runtime(
                     &error.to_string(),
                 );
                 runtime.story = None;
+            } else {
+                accepted = true;
             }
+        }
+        if accepted {
+            record_replay_response(&mut runtime, &response);
         }
     }
 
@@ -238,6 +324,7 @@ pub fn drive_story_runtime(
     };
 
     if let Some(event) = event {
+        observe_replay_boundary(&mut runtime, &event);
         match event {
             StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayBgm {
                 path,

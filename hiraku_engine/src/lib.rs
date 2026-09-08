@@ -252,6 +252,7 @@ impl Plugin for HirakuPlugin {
                 First,
                 input::bridge_virtual_pointers.before(bevy::picking::PickingSystems::Input),
             )
+            .add_systems(Last, input::cleanup_touch_pointers)
             .init_resource::<ScriptRuntimeState>()
             .init_resource::<UiModels>()
             .init_resource::<scene::PendingMovieWaits>()
