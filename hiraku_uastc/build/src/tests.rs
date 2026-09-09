@@ -3,6 +3,55 @@ use bevy::image::CompressedImageFormats;
 use hiraku_hdp::Archive;
 
 #[test]
+fn asset_server_loads_uastc_with_standard_mask_settings() {
+    use bevy::{
+        asset::RenderAssetUsages,
+        image::{ImageLoaderSettings, ImageSampler},
+        prelude::*,
+    };
+    let temp = tempfile::tempdir().expect("temporary asset root");
+    let bytes = encode_rgba(&[32, 64, 96, 255].repeat(64), 8, 8).expect("encode fixture");
+    fs::write(temp.path().join("alice.uastc.ktx2"), bytes).expect("fixture texture");
+    let mut app = App::new();
+    app.add_plugins((
+        MinimalPlugins,
+        AssetPlugin {
+            file_path: temp.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+    ))
+    .init_asset::<Image>()
+    .add_plugins(hiraku_uastc::UastcPlugin);
+    app.finish();
+    app.cleanup();
+    let handle: Handle<Image> = app
+        .world()
+        .resource::<AssetServer>()
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.is_srgb = false;
+            settings.sampler = ImageSampler::nearest();
+            settings.asset_usage = RenderAssetUsages::MAIN_WORLD;
+        })
+        .load("alice.uastc.ktx2");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        app.update();
+        if let Some(image) = app.world().resource::<Assets<Image>>().get(&handle) {
+            assert!(!image.texture_descriptor.format.is_srgb());
+            assert_eq!(image.sampler, ImageSampler::nearest());
+            assert_eq!(image.asset_usage, RenderAssetUsages::MAIN_WORLD);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "asset loader did not deliver the UASTC image"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
 fn synthetic_uastc_roundtrips_through_pure_rust_runtime() {
     for (width, height) in [(8, 8), (7, 5)] {
         let pixels = [24, 96, 180, 128].repeat(width * height);

@@ -12,6 +12,12 @@ KTX2 DFD. Arrays, cubemaps, video and other Basis codecs are rejected. The curre
 dimension limit is 16384 per axis. The runtime accepts mip chains; the build
 pipeline currently writes only the base level to avoid atlas mip bleeding.
 
+The loader uses Bevy's `ImageLoaderSettings`, including sampler and asset usage.
+Setting `is_srgb = false` selects linear sampling of the same blocks (needed for
+curtain/dissolve masks), overriding an sRGB DFD without changing pixel bytes.
+Explicit texture-format overrides may select the linear/sRGB counterpart but
+cannot change block layout. Array-layout reinterpretation is rejected explicitly.
+
 ## Build-time pipeline
 
 Use `hiraku-uastc-build` (the `build/` package) **only as a build dependency**.

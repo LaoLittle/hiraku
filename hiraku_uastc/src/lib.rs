@@ -2,7 +2,7 @@
 use basisu::{DecodeFlags, SourceFormat, TargetFormat, Transcoder};
 use bevy::{
     asset::{AssetLoader, LoadContext, RenderAssetUsages, io::Reader},
-    image::{CompressedImageFormatSupport, CompressedImageFormats},
+    image::{CompressedImageFormatSupport, CompressedImageFormats, ImageLoaderSettings},
     prelude::*,
     render::render_resource::{AstcBlock, AstcChannel, Extent3d, TextureDimension, TextureFormat},
 };
@@ -33,22 +33,47 @@ pub enum UastcError {
 }
 impl AssetLoader for UastcLoader {
     type Asset = Image;
-    type Settings = ();
+    type Settings = ImageLoaderSettings;
     type Error = UastcError;
     async fn load(
         &self,
         reader: &mut dyn Reader,
-        _: &(),
+        settings: &ImageLoaderSettings,
         _: &mut LoadContext<'_>,
     ) -> Result<Image, UastcError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        println!("loaded uastc");
-        decode(&bytes, self.formats)
+        let image = decode(&bytes, self.formats)?;
+        apply_settings(image, settings)
     }
     fn extensions(&self) -> &[&str] {
         &["uastc.ktx2"]
     }
+}
+
+fn apply_settings(mut image: Image, settings: &ImageLoaderSettings) -> Result<Image, UastcError> {
+    // Curtain/dissolve masks explicitly request linear sampling even when the
+    // packaged texture DFD describes sRGB artwork. Do not gamma-convert bytes:
+    // select the linear view of the same encoded blocks.
+    if !settings.is_srgb {
+        image.texture_descriptor.format = image.texture_descriptor.format.remove_srgb_suffix();
+    }
+    if let Some(format) = settings.texture_format {
+        if format.remove_srgb_suffix() != image.texture_descriptor.format.remove_srgb_suffix() {
+            return Err(UastcError::Invalid(
+                "texture_format override must preserve the transcoded block layout".into(),
+            ));
+        }
+        image.texture_descriptor.format = format;
+    }
+    if settings.array_layout.is_some() {
+        return Err(UastcError::Invalid(
+            "array_layout is not supported for UASTC textures".into(),
+        ));
+    }
+    image.sampler = settings.sampler.clone();
+    image.asset_usage = settings.asset_usage;
+    Ok(image)
 }
 
 /// Transcode a 2D texture to a format supported by the device.
@@ -137,6 +162,48 @@ pub fn decode(bytes: &[u8], formats: CompressedImageFormats) -> Result<Image, Ua
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loader_accepts_standard_image_settings_and_preserves_block_layout() {
+        fn standard_settings<T: AssetLoader<Settings = ImageLoaderSettings>>() {}
+        standard_settings::<UastcLoader>();
+        for format in [
+            TextureFormat::Rgba8UnormSrgb,
+            TextureFormat::Bc7RgbaUnormSrgb,
+            TextureFormat::Astc {
+                block: AstcBlock::B4x4,
+                channel: AstcChannel::UnormSrgb,
+            },
+        ] {
+            let image = Image::new_uninit(
+                Extent3d {
+                    width: 8,
+                    height: 8,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                format,
+                RenderAssetUsages::default(),
+            );
+            let settings = ImageLoaderSettings {
+                is_srgb: false,
+                sampler: bevy::image::ImageSampler::nearest(),
+                asset_usage: RenderAssetUsages::RENDER_WORLD,
+                ..Default::default()
+            };
+            let linear = apply_settings(image.clone(), &settings).expect("mask settings");
+            assert_eq!(
+                linear.texture_descriptor.format,
+                format.remove_srgb_suffix()
+            );
+            assert_eq!(linear.sampler, settings.sampler);
+            assert_eq!(linear.asset_usage, settings.asset_usage);
+            let invalid = ImageLoaderSettings {
+                texture_format: Some(TextureFormat::R32Float),
+                ..Default::default()
+            };
+            assert!(apply_settings(image, &invalid).is_err());
+        }
+    }
     #[test]
     fn malformed_input_returns_error() {
         for bytes in [
