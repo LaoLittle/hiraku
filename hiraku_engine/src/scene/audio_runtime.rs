@@ -42,11 +42,13 @@ pub(crate) struct SfxCompletion {
 /// Playback owns its ECS entity. There are no threads/channels or blocking
 /// waits here; task joins observe completion through the animation tracker.
 pub fn poll_sfx_playback(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut animations: ResMut<AnimationState>,
     sounds: Query<(Entity, &AudioPlayer, Option<&AudioSink>, &SfxCompletion)>,
 ) {
+    if !sounds.is_empty() { redraw.request(); }
     for (entity, player, sink, completion) in &sounds {
         let failed = matches!(
             asset_server.get_load_state(player.0.id()),
@@ -62,6 +64,7 @@ pub fn poll_sfx_playback(
 }
 
 pub fn animate_audio_fades(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     settings: Res<UserSettings>,
@@ -75,6 +78,7 @@ pub fn animate_audio_fades(
         Option<&SfxChannel>,
     )>,
 ) {
+    if !sources.is_empty() { redraw.request(); }
     for (entity, sink, mut fade, bgm, voice, sfx) in &mut sources {
         let Some(mut sink) = sink else {
             // Asset loading is asynchronous. The fade starts with audible playback, not while
@@ -109,11 +113,13 @@ pub fn animate_audio_fades(
 
 /// Waits until both files are cached, then starts one decoder with no ECS boundary switch.
 pub fn prepare_bgm_preludes(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     file_audio: Res<Assets<AudioSource>>,
     mut prelude_loop_audio: ResMut<Assets<PreludeLoopAudio>>,
     preludes: Query<(Entity, &BgmPrelude)>,
 ) {
+    if !preludes.is_empty() { redraw.request(); }
     for (entity, prelude) in &preludes {
         let Some(prelude_source) = file_audio.get(&prelude.prelude_audio) else {
             continue;
@@ -269,11 +275,13 @@ pub(super) fn finish_voice(
 }
 
 pub fn poll_voice_playback(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     mut animations: ResMut<AnimationState>,
     mut voice_state: ResMut<VoiceState>,
     sinks: Query<&AudioSink>,
 ) {
+    if voice_state.active.is_some() || !voice_state.concurrent.is_empty() { redraw.request(); }
     let exclusive_finished = voice_state
         .active
         .as_ref()

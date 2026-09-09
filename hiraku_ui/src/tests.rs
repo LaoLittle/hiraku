@@ -192,6 +192,8 @@ fn typed_pass_extracts_properties_and_keeps_type_errors() {
         1
     );
     assert!(!plan.structural_globals.contains("label"));
+    assert!(plan.read_globals.contains("label"));
+    assert!(!plan.read_globals.contains("time"));
     let mut next = UiCompiler::default();
     let second =
         hiraku_script::project::compile_project_with_hir_pass(vec![source], &manifest, &mut next)

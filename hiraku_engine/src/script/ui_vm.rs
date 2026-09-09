@@ -107,6 +107,7 @@ struct UiDraft {
     hovered_when_disabled: bool,
     hover_scale: f32,
     hover_active: Option<HksBinding<bool>>,
+    text_reveal: Option<HksBinding<u32>>,
     press_scale: f32,
     scroll_speed: f32,
     gap: f32,
@@ -145,6 +146,7 @@ impl UiDraft {
             hovered_when_disabled: false,
             hover_scale: 1.0,
             hover_active: None,
+            text_reveal: None,
             press_scale: 1.0,
             scroll_speed: 48.0,
             gap: 12.0,
@@ -385,6 +387,24 @@ mod native_ui {
         characters: u32,
     ) -> Result<String, NativeError> {
         Ok(value.chars().take(characters as usize).collect())
+    }
+
+    #[hks(name = "richText")]
+    fn rich_text(context: &mut UiVmContext, value: HksBindable<String>) -> Result<UiNodeHandle, NativeError> {
+        let mut draft = UiDraft::new(UiDraftKind::Text(value), None);
+        draft.layout.rich_text = true;
+        Ok(context.insert(draft))
+    }
+
+    #[hks(name = "reveal", receiver)]
+    fn text_reveal(context: &mut UiVmContext, node: UiNodeHandle, count: HksBindable<u32>) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !draft.layout.rich_text { return Err(NativeError::message("reveal requires richText")); }
+        match count {
+            HksBindable::Value(value) => { draft.layout.text_reveal = Some(value); draft.text_reveal = None; }
+            HksBindable::Binding(binding) => draft.text_reveal = Some(binding),
+        }
+        Ok(node)
     }
 
     #[hks(name = "__uiTerm")]
@@ -674,7 +694,7 @@ mod native_ui {
     #[hks(name = "fitText", receiver)]
     fn ui_fit_text(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
-        if !matches!(draft.kind, UiDraftKind::Text(_)) {
+        if !matches!(draft.kind, UiDraftKind::Text(_)) || draft.layout.rich_text {
             return Err(NativeError::message("fitText requires a text node"));
         }
         draft.layout.text_fit = true;
@@ -2076,6 +2096,12 @@ fn materialize_node(
         draft.layout.hover_active =
             bool::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?;
         draft.layout.reactive_hover_active = Some(reactive);
+    }
+    if let Some(binding) = &draft.text_reveal {
+        let reactive = reactive_binding(binding, program, context);
+        let value = evaluate_binding_value(&reactive, registry, context)?;
+        draft.layout.text_reveal = Some(u32::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?);
+        draft.layout.reactive_text_reveal = Some(reactive);
     }
     draft.layout.visible_binding = None;
     if let Some(binding) = &draft.enabled_binding {

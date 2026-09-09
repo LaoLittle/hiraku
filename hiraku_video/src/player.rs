@@ -212,6 +212,7 @@ impl Plugin for HirakuVideoPlugin {
 }
 
 fn start_pending_video(
+    redraw: Option<Res<Messages<bevy::window::RequestRedraw>>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     videos: Res<Assets<VideoAsset>>,
@@ -227,6 +228,7 @@ fn start_pending_video(
     let Some(pending) = player.pending.front() else {
         return;
     };
+    if redraw.is_some() { commands.write_message(bevy::window::RequestRedraw); }
     let Some(asset) = videos.get(&pending.asset) else {
         if let LoadState::Failed(error) = asset_server.load_state(&pending.asset) {
             let pending = player
@@ -302,12 +304,16 @@ fn start_pending_video(
 }
 
 fn apply_video_controls(
+    redraw: Option<Res<Messages<bevy::window::RequestRedraw>>>,
     mut commands: Commands,
     mut player: ResMut<VideoPlayer>,
     mut active: NonSendMut<ActiveVideo>,
     sinks: Query<&AudioSink>,
     mut events: MessageWriter<VideoEvent>,
 ) {
+    if !player.controls.is_empty() && redraw.is_some() {
+        commands.write_message(bevy::window::RequestRedraw);
+    }
     while let Some(control) = player.controls.pop_front() {
         match control {
             PlaybackControl::Pause(id) => {
@@ -361,6 +367,7 @@ fn apply_video_controls(
 }
 
 fn update_video(
+    redraw: Option<Res<Messages<bevy::window::RequestRedraw>>>,
     mut commands: Commands,
     time: Res<Time>,
     mut images: ResMut<Assets<Image>>,
@@ -377,6 +384,9 @@ fn update_video(
         return;
     };
     playback.age += time.delta();
+    if (!playback.paused || !playback.started) && redraw.is_some() {
+        commands.write_message(bevy::window::RequestRedraw);
+    }
     playback.decoder.poll();
     if playback
         .audio_entity

@@ -439,6 +439,13 @@ mod api {
         Ok(())
     }
 
+    /// Freeze placement at its displayed value; tint, blur and fade continue.
+    #[hks(name = "stopPictureMotion", selector = "scene")]
+    fn stop_picture_motion(context: &mut CharacterContext, id: String) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::Picture(PictureCommand::StopMotion { id }));
+        Ok(())
+    }
+
     #[hks(name = "animatePictureX", selector = "scene")]
     fn animate_picture_x(
         context: &mut CharacterContext,

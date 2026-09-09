@@ -115,7 +115,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub waits: ResMut<'w, PendingWaits>,
 }
 
-pub fn process_script_commands(ctx: SceneCommandContext) {
+pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneCommandContext) {
     let mut dependencies = ctx.dependencies;
     let ui = ctx.ui;
     let execution = ctx.execution;
@@ -180,6 +180,7 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
             }
         }
         let Some(queued) = pending_script_commands.dispatch_next() else { break; };
+        redraw.request();
         let command = queued.command;
         if screen_state.active_root.is_some()
             && screen_state.waiting.is_none()

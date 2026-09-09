@@ -110,6 +110,7 @@ pub enum PictureCommand {
         step_seconds: f32,
     },
     Clear,
+    StopMotion { id: String },
 }
 
 #[derive(Component)]
@@ -127,6 +128,13 @@ pub(super) fn apply_picture_command(
     command: PictureCommand,
 ) -> Result<(), String> {
     match command {
+        PictureCommand::StopMotion { id } => {
+            if let Some(picture) = pictures.get_mut(&id) {
+                // State already contains the displayed interpolation sample.
+                // Do not snap to the destination or cancel independent fades.
+                picture.motion = None;
+            }
+        }
         PictureCommand::Tint { id, color, seconds } => {
             if !color
                 .iter()
@@ -337,6 +345,7 @@ pub(super) fn apply_picture_command(
 }
 
 pub fn sync_pictures(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     canvas: Res<crate::HirakuCanvas>,
@@ -365,6 +374,10 @@ pub fn sync_pictures(
         })
         .collect();
     pictures.retain(|id, picture| {
+        if picture.fade.is_some() || picture.motion.is_some() || picture.tint_tween.is_some()
+            || picture.blur_tween.is_some() || !ready.contains(id) {
+            redraw.request();
+        }
         // Exit is independent of image readiness: hiding an unloaded image
         // must not retain it forever or wait for a failed download.
         let exiting = picture.fade.as_ref().is_some_and(|fade| fade.remove);
@@ -702,6 +715,26 @@ mod tests {
         )
         .expect("valid picture");
         pictures
+    }
+
+    #[test]
+    fn stopping_motion_preserves_pose_and_independent_fade() {
+        let mut pictures = shown();
+        apply_picture_command(&mut pictures, PictureCommand::Move {
+            id: "room".into(), position: [20.0, 25.0], seconds: 1.0, ease: "linear".into(),
+        }).expect("start movement");
+        tick_picture(pictures.get_mut("room").expect("picture exists"), 0.25);
+        let before = pictures["room"].clone();
+        assert!(before.motion.is_some());
+        assert_eq!(before.position, [65.0, -20.0]);
+        assert!(before.fade.is_some());
+        apply_picture_command(&mut pictures, PictureCommand::StopMotion { id: "room".into() })
+            .expect("stop shown picture");
+        let mut expected = before;
+        expected.motion = None;
+        assert_eq!(pictures["room"], expected);
+        apply_picture_command(&mut pictures, PictureCommand::StopMotion { id: "absent".into() })
+            .expect("stopping an absent picture is idempotent");
     }
 
     #[test]

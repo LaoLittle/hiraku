@@ -198,6 +198,12 @@ pub struct InputNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    #[serde(default)]
+    pub rich_text: bool,
+    #[serde(default)]
+    pub text_reveal: Option<u32>,
+    #[serde(skip)]
+    pub reactive_text_reveal: Option<PropertyComputation>,
     /// Opt into Unity-style RectTransform image stretching instead of contain.
     #[serde(default)]
     pub image_stretch: bool,

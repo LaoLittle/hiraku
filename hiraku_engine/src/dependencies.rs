@@ -134,11 +134,13 @@ fn package_path(script: &str) -> (String, String) {
 pub struct LoadingScreenRoot;
 
 pub(crate) fn loading_screen(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     state: Res<ScriptDependencies>,
     config: Res<LoadingScreen>,
     roots: Query<Entity, With<LoadingScreenRoot>>,
 ) {
+    if state.loading && state.error.is_none() { redraw.request(); }
     if !state.loading {
         for root in &roots {
             commands.entity(root).try_despawn();

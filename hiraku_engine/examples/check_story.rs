@@ -1,6 +1,14 @@
 //! Offline story checking. Supply paths explicitly; no bundled game fixtures.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut paths = std::env::args().skip(1).collect::<Vec<_>>();
+    if paths.first().is_some_and(|arg| arg == "--story-project") {
+        if paths.len() != 4 {
+            return Err("usage: --story-project ROOT SETTINGS ENTRY".into());
+        }
+        hiraku_engine::validate_story_project(std::path::Path::new(&paths[1]), &paths[2], &paths[3])?;
+        println!("Compiled and linked story project without rendering");
+        return Ok(());
+    }
     if paths.first().is_some_and(|arg| arg == "--ui-project") {
         if paths.len() < 4 {
             return Err("usage: --ui-project ROOT SETTINGS UI_PATH...".into());

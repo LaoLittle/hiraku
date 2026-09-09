@@ -62,6 +62,7 @@ pub(crate) mod clipping;
 mod command_runtime;
 pub(crate) mod curtain;
 mod dialogue;
+pub(crate) mod rich_text;
 pub(crate) mod loading;
 pub(crate) mod effect_wait;
 pub(crate) mod pictures;

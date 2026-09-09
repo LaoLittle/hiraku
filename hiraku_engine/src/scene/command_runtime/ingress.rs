@@ -245,6 +245,7 @@ pub(crate) fn resolve_ui_component_path(
 }
 
 pub fn drive_story_runtime(
+    mut redraw: crate::redraw::Redraw,
     dependencies: Res<crate::dependencies::ScriptDependencies>,
     mut runtime: ResMut<ScriptRuntimeState>,
     mut response_messages: MessageReader<ScriptResponseMessage>,
@@ -327,6 +328,9 @@ pub fn drive_story_runtime(
     };
 
     if let Some(event) = event {
+        // Effects are dispatched in later systems; their completion/next story
+        // step must not depend on a subsequent physical input event.
+        redraw.request();
         observe_replay_boundary(&mut runtime, &event);
         match event {
             StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayBgm {

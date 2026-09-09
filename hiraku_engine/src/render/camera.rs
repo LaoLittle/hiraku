@@ -235,6 +235,7 @@ pub fn assign_render_layers(
 }
 
 pub fn animate_camera_shake(
+    mut redraw: crate::redraw::Redraw,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
     mut shake_state: ResMut<CameraShakeState>,
@@ -249,6 +250,7 @@ pub fn animate_camera_shake(
         return;
     };
 
+    redraw.request();
     shake.timer.tick(time.delta());
     let decay = 1.0 - tween_fraction(&shake.timer);
     let elapsed = shake.timer.elapsed_secs();
@@ -419,6 +421,7 @@ fn interpolate_zoom(from: f32, to: f32, progress: f32, view_space: bool) -> f32 
 }
 
 pub fn animate_camera_transition(
+    mut redraw: crate::redraw::Redraw,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
     mut camera_state: ResMut<CameraState>,
@@ -436,6 +439,7 @@ pub fn animate_camera_transition(
 ) {
     let mut completed = Vec::new();
     if let Some(tween) = tweens.active.as_mut() {
+        redraw.request();
         if let Some(blur_tween) = tween.blur.as_mut() {
             blur_tween.timer.tick(time.delta());
             camera_state.blur_intensity = blur_tween.from.lerp(

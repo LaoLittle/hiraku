@@ -14,10 +14,14 @@ pub(crate) fn storage_ready() -> bool {
 }
 
 pub(crate) fn poll_runtime_storage(
+    mut redraw: crate::redraw::Redraw,
     mut previous: Local<Option<RuntimeStorageStatus>>,
     frontend: Option<ResMut<crate::scene::FrontendState>>,
 ) {
     let status = hiraku_storage::runtime_status();
+    if !matches!(status, RuntimeStorageStatus::Ready | RuntimeStorageStatus::Failed(_)) {
+        redraw.request();
+    }
     if previous.as_ref() == Some(&status) { return }
     if let RuntimeStorageStatus::Failed(error) = &status {
         error!("persistent storage failed; runtime is paused: {error}");

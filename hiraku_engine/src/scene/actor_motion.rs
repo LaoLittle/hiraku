@@ -34,6 +34,7 @@ pub(super) fn finish(motion: &mut ActorMotion, animations: &mut AnimationState) 
 }
 
 pub(crate) fn animate(
+    mut redraw: crate::redraw::Redraw,
     time: Res<Time>,
     mut shared: ResMut<SceneSharedState>,
     stage: Res<StageState>,
@@ -42,6 +43,7 @@ pub(crate) fn animate(
     mut parts: Query<(&character_composite::LogicalCharacterPart, &mut Transform)>,
 ) {
     for (actor, motion) in &mut shared.0.actor_motions {
+        if !motion.finished { redraw.request(); }
         if !stage.character_active_parts.contains_key(actor)
             && !stage.pending_character_restore.iter().any(|part| part.id.starts_with(&format!("character::{actor}::")))
         {

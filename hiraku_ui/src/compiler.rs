@@ -24,6 +24,9 @@ pub struct CompositionPlan {
     pub sites: Vec<RegionSite>,
     /// Conservative reads outside extracted property computations.
     pub structural_globals: BTreeSet<String>,
+    /// All reads, including extracted properties and helper functions. Hosts
+    /// can use this to schedule updates for time-dependent documents.
+    pub read_globals: BTreeSet<String>,
 }
 
 /// Lifts host-declared property parameters into ordinary closures.
@@ -155,6 +158,10 @@ impl<'h> Lower<'_, 'h> {
         }
         let kind = match expr.kind {
             E::Global(id) => {
+                let name = self.program.globals[id.0 as usize].name;
+                if let Some(name) = self.program.symbols.resolve(name) {
+                    self.plan.read_globals.insert(name.into());
+                }
                 if self.property_depth == 0 {
                     let name = self.program.globals[id.0 as usize].name;
                     if let Some(name) = self.program.symbols.resolve(name) {

@@ -64,6 +64,7 @@ impl HoverMotion {
 }
 
 pub fn animate_hover(
+    mut redraw: crate::redraw::Redraw,
     time: Res<Time>,
     models: Res<UiModels>,
     screen: Res<ScreenUiState>,
@@ -115,7 +116,9 @@ pub fn animate_hover(
         }
         motion.revision = revision;
         let active = motion.selected || (interactive && hovered.contains(&entity));
+        let old_position = motion.current;
         let position = motion.advance(active, time.delta_secs());
+        if position != old_position || motion.current != motion.target { redraw.request(); }
         let translation = Val2::px(position.x, position.y);
         if transform.translation != translation {
             transform.translation = translation;
@@ -142,11 +145,13 @@ mod tests {
         use bevy::picking::{backend::HitData, pointer::PointerId};
         let mut app = App::new();
         app.init_resource::<Time>()
+            .add_message::<bevy::window::RequestRedraw>()
             .init_resource::<UiModels>()
             .init_resource::<ScreenUiState>()
             .init_resource::<OverlayUiState>()
             .init_resource::<HoverMap>()
             .add_systems(Update, animate_hover);
+        let mut redraws = bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
         let root = app.world_mut().spawn(ScreenUiRoot).id();
         let group = app
             .world_mut()
@@ -174,6 +179,9 @@ mod tests {
             .or_default()
             .insert(button, HitData::new(root, 0.0, None, None));
         app.update();
+        assert_eq!(redraws.read(app.world().resource::<Messages<bevy::window::RequestRedraw>>()).count(), 1);
+        app.update();
+        assert_eq!(redraws.read(app.world().resource::<Messages<bevy::window::RequestRedraw>>()).count(), 0);
         assert_eq!(
             app.world()
                 .get::<UiTransform>(group)

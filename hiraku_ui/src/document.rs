@@ -120,6 +120,7 @@ impl UiDocument {
         // dependency tracking exists, conservatively include their reads.
         let mut plan = compiler.plans.remove(path).unwrap_or_default();
         for dependency in compiler.plans.values() {
+            plan.read_globals.extend(dependency.read_globals.iter().cloned());
             plan.structural_globals
                 .extend(dependency.structural_globals.iter().cloned());
         }

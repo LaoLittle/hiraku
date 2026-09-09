@@ -132,7 +132,7 @@ fn restore_frontend_scene(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext, mut deferred: Local<Vec<crate::ui::UiEffect>>, dependencies: Option<Res<crate::dependencies::ScriptDependencies>>) {
+pub fn handle_runtime_menu_buttons(mut redraw: crate::redraw::Redraw, mut ctx: RuntimeMenuContext, mut deferred: Local<Vec<crate::ui::UiEffect>>, dependencies: Option<Res<crate::dependencies::ScriptDependencies>>) {
     if dependencies.is_some_and(|d| d.loading) {
         ctx.clicks.clear();
         ctx.widget_callbacks.clear();
@@ -145,6 +145,7 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext, mut deferred: Lo
         return;
     }
     if !deferred.is_empty() {
+        redraw.request();
         let effects = std::mem::take(&mut *deferred);
         dispatch_ui_effects(&mut ctx, effects, &mut deferred);
         ctx.clicks.clear();
@@ -246,6 +247,9 @@ pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext, mut deferred: Lo
         {
             continue;
         }
+        // A callback can change local UI state without emitting a story
+        // command. Allow the dependent layout/visual systems to finish too.
+        redraw.request();
         let mut globals = ctx
             .script_runtime
             .story

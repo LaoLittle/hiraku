@@ -9,8 +9,12 @@ use bevy::{
 #[derive(Clone, Debug, Message)]
 pub struct UiEffectMessage(pub UiEffect);
 
-#[derive(Component)]
-pub(crate) struct FitText { maximum: f32 }
+#[derive(Component, Default)]
+pub(crate) struct FitText {
+    maximum: f32,
+    content: Option<String>,
+    width: f32,
+}
 
 fn fitted_font_size(current: f32, maximum: f32, available: f32, measured: f32) -> f32 {
     if available <= 0.0 || measured <= 0.0 { return current; }
@@ -20,11 +24,38 @@ fn fitted_font_size(current: f32, maximum: f32, available: f32, measured: f32) -
 /// Uses shaped glyph bounds, not character counts (which break proportional
 /// fonts and localized text). Bevy stores text bounds in logical pixels;
 /// convert the physical UI node width before comparing, including on HiDPI.
-pub(crate) fn fit_screen_text(mut texts: Query<(&FitText, &ComputedNode, &bevy::text::TextLayoutInfo, &mut TextFont)>) {
-    for (fit, node, measured, mut font) in &mut texts {
+pub(crate) fn fit_screen_text(mut redraw: crate::redraw::Redraw, mut texts: Query<(&mut FitText, &Text, &ComputedNode, &bevy::text::TextLayoutInfo, &mut TextFont, &mut Visibility)>) {
+    for (mut fit, text, node, measured, mut font, mut visibility) in &mut texts {
         let bevy::text::FontSize::Px(current) = font.font_size else { continue };
-        let next = fitted_font_size(current, fit.maximum, node.size().x * node.inverse_scale_factor(), measured.size.x);
-        if (next - current).abs() > 0.05 { font.font_size = next.into(); }
+        if node.size().x <= 0.0 || measured.size.x <= 0.0 {
+            visibility.set_if_neq(Visibility::Hidden);
+            continue;
+        }
+        let width = node.size().x * node.inverse_scale_factor();
+        if fit.content.as_deref() != Some(text.0.as_str()) || (fit.width - width).abs() > 0.01 {
+            fit.content = Some(text.0.clone());
+            fit.width = width;
+            if (current - fit.maximum).abs() > 0.05 {
+                // A different label may fit at the full authored size. Measure
+                // that size invisibly before deciding whether to shrink again.
+                font.font_size = fit.maximum.into();
+                visibility.set_if_neq(Visibility::Hidden);
+                redraw.request();
+                continue;
+            }
+        }
+        // Shaping rounds bounds to pixels. Never grow a fitted label merely
+        // to fill a subpixel gap: that can oscillate across adjacent sizes.
+        let next = if measured.size.x > width {
+            fitted_font_size(current, fit.maximum, width, measured.size.x)
+        } else { current };
+        if (next - current).abs() > 0.05 {
+            visibility.set_if_neq(Visibility::Hidden);
+            font.font_size = next.into();
+            redraw.request();
+        } else if visibility.set_if_neq(Visibility::Inherited) {
+            redraw.request();
+        }
     }
 }
 
@@ -68,14 +99,19 @@ pub(super) fn clear_overlay_ui(commands: &mut Commands, overlay_state: &mut Over
 }
 
 pub fn cleanup_stale_screen_ui(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     images: Res<Assets<Image>>,
     mut screen_state: ResMut<ScreenUiState>,
     preview: Option<ResMut<super::save_preview::SavePreview>>,
 ) {
+    if screen_state.pending_root.is_some() || !screen_state.stale_roots.is_empty() {
+        redraw.request();
+    }
     if let Some(mut preview) = preview
         && preview.capture.is_some()
     {
+        redraw.request();
         preview.waiting_frames += 1;
         if preview.waiting_frames < 180 {
             return;
@@ -516,16 +552,25 @@ fn spawn_screen_node_entity(
         }) => {
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
+            // Authored layout/visibility belongs to the wrapper. The text leaf
+            // can hide during fitting without overriding .visible(...) or
+            // removing its box from Bevy layout.
+            let fit_wrapper = layout.text_fit.then(|| {
+                commands.spawn((ScreenUiNode, Pickable::IGNORE, node.clone())).id()
+            });
+            if fit_wrapper.is_some() {
+                node = Node { width: percent(100), height: percent(100), min_width: px(0), flex_shrink: 0.0, ..default() };
+            }
             let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Pickable::IGNORE,
                     node,
-                    Text::new(text.clone()),
+                    Text::new(if layout.rich_text { String::new() } else { text.clone() }),
                     ui_text_font(ui_fonts, *size),
                     TextLayout::new(
                         justify_text_from_align(align.unwrap_or(0.0)),
-                        if layout.text_fit { LineBreak::NoWrap } else { LineBreak::AnyCharacter },
+                        if layout.text_fit { LineBreak::NoWrap } else if layout.rich_text { LineBreak::WordBoundary } else { LineBreak::AnyCharacter },
                     ),
                     TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
                     if layout.text_shadow == Some(false) {
@@ -533,8 +578,14 @@ fn spawn_screen_node_entity(
                     } else { default_text_outline() },
                 ))
                 .id();
+            if layout.rich_text {
+                commands.entity(entity).insert((
+                    super::rich_text::RichTextSource::new(text.clone(), layout),
+                    bevy::text::LineHeight::RelativeToFont(1.8),
+                ));
+            }
             if layout.text_fit {
-                commands.entity(entity).insert(FitText { maximum: *size });
+                commands.entity(entity).insert((FitText { maximum: *size, ..default() }, Visibility::Hidden));
             }
             if let Some(template) = binding {
                 commands.entity(entity).insert(UiTextBinding {
@@ -548,8 +599,12 @@ fn spawn_screen_node_entity(
                     rendered_revision: u64::MAX,
                 });
             }
-            apply_live_layout_bindings(commands, entity, layout);
-            entity
+            let layout_entity = if let Some(wrapper) = fit_wrapper {
+                commands.entity(wrapper).add_child(entity);
+                wrapper
+            } else { entity };
+            apply_live_layout_bindings(commands, layout_entity, layout);
+            layout_entity
         }
         ScreenNode::Button(ButtonNode {
             children,
@@ -657,6 +712,7 @@ fn spawn_screen_node_entity(
                     Text::new(text.clone()),
                     ui_text_font(ui_fonts, *size),
                     TextColor(initial_text_color),
+                    TextLayout { justify: justify_text_from_align(align.unwrap_or(0.5)), ..default() },
                     if layout.text_shadow == Some(false) {
                         TextShadow { offset: Vec2::ZERO, color: Color::NONE }
                     } else { default_text_outline() },
@@ -1220,10 +1276,12 @@ pub(super) fn apply_live_layout_bindings(
 /// Advances embedding-owned UI timelines. The HKS VM only constructs the
 /// serializable spec; Bevy owns clocks and presentation state.
 pub fn animate_screen_ui(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     mut players: Query<(Entity, &mut UiAnimationPlayer, &mut UiTransform)>,
 ) {
+    if !players.is_empty() { redraw.request(); }
     for (entity, mut player, mut transform) in &mut players {
         player.elapsed += time.delta_secs();
         let duration = player.spec.duration().max(f32::EPSILON);
@@ -1671,6 +1729,8 @@ pub fn handle_screen_toggles(
 }
 
 pub fn update_builtin_ui_models(
+    mut redraw: crate::redraw::Redraw,
+    compositions: Query<&ScreenComposition>,
     time: Res<Time>,
     scene: Res<SceneSharedState>,
     dialogue_state: Res<DialogueState>,
@@ -1679,6 +1739,9 @@ pub fn update_builtin_ui_models(
     mut last_second: Local<Option<u64>>,
 ) {
     let elapsed = time.elapsed_secs_f64().floor().max(0.0) as u64;
+    if compositions.iter().any(|composition| composition.renderer.document.plan.read_globals.contains("time")) {
+        redraw.request();
+    }
     if *last_second != Some(elapsed) {
         *last_second = Some(elapsed);
         let unix = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
@@ -1702,7 +1765,7 @@ pub fn update_builtin_ui_models(
         .reveal
         .as_ref()
         .map(|reveal| reveal.next_index)
-        .unwrap_or_else(|| text.chars().count());
+        .unwrap_or_else(|| crate::rich_text::character_count(text));
     models.set(
         "dialogue",
         StoredValue::Map(BTreeMap::from([
@@ -1767,7 +1830,7 @@ pub fn update_builtin_ui_models(
 
 pub fn update_ui_text_bindings(
     models: Res<UiModels>,
-    mut text_bindings: Query<(&mut UiTextBinding, &mut Text)>,
+    mut text_bindings: Query<(&mut UiTextBinding, &mut Text, Option<&mut super::rich_text::RichTextSource>)>,
     mut visibility_bindings: Query<(&mut UiVisibilityBinding, &mut Visibility)>,
     mut button_bindings: Query<
         (
@@ -1785,12 +1848,14 @@ pub fn update_ui_text_bindings(
     mut button_texts: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
     let revision = models.revision();
-    for (mut binding, mut text) in &mut text_bindings {
+    for (mut binding, mut text, rich) in &mut text_bindings {
         if binding.rendered_revision == revision {
             continue;
         }
         let rendered = expand_model_template(&binding.template, &models);
-        if text.0 != rendered {
+        if let Some(mut rich) = rich {
+            if rich.source != rendered { rich.source = rendered; }
+        } else if text.0 != rendered {
             text.0 = rendered;
         }
         binding.rendered_revision = revision;
@@ -1857,7 +1922,7 @@ pub fn update_ui_reactive_bindings(
     models: Res<UiModels>,
     parents: Query<&ChildOf>,
     local_states: Query<&super::widgets::UiLocalState>,
-    mut text_bindings: Query<(Entity, &mut UiReactiveTextBinding, &mut Text)>,
+    mut text_bindings: Query<(Entity, &mut UiReactiveTextBinding, &mut Text, Option<&mut super::rich_text::RichTextSource>)>,
     mut visibility_bindings: Query<(Entity, &mut UiReactiveVisibilityBinding, &mut Visibility)>,
     mut button_bindings: Query<
         (
@@ -1880,15 +1945,18 @@ pub fn update_ui_reactive_bindings(
     mut button_texts: Query<&mut TextColor, With<ScreenUiButtonText>>,
 ) {
     let revision = models.revision();
-    for (entity, mut binding, mut text) in &mut text_bindings {
+    for (entity, mut binding, mut text, rich) in &mut text_bindings {
         let changed =
             refresh_local_binding(entity, &mut binding.expression, &parents, &local_states);
         if binding.rendered_revision == revision && !changed {
             continue;
         }
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
-            Ok(hiraku_script::Value::String(value)) if text.0 != value => text.0 = value,
-            Ok(hiraku_script::Value::String(_)) => {}
+            Ok(hiraku_script::Value::String(value)) => {
+                if let Some(mut rich) = rich {
+                    if rich.source != value { rich.source = value; }
+                } else if text.0 != value { text.0 = value; }
+            }
             Ok(value) => warn!("reactive UI text returned {value:?}, expected String"),
             Err(error) => {
                 crate::script::emit_script_diagnostic("reactive UI text failed", &error.to_string())
@@ -2053,13 +2121,34 @@ mod tests {
         let mut app = App::new();
         app.add_systems(Update, fit_screen_text);
         let entity = app.world_mut().spawn((
-            FitText { maximum: 75.0 },
+            FitText { maximum: 75.0, ..default() },
+            Text::new("Alice"),
             ComputedNode { size: Vec2::new(1000.0, 200.0), inverse_scale_factor: 0.5, ..default() },
             bevy::text::TextLayoutInfo { size: Vec2::new(750.0, 75.0), ..default() },
             TextFont::from_font_size(75.0),
+            Visibility::Hidden,
         )).id();
         app.update();
         assert_eq!(app.world().get::<TextFont>(entity).expect("text font").font_size, bevy::text::FontSize::Px(50.0));
+        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Hidden);
+        // Simulate Bevy's next text layout using the fitted font.
+        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 500.0;
+        app.update();
+        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
+        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 499.0;
+        app.update();
+        assert_eq!(app.world().get::<TextFont>(entity).expect("text font").font_size, bevy::text::FontSize::Px(50.0));
+        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
+        // Replacing the text with a shorter label restores the maximum font
+        // off-screen instead of briefly displaying an undersized label.
+        app.world_mut().get_mut::<Text>(entity).expect("text").0 = "Bob".into();
+        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 250.0;
+        app.update();
+        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Hidden);
+        assert_eq!(app.world().get::<TextFont>(entity).expect("text font").font_size, bevy::text::FontSize::Px(75.0));
+        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 375.0;
+        app.update();
+        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
     }
     #[test]
     fn single_line_fit_shrinks_and_restores_without_exceeding_authored_size() {

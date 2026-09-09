@@ -332,6 +332,7 @@ fn update_actor_placement_with_animation(
 }
 
 pub fn animate_character_motion_effects(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
@@ -357,8 +358,10 @@ pub fn animate_character_motion_effects(
         ),
     >,
 ) {
+    if !movers.is_empty() { redraw.request(); }
     for mut placement in &mut placements {
         if let Some(tween) = placement.trajectory.as_mut() {
+            redraw.request();
             tween.timer.tick(time.delta());
             let t = tween
                 .animation

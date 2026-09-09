@@ -78,6 +78,7 @@ pub struct DialogueRoot;
 pub struct DialogueAdvanceSurface;
 
 pub fn advance_dialogue_on_input(
+    mut redraw: crate::redraw::Redraw,
     dependencies: Option<Res<crate::dependencies::ScriptDependencies>>,
     mut actions: MessageReader<crate::input::HirakuActionInput>,
     mut clicks: MessageReader<Pointer<Click>>,
@@ -122,6 +123,7 @@ pub fn advance_dialogue_on_input(
         && voices.active.is_none()
         && voices.concurrent.is_empty();
     if auto_ready {
+        redraw.request();
         dialogue_state.auto_elapsed += time.delta_secs();
     } else {
         dialogue_state.auto_elapsed = 0.0;
@@ -167,6 +169,7 @@ pub(super) fn advance_dialogue(
 }
 
 pub fn animate_dialogue_text_reveal(
+    mut redraw: crate::redraw::Redraw,
     time: Res<Time>,
     preferences: Res<UserSettings>,
     mut dialogue_state: ResMut<DialogueState>,
@@ -177,6 +180,7 @@ pub fn animate_dialogue_text_reveal(
         return;
     };
 
+    redraw.request();
     reveal.accumulator += time.delta_secs() * preferences.text_speed;
     while reveal.next_index < reveal.total_chars && reveal.accumulator >= reveal.interval {
         reveal.accumulator -= reveal.interval;
@@ -231,7 +235,7 @@ pub(super) fn set_dialogue_model_reveal(
     visible_prefix_chars: usize,
     animation_id: Option<String>,
 ) {
-    let total_chars = text.chars().count();
+    let total_chars = crate::rich_text::character_count(text);
     let visible_prefix_chars = visible_prefix_chars.min(total_chars);
     if dialogue_state.effect.mode == DialogueTextEffectMode::Instant
         || visible_prefix_chars >= total_chars

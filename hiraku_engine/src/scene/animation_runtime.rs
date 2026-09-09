@@ -1,5 +1,34 @@
 use super::*;
 
+#[cfg(test)]
+mod redraw_tests {
+    use super::*;
+
+    #[test]
+    fn timed_wait_requests_its_completion_frame_then_becomes_idle() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<PendingWaits>()
+            .init_resource::<AnimationState>()
+            .add_message::<ScriptResponseMessage>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .add_systems(Update, tick_pending_waits);
+        app.world_mut().resource_mut::<PendingWaits>().items.push(PendingWait {
+            timer: Timer::new(std::time::Duration::from_millis(200), TimerMode::Once),
+            animation_id: None,
+            done: ScriptRequestId(1),
+        });
+        let mut redraws = bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
+        let mut responses = bevy::ecs::message::MessageCursor::<ScriptResponseMessage>::default();
+        for (redraw_count, response_count) in [(1, 0), (1, 1), (0, 0)] {
+            app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+            app.update();
+            assert_eq!(redraws.read(app.world().resource::<Messages<bevy::window::RequestRedraw>>()).count(), redraw_count);
+            assert_eq!(responses.read(app.world().resource::<Messages<ScriptResponseMessage>>()).count(), response_count);
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct PendingWaits {
     pub items: Vec<PendingWait>,
@@ -41,11 +70,13 @@ pub struct VisualTween {
 }
 
 pub fn tick_pending_waits(
+    mut redraw: crate::redraw::Redraw,
     time: Res<Time>,
     mut waits: ResMut<PendingWaits>,
     mut animations: ResMut<AnimationState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
 ) {
+    if !waits.items.is_empty() { redraw.request(); }
     for wait in waits.items.iter_mut() {
         wait.timer.tick(time.delta());
     }
@@ -68,6 +99,7 @@ pub fn tick_pending_waits(
 }
 
 pub fn animate_visual_tweens(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
@@ -85,6 +117,7 @@ pub fn animate_visual_tweens(
         Option<&mut Visibility>,
     )>,
 ) {
+    if !visuals.is_empty() { redraw.request(); }
     for (
         entity,
         mut sprite,
@@ -179,6 +212,7 @@ fn set_visual_alpha(
 }
 
 pub fn animate_rule_transitions(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     mut stage: ResMut<StageState>,
@@ -188,6 +222,7 @@ pub fn animate_rule_transitions(
     mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
     mut transitions: Query<(Entity, &mut RuleTransitionPlayer)>,
 ) {
+    if !transitions.is_empty() { redraw.request(); }
     for (entity, mut transition) in &mut transitions {
         transition.timer.tick(time.delta());
         if let Some(mut material) = rule_materials.get_mut(&transition.material) {
@@ -221,6 +256,7 @@ pub fn animate_rule_transitions(
 }
 
 pub fn animate_custom_effects(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     mut stage: ResMut<StageState>,
@@ -230,6 +266,7 @@ pub fn animate_custom_effects(
     mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
     mut effects: Query<(Entity, &mut CustomScreenEffectPlayer)>,
 ) {
+    if !effects.is_empty() { redraw.request(); }
     for (entity, mut effect) in &mut effects {
         effect.timer.tick(time.delta());
         if let Some(mut material) = materials.get_mut(&effect.material) {

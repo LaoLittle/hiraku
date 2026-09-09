@@ -8,6 +8,7 @@ mod glossary;
 pub mod input;
 mod movie;
 mod proto;
+mod redraw;
 pub mod render;
 mod scene;
 mod script;
@@ -17,6 +18,7 @@ pub use storage::{PreferenceChange, UserSettings};
 mod texture;
 mod ui;
 mod vfs;
+mod rich_text;
 
 pub use script::{UiContext, UiIntent};
 pub use ui::UiModels;
@@ -25,6 +27,13 @@ pub use ui::UiModels;
 /// This does not launch Bevy, access assets, or execute script/native functions.
 pub fn validate_story_source(path: &str, source: &str) -> Result<(), String> {
     script::compile_story_bytecode(path, source).map(|_| ())
+}
+
+/// Compile and link the project's story modules without starting the game.
+pub fn validate_story_project(root: &std::path::Path, settings: &str, entry: &str) -> Result<(), String> {
+    let vfs = vfs::HdpVfs::new_with_config(root, settings, entry);
+    let source = vfs.read_text(entry).map_err(|error| error.to_string())?;
+    script::compile_story_program(&vfs, entry, &source).map(|_| ())
 }
 
 /// Type-check a UI source with the standard widget module, without rendering.
@@ -258,6 +267,7 @@ impl Plugin for HirakuPlugin {
                 input::bridge_virtual_pointers.before(bevy::picking::PickingSystems::Input),
             )
             .add_systems(Last, input::cleanup_touch_pointers)
+            .add_systems(Last, input::request_input_redraw)
             .add_systems(PreStartup, storage::initialize_runtime_storage)
             .add_systems(First, storage::poll_runtime_storage)
             .init_resource::<ScriptRuntimeState>()
@@ -335,6 +345,7 @@ impl Plugin for HirakuPlugin {
                     update_builtin_ui_models,
                     update_ui_text_bindings,
                     update_ui_reactive_bindings,
+                    scene::rich_text::update,
                     animate_screen_ui,
                     scene::ui_hover::animate_hover,
                 )
@@ -394,7 +405,12 @@ impl Plugin for HirakuPlugin {
                     .before(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
-            .add_systems(PostUpdate, scene::fit_screen_text.after(bevy::ui::widget::text_system))
+            .add_systems(PostUpdate, scene::fit_screen_text
+                .after(bevy::ui::widget::text_system)
+                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
+            .add_systems(PostUpdate, scene::rich_text::position_ruby
+                .after(bevy::ui::widget::text_system)
+                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
             .add_systems(
                 Update,
                 handle_choice_buttons

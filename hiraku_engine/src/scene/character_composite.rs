@@ -96,6 +96,7 @@ pub(super) fn fade_group(
     });
 }
 fn advance_group_fades(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: Res<Time>,
     mut animations: ResMut<AnimationState>,
@@ -106,6 +107,7 @@ fn advance_group_fades(
         let Some(tween) = group.tween.as_mut() else {
             continue;
         };
+        redraw.request();
         tween.timer.tick(time.delta());
         let alpha = tween.from + (tween.to - tween.from) * tween.timer.fraction();
         let complete = tween.timer.is_finished();

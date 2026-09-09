@@ -11,6 +11,21 @@ use uuid::Uuid;
 
 use crate::{HirakuCanvas, HirakuInputTarget};
 
+/// Physical picking forwards canvas input after this frame's `First` bridge.
+/// Wake the next update to consume it; reactive runners otherwise wait for
+/// another OS event or their idle timeout. Independent readers never steal input.
+pub(crate) fn request_input_redraw(
+    mut redraw: crate::redraw::Redraw,
+    mut pointers: MessageReader<HirakuPointerInput>,
+    mut scrolls: MessageReader<HirakuScrollInput>,
+    mut actions: MessageReader<HirakuActionInput>,
+    mut text: MessageReader<HirakuTextInput>,
+) {
+    let pending = pointers.read().count() + scrolls.read().count()
+        + actions.read().count() + text.read().count();
+    if pending != 0 { redraw.request(); }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HirakuPointerPhase {
     Move,
@@ -126,6 +141,65 @@ fn retire_touch_pointer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_host_input_wakes_the_bridge_then_returns_to_idle() {
+        use bevy::{ecs::message::MessageCursor, picking::events::Scroll, window::RequestRedraw};
+        for pointer in [HirakuPointerId::Pointer(0), HirakuPointerId::Touch(7)] {
+            let mut app = App::new();
+            app.insert_resource(HirakuCanvas { image: Handle::default(), size: UVec2::new(800, 600) })
+                .insert_resource(HirakuInputTarget(Handle::default()))
+                .add_message::<HirakuPointerInput>()
+                .add_message::<HirakuScrollInput>()
+                .add_message::<HirakuActionInput>()
+                .add_message::<HirakuTextInput>()
+                .add_message::<PointerInput>()
+                .add_message::<Pointer<Scroll>>()
+                .add_message::<RequestRedraw>()
+                .add_systems(First, bridge_virtual_pointers)
+                // Host picking happens after First; no animation or subsequent
+                // physical input is available to drive another frame here.
+                .add_systems(Update, move |mut sent: Local<bool>, mut output: MessageWriter<HirakuPointerInput>| {
+                    if !*sent {
+                        *sent = true;
+                        output.write(HirakuPointerInput { pointer, uv: Vec2::splat(0.5), phase: HirakuPointerPhase::Press });
+                    }
+                })
+                .add_systems(Last, request_input_redraw);
+            let mut redraws = MessageCursor::<RequestRedraw>::default();
+            let mut inputs = MessageCursor::<PointerInput>::default();
+            app.update();
+            assert_eq!(inputs.read(app.world().resource::<Messages<PointerInput>>()).count(), 0);
+            assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 1);
+            app.update();
+            assert!(inputs.read(app.world().resource::<Messages<PointerInput>>()).any(|event| matches!(event.action, PointerAction::Press(PointerButton::Primary))));
+            assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 1);
+            app.update();
+            assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 0);
+        }
+    }
+
+    #[test]
+    fn non_pointer_input_also_requests_a_follow_up_frame() {
+        use bevy::{ecs::message::MessageCursor, window::RequestRedraw};
+        let mut app = App::new();
+        app.add_message::<HirakuPointerInput>()
+            .add_message::<HirakuScrollInput>()
+            .add_message::<HirakuActionInput>()
+            .add_message::<HirakuTextInput>()
+            .add_message::<RequestRedraw>()
+            .add_systems(Last, request_input_redraw);
+        let mut redraws = MessageCursor::<RequestRedraw>::default();
+        app.world_mut().write_message(HirakuActionInput(HirakuAction::NextDialogue));
+        app.world_mut().write_message(HirakuTextInput::Insert("Alice".into()));
+        app.world_mut().write_message(HirakuScrollInput {
+            pointer: HirakuPointerId::Pointer(0), uv: Vec2::splat(0.5), delta: Vec2::Y, unit: HirakuScrollUnit::Line,
+        });
+        app.update();
+        assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 1);
+        app.update();
+        assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 0);
+    }
 
     #[test]
     fn touch_scroll_cancels_click_and_keeps_fingers_independent() {
@@ -296,6 +370,7 @@ mod tests {
 }
 
 pub(crate) fn bridge_virtual_pointers(
+    mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     canvas: Option<Res<HirakuCanvas>>,
     target: Option<Res<HirakuInputTarget>>,
@@ -319,6 +394,7 @@ pub(crate) fn bridge_virtual_pointers(
         if !sample.uv.is_finite() {
             continue;
         }
+        redraw.request();
         if matches!(sample.pointer, HirakuPointerId::Touch(_))
             && matches!(
                 sample.phase,
@@ -475,6 +551,7 @@ pub(crate) fn bridge_virtual_pointers(
         if !scroll.uv.is_finite() || !scroll.delta.is_finite() {
             continue;
         }
+        redraw.request();
         let position = scroll.uv.clamp(Vec2::ZERO, Vec2::ONE) * canvas.size.as_vec2();
         let location = Location {
             target: target.clone(),
