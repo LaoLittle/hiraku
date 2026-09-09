@@ -408,7 +408,7 @@ impl Plugin for HirakuPlugin {
             .add_systems(PostUpdate, scene::fit_screen_text
                 .after(bevy::ui::widget::text_system)
                 .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
-            .add_systems(PostUpdate, scene::rich_text::position_ruby
+            .add_systems(PostUpdate, (scene::rich_text::reveal_glyphs, scene::rich_text::position_ruby).chain()
                 .after(bevy::ui::widget::text_system)
                 .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
             .add_systems(

@@ -581,7 +581,8 @@ fn spawn_screen_node_entity(
             if layout.rich_text {
                 commands.entity(entity).insert((
                     super::rich_text::RichTextSource::new(text.clone(), layout),
-                    bevy::text::LineHeight::RelativeToFont(1.8),
+                    super::rich_text::RichGlyphs::default(),
+                    bevy::text::LineHeight::RelativeToFont(1.2),
                 ));
             }
             if layout.text_fit {

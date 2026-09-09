@@ -695,7 +695,7 @@ mod native_ui {
     fn ui_fit_text(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Text(_)) || draft.layout.rich_text {
-            return Err(NativeError::message("fitText requires a text node"));
+            return Err(NativeError::message("fitText requires a plain text node; richText uses wrapping layout"));
         }
         draft.layout.text_fit = true;
         Ok(node)
@@ -2194,6 +2194,9 @@ fn materialize_node(
             } else {
                 text
             };
+            if draft.layout.rich_text {
+                crate::rich_text::parse(&text).map_err(UiVmError::Invalid)?;
+            }
             Ok(ScreenNode::Text(TextNode {
                 binding: is_template.then(|| text.clone()),
                 reactive_text: if is_template { None } else { reactive },
@@ -2593,6 +2596,24 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rich_text_keeps_markup_and_reveal_as_separate_properties() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://ruby.ui.hks",
+            "import ui.widgets.*; global var count = 1; canvas { richText(\"{ruby:reader}Alice{/ruby}\").reveal(count) }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("rich text builds");
+        let ScreenNode::Text(text) = &screen.children[0] else { panic!("expected text") };
+        assert_eq!(text.text, "{ruby:reader}Alice{/ruby}");
+        assert!(text.layout.rich_text);
+        assert_eq!(text.layout.text_reveal, Some(1));
+        assert!(text.layout.reactive_text_reveal.is_some());
+        assert!(evaluate_ui_component_named_with_args(
+            "memory://invalid.ui.hks", "import ui.widgets.*; canvas { richText(\"{ruby:reader}Alice\") }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).is_err());
+    }
 
     #[test]
     fn image_button_has_independent_pressed_artwork() {
