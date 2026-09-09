@@ -9,6 +9,25 @@ use bevy::{
 #[derive(Clone, Debug, Message)]
 pub struct UiEffectMessage(pub UiEffect);
 
+#[derive(Component)]
+pub(crate) struct FitText { maximum: f32 }
+
+fn fitted_font_size(current: f32, maximum: f32, available: f32, measured: f32) -> f32 {
+    if available <= 0.0 || measured <= 0.0 { return current; }
+    (current * available / measured).min(maximum).max(0.1)
+}
+
+/// Uses shaped glyph bounds, not character counts (which break proportional
+/// fonts and localized text). Bevy stores text bounds in logical pixels;
+/// convert the physical UI node width before comparing, including on HiDPI.
+pub(crate) fn fit_screen_text(mut texts: Query<(&FitText, &ComputedNode, &bevy::text::TextLayoutInfo, &mut TextFont)>) {
+    for (fit, node, measured, mut font) in &mut texts {
+        let bevy::text::FontSize::Px(current) = font.font_size else { continue };
+        let next = fitted_font_size(current, fit.maximum, node.size().x * node.inverse_scale_factor(), measured.size.x);
+        if (next - current).abs() > 0.05 { font.font_size = next.into(); }
+    }
+}
+
 pub(super) fn clear_screen_ui(commands: &mut Commands, screen_state: &mut ScreenUiState) {
     for (root, _) in screen_state.stack.drain(..) {
         commands.entity(root).try_despawn();
@@ -506,12 +525,17 @@ fn spawn_screen_node_entity(
                     ui_text_font(ui_fonts, *size),
                     TextLayout::new(
                         justify_text_from_align(align.unwrap_or(0.0)),
-                        LineBreak::AnyCharacter,
+                        if layout.text_fit { LineBreak::NoWrap } else { LineBreak::AnyCharacter },
                     ),
                     TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
-                    default_text_outline(),
+                    if layout.text_shadow == Some(false) {
+                        TextShadow { offset: Vec2::ZERO, color: Color::NONE }
+                    } else { default_text_outline() },
                 ))
                 .id();
+            if layout.text_fit {
+                commands.entity(entity).insert(FitText { maximum: *size });
+            }
             if let Some(template) = binding {
                 commands.entity(entity).insert(UiTextBinding {
                     template: template.clone(),
@@ -633,7 +657,9 @@ fn spawn_screen_node_entity(
                     Text::new(text.clone()),
                     ui_text_font(ui_fonts, *size),
                     TextColor(initial_text_color),
-                    default_text_outline(),
+                    if layout.text_shadow == Some(false) {
+                        TextShadow { offset: Vec2::ZERO, color: Color::NONE }
+                    } else { default_text_outline() },
                 ))
                 .id();
             let button = commands
@@ -725,7 +751,9 @@ fn spawn_screen_node_entity(
             image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
-            let mut image = image_node(image, texture.rect);
+            let mut image = if layout.image_stretch {
+                stretched_image_node(image, texture.rect)
+            } else { image_node(image, texture.rect) };
             image.flip_x = layout.flip_x;
             let entity = commands
                 .spawn((ScreenUiNode, Pickable::IGNORE, image, node))
@@ -2020,6 +2048,26 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_line_fit_accounts_for_ui_scale() {
+        let mut app = App::new();
+        app.add_systems(Update, fit_screen_text);
+        let entity = app.world_mut().spawn((
+            FitText { maximum: 75.0 },
+            ComputedNode { size: Vec2::new(1000.0, 200.0), inverse_scale_factor: 0.5, ..default() },
+            bevy::text::TextLayoutInfo { size: Vec2::new(750.0, 75.0), ..default() },
+            TextFont::from_font_size(75.0),
+        )).id();
+        app.update();
+        assert_eq!(app.world().get::<TextFont>(entity).expect("text font").font_size, bevy::text::FontSize::Px(50.0));
+    }
+    #[test]
+    fn single_line_fit_shrinks_and_restores_without_exceeding_authored_size() {
+        assert_eq!(super::fitted_font_size(75.0, 75.0, 500.0, 750.0), 50.0);
+        assert_eq!(super::fitted_font_size(50.0, 75.0, 500.0, 250.0), 75.0);
+        assert_eq!(super::fitted_font_size(75.0, 75.0, 0.0, 750.0), 75.0);
+        assert_eq!(super::fitted_font_size(75.0, 75.0, 500.0, 0.0), 75.0);
+    }
     use std::{sync::Arc, time::Duration};
 
     use crate::scene::command_runtime::resolve_ui_component_path;

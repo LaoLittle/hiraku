@@ -78,6 +78,7 @@ pub struct DialogueRoot;
 pub struct DialogueAdvanceSurface;
 
 pub fn advance_dialogue_on_input(
+    dependencies: Option<Res<crate::dependencies::ScriptDependencies>>,
     mut actions: MessageReader<crate::input::HirakuActionInput>,
     mut clicks: MessageReader<Pointer<Click>>,
     mut dialogue_state: ResMut<DialogueState>,
@@ -107,6 +108,7 @@ pub fn advance_dialogue_on_input(
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
     if !crate::storage::storage_ready()
+        || dependencies.is_some_and(|d| d.loading)
         || choice_state.waiting.is_some()
         || screen_state.active_root.is_some()
         || screen_state.pending_root.is_some()

@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PictureState {
+    /// Frozen backing layers retained until the incoming image is ready and
+    /// its entrance finishes. Owned by this replacement, never by callbacks.
+    #[serde(default)]
+    pub previous: Vec<PictureState>,
     #[serde(default)]
     pub size: Option<[f32; 2]>,
     #[serde(default)]
@@ -111,6 +115,9 @@ pub enum PictureCommand {
 #[derive(Component)]
 pub(crate) struct PictureEntity(pub String);
 
+#[derive(Component)]
+pub(crate) struct PreviousPicture(usize);
+
 fn values(p: &PictureState) -> [f32; 5] {
     [p.position[0], p.position[1], p.scale, p.rotation, p.alpha]
 }
@@ -182,6 +189,19 @@ pub(super) fn apply_picture_command(
             seconds,
         } => {
             // Only an update to the same visible image may interpolate its pose.
+            let previous = pictures.get(&id).map(|old| {
+                let mut layers = old.previous.clone();
+                if (old.path != path || old.rect != rect) && old.alpha > 0.0 {
+                    let mut frozen = old.clone();
+                    frozen.previous.clear();
+                    frozen.motion = None;
+                    frozen.fade = None;
+                    frozen.tint_tween = None;
+                    frozen.blur_tween = None;
+                    layers.push(frozen);
+                }
+                layers
+            }).unwrap_or_default();
             let blur = pictures
                 .get(&id)
                 .map(|p| (p.blur_radius, p.blur_tween.clone()))
@@ -223,6 +243,7 @@ pub(super) fn apply_picture_command(
             pictures.insert(
                 id.clone(),
                 PictureState {
+                    previous,
                     size,
                     slice,
                     tint,
@@ -322,7 +343,7 @@ pub fn sync_pictures(
     assets: Res<AssetServer>,
     images: Res<Assets<Image>>,
     mut shared: ResMut<SceneSharedState>,
-    mut entities: Query<(Entity, &PictureEntity, &mut WorldSprite, &mut Transform)>,
+    mut entities: Query<(Entity, &PictureEntity, Option<&PreviousPicture>, &mut WorldSprite, &mut Transform)>,
 ) {
     let crate::state::SceneSnapshot {
         pictures, clips, ..
@@ -331,7 +352,8 @@ pub fn sync_pictures(
     // large picture must not consume the entire entrance before it is ready.
     let ready: HashSet<_> = entities
         .iter()
-        .filter_map(|(_, marker, sprite, _)| {
+        .filter_map(|(_, marker, previous, sprite, _)| {
+            if previous.is_some() { return None; }
             let image = sprite.image.as_ref()?;
             let picture = pictures.get(&marker.0)?;
             (images.contains(image.id())
@@ -346,15 +368,24 @@ pub fn sync_pictures(
         // Exit is independent of image readiness: hiding an unloaded image
         // must not retain it forever or wait for a failed download.
         let exiting = picture.fade.as_ref().is_some_and(|fade| fade.remove);
-        (!ready.contains(id) && !exiting) || tick_picture(picture, time.delta_secs())
+        if !ready.contains(id) && !exiting { return true; }
+        let keep = tick_picture(picture, time.delta_secs());
+        if picture.fade.is_none() && picture.motion.is_none() { picture.previous.clear(); }
+        keep
     });
+    let render_pictures: BTreeMap<_, _> = pictures.iter().flat_map(|(id, picture)| {
+        std::iter::once(((id.clone(), None), picture)).chain(
+            picture.previous.iter().enumerate().map(move |(i, p)| ((id.clone(), Some(i)), p))
+        )
+    }).collect();
     let mut existing = HashSet::new();
-    for (entity, marker, mut sprite, mut transform) in &mut entities {
-        let Some(picture) = pictures.get(&marker.0) else {
+    for (entity, marker, previous, mut sprite, mut transform) in &mut entities {
+        let key = (marker.0.clone(), previous.map(|p| p.0));
+        let Some(picture) = render_pictures.get(&key) else {
             commands.entity(entity).try_despawn();
             continue;
         };
-        existing.insert(marker.0.clone());
+        existing.insert(key.clone());
         let size = picture.size.map(Vec2::from_array);
         if sprite.custom_size != size {
             sprite.custom_size = size;
@@ -384,12 +415,16 @@ pub fn sync_pictures(
         if sprite.color != color {
             sprite.color = color;
         }
-        let next = picture_transform(picture, canvas.size.as_vec2());
+        let mut next = picture_transform(picture, canvas.size.as_vec2());
+        if let Some(index) = key.1 {
+            let incoming = &pictures[&marker.0];
+            next.translation.z = incoming.layer - (incoming.previous.len() - index) as f32 * 0.001;
+        }
         if *transform != next {
             *transform = next;
         }
     }
-    for (id, picture) in pictures.iter().filter(|(id, _)| !existing.contains(*id)) {
+    for ((id, previous), picture) in render_pictures.iter().filter(|(key, _)| !existing.contains(*key)) {
         let mut sprite = WorldSprite::from_image(assets.load(picture.path.clone()));
         sprite.custom_size = picture.size.map(Vec2::from_array);
         sprite.slice = picture.slice;
@@ -397,14 +432,19 @@ pub fn sync_pictures(
         sprite.rect = picture.rect;
         sprite.blur_radius = picture.blur_radius;
         sprite.color = picture_color(picture);
-        commands.spawn((
+        let mut transform = picture_transform(picture, canvas.size.as_vec2());
+        if let Some(index) = previous {
+            transform.translation.z = pictures[id].layer - (pictures[id].previous.len() - index) as f32 * 0.001;
+        }
+        let mut entity = commands.spawn((
             PictureEntity(id.clone()),
             BackgroundLayer {
                 path: picture.path.clone(),
             },
             sprite,
-            picture_transform(picture, canvas.size.as_vec2()),
+            transform,
         ));
+        if let Some(index) = previous { entity.insert(PreviousPicture(*index)); }
     }
 }
 
@@ -474,6 +514,7 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
             picture.fade = None;
         }
     }
+    if picture.fade.is_none() && picture.motion.is_none() { picture.previous.clear(); }
     true
 }
 
@@ -796,8 +837,16 @@ mod tests {
         assert_eq!(picture.scale, 1.0);
         assert_eq!(picture.rotation, 0.0);
         assert_eq!(picture.alpha, 0.0);
+        assert_eq!(picture.previous.len(), 1);
+        assert_eq!(picture.previous[0].alpha, 1.0);
         tick_picture(picture, 0.5);
         assert_eq!(picture.position, [50.0, 50.0]);
         assert_eq!(picture.alpha, 0.5);
+        assert_eq!(picture.previous[0].alpha, 1.0);
+        let encoded = hiraku_script::hson::to_string(picture).expect("save replacement layers");
+        let mut restored: PictureState = hiraku_script::hson::from_str(&encoded).expect("restore replacement layers");
+        tick_picture(&mut restored, 0.5);
+        assert!(restored.previous.is_empty());
+        assert_eq!(restored.path, "pictures/bob.png");
     }
 }

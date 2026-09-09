@@ -16,7 +16,7 @@ members = [
     "hiraku_ui",
     "hiraku_uastc",
     "hiraku_uastc/build"
-]
+, "hiraku_tools"]
 
 [workspace.package]
 version = "0.1.0"

@@ -655,6 +655,32 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "stretch", receiver)]
+    fn ui_stretch(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Image(_)) {
+            return Err(NativeError::message("stretch requires an image node"));
+        }
+        draft.layout.image_stretch = true;
+        Ok(node)
+    }
+
+    #[hks(name = "textShadow", receiver)]
+    fn ui_text_shadow(context: &mut UiVmContext, node: UiNodeHandle, enabled: bool) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.layout.text_shadow = Some(enabled);
+        Ok(node)
+    }
+
+    #[hks(name = "fitText", receiver)]
+    fn ui_fit_text(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Text(_)) {
+            return Err(NativeError::message("fitText requires a text node"));
+        }
+        draft.layout.text_fit = true;
+        Ok(node)
+    }
+
     #[hks(name = "flipX", receiver)]
     fn ui_flip_x(
         context: &mut UiVmContext,
@@ -2390,11 +2416,13 @@ fn materialize_node(
                             "hovered artwork requires an image button".into(),
                         ));
                     }
-                    let (text, size, align, children) = match normal {
-                        ScreenNode::Text(text) => (text.text, text.size, text.align, Vec::new()),
-                        content => (String::new(), 16.0, None, vec![content]),
+                    let (text, size, align, children, text_color, text_shadow) = match normal {
+                        ScreenNode::Text(text) => (text.text, text.size, text.align, Vec::new(), text.color, text.layout.text_shadow),
+                        content => (String::new(), 16.0, None, vec![content], None, None),
                     };
                     let custom_content = !children.is_empty();
+                    let mut layout = draft.layout;
+                    if layout.text_shadow.is_none() { layout.text_shadow = text_shadow; }
                     Ok(ScreenNode::Button(ButtonNode {
                         children,
                         text,
@@ -2404,7 +2432,7 @@ fn materialize_node(
                         enabled_binding: None,
                         reactive_enabled,
                         size,
-                        color: None,
+                        color: text_color,
                         hovered_color: None,
                         pressed_color: None,
                         insensitive_color: None,
@@ -2429,7 +2457,7 @@ fn materialize_node(
                         padding_y: custom_content.then_some(0.0),
                         border_width: custom_content.then_some(0.0),
                         radius: custom_content.then_some(0.0),
-                        layout: draft.layout,
+                        layout,
                     }))
                 }
                 ScreenNode::Image(image) => {
@@ -2638,7 +2666,7 @@ mod tests {
                 canvas {
                     column {
                         image("save-thumbnail://alice").at(.abs(-10, -8))
-                            .size(.abs(100, 100)).flipX()
+                            .size(.abs(100, 100)).flipX().stretch()
                     }.size(.abs(80, 84)).clip()
                 }
             "#,
@@ -2656,8 +2684,32 @@ mod tests {
             panic!("expected image");
         };
         assert!(image.layout.flip_x);
+        assert!(image.layout.image_stretch);
         assert_eq!(image.layout.left, Some(-10.0));
         assert_eq!(image.layout.top, Some(-8.0));
+    }
+
+    #[test]
+    fn button_keeps_authored_text_color_and_shadow() {
+        let evaluate = |source: &str| evaluate_ui_component_named_with_args(
+            "memory://typography.ui.hks", source, UiContext::default(),
+            &TextureCatalog::default(), &TermCatalog::default(), &[],
+        );
+        let screen = evaluate(r#"
+            import ui.widgets.*
+            canvas {
+                button { text("Alice").color(0.2, 0.3, 0.4, 1).textShadow(false) }
+                text("Bob").textShadow(false).fitText()
+            }
+        "#).expect("authored typography");
+        let ScreenNode::Button(button) = &screen.children[0] else { panic!("expected button"); };
+        assert_eq!(button.color, Some([0.2, 0.3, 0.4, 1.0]));
+        assert_eq!(button.layout.text_shadow, Some(false));
+        let ScreenNode::Text(text) = &screen.children[1] else { panic!("expected text"); };
+        assert_eq!(text.layout.text_shadow, Some(false));
+        assert!(text.layout.text_fit);
+        assert!(evaluate("import ui.widgets.*; canvas { column {}.fitText() }").is_err());
+        assert!(evaluate("import ui.widgets.*; canvas { text(\"Alice\").stretch() }").is_err());
     }
 
     #[test]

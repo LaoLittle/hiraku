@@ -695,6 +695,7 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                previous: Vec::new(),
                 size: Some([640.0, 320.0]),
                 slice: Some([20.0; 4]),
                 tint: [0.5, 0.75, 1.0, 1.0],

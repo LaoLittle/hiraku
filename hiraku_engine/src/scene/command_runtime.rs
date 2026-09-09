@@ -96,6 +96,7 @@ pub struct RenderAssetCommandContext<'w> {
 
 #[derive(SystemParam)]
 pub struct SceneCommandContext<'w, 's> {
+    pub dependencies: ResMut<'w, crate::dependencies::ScriptDependencies>,
     pub commands: Commands<'w, 's>,
     pub app_exit: MessageWriter<'w, AppExit>,
     pub asset_server: Res<'w, AssetServer>,
@@ -115,6 +116,7 @@ pub struct SceneCommandContext<'w, 's> {
 }
 
 pub fn process_script_commands(ctx: SceneCommandContext) {
+    let mut dependencies = ctx.dependencies;
     let ui = ctx.ui;
     let execution = ctx.execution;
     let mut render_assets = ctx.render_assets;
@@ -155,8 +157,29 @@ pub fn process_script_commands(ctx: SceneCommandContext) {
     let mut line_text = ui.line_text;
     let line_text_entity = ui.line_text_entity;
 
-    while crate::storage::storage_ready()
-        && let Some(queued) = pending_script_commands.dispatch_next() {
+    while crate::storage::storage_ready() {
+        // Inspect without consuming the command: its sequence and the caller
+        // remain intact throughout asynchronous preload.
+        if let Some(SequencedScriptCommand { command: ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation)), .. }) = pending_script_commands.items.front() {
+            let target = vfs.0.resolve_path(navigation.origin.as_deref().or(script_runtime.current_script.as_deref()), &navigation.path);
+            let mut required = vec![target];
+            if navigation.kind == NavigationKind::Call {
+                required.extend(script_runtime.current_script.iter().cloned());
+                required.extend(script_runtime.call_stack.iter().map(|f| f.script.clone()));
+            }
+            match dependencies.prepare(&vfs.0, &asset_server, &required) {
+                Ok(false) => break,
+                Err(error) => {
+                    crate::script::emit_script_diagnostic("failed to preload script:", &error);
+                    pending_script_commands.clear();
+                    dependencies.loading = true;
+                    dependencies.error = Some(error);
+                    break;
+                }
+                Ok(true) => (),
+            }
+        }
+        let Some(queued) = pending_script_commands.dispatch_next() else { break; };
         let command = queued.command;
         if screen_state.active_root.is_some()
             && screen_state.waiting.is_none()

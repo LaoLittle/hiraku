@@ -245,6 +245,7 @@ pub(crate) fn resolve_ui_component_path(
 }
 
 pub fn drive_story_runtime(
+    dependencies: Res<crate::dependencies::ScriptDependencies>,
     mut runtime: ResMut<ScriptRuntimeState>,
     mut response_messages: MessageReader<ScriptResponseMessage>,
     mut pending_script_commands: ResMut<PendingScriptCommands>,
@@ -271,7 +272,7 @@ pub fn drive_story_runtime(
         }
     }
 
-    if !crate::storage::storage_ready() { return; }
+    if !crate::storage::storage_ready() || dependencies.loading { return; }
 
     if let Some(request) = runtime.wait_request
         && let Some(response) = runtime.take_response(request)

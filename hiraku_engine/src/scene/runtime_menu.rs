@@ -132,7 +132,12 @@ fn restore_frontend_scene(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext, mut deferred: Local<Vec<crate::ui::UiEffect>>) {
+pub fn handle_runtime_menu_buttons(mut ctx: RuntimeMenuContext, mut deferred: Local<Vec<crate::ui::UiEffect>>, dependencies: Option<Res<crate::dependencies::ScriptDependencies>>) {
+    if dependencies.is_some_and(|d| d.loading) {
+        ctx.clicks.clear();
+        ctx.widget_callbacks.clear();
+        return;
+    }
     if !crate::storage::storage_ready() {
         ctx.clicks.clear();
         ctx.widget_callbacks.clear();

@@ -6,6 +6,7 @@
 //! chunk encryption.
 
 mod codec;
+pub mod dependencies;
 mod error;
 mod format;
 mod reader;

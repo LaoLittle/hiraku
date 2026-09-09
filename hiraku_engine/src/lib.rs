@@ -2,6 +2,7 @@ mod assets;
 mod audio;
 mod character;
 mod data;
+pub mod dependencies;
 mod effect;
 mod glossary;
 pub mod input;
@@ -260,6 +261,10 @@ impl Plugin for HirakuPlugin {
             .add_systems(PreStartup, storage::initialize_runtime_storage)
             .add_systems(First, storage::poll_runtime_storage)
             .init_resource::<ScriptRuntimeState>()
+            .init_resource::<dependencies::ScriptDependencies>()
+            .init_resource::<dependencies::LoadingScreen>()
+            .add_systems(PostUpdate, dependencies::loading_screen)
+            .add_systems(PostUpdate, scene::loading::sync)
             .init_resource::<UiModels>()
             .init_resource::<scene::PendingMovieWaits>()
             .add_message::<ScriptResponseMessage>()
@@ -389,6 +394,7 @@ impl Plugin for HirakuPlugin {
                     .before(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
+            .add_systems(PostUpdate, scene::fit_screen_text.after(bevy::ui::widget::text_system))
             .add_systems(
                 Update,
                 handle_choice_buttons
@@ -536,6 +542,8 @@ fn runtime_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool {
 
 fn boot_runtime(
     vfs: Res<VfsResource>,
+    assets: Res<AssetServer>,
+    mut dependencies: ResMut<dependencies::ScriptDependencies>,
     user_settings: Res<storage::UserSettings>,
     mut script_runtime: ResMut<ScriptRuntimeState>,
     mut booted: Local<bool>,
@@ -545,6 +553,15 @@ fn boot_runtime(
     }
     match vfs.0.load_startup_script_path() {
         Ok(startup_script) => {
+            match dependencies.prepare(&vfs.0, &assets, std::slice::from_ref(&startup_script)) {
+                Ok(false) => return,
+                Err(error) => {
+                    script::emit_script_diagnostic("failed to preload startup:", &error);
+                    *booted = true;
+                    return;
+                }
+                Ok(true) => (),
+            }
             info!("startup script: {startup_script}");
             let result = vfs
                 .0

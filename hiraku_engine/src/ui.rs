@@ -198,6 +198,15 @@ pub struct InputNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    /// Opt into Unity-style RectTransform image stretching instead of contain.
+    #[serde(default)]
+    pub image_stretch: bool,
+    /// None preserves the standard text shadow; false is useful on paper UI.
+    #[serde(default)]
+    pub text_shadow: Option<bool>,
+    /// Keep text on one line and shrink its font to the available width.
+    #[serde(default)]
+    pub text_fit: bool,
     /// Clip descendants to this node's bounds without creating a scroll area.
     #[serde(default)]
     pub clip: bool,
