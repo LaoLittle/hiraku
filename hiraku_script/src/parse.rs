@@ -69,6 +69,10 @@ enum TokenKind {
     GreaterEqual,
     Question,
     Bang,
+    Amp,
+    Pipe,
+    AndAnd,
+    OrOr,
     Lt,
     Gt,
     Plus,
@@ -165,6 +169,22 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::At => TokenKind::At,
                 RawToken::Question => TokenKind::Question,
                 RawToken::Bang => TokenKind::Bang,
+                RawToken::And | RawToken::Or => {
+                    let (single, double) = if matches!(raw.kind, RawToken::And) {
+                        (TokenKind::Amp, TokenKind::AndAnd)
+                    } else {
+                        (TokenKind::Pipe, TokenKind::OrOr)
+                    };
+                    if let Some(previous) = tokens.last_mut()
+                        && previous.kind == single
+                        && previous.span.end == start
+                    {
+                        previous.kind = double;
+                        previous.span.end = span.end;
+                        continue;
+                    }
+                    single
+                }
                 RawToken::Lt => TokenKind::Lt,
                 RawToken::Gt => TokenKind::Gt,
                 RawToken::OpenParen => TokenKind::LParen,
@@ -1102,7 +1122,7 @@ impl Parser {
     }
 
     fn parse_elvis(&mut self, allow_trailing_block: bool) -> Expr {
-        let mut expression = self.parse_equality(allow_trailing_block);
+        let mut expression = self.parse_or(allow_trailing_block);
         if self.at(TokenKind::Question) && matches!(self.peek().kind, TokenKind::Colon) {
             self.advance();
             self.advance();
@@ -1115,6 +1135,28 @@ impl Parser {
                 },
                 span,
             };
+        }
+        expression
+    }
+
+    fn parse_or(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_and(allow_trailing_block);
+        while self.at(TokenKind::OrOr) {
+            self.advance();
+            self.skip_newlines();
+            let right = self.parse_and(false);
+            expression = binary_expression(expression, BinaryOp::Or, right);
+        }
+        expression
+    }
+
+    fn parse_and(&mut self, allow_trailing_block: bool) -> Expr {
+        let mut expression = self.parse_equality(allow_trailing_block);
+        while self.at(TokenKind::AndAnd) {
+            self.advance();
+            self.skip_newlines();
+            let right = self.parse_equality(false);
+            expression = binary_expression(expression, BinaryOp::And, right);
         }
         expression
     }
@@ -1167,7 +1209,7 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self, allow_trailing_block: bool) -> Expr {
-        let mut expression = self.parse_postfix(allow_trailing_block);
+        let mut expression = self.parse_unary(allow_trailing_block);
         loop {
             let operator = match self.current().kind {
                 TokenKind::Star => BinaryOp::Multiply,
@@ -1175,10 +1217,27 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.parse_postfix(false);
+            let right = self.parse_unary(false);
             expression = binary_expression(expression, operator, right);
         }
         expression
+    }
+
+    fn parse_unary(&mut self, allow_trailing_block: bool) -> Expr {
+        if self.at(TokenKind::Bang) || self.at(TokenKind::Minus) {
+            let token = self.advance();
+            let value = self.parse_unary(allow_trailing_block);
+            let span = Span::join(&token.span, &value.span);
+            return Expr {
+                kind: if token.kind == TokenKind::Bang {
+                    ExprKind::Not(Box::new(value))
+                } else {
+                    ExprKind::UnaryMinus(Box::new(value))
+                },
+                span,
+            };
+        }
+        self.parse_postfix(allow_trailing_block)
     }
 
     fn parse_postfix(&mut self, allow_trailing_block: bool) -> Expr {
@@ -1273,7 +1332,11 @@ impl Parser {
             let type_arguments = self.try_parse_call_type_arguments();
             if self.at(TokenKind::LParen) {
                 let mut arguments = self.parse_arguments();
-                let trailing = self.parse_optional_trailing_callable();
+                let trailing = if allow_trailing_block {
+                    self.parse_optional_trailing_callable()
+                } else {
+                    None
+                };
                 let end = trailing
                     .as_ref()
                     .map(|expression| expression.span.clone())
@@ -1446,14 +1509,6 @@ impl Parser {
                     span,
                 }
             }
-            TokenKind::Minus => {
-                let value = self.parse_primary();
-                let span = Span::join(&token.span, &value.span);
-                Expr {
-                    kind: ExprKind::UnaryMinus(Box::new(value)),
-                    span,
-                }
-            }
             TokenKind::Dot if self.at(TokenKind::LBrace) => self.parse_map(token.span.start),
             TokenKind::Dot => match self.advance().kind {
                 TokenKind::Ident(name) => Expr {
@@ -1501,6 +1556,7 @@ impl Parser {
 
     fn parse_tuple(&mut self, start: usize) -> Expr {
         let mut values = Vec::new();
+        let mut has_comma = false;
         self.skip_newlines();
         if self.at(TokenKind::RParen) {
             let end = self.advance().span.end;
@@ -1513,8 +1569,12 @@ impl Parser {
             values.push(self.parse_expression());
             self.skip_newlines();
             if self.at(TokenKind::Comma) {
+                has_comma = true;
                 self.advance();
                 self.skip_newlines();
+                if self.at(TokenKind::RParen) {
+                    break;
+                }
                 continue;
             }
             break;
@@ -1523,6 +1583,9 @@ impl Parser {
             .expect(TokenKind::RParen, "expected `)` after tuple")
             .span
             .end;
+        if values.len() == 1 && !has_comma {
+            return values.pop().expect("one parenthesized expression");
+        }
         Expr {
             kind: ExprKind::Tuple(values),
             span: Span { start, end },
@@ -1775,6 +1838,24 @@ mod tests {
     fn parses_unit_literal_separately_from_tuples() {
         assert_eq!(expression("()").kind, ExprKind::Unit);
         assert!(matches!(expression("(1, 2)").kind, ExprKind::Tuple(values) if values.len() == 2));
+        assert!(matches!(expression("(true)").kind, ExprKind::Bool(true)));
+        assert!(matches!(expression("(true,)").kind, ExprKind::Tuple(values) if values.len() == 1));
+        assert!(
+            matches!(expression("(true, false,)").kind, ExprKind::Tuple(values) if values.len() == 2)
+        );
+    }
+
+    #[test]
+    fn conditions_do_not_consume_their_body_as_a_trailing_call_closure() {
+        for source in [
+            "if ready() { return }",
+            "if ready() && enabled() { return }",
+            "while count < limit() { count += 1 }",
+            "if !ready() { return }",
+        ] {
+            parse_program(source).expect("condition body remains a statement block");
+        }
+        parse_program("button(\"label\") { clicked() }").expect("ordinary trailing closures still parse");
     }
 
     #[test]

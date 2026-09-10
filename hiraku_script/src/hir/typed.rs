@@ -1159,6 +1159,31 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let ty = ScriptType::Symbol;
                 (HirExprKind::Symbol(symbol), ty)
             }
+            ExprKind::Not(value) => {
+                let value = self.lower_expression(value);
+                if !ScriptType::Bool.accepts(self.expression_type(value)) {
+                    self.error(
+                        format!(
+                            "operator `!` expects Bool, got {:?}",
+                            self.expression_type(value)
+                        ),
+                        value.span,
+                    );
+                }
+                let falsy = self.alloc_expression(
+                    HirExprKind::Literal(HirLiteral::Bool(false)),
+                    ScriptType::Bool,
+                    expression.span,
+                );
+                (
+                    HirExprKind::Binary {
+                        left: value,
+                        op: BinaryOp::Equal,
+                        right: falsy,
+                    },
+                    ScriptType::Bool,
+                )
+            }
             ExprKind::UnaryMinus(value) => {
                 let value = self.lower_expression(value);
                 (
@@ -1702,7 +1727,27 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let left_syntax = left;
                 let right_syntax = right;
                 let mut left = self.lower_expression(left);
+                let (truthy, falsy) = self.condition_refinements(left_syntax);
+                self.refinements.push(match op {
+                    BinaryOp::And => truthy,
+                    BinaryOp::Or => falsy,
+                    _ => BTreeMap::new(),
+                });
                 let mut right = self.lower_expression(right);
+                self.refinements.pop();
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    for operand in [left, right] {
+                        if !ScriptType::Bool.accepts(self.expression_type(operand)) {
+                            self.error(
+                                format!(
+                                    "logical operator expects Bool, got {:?}",
+                                    self.expression_type(operand)
+                                ),
+                                operand.span,
+                            );
+                        }
+                    }
+                }
                 if self.expression_type(left) == &ScriptType::Float
                     && self.expression_type(right) == &ScriptType::Int
                 {
@@ -1721,6 +1766,39 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         &self.expression_type(left).clone(),
                         left.span,
                     );
+                }
+                if matches!(
+                    op,
+                    BinaryOp::Less
+                        | BinaryOp::LessEqual
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEqual
+                ) {
+                    for operand in [left, right] {
+                        if !matches!(
+                            self.expression_type(operand),
+                            ScriptType::Int | ScriptType::Float | ScriptType::Never
+                        ) {
+                            self.error(
+                                format!(
+                                    "ordered comparison expects Int or Float, got {:?}",
+                                    self.expression_type(operand)
+                                ),
+                                operand.span,
+                            );
+                        }
+                    }
+                }
+                if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
+                    let left_type = self.expression_type(left);
+                    let right_type = self.expression_type(right);
+                    if left_type != &ScriptType::Any
+                        && right_type != &ScriptType::Any
+                        && !left_type.accepts(right_type)
+                        && !right_type.accepts(left_type)
+                    {
+                        self.error(format!("equality requires compatible operand types, got {left_type:?} and {right_type:?}"), expression.span);
+                    }
                 }
                 if let Some(builtin) = self.manifest.and_then(|manifest| {
                     manifest.resolve_operator(match op {
@@ -2611,9 +2689,26 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         BTreeMap<HirLocalId, ScriptType>,
         BTreeMap<HirLocalId, ScriptType>,
     ) {
+        if let ExprKind::Not(value) = &condition.kind {
+            let (truthy, falsy) = self.condition_refinements(value);
+            return (falsy, truthy);
+        }
         let ExprKind::Binary { left, op, right } = &condition.kind else {
             return (BTreeMap::new(), BTreeMap::new());
         };
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            let (mut lt, mut lf) = self.condition_refinements(left);
+            let (rt, rf) = self.condition_refinements(right);
+            if *op == BinaryOp::And {
+                lt.extend(rt);
+                // Either operand can make the expression false.
+                lf.retain(|id, ty| rf.get(id) == Some(ty));
+            } else {
+                lt.retain(|id, ty| rt.get(id) == Some(ty));
+                lf.extend(rf);
+            }
+            return (lt, lf);
+        }
         let name = match (&left.kind, &right.kind) {
             (ExprKind::Ident(name), ExprKind::Null) | (ExprKind::Null, ExprKind::Ident(name)) => {
                 name
@@ -3192,7 +3287,9 @@ fn member_type(object: &ScriptType, member: &str) -> ScriptType {
 
 fn binary_type(op: BinaryOp, left: &ScriptType, right: &ScriptType) -> ScriptType {
     match op {
-        BinaryOp::Equal
+        BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Equal
         | BinaryOp::NotEqual
         | BinaryOp::Less
         | BinaryOp::LessEqual

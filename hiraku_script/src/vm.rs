@@ -2050,6 +2050,9 @@ fn set_member(value: &mut Value, name: &str, new_value: Value) -> Result<(), VmE
 fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmError> {
     use crate::BinaryOp;
     match op {
+        BinaryOp::And | BinaryOp::Or => Err(VmError::TypeMismatch(
+            "logical operators must be lowered to branches",
+        )),
         BinaryOp::Equal => Ok(Value::Bool(left == right)),
         BinaryOp::NotEqual => Ok(Value::Bool(left != right)),
         BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
@@ -2395,6 +2398,185 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn boolean_expressions_short_circuit_and_survive_instruction_snapshots() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let source = r#"
+            global var calls = 0
+            fn probe() -> Bool { calls += 1; true }
+            let state = .{ finished: false }
+            let optional: Bool? = true
+            global let results = [
+                !state.finished, !(false || true), !!true, !optional!,
+                true || false && false, (true || false) && false,
+                false && probe(), true || probe(), true && probe(), false || probe(),
+                false && (unreachable() as! Bool), true || (unreachable() as! Bool)
+            ]
+            var finished = false
+            var count = 0
+            while !finished && count < 4 {
+                count += 1
+                finished = count == 3
+            }
+            global let iterations = count
+        "#;
+        let code = Arc::new(compile(source, &manifest));
+        let mut vm = Vm::new(code.clone()).expect("VM initializes");
+        for _ in 0..2000 {
+            let snapshot = crate::hson::from_str(
+                &crate::hson::to_string(&vm.snapshot()).expect("snapshot serializes"),
+            )
+            .expect("snapshot parses");
+            vm = Vm::restore(code.clone(), snapshot).expect("snapshot restores");
+            if matches!(
+                vm.step_with_budget(&mut 1).expect("boolean program runs"),
+                Some(VmEvent::Completed(_))
+            ) {
+                assert_eq!(vm.globals()[0], Value::Number(2.0));
+                assert_eq!(
+                    vm.globals()[1],
+                    Value::List(
+                        [
+                            true, false, true, false, true, false, false, true, true, true, false,
+                            true
+                        ]
+                        .into_iter()
+                        .map(Value::Bool)
+                        .collect()
+                    )
+                );
+                assert_eq!(vm.globals()[2], Value::Number(3.0));
+                return;
+            }
+        }
+        panic!("boolean program exceeded instruction budget");
+    }
+
+    #[test]
+    fn boolean_operators_reject_non_bool_even_in_unreachable_operands() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for source in [
+            "let value = !1",
+            "let value = !\"false\"",
+            "let value = false && 1",
+            "let value = true || 1",
+            "let value: Bool? = true; !value",
+            "let value: Any = true; !value",
+            "if 1 {}",
+            "while \"true\" {}",
+            "let result = true == 1",
+            "let result = false < true",
+        ] {
+            let program = parse_program(source).expect("invalid types still parse");
+            let error = compile_with_manifest(&program, 91, &manifest).expect_err(source);
+            assert!(format!("{error:?}").contains("Bool"), "{source}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn boolean_rhs_can_wait_for_a_native_response() {
+        let mut registry = crate::native::NativeRegistry::<()>::default();
+        registry
+            .register_fn(
+                "probe",
+                |_: &mut ()| -> Result<bool, crate::native::NativeError> { Ok(true) },
+            )
+            .expect("native function registers");
+        registry
+            .set_signature_for(
+                "probe",
+                crate::FunctionSignature {
+                    receiver: None,
+                    parameters: Vec::new(),
+                    variadic: None,
+                    result: crate::ScriptType::Bool,
+                },
+            )
+            .expect("Bool signature registers");
+        for (expression, response, expected) in [
+            ("true && probe()", false, false),
+            ("false || probe()", true, true),
+            ("!probe()", false, true),
+        ] {
+            let code = Arc::new(compile(
+                &format!("global let result = {expression}"),
+                &registry.manifest(),
+            ));
+            let mut vm = Vm::new(code.clone()).expect("VM initializes");
+            let mut calls = 0;
+            for _ in 0..100 {
+                match vm.step().expect("boolean call runs") {
+                    Some(VmEvent::Call(_)) => {
+                        calls += 1;
+                        vm = Vm::restore(code.clone(), vm.snapshot()).expect("host wait restores");
+                        vm.resume(Value::Bool(response))
+                            .expect("native response resumes");
+                    }
+                    Some(VmEvent::Completed(_)) => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(calls, 1);
+            assert_eq!(vm.globals(), &[Value::Bool(expected)]);
+        }
+    }
+
+    #[test]
+    fn boolean_conditions_narrow_optional_operands() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = Arc::new(compile(
+            r#"
+            fn positive(value: Int) -> Bool { value > 0 }
+            let value: Int? = 2
+            global let andResult = value != null && positive(value)
+            global let orResult = value == null || positive(value)
+            global var negated = false
+            if !(value == null) { negated = positive(value) }
+        "#,
+            &manifest,
+        ));
+        let mut vm = Vm::new(code).expect("VM initializes");
+        for _ in 0..100 {
+            if matches!(
+                vm.step().expect("narrowed program runs"),
+                Some(VmEvent::Completed(_))
+            ) {
+                assert_eq!(
+                    vm.globals(),
+                    &[Value::Bool(true), Value::Bool(true), Value::Bool(true)]
+                );
+                return;
+            }
+        }
+        panic!("narrowed program did not finish");
+    }
+
+    #[test]
+    fn boolean_constants_support_logical_and_comparison_operators() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = Arc::new(compile(
+            r#"
+            const ready: Bool = !false && (1 <= 2 || false)
+            const same = "alice" == "alice"
+            const other = 2 != 1 && 3 >= 2 && 3 > 1
+            const shortCircuit = true || (1 / 0 > 0)
+            global let result = ready && same && other && shortCircuit
+        "#,
+            &manifest,
+        ));
+        let mut vm = Vm::new(code).expect("VM initializes");
+        for _ in 0..100 {
+            if matches!(
+                vm.step().expect("constant program runs"),
+                Some(VmEvent::Completed(_))
+            ) {
+                assert_eq!(vm.globals(), &[Value::Bool(true)]);
+                return;
+            }
+        }
+        panic!("constant program did not finish");
     }
 
     #[test]

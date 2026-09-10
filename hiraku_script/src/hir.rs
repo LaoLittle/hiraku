@@ -224,9 +224,10 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
             intern_expression(object, symbols);
             symbols.intern(name);
         }
-        ExprKind::Binding(value) | ExprKind::UnaryMinus(value) | ExprKind::NonNull(value) => {
-            intern_expression(value, symbols)
-        }
+        ExprKind::Binding(value)
+        | ExprKind::Not(value)
+        | ExprKind::UnaryMinus(value)
+        | ExprKind::NonNull(value) => intern_expression(value, symbols),
         ExprKind::Cast { value, ty, .. } => {
             intern_expression(value, symbols);
             intern_type(ty, symbols);

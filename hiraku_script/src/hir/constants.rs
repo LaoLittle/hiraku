@@ -6,6 +6,16 @@ use std::collections::BTreeMap;
 type Constants = BTreeMap<String, Expr>;
 
 pub(super) fn evaluate(expr: &Expr, constants: &Constants) -> Result<Expr, LoweringError> {
+    evaluate_scalar(expr, constants, true)
+}
+
+// Skipped logical operands still have to be well-typed constant expressions,
+// but must not execute arithmetic (for example, division by zero).
+fn evaluate_scalar(
+    expr: &Expr,
+    constants: &Constants,
+    execute: bool,
+) -> Result<Expr, LoweringError> {
     let fail = || {
         LoweringError { message: "constant initializer must be a compile-time scalar expression; calls and mutable objects are not constant".into(), span: expr.span }
     };
@@ -13,7 +23,11 @@ pub(super) fn evaluate(expr: &Expr, constants: &Constants) -> Result<Expr, Lower
         ExprKind::Unit | ExprKind::Bool(_) | ExprKind::Number { .. } => expr.kind.clone(),
         ExprKind::String(value) if !value.contains("${") => expr.kind.clone(),
         ExprKind::Ident(name) => constants.get(name).ok_or_else(fail)?.kind.clone(),
-        ExprKind::UnaryMinus(value) => match evaluate(value, constants)?.kind {
+        ExprKind::Not(value) => match evaluate_scalar(value, constants, execute)?.kind {
+            ExprKind::Bool(value) => ExprKind::Bool(!value),
+            _ => return Err(fail()),
+        },
+        ExprKind::UnaryMinus(value) => match evaluate_scalar(value, constants, execute)?.kind {
             ExprKind::Number { value, unit } => ExprKind::Number {
                 value: -value,
                 unit,
@@ -21,9 +35,20 @@ pub(super) fn evaluate(expr: &Expr, constants: &Constants) -> Result<Expr, Lower
             _ => return Err(fail()),
         },
         ExprKind::Binary { left, op, right } => {
-            let left = evaluate(left, constants)?.kind;
-            let right = evaluate(right, constants)?.kind;
+            let left = evaluate_scalar(left, constants, execute)?.kind;
+            let skipped = matches!(
+                (&left, op),
+                (ExprKind::Bool(false), BinaryOp::And) | (ExprKind::Bool(true), BinaryOp::Or)
+            );
+            let right = evaluate_scalar(right, constants, execute && !skipped)?.kind;
             match (left, right) {
+                (ExprKind::Bool(a), ExprKind::Bool(b)) => ExprKind::Bool(match op {
+                    BinaryOp::And => a && b,
+                    BinaryOp::Or => a || b,
+                    BinaryOp::Equal => a == b,
+                    BinaryOp::NotEqual => a != b,
+                    _ => return Err(fail()),
+                }),
                 (
                     ExprKind::Number {
                         value: a,
@@ -35,19 +60,34 @@ pub(super) fn evaluate(expr: &Expr, constants: &Constants) -> Result<Expr, Lower
                     },
                 ) => {
                     let value = match op {
+                        BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                            if !execute =>
+                        {
+                            0.0
+                        }
                         BinaryOp::Add => a + b,
                         BinaryOp::Subtract => a - b,
                         BinaryOp::Multiply => a * b,
                         BinaryOp::Divide if b != 0.0 => a / b,
-                        BinaryOp::Equal => {
+                        BinaryOp::Equal
+                        | BinaryOp::NotEqual
+                        | BinaryOp::Less
+                        | BinaryOp::LessEqual
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEqual => {
                             return Ok(Expr {
-                                kind: ExprKind::Bool(a == b),
-                                span: expr.span,
-                            });
-                        }
-                        BinaryOp::Less => {
-                            return Ok(Expr {
-                                kind: ExprKind::Bool(a < b),
+                                kind: ExprKind::Bool(match op {
+                                    BinaryOp::Equal => a == b,
+                                    BinaryOp::NotEqual => a != b,
+                                    BinaryOp::Less => a < b,
+                                    BinaryOp::LessEqual => a <= b,
+                                    BinaryOp::Greater => a > b,
+                                    BinaryOp::GreaterEqual => a >= b,
+                                    _ => unreachable!("comparison operator"),
+                                }),
                                 span: expr.span,
                             });
                         }
@@ -63,6 +103,11 @@ pub(super) fn evaluate(expr: &Expr, constants: &Constants) -> Result<Expr, Lower
                 }
                 (ExprKind::String(a), ExprKind::String(b)) if *op == BinaryOp::Add => {
                     ExprKind::String(a + &b)
+                }
+                (ExprKind::String(a), ExprKind::String(b))
+                    if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) =>
+                {
+                    ExprKind::Bool((a == b) == (*op == BinaryOp::Equal))
                 }
                 _ => return Err(fail()),
             }
@@ -194,6 +239,7 @@ fn expression(expr: &mut Expr, constants: &Constants) -> Result<(), LoweringErro
             expression(object, constants)?
         }
         ExprKind::UnaryMinus(value)
+        | ExprKind::Not(value)
         | ExprKind::Binding(value)
         | ExprKind::NonNull(value)
         | ExprKind::Cast { value, .. } => expression(value, constants)?,

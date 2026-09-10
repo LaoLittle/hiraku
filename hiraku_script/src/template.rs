@@ -150,6 +150,12 @@ fn evaluate_ast(
                 value => Ok(value),
             }
         }
+        ExprKind::Not(value) => match evaluate_ast(value, context)? {
+            Value::Bool(value) => Ok(Value::Bool(!value)),
+            _ => Err(TemplateError::UnsupportedExpression(
+                "operator `!` expects Bool".into(),
+            )),
+        },
         ExprKind::UnaryMinus(value) => match evaluate_ast(value, context)? {
             Value::Number(value) => Ok(Value::Number(-value)),
             _ => Err(TemplateError::UnsupportedExpression(
@@ -158,8 +164,27 @@ fn evaluate_ast(
         },
         ExprKind::Binary { left, op, right } => {
             let left = evaluate_ast(left, context)?;
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                let Value::Bool(left) = left else {
+                    return Err(TemplateError::UnsupportedExpression(
+                        "logical operator expects Bool".into(),
+                    ));
+                };
+                if left == (*op == BinaryOp::Or) {
+                    return Ok(Value::Bool(left));
+                }
+                return match evaluate_ast(right, context)? {
+                    Value::Bool(value) => Ok(Value::Bool(value)),
+                    _ => Err(TemplateError::UnsupportedExpression(
+                        "logical operator expects Bool".into(),
+                    )),
+                };
+            }
             let right = evaluate_ast(right, context)?;
             match op {
+                BinaryOp::And | BinaryOp::Or => {
+                    unreachable!("logical operators short circuit above")
+                }
                 BinaryOp::Equal => Ok(Value::Bool(left == right)),
                 BinaryOp::NotEqual => Ok(Value::Bool(left != right)),
                 BinaryOp::Add
@@ -326,6 +351,21 @@ impl Error for TemplateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boolean_templates_short_circuit_and_validate_executed_operands() {
+        let mut context = BTreeMap::from([("finished".into(), Value::Bool(false))]);
+        assert_eq!(
+            eval_template(
+                "${!finished && !(2 < 1)} ${true || missing()} ${false && missing()}",
+                &mut context
+            )
+            .expect("boolean template evaluates"),
+            "true true false"
+        );
+        assert!(eval_template("${!1}", &mut context).is_err());
+        assert!(eval_template("${true && 1}", &mut context).is_err());
+    }
 
     #[test]
     fn evaluates_identifier_paths_through_the_host_context() {

@@ -784,6 +784,36 @@ impl<'types> MirBuilder<'types> {
             }
             HirExprKind::Binary { left, op, right } => {
                 let left = self.lower_expression(left, errors)?;
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let dst = self.constant(MirConstant::Bool(op == BinaryOp::Or));
+                    let evaluate_right = self.new_block();
+                    let join = self.new_block();
+                    self.current_block_mut().terminator = MirTerminator::Branch {
+                        condition: left,
+                        then_block: if op == BinaryOp::And {
+                            evaluate_right
+                        } else {
+                            join
+                        },
+                        else_block: if op == BinaryOp::And {
+                            join
+                        } else {
+                            evaluate_right
+                        },
+                    };
+                    self.current = evaluate_right;
+                    let right = self.lower_expression(right, errors)?;
+                    let truth = self.constant(MirConstant::Bool(true));
+                    self.push(MirInstruction::Binary {
+                        dst,
+                        op: BinaryOp::Equal,
+                        left: right,
+                        right: truth,
+                    });
+                    self.jump_if_unset(join);
+                    self.current = join;
+                    return Some(dst);
+                }
                 let right = self.lower_expression(right, errors)?;
                 let dst = self.register();
                 self.push(MirInstruction::Binary {

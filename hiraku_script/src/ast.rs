@@ -167,6 +167,7 @@ pub enum ExprKind {
     /// An explicitly captured reactive expression, written `$name` or `${expr}`.
     Binding(Box<Expr>),
     UnaryMinus(Box<Expr>),
+    Not(Box<Expr>),
     Member {
         object: Box<Expr>,
         name: String,
@@ -224,6 +225,8 @@ pub enum CastMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
+    And,
+    Or,
     Add,
     Subtract,
     Multiply,
