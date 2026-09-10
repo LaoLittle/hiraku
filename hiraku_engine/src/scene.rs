@@ -62,6 +62,7 @@ pub(crate) mod clipping;
 mod command_runtime;
 pub(crate) mod curtain;
 mod dialogue;
+pub(crate) mod playback;
 pub(crate) mod rich_text;
 pub(crate) mod loading;
 pub(crate) mod effect_wait;
@@ -123,6 +124,7 @@ pub use screen_ui::{
     update_ui_text_bindings,
 };
 pub(crate) use screen_ui::fit_screen_text;
+pub(crate) use screen_ui::expire_overlays;
 use screen_ui::{
     clear_overlay_ui, clear_screen_ui, close_screen_ui, screen_images_ready,
     should_clear_stale_screen_before_command, spawn_screen_ui,

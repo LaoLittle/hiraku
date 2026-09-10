@@ -35,7 +35,7 @@ pub(super) fn finish(motion: &mut ActorMotion, animations: &mut AnimationState) 
 
 pub(crate) fn animate(
     mut redraw: crate::redraw::Redraw,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut shared: ResMut<SceneSharedState>,
     stage: Res<StageState>,
     mut animations: ResMut<AnimationState>,

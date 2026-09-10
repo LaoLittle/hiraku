@@ -66,7 +66,7 @@ pub fn poll_sfx_playback(
 pub fn animate_audio_fades(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     settings: Res<UserSettings>,
     mut animations: ResMut<AnimationState>,
     mut sources: Query<(

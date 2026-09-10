@@ -2,6 +2,9 @@ use super::*;
 
 #[derive(Resource, Default)]
 pub struct DialogueState {
+    pub fast_forward_enabled: bool,
+    pub fast_forward_held: bool,
+    pub fast_forward_elapsed: f32,
     pub auto_enabled: bool,
     pub auto_elapsed: f32,
     pub waiting: Option<PendingDialogueAdvance>,
@@ -130,6 +133,23 @@ pub fn advance_dialogue_on_input(
     }
     let advance =
         (action_advance && text_focus.is_none_or(|focus| focus.0.is_none())) || pointer_advance;
+
+    if advance {
+        dialogue_state.fast_forward_enabled = false;
+        dialogue_state.fast_forward_held = false;
+    }
+    let skipping = dialogue_state.fast_forward_enabled || dialogue_state.fast_forward_held;
+    if skipping && dialogue_state.waiting.is_some() {
+        redraw.request();
+        dialogue_state.fast_forward_elapsed += time.delta_secs();
+        // Bounded progress: never execute an unbounded dialogue loop per frame.
+        if dialogue_state.fast_forward_elapsed >= 0.08 {
+            dialogue_state.fast_forward_elapsed = 0.0;
+            reveal_all_dialogue_chars(&mut dialogue_state, &mut dialogue_chars);
+            advance_dialogue(&mut dialogue_state, &mut animations, &mut dialogue_chars, &mut responses);
+        }
+        return;
+    }
 
     if !advance && !(auto_ready && dialogue_state.auto_elapsed >= preferences.auto_delay) {
         return;
@@ -470,6 +490,38 @@ pub(super) fn complete_dialogue_wait(
 #[cfg(test)]
 mod preference_tests {
     use super::*;
+
+    #[test]
+    fn fast_forward_reveals_and_completes_one_dialogue_wait() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<ChoiceState>()
+            .init_resource::<ScreenUiState>()
+            .init_resource::<VoiceState>()
+            .init_resource::<UserSettings>()
+            .add_message::<crate::input::HirakuActionInput>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, advance_dialogue_on_input);
+        {
+            let mut dialogue = app.world_mut().resource_mut::<DialogueState>();
+            dialogue.fast_forward_enabled = true;
+            dialogue.waiting = Some(PendingDialogueAdvance { animation_id: Some("line".into()), request: None });
+            dialogue.reveal = Some(DialogueRevealState { spans: vec![], total_chars: 5, next_index: 0,
+                accumulator: 0.0, interval: 0.1, fade_seconds: 0.12, animation_id: None });
+        }
+        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(40));
+        app.update();
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        app.update();
+        assert!(app.world().resource::<DialogueState>().waiting.is_none());
+        assert_eq!(app.world().resource::<DialogueState>().reveal.as_ref().expect("reveal").next_index, 5);
+        assert!(app.world().resource::<AnimationState>().completed.contains("line"));
+        app.update();
+        assert_eq!(app.world().resource::<AnimationState>().completed.len(), 1);
+    }
 
     #[test]
     fn auto_delay_pauses_in_a_modal_without_accumulating_catchup() {

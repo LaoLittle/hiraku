@@ -9,9 +9,30 @@ use bevy::{
 #[derive(Clone, Debug, Message)]
 pub struct UiEffectMessage(pub UiEffect);
 
+#[derive(Component)]
+pub(crate) struct OverlayLifetime(pub Timer);
+
+pub(crate) fn expire_overlays(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut redraw: crate::redraw::Redraw,
+    mut overlays: ResMut<OverlayUiState>,
+    mut timers: Query<(Entity, &mut OverlayLifetime)>,
+) {
+    for (entity, mut lifetime) in &mut timers {
+        redraw.request();
+        if lifetime.0.tick(time.delta()).is_finished() {
+            // Entity identity prevents an older mount expiring its replacement.
+            overlays.roots.retain(|_, root| *root != entity);
+            commands.entity(entity).try_despawn();
+        }
+    }
+}
+
 #[derive(Component, Default)]
 pub(crate) struct FitText {
     maximum: f32,
+    align: f32,
     content: Option<String>,
     width: f32,
 }
@@ -24,8 +45,8 @@ fn fitted_font_size(current: f32, maximum: f32, available: f32, measured: f32) -
 /// Uses shaped glyph bounds, not character counts (which break proportional
 /// fonts and localized text). Bevy stores text bounds in logical pixels;
 /// convert the physical UI node width before comparing, including on HiDPI.
-pub(crate) fn fit_screen_text(mut redraw: crate::redraw::Redraw, mut texts: Query<(&mut FitText, &Text, &ComputedNode, &bevy::text::TextLayoutInfo, &mut TextFont, &mut Visibility)>) {
-    for (mut fit, text, node, measured, mut font, mut visibility) in &mut texts {
+pub(crate) fn fit_screen_text(mut redraw: crate::redraw::Redraw, mut texts: Query<(&mut FitText, &Text, &ComputedNode, &bevy::text::TextLayoutInfo, &mut TextFont, &mut Visibility, &mut Node)>) {
+    for (mut fit, text, node, measured, mut font, mut visibility, mut layout) in &mut texts {
         let bevy::text::FontSize::Px(current) = font.font_size else { continue };
         if node.size().x <= 0.0 || measured.size.x <= 0.0 {
             visibility.set_if_neq(Visibility::Hidden);
@@ -53,8 +74,17 @@ pub(crate) fn fit_screen_text(mut redraw: crate::redraw::Redraw, mut texts: Quer
             visibility.set_if_neq(Visibility::Hidden);
             font.font_size = next.into();
             redraw.request();
-        } else if visibility.set_if_neq(Visibility::Inherited) {
-            redraw.request();
+        } else {
+            // NoWrap shapes against unbounded bounds: Justify cannot align
+            // the line in the authored box. Move the absolute text leaf.
+            let left = px((width - measured.size.x).max(0.0) * fit.align);
+            if layout.left != left {
+                layout.left = left;
+                visibility.set_if_neq(Visibility::Hidden);
+                redraw.request();
+            } else if visibility.set_if_neq(Visibility::Inherited) {
+                redraw.request();
+            }
         }
     }
 }
@@ -559,7 +589,7 @@ fn spawn_screen_node_entity(
                 commands.spawn((ScreenUiNode, Pickable::IGNORE, node.clone())).id()
             });
             if fit_wrapper.is_some() {
-                node = Node { width: percent(100), height: percent(100), min_width: px(0), flex_shrink: 0.0, ..default() };
+                node = Node { position_type: PositionType::Absolute, left: px(0), width: percent(100), height: percent(100), min_width: px(0), flex_shrink: 0.0, ..default() };
             }
             let entity = commands
                 .spawn((
@@ -586,7 +616,7 @@ fn spawn_screen_node_entity(
                 ));
             }
             if layout.text_fit {
-                commands.entity(entity).insert((FitText { maximum: *size, ..default() }, Visibility::Hidden));
+                commands.entity(entity).insert((FitText { maximum: *size, align: align.unwrap_or(0.0).clamp(0.0, 1.0), ..default() }, Visibility::Hidden));
             }
             if let Some(template) = binding {
                 commands.entity(entity).insert(UiTextBinding {
@@ -608,6 +638,7 @@ fn spawn_screen_node_entity(
             layout_entity
         }
         ScreenNode::Button(ButtonNode {
+            hovered_when_disabled,
             children,
             text,
             value,
@@ -742,6 +773,7 @@ fn spawn_screen_node_entity(
                 ));
             }
             commands.entity(button).insert(ScreenUiButton {
+                hovered_when_disabled: *hovered_when_disabled,
                 root,
                 value: value.clone(),
                 enabled: *enabled,
@@ -808,9 +840,7 @@ fn spawn_screen_node_entity(
             image_handles.push(image.clone());
             let mut node = Node::default();
             apply_screen_layout(&mut node, layout);
-            let mut image = if layout.image_stretch {
-                stretched_image_node(image, texture.rect)
-            } else { image_node(image, texture.rect) };
+            let mut image = screen_image_node(image, texture.rect, layout);
             image.flip_x = layout.flip_x;
             let entity = commands
                 .spawn((ScreenUiNode, Pickable::IGNORE, image, node))
@@ -862,7 +892,7 @@ fn spawn_screen_node_entity(
                 node
             });
             let normal_rect = texture.rect.map(texture_rect);
-            let mut artwork = stretched_image_node(image.clone(), texture.rect);
+            let mut artwork = screen_image_node(image.clone(), texture.rect, layout);
             artwork.flip_x = layout.flip_x;
             let entity = commands
                 .spawn((
@@ -1334,6 +1364,17 @@ fn image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
     node
 }
 
+// Interactive images obey the same fit policy as non-interactive images.
+// Bevy Auto contains the source inside the node while preserving its aspect
+// ratio; the full node remains the button's hit area, including letterboxing.
+fn screen_image_node(image: Handle<Image>, rect: Option<[f32; 4]>, layout: &ScreenLayout) -> ImageNode {
+    if layout.image_stretch {
+        stretched_image_node(image, rect)
+    } else {
+        image_node(image, rect)
+    }
+}
+
 fn stretched_image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
     let mut node = image_node(image, rect).with_mode(NodeImageMode::Stretch);
     node.visual_box = VisualBox::BorderBox;
@@ -1410,7 +1451,7 @@ pub fn handle_screen_buttons(
             Option<&mut ImageNode>,
             &ScreenUiButton,
         ),
-        Changed<PickingInteraction>,
+        Or<(Changed<PickingInteraction>, Changed<ScreenUiButton>)>,
     >,
     button_query: Query<&ScreenUiButton>,
     mut text_query: Query<&mut TextColor, With<ScreenUiButtonText>>,
@@ -1420,7 +1461,7 @@ pub fn handle_screen_buttons(
             continue;
         }
 
-        if !button.enabled {
+        if !button.enabled && !(button.hovered_when_disabled && *interaction == PickingInteraction::Hovered) {
             transform.scale = Vec2::ONE;
             *color = button.insensitive_background.into();
             if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
@@ -1780,6 +1821,7 @@ pub fn update_builtin_ui_models(
             ),
             ("text".to_string(), StoredValue::String(text.to_string())),
             ("visible".to_string(), StoredValue::Bool(dialogue.is_some())),
+            ("fastForwardEnabled".to_string(), StoredValue::Bool(dialogue_state.fast_forward_enabled || dialogue_state.fast_forward_held)),
             (
                 "autoEnabled".to_string(),
                 StoredValue::Bool(dialogue_state.auto_enabled),
@@ -2118,11 +2160,71 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fitted_title_centers_shaped_line_inside_its_box() {
+        let mut app = App::new();
+        app.add_systems(Update, fit_screen_text);
+        let entity = app.world_mut().spawn((
+            FitText { maximum: 75.0, align: 0.5, ..default() },
+            Node { left: px(0), ..default() },
+            Text::new("Alice"),
+            ComputedNode { size: Vec2::new(1000.0, 200.0), inverse_scale_factor: 0.5, ..default() },
+            bevy::text::TextLayoutInfo { size: Vec2::new(200.0, 75.0), ..default() },
+            TextFont::from_font_size(75.0),
+            Visibility::Hidden,
+        )).id();
+        app.update();
+        assert_eq!(app.world().get::<Node>(entity).expect("layout").left, px(150));
+        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Hidden);
+        app.update();
+        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
+    }
+
+    #[test]
+    fn timed_overlay_expires_without_a_story_and_does_not_remove_replacement() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .init_resource::<OverlayUiState>()
+            .add_systems(Update, expire_overlays);
+        let expired = app.world_mut().spawn(OverlayLifetime(Timer::from_seconds(1.0, TimerMode::Once))).id();
+        let replacement = app.world_mut().spawn_empty().id();
+        let other = app.world_mut().spawn(OverlayLifetime(Timer::from_seconds(1.0, TimerMode::Once))).id();
+        {
+            let mut overlays = app.world_mut().resource_mut::<OverlayUiState>();
+            overlays.roots.insert("notification".into(), replacement);
+            overlays.roots.insert("other".into(), other);
+        }
+        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs(2));
+        app.update();
+        assert!(app.world().get_entity(expired).is_err());
+        assert!(app.world().get_entity(other).is_err());
+        let overlays = app.world().resource::<OverlayUiState>();
+        assert_eq!(overlays.roots.get("notification"), Some(&replacement));
+        assert!(!overlays.roots.contains_key("other"));
+    }
+
+    #[test]
+    fn restoring_an_earlier_presentation_removes_future_overlay_callbacks() {
+        let mut app = App::new();
+        app.init_resource::<OverlayUiState>();
+        let callback = app.world_mut().spawn_empty().id();
+        let root = app.world_mut().spawn_empty().add_child(callback).id();
+        app.world_mut().resource_mut::<OverlayUiState>().roots.insert("optionalPanel".into(), root);
+        app.add_systems(Update, |mut commands: Commands, mut overlays: ResMut<OverlayUiState>| {
+            clear_overlay_ui(&mut commands, &mut overlays);
+        });
+        app.update();
+        assert!(app.world().resource::<OverlayUiState>().roots.is_empty());
+        assert!(app.world().get_entity(root).is_err());
+        assert!(app.world().get_entity(callback).is_err());
+    }
+
+    #[test]
     fn single_line_fit_accounts_for_ui_scale() {
         let mut app = App::new();
         app.add_systems(Update, fit_screen_text);
         let entity = app.world_mut().spawn((
             FitText { maximum: 75.0, ..default() },
+            Node { left: px(0), ..default() },
             Text::new("Alice"),
             ComputedNode { size: Vec2::new(1000.0, 200.0), inverse_scale_factor: 0.5, ..default() },
             bevy::text::TextLayoutInfo { size: Vec2::new(750.0, 75.0), ..default() },
@@ -2455,6 +2557,36 @@ mod tests {
     }
 
     #[test]
+    fn images_and_image_buttons_preserve_aspect_unless_stretch_is_requested() {
+        let mut layout = ScreenLayout::default();
+        let region = Some([8.0, 16.0, 640.0, 360.0]);
+        let contained = screen_image_node(Handle::default(), region, &layout);
+        assert_eq!(contained.image_mode, NodeImageMode::Auto);
+        assert_eq!(contained.rect, Some(texture_rect(region.expect("test region"))));
+        layout.image_stretch = true;
+        assert_eq!(
+            screen_image_node(Handle::default(), region, &layout).image_mode,
+            NodeImageMode::Stretch,
+        );
+    }
+
+    #[test]
+    fn nested_artwork_uses_canvas_dimensions_not_parent_percentages() {
+        let mut node = Node::default();
+        apply_screen_layout(&mut node, &ScreenLayout {
+            left_percent: Some(8.0 / 25.6),
+            top_percent: Some(8.0 / 14.4),
+            width_percent: Some(640.0 / 25.6),
+            height_percent: Some(360.0 / 14.4),
+            ..default()
+        });
+        assert_eq!(node.width, vw(25.0));
+        assert_eq!(node.height, vh(25.0));
+        assert_eq!(node.left, vw(8.0 / 25.6));
+        assert_eq!(node.top, vh(8.0 / 14.4));
+    }
+
+    #[test]
     fn ui_images_crop_authored_regions_without_generated_atlases() {
         let region = Some([8.0, 16.0, 32.0, 48.0]);
         for node in [
@@ -2613,6 +2745,7 @@ mod tests {
                 BackgroundColor(Color::BLACK),
                 UiTransform::IDENTITY,
                 ScreenUiButton {
+                    hovered_when_disabled: false,
                     root,
                     value: Some(StoredValue::String("continue".into())),
                     enabled: true,
@@ -2675,6 +2808,19 @@ mod tests {
         app.update();
 
         assert_eq!(app.world().resource::<ScreenUiState>().waiting, None);
+        {
+            let mut appearance = app.world_mut().get_mut::<ScreenUiButton>(button).expect("button");
+            appearance.enabled = false;
+            appearance.hovered_when_disabled = true;
+            appearance.hovered_background = Color::WHITE;
+        }
+        *app.world_mut().get_mut::<PickingInteraction>(button).expect("pointer") = PickingInteraction::Hovered;
+        app.update();
+        assert_eq!(app.world().get::<BackgroundColor>(button).expect("surface").0, Color::WHITE);
+        // A policy update must reset the appearance without pointer movement.
+        app.world_mut().get_mut::<ScreenUiButton>(button).expect("button").hovered_when_disabled = false;
+        app.update();
+        assert_eq!(app.world().get::<BackgroundColor>(button).expect("surface").0, Color::BLACK);
     }
 
     #[test]

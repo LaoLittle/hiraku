@@ -93,6 +93,7 @@ pub enum CameraCommand {
 pub enum SettingsCommand {
     Preference(crate::storage::PreferenceChange),
     AutoDialogue(bool),
+    FastForward(bool),
     Adjust { name: String, delta: f32 },
     Set { name: String, value: f32 },
 }
@@ -107,6 +108,7 @@ pub enum UiCommand {
     ShowOverlay {
         name: String,
         screen: ScreenSpec,
+        lifetime: Option<f32>,
     },
     HideOverlay {
         name: String,
@@ -115,6 +117,7 @@ pub enum UiCommand {
 
 #[derive(Debug)]
 pub enum CharacterCommand {
+    StopMotion { actor_id: String },
     Motion {
         actor_id: String,
         revision: u64,

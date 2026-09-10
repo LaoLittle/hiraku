@@ -79,6 +79,9 @@ pub struct HirakuScrollInput {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HirakuAction {
+    /// Hosts send both press and release, including release on focus loss.
+    FastForwardHeld(bool),
+    ToggleFastForward,
     NextDialogue,
     Choice(usize),
     Back,

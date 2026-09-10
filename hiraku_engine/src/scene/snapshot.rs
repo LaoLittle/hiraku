@@ -154,6 +154,11 @@ pub(super) fn restore_scene_snapshot(
     snapshot: SceneSnapshot,
 ) {
     let text_effect = snapshot.text_effect.clone();
+    // Playback controls are transient input, never restored story state.
+    dialogue_state.fast_forward_enabled = false;
+    dialogue_state.fast_forward_held = false;
+    dialogue_state.fast_forward_elapsed = 0.0;
+    commands.insert_resource(super::playback::FastForward::default());
 
     if let Some(background) = stage.background.take() {
         commands.entity(background).try_despawn();

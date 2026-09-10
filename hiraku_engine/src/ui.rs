@@ -38,6 +38,7 @@ pub enum UiEffect {
     },
     SetPreference(crate::storage::PreferenceChange),
     SetAutoDialogue(bool),
+    SetFastForward(bool),
     Navigate(NavigationRequest),
 }
 
@@ -457,6 +458,8 @@ pub(crate) struct UiAnimationPlayer {
 /// the existing ergonomic map shape.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ButtonNode {
+    #[serde(default)]
+    pub hovered_when_disabled: bool,
     /// Declarative visual content, positioned inside the button's hit bounds.
     #[serde(default)]
     pub children: Vec<ScreenNode>,
@@ -744,6 +747,7 @@ pub struct ScreenUiNode;
 /// Runtime interaction state for a screen button.
 #[derive(Component, Clone)]
 pub struct ScreenUiButton {
+    pub hovered_when_disabled: bool,
     /// Root this button belongs to; stale/pending roots are ignored.
     pub root: Entity,
     /// Intent value returned to the story runtime when the button is pressed.

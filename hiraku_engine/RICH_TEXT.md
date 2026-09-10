@@ -1,4 +1,9 @@
-# Ruby text
+# Rich text
+
+Hex color spans use `{color:#RRGGBB}text{/color}` (optional alpha:
+`#RRGGBBAA`). Nested color spans restore the outer color on close. Unstyled
+characters retain the UI node's color; the ruby reading uses its first base
+character's color. Color markup is not part of typewriter character counts.
 
 Ruby is presentation markup, not HKS syntax. The string/template is evaluated
 normally before the engine parses the resulting markup:

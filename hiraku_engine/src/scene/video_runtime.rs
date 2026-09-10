@@ -10,6 +10,10 @@ use crate::script::{
 #[derive(Resource, Default)]
 pub struct PendingMovieWaits(BTreeMap<VideoPlaybackId, ScriptRequestId>);
 
+impl PendingMovieWaits {
+    pub(crate) fn is_waiting(&self) -> bool { !self.0.is_empty() }
+}
+
 pub(super) fn dispatch_video_command(
     command: VideoCommand,
     asset_server: &AssetServer,

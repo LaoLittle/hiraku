@@ -376,8 +376,18 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         continue;
                     }
                     SettingsCommand::AutoDialogue(enabled) => {
+                        if *enabled {
+                            dialogue_state.fast_forward_enabled = false;
+                            dialogue_state.fast_forward_held = false;
+                        }
                         dialogue_state.auto_enabled = *enabled;
                         dialogue_state.auto_elapsed = 0.0;
+                        continue;
+                    }
+                    SettingsCommand::FastForward(enabled) => {
+                        dialogue_state.fast_forward_enabled = *enabled;
+                        dialogue_state.fast_forward_elapsed = 0.0;
+                        if *enabled { dialogue_state.auto_enabled = false; }
                         continue;
                     }
                     _ => {}
@@ -418,6 +428,12 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 &render_assets.canvas,
                 &mut render_assets.preview,
             ),
+            ScriptCommand::Character(CharacterCommand::StopMotion { actor_id }) => {
+                if let Some(motion) = shared_state.0.actor_motions.get_mut(&actor_id) {
+                    motion.stop();
+                    complete_missing_animation(&mut animations, motion.animation_id.take());
+                }
+            }
             ScriptCommand::Character(CharacterCommand::Motion {
                 actor_id,
                 revision,

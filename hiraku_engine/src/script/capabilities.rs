@@ -63,6 +63,7 @@ pub enum StoryEffect {
     MountUiOverlay {
         name: String,
         component: String,
+        lifetime: Option<f32>,
     },
     UnmountUiOverlay {
         name: String,
@@ -113,6 +114,7 @@ pub enum StoryEffect {
         scale: f32,
         focused: bool,
     },
+    StopActorMotion { actor_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,7 +447,24 @@ mod ui_api {
     ) -> Result<(), NativeError> {
         context
             .commands
-            .push(StoryEffect::MountUiOverlay { name, component });
+            .push(StoryEffect::MountUiOverlay { name, component, lifetime: None });
+        Ok(())
+    }
+
+    /// Presentation-owned lifetime, independent of the calling execution.
+    #[hks]
+    fn native_mount_for(
+        context: &mut CharacterContext,
+        name: String,
+        component: String,
+        seconds: f32,
+    ) -> Result<(), NativeError> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(NativeError::message("overlay duration must be finite and non-negative"));
+        }
+        context.commands.push(StoryEffect::MountUiOverlay {
+            name, component, lifetime: Some(seconds),
+        });
         Ok(())
     }
 
@@ -1382,6 +1401,15 @@ mod native_api {
             .map_err(|e| NativeError::message(e.to_string()))?;
         actor.pending_offset = Some(transition);
         Ok(ActorHandle(handle))
+    }
+
+    #[hks(name = "stopMotion", selector = "Actor", receiver)]
+    fn native_actor_stop_motion(context: &mut CharacterContext, actor: ActorHandle) -> Result<ActorHandle, NativeError> {
+        let actor_id = context.actor_mut(actor.0)
+            .map_err(|e| NativeError::message(e.to_string()))?.display_instance.clone();
+        context.invalidate_actor_motions(Some(&actor_id))?;
+        context.commands.push(StoryEffect::StopActorMotion { actor_id });
+        Ok(actor)
     }
 
     #[hks(name = "animation", selector = "Actor", receiver)]

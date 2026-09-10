@@ -22,6 +22,7 @@ mod rich_text;
 
 pub use script::{UiContext, UiIntent};
 pub use ui::UiModels;
+pub use state::StoredValue;
 
 /// Type-check a standalone story source against the engine capability schema.
 /// This does not launch Bevy, access assets, or execute script/native functions.
@@ -62,6 +63,7 @@ pub fn validate_ui_document(
                 ("revealedCharacters".into(), V::Int(0)),
                 ("canAdvance".into(), V::Bool(false)),
                 ("autoEnabled".into(), V::Bool(false)),
+                ("fastForwardEnabled".into(), V::Bool(false)),
             ])),
         ),
         (
@@ -90,11 +92,22 @@ pub fn validate_ui_document_with_context(
     path: &str,
     context: UiContext,
 ) -> Result<(), String> {
+    validate_ui_document_with_arguments(root, settings, path, context, &[])
+}
+
+/// Offline construction of a typed UI entry, without mounting a scene/window.
+pub fn validate_ui_document_with_arguments(
+    root: &std::path::Path,
+    settings: &str,
+    path: &str,
+    context: UiContext,
+    arguments: &[state::StoredValue],
+) -> Result<(), String> {
     let vfs = vfs::HdpVfs::new_with_config(root, settings, "startup.hks");
     let source = vfs.read_text(path).map_err(|error| error.to_string())?;
     let textures = texture::load_texture_catalog(&vfs).map_err(|error| error.to_string())?;
     let terms = glossary::load_term_catalog(&vfs).map_err(|error| error.to_string())?;
-    script::evaluate_ui_component_named_with_args(path, &source, context, &textures, &terms, &[])
+    script::evaluate_ui_component_named_with_args(path, &source, context, &textures, &terms, arguments)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
@@ -253,6 +266,7 @@ impl Plugin for HirakuPlugin {
 
         let archive_path = archive_path_from_config(app.world().resource::<RuntimeLaunchConfig>());
         let archive_store = app.world().resource::<HdpArchiveStore>().clone();
+        let archive_root = std::path::PathBuf::from(&app.world().resource::<RuntimeLaunchConfig>().asset_root);
 
         app.init_asset::<HdpArchive>()
             .init_asset::<BytesAsset>()
@@ -277,9 +291,13 @@ impl Plugin for HirakuPlugin {
             .add_systems(PostUpdate, scene::loading::sync)
             .init_resource::<UiModels>()
             .init_resource::<scene::PendingMovieWaits>()
+            .init_resource::<scene::playback::FastForward>()
+            .add_systems(PreUpdate, scene::playback::update_fast_forward.in_set(HirakuRuntimeSystems))
+            .add_systems(Update, scene::playback::skip_voices
+                .after(scene::process_script_commands).in_set(HirakuRuntimeSystems))
             .add_message::<ScriptResponseMessage>()
             .add_message::<scene::UiEffectMessage>()
-            .register_asset_loader(HdpArchiveLoader::new(archive_store))
+            .register_asset_loader(HdpArchiveLoader::new(archive_store, archive_root))
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(Update, stream_requested_hdp_volumes)
             .add_systems(
@@ -291,7 +309,9 @@ impl Plugin for HirakuPlugin {
                     .run_if(runtime_not_initialized),
             )
             .add_systems(Update, assign_render_layers.after(process_script_commands))
+            .configure_sets(PreUpdate, HirakuRuntimeSystems.run_if(runtime_initialized))
             .configure_sets(Update, HirakuRuntimeSystems.run_if(runtime_initialized))
+            .configure_sets(PostUpdate, HirakuRuntimeSystems.run_if(runtime_initialized))
             .add_systems(Update, boot_runtime.run_if(runtime_initialized).run_if(storage::storage_ready))
             .add_systems(
                 Update,
@@ -408,6 +428,7 @@ impl Plugin for HirakuPlugin {
             .add_systems(PostUpdate, scene::fit_screen_text
                 .after(bevy::ui::widget::text_system)
                 .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
+            .add_systems(PostUpdate, scene::expire_overlays.in_set(HirakuRuntimeSystems))
             .add_systems(PostUpdate, (scene::rich_text::reveal_glyphs, scene::rich_text::position_ruby).chain()
                 .after(bevy::ui::widget::text_system)
                 .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))

@@ -334,7 +334,7 @@ fn update_actor_placement_with_animation(
 pub fn animate_character_motion_effects(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
     mut stage: ResMut<StageState>,
     mut placements: Query<&mut ActorPlacement>,
@@ -1175,6 +1175,32 @@ mod tests {
                 .contains("reveal")
         );
         assert!(character_depth(131.0) < STAGE_Z_OVERLAY);
+    }
+
+    #[test]
+    fn zero_duration_pose_does_not_disable_later_default_tween() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .init_resource::<AnimationState>()
+            .init_resource::<StageState>()
+            .add_systems(Update, animate_character_motion_effects);
+        let root = app.world_mut().spawn_empty().id();
+        let part = spawn_placement_part(app.world_mut(), root, "alice/body", Vec2::ZERO, 0.0);
+        update_actor_placement_with_animation(
+            app.world_mut(), root, Some(part), Vec2::new(100.0, 0.0),
+            1.0, Quat::IDENTITY, Some(crate::script::AnimationSpec::Linear(0.0, false)),
+        );
+        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_millis(16));
+        app.update();
+        assert_eq!(app.world().get::<Transform>(part).expect("pose").translation.x, 100.0);
+        update_actor_placement_with_animation(
+            app.world_mut(), root, Some(part), Vec2::new(200.0, 0.0),
+            1.0, Quat::IDENTITY, None,
+        );
+        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_millis(150));
+        app.update();
+        let x = app.world().get::<Transform>(part).expect("pose").translation.x;
+        assert!((x - 187.5).abs() < 0.01, "default ease-out must remain active: {x}");
     }
 
     #[test]

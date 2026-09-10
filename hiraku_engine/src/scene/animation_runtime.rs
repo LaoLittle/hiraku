@@ -71,7 +71,7 @@ pub struct VisualTween {
 
 pub fn tick_pending_waits(
     mut redraw: crate::redraw::Redraw,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut waits: ResMut<PendingWaits>,
     mut animations: ResMut<AnimationState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
@@ -101,7 +101,7 @@ pub fn tick_pending_waits(
 pub fn animate_visual_tweens(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
     mut alpha_mask_materials: ResMut<Assets<AlphaMaskMaterial>>,
     mut multiply_materials: ResMut<Assets<MultiplyMaterial>>,
@@ -214,7 +214,7 @@ fn set_visual_alpha(
 pub fn animate_rule_transitions(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut stage: ResMut<StageState>,
     mut animations: ResMut<AnimationState>,
     mut rule_materials: ResMut<Assets<RuleTransitionMaterial>>,
@@ -258,7 +258,7 @@ pub fn animate_rule_transitions(
 pub fn animate_custom_effects(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut stage: ResMut<StageState>,
     mut animations: ResMut<AnimationState>,
     mut materials: ResMut<Assets<CustomScreenEffectMaterial>>,

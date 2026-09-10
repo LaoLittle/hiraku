@@ -236,7 +236,7 @@ pub fn assign_render_layers(
 
 pub fn animate_camera_shake(
     mut redraw: crate::redraw::Redraw,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
     mut shake_state: ResMut<CameraShakeState>,
     camera_state: Res<CameraState>,
@@ -422,7 +422,7 @@ fn interpolate_zoom(from: f32, to: f32, progress: f32, view_space: bool) -> f32 
 
 pub fn animate_camera_transition(
     mut redraw: crate::redraw::Redraw,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
     mut camera_state: ResMut<CameraState>,
     mut tweens: ResMut<CameraTweenState>,

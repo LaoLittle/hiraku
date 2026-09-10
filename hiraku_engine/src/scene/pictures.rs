@@ -347,7 +347,7 @@ pub(super) fn apply_picture_command(
 pub fn sync_pictures(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     canvas: Res<crate::HirakuCanvas>,
     assets: Res<AssetServer>,
     images: Res<Assets<Image>>,

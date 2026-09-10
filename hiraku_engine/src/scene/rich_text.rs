@@ -3,6 +3,17 @@ use crate::{
     rich_text::{RichText, Ruby},
     ui::{PropertyComputation, UiModels},
 };
+
+fn span_color(document: &RichText, index: usize, fallback: TextColor) -> TextColor {
+    document
+        .colors
+        .get(index)
+        .copied()
+        .flatten()
+        .map_or(fallback, |[r, g, b, a]| {
+            TextColor(Color::srgba_u8(r, g, b, a))
+        })
+}
 use bevy::prelude::*;
 
 #[derive(Component)]
@@ -120,11 +131,13 @@ pub(crate) fn update(
                     RichText {
                         text: rich.source.clone(),
                         ruby: Vec::new(),
+                        colors: vec![None; rich.source.chars().count()],
                     }
                 }
             };
             let append = document.text.starts_with(&rich.document.text)
-                && document.ruby.starts_with(&rich.document.ruby);
+                && document.ruby.starts_with(&rich.document.ruby)
+                && document.colors.starts_with(&rich.document.colors);
             if !append {
                 for child in std::mem::take(&mut rich.spans)
                     .into_iter()
@@ -155,7 +168,7 @@ pub(crate) fn update(
                     .spawn((
                         TextSpan::new(text),
                         (*font).clone(),
-                        *color,
+                        span_color(&document, index, *color),
                         bevy::text::LineHeight::RelativeToFont(if annotated { 1.8 } else { 1.2 }),
                     ))
                     .id();
@@ -181,7 +194,7 @@ pub(crate) fn update(
                         },
                         Text::new(range.reading.clone()),
                         reading_font,
-                        *color,
+                        span_color(&document, range.start, *color),
                         TextLayout::new(Justify::Left, bevy::text::LineBreak::NoWrap),
                         shadow.as_deref().copied().unwrap_or_default(),
                         Visibility::Hidden,
@@ -199,17 +212,19 @@ pub(crate) fn update(
             || color.is_changed()
             || shadow.as_ref().is_some_and(|s| s.is_changed())
         {
-            for &span in &rich.spans {
-                commands.entity(span).insert(((*font).clone(), *color));
+            for (index, &span) in rich.spans.iter().enumerate() {
+                commands
+                    .entity(span)
+                    .insert(((*font).clone(), span_color(&rich.document, index, *color)));
             }
             let mut reading_font = (*font).clone();
             if let bevy::text::FontSize::Px(size) = font.font_size {
                 reading_font.font_size = bevy::text::FontSize::Px(size * 0.5);
             }
-            for &label in &rich.labels {
+            for (&label, range) in rich.labels.iter().zip(&rich.document.ruby) {
                 commands.entity(label).insert((
                     reading_font.clone(),
-                    *color,
+                    span_color(&rich.document, range.start, *color),
                     shadow.as_deref().copied().unwrap_or_default(),
                 ));
             }
@@ -341,13 +356,30 @@ mod tests {
         app.world_mut()
             .get_mut::<RichTextSource>(root)
             .expect("rich source")
-            .source = "Bob".into();
+            .source = "{color:#ff0000}Bob{/color}".into();
         app.update();
         assert!(
             spans
                 .into_iter()
                 .chain(labels)
                 .all(|entity| app.world().get_entity(entity).is_err())
+        );
+        let colored = app
+            .world()
+            .get::<RichTextSource>(root)
+            .expect("colored source")
+            .spans[0];
+        app.world_mut()
+            .get_mut::<TextColor>(root)
+            .expect("root color")
+            .0 = Color::BLACK;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<TextColor>(colored)
+                .expect("explicit color")
+                .0,
+            Color::srgba_u8(255, 0, 0, 255)
         );
     }
 

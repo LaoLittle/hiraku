@@ -14,6 +14,7 @@ pub(crate) struct CharacterGroup {
     display: Option<Entity>,
     atlas: Option<Handle<TextureAtlasLayout>>,
     error: Option<String>,
+    hidden_seconds: f32,
 }
 struct GroupTween {
     from: f32,
@@ -38,12 +39,44 @@ pub(crate) fn install(app: &mut App) {
 fn install_runtime_systems(app: &mut App) {
     app.add_systems(
         PostUpdate,
-        (advance_group_fades, compose_groups)
+        (advance_group_fades, compose_groups, retire_hidden_groups)
             .chain()
             // Stage resources are created only after runtime content has loaded.
             .run_if(crate::runtime_initialized)
             .before(Sprite3dSync),
     );
+}
+
+/// Short reuse window for hide/show cuts; persistent actor state lives in the
+/// story model, not these rendering entities. Retire the entire hierarchy so
+/// both logical sprites and GPU materials release their atlas handles.
+fn retire_hidden_groups(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut stage: ResMut<StageState>,
+    pending: Res<PendingCharacterShows>,
+    mut roots: Query<(Entity, &CharacterRoot, &mut CharacterGroup)>,
+) {
+    for (entity, identity, mut group) in &mut roots {
+        let name = &identity.actor_id;
+        let prefix = format!("character::{name}::");
+        let reusable = stage.character_active_parts.contains_key(name)
+            || pending.items.iter().any(|show| &show.actor_id == name)
+            || stage.pending_character_restore.iter().any(|part| part.id.starts_with(&prefix))
+            || group.tween.is_some() || group.alpha != 0.0;
+        if reusable {
+            if group.hidden_seconds != 0.0 { group.hidden_seconds = 0.0; }
+            continue;
+        }
+        group.hidden_seconds += time.delta_secs();
+        if group.hidden_seconds < 5.0 { continue; }
+        if stage.character_roots.get(name) == Some(&entity) {
+            stage.character_roots.remove(name);
+            stage.sprites.retain(|id, _| !id.starts_with(&prefix));
+            stage.character_order.retain(|id| id != name);
+        }
+        commands.entity(entity).try_despawn();
+    }
 }
 fn composite_transform(center: Vec2, placement: Option<Transform>) -> Transform {
     let (center, rotation) = placement
@@ -98,7 +131,7 @@ pub(super) fn fade_group(
 fn advance_group_fades(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
     mut groups: Query<(&Children, &mut CharacterGroup)>,
     parts: Query<(), With<LogicalCharacterPart>>,
@@ -387,6 +420,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hidden_actor_cache_expires_without_removing_active_actor_or_story_identity() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<StageState>()
+            .init_resource::<PendingCharacterShows>()
+            .add_systems(Update, retire_hidden_groups);
+        let mut roots = Vec::new();
+        for name in ["alice", "bob"] {
+            let child = app.world_mut().spawn_empty().id();
+            let root = app.world_mut().spawn((
+                CharacterRoot { actor_id: name.into() },
+                CharacterGroup::default(),
+            )).add_child(child).id();
+            let mut stage = app.world_mut().resource_mut::<StageState>();
+            stage.character_roots.insert(name.into(), root);
+            stage.sprites.insert(format!("character::{name}::body"), child);
+            stage.character_catalog_names.insert(name.into(), name.into());
+            stage.character_order.push(name.into());
+            roots.push((root, child));
+        }
+        app.world_mut().resource_mut::<StageState>().character_active_parts.insert("alice".into(), HashSet::from(["body".into()]));
+        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs(2));
+        app.update();
+        assert!(app.world().get_entity(roots[1].0).is_ok(), "short hide/show cuts reuse the cache");
+        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs(4));
+        app.update();
+        assert!(app.world().get_entity(roots[0].0).is_ok());
+        assert!(app.world().get_entity(roots[1].0).is_err());
+        assert!(app.world().get_entity(roots[1].1).is_err(), "all child asset owners retire with the root");
+        let stage = app.world().resource::<StageState>();
+        assert!(!stage.character_roots.contains_key("bob"));
+        assert!(!stage.sprites.contains_key("character::bob::body"));
+        assert_eq!(stage.character_catalog_names["bob"], "bob");
+        assert_eq!(stage.character_order, ["alice"]);
+    }
+
+    #[test]
     fn composition_waits_for_runtime_initialization() {
         let mut app = App::new();
         install_runtime_systems(&mut app);
@@ -394,6 +464,8 @@ mod tests {
         app.update();
         app.update();
         app.init_resource::<Time>()
+            .init_resource::<StageState>()
+            .init_resource::<PendingCharacterShows>()
             .init_resource::<super::super::SceneSharedState>()
             .init_resource::<AnimationState>()
             .init_resource::<Assets<Image>>()

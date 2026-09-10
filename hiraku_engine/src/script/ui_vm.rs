@@ -113,6 +113,7 @@ struct UiDraft {
     gap: f32,
     padding: f32,
     surface: Option<[f32; 4]>,
+    hovered_surface: Option<[f32; 4]>,
     text_size: Option<f32>,
     text_color: Option<[f32; 4]>,
     text_align: Option<f32>,
@@ -152,6 +153,7 @@ impl UiDraft {
             gap: 12.0,
             padding: 0.0,
             surface: None,
+            hovered_surface: None,
             text_size: None,
             text_color: None,
             text_align: None,
@@ -529,6 +531,25 @@ mod native_ui {
         alpha: f64,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.surface = Some([
+            color_component(red)?,
+            color_component(green)?,
+            color_component(blue)?,
+            color_component(alpha)?,
+        ]);
+        Ok(node)
+    }
+
+    /// Set a custom-content button's hover surface without replacing its children.
+    #[hks(name = "hoveredSurface", receiver)]
+    fn ui_hovered_surface(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        red: f64,
+        green: f64,
+        blue: f64,
+        alpha: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        context.node_mut(node)?.hovered_surface = Some([
             color_component(red)?,
             color_component(green)?,
             color_component(blue)?,
@@ -1223,6 +1244,11 @@ mod preference_actions {
     ) -> Result<UiEffectHandle, NativeError> {
         Ok(context.insert_effect(UiEffect::SetAutoDialogue(enabled)))
     }
+
+    #[hks(name = "setFastForward")]
+    fn set_fast_forward(context: &mut UiVmContext, enabled: bool) -> Result<UiEffectHandle, NativeError> {
+        Ok(context.insert_effect(UiEffect::SetFastForward(enabled)))
+    }
 }
 
 #[hiraku_script::hks_module("audio")]
@@ -1467,6 +1493,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
                 ("revealedCharacters".to_string(), ScriptType::Int),
                 ("canAdvance".to_string(), ScriptType::Bool),
                 ("autoEnabled".to_string(), ScriptType::Bool),
+                ("fastForwardEnabled".to_string(), ScriptType::Bool),
             ])),
         )
         .expect("built-in dialogue model must be defined once");
@@ -2453,6 +2480,7 @@ fn materialize_node(
                     let mut layout = draft.layout;
                     if layout.text_shadow.is_none() { layout.text_shadow = text_shadow; }
                     Ok(ScreenNode::Button(ButtonNode {
+                        hovered_when_disabled: draft.hovered_when_disabled,
                         children,
                         text,
                         value,
@@ -2465,10 +2493,10 @@ fn materialize_node(
                         hovered_color: None,
                         pressed_color: None,
                         insensitive_color: None,
-                        background: custom_content.then_some([0.0; 4]),
+                        background: draft.surface.or(custom_content.then_some([0.0; 4])),
                         border: custom_content.then_some([0.0; 4]),
-                        hovered_background: custom_content.then_some([0.0; 4]),
-                        pressed_background: custom_content.then_some([0.0; 4]),
+                        hovered_background: draft.hovered_surface.or(draft.surface).or(custom_content.then_some([0.0; 4])),
+                        pressed_background: draft.hovered_surface.or(draft.surface).or(custom_content.then_some([0.0; 4])),
                         background_texture: draft
                             .button_background_texture
                             .as_deref()
@@ -3031,6 +3059,19 @@ screen {
     }
 
     #[test]
+    fn restored_record_fields_keep_numeric_comparison_types_in_ui() {
+        let source = "import ui.widgets.*\nscreen { if progress.version > 0 { text(\"Alice\") } }";
+        let context = UiContext::new(BTreeMap::from([("progress".into(), StoredValue::Map(
+            BTreeMap::from([("version".into(), StoredValue::Int(1))])
+        ))]));
+        let screen = evaluate_ui_component_named("memory://record.ui.hks", source, context,
+            &TextureCatalog::default(), &TermCatalog::default()).expect("numeric fields compile");
+        assert_eq!(screen.children.len(), 1);
+        assert!(evaluate_ui_component_named("memory://record.ui.hks", source, UiContext::default(),
+            &TextureCatalog::default(), &TermCatalog::default()).is_err(), "missing saved state must not become dynamically truthy");
+    }
+
+    #[test]
     fn ui_entry_initializes_private_state_and_callbacks_share_it() {
         let source = r#"import ui.widgets.*
 global var name: String = "alice"
@@ -3330,6 +3371,32 @@ screen {
     }
 
     #[test]
+    fn custom_button_hover_surface_preserves_content_and_geometry() {
+        let screen = evaluate_ui_component_named(
+            "memory://buttons.ui.hks",
+            r#"
+import ui.widgets.*
+canvas {
+    button { column { text("Alice") } }
+        .size(.abs(240, 120)).surface(0, 0, 0, 0).hoveredSurface(1, 1, 1, 1)
+}
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        ).expect("custom button renders");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected custom-content button");
+        };
+        assert_eq!(button.background, Some([0.0; 4]));
+        assert_eq!(button.hovered_background, Some([1.0; 4]));
+        assert_eq!(button.pressed_background, Some([1.0; 4]));
+        assert_eq!(button.hover_scale, 1.0);
+        assert_eq!(button.press_scale, 1.0);
+        assert!(matches!(button.children.as_slice(), [ScreenNode::Column(_)]));
+    }
+
+    #[test]
     fn slot_button_accepts_empty_and_thumbnail_branches() {
         for thumbnail in ["null", "\"save-thumbnail://alice\""] {
             let source = format!(
@@ -3504,6 +3571,8 @@ global fn card(label: String, count: Int) -> UiNode {
             progress(count.toFloat()).range(0, 10)
         }
     }
+
+
 }
 "#;
         let screen = evaluate_ui_component_named_with_args(
@@ -3520,6 +3589,38 @@ global fn card(label: String, count: Int) -> UiNode {
         };
         assert!(matches!(&column.children[0], ScreenNode::Text(text) if text.text == "Items"));
         assert!(matches!(&column.children[1], ScreenNode::Bar(bar) if bar.value == 3.0));
+    }
+
+    #[test]
+    fn modal_availability_arguments_filter_nodes_and_callbacks_return_room_ids() {
+        let source = r#"
+            import ui.widgets.*
+            fn room(id: String) -> UiNode { button { text(id) }.onClick { ui.close(id) } }
+            @ui
+            global fn main(north: Bool, south: Bool, east: Bool, west: Bool) -> UiNode {
+                canvas {
+                    if north == false { room("north") }
+                    if south == false { room("south") }
+                    if east == false { room("east") }
+                    if west == false { room("west") }
+                }
+            }
+        "#;
+        for mask in 0u32..16 {
+            let args = (0..4).map(|i| StoredValue::Bool(mask & (1 << i) != 0)).collect::<Vec<_>>();
+            let screen = evaluate_ui_component_named_with_args("memory://rooms.ui.hks", source,
+                UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &args)
+                .expect("availability UI builds");
+            let remaining = ["north", "south", "east", "west"].into_iter().enumerate()
+                .filter(|(i, _)| mask & (1 << i) == 0).map(|(_, name)| name).collect::<Vec<_>>();
+            assert_eq!(screen.children.len(), remaining.len());
+            for (node, id) in screen.children.iter().zip(remaining) {
+                let ScreenNode::Button(button) = node else { panic!("expected room button") };
+                let (effects, _) = evaluate_ui_callback(button.on_click.as_ref().expect("selection callback"),
+                    &BTreeMap::new(), &crate::ui::UiModels::default()).expect("select room");
+                assert_eq!(effects, [UiEffect::CloseUi { value: Value::String(id.into()) }]);
+            }
+        }
     }
 
     #[test]

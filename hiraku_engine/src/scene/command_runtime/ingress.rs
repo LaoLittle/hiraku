@@ -211,6 +211,7 @@ fn default_dialogue_model() -> StoredValue {
         ("revealedCharacters".to_string(), StoredValue::Int(0)),
         ("canAdvance".to_string(), StoredValue::Bool(false)),
         ("autoEnabled".to_string(), StoredValue::Bool(false)),
+        ("fastForwardEnabled".to_string(), StoredValue::Bool(false)),
     ]))
 }
 
@@ -414,6 +415,7 @@ pub fn drive_story_runtime(
                                 UiCommand::ShowOverlay {
                                     name: "__role.dialogue".into(),
                                     screen,
+                                    lifetime: None,
                                 },
                             ));
                         }
@@ -428,7 +430,7 @@ pub fn drive_story_runtime(
                 }
             }
             StoryRuntimeEvent::Effect(
-                crate::script::capabilities::StoryEffect::MountUiOverlay { name, component },
+                crate::script::capabilities::StoryEffect::MountUiOverlay { name, component, lifetime },
             ) => {
                 let target = runtime
                     .ui_registry
@@ -451,11 +453,15 @@ pub fn drive_story_runtime(
                 );
                 match overlay {
                     Ok(screen) => {
-                        runtime
-                            .mounted_ui_overlays
-                            .insert(name.clone(), target.clone());
+                        // Timed notifications are presentation-only, not
+                        // persistent UI roles restored from a save.
+                        if lifetime.is_none() {
+                            runtime.mounted_ui_overlays.insert(name.clone(), target.clone());
+                        } else {
+                            runtime.mounted_ui_overlays.remove(&name);
+                        }
                         pending_script_commands
-                            .enqueue(ScriptCommand::Ui(UiCommand::ShowOverlay { name, screen }));
+                            .enqueue(ScriptCommand::Ui(UiCommand::ShowOverlay { name, screen, lifetime }));
                     }
                     Err(error) => crate::script::emit_script_diagnostic(
                         &format!("failed to mount UI overlay `{name}` from `{target}`"),
@@ -501,6 +507,7 @@ pub fn drive_story_runtime(
                                 UiCommand::ShowOverlay {
                                     name: dialogue_overlay.into(),
                                     screen,
+                                    lifetime: None,
                                 },
                             ));
                             true

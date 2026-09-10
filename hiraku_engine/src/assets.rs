@@ -8,17 +8,20 @@ use bevy::{
 };
 use thiserror::Error;
 
+mod platform;
+
 #[derive(Asset, TypePath, Debug, Clone)]
 pub struct HdpArchive;
 
 #[derive(TypePath)]
 pub struct HdpArchiveLoader {
     store: HdpArchiveStore,
+    root: std::path::PathBuf,
 }
 
 impl HdpArchiveLoader {
-    pub fn new(store: HdpArchiveStore) -> Self {
-        Self { store }
+    pub fn new(store: HdpArchiveStore, root: std::path::PathBuf) -> Self {
+        Self { store, root }
     }
 }
 
@@ -43,6 +46,16 @@ impl AssetLoader for HdpArchiveLoader {
         _settings: &Self::Settings,
         load_context: &mut LoadContext<'_>,
     ) -> Result<Self::Asset, Self::Error> {
+        // Local packages are range-read on the asset worker. Do not keep a
+        // multi-gigabyte compressed archive alive beside decoded GPU assets.
+        // Non-filesystem sources (including web) retain the reader path below.
+        if let Some(archive) = platform::open_local(&self.root, load_context.path()) {
+            let archive = Arc::new(archive?);
+            self.store
+                .publish(archive, load_context.path().path().to_path_buf())
+                .map_err(|_| HdpArchiveLoaderError::AlreadyLoaded)?;
+            return Ok(HdpArchive);
+        }
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
         let first_volume = Arc::<[u8]>::from(bytes);

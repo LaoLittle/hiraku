@@ -171,6 +171,7 @@ pub(crate) fn script_command_from_effect(
             }
             ScriptCommand::Stage(StageCommand::Picture(picture))
         }
+        StoryEffect::StopActorMotion { actor_id } => ScriptCommand::Character(CharacterCommand::StopMotion { actor_id }),
         StoryEffect::ActorMotion {
             actor_id,
             revision,
@@ -343,6 +344,7 @@ pub fn start_story_runtime(
             capabilities::StoryEffect::MountUiOverlay {
                 name: name.clone(),
                 component: component.clone(),
+                lifetime: None,
             },
         ));
     }

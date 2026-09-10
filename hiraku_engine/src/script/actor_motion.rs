@@ -44,6 +44,11 @@ pub struct ActorMotion {
 }
 
 impl ActorMotion {
+    /// Cancel at the sampled pose, including when later hidden/restored.
+    pub(crate) fn stop(&mut self) {
+        self.transition.target = self.offset;
+        self.finish();
+    }
     pub(crate) fn finish(&mut self) {
         self.offset = self.transition.target;
         self.elapsed = self.transition.animation.duration();
@@ -83,6 +88,27 @@ impl ActorMotion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stopped_motion_keeps_sampled_pose_after_restore_and_finish() {
+        let mut motion = ActorMotion::new(
+            1,
+            ActorOffset {
+                target: [0.0, 20.0],
+                animation: AnimationSpec::Linear(1.0, false),
+            },
+            [0.0; 2],
+        );
+        motion.advance(0.25);
+        motion.stop();
+        assert_eq!(motion.offset, [0.0, 5.0]);
+        let bytes = hiraku_script::hson::to_vec(&motion).expect("serialize stopped motion");
+        let mut restored: ActorMotion =
+            hiraku_script::hson::from_slice(&bytes).expect("restore stopped motion");
+        restored.advance(1.0);
+        restored.finish();
+        assert_eq!(restored.offset, [0.0, 5.0]);
+        assert!(restored.finished);
+    }
     #[test]
     fn atomic_translation_restores_progress() {
         let transition = ActorOffset {

@@ -837,6 +837,60 @@ mod tests {
     };
 
     #[test]
+    fn modal_visits_survive_restore_before_selection_and_after_each_visit() {
+        let code = compile_story_bytecode("memory://visits.hks", r#"
+            global var north = false
+            global var south = false
+            global var east = false
+            global var west = false
+            global var count = 0
+            while count < 4 {
+                let room = ui.open("map.ui.hks", north, south, east, west) as! String
+                if room == "north" { if north { panic("duplicate") }; north = true }
+                if room == "south" { if south { panic("duplicate") }; south = true }
+                if room == "east" { if east { panic("duplicate") }; east = true }
+                if room == "west" { if west { panic("duplicate") }; west = true }
+                count += 1
+                "Visited"
+            }
+            log("complete")
+        "#).expect("typed visit loop compiles");
+        let names = ["north", "south", "east", "west"];
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = [a,b,c,d];
+                        if order.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != 4 { continue; }
+                        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+                        let mut visited = [false; 4];
+                        for room in order {
+                            let event = runtime.step().expect("next map");
+                            assert!(matches!(event, Some(StoryRuntimeEvent::OpenUi { arguments, .. })
+                                if arguments == visited.map(Value::Bool).to_vec()));
+                            runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("map boundary"))
+                                .expect("restore pending map");
+                            runtime.resume(Value::String(names[room].into())).expect("select room");
+                            visited[room] = true;
+                            let mut waiting = false;
+                            for _ in 0..16 {
+                                if matches!(runtime.step().expect("visit dialogue"), Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))) {
+                                    waiting = true; break;
+                                }
+                            }
+                            assert!(waiting, "visit must reach dialogue");
+                            runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("dialogue boundary"))
+                                .expect("restore visited room");
+                            runtime.resume(Value::Unit).expect("leave visited room");
+                        }
+                        assert!(matches!(runtime.step().expect("all rooms visited"), Some(StoryRuntimeEvent::Effect(StoryEffect::Log(s))) if s == "complete"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn modal_result_loop_reopens_after_back_and_can_navigate_without_falling_through() {
         let bytecode = compile_story_bytecode(
             "menu.hks",
@@ -933,6 +987,7 @@ mod tests {
             "alice.hide(0)",
             "scene.hideCharacters(0)\nalice.show()",
             "alice.alias(\"middle\").show()",
+            "alice.stopMotion()",
         ] {
             let bytecode = compile_story_bytecode(
                 "cancel.hks",
@@ -1315,6 +1370,7 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
                 name: "clock".to_string(),
                 component: "ui/clock.ui.hks".to_string(),
+                lifetime: None,
             }))
         );
         assert_eq!(
@@ -1330,6 +1386,20 @@ mod tests {
                 arguments: vec![Value::String("Alice".to_string()), Value::Number(3.0)],
             })
         );
+    }
+
+    #[test]
+    fn timed_ui_mount_emits_a_presentation_owned_lifetime() {
+        let bytecode = compile_story_bytecode(
+            "notification.hks",
+            "ui.mountFor(\"notice\", \"ui/notice.ui.hks\", 3.0)",
+        ).expect("timed mount must compile");
+        let mut runtime = StoryRuntime::new(bytecode).expect("runtime must initialize");
+        assert_eq!(runtime.step().expect("mount must run"), Some(
+            StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
+                name: "notice".into(), component: "ui/notice.ui.hks".into(), lifetime: Some(3.0),
+            }),
+        ));
     }
 
     #[test]

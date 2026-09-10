@@ -306,6 +306,11 @@ fn dispatch_ui_effects(ctx: &mut RuntimeMenuContext, effects: Vec<crate::ui::UiE
                         SettingsCommand::AutoDialogue(*enabled),
                     ));
                 }
+                crate::ui::UiEffect::SetFastForward(enabled) => {
+                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                        SettingsCommand::FastForward(*enabled),
+                    ));
+                }
                 crate::ui::UiEffect::SetVolume { channel, value } => {
                     ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
                         SettingsCommand::Set {
@@ -376,6 +381,11 @@ fn dispatch_ui_effects(ctx: &mut RuntimeMenuContext, effects: Vec<crate::ui::UiE
                         &ctx.choice_ui_roots,
                     );
                     ctx.dialogue_history.entries.clear();
+                    // Mounted overlays belong to the saved presentation, not
+                    // the session being replaced. Bootstrap will mount exactly
+                    // the saved set; retaining future overlays exposes stale
+                    // callbacks to globals which do not exist in this save.
+                    clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
                     clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
                     restore_frontend_scene(
                         &mut ctx.commands,
