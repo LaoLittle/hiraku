@@ -888,6 +888,7 @@ mod tests {
         );
 
         let archive = Archive::open(&output).expect("streamed package must reopen");
+        assert_eq!(archive.resident_bytes(), 0, "opening a local package must not retain payloads");
         assert_eq!(
             archive
                 .read_file("scripts/start.hks")
@@ -900,6 +901,7 @@ mod tests {
                 .expect("stored file must decode"),
             audio
         );
+        assert_eq!(archive.resident_bytes(), 0, "decoded reads must not populate a permanent volume cache");
     }
 
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);

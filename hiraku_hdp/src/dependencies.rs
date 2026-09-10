@@ -14,6 +14,7 @@ pub struct DependencyManifest {
     pub scripts: BTreeMap<String, BTreeSet<String>>,
     pub resident: BTreeSet<String>,
     /// Computed resource expressions which could not be narrowed statically.
-    /// Their resource family is conservatively included in the corresponding set.
+    /// Story queries include their resource family conservatively; open-ended
+    /// UI queries stay lazy rather than permanently pinning all game textures.
     pub conservative: BTreeMap<String, BTreeSet<String>>,
 }

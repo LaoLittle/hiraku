@@ -1,10 +1,9 @@
 use std::{
     fs,
-    path::Path,
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
-
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     ChunkDescriptor, HdpError, PackageIndex,
@@ -12,29 +11,59 @@ use crate::{
     format::{HEADER_SIZE, checksum64, decode_header, decode_index},
 };
 
-/// An opened HDP package backed by one or more complete physical volumes.
-///
-/// The owning representation is suitable for the current Bevy asset loader.
-/// A future range-backed reader can reuse [`PackageIndex`] and the same chunk
-/// decoder without requiring the whole package to be resident.
+/// An indexed HDP package. `open` range-reads local files; `from_*` retains
+/// supplied volume bytes for hosts without filesystem access.
 #[derive(Clone, Debug)]
 pub struct Archive {
     index: PackageIndex,
     volumes: Vec<OnceLock<Arc<[u8]>>>,
+    /// File-backed packages retain paths and the index, not compressed payloads.
+    files: Option<Vec<PathBuf>>,
 }
 
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HdpError> {
         let path = path.as_ref();
-        let first = Arc::<[u8]>::from(fs::read(path)?);
-        let index = Self::read_index(&first)?;
-        let mut volumes = Vec::with_capacity(index.volume_count as usize);
-        volumes.push(first);
-        for volume in 1..index.volume_count {
-            let volume_path = format!("{}.{volume:03}", path.display());
-            volumes.push(Arc::<[u8]>::from(fs::read(volume_path)?));
+        let mut first = fs::File::open(path)?;
+        let mut header_bytes = vec![0; HEADER_SIZE];
+        first.read_exact(&mut header_bytes)?;
+        let header = decode_header(&header_bytes)?;
+        let index_size = usize::try_from(header.index_size)
+            .map_err(|_| HdpError::InvalidFormat("index is too large".into()))?;
+        let prefix_size = HEADER_SIZE
+            .checked_add(index_size)
+            .ok_or_else(|| HdpError::InvalidFormat("index offset overflow".into()))?;
+        if prefix_size as u64 > first.metadata()?.len() {
+            return Err(HdpError::InvalidFormat("truncated package index".into()));
         }
-        Self::from_volumes(volumes)
+        header_bytes.resize(prefix_size, 0);
+        first.read_exact(&mut header_bytes[HEADER_SIZE..])?;
+        let index = Self::read_index(&header_bytes)?;
+        let mut files = vec![path.to_path_buf()];
+        for volume in 1..index.volume_count {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(format!(".{volume:03}"));
+            files.push(PathBuf::from(name));
+        }
+        let archive = Self {
+            volumes: (0..index.volume_count).map(|_| OnceLock::new()).collect(),
+            index,
+            files: Some(files),
+        };
+        archive.validate_index()?;
+        for (position, path) in archive
+            .files
+            .as_ref()
+            .expect("file-backed archive")
+            .iter()
+            .enumerate()
+        {
+            let mut file = fs::File::open(path)?;
+            let mut header = [0; HEADER_SIZE];
+            file.read_exact(&mut header)?;
+            archive.validate_volume_extent(position, &header, file.metadata()?.len())?;
+        }
+        Ok(archive)
     }
 
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self, HdpError> {
@@ -51,7 +80,11 @@ impl Archive {
         volumes[0]
             .set(first)
             .expect("volume zero slot must be empty during archive construction");
-        let archive = Self { index, volumes };
+        let archive = Self {
+            index,
+            volumes,
+            files: None,
+        };
         archive.validate_index()?;
         archive.validate_volume(0)?;
         Ok(archive)
@@ -74,6 +107,11 @@ impl Archive {
 
     /// Validates and publishes one physical volume. Each slot can be filled once.
     pub fn provide_volume(&self, position: u32, volume: Arc<[u8]>) -> Result<(), HdpError> {
+        if self.files.is_some() {
+            return Err(HdpError::InvalidFormat(
+                "cannot publish bytes to a file-backed archive".into(),
+            ));
+        }
         let slot = self
             .volumes
             .get(position as usize)
@@ -91,13 +129,16 @@ impl Archive {
     }
 
     pub fn is_volume_available(&self, volume: u32) -> bool {
+        if let Some(files) = &self.files {
+            return (volume as usize) < files.len();
+        }
         self.volumes
             .get(volume as usize)
             .is_some_and(|slot| slot.get().is_some())
     }
 
     pub fn is_complete(&self) -> bool {
-        self.volumes.iter().all(|volume| volume.get().is_some())
+        self.files.is_some() || self.volumes.iter().all(|volume| volume.get().is_some())
     }
 
     fn first_missing_volume(&self) -> Option<u32> {
@@ -115,6 +156,15 @@ impl Archive {
     }
 
     fn validate_volume_bytes(&self, position: usize, volume: &[u8]) -> Result<(), HdpError> {
+        self.validate_volume_extent(position, volume, volume.len() as u64)
+    }
+
+    fn validate_volume_extent(
+        &self,
+        position: usize,
+        volume: &[u8],
+        length: u64,
+    ) -> Result<(), HdpError> {
         let header = decode_header(volume)?;
         if header.package_id != self.index.package_id {
             return Err(HdpError::InvalidFormat(format!(
@@ -137,7 +187,7 @@ impl Archive {
                 "volume {position} unexpectedly contains an index"
             )));
         }
-        if header.data_offset < HEADER_SIZE as u64 || header.data_offset > volume.len() as u64 {
+        if header.data_offset < HEADER_SIZE as u64 || header.data_offset > length {
             return Err(HdpError::InvalidFormat(format!(
                 "volume {position} has an invalid data offset"
             )));
@@ -151,7 +201,7 @@ impl Archive {
                 let end = chunk.offset.checked_add(chunk.stored_size).ok_or_else(|| {
                     HdpError::InvalidFormat(format!("chunk offset overflows for `{}`", file.path))
                 })?;
-                if end > volume.len() as u64 {
+                if end > length {
                     return Err(HdpError::InvalidFormat(format!(
                         "chunk range is outside volume {position} for `{}`",
                         file.path
@@ -234,6 +284,15 @@ impl Archive {
         &self.index
     }
 
+    /// Compressed bytes retained by this reader, excluding decoded consumers.
+    pub fn resident_bytes(&self) -> usize {
+        self.volumes
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(|v| v.len())
+            .sum()
+    }
+
     pub fn contains(&self, path: &str) -> bool {
         self.index.files.contains_key(path)
     }
@@ -252,14 +311,9 @@ impl Archive {
             .map_err(|_| HdpError::InvalidFormat(format!("`{path}` is too large")))?;
         let mut output = Vec::with_capacity(capacity);
 
-        let decoded_chunks = file
-            .chunks
-            .par_iter()
-            .enumerate()
-            .map(|(idx, chunk)| self.decode_chunk(idx, chunk, path))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for decoded in decoded_chunks {
+        // Bound scratch memory to one chunk, not a second complete decoded file.
+        for (index, chunk) in file.chunks.iter().enumerate() {
+            let decoded = self.decode_chunk(index, chunk, path)?;
             output.extend_from_slice(&decoded);
         }
 
@@ -280,27 +334,45 @@ impl Archive {
         if chunk.encryption.id() != 0 {
             return Err(HdpError::UnsupportedEncryption(chunk.encryption.id()));
         }
-        let volume = self
-            .volumes
-            .get(chunk.volume as usize)
-            .and_then(OnceLock::get)
-            .ok_or(HdpError::MissingVolume(chunk.volume))?;
-        let start = usize::try_from(chunk.offset).map_err(|_| HdpError::CorruptChunk {
-            path: path.to_string(),
-            chunk: chunk_index,
-        })?;
-        let end = usize::try_from(chunk.offset + chunk.stored_size).map_err(|_| {
-            HdpError::CorruptChunk {
-                path: path.to_string(),
-                chunk: chunk_index,
-            }
-        })?;
-        let stored = volume
-            .get(start..end)
-            .ok_or_else(|| HdpError::CorruptChunk {
+        let disk_bytes;
+        let stored = if let Some(files) = &self.files {
+            let file_path = files
+                .get(chunk.volume as usize)
+                .ok_or(HdpError::MissingVolume(chunk.volume))?;
+            let mut file = fs::File::open(file_path)?;
+            file.seek(SeekFrom::Start(chunk.offset))?;
+            let length =
+                usize::try_from(chunk.stored_size).map_err(|_| HdpError::CorruptChunk {
+                    path: path.into(),
+                    chunk: chunk_index,
+                })?;
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes)?;
+            disk_bytes = bytes;
+            disk_bytes.as_slice()
+        } else {
+            let volume = self
+                .volumes
+                .get(chunk.volume as usize)
+                .and_then(OnceLock::get)
+                .ok_or(HdpError::MissingVolume(chunk.volume))?;
+            let start = usize::try_from(chunk.offset).map_err(|_| HdpError::CorruptChunk {
                 path: path.to_string(),
                 chunk: chunk_index,
             })?;
+            let end = usize::try_from(chunk.offset + chunk.stored_size).map_err(|_| {
+                HdpError::CorruptChunk {
+                    path: path.to_string(),
+                    chunk: chunk_index,
+                }
+            })?;
+            volume
+                .get(start..end)
+                .ok_or_else(|| HdpError::CorruptChunk {
+                    path: path.to_string(),
+                    chunk: chunk_index,
+                })?
+        };
         let decoded = decode(chunk.compression, stored).map_err(|_| HdpError::CorruptChunk {
             path: path.to_string(),
             chunk: chunk_index,
