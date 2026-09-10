@@ -117,16 +117,32 @@ decoder!(AudioDecoder, AudioDecoderConfig, AudioData);
 
 enum VideoCodec {
     Software(software::Video),
-    #[cfg(all(target_os = "macos", feature = "hardware"))]
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    Vaapi(super::linux::VaapiDecoder),
+    #[cfg(all(target_os = "android", feature = "media-codec"))]
+    MediaCodec(super::android::MediaCodecDecoder),
+    #[cfg(all(target_os = "macos", feature = "video-toolbox"))]
     VideoToolbox(super::macos::VideoToolboxDecoder),
-    #[cfg(all(target_os = "windows", feature = "hardware"))]
+    #[cfg(all(target_os = "windows", feature = "media-foundation"))]
     MediaFoundation(super::windows::MediaFoundationDecoder),
 }
 
 impl Configuration<VideoFrame> for VideoDecoderConfig {
     fn open(self) -> Result<Box<dyn Processor<VideoFrame>>, CodecError> {
         if !software::supports_video(&self) { return Err(CodecError::Unsupported(self.codec.0.clone())); }
-        #[cfg(all(target_os = "macos", feature = "hardware"))]
+        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+        if self.hardware_acceleration != HardwareAcceleration::PreferSoftware
+            && let Ok(decoder) = super::linux::VaapiDecoder::new(&self)
+        {
+            return Ok(Box::new(VideoCodec::Vaapi(decoder)));
+        }
+        #[cfg(all(target_os = "android", feature = "media-codec"))]
+        if self.hardware_acceleration != HardwareAcceleration::PreferSoftware
+            && let Ok(decoder) = super::android::MediaCodecDecoder::new(&self)
+        {
+            return Ok(Box::new(VideoCodec::MediaCodec(decoder)));
+        }
+        #[cfg(all(target_os = "macos", feature = "video-toolbox"))]
         if self.hardware_acceleration != HardwareAcceleration::PreferSoftware
             && super::macos::av1_hardware_decode_supported()
             && let Some(description) = &self.description
@@ -134,7 +150,7 @@ impl Configuration<VideoFrame> for VideoDecoderConfig {
         {
             return Ok(Box::new(VideoCodec::VideoToolbox(decoder)));
         }
-        #[cfg(all(target_os = "windows", feature = "hardware"))]
+        #[cfg(all(target_os = "windows", feature = "media-foundation"))]
         if self.hardware_acceleration != HardwareAcceleration::PreferSoftware
             && let Ok(decoder) = super::windows::MediaFoundationDecoder::new(self.coded_width, self.coded_height)
         {
@@ -147,18 +163,26 @@ impl Processor<VideoFrame> for VideoCodec {
     fn decode(&mut self, chunk: EncodedChunk, _cancelled: &AtomicBool) -> Result<Vec<VideoFrame>, CodecError> {
         match self {
             Self::Software(codec) => codec.decode(chunk),
-            #[cfg(all(target_os = "macos", feature = "hardware"))]
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::Vaapi(codec) => codec.decode(chunk, _cancelled),
+            #[cfg(all(target_os = "android", feature = "media-codec"))]
+            Self::MediaCodec(codec) => codec.decode(chunk, _cancelled),
+            #[cfg(all(target_os = "macos", feature = "video-toolbox"))]
             Self::VideoToolbox(codec) => codec.decode(&chunk.data, chunk.timestamp, chunk.duration.unwrap_or(0).min(i64::MAX as u64) as i64, 1, 1_000_000).map_err(CodecError::Operation),
-            #[cfg(all(target_os = "windows", feature = "hardware"))]
+            #[cfg(all(target_os = "windows", feature = "media-foundation"))]
             Self::MediaFoundation(codec) => codec.decode(&chunk.data, chunk.timestamp, chunk.duration.unwrap_or(0).min(i64::MAX as u64) as i64, 1, 1_000_000, _cancelled).map_err(CodecError::Operation),
         }
     }
     fn flush(&mut self, _cancelled: &AtomicBool) -> Result<Vec<VideoFrame>, CodecError> {
         match self {
             Self::Software(codec) => codec.flush(),
-            #[cfg(all(target_os = "macos", feature = "hardware"))]
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::Vaapi(codec) => codec.flush(_cancelled),
+            #[cfg(all(target_os = "android", feature = "media-codec"))]
+            Self::MediaCodec(codec) => codec.flush(_cancelled),
+            #[cfg(all(target_os = "macos", feature = "video-toolbox"))]
             Self::VideoToolbox(codec) => codec.finish().map_err(CodecError::Operation),
-            #[cfg(all(target_os = "windows", feature = "hardware"))]
+            #[cfg(all(target_os = "windows", feature = "media-foundation"))]
             Self::MediaFoundation(codec) => codec.finish(_cancelled).map_err(CodecError::Operation),
         }
     }

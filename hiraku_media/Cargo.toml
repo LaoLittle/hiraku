@@ -42,7 +42,17 @@ features = [
 
 [features]
 default = ["hardware"]
-hardware = ["dep:windows"]
+hardware = ["video-toolbox" ,"media-foundation", "media-codec", "vaapi"]
+video-toolbox = []
+vaapi = ["dep:cros-codecs", "dep:cros-libva"]
+media-foundation = ["dep:windows"]
+media-codec = ["dep:ndk"]
+
+[target.'cfg(target_os = "android")'.dependencies.ndk]
+version = "0.9"
+optional = true
+default-features = false
+features = ["media", "api-level-28"]
 
 [dev-dependencies]
 futures-lite.workspace = true
@@ -51,3 +61,13 @@ futures-lite.workspace = true
 version = "0.62.2"
 optional = true
 features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage"]
+
+[target.'cfg(target_os = "linux")'.dependencies.cros-codecs]
+version = "0.0.6"
+optional = true
+default-features = false
+features = ["vaapi"]
+
+[target.'cfg(target_os = "linux")'.dependencies.cros-libva]
+version = "0.0.12"
+optional = true

@@ -6,10 +6,23 @@ cfg_select! {
     _ => {
         mod software;
         mod native;
-        #[cfg(all(target_os = "macos", feature = "hardware"))]
-        mod macos;
-        #[cfg(all(target_os = "windows", feature = "hardware"))]
-        mod windows;
+        cfg_select! {
+            all(target_os = "macos", feature = "video-toolbox") => {
+                mod macos;
+            },
+            all(target_os = "android", feature = "media-codec") => {
+                mod frame;
+                mod android;
+            },
+            all(target_os = "windows", feature = "media-foundation") => {
+                mod windows;
+            },
+            all(target_os = "linux", feature = "vaapi") => {
+                mod frame;
+                mod linux;
+            },
+            _ => {}
+        }
         pub(crate) use native::{VideoDecoder, AudioDecoder, video_config_supported, audio_config_supported};
     }
 }
