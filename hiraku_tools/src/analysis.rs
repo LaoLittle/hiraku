@@ -232,6 +232,13 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
                     }
                 }
             } else {
+                // An open-ended UI image parameter (gallery, thumbnail, etc.)
+                // must stay lazy. Pinning its entire family makes every game
+                // texture resident for the session, regardless of navigation.
+                if ui_files.contains(&path) {
+                    unresolved.insert(query.clone());
+                    continue;
+                }
                 images.extend(
                     if family == "char" {
                         &all_characters
@@ -496,6 +503,7 @@ fn expr(value: &Expr, out: &mut Facts) {
         ExprKind::Member { object, .. } | ExprKind::SafeMember { object, .. } => expr(object, out),
         ExprKind::Binding(v)
         | ExprKind::UnaryMinus(v)
+        | ExprKind::Not(v)
         | ExprKind::NonNull(v)
         | ExprKind::Cast { value: v, .. } => expr(v, out),
         ExprKind::Elvis { value, fallback } => {
@@ -581,6 +589,19 @@ fn expr(value: &Expr, out: &mut Facts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn open_ended_ui_images_do_not_make_the_texture_catalog_resident() {
+        let docs = BTreeMap::from([
+            ("ui.texture.hson".into(), ".{ name: \"ui/frame\", image: \"ui.png\" }".into()),
+            ("alice.texture.hson".into(), ".{ name: \"alice\", image: \"alice.png\" }".into()),
+            ("bob.texture.hson".into(), ".{ name: \"bob\", image: \"bob.png\" }".into()),
+            ("ui/view.ui.hks".into(), "@ui fn view(name: String) { image(\"ui/frame\"); image(name) }".into()),
+        ]);
+        let manifest = analyze(&docs).expect("analyze dynamic UI");
+        assert_eq!(manifest.resident, BTreeSet::from(["ui.png".into()]));
+        assert!(!manifest.scripts["ui/view.ui.hks"].contains("alice.png"));
+        assert!(!manifest.scripts["ui/view.ui.hks"].contains("bob.png"));
+    }
     #[test]
     fn parameterized_ui_and_returned_images_do_not_pin_unrelated_textures() {
         let docs = BTreeMap::from([

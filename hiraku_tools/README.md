@@ -20,8 +20,10 @@ entries rather than transitive preload dependencies. UI entries contribute
 their image sets to the resident set, including gallery content referenced by
 UI. Runtime storage thumbnails are external images, not package dependencies.
 
-Unknown computed catalog references conservatively include their resource
-family and are recorded under `conservative` (and reported while building).
+Unknown computed story catalog references conservatively include their resource
+family. Unknown UI references remain on-demand: an unconstrained image parameter
+must not pin the entire game's texture catalog. Both are recorded under
+`conservative` (and reported while building).
 This is a static over-approximation, not execution of project scripts. Native
 extensions that consume resource names need corresponding analysis support;
 arbitrary externally generated paths still use normal on-demand asset loading.
@@ -38,6 +40,13 @@ The engine holds strong preload handles for the target script and resident UI.
 Calls additionally retain caller dependencies. Goto drops obsolete **preload
 ownership**, not live scene/UI ownership; Bevy frees images when their last
 owner releases them. No forced removal from `Assets<Image>` occurs.
+
+Fully hidden character render hierarchies are retired after a five-second reuse
+window once fades and pending shows have finished. Script actor state is kept;
+the next show reconstructs rendering and reacquires assets normally. Local HDP
+packages keep only the index and read compressed chunks from disk on demand;
+in-memory/web volume eviction is not implemented yet. File decoding retains at
+most one decoded scratch chunk in addition to the final output buffer.
 
 Script entry waits for load completion. Failure reports an error and stops at
 the loading gate rather than starting an incomplete scene. A package manifest

@@ -80,7 +80,15 @@ fn bridge_host_actions(
     keys: Res<ButtonInput<KeyCode>>,
     mut actions: MessageWriter<HirakuActionInput>,
     focus: Res<hiraku_engine::input::HirakuTextFocus>,
+    windows: Query<&Window>,
+    mut was_fast_forward_held: Local<bool>,
 ) {
+    let held = focus.0.is_none() && windows.iter().any(|window| window.focused)
+        && keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    if held != *was_fast_forward_held {
+        actions.write(HirakuActionInput(HirakuAction::FastForwardHeld(held)));
+        *was_fast_forward_held = held;
+    }
     if focus.0.is_some() {
         return;
     }

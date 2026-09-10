@@ -23,8 +23,13 @@ jobs:
                   apt-get install -y --no-install-recommends
                   pkg-config
                   libasound2-dev:arm64
-                  libudev-dev:arm64
                   libwayland-dev:arm64
+                  libudev-dev:arm64
+                  clang:arm64
+                  libclang-dev:arm64
+                  libva-dev:arm64
+                  libgbm-dev:arm64
+                  libdrm-dev:arm64
       
       CROSS_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_PRE_BUILD: >-
                   dpkg --add-architecture riscv64 &&
@@ -94,7 +99,12 @@ jobs:
           pkg-config \
           libwayland-dev \
           libasound2-dev \
-          libudev-dev
+          libudev-dev \
+          clang \
+          libclang-dev \
+          libva-dev \
+          libgbm-dev \
+          libdrm-dev
 
       - name: Install NASM
         if: |

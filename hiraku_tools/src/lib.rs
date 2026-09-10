@@ -43,7 +43,7 @@ pub fn pack_directory(
     }
     let manifest = analyze(&documents)?;
     for (script, expressions) in &manifest.conservative {
-        eprintln!("[HDP dependencies] {script}: conservative preload for {expressions:?}");
+        eprintln!("[HDP dependencies] {script}: unresolved references {expressions:?} (story: conservative preload; UI: on-demand)");
     }
     let encoded = hiraku_script::hson::to_string(&manifest)?;
     let mut builder = StreamPackageBuilder::new(options)?;

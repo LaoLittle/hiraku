@@ -235,6 +235,7 @@ impl Collector<'_> {
             ExprKind::Member { object, .. }
             | ExprKind::SafeMember { object, .. }
             | ExprKind::UnaryMinus(object)
+            | ExprKind::Not(object)
             | ExprKind::NonNull(object)
             | ExprKind::Binding(object) => self.expression(object),
             ExprKind::Cast { value, .. } => self.expression(value),
