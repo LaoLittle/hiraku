@@ -69,5 +69,5 @@ default-features = false
 features = ["vaapi"]
 
 [target.'cfg(target_os = "linux")'.dependencies.cros-libva]
-version = "0.0.13"
+version = "0.0.12"
 optional = true
