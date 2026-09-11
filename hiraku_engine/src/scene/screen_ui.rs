@@ -14,7 +14,7 @@ pub(crate) struct OverlayLifetime(pub Timer);
 
 pub(crate) fn expire_overlays(
     mut commands: Commands,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     mut redraw: crate::redraw::Redraw,
     mut overlays: ResMut<OverlayUiState>,
     mut timers: Query<(Entity, &mut OverlayLifetime)>,
@@ -90,6 +90,7 @@ pub(crate) fn fit_screen_text(mut redraw: crate::redraw::Redraw, mut texts: Quer
 }
 
 pub(super) fn clear_screen_ui(commands: &mut Commands, screen_state: &mut ScreenUiState) {
+    screen_state.closing_root = None;
     for (root, _) in screen_state.stack.drain(..) {
         commands.entity(root).try_despawn();
     }
@@ -132,6 +133,8 @@ pub fn cleanup_stale_screen_ui(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     images: Res<Assets<Image>>,
+    shaders: Option<Res<Assets<Shader>>>,
+    shader_dependencies: Query<&crate::render::ui_quad::UiShaderAssets>,
     mut screen_state: ResMut<ScreenUiState>,
     preview: Option<ResMut<super::save_preview::SavePreview>>,
 ) {
@@ -153,7 +156,9 @@ pub fn cleanup_stale_screen_ui(
     }
     let depth_offset = screen_state.stack.len() as i32 * 3;
     if let Some(mut pending) = screen_state.pending_root.take() {
-        if screen_images_ready(&images, &pending.wait_images) && pending.ready_frames_remaining == 0
+        let ready = screen_images_ready(&images, &pending.wait_images)
+            && shader_dependencies.get(pending.entity).map_or(true, |deps| shaders.as_ref().is_some_and(|assets| deps.0.iter().all(|h|assets.contains(h))));
+        if ready && pending.ready_frames_remaining == 0
         {
             commands.entity(pending.entity).insert((
                 Visibility::Inherited,
@@ -172,7 +177,7 @@ pub fn cleanup_stale_screen_ui(
             screen_state.active_root = Some(pending.entity);
             screen_state.waiting = pending.done;
         } else {
-            if screen_images_ready(&images, &pending.wait_images) {
+            if ready {
                 commands.entity(pending.entity).insert((
                     Visibility::Inherited,
                     GlobalZIndex(SCREEN_MODAL_PENDING_Z + depth_offset),
@@ -294,6 +299,8 @@ pub fn recompose_screen_ui(
             commands.entity(child).try_despawn();
         }
         commands.entity(root).add_children(&next);
+        commands.entity(root).insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
+        commands.entity(root).insert(super::clock::ScenePausePolicy(screen.pauses_scene));
         commands
             .entity(root)
             .insert((screen_root_node(&screen), screen_root_background(&screen)));
@@ -328,6 +335,12 @@ pub(super) fn spawn_screen_ui(
         .id();
 
     let mut image_handles = Vec::new();
+    commands.entity(root).insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
+    commands.entity(root).insert(super::clock::ScenePausePolicy(screen.pauses_scene));
+    if screen.fade_seconds > 0.0 { commands.entity(root).insert(super::ui_visuals::ScreenFade::new(screen.fade_seconds)); }
+    if !screen.timers.is_empty() {
+        commands.entity(root).insert((super::ui_timers::UiTimers::new(&screen.timers), super::ui_timers::UiTimersPaused(screen.timers_paused)));
+    }
     if let Some(renderer) = &screen.composition {
         commands.entity(root).insert((
             super::widgets::UiLocalState(renderer.globals.clone()),
@@ -347,6 +360,10 @@ pub(super) fn spawn_screen_ui(
         &mut image_handles,
     );
     commands.entity(root).add_children(&children);
+
+    if !screen.timers.is_empty() {
+        commands.entity(root).insert(crate::render::ui_quad::UiImageAssets(image_handles.clone()));
+    }
 
     SpawnedScreenUi {
         root,
@@ -497,6 +514,11 @@ fn screen_root_background(screen: &ScreenSpec) -> BackgroundColor {
 }
 
 pub(super) fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
+    if layout.fit_content {
+        node.width = Val::Auto;
+        node.height = Val::Auto;
+        node.flex_shrink = 0.0;
+    }
     if layout.clip {
         node.overflow = Overflow::clip();
     }
@@ -846,6 +868,24 @@ fn spawn_screen_node_entity(
                 .spawn((ScreenUiNode, Pickable::IGNORE, image, node))
                 .id();
             apply_live_layout_bindings(commands, entity, layout);
+            if let Some(shader)=&layout.shader {
+                let handle: Handle<Shader> = asset_server.load(shader.path.clone());
+                let dependency = handle.clone();
+                commands.queue(move |world: &mut World| {
+                    if let Ok(mut root) = world.get_entity_mut(root) {
+                        if let Some(mut deps) = root.get_mut::<crate::render::ui_quad::UiShaderAssets>() {
+                            deps.0.push(dependency);
+                        } else {
+                            root.insert(crate::render::ui_quad::UiShaderAssets(vec![dependency]));
+                        }
+                    }
+                });
+                let textures:Vec<_>=shader.textures.iter().map(|path| super::save_preview::load_image(asset_server,path)).collect();
+                image_handles.extend(textures.iter().cloned());
+                commands.entity(entity).insert(crate::render::ui_quad::UiShaderSource {
+                    shader:handle,textures,keys:shader.keys.clone(),blend:shader.blend,
+                });
+            }
             entity
         }
         ScreenNode::ImageButton(ScreenImageButtonNode {
@@ -1261,6 +1301,8 @@ pub(super) fn apply_live_layout_bindings(
     entity: Entity,
     layout: &ScreenLayout,
 ) {
+    if let Some(factor) = layout.hover_brightness { commands.entity(entity).insert(super::ui_visuals::HoverBrightness(factor)); }
+    commands.entity(entity).insert(UiTransform { rotation: Rot2::degrees(layout.rotation), ..default() });
     commands.entity(entity).insert(if layout.hidden {
         Visibility::Hidden
     } else {
@@ -1277,6 +1319,9 @@ pub(super) fn apply_live_layout_bindings(
             expression: expression.clone(),
             rendered_revision: u64::MAX,
         });
+    }
+    if !layout.keyframes.is_empty() {
+        commands.entity(entity).insert((super::ui_keyframes::UiKeyframes::new(&layout.keyframes), super::ui_keyframes::Opacity(0.0)));
     }
     if layout.hover_offset.is_some() {
         let motion = super::ui_hover::HoverMotion::new(layout);
@@ -1309,12 +1354,14 @@ pub(super) fn apply_live_layout_bindings(
 pub fn animate_screen_ui(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
-    time: Res<Time>,
+    time: super::ui_timers::UiClock,
     mut players: Query<(Entity, &mut UiAnimationPlayer, &mut UiTransform)>,
 ) {
-    if !players.is_empty() { redraw.request(); }
     for (entity, mut player, mut transform) in &mut players {
-        player.elapsed += time.delta_secs();
+        let delta = time.delta(entity);
+        if delta.is_zero() { continue; }
+        redraw.request();
+        player.elapsed += delta.as_secs_f32();
         let duration = player.spec.duration().max(f32::EPSILON);
         let raw = player.elapsed / duration;
         if let Some(phases) = &player.phases {
@@ -1837,6 +1884,11 @@ pub fn update_builtin_ui_models(
         ])),
     );
 
+    // History changes per utterance, not per frame or revealed character.
+    // Avoid cloning and joining the entire log while rendering an unchanged UI.
+    if !dialogue_history.is_changed() && models.get("history").is_some() {
+        return;
+    }
     let entries = dialogue_history
         .entries
         .iter()
@@ -2159,6 +2211,26 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unchanged_history_does_not_overwrite_or_rebuild_its_model() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<SceneSharedState>()
+            .init_resource::<DialogueState>()
+            .init_resource::<DialogueHistoryState>()
+            .init_resource::<UiModels>()
+            .add_systems(Update, update_builtin_ui_models);
+        app.update();
+        // A sentinel detects a rebuild, even when UiModels::set would normally
+        // hide redundant construction by comparing the full value for equality.
+        app.world_mut().resource_mut::<UiModels>().set("history", StoredValue::String("sentinel".into()));
+        for _ in 0..20 { app.update(); }
+        assert_eq!(app.world().resource::<UiModels>().get("history"), Some(&StoredValue::String("sentinel".into())));
+        app.world_mut().resource_mut::<DialogueHistoryState>().push(DialogueSnapshot { speaker: "alice".into(), text: "Hello".into() });
+        app.update();
+        assert_eq!(app.world().resource::<UiModels>().get("history.text"), Some(&StoredValue::String("alice\nHello".into())));
+    }
+
     #[test]
     fn fitted_title_centers_shaped_line_inside_its_box() {
         let mut app = App::new();

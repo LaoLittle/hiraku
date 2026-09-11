@@ -13,9 +13,44 @@ pub struct DialogueState {
     pub effect: DialogueTextEffect,
 }
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct DialogueHistoryState {
     pub entries: Vec<DialogueSnapshot>,
+    /// Maximum retained dialogue entries; zero disables history recording.
+    pub max_entries: usize,
+}
+
+impl Default for DialogueHistoryState {
+    fn default() -> Self { Self { entries: Vec::new(), max_entries: 1024 } }
+}
+
+impl DialogueHistoryState {
+    pub(super) fn push(&mut self, entry: DialogueSnapshot) {
+        if self.max_entries == 0 { self.entries.clear(); return; }
+        let discard = (self.entries.len() + 1).saturating_sub(self.max_entries);
+        self.entries.drain(..discard);
+        self.entries.push(entry);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn history_keeps_the_newest_entries_and_can_be_disabled() {
+        let mut history = DialogueHistoryState { max_entries: 3, ..default() };
+        for index in 0..100 {
+            history.push(DialogueSnapshot { speaker: "alice".into(), text: index.to_string() });
+        }
+        assert_eq!(history.entries.iter().map(|entry| entry.text.as_str()).collect::<Vec<_>>(), ["97", "98", "99"]);
+        history.max_entries = 1;
+        history.push(DialogueSnapshot { speaker: "bob".into(), text: "latest".into() });
+        assert_eq!(history.entries.len(), 1);
+        history.max_entries = 0;
+        history.push(DialogueSnapshot { speaker: "alice".into(), text: "ignored".into() });
+        assert!(history.entries.is_empty());
+    }
 }
 
 pub struct PendingDialogueAdvance {
@@ -190,7 +225,7 @@ pub(super) fn advance_dialogue(
 
 pub fn animate_dialogue_text_reveal(
     mut redraw: crate::redraw::Redraw,
-    time: Res<Time>,
+    time: crate::scene::playback::StoryTime,
     preferences: Res<UserSettings>,
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,

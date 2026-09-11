@@ -3,6 +3,7 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub enum SceneEffect {
+    Spatial(crate::stage::runtime::StageCommand),
     Picture(super::pictures::PictureCommand),
     HideCharacter(Option<String>),
     ShowCharacter(String),
@@ -18,6 +19,7 @@ pub fn complete(
     mut commands: Commands,
     mut runtime: ResMut<ScriptRuntimeState>,
     shared: Res<SceneSharedState>,
+    spatial: Res<crate::stage::runtime::StageRuntime>,
     stage: Res<StageState>,
     assets: Res<AssetServer>,
     groups: Query<&super::character_composite::CharacterGroup>,
@@ -34,6 +36,29 @@ pub fn complete(
             continue;
         }
         let busy = match &wait.effect {
+            SceneEffect::Spatial(command) => {
+                if let Some(error) = &spatial.error {
+                    crate::script::emit_script_diagnostic("stage execution failed", error);
+                    runtime.story = None;
+                    commands.entity(entity).try_despawn();
+                    continue;
+                }
+                shared.0.spatial_stage.as_ref().is_some_and(|state| {
+                    use crate::stage::runtime::StageCommand;
+                    match command {
+                        StageCommand::Close { .. } => false,
+                        StageCommand::Clip { id, .. } => state.id == *id && !spatial.ready(state),
+                        StageCommand::Open { id, .. } | StageCommand::Place { id, .. } =>
+                            state.id == *id && !spatial.ready(state),
+                        StageCommand::Camera { id, view, name, .. } => state.id == *id &&
+                            (!spatial.ready(state) || state.views.get(view).is_some_and(|v|
+                                v.request.as_ref().is_some_and(|r| &r.0 == name)
+                                || (v.camera_name.as_ref() == Some(name) && v.tween.is_some()))),
+                        StageCommand::View { id, view, .. } => state.id == *id &&
+                            (!spatial.ready(state) || state.views.get(view).is_some_and(|v| v.fade.is_some())),
+                    }
+                })
+            }
             SceneEffect::ShowCharacter(actor) => {
                 pending.items.iter().any(|show| &show.actor_id == actor)
                     || stage.character_roots.get(actor).is_some_and(|root| {
@@ -56,7 +81,8 @@ pub fn complete(
             SceneEffect::Picture(command) => {
                 let (P::Show { id, .. }
                 | P::Hide { id, .. }
-                | P::Move { id, .. }
+                | P::Exit { id, .. }
+                | P::Transform { id, .. }
                 | P::AnimateX { id, .. }
                 | P::Tint { id, .. }
                 | P::Blur { id, .. }) = command
@@ -65,7 +91,7 @@ pub fn complete(
                 };
                 if let Some(picture) = shared.0.pictures.get(id) {
                     let handle: Handle<Image> = assets.load(picture.path.clone());
-                    if !matches!(command, P::Hide { .. })
+                    if !matches!(command, P::Hide { .. } | P::Exit { .. })
                         && matches!(
                             assets.load_state(handle.id()),
                             bevy::asset::LoadState::Failed(_)
@@ -84,10 +110,10 @@ pub fn complete(
                             !assets.is_loaded_with_dependencies(handle.id())
                                 || picture.fade.is_some()
                         }
-                        P::Hide { .. } => picture.fade.is_some(),
+                        P::Hide { .. } | P::Exit { .. } => picture.fade.is_some(),
                         P::Blur { .. } => picture.blur_tween.is_some(),
                         P::Tint { .. } => picture.tint_tween.is_some(),
-                        P::Move { .. } | P::AnimateX { .. } => picture.motion.is_some(),
+                        P::Transform { .. } | P::AnimateX { .. } => picture.motion.is_some(),
                         P::Clear | P::StopMotion { .. } => false,
                     }
                 } else {

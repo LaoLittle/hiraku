@@ -421,6 +421,7 @@ fn interpolate_zoom(from: f32, to: f32, progress: f32, view_space: bool) -> f32 
 }
 
 pub fn animate_camera_transition(
+    shared: Option<Res<crate::state::SceneSharedState>>,
     mut redraw: crate::redraw::Redraw,
     time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
@@ -512,6 +513,10 @@ pub fn animate_camera_transition(
         tweens.active = None;
     }
 
+    if shared.as_ref().is_some_and(|shared| shared.0.spatial_stage.is_some()) {
+        *applied_state = None;
+        return;
+    }
     if applied_state.as_ref() == Some(&*camera_state) {
         return;
     }

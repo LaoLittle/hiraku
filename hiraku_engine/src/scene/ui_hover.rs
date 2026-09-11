@@ -65,7 +65,7 @@ impl HoverMotion {
 
 pub fn animate_hover(
     mut redraw: crate::redraw::Redraw,
-    time: Res<Time>,
+    time: super::ui_timers::UiClock,
     models: Res<UiModels>,
     screen: Res<ScreenUiState>,
     overlays: Res<OverlayUiState>,
@@ -96,6 +96,8 @@ pub fn animate_hover(
         }
     }
     for (entity, mut motion, mut transform) in &mut motions {
+        let delta = time.delta(entity);
+        if delta.is_zero() { continue; }
         let root = find_component_ancestor(entity, &roots, &parents);
         let interactive = root.is_some_and(|root| screen.accepts_input(root, &overlays));
         let revision = models.revision();
@@ -117,7 +119,7 @@ pub fn animate_hover(
         motion.revision = revision;
         let active = motion.selected || (interactive && hovered.contains(&entity));
         let old_position = motion.current;
-        let position = motion.advance(active, time.delta_secs());
+        let position = motion.advance(active, delta.as_secs_f32());
         if position != old_position || motion.current != motion.target { redraw.request(); }
         let translation = Val2::px(position.x, position.y);
         if transform.translation != translation {
@@ -204,7 +206,7 @@ mod tests {
                 .get::<UiTransform>(group)
                 .expect("blocked transform")
                 .translation,
-            Val2::ZERO
+            Val2::px(-84.0, 0.0) // Covered screen's animation clock is frozen.
         );
         app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(root);
         app.world_mut().resource_mut::<HoverMap>().0.clear();

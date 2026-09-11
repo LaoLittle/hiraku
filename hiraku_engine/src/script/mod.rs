@@ -75,6 +75,7 @@ pub(crate) fn script_command_from_effect(
     use capabilities::StoryEffect;
 
     Ok(match effect {
+        StoryEffect::Spatial(command) => ScriptCommand::Stage(StageCommand::Spatial(command)),
         StoryEffect::Log(message) => ScriptCommand::Runtime(RuntimeCommand::Log(message)),
         StoryEffect::ClearDialogue => ScriptCommand::Dialogue(DialogueCommand::Clear),
         StoryEffect::DialogueSpeed(multiplier) => {
@@ -161,6 +162,7 @@ pub(crate) fn script_command_from_effect(
             })
         }
         StoryEffect::Clip(clip) => ScriptCommand::Stage(StageCommand::Clip(clip)),
+        StoryEffect::SetActorDepth { id, depth } => ScriptCommand::Stage(StageCommand::SetActorDepth { id, depth }),
         StoryEffect::Picture(mut picture) => {
             if let crate::scene::pictures::PictureCommand::Show { path, rect, .. } = &mut picture {
                 let texture = textures
@@ -225,6 +227,8 @@ fn parse_camera_ease(name: &str) -> Result<CharacterEase, String> {
         "ease" => Ok(CharacterEase::Ease),
         "easeIn" | "ease_in" => Ok(CharacterEase::EaseIn),
         "easeOut" | "ease_out" => Ok(CharacterEase::EaseOut),
+        "easeOutSine" => Ok(CharacterEase::EaseOutSine),
+        "easeInOutSine" => Ok(CharacterEase::EaseInOutSine),
         "easeInOut" | "ease_in_out" => Ok(CharacterEase::EaseInOut),
         "bounce" => Ok(CharacterEase::Bounce),
         _ => Err(format!("unsupported camera easing `{name}`")),

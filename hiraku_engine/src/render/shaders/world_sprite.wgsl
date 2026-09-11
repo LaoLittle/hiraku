@@ -1,6 +1,7 @@
 #import bevy_pbr::forward_io::VertexOutput
 
 struct WorldSpriteMaterial {
+    clip_plane: vec4<f32>,
     slice_borders: vec4<f32>,
     slice_size: vec4<f32>,
     clip_bounds: vec4<f32>,
@@ -31,6 +32,9 @@ fn slice_axis(uv: f32, source: f32, destination: f32, before: f32, after: f32) -
 
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    if material.clip_plane.w > 0.0 && dot(material.clip_plane.xy, mesh.world_position.xy) > material.clip_plane.z {
+        discard;
+    }
     let texture_size = vec2<f32>(textureDimensions(color_texture));
     let full_image = material.rect.z <= 0.0 || material.rect.w <= 0.0;
     let source_size = select(material.rect.zw, texture_size, full_image);

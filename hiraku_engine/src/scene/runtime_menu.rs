@@ -13,6 +13,7 @@ pub struct RuntimeMenuButton {
 
 #[derive(SystemParam)]
 pub struct RuntimeMenuContext<'w, 's> {
+    pub fades: Query<'w, 's, &'static super::ui_visuals::ScreenFade>,
     pub preview: Res<'w, super::save_preview::SavePreview>,
     pub local_states: Query<'w, 's, &'static mut super::widgets::UiLocalState>,
     pub commands: Commands<'w, 's>,
@@ -296,6 +297,9 @@ fn dispatch_ui_effects(ctx: &mut RuntimeMenuContext, effects: Vec<crate::ui::UiE
     let mut effects = effects.into_iter();
     while let Some(effect) = effects.next() {
             match &effect {
+                crate::ui::UiEffect::StopVoice => {
+                    finish_all_voices(&mut ctx.commands, &mut ctx.animations, &mut ctx.voice_state);
+                }
                 crate::ui::UiEffect::SetPreference(change) => {
                     ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
                         SettingsCommand::Preference(change.clone()),
@@ -442,14 +446,18 @@ fn dispatch_ui_effects(ctx: &mut RuntimeMenuContext, effects: Vec<crate::ui::UiE
                         ),
                     }
                 }
-                crate::ui::UiEffect::CloseUi { value } => {
-                    if let Some(request) = ctx.screen_state.waiting.take() {
-                        ctx.responses.write(ScriptResponseMessage {
-                            request,
-                            response: ScriptResponse::UiResult(value.clone()),
-                        });
+                crate::ui::UiEffect::CloseUi { value } | crate::ui::UiEffect::CompleteUi { value } => {
+                    let complete = matches!(&effect, crate::ui::UiEffect::CompleteUi { .. });
+                    if let Some(root) = ctx.screen_state.active_root {
+                        if ctx.fades.contains(root) {
+                            if ctx.screen_state.closing_root.is_none() {
+                                ctx.commands.entity(root).try_insert(super::ui_visuals::FadeResult { value: value.clone(), complete });
+                                ctx.screen_state.closing_root = Some(root);
+                            }
+                            continue;
+                        }
                     }
-                    close_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                    super::ui_visuals::finish(&mut ctx.commands, &mut ctx.screen_state, &mut ctx.responses, value.clone(), complete);
                 }
                 crate::ui::UiEffect::Navigate(navigation) => {
                     ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(

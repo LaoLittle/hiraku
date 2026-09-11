@@ -312,6 +312,8 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            spatial_stage_hson: hson::to_vec(&scene.spatial_stage).expect("serializable spatial stage"),
+            actor_depths: scene.actor_depths.clone(),
             clips_hson: hson::to_vec(&scene.clips)
                 .expect("clip state contains only serializable data"),
             actor_motions_hson: hson::to_vec(&scene.actor_motions)
@@ -351,6 +353,13 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
+            spatial_stage: if scene.spatial_stage_hson.is_empty() { None } else {
+                let stage: Option<crate::stage::StageSnapshot> = hson::from_slice(&scene.spatial_stage_hson)
+                    .map_err(|error| StorageError::InvalidSave(format!("invalid spatial stage: {error}")))?;
+                if let Some(stage) = &stage { stage.validate().map_err(StorageError::InvalidSave)?; }
+                stage
+            },
+            actor_depths: scene.actor_depths,
             clips: hson::from_slice(&scene.clips_hson).map_err(|error| {
                 StorageError::InvalidSave(format!("invalid clip state: {error}"))
             })?,
@@ -695,6 +704,7 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                screen_space: false,
                 previous: Vec::new(),
                 size: Some([640.0, 320.0]),
                 slice: Some([20.0; 4]),
@@ -741,6 +751,7 @@ mod tests {
     fn save_roundtrip_preserves_shared_actor_picture_clip() {
         use crate::scene::clipping::{ClipCommand, ClipRegion};
         let mut data = SaveGameData::default();
+        data.scene.actor_depths.insert("alice".into(), 14.0);
         data.scene
             .clips
             .apply(ClipCommand::Define {
@@ -768,6 +779,7 @@ mod tests {
             .expect("clip picture");
         let restored = decode_save_data(&encode_save_data(&data)).expect("clip save decodes");
         assert_eq!(restored.scene.clips, data.scene.clips);
+        assert_eq!(restored.scene.actor_depths, data.scene.actor_depths);
         assert_eq!(
             restored.scene.clips.actor("alice"),
             restored.scene.clips.picture("room")

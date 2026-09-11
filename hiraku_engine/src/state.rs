@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 24;
+pub const CURRENT_SAVE_VERSION: u32 = 25;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
@@ -123,6 +123,9 @@ impl Default for CameraSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
+    #[serde(default)]
+    pub spatial_stage: Option<crate::stage::runtime::StageSnapshot>,
+    pub actor_depths: BTreeMap<String, f32>,
     pub clips: crate::scene::clipping::ClipState,
     pub actor_motions: BTreeMap<String, crate::script::actor_motion::ActorMotion>,
     #[serde(default)]

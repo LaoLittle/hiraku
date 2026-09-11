@@ -200,6 +200,19 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     warn!("{error}");
                 }
             }
+            ScriptCommand::Stage(StageCommand::SetActorDepth { id, depth }) => {
+                shared_state.0.actor_depths.insert(id, depth);
+            }
+            ScriptCommand::Stage(StageCommand::Spatial(mut command)) => {
+                if let crate::stage::runtime::StageCommand::Open { path, .. } = &mut command {
+                    *path = vfs.0.resolve_path(script_runtime.current_script.as_deref(), path);
+                }
+                if let Err(error) = crate::stage::runtime::StageSnapshot::apply(&mut shared_state.0.spatial_stage, command) {
+                    crate::script::emit_script_diagnostic("stage command failed", &error);
+                    script_runtime.story = None;
+                    return;
+                }
+            }
             ScriptCommand::Stage(StageCommand::Picture(picture)) => {
                 if let Err(error) =
                     pictures::apply_picture_command(&mut shared_state.0.pictures, picture)

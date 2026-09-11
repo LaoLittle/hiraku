@@ -36,6 +36,8 @@ pub enum RuntimeCommand {
 
 #[derive(Debug)]
 pub enum StageCommand {
+    Spatial(crate::stage::runtime::StageCommand),
+    SetActorDepth { id: String, depth: f32 },
     Clip(crate::scene::clipping::ClipCommand),
     AwaitCurtain {
         done: ScriptRequestId,
@@ -202,6 +204,8 @@ pub struct ResolvedCharacterKeyframe {
 
 #[derive(Debug, Clone, Copy)]
 pub enum CharacterEase {
+    EaseOutSine,
+    EaseInOutSine,
     Linear,
     Ease,
     EaseIn,

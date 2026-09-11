@@ -11,6 +11,8 @@ pub enum AnimationSpec {
     EaseIn(f64, bool),
     EaseOut(f64, bool),
     EaseInOut(f64, bool),
+    EaseOutSine(f64, bool),
+    EaseInOutSine(f64, bool),
 }
 
 #[allow(non_snake_case)]
@@ -19,6 +21,8 @@ impl AnimationSpec {
     fn easeIn(seconds: f64) -> AnimationSpec { Self::EaseIn(seconds, false) }
     fn easeOut(seconds: f64) -> AnimationSpec { Self::EaseOut(seconds, false) }
     fn easeInOut(seconds: f64) -> AnimationSpec { Self::EaseInOut(seconds, false) }
+    fn easeOutSine(seconds: f64) -> AnimationSpec { Self::EaseOutSine(seconds, false) }
+    fn easeInOutSine(seconds: f64) -> AnimationSpec { Self::EaseInOutSine(seconds, false) }
 }
 }
 
@@ -54,6 +58,8 @@ impl AnimationSpec {
             Self::Linear(value, _)
             | Self::EaseIn(value, _)
             | Self::EaseOut(value, _)
+            | Self::EaseOutSine(value, _)
+            | Self::EaseInOutSine(value, _)
             | Self::EaseInOut(value, _) => value.max(0.0) as f32,
         }
     }
@@ -63,6 +69,8 @@ impl AnimationSpec {
             Self::Linear(_, repeat)
             | Self::EaseIn(_, repeat)
             | Self::EaseOut(_, repeat)
+            | Self::EaseOutSine(_, repeat)
+            | Self::EaseInOutSine(_, repeat)
             | Self::EaseInOut(_, repeat) => repeat,
         }
     }
@@ -73,6 +81,8 @@ impl AnimationSpec {
             Self::Linear(..) => progress,
             Self::EaseIn(..) => progress * progress,
             Self::EaseOut(..) => 1.0 - (1.0 - progress) * (1.0 - progress),
+            Self::EaseOutSine(..) => (progress * std::f32::consts::FRAC_PI_2).sin(),
+            Self::EaseInOutSine(..) => (1.0 - (progress * std::f32::consts::PI).cos()) * 0.5,
             Self::EaseInOut(..) => {
                 if progress < 0.5 {
                     2.0 * progress * progress
@@ -88,6 +98,8 @@ impl AnimationSpec {
             Self::Linear(value, _) => Self::Linear(value, true),
             Self::EaseIn(value, _) => Self::EaseIn(value, true),
             Self::EaseOut(value, _) => Self::EaseOut(value, true),
+            Self::EaseOutSine(value, _) => Self::EaseOutSine(value, true),
+            Self::EaseInOutSine(value, _) => Self::EaseInOutSine(value, true),
             Self::EaseInOut(value, _) => Self::EaseInOut(value, true),
         }
     }

@@ -17,6 +17,7 @@ use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
 mod scene_visuals;
+mod spatial_stage;
 mod sound;
 
 /// Engine-facing effects produced by HKS native functions.
@@ -24,6 +25,7 @@ mod sound;
 /// Engine code dispatches these effects directly to ECS-facing systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
+    Spatial(crate::stage::runtime::StageCommand),
     ActorMotion {
         actor_id: String,
         revision: u64,
@@ -31,6 +33,7 @@ pub enum StoryEffect {
     },
     Picture(crate::scene::pictures::PictureCommand),
     Clip(crate::scene::clipping::ClipCommand),
+    SetActorDepth { id: String, depth: f32 },
     Log(String),
     ClearDialogue,
     DialogueSpeed(f32),
@@ -132,6 +135,7 @@ pub enum StoryTaskKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoryControl {
+    RandomInt { min: i64, max: i64 },
     Navigate(NavigationRequest),
     SpawnTask { kind: StoryTaskKind, closure: Value },
     BeginChoice { prompt: String, closure: Value },
@@ -264,6 +268,7 @@ fn source_hash(path: &str, source: &str) -> u64 {
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
     scene_visuals::register(&mut registry);
+    spatial_stage::register(&mut registry);
     sound::register(&mut registry);
     Position::register_hks(&mut registry)
         .expect("Position API registration must be internally consistent");
@@ -311,6 +316,7 @@ fn registry() -> NativeRegistry<CharacterContext> {
 
 fn story_registry() -> NativeRegistry<CharacterContext> {
     let mut registry = registry();
+    random_api::register_hks(&mut registry).expect("random API registration");
     profile_api::register_hks(&mut registry).expect("profile API must register once");
     ui_api::register_hks(&mut registry)
         .expect("story UI API registration must be internally consistent");
@@ -392,6 +398,15 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
         )
         .expect("option signature must target its registered builtin");
     registry
+}
+
+#[hiraku_script::hks_module]
+mod random_api {
+    use super::*;
+    #[hks(name = "randomInt")]
+    fn random_int(_context: &mut CharacterContext, _min: i32, _max: i32) -> Result<i32, NativeError> {
+        Err(NativeError::message("randomInt requires a story host response"))
+    }
 }
 
 fn async_capability_placeholder(
@@ -488,6 +503,7 @@ pub struct StoryNativeHost {
 }
 
 struct StoryControlBuiltins {
+    random_int: BuiltinId,
     enable_option: BuiltinId,
     goto: BuiltinId,
     sequence: BuiltinId,
@@ -503,6 +519,7 @@ struct StoryControlBuiltins {
 impl StoryControlBuiltins {
     fn new(manifest: &BuiltinManifest) -> Self {
         Self {
+            random_int: manifest.resolve("randomInt").expect("random API is registered"),
             open_ui_any: manifest
                 .resolve_selector("ui", "open_any")
                 .expect("raw UI API is registered"),
@@ -653,6 +670,15 @@ impl StoryNativeHost {
                     enabled: *enabled,
                 },
             ));
+        }
+        if call.builtin == self.controls.random_int {
+            let values = call.arguments.iter().map(|a| match a.value {
+                Value::Number(n) if n.is_finite() && n.fract()==0.0 && n>=i32::MIN as f64 && n<=i32::MAX as f64 => Some(n as i64),
+                _ => None,
+            }).collect::<Option<Vec<_>>>().ok_or(CharacterCapabilityError::InvalidArguments("randomInt expects exact integers"))?;
+            let [min,max] = values.as_slice() else { return Err(CharacterCapabilityError::InvalidArguments("randomInt requires min and exclusive max")); };
+            if min>=max { return Err(CharacterCapabilityError::InvalidArguments("randomInt requires min < max")); }
+            return Ok(StoryCallOutcome::Control(StoryControl::RandomInt { min:*min,max:*max }));
         }
         if call.builtin == self.controls.open_ui || call.builtin == self.controls.open_ui_any {
             let path = call
@@ -1516,6 +1542,19 @@ mod native_api {
         Ok(actor)
     }
 
+    /// Scene-space depth, shared by aliases but independent for clones. Leave
+    /// one unit below the curtain for stable ordering within each depth band.
+    #[hks(name = "depth", selector = "Actor", receiver)]
+    pub(super) fn native_actor_depth(context: &mut CharacterContext, actor: ActorHandle, depth: f64) -> Result<ActorHandle, NativeError> {
+        if !depth.is_finite() || !(0.0..=29.0).contains(&depth) {
+            return Err(NativeError::message("actor depth must be finite and in 0..=29 (below the curtain)"));
+        }
+        let id = context.actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?.display_instance.clone();
+        context.commands.push(StoryEffect::SetActorDepth { id, depth: depth as f32 });
+        Ok(actor)
+    }
+
     /// Clipping belongs to the display identity, shared by aliases but not clones.
     #[hks(name = "clip", selector = "Actor", receiver)]
     fn native_actor_clip(
@@ -1749,6 +1788,8 @@ mod native_api {
             AnimationSpec::Linear(..) => "linear",
             AnimationSpec::EaseIn(..) => "easeIn",
             AnimationSpec::EaseOut(..) => "easeOut",
+            AnimationSpec::EaseOutSine(..) => "easeOutSine",
+            AnimationSpec::EaseInOutSine(..) => "easeInOutSine",
             AnimationSpec::EaseInOut(..) => "easeInOut",
         }
         .to_string();
@@ -1913,6 +1954,26 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_depth_uses_display_identity_without_showing_the_actor() {
+        compile_story_bytecode("depth.hks", "char(\"alice\").clone(\"closeup\").depth(14)")
+            .expect("typed depth API");
+        let mut host = StoryNativeHost::new();
+        let alice = host.context.char("alice".into()).expect("actor");
+        let alias = native_api::native_alias(&mut host.context, alice, "alternate".into()).expect("alias");
+        let copy = native_api::native_clone(&mut host.context, alice, "closeup".into()).expect("clone");
+        native_api::native_actor_depth(&mut host.context, alias, 12.0).expect("alias depth");
+        native_api::native_actor_depth(&mut host.context, copy, 14.0).expect("clone depth");
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 30.0] {
+            assert!(native_api::native_actor_depth(&mut host.context, copy, invalid).is_err());
+        }
+        host.context.commit().expect("commit");
+        assert_eq!(host.drain_effects(), vec![
+            StoryEffect::SetActorDepth { id: "alice".into(), depth: 12.0 },
+            StoryEffect::SetActorDepth { id: "closeup".into(), depth: 14.0 },
+        ]);
+    }
 
     #[test]
     fn aliases_share_display_but_preserve_state_and_clones_remain_visible() {

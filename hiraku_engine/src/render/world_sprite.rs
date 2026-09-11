@@ -30,6 +30,8 @@ mod dissolve_shader_tests {
 /// remains available for story-level position, scale and animation.
 #[derive(Component, Clone, Debug)]
 pub struct WorldSprite {
+    /// Canvas/world XY plane: keep dot(normal, position) <= distance.
+    pub clip_plane: Option<Vec3>,
     /// Nine-slice borders in source pixels: left, top, right, bottom.
     pub slice: Option<[f32; 4]>,
     pub clip: Option<hiraku_sprite3d::ClipRect>,
@@ -56,6 +58,7 @@ pub struct DissolveMask {
 impl WorldSprite {
     pub fn from_image(image: Handle<Image>) -> Self {
         Self {
+            clip_plane: None,
             slice: None,
             clip: None,
             blur_radius: 0.0,
@@ -70,6 +73,7 @@ impl WorldSprite {
 
     pub fn from_color(color: Color, size: Vec2) -> Self {
         Self {
+            clip_plane: None,
             slice: None,
             clip: None,
             blur_radius: 0.0,
@@ -92,6 +96,7 @@ impl WorldSprite {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, WorldSpriteUniform)]
 pub struct WorldSpriteMaterial {
+    pub clip_plane: Vec4,
     pub slice_borders: Vec4,
     pub slice_size: Vec4,
     pub clip_bounds: Vec4,
@@ -110,6 +115,7 @@ pub struct WorldSpriteMaterial {
 
 #[derive(Clone, Debug, ShaderType)]
 pub struct WorldSpriteUniform {
+    clip_plane: Vec4,
     slice_borders: Vec4,
     slice_size: Vec4,
     clip_bounds: Vec4,
@@ -123,6 +129,7 @@ pub struct WorldSpriteUniform {
 impl From<&WorldSpriteMaterial> for WorldSpriteUniform {
     fn from(material: &WorldSpriteMaterial) -> Self {
         Self {
+            clip_plane: material.clip_plane,
             slice_borders: material.slice_borders,
             slice_size: material.slice_size,
             clip_bounds: material.clip_bounds,
@@ -162,6 +169,7 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
+        clip_plane: sprite.clip_plane.map_or(Vec4::ZERO, |plane| plane.extend(1.0)),
         slice_borders: sprite.slice.map(Vec4::from_array).unwrap_or(Vec4::ZERO),
         slice_size: sprite.slice.map_or(Vec4::ZERO, |_| {
             sprite

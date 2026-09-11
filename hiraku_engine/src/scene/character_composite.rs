@@ -165,6 +165,7 @@ fn advance_group_fades(
 fn compose_groups(
     mut commands: Commands,
     shared: Res<super::SceneSharedState>,
+    spatial: Option<Res<crate::stage::runtime::StageRuntime>>,
     images: Res<Assets<Image>>,
     mut atlases: ResMut<Assets<TextureAtlasLayout>>,
     mut roots: Query<(
@@ -262,8 +263,25 @@ fn compose_groups(
         // the root and must not change when a high-layer expression is swapped.
         // Rotate the composed surface, not each part: mask coordinates and
         // premultiplied composition remain in their shared unrotated plane.
-        let transform = composite_transform(center, placement.map(|p| p.current));
-        let render_layers = if selected.iter().any(|p| p.4) {
+        let mut transform = composite_transform(center, placement.map(|p| p.current));
+        if let Some(anchor) = shared.0.spatial_stage.as_ref()
+            .and_then(|stage| stage.actors.get(&identity.actor_id)) {
+            let anchor = spatial.as_ref().and_then(|runtime| runtime.definition.as_ref())
+                .and_then(|definition| definition.anchor(anchor).ok());
+            let Some(anchor) = anchor else {
+                if let Some(entity) = group.display { commands.entity(entity).try_insert(Visibility::Hidden); }
+                continue;
+            };
+            // Pixel-space composition (including intrinsic alpha/masks) remains
+            // unchanged. Only the final plane enters the anchor's local space.
+            transform.translation.z = 0.0;
+            transform = anchor.mul_transform(transform);
+        } else if let Some(depth) = shared.0.actor_depths.get(&identity.actor_id) {
+            transform.translation.z = *depth;
+        }
+        let render_layers = if shared.0.spatial_stage.as_ref().is_some_and(|s| s.actors.contains_key(&identity.actor_id)) {
+            crate::stage::views::spatial_layer()
+        } else if selected.iter().any(|p| p.4) {
             focus_layer()
         } else {
             scene_layer()
@@ -620,6 +638,7 @@ mod tests {
             let mut shared = app
                 .world_mut()
                 .resource_mut::<super::super::SceneSharedState>();
+            shared.0.actor_depths.insert("bob".into(), 14.0);
             shared
                 .0
                 .clips
@@ -653,6 +672,7 @@ mod tests {
             .expect("one composed sprite");
         assert_eq!(composed.color.alpha(), 0.5);
         assert_eq!(composed.clip, Some(expected_clip));
+        assert_eq!(app.world().get::<Transform>(display).expect("display transform").translation.z, 14.0);
         assert_eq!(composed.layers[0].color.alpha(), 0.4);
         assert_eq!(
             app.world().get::<CharacterGroup>(root).expect("root").alpha,

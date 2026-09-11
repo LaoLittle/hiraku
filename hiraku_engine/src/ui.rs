@@ -6,12 +6,51 @@ use serde::{Deserialize, Serialize};
 use crate::script::navigation::NavigationRequest;
 use crate::state::StoredValue;
 
+hiraku_script::hks_define! {
+/// A sampled UI rectangle in logical canvas pixels, with straight alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum UiKeyframe {
+    Rect(f64, f64, f64, f64, f64, f64),
+    Quad(f64, f64, f64, f64, f64, f64, f64, f64),
+}
+impl UiKeyframe {
+    fn rect(seconds: f64, x: f64, y: f64, width: f64, height: f64, alpha: f64) -> UiKeyframe {
+        Self::Rect(seconds, x, y, width, height, alpha)
+    }
+    /// Origin and two full edge vectors after orthographic projection.
+    fn quad(seconds: f64, x: f64, y: f64, ux: f64, uy: f64, vx: f64, vy: f64, alpha: f64) -> UiKeyframe {
+        Self::Quad(seconds, x, y, ux, uy, vx, vy, alpha)
+    }
+}
+}
+
+hiraku_script::hks_define! {
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum UiShaderKeyframe { At(f64, f64, f64, f64, f64) }
+impl UiShaderKeyframe {
+    fn at(seconds: f64, x: f64, y: f64, z: f64, w: f64) -> UiShaderKeyframe { Self::At(seconds,x,y,z,w) }
+}
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UiShaderBlend { #[default] Alpha, Multiply, Additive }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiShaderSpec {
+    #[serde(default)]
+    pub blend: UiShaderBlend,
+    pub path: String,
+    pub textures: Vec<String>,
+    pub keys: Vec<UiShaderKeyframe>,
+}
+
 /// A typed side effect dispatched after a UI button accepts a click.
 ///
 /// These are data, rather than Rust callbacks or string action routes, so a
 /// declarative screen remains serializable and the ECS owns the actual work.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum UiEffect {
+    StopVoice,
     PlaySfx {
         name: String,
         #[serde(default = "default_ui_effect_volume")]
@@ -25,6 +64,8 @@ pub enum UiEffect {
     CloseUi {
         value: hiraku_script::Value,
     },
+    /// Complete the nearest story-owned UI request, closing its nested modals.
+    CompleteUi { value: hiraku_script::Value },
     Save {
         slot: String,
     },
@@ -76,6 +117,15 @@ pub struct UiPhaseAnimation {
 /// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSpec {
+    #[serde(default)]
+    pub fade_seconds: f32,
+    #[serde(default)]
+    pub pauses_scene: bool,
+    #[serde(default)]
+    pub timers_paused: bool,
+    /// One-shot callbacks owned by this mount; not persisted executions.
+    #[serde(skip)]
+    pub(crate) timers: Vec<(f32, UiCallback)>,
     /// Ephemeral compiled renderer; scene saves rebuild UI from its source.
     #[serde(skip)]
     pub(crate) composition: Option<std::sync::Arc<crate::script::UiComposition>>,
@@ -199,6 +249,17 @@ pub struct InputNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    #[serde(default)]
+    pub hover_brightness: Option<f32>,
+    #[serde(default)]
+    pub keyframes: Vec<UiKeyframe>,
+    #[serde(default)]
+    pub shader: Option<UiShaderSpec>,
+    /// Intrinsic content measurement instead of container defaults such as 100% width.
+    #[serde(default)]
+    pub fit_content: bool,
+    #[serde(default)]
+    pub rotation: f32,
     #[serde(default)]
     pub rich_text: bool,
     #[serde(default)]
@@ -681,6 +742,7 @@ pub struct SpacerNode {
 /// replacement never exposes an empty frame while images are loading.
 #[derive(Resource, Default)]
 pub struct ScreenUiState {
+    pub closing_root: Option<Entity>,
     /// Suspended modal screens, retaining their UI state and story continuation.
     pub stack: Vec<(Entity, Option<crate::script::ScriptRequestId>)>,
     /// Currently interactive screen root.
@@ -703,7 +765,7 @@ pub struct OverlayUiState {
 impl ScreenUiState {
     /// Only the top modal receives input; overlays are interactive without a modal.
     pub(crate) fn accepts_input(&self, root: Entity, overlays: &OverlayUiState) -> bool {
-        self.pending_root.is_none()
+        self.closing_root.is_none() && self.pending_root.is_none()
             && self.active_root.map_or_else(
                 || self.stack.is_empty() && overlays.roots.values().any(|entity| *entity == root),
                 |active| active == root,

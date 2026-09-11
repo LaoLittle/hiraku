@@ -1043,6 +1043,8 @@ fn interpolate_character_position(
 
 pub(crate) fn apply_character_ease(ease: CharacterEase, t: f32) -> f32 {
     match ease {
+        CharacterEase::EaseOutSine => (t * std::f32::consts::FRAC_PI_2).sin(),
+        CharacterEase::EaseInOutSine => (1.0 - (t * std::f32::consts::PI).cos()) * 0.5,
         CharacterEase::Linear => t,
         CharacterEase::Ease | CharacterEase::EaseInOut => t * t * (3.0 - 2.0 * t),
         CharacterEase::EaseIn => t * t,

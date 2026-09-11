@@ -13,12 +13,14 @@ pub(crate) struct FastForward {
 #[derive(SystemParam)]
 pub struct StoryTime<'w> {
     time: Res<'w, Time>,
+    clock: Option<Res<'w, Time<super::clock::SceneClock>>>,
     pacing: Option<Res<'w, FastForward>>,
 }
 
 impl StoryTime<'_> {
     pub fn delta(&self) -> Duration {
-        self.time.delta().mul_f32(if self.pacing.as_ref().is_some_and(|p| p.active) { 32.0 } else { 1.0 })
+        self.clock.as_ref().map_or(self.time.delta(), |clock| clock.delta())
+            .mul_f32(if self.pacing.as_ref().is_some_and(|p| p.active) { 32.0 } else { 1.0 })
     }
     pub fn delta_secs(&self) -> f32 { self.delta().as_secs_f32() }
 }

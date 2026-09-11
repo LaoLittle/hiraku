@@ -125,6 +125,14 @@ mod tests {
             })
             .expect("picture");
         assert_eq!(state.actor("alice"), state.picture("room"));
+        let updated = ClipRegion {
+            center: [-30.0, 60.0], size: [50.0, 90.0], rotation: -15.0,
+        };
+        state.apply(ClipCommand::Define {
+            name: "window".into(), region: updated.clone(),
+        }).expect("replace shared region without losing attachments");
+        assert_eq!(state.actor("alice"), Some(updated.rect().expect("valid updated region")));
+        assert_eq!(state.picture("room"), Some(updated.rect().expect("valid updated region")));
         let bytes = hiraku_script::hson::to_vec(&state).expect("serialize");
         let mut restored: ClipState = hiraku_script::hson::from_slice(&bytes).expect("restore");
         assert_eq!(state, restored);

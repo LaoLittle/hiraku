@@ -121,6 +121,32 @@ mod tests {
     }
 
     #[test]
+    fn stage_handles_cross_module_boundaries_through_typed_parameters() {
+        compile_sources(vec![
+            source("entry.hks", "let room = stage.open(\"room.stage.hson\")\nshot(room)"),
+            source("shot.hks", "global fn shot(room: Stage) { room.camera(\"alice\").await()\nroom.clipView(\"main\", .left(25, 10)) }"),
+        ], "entry.hks").expect("native handles retain selector types across script modules");
+    }
+
+    #[test]
+    fn provider_resolves_existing_actor_handles_in_its_local_scope() {
+        let code = compile_sources(vec![
+            source("entry.hks", "global let alice = char(\"alice\")\ntell()"),
+            source("provider.hks", "global fn tell() { let alice = char(\"alice\")\nalice.e(\"happy\")\nalice: \"Hello\" }"),
+        ], "entry.hks").expect("typed local actor binding");
+        let mut runtime = crate::script::story_runtime::StoryRuntime::new(code).expect("runtime");
+        let mut said = false;
+        for _ in 0..20 {
+            if let Some(crate::script::story_runtime::StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::Say { speaker, text })) = runtime.step().expect("native actor argument") {
+                assert_eq!((speaker.as_str(), text.as_str()), ("alice", "Hello"));
+                said = true;
+                break;
+            }
+        }
+        assert!(said);
+    }
+
+    #[test]
     fn exported_function_links_without_executing_provider_and_restores_its_call_frame() {
         let compile = || {
             compile_sources(

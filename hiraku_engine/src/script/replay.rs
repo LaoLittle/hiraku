@@ -73,6 +73,30 @@ fn extend_digest(previous: &str, point: &ReplayPoint) -> Result<String, ReplayEr
 }
 
 impl ReplayJournal {
+    /// Deterministic draw from the saved seed and recorded draw ordinal. Bounds
+    /// are half-open. Rejection sampling avoids modulo bias.
+    pub fn random_int(&mut self, min: i64, max: i64) -> i64 {
+        let ordinal=self.events.iter().filter(|event| matches!(event, ReplayEvent::Input { kind: InputKind::Random, .. })).count() as u64;
+        let mut attempt=0u64;
+        let width=(max-min) as u64;
+        let threshold=width.wrapping_neg()%width;
+        let draw=loop {
+            // Domain-separated attempts cannot reuse the next draw's stream
+            // position if rejection sampling consumes more than one candidate.
+            let mut hash=blake3::Hasher::new();
+            hash.update(b"hiraku/random-int/v1\0");
+            hash.update(&self.random_seed.to_le_bytes());
+            hash.update(&ordinal.to_le_bytes());
+            hash.update(&attempt.to_le_bytes());
+            let bytes=hash.finalize();
+            let n=u64::from_le_bytes(bytes.as_bytes()[..8].try_into().expect("fixed hash prefix"));
+            if n>=threshold { break n%width; }
+            attempt=attempt.wrapping_add(1);
+        };
+        let value=min+draw as i64;
+        if let Some(point)=self.destination.clone() { self.input(InputKind::Random,point,crate::state::StoredValue::Int(value)); }
+        value
+    }
     pub fn new(entry_script: String, random_seed: u64) -> Self {
         Self {
             version: JOURNAL_VERSION,
@@ -244,6 +268,25 @@ mod tests {
         replay
             .finish(&point("pending choice"))
             .expect("exact destination");
+    }
+
+    #[test]
+    fn random_draws_restore_from_seed_and_recorded_ordinal() {
+        let mut journal=ReplayJournal::new("memory://alice.hks".into(),42);
+        let mut seen=std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            journal.destination=Some(point("random:2,4"));
+            seen.insert(journal.random_int(2,4));
+        }
+        assert_eq!(seen,std::collections::BTreeSet::from([2,3]));
+        let bytes=hiraku_script::hson::to_vec(&journal).expect("journal serializes");
+        let mut restored:ReplayJournal=hiraku_script::hson::from_slice(&bytes).expect("journal restores");
+        for _ in 0..32 {
+            journal.destination=Some(point("random:2,4"));
+            restored.destination=journal.destination.clone();
+            assert_eq!(journal.random_int(2,4),restored.random_int(2,4));
+        }
+        assert!(journal.events.iter().all(|event| matches!(event,ReplayEvent::Input { kind:InputKind::Random,.. })));
     }
     #[test]
     fn changed_dialogue_and_partial_histories_are_not_silently_accepted() {

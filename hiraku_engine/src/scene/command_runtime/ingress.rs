@@ -17,7 +17,11 @@ fn observe_replay_boundary(runtime: &mut ScriptRuntimeState, event: &StoryRuntim
     let script = runtime.current_script.clone().unwrap_or_default();
     let journal = runtime
         .replay
-        .get_or_insert_with(|| ReplayJournal::new(script.clone(), 0));
+        .get_or_insert_with(|| {
+            use std::hash::{BuildHasher, Hasher};
+            let seed=std::collections::hash_map::RandomState::new().build_hasher().finish();
+            ReplayJournal::new(script.clone(), seed)
+        });
     use crate::script::capabilities::{StoryEffect, StoryWait};
     let signature = match event {
         StoryRuntimeEvent::Effect(StoryEffect::Say { speaker, text }) => {
@@ -37,6 +41,7 @@ fn observe_replay_boundary(runtime: &mut ScriptRuntimeState, event: &StoryRuntim
             enabled,
         } => replay_signature("choice", &(prompt, options, enabled)),
         StoryRuntimeEvent::OpenUi { path, arguments } => replay_signature("ui", &(path, arguments)),
+        StoryRuntimeEvent::RandomInt { min, max } => replay_signature("random", &(min,max)),
         _ => None,
     };
     if journal.destination.is_none() {
@@ -637,6 +642,16 @@ pub fn drive_story_runtime(
                     }
                 }
             }
+            StoryRuntimeEvent::RandomInt { min, max } => {
+                let journal = runtime.replay.as_mut().expect("observed story event has a journal");
+                let value = journal.random_int(min, max);
+                if let Some(story)=runtime.story.as_mut() {
+                    if let Err(error)=story.resume(hiraku_script::Value::Number(value as f64)) {
+                        warn!("failed to resume randomInt: {error}");
+                        runtime.story=None;
+                    }
+                }
+            }
             StoryRuntimeEvent::OpenUi { path, arguments } => {
                 let target = runtime.ui_registry.get(&path).cloned().unwrap_or_else(|| {
                     vfs.0.resolve_path(runtime.current_script.as_deref(), &path)
@@ -901,6 +916,11 @@ pub fn drive_story_runtime(
                                 picture.clone(),
                             ),
                             done: request,
+                        })
+                    }
+                    ScriptCommand::Stage(StageCommand::Spatial(command)) => {
+                        ScriptCommand::Animation(AnimationCommand::Scene {
+                            effect: super::super::effect_wait::SceneEffect::Spatial(command.clone()), done: request,
                         })
                     }
                     ScriptCommand::Character(CharacterCommand::Hide { actor_id, .. }) => {

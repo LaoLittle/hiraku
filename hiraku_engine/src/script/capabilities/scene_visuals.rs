@@ -14,10 +14,11 @@ pub(super) struct SceneClipHandle(u64);
 
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "SceneTransition", handle_type = 4)]
-pub(super) struct SceneTransitionHandle(u64);
+pub(super) struct SceneTransitionHandle(pub(super) u64);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-enum SceneVisualTarget {
+pub(super) enum SceneVisualTarget {
+    Spatial(crate::stage::runtime::StageCommand),
     Clip {
         name: String,
         region: ClipRegion,
@@ -37,7 +38,7 @@ enum SceneVisualTarget {
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct SceneVisualState {
     next: u64,
-    pending: BTreeMap<u64, (SceneVisualTarget, Option<u64>)>,
+    pub(super) pending: BTreeMap<u64, (SceneVisualTarget, Option<u64>)>,
 }
 
 impl SceneVisualState {
@@ -47,7 +48,7 @@ impl SceneVisualState {
     ) -> Result<SceneTransitionHandle, NativeError> {
         self.begin(SceneVisualTarget::HideCharacters { duration_ms })
     }
-    fn begin(&mut self, target: SceneVisualTarget) -> Result<SceneTransitionHandle, NativeError> {
+    pub(super) fn begin(&mut self, target: SceneVisualTarget) -> Result<SceneTransitionHandle, NativeError> {
         self.next = self
             .next
             .checked_add(1)
@@ -59,6 +60,7 @@ impl SceneVisualState {
     pub(super) fn commit(&mut self, effects: &mut Vec<StoryEffect>) {
         for (_, (target, fade_ms)) in std::mem::take(&mut self.pending) {
             effects.push(match target {
+                SceneVisualTarget::Spatial(command) => StoryEffect::Spatial(command),
                 SceneVisualTarget::Clip { name, region } => {
                     StoryEffect::Clip(ClipCommand::Define { name, region })
                 }
@@ -218,6 +220,7 @@ mod api {
         context
             .scene_visuals
             .begin(SceneVisualTarget::Picture(PictureCommand::Show {
+                screen_space: false,
                 size: None,
                 slice: None,
                 color: None,
@@ -230,6 +233,15 @@ mod api {
                 layer: 1.0,
                 seconds: 0.0,
             }))
+    }
+
+    #[hks(name = "screenSpace", receiver)]
+    fn screen_space(context: &mut CharacterContext, handle: SceneTransitionHandle) -> Result<SceneTransitionHandle, NativeError> {
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { screen_space, .. }), _)) = context.scene_visuals.pending.get_mut(&handle.0) else {
+            return Err(NativeError::message("screenSpace requires an uncommitted picture"));
+        };
+        *screen_space = true;
+        Ok(handle)
     }
 
     #[hks(name = "frame", receiver)]
@@ -417,18 +429,112 @@ mod api {
     ) -> Result<SceneTransitionHandle, NativeError> {
         milliseconds(seconds)?;
         if ![x, y].iter().all(|n| n.is_finite() && n.abs() <= 100000.0)
-            || !["linear", "easeOutQuad", "easeOutBack"].contains(&ease.as_str())
+            || !["linear", "smoothStep", "easeOutQuad", "easeOutBack"].contains(&ease.as_str())
         {
             return Err(NativeError::message("invalid picture movement or easing"));
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Move {
+            .begin(SceneVisualTarget::Picture(PictureCommand::Transform {
                 id,
-                position: [x as f32, y as f32],
+                position: [Some(x as f32), Some(y as f32)],
+                scale: None,
+                rotation: None,
                 seconds: seconds as f32,
                 ease,
             }))
+    }
+
+    /// Edit the displayed pose without showing/replacing the texture. Missing
+    /// fields are resolved from the current pose when ECS applies the command.
+    #[hks(name = "transformPicture", selector = "scene")]
+    fn transform_picture(context: &mut CharacterContext, id: String) -> Result<SceneTransitionHandle, NativeError> {
+        if id.trim().is_empty() {
+            return Err(NativeError::message("picture identity must not be empty"));
+        }
+        context.scene_visuals.begin(SceneVisualTarget::Picture(PictureCommand::Transform {
+            id, position: [None; 2], scale: None, rotation: None,
+            seconds: 0.0, ease: "linear".into(),
+        }))
+    }
+
+    fn transform_field(context: &mut CharacterContext, handle: SceneTransitionHandle, field: usize, value: f64) -> Result<SceneTransitionHandle, NativeError> {
+        if !value.is_finite() || value.abs() > 100000.0 || (field == 2 && value <= 0.0) {
+            return Err(NativeError::message("picture transform requires finite coordinates and positive scale"));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Transform { position, scale, rotation, .. }), _)) = context.scene_visuals.pending.get_mut(&handle.0) else {
+            return Err(NativeError::message("transform property requires an uncommitted picture transform"));
+        };
+        match field {
+            0 | 1 => position[field] = Some(value as f32),
+            2 => *scale = Some(value as f32),
+            _ => *rotation = Some(value as f32),
+        }
+        Ok(handle)
+    }
+
+    /// Virtual-canvas percentages; offscreen and fractional positions allowed.
+    #[hks(name = "x", selector = "SceneTransition", receiver)]
+    fn transform_x(context: &mut CharacterContext, handle: SceneTransitionHandle, value: f64) -> Result<SceneTransitionHandle, NativeError> {
+        transform_field(context, handle, 0, value)
+    }
+
+    #[hks(name = "y", selector = "SceneTransition", receiver)]
+    fn transform_y(context: &mut CharacterContext, handle: SceneTransitionHandle, value: f64) -> Result<SceneTransitionHandle, NativeError> {
+        transform_field(context, handle, 1, value)
+    }
+
+    #[hks(name = "scale", selector = "SceneTransition", receiver)]
+    fn transform_scale(context: &mut CharacterContext, handle: SceneTransitionHandle, value: f64) -> Result<SceneTransitionHandle, NativeError> {
+        transform_field(context, handle, 2, value)
+    }
+
+    #[hks(name = "rotation", selector = "SceneTransition", receiver)]
+    fn transform_rotation(context: &mut CharacterContext, handle: SceneTransitionHandle, value: f64) -> Result<SceneTransitionHandle, NativeError> {
+        transform_field(context, handle, 3, value)
+    }
+
+    #[hks(name = "animation", selector = "SceneTransition", receiver)]
+    fn transform_animation(context: &mut CharacterContext, handle: SceneTransitionHandle, animation: crate::script::animation::AnimationSpec) -> Result<SceneTransitionHandle, NativeError> {
+        use crate::script::animation::AnimationSpec;
+        let (duration, curve) = match animation {
+            AnimationSpec::Linear(duration, _) => (duration, "linear"),
+            AnimationSpec::EaseIn(duration, _) => (duration, "easeInQuad"),
+            AnimationSpec::EaseOut(duration, _) => (duration, "easeOutQuad"),
+            AnimationSpec::EaseOutSine(duration, _) => (duration, "easeOutSine"),
+            AnimationSpec::EaseInOutSine(duration, _) => (duration, "easeInOutSine"),
+            AnimationSpec::EaseInOut(duration, _) => (duration, "easeInOutQuad"),
+        };
+        milliseconds(duration)?;
+        if animation.repeats() {
+            return Err(NativeError::message("scene command animations must complete"));
+        }
+        if let Some((SceneVisualTarget::Spatial(crate::stage::runtime::StageCommand::Camera { animation: target, .. } | crate::stage::runtime::StageCommand::View { animation: target, .. }), _)) = context.scene_visuals.pending.get_mut(&handle.0) {
+            *target = animation;
+            return Ok(handle);
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Transform { seconds, ease, .. } | PictureCommand::Exit { seconds, ease, .. }), _)) = context.scene_visuals.pending.get_mut(&handle.0) else {
+            return Err(NativeError::message("animation requires an uncommitted picture transform"));
+        };
+        *seconds = duration as f32;
+        *ease = curve.into();
+        Ok(handle)
+    }
+
+    /// One owned exit: final position and alpha finish before removal.
+    #[hks(name = "to", selector = "SceneTransition", receiver)]
+    fn exit_to(context: &mut CharacterContext, handle: SceneTransitionHandle, x: f64, y: f64) -> Result<SceneTransitionHandle, NativeError> {
+        if !x.is_finite() || !y.is_finite() || x.abs() > 100000.0 || y.abs() > 100000.0 {
+            return Err(NativeError::message("invalid picture exit position"));
+        }
+        let Some((SceneVisualTarget::Picture(command), _)) = context.scene_visuals.pending.get_mut(&handle.0) else {
+            return Err(NativeError::message("to requires an uncommitted picture exit"));
+        };
+        let PictureCommand::Hide { id, seconds } = command else {
+            return Err(NativeError::message("to requires hidePicture"));
+        };
+        *command = PictureCommand::Exit { id: id.clone(), position: [x as f32, y as f32], seconds: *seconds, ease: "linear".into() };
+        Ok(handle)
     }
 
     #[hks(name = "clearPictures", selector = "scene")]
@@ -611,6 +717,22 @@ mod api {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_space_and_atomic_exit_are_registered_native_builders() {
+        let mut show = runtime("scene.picture(\"panel\", \"image/panel\").screenSpace()");
+        assert!(matches!(event(&mut show), StoryRuntimeEvent::Effect(StoryEffect::Picture(
+            PictureCommand::Show { screen_space: true, .. }
+        ))));
+        let mut exit = runtime("scene.hidePicture(\"panel\").to(20, 30).animation(.easeIn(0.4)).await()");
+        let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut exit) else {
+            panic!("exit must expose one awaitable effect");
+        };
+        assert!(matches!(&effect, StoryEffect::Picture(PictureCommand::Exit { position: [20.0, 30.0], seconds, ease, .. })
+            if (*seconds - 0.4).abs() < 0.0001 && ease == "easeInQuad"));
+        assert!(exit.step().expect("wait for owned exit").is_none());
+        exit.complete_task_effect(task, &effect).expect("complete exit");
+    }
     use crate::script::capabilities::{StoryWait, compile_story_bytecode};
     use crate::script::{StoryRuntime, StoryRuntimeEvent};
     use hiraku_script::Value;
@@ -737,6 +859,61 @@ mod tests {
         assert!(
             matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(message)) if message == "finished")
         );
+    }
+
+    #[test]
+    fn picture_transform_is_statement_scoped_and_awaitable() {
+        let mut runtime = runtime(r#"
+            scene.transformPicture("panel").scale(1.15).animation(.easeOut(2.4)).await()
+            log("finished")
+        "#);
+        let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut runtime) else {
+            panic!("expected awaited picture transform");
+        };
+        assert!(matches!(&effect, StoryEffect::Picture(PictureCommand::Transform {
+            position: [None, None], scale: Some(scale), rotation: None, seconds, ease, ..
+        }) if (*scale - 1.15).abs() < 0.001 && (*seconds - 2.4).abs() < 0.001 && ease == "easeOutQuad"));
+        assert!(runtime.step().expect("waiting").is_none());
+        runtime.complete_task_effect(task, &effect).expect("transform finishes");
+        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(message)) if message == "finished"));
+    }
+
+    #[test]
+    fn script_presentation_returns_a_parallel_task_and_restores_its_join() {
+        let code = compile_story_bytecode("presentation.hks", r#"
+            global fn present(texture: String) -> Task {
+                par {
+                    scene.picture("panel", texture).size(500, 500).fade(400)
+                    scene.transformPicture("panel").y(60).animation(.easeOut(0.4))
+                }
+            }
+            present("image/panel").await()
+            log("complete")
+        "#).expect("script-defined task factory");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+        let mut pending = Vec::new();
+        while let Some(next) = runtime.step().expect("start parallel effects") {
+            let StoryRuntimeEvent::TaskEffect { task, effect } = next else {
+                panic!("expected a presentation effect");
+            };
+            pending.push((task, effect));
+        }
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(&pending[0].1, StoryEffect::Picture(PictureCommand::Show { path, .. }) if path == "image/panel"));
+        runtime = StoryRuntime::restore(code, runtime.snapshot().expect("snapshot joined task")).expect("restore");
+        // Restore reissues in-flight host effects so ECS can rebuild their
+        // completion requests; consume those before reporting completion.
+        for (expected_task, expected_effect) in &pending {
+            assert!(matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect { task, effect }
+                if task == *expected_task && effect == *expected_effect));
+        }
+        let (task, effect) = &pending[1];
+        runtime.complete_task_effect(*task, effect).expect("movement ends first");
+        let next = runtime.step().expect("still waiting for fade");
+        assert!(next.is_none(), "unexpected event: {next:?}");
+        let (task, effect) = &pending[0];
+        runtime.complete_task_effect(*task, effect).expect("fade ends");
+        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(message)) if message == "complete"));
     }
 
     #[test]
@@ -1209,6 +1386,7 @@ mod tests {
         assert_eq!(
             event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                screen_space: false,
                 id: "Backgrounds".into(),
                 size: None,
                 slice: None,

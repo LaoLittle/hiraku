@@ -55,7 +55,7 @@ pub(super) fn dispatch_dialogue_command(
             });
             shared_state.0.dialogue = Some(DialogueSnapshot { speaker, text });
             if let Some(dialogue) = shared_state.0.dialogue.clone() {
-                dialogue_history.entries.push(dialogue);
+                dialogue_history.push(dialogue);
             }
         }
         DialogueCommand::Continue { text, animation_id } => {

@@ -14,6 +14,8 @@ impl ActorOffset {
             AnimationSpec::Linear(s, _)
             | AnimationSpec::EaseIn(s, _)
             | AnimationSpec::EaseOut(s, _)
+            | AnimationSpec::EaseOutSine(s, _)
+            | AnimationSpec::EaseInOutSine(s, _)
             | AnimationSpec::EaseInOut(s, _) => s,
         };
         if self

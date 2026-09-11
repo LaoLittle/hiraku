@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+pub mod clock;
+pub(crate) mod ui_visuals;
+pub(crate) mod ui_keyframes;
 
 use bevy::{
     app::AppExit,
@@ -74,6 +77,7 @@ mod snapshot;
 pub(crate) mod ui_hover;
 mod video_runtime;
 pub(crate) mod widgets;
+pub(crate) mod ui_timers;
 
 pub use animation_runtime::{
     AnimationState, PendingAnimationCancels, PendingWaits, animate_custom_effects,
@@ -126,7 +130,7 @@ pub use screen_ui::{
 pub(crate) use screen_ui::fit_screen_text;
 pub(crate) use screen_ui::expire_overlays;
 use screen_ui::{
-    clear_overlay_ui, clear_screen_ui, close_screen_ui, screen_images_ready,
+    clear_overlay_ui, clear_screen_ui, screen_images_ready,
     should_clear_stale_screen_before_command, spawn_screen_ui,
 };
 use snapshot::restore_scene_snapshot;

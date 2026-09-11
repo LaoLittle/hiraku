@@ -11,8 +11,11 @@ mod proto;
 mod redraw;
 pub mod render;
 mod scene;
+pub use scene::DialogueHistoryState;
+pub use scene::clock::SceneClock;
 mod script;
 mod state;
+pub mod stage;
 mod storage;
 pub use storage::{PreferenceChange, UserSettings};
 mod texture;
@@ -249,6 +252,8 @@ struct HirakuRuntimeSystems;
 
 impl Plugin for HirakuPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(stage::StagePlugin);
+        render::ui_quad::register(app);
         app.add_plugins((
             hiraku_uastc::UastcPlugin,
             hiraku_video::HirakuVideoPlugin,
@@ -326,6 +331,10 @@ impl Plugin for HirakuPlugin {
                     .in_set(HirakuRuntimeSystems),
             )
             .add_message::<scene::widgets::UiCallbackRequest>()
+            .init_resource::<Time<scene::clock::SceneClock>>()
+            .add_systems(PostUpdate, (scene::ui_visuals::tick, scene::ui_visuals::apply).chain().in_set(HirakuRuntimeSystems))
+            .add_systems(PreUpdate, scene::clock::advance.in_set(HirakuRuntimeSystems))
+            .add_systems(Update, scene::clock::pause_voices.in_set(HirakuRuntimeSystems))
             .add_message::<input::HirakuTextInput>()
             .init_resource::<input::HirakuTextFocus>()
             .init_resource::<scene::save_preview::SavePreview>()
@@ -336,6 +345,10 @@ impl Plugin for HirakuPlugin {
                     .before(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
+            .add_systems(Update, scene::ui_timers::tick
+                .after(cleanup_stale_screen_ui)
+                .after(scene::recompose_screen_ui)
+                .in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
                 (
@@ -367,6 +380,7 @@ impl Plugin for HirakuPlugin {
                     update_ui_reactive_bindings,
                     scene::rich_text::update,
                     animate_screen_ui,
+                    scene::ui_keyframes::tick,
                     scene::ui_hover::animate_hover,
                 )
                     .chain()
@@ -488,6 +502,8 @@ impl Plugin for HirakuPlugin {
                     scene::poll_sfx_playback.in_set(HirakuRuntimeSystems),
                     animate_custom_effects.in_set(HirakuRuntimeSystems),
                     scene::pictures::sync_pictures
+                        .after(animate_camera_transition)
+                        .after(animate_camera_shake)
                         .after(scene::process_script_commands)
                         .in_set(HirakuRuntimeSystems),
                     animate_rule_transitions.in_set(HirakuRuntimeSystems),
