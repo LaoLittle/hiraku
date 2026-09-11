@@ -1244,18 +1244,7 @@ impl Vm {
                 } => {
                     let target = crate::hir::substitute_type(&target, &self.type_bindings);
                     let source = self.read(value)?.clone();
-                    let value = if matches!(source, Value::Object(_)) {
-                        if target == crate::ScriptType::Any {
-                            Ok(source)
-                        } else {
-                            self.objects
-                                .export(&source)
-                                .and_then(|value| cast_value(&value, &target))
-                                .map(|_| source)
-                        }
-                    } else {
-                        cast_value(&source, &target)
-                    };
+                    let value = cast_value_with_heap(&source, &target, &self.objects);
                     let value = match (mode, value) {
                         (crate::CastMode::Optional, Ok(value)) => {
                             Value::Optional(Some(Box::new(value)))
@@ -2174,6 +2163,24 @@ fn argument_matches(
         }
         _ => false,
     })
+}
+
+fn cast_value_with_heap(value: &Value, target: &crate::ScriptType, heap: &crate::objects::ObjectHeap) -> Result<Value, VmError> {
+    use crate::ScriptType as T;
+    match (value, target) {
+        (_, T::Any) => Ok(value.clone()),
+        (Value::List(values), T::List(element)) => values.iter()
+            .map(|value| cast_value_with_heap(value, element, heap))
+            .collect::<Result<Vec<_>, _>>().map(Value::List),
+        (Value::Tuple(values), T::TupleOf(types)) if values.len()==types.len() => values.iter().zip(types)
+            .map(|(value, ty)|cast_value_with_heap(value, ty, heap))
+            .collect::<Result<Vec<_>, _>>().map(Value::Tuple),
+        (Value::Null | Value::Optional(None), T::Optional(_)) => Ok(Value::Optional(None)),
+        (Value::Optional(Some(value)), T::Optional(inner)) => cast_value_with_heap(value,inner,heap).map(|v|Value::Optional(Some(Box::new(v)))),
+        (value, T::Optional(inner)) => cast_value_with_heap(value,inner,heap).map(|v|Value::Optional(Some(Box::new(v)))),
+        (Value::Object(_), _) => heap.export(value).and_then(|exported|cast_value(&exported,target)).map(|_|value.clone()),
+        _ => cast_value(value,target),
+    }
 }
 
 fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmError> {
@@ -3369,6 +3376,22 @@ mod tests {
             restored.global("nested"),
             Some(&Value::Optional(Some(Box::new(Value::Optional(None)))))
         );
+    }
+
+    #[test]
+    fn collection_cast_validates_nested_heap_objects_without_copying_identity() {
+        let mut heap=crate::objects::ObjectHeap::default();
+        let value=heap.import(Value::List(vec![Value::List(vec![Value::Map(BTreeMap::from([
+            ("name".into(),Value::String("alice".into()))
+        ]))]) ]));
+        let target=crate::ScriptType::List(Box::new(crate::ScriptType::List(Box::new(crate::ScriptType::Record(BTreeMap::from([
+            ("name".into(),crate::ScriptType::String)
+        ]))))));
+        assert_eq!(cast_value_with_heap(&value,&target,&heap).expect("nested cast"),value);
+        let bad=heap.import(Value::List(vec![Value::List(vec![Value::Map(BTreeMap::from([
+            ("name".into(),Value::Number(1.0))
+        ]))])]));
+        assert!(cast_value_with_heap(&bad,&target,&heap).is_err());
     }
 
     #[test]
