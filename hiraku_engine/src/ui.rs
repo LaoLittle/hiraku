@@ -117,6 +117,9 @@ pub struct UiPhaseAnimation {
 /// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSpec {
+    /// Mounted overlays explicitly allowed above this modal screen.
+    #[serde(default)]
+    pub allowed_overlays: Vec<String>,
     #[serde(default)]
     pub fade_seconds: f32,
     #[serde(default)]
@@ -742,6 +745,9 @@ pub struct SpacerNode {
 /// replacement never exposes an empty frame while images are loading.
 #[derive(Resource, Default)]
 pub struct ScreenUiState {
+    /// Overlay roots admitted by the active screen; nested modals revoke access.
+    pub allowed_overlay_roots: Vec<Entity>,
+    pub allowed_overlay_owner: Option<Entity>,
     pub closing_root: Option<Entity>,
     /// Suspended modal screens, retaining their UI state and story continuation.
     pub stack: Vec<(Entity, Option<crate::script::ScriptRequestId>)>,
@@ -768,7 +774,7 @@ impl ScreenUiState {
         self.closing_root.is_none() && self.pending_root.is_none()
             && self.active_root.map_or_else(
                 || self.stack.is_empty() && overlays.roots.values().any(|entity| *entity == root),
-                |active| active == root,
+                |active| active == root || (self.allowed_overlay_owner == Some(active) && self.allowed_overlay_roots.contains(&root)),
             )
     }
 }

@@ -303,8 +303,33 @@ pub fn recompose_screen_ui(
         commands.entity(root).insert(super::clock::ScenePausePolicy(screen.pauses_scene));
         commands
             .entity(root)
-            .insert((screen_root_node(&screen), screen_root_background(&screen)));
+            .insert((screen_root_node(&screen), screen_root_background(&screen), AllowedOverlays(screen.allowed_overlays.clone())));
     }
+}
+
+#[derive(Component)]
+pub(crate) struct AllowedOverlays(Vec<String>);
+
+/// Retain mounted overlay entities across modal replacements; only explicitly
+/// admitted overlays are lifted above the current modal and receive input.
+pub(crate) fn sync_allowed_overlays(
+    mut state: ResMut<ScreenUiState>,
+    overlays: Res<OverlayUiState>,
+    policies: Query<&AllowedOverlays>,
+    mut layers: Query<&mut GlobalZIndex>,
+) {
+    let policy = state.active_root.and_then(|root| policies.get(root).ok());
+    let mut allowed = Vec::new();
+    for (name, &root) in &overlays.roots {
+        let admitted = policy.is_some_and(|policy| policy.0.contains(name));
+        if admitted { allowed.push(root); }
+        if let Ok(mut layer) = layers.get_mut(root) {
+            let z = if admitted { SCREEN_MODAL_ACTIVE_Z + state.stack.len() as i32 * 3 + 1 } else { SCREEN_ACTIVE_Z + 10 };
+            if layer.0 != z { layer.0 = z; }
+        }
+    }
+    if state.allowed_overlay_roots != allowed { state.allowed_overlay_roots = allowed; }
+    if state.allowed_overlay_owner != state.active_root { state.allowed_overlay_owner = state.active_root; }
 }
 
 pub(super) fn spawn_screen_ui(
@@ -318,6 +343,7 @@ pub(super) fn spawn_screen_ui(
     let root = commands
         .spawn((
             ScreenUiRoot,
+            AllowedOverlays(screen.allowed_overlays.clone()),
             super::widgets::UiLocalState::default(),
             ScreenUiNode,
             // A modal screen must own its empty area as well as its buttons.
@@ -2212,6 +2238,29 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn admitted_overlay_retains_entity_and_nested_modal_revokes_access() {
+        use super::*;
+        let mut app = App::new();
+        app.init_resource::<ScreenUiState>().init_resource::<OverlayUiState>()
+            .add_systems(Update, sync_allowed_overlays);
+        let overlay = app.world_mut().spawn(GlobalZIndex(SCREEN_ACTIVE_Z + 10)).id();
+        let screen = app.world_mut().spawn(AllowedOverlays(vec!["tools".into()])).id();
+        let nested = app.world_mut().spawn(AllowedOverlays(Vec::new())).id();
+        app.world_mut().resource_mut::<OverlayUiState>().roots.insert("tools".into(), overlay);
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(screen);
+        app.update();
+        assert!(app.world().resource::<ScreenUiState>().accepts_input(overlay, app.world().resource::<OverlayUiState>()));
+        assert!(app.world().get::<GlobalZIndex>(overlay).expect("overlay layer").0 > SCREEN_MODAL_ACTIVE_Z);
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(nested);
+        // Even before synchronization, stale permission cannot leak into a new modal.
+        assert!(!app.world().resource::<ScreenUiState>().accepts_input(overlay, app.world().resource::<OverlayUiState>()));
+        app.update();
+        assert_eq!(app.world().get::<GlobalZIndex>(overlay).expect("retained overlay").0, SCREEN_ACTIVE_Z + 10);
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(screen);
+        app.update();
+        assert!(app.world().resource::<ScreenUiState>().accepts_input(overlay, app.world().resource::<OverlayUiState>()));
+    }
+    #[test]
     fn unchanged_history_does_not_overwrite_or_rebuild_its_model() {
         let mut app = App::new();
         app.init_resource::<Time>()
@@ -2432,6 +2481,88 @@ mod tests {
         );
         assert_eq!(viewport.width, vw(100));
         assert_eq!(viewport.height, vh(100));
+    }
+
+    #[test]
+    fn rich_history_rows_measure_content_instead_of_viewport_height() {
+        use bevy::app::{HierarchyPropagatePlugin, PropagateSet};
+        use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiSystems};
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), bevy::text::TextPlugin));
+        app.init_resource::<bevy::ui::UiScale>()
+            .init_resource::<bevy::ui::ui_surface::UiSurface>()
+            .init_resource::<UiModels>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate))
+            .add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate))
+            .configure_sets(PostUpdate, (
+                UiSystems::Prepare, UiSystems::Propagate, UiSystems::Content, UiSystems::Layout,
+            ).chain())
+            .configure_sets(PostUpdate, PropagateSet::<ComputedUiTargetCamera>::default().in_set(UiSystems::Propagate))
+            .configure_sets(PostUpdate, PropagateSet::<ComputedUiRenderTargetInfo>::default().in_set(UiSystems::Propagate))
+            .add_systems(Update, super::super::rich_text::update)
+            .add_systems(PostUpdate, (
+                bevy::ui::update::propagate_ui_target_cameras.in_set(UiSystems::Prepare),
+                bevy::ui::widget::measure_text_system.in_set(UiSystems::Content)
+                    .after(bevy::text::detect_text_needs_rerender)
+                    .after(bevy::text::load_font_assets_into_font_collection),
+                bevy::ui::ui_layout_system.in_set(UiSystems::Layout),
+            ));
+        app.world_mut().spawn((Camera2d, Camera {
+            computed: bevy::camera::ComputedCameraValues {
+                target_info: Some(bevy::camera::RenderTargetInfo {
+                    physical_size: UVec2::new(2560, 1440), scale_factor: 1.0,
+                }), ..default()
+            }, ..default()
+        }));
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://history.ui.hks",
+            r#"import ui.widgets.*
+            canvas {
+                scrollable {
+                    column {
+                        let messages = ["A short history entry.", "A short history entry.", "A short history entry.", "A longer history entry that must wrap without being clipped. A longer history entry that must wrap without being clipped. A longer history entry that must wrap without being clipped."]
+                        var index = 0
+                        while index < 4 {
+                            let message = item(messages, index) as! String
+                            column {
+                                column { text("Alice").at(.abs(152, 27)).fontSize(66) }
+                                    .size(.fit()).size(.abs(1648, 114))
+                                row {
+                                    spacer().size(.abs(194, 1))
+                                    column {
+                                        richText(message).fontSize(44).width(1338)
+                                    }.size(.fit()).width(1338)
+                                }.size(.fit()).width(1648).gap(0).padding(16)
+                            }.size(.fit()).width(1648).gap(0)
+                            index += 1
+                        }
+                    }.size(.fit()).width(1648).gap(8)
+                }.size(.abs(1648, 939))
+            }"#,
+            crate::script::UiContext::default(), &crate::texture::TextureCatalog::default(),
+            &TermCatalog::default(), &[],
+        ).expect("synthetic history compiles");
+        let server = app.world().resource::<AssetServer>().clone();
+        let root = app.world_mut().spawn(screen_root_node(&screen)).id();
+        let entity = spawn_screen_node_entity(
+            &mut app.world_mut().commands(), root, &server,
+            &UiFonts { regular: Handle::default(), _fonts: vec![] }, &UiStyle::default(),
+            &screen.children[0], &mut vec![],
+        );
+        app.world_mut().commands().entity(root).add_child(entity);
+        app.world_mut().flush();
+        for _ in 0..5 { app.update(); }
+        let world = app.world();
+        let list = world.get::<Children>(entity).expect("list")[0];
+        for (index, row) in world.get::<Children>(list).expect("rows").iter().enumerate() {
+            let size = world.get::<ComputedNode>(row).expect("measured row").size();
+            if index == 3 {
+                assert!(size.y > 250.0 && size.y < 500.0, "wrapped history row measured {size:?}");
+            } else {
+                assert!(size.y > 190.0 && size.y < 240.0, "short history row measured {size:?}");
+            }
+        }
     }
 
     #[test]

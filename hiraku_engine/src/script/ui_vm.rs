@@ -90,6 +90,7 @@ enum UiDraftKind {
 
 #[derive(Clone, Debug)]
 struct UiDraft {
+    allowed_overlays: Vec<String>,
     fade_seconds: f32,
     timers_paused: bool,
     pauses_scene: bool,
@@ -135,6 +136,7 @@ struct UiDraft {
 impl UiDraft {
     fn new(kind: UiDraftKind, content: Option<HksClosure>) -> Self {
         Self {
+            allowed_overlays: Vec::new(),
             timers: Vec::new(),
             timers_paused: false,
             fade_seconds: 0.0,
@@ -435,6 +437,25 @@ mod native_ui {
 
     /// Opt into scene suspension without teaching the engine about menus or
     /// minigames. UI timers/animations still belong to their own screen clock.
+    #[hks(name = "allowOverlay", receiver)]
+    fn allow_overlay(context: &mut UiVmContext, node: UiNodeHandle, name: String) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Screen) {
+            return Err(NativeError::message("allowOverlay requires a screen or canvas"));
+        }
+        if !draft.allowed_overlays.contains(&name) { draft.allowed_overlays.push(name); }
+        Ok(node)
+    }
+
+    /// Constrain wrapping without fixing the text's content-driven height.
+    #[hks(name = "width", receiver)]
+    fn width(context: &mut UiVmContext, node: UiNodeHandle, width: f64) -> Result<UiNodeHandle, NativeError> {
+        let layout = &mut context.node_mut(node)?.layout;
+        layout.width = Some(non_negative(width, "UI width")?);
+        layout.width_percent = None;
+        Ok(node)
+    }
+
     #[hks(name = "pauseScene", receiver)]
     fn pause_scene(context: &mut UiVmContext, node: UiNodeHandle, paused: bool) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
@@ -2066,6 +2087,7 @@ fn materialize_screen(
         .map(|name| resolve_texture(textures, name))
         .transpose()?;
     Ok(ScreenSpec {
+        allowed_overlays: draft.allowed_overlays,
         timers_paused: draft.timers_paused,
         fade_seconds: draft.fade_seconds,
         pauses_scene: draft.pauses_scene,
@@ -2721,10 +2743,10 @@ fn materialize_node(
                     };
                     Ok(ScreenNode::ImageButton(ScreenImageButtonNode {
                         pressed_texture: pressed.as_ref().map(|image| image.texture.clone()),
-                        pressed_layout: pressed.map(|image| image.layout),
+                        pressed_layout: pressed.map(|image| image_button_layout(image.layout, &draft.layout)),
                         texture: image.texture,
                         hovered_texture,
-                        hovered_layout,
+                        hovered_layout: hovered_layout.map(|layout| image_button_layout(layout, &draft.layout)),
                         hover_scale: draft.hover_scale,
                         press_scale: draft.press_scale,
                         value,
@@ -2733,7 +2755,7 @@ fn materialize_node(
                         enabled_binding: None,
                         reactive_enabled,
                         hovered_when_disabled: draft.hovered_when_disabled,
-                        layout: image.layout,
+                        layout: image_button_layout(image.layout, &draft.layout),
                     }))
                 }
                 _ => Err(UiVmError::Invalid(
@@ -2742,6 +2764,37 @@ fn materialize_node(
             }
         }
     }
+}
+
+/// The compact image-button representation must retain the outer button's
+/// placement. Explicit button dimensions/insets override the image defaults.
+fn image_button_layout(mut image: ScreenLayout, button: &ScreenLayout) -> ScreenLayout {
+    if button.fit_content {
+        image.fit_content = true;
+        image.width = None;
+        image.width_percent = None;
+        image.height = None;
+        image.height_percent = None;
+    }
+    macro_rules! dimension {
+        ($px:ident, $percent:ident) => {
+            if button.$px.is_some() || button.$percent.is_some() {
+                image.$px = button.$px;
+                image.$percent = button.$percent;
+            }
+        };
+    }
+    dimension!(width, width_percent);
+    dimension!(height, height_percent);
+    dimension!(left, left_percent);
+    dimension!(right, right_percent);
+    dimension!(top, top_percent);
+    dimension!(bottom, bottom_percent);
+    image.min_width = button.min_width.or(image.min_width);
+    image.hover_brightness = button.hover_brightness.or(image.hover_brightness);
+    image.hidden |= button.hidden;
+    image.clip |= button.clip;
+    image
 }
 
 fn stored_value(value: Value) -> Result<StoredValue, UiVmError> {
@@ -2786,6 +2839,68 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_button_preserves_outer_placement_in_all_visual_states() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+            canvas {
+                button { image("save-thumbnail://alice").size(.rel(10, 10)) }
+                    .hovered { image("save-thumbnail://bob") }
+                    .pressed { image("save-thumbnail://alice") }
+                    .at(.abs(2260, 0)).size(.abs(300, 238))
+                    .onClick { ui.close() }
+            }"#,
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("image button compiles");
+        let ScreenNode::ImageButton(button) = &screen.children[0] else { panic!("expected image button") };
+        assert!(button.on_click.is_some());
+        for layout in [&button.layout, button.hovered_layout.as_ref().expect("hover"), button.pressed_layout.as_ref().expect("press")] {
+            assert_eq!(layout.left, Some(2260.0));
+            assert_eq!(layout.top, Some(0.0));
+            assert_eq!(layout.width, Some(300.0));
+            assert_eq!(layout.width_percent, None);
+            assert_eq!(layout.height, Some(238.0));
+        }
+    }
+
+    #[test]
+    fn history_rows_keep_intrinsic_height_and_close_is_outside_scrollable() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://history.ui.hks",
+            r#"import ui.widgets.*
+            canvas {
+                image("save-thumbnail://alice").at(.abs(0, 0)).size(.abs(2560, 1440))
+                scrollable {
+                    column {
+                        var index = 0
+                        while index < 128 {
+                            column {
+                                text("Alice").fontSize(66)
+                                text("A history entry").width(1338)
+                            }.size(.fit()).width(1648)
+                            index += 1
+                        }
+                    }.size(.fit()).width(1648)
+                }.at(.abs(460, 241)).size(.abs(1648, 939))
+                button { image("save-thumbnail://bob") }.at(.abs(2260, 0)).size(.abs(300, 238)).onClick { ui.close() }
+            }"#,
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("full history builds");
+        assert_eq!(screen.children.len(), 3);
+        let ScreenNode::Scrollable(scroll) = &screen.children[1] else { panic!("scrollable expected") };
+        let ScreenNode::Column(content) = &scroll.children[0] else { panic!("content expected") };
+        assert!(content.layout.fit_content);
+        assert_eq!(content.layout.height, None);
+        assert_eq!(content.children.len(), 128);
+        for row in &content.children {
+            let ScreenNode::Column(row) = row else { panic!("row expected") };
+            assert!(row.layout.fit_content);
+            assert_eq!(row.children.len(), 2);
+        }
+        assert!(matches!(&screen.children[2], ScreenNode::ImageButton(button) if button.on_click.is_some() && button.layout.left == Some(2260.0)));
+    }
 
     #[test]
     fn rich_text_keeps_markup_and_reveal_as_separate_properties() {
@@ -3082,6 +3197,19 @@ mod tests {
             .expect("centered text compiles");
         assert!(matches!(&screen.children[0], ScreenNode::Text(text) if text.align == Some(0.5)));
         assert!(evaluate("import ui.widgets.*\ncanvas { text(\"bob\").textAlign(2) }").is_err());
+    }
+
+    #[test]
+    fn screen_can_admit_a_persistent_overlay_and_wrap_auto_height_text() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://alice.ui.hks",
+            "import ui.widgets.*; canvas { text(\"Alice\").width(400) }.allowOverlay(\"tools\")",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("screen policy compiles");
+        assert_eq!(screen.allowed_overlays, ["tools"]);
+        let ScreenNode::Text(text) = &screen.children[0] else { panic!("expected text") };
+        assert_eq!(text.layout.width, Some(400.0));
+        assert_eq!(text.layout.height, None);
     }
 
     #[test]

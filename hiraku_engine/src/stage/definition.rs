@@ -28,7 +28,7 @@ impl StagePose {
             ))
             .with_scale(Vec3::from(self.scale))
     }
-    fn validate(&self) -> bool {
+    pub(super) fn validate(&self) -> bool {
         Vec3::from(self.position).is_finite()
             && Vec3::from(self.rotation).is_finite()
             && Vec3::from(self.scale).is_finite()
@@ -165,6 +165,15 @@ pub struct StageDefinition {
     /// Optional camera-local white ambient light, in cd/m².
     #[serde(default)]
     pub ambient_brightness: Option<f32>,
+    /// Physical emitter radius, independent of the light's attenuation range.
+    #[serde(default)]
+    pub light_source_radius: Option<f32>,
+    /// Overrides keyed by imported glTF material name, scoped to this instance.
+    #[serde(default)]
+    pub materials: BTreeMap<String, super::StageMaterial>,
+    /// Lights attached beneath named model nodes, without editing the GLB.
+    #[serde(default)]
+    pub lights: BTreeMap<String, super::StageLight>,
     pub default_camera: String,
     #[serde(default)]
     pub anchors: BTreeMap<String, StagePose>,
@@ -175,6 +184,19 @@ pub struct StageDefinition {
 }
 impl StageDefinition {
     pub fn validate(&self) -> Result<(), String> {
+        for (name, material) in &self.materials {
+            if name.trim().is_empty() || !material.validate() {
+                return Err(format!("invalid stage material `{name}`"));
+            }
+        }
+        for (name, light) in &self.lights {
+            if name.trim().is_empty() || !light.validate() {
+                return Err(format!("invalid stage light `{name}`"));
+            }
+        }
+        if self.light_source_radius.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return Err("lightSourceRadius must be finite and non-negative".into());
+        }
         if self.ambient_brightness.is_some_and(|value| !value.is_finite() || value < 0.0) {
             return Err("ambientBrightness must be finite and non-negative".into());
         }

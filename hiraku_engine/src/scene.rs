@@ -72,7 +72,7 @@ pub(crate) mod effect_wait;
 pub(crate) mod pictures;
 mod runtime_menu;
 pub(crate) mod save_preview;
-mod screen_ui;
+pub(crate) mod screen_ui;
 mod snapshot;
 pub(crate) mod ui_hover;
 mod video_runtime;

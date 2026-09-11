@@ -428,7 +428,7 @@ fn dispatch_ui_effects(ctx: &mut RuntimeMenuContext, effects: Vec<crate::ui::UiE
                         &ctx.user_settings,
                         Some(&ctx.textures),
                         Some(&ctx.terms),
-                        Default::default(),
+                        ctx.models.roots().map(|(name, value)| (name.to_owned(), value.clone())).collect(),
                         arguments,
                     ) {
                         Ok(screen) => {

@@ -1,6 +1,8 @@
 //! Data-driven 3D stages. Anchors and camera presets are scene data, not
 //! story-specific trial mechanics. Explicit views allocate on-demand cameras.
 mod definition;
+mod model;
+pub use model::{StageAlpha, StageLight, StageLightKind, StageMaterial};
 mod clip;
 pub use clip::ViewClip;
 pub(crate) mod runtime;

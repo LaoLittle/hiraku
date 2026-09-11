@@ -21,7 +21,7 @@ pub struct DialogueHistoryState {
 }
 
 impl Default for DialogueHistoryState {
-    fn default() -> Self { Self { entries: Vec::new(), max_entries: 1024 } }
+    fn default() -> Self { Self { entries: Vec::new(), max_entries: 128 } }
 }
 
 impl DialogueHistoryState {
@@ -36,6 +36,17 @@ impl DialogueHistoryState {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn default_history_is_bounded_to_128_utterances() {
+        let mut history = DialogueHistoryState::default();
+        for index in 0..256 {
+            history.push(DialogueSnapshot { speaker: "alice".into(), text: index.to_string() });
+        }
+        assert_eq!(history.entries.len(), 128);
+        assert_eq!(history.entries[0].text, "128");
+        assert_eq!(history.entries[127].text, "255");
+    }
 
     #[test]
     fn history_keeps_the_newest_entries_and_can_be_disabled() {

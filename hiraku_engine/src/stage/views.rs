@@ -114,6 +114,10 @@ pub(super) fn sync(
             .spawn((
                 ViewCamera,
                 Camera3d::default(),
+                // This view is composed as an SDR image. Do not inherit the
+                // cinematic tone mapper required by Camera3d and compress the
+                // authored colors before the presentation pass samples them.
+                bevy::core_pipeline::tonemapping::Tonemapping::None,
                 exposure,
                 Camera {
                     order: primary.order - 1 - view.order as isize,

@@ -380,6 +380,7 @@ impl Plugin for HirakuPlugin {
                     update_ui_reactive_bindings,
                     scene::rich_text::update,
                     animate_screen_ui,
+                    scene::screen_ui::sync_allowed_overlays,
                     scene::ui_keyframes::tick,
                     scene::ui_hover::animate_hover,
                 )

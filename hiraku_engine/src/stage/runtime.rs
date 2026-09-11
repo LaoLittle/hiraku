@@ -238,7 +238,7 @@ pub(crate) struct StageRuntime {
     instantiated: bool,
     pub error: Option<String>,
     pub definition: Option<StageDefinition>,
-    materials: std::collections::HashMap<AssetId<StandardMaterial>, Handle<StandardMaterial>>,
+    materials: std::collections::HashMap<(AssetId<StandardMaterial>, Option<String>), Handle<StandardMaterial>>,
 }
 impl StageRuntime {
     pub fn ready(&self, state: &StageSnapshot) -> bool {
@@ -437,15 +437,19 @@ fn tick_view(
 #[derive(Component)]
 pub(crate) struct StageSurface;
 
+#[derive(Component)]
+pub(crate) struct StageLightMarker;
+
 /// World assets instantiate asynchronously. Decorate newly spawned descendants
 /// without modifying the source asset or materials shared with another scene.
 pub(crate) fn prepare_surfaces(
     mut commands: Commands,
     mut runtime: ResMut<StageRuntime>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    surfaces: Query<(Entity, &MeshMaterial3d<StandardMaterial>), Without<StageSurface>>,
-    lights: Query<
-        Entity,
+    surfaces: Query<(Entity, &MeshMaterial3d<StandardMaterial>, Option<&bevy::gltf::GltfMaterialName>), Without<StageSurface>>,
+    markers: Query<(Entity, &Name), Without<StageLightMarker>>,
+    mut lights: Query<
+        (Entity, Option<&mut PointLight>, Option<&mut SpotLight>),
         (
             Or<(With<PointLight>, With<SpotLight>, With<DirectionalLight>)>,
             Without<StageSurface>,
@@ -455,36 +459,53 @@ pub(crate) fn prepare_surfaces(
 ) {
     let Some(root) = runtime.root else { return };
     let unlit = runtime.definition.as_ref().is_some_and(|d| d.unlit);
+    if let Some(definition) = &runtime.definition {
+        for (entity, name) in &markers {
+            if let Some(light) = definition.lights.get(name.as_str()) {
+                if parents.iter_ancestors(entity).any(|ancestor| ancestor == root) {
+                    light.spawn(&mut commands, entity);
+                    commands.entity(entity).insert(StageLightMarker);
+                }
+            }
+        }
+    }
     // RenderLayers are not inherited through ChildOf. Imported lights must
     // illuminate the stage's layer, not Bevy's default layer zero.
-    for entity in &lights {
+    for (entity, point, spot) in &mut lights {
         if parents
             .iter_ancestors(entity)
             .any(|ancestor| ancestor == root)
         {
+            if let Some(radius) = runtime.definition.as_ref().and_then(|d| d.light_source_radius) {
+                if let Some(mut light) = point { light.radius = radius; }
+                if let Some(mut light) = spot { light.radius = radius; }
+            }
             commands
                 .entity(entity)
                 .insert((StageSurface, super::views::spatial_layer()));
         }
     }
-    for (entity, material) in &surfaces {
+    for (entity, material, name) in &surfaces {
         if !parents
             .iter_ancestors(entity)
             .any(|ancestor| ancestor == root)
         {
             continue;
         }
-        if unlit {
-            let handle = if let Some(handle) = runtime.materials.get(&material.id()) {
+        let settings = name.and_then(|name| runtime.definition.as_ref()?.materials.get(&name.0)).cloned();
+        if unlit || settings.is_some() {
+            let key = (material.id(), settings.as_ref().and(name.map(|n| n.0.clone())));
+            let handle = if let Some(handle) = runtime.materials.get(&key) {
                 handle.clone()
             } else {
                 let Some(source) = materials.get(material) else {
                     continue;
                 };
                 let mut source = source.clone();
-                source.unlit = true;
+                if unlit { source.unlit = true; }
+                if let Some(settings) = &settings { settings.apply(&mut source); }
                 let handle = materials.add(source);
-                runtime.materials.insert(material.id(), handle.clone());
+                runtime.materials.insert(key, handle.clone());
                 handle
             };
             commands.entity(entity).insert(MeshMaterial3d(handle));
@@ -495,9 +516,11 @@ pub(crate) fn prepare_surfaces(
     }
 }
 
-pub(super) fn projection_kind_values(p: &Projection) -> (u8, f32, f32, f32) {
+pub(super) fn projection_kind_values(p: &Projection) -> (u8, f32, f32, f32, f32) {
+    // Compare authored framing, including ADV zoom. Exclude target-derived
+    // aspect/area so Bevy's camera update does not cause a reset every frame.
     match p {
-        Projection::Perspective(p) => (0, p.fov, p.near, p.far),
+        Projection::Perspective(p) => (0, p.fov, p.near, p.far, 1.0),
         Projection::Orthographic(p) => (
             1,
             match p.scaling_mode {
@@ -506,8 +529,9 @@ pub(super) fn projection_kind_values(p: &Projection) -> (u8, f32, f32, f32) {
             },
             p.near,
             p.far,
+            p.scale,
         ),
-        _ => (2, 0.0, 0.0, 0.0),
+        _ => (2, 0.0, 0.0, 0.0, 1.0),
     }
 }
 
@@ -573,6 +597,22 @@ fn interpolate_camera(from: &StageCamera, to: &StageCamera, t: f32) -> StageCame
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_projection_detects_inherited_zoom_without_resetting_computed_area() {
+        let mut lens = OrthographicProjection::default_3d();
+        lens.scaling_mode = bevy::camera::ScalingMode::FixedVertical { viewport_height: 1440.0 };
+        let expected = projection_kind_values(&Projection::Orthographic(lens.clone()));
+        lens.scale = 0.5;
+        assert_ne!(projection_kind_values(&Projection::Orthographic(lens.clone())), expected);
+        lens.scale = 1.0;
+        lens.area = Rect::new(-1280.0, -720.0, 1280.0, 720.0);
+        assert_eq!(projection_kind_values(&Projection::Orthographic(lens)), expected);
+        let mut perspective = PerspectiveProjection::default();
+        let expected = projection_kind_values(&Projection::Perspective(perspective.clone()));
+        perspective.aspect_ratio = 16.0 / 9.0;
+        assert_eq!(projection_kind_values(&Projection::Perspective(perspective)), expected);
+    }
 
     #[test]
     fn hidden_tracks_advance_independently_and_survive_restore_mid_crossfade() {
@@ -721,6 +761,11 @@ mod tests {
         app.update();
         let camera_count = app.world_mut().query::<&Camera>().iter(app.world()).count();
         assert_eq!(camera_count, 2);
+        let tonemapping = app.world_mut()
+            .query_filtered::<&bevy::core_pipeline::tonemapping::Tonemapping, With<super::super::views::ViewCamera>>()
+            .single(app.world())
+            .expect("stage view tone mapping");
+        assert_eq!(*tonemapping, bevy::core_pipeline::tonemapping::Tonemapping::None);
         app.world_mut()
             .resource_mut::<crate::state::SceneSharedState>()
             .0
@@ -749,10 +794,18 @@ mod tests {
         let child = app.world_mut().spawn(ChildOf(root)).id();
         let light = app
             .world_mut()
-            .spawn((SpotLight::default(), ChildOf(child)))
+            .spawn((SpotLight { radius: 90.0, range: 90.0, ..default() }, ChildOf(child)))
             .id();
-        let external = app.world_mut().spawn(SpotLight::default()).id();
-        app.world_mut().resource_mut::<StageRuntime>().root = Some(root);
+        let external = app.world_mut().spawn(SpotLight { radius: 2.0, ..default() }).id();
+        {
+            let mut runtime = app.world_mut().resource_mut::<StageRuntime>();
+            runtime.root = Some(root);
+            runtime.definition = Some(hiraku_script::hson::from_str(r#".{
+                lightSourceRadius: 0, defaultCamera: "wide", cameras: .{
+                    wide: .{ pose: .{ position: (0, 0, 10) }, projection: .{ kind: "perspective", fov: 60, near: 0.1, far: 100 } }
+                }
+            }"#).expect("fixture stage"));
+        }
         app.update();
         assert_eq!(
             app.world()
@@ -761,8 +814,77 @@ mod tests {
         );
         assert!(app.world().get::<StageSurface>(light).is_some());
         assert!(app.world().get::<StageSurface>(external).is_none());
+        let imported = app.world().get::<SpotLight>(light).expect("imported light");
+        assert_eq!(imported.radius, 0.0);
+        assert_eq!(imported.range, 90.0);
+        assert_eq!(app.world().get::<SpotLight>(external).expect("external light").radius, 2.0);
         app.update();
         assert!(app.world().get_entity(light).is_ok());
+    }
+
+    #[test]
+    fn stage_model_settings_are_instance_local_and_light_markers_are_idempotent() {
+        let mut app = App::new();
+        app.init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<StageRuntime>()
+            .add_systems(Update, prepare_surfaces);
+        let root = app.world_mut().spawn(StageRoot).id();
+        let source = app.world_mut().resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let a = app.world_mut().spawn((ChildOf(root), MeshMaterial3d(source.clone()),
+            bevy::gltf::GltfMaterialName("alice".into()))).id();
+        let b = app.world_mut().spawn((ChildOf(root), MeshMaterial3d(source.clone()),
+            bevy::gltf::GltfMaterialName("bob".into()))).id();
+        let external = app.world_mut().spawn((MeshMaterial3d(source.clone()),
+            bevy::gltf::GltfMaterialName("alice".into()))).id();
+        let marker = app.world_mut().spawn((ChildOf(root), Name::new("lamp"),
+            Transform::from_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)))).id();
+        let definition: StageDefinition = hiraku_script::hson::from_str(r#".{
+            materials: .{
+                alice: .{ baseColor: (0.5, 1, 0, 1), metallic: 0, roughness: 0.6,
+                    uvScale: (2, 3), uvOffset: (0.1, -2), alpha: .{ kind: "mask", cutoff: 0.5 } },
+                bob: .{ roughness: 0.2 }
+            },
+            lights: .{ lamp: .{ pose: .{ rotation: (0, 180, 0) },
+                light: .{ kind: "spot", color: (1, 1, 1), intensity: 1200, range: 20,
+                    radius: 0, innerAngle: 30, outerAngle: 60 } } },
+            defaultCamera: "wide", cameras: .{
+                wide: .{ pose: .{ position: (0, 0, 10) }, projection: .{ kind: "perspective", fov: 60, near: 0.1, far: 100 } }
+            }
+        }"#).expect("stage settings deserialize");
+        definition.validate().expect("valid model settings");
+        {
+            let mut runtime = app.world_mut().resource_mut::<StageRuntime>();
+            runtime.root = Some(root);
+            runtime.definition = Some(definition.clone());
+        }
+        for _ in 0..3 { app.update(); }
+        let world = app.world();
+        let ah = &world.get::<MeshMaterial3d<StandardMaterial>>(a).expect("alice material").0;
+        let bh = &world.get::<MeshMaterial3d<StandardMaterial>>(b).expect("bob material").0;
+        assert_ne!(ah, bh);
+        assert_ne!(ah, &source);
+        let materials = world.resource::<Assets<StandardMaterial>>();
+        let a = materials.get(ah).expect("cloned material");
+        assert_eq!(a.base_color, Color::srgba(0.5, 1.0, 0.0, 1.0));
+        assert_eq!(a.alpha_mode, AlphaMode::Mask(0.5));
+        assert!(a.uv_transform.transform_point2(Vec2::ONE).abs_diff_eq(Vec2::new(2.1, 1.0), 0.0001));
+        assert_eq!(materials.get(bh).expect("bob material").perceptual_roughness, 0.2);
+        assert_eq!(materials.get(&source).expect("source").base_color, Color::WHITE);
+        assert_eq!(world.get::<MeshMaterial3d<StandardMaterial>>(external).expect("external").0, source);
+        let children = world.get::<Children>(marker).expect("attached light");
+        assert_eq!(children.len(), 1);
+        let light = children[0];
+        assert_eq!(world.get::<SpotLight>(light).expect("spot").intensity, 1200.0);
+        let direction = world.get::<Transform>(marker).expect("original transform").rotation
+            * world.get::<Transform>(light).expect("relative transform").rotation * Vec3::NEG_Z;
+        assert!(direction.abs_diff_eq(Vec3::NEG_Y, 0.0001));
+        let mut invalid = definition;
+        invalid.materials.get_mut("alice").expect("settings").roughness = Some(2.0);
+        assert!(invalid.validate().is_err());
+        app.world_mut().despawn(root);
+        assert!(app.world().get_entity(light).is_err());
+        assert!(app.world().get_entity(external).is_ok());
     }
 
     #[test]

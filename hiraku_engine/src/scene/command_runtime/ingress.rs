@@ -262,6 +262,7 @@ pub fn drive_story_runtime(
     movies: Option<Res<crate::movie::MovieCatalog>>,
     vfs: Res<VfsResource>,
     user_settings: Res<UserSettings>,
+    models: Res<crate::ui::UiModels>,
 ) {
     for message in response_messages.read() {
         if let Some((task, effect)) = runtime.task_requests.remove(&message.request) {
@@ -675,7 +676,7 @@ pub fn drive_story_runtime(
                     &user_settings,
                     textures.as_deref(),
                     terms.as_deref(),
-                    BTreeMap::new(),
+                    models.roots().map(|(name, value)| (name.to_owned(), value.clone())).collect(),
                     &arguments,
                 );
                 let request = runtime.allocate_request();
