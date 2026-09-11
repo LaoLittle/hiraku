@@ -1,10 +1,5 @@
 use bevy::{
-    asset::{AssetMetaCheck, AssetPlugin},
-    camera::{ScalingMode, visibility::RenderLayers},
-    picking::pointer::PointerId,
-    prelude::*,
-    sprite::{SpritePickingCamera, SpritePickingMode, SpritePickingSettings},
-    window::WindowPlugin,
+    asset::{AssetMetaCheck, AssetPlugin}, camera::{ScalingMode, visibility::RenderLayers}, picking::pointer::PointerId, prelude::*, sprite::{SpritePickingCamera, SpritePickingMode, SpritePickingSettings}, window::WindowPlugin, winit::WinitSettings,
 };
 use bevy::{input::mouse::MouseScrollUnit, picking::events::Scroll};
 use hiraku_engine::input::{HirakuPointerId, HirakuScrollInput, HirakuScrollUnit};
@@ -69,7 +64,8 @@ pub fn build_app(config: RuntimeLaunchConfig) -> App {
                 }),
                 ..default()
             }),
-    );
+    )
+    .insert_resource(WinitSettings::desktop_app());
     app.add_plugins(HirakuPluginGroup);
     app.add_plugins(HirakuPresentationPlugin);
 
