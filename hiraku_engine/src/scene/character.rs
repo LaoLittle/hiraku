@@ -358,7 +358,9 @@ pub fn animate_character_motion_effects(
         ),
     >,
 ) {
-    if !movers.is_empty() { redraw.request(); }
+    if !movers.is_empty() {
+        redraw.request();
+    }
     for mut placement in &mut placements {
         if let Some(tween) = placement.trajectory.as_mut() {
             redraw.request();
@@ -873,7 +875,10 @@ pub(super) fn queue_character_show(
             });
             entities.push(entity);
             entity_ids.push(sprite_id);
-            handles.push(asset_server.load(part.path.clone()));
+            handles.push(crate::texture::load_static_image(
+                asset_server,
+                part.path.clone(),
+            ));
             newly_spawned.push(false);
             continue;
         }
@@ -893,7 +898,7 @@ pub(super) fn queue_character_show(
             rect: part.rect,
         };
 
-        let handle = asset_server.load(part.path.clone());
+        let handle = crate::texture::load_static_image(asset_server, part.path.clone());
         let mut sprite = character_part_sprite(handle.clone(), part);
         sprite.color = color;
         let entity = commands
@@ -1189,20 +1194,49 @@ mod tests {
         let root = app.world_mut().spawn_empty().id();
         let part = spawn_placement_part(app.world_mut(), root, "alice/body", Vec2::ZERO, 0.0);
         update_actor_placement_with_animation(
-            app.world_mut(), root, Some(part), Vec2::new(100.0, 0.0),
-            1.0, Quat::IDENTITY, Some(crate::script::AnimationSpec::Linear(0.0, false)),
+            app.world_mut(),
+            root,
+            Some(part),
+            Vec2::new(100.0, 0.0),
+            1.0,
+            Quat::IDENTITY,
+            Some(crate::script::AnimationSpec::Linear(0.0, false)),
         );
-        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_millis(16));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(16));
         app.update();
-        assert_eq!(app.world().get::<Transform>(part).expect("pose").translation.x, 100.0);
+        assert_eq!(
+            app.world()
+                .get::<Transform>(part)
+                .expect("pose")
+                .translation
+                .x,
+            100.0
+        );
         update_actor_placement_with_animation(
-            app.world_mut(), root, Some(part), Vec2::new(200.0, 0.0),
-            1.0, Quat::IDENTITY, None,
+            app.world_mut(),
+            root,
+            Some(part),
+            Vec2::new(200.0, 0.0),
+            1.0,
+            Quat::IDENTITY,
+            None,
         );
-        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_millis(150));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(150));
         app.update();
-        let x = app.world().get::<Transform>(part).expect("pose").translation.x;
-        assert!((x - 187.5).abs() < 0.01, "default ease-out must remain active: {x}");
+        let x = app
+            .world()
+            .get::<Transform>(part)
+            .expect("pose")
+            .translation
+            .x;
+        assert!(
+            (x - 187.5).abs() < 0.01,
+            "default ease-out must remain active: {x}"
+        );
     }
 
     #[test]

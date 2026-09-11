@@ -133,7 +133,12 @@ fn restore_frontend_scene(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn handle_runtime_menu_buttons(mut redraw: crate::redraw::Redraw, mut ctx: RuntimeMenuContext, mut deferred: Local<Vec<crate::ui::UiEffect>>, dependencies: Option<Res<crate::dependencies::ScriptDependencies>>) {
+pub fn handle_runtime_menu_buttons(
+    mut redraw: crate::redraw::Redraw,
+    mut ctx: RuntimeMenuContext,
+    mut deferred: Local<Vec<crate::ui::UiEffect>>,
+    dependencies: Option<Res<crate::dependencies::ScriptDependencies>>,
+) {
     if dependencies.is_some_and(|d| d.loading) {
         ctx.clicks.clear();
         ctx.widget_callbacks.clear();
@@ -142,7 +147,12 @@ pub fn handle_runtime_menu_buttons(mut redraw: crate::redraw::Redraw, mut ctx: R
     if !crate::storage::storage_ready() {
         ctx.clicks.clear();
         ctx.widget_callbacks.clear();
-        if matches!(hiraku_storage::runtime_status(), hiraku_storage::RuntimeStorageStatus::Failed(_)) { deferred.clear(); }
+        if matches!(
+            hiraku_storage::runtime_status(),
+            hiraku_storage::RuntimeStorageStatus::Failed(_)
+        ) {
+            deferred.clear();
+        }
         return;
     }
     if !deferred.is_empty() {
@@ -285,199 +295,220 @@ pub fn handle_runtime_menu_buttons(mut redraw: crate::redraw::Redraw, mut ctx: R
             }
         }
         dispatch_ui_effects(&mut ctx, effects, &mut deferred);
-        if !crate::storage::storage_ready() { return; }
+        if !crate::storage::storage_ready() {
+            return;
+        }
     }
 }
 
-fn dispatch_ui_effects(ctx: &mut RuntimeMenuContext, effects: Vec<crate::ui::UiEffect>, deferred: &mut Vec<crate::ui::UiEffect>) {
+fn dispatch_ui_effects(
+    ctx: &mut RuntimeMenuContext,
+    effects: Vec<crate::ui::UiEffect>,
+    deferred: &mut Vec<crate::ui::UiEffect>,
+) {
     if !crate::storage::storage_ready() {
         deferred.extend(effects);
         return;
     }
     let mut effects = effects.into_iter();
     while let Some(effect) = effects.next() {
-            match &effect {
-                crate::ui::UiEffect::StopVoice => {
-                    finish_all_voices(&mut ctx.commands, &mut ctx.animations, &mut ctx.voice_state);
+        match &effect {
+            crate::ui::UiEffect::StopVoice => {
+                finish_all_voices(&mut ctx.commands, &mut ctx.animations, &mut ctx.voice_state);
+            }
+            crate::ui::UiEffect::SetPreference(change) => {
+                ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                    SettingsCommand::Preference(change.clone()),
+                ));
+            }
+            crate::ui::UiEffect::SetAutoDialogue(enabled) => {
+                ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                    SettingsCommand::AutoDialogue(*enabled),
+                ));
+            }
+            crate::ui::UiEffect::SetFastForward(enabled) => {
+                ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                    SettingsCommand::FastForward(*enabled),
+                ));
+            }
+            crate::ui::UiEffect::SetVolume { channel, value } => {
+                ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
+                    SettingsCommand::Set {
+                        name: channel.clone(),
+                        value: *value,
+                    },
+                ));
+            }
+            crate::ui::UiEffect::PlaySfx { .. } => {
+                ctx.effects
+                    .write(super::screen_ui::UiEffectMessage(effect.clone()));
+            }
+            crate::ui::UiEffect::Save { slot } => {
+                if let Err(error) = save_runtime_slot(
+                    slot,
+                    &ctx.script_runtime,
+                    &ctx.shared_state,
+                    if ctx.screen_state.active_root.is_some() {
+                        &ctx.preview.png
+                    } else {
+                        &[]
+                    },
+                    &ctx.dialogue_history.entries,
+                ) {
+                    warn!("failed to save slot `{slot}`: {error}");
+                    ctx.frontend.notice = Some(format!("Failed to save slot {slot}: {error}"));
+                    break;
                 }
-                crate::ui::UiEffect::SetPreference(change) => {
-                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
-                        SettingsCommand::Preference(change.clone()),
-                    ));
-                }
-                crate::ui::UiEffect::SetAutoDialogue(enabled) => {
-                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
-                        SettingsCommand::AutoDialogue(*enabled),
-                    ));
-                }
-                crate::ui::UiEffect::SetFastForward(enabled) => {
-                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
-                        SettingsCommand::FastForward(*enabled),
-                    ));
-                }
-                crate::ui::UiEffect::SetVolume { channel, value } => {
-                    ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
-                        SettingsCommand::Set {
-                            name: channel.clone(),
-                            value: *value,
-                        },
-                    ));
-                }
-                crate::ui::UiEffect::PlaySfx { .. } => {
-                    ctx.effects
-                        .write(super::screen_ui::UiEffectMessage(effect.clone()));
-                }
-                crate::ui::UiEffect::Save { slot } => {
-                    if let Err(error) = save_runtime_slot(
-                        slot,
-                        &ctx.script_runtime,
-                        &ctx.shared_state,
-                        if ctx.screen_state.active_root.is_some() {
-                            &ctx.preview.png
-                        } else {
-                            &[]
-                        },
-                    ) {
-                        warn!("failed to save slot `{slot}`: {error}");
-                        ctx.frontend.notice = Some(format!("Failed to save slot {slot}: {error}"));
-                        break;
-                    }
-                }
-                crate::ui::UiEffect::Load { slot } => {
-                    let save_data = match load_save_data(slot) {
-                        Ok(save_data) => save_data,
-                        Err(error) => {
-                            warn!("failed to load slot `{slot}`: {error}");
-                            ctx.frontend.notice =
-                                Some(format!("Failed to load slot {slot}: {error}"));
-                            break;
-                        }
-                    };
-                    // Compile and validate every saved continuation before
-                    // touching the visible scene, modal stack or active waits.
-                    // start_story_runtime commits only after all validation succeeds.
-                    let prepared = ScriptBootstrap::from_save(&save_data).and_then(|bootstrap| {
-                        start_story_runtime(
-                            &ctx.vfs,
-                            &mut ctx.script_runtime,
-                            bootstrap,
-                            &ctx.user_settings,
-                        )
-                    });
-                    if let Err(error) = prepared {
-                        crate::script::emit_script_diagnostic(
-                            &format!("failed to restore slot `{slot}`"),
-                            &error,
-                        );
+            }
+            crate::ui::UiEffect::Load { slot } => {
+                let save_data = match load_save_data(slot) {
+                    Ok(save_data) => save_data,
+                    Err(error) => {
+                        warn!("failed to load slot `{slot}`: {error}");
                         ctx.frontend.notice = Some(format!("Failed to load slot {slot}: {error}"));
                         break;
                     }
-                    abort_runtime_waiters(
-                        &mut ctx.commands,
-                        &mut ctx.waits,
-                        &mut ctx.dialogue_state,
-                        &mut ctx.choice_state,
-                        &mut ctx.screen_state,
-                        &mut ctx.pending_script_commands,
-                        &mut ctx.pending_characters,
-                        &mut ctx.animations,
-                        &mut ctx.voice_state,
-                        &ctx.choice_ui_roots,
-                    );
-                    ctx.dialogue_history.entries.clear();
-                    // Mounted overlays belong to the saved presentation, not
-                    // the session being replaced. Bootstrap will mount exactly
-                    // the saved set; retaining future overlays exposes stale
-                    // callbacks to globals which do not exist in this save.
-                    clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
-                    clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                    restore_frontend_scene(
-                        &mut ctx.commands,
-                        &ctx.asset_server,
-                        &mut ctx.shared_state,
-                        &mut ctx.stage,
-                        &mut ctx.dialogue_state,
-                        &mut ctx.choice_state,
-                        &ctx.choice_ui_roots,
-                        &mut ctx.dialogue_root,
-                        &mut ctx.speaker_text,
-                        &mut ctx.line_text,
+                };
+                // Compile and validate every saved continuation before
+                // touching the visible scene, modal stack or active waits.
+                // start_story_runtime commits only after all validation succeeds.
+                let prepared = ScriptBootstrap::from_save(&save_data).and_then(|bootstrap| {
+                    start_story_runtime(
+                        &ctx.vfs,
+                        &mut ctx.script_runtime,
+                        bootstrap,
                         &ctx.user_settings,
-                        &mut ctx.frontend,
-                        save_data.scene.clone(),
+                    )
+                });
+                if let Err(error) = prepared {
+                    crate::script::emit_script_diagnostic(
+                        &format!("failed to restore slot `{slot}`"),
+                        &error,
                     );
-                    info!("loaded save slot `{slot}`");
-                    // Remaining effects belong to the pre-load UI invocation.
+                    ctx.frontend.notice = Some(format!("Failed to load slot {slot}: {error}"));
                     break;
                 }
-                crate::ui::UiEffect::OpenUi {
-                    role,
-                    origin,
+                abort_runtime_waiters(
+                    &mut ctx.commands,
+                    &mut ctx.waits,
+                    &mut ctx.dialogue_state,
+                    &mut ctx.choice_state,
+                    &mut ctx.screen_state,
+                    &mut ctx.pending_script_commands,
+                    &mut ctx.pending_characters,
+                    &mut ctx.animations,
+                    &mut ctx.voice_state,
+                    &ctx.choice_ui_roots,
+                );
+                ctx.dialogue_history
+                    .restore(save_data.dialogue_history.clone());
+                // Mounted overlays belong to the saved presentation, not
+                // the session being replaced. Bootstrap will mount exactly
+                // the saved set; retaining future overlays exposes stale
+                // callbacks to globals which do not exist in this save.
+                clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
+                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+                restore_frontend_scene(
+                    &mut ctx.commands,
+                    &ctx.asset_server,
+                    &mut ctx.shared_state,
+                    &mut ctx.stage,
+                    &mut ctx.dialogue_state,
+                    &mut ctx.choice_state,
+                    &ctx.choice_ui_roots,
+                    &mut ctx.dialogue_root,
+                    &mut ctx.speaker_text,
+                    &mut ctx.line_text,
+                    &ctx.user_settings,
+                    &mut ctx.frontend,
+                    save_data.scene.clone(),
+                );
+                info!("loaded save slot `{slot}`");
+                // Remaining effects belong to the pre-load UI invocation.
+                break;
+            }
+            crate::ui::UiEffect::OpenUi {
+                role,
+                origin,
+                arguments,
+            } => {
+                let target = ctx
+                    .script_runtime
+                    .ui_registry
+                    .get(role)
+                    .cloned()
+                    .unwrap_or_else(|| ctx.vfs.0.resolve_path(origin.as_deref(), role));
+                match super::command_runtime::evaluate_ui_at_with_arguments(
+                    &target,
+                    &ctx.script_runtime,
+                    &ctx.vfs,
+                    &ctx.user_settings,
+                    Some(&ctx.textures),
+                    Some(&ctx.terms),
+                    ctx.models
+                        .roots()
+                        .map(|(name, value)| (name.to_owned(), value.clone()))
+                        .collect(),
                     arguments,
-                } => {
-                    let target = ctx
-                        .script_runtime
-                        .ui_registry
-                        .get(role)
-                        .cloned()
-                        .unwrap_or_else(|| ctx.vfs.0.resolve_path(origin.as_deref(), role));
-                    match super::command_runtime::evaluate_ui_at_with_arguments(
-                        &target,
-                        &ctx.script_runtime,
-                        &ctx.vfs,
-                        &ctx.user_settings,
-                        Some(&ctx.textures),
-                        Some(&ctx.terms),
-                        ctx.models.roots().map(|(name, value)| (name.to_owned(), value.clone())).collect(),
-                        arguments,
-                    ) {
-                        Ok(screen) => {
-                            ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
-                                UiCommand::ShowScreen {
-                                    screen,
-                                    done: None,
-                                    push: true,
-                                },
-                            ));
-                        }
-                        Err(error) => crate::script::emit_script_diagnostic(
-                            &format!("failed to open UI role `{role}`"),
-                            &error.to_string(),
-                        ),
+                ) {
+                    Ok(screen) => {
+                        ctx.pending_script_commands.enqueue(ScriptCommand::Ui(
+                            UiCommand::ShowScreen {
+                                screen,
+                                done: None,
+                                push: true,
+                            },
+                        ));
                     }
-                }
-                crate::ui::UiEffect::CloseUi { value } | crate::ui::UiEffect::CompleteUi { value } => {
-                    let complete = matches!(&effect, crate::ui::UiEffect::CompleteUi { .. });
-                    if let Some(root) = ctx.screen_state.active_root {
-                        if ctx.fades.contains(root) {
-                            if ctx.screen_state.closing_root.is_none() {
-                                ctx.commands.entity(root).try_insert(super::ui_visuals::FadeResult { value: value.clone(), complete });
-                                ctx.screen_state.closing_root = Some(root);
-                            }
-                            continue;
-                        }
-                    }
-                    super::ui_visuals::finish(&mut ctx.commands, &mut ctx.screen_state, &mut ctx.responses, value.clone(), complete);
-                }
-                crate::ui::UiEffect::Navigate(navigation) => {
-                    ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
-                        RuntimeCommand::Navigate(navigation.clone()),
-                    ));
-                }
-                crate::ui::UiEffect::NextDialogue => {
-                    advance_dialogue(
-                        &mut ctx.dialogue_state,
-                        &mut ctx.animations,
-                        &mut ctx.dialogue_chars,
-                        &mut ctx.responses,
-                    );
+                    Err(error) => crate::script::emit_script_diagnostic(
+                        &format!("failed to open UI role `{role}`"),
+                        &error.to_string(),
+                    ),
                 }
             }
+            crate::ui::UiEffect::CloseUi { value } | crate::ui::UiEffect::CompleteUi { value } => {
+                let complete = matches!(&effect, crate::ui::UiEffect::CompleteUi { .. });
+                if let Some(root) = ctx.screen_state.active_root {
+                    if ctx.fades.contains(root) {
+                        if ctx.screen_state.closing_root.is_none() {
+                            ctx.commands
+                                .entity(root)
+                                .try_insert(super::ui_visuals::FadeResult {
+                                    value: value.clone(),
+                                    complete,
+                                });
+                            ctx.screen_state.closing_root = Some(root);
+                        }
+                        continue;
+                    }
+                }
+                super::ui_visuals::finish(
+                    &mut ctx.commands,
+                    &mut ctx.screen_state,
+                    &mut ctx.responses,
+                    value.clone(),
+                    complete,
+                );
+            }
+            crate::ui::UiEffect::Navigate(navigation) => {
+                ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
+                    RuntimeCommand::Navigate(navigation.clone()),
+                ));
+            }
+            crate::ui::UiEffect::NextDialogue => {
+                advance_dialogue(
+                    &mut ctx.dialogue_state,
+                    &mut ctx.animations,
+                    &mut ctx.dialogue_chars,
+                    &mut ctx.responses,
+                );
+            }
+        }
         if !crate::storage::storage_ready() {
             deferred.extend(effects);
             break;
         }
-        }
+    }
 }
 
 /// Swapping artwork must not discard stretching, tint, flips or visual-box

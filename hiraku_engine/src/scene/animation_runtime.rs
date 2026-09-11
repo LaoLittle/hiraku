@@ -13,18 +13,37 @@ mod redraw_tests {
             .add_message::<ScriptResponseMessage>()
             .add_message::<bevy::window::RequestRedraw>()
             .add_systems(Update, tick_pending_waits);
-        app.world_mut().resource_mut::<PendingWaits>().items.push(PendingWait {
-            timer: Timer::new(std::time::Duration::from_millis(200), TimerMode::Once),
-            animation_id: None,
-            done: ScriptRequestId(1),
-        });
-        let mut redraws = bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
+        app.world_mut()
+            .resource_mut::<PendingWaits>()
+            .items
+            .push(PendingWait {
+                timer: Timer::new(std::time::Duration::from_millis(200), TimerMode::Once),
+                animation_id: None,
+                done: ScriptRequestId(1),
+            });
+        let mut redraws =
+            bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
         let mut responses = bevy::ecs::message::MessageCursor::<ScriptResponseMessage>::default();
         for (redraw_count, response_count) in [(1, 0), (1, 1), (0, 0)] {
-            app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(100));
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_millis(100));
             app.update();
-            assert_eq!(redraws.read(app.world().resource::<Messages<bevy::window::RequestRedraw>>()).count(), redraw_count);
-            assert_eq!(responses.read(app.world().resource::<Messages<ScriptResponseMessage>>()).count(), response_count);
+            assert_eq!(
+                redraws
+                    .read(
+                        app.world()
+                            .resource::<Messages<bevy::window::RequestRedraw>>()
+                    )
+                    .count(),
+                redraw_count
+            );
+            assert_eq!(
+                responses
+                    .read(app.world().resource::<Messages<ScriptResponseMessage>>())
+                    .count(),
+                response_count
+            );
         }
     }
 }
@@ -76,7 +95,9 @@ pub fn tick_pending_waits(
     mut animations: ResMut<AnimationState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
 ) {
-    if !waits.items.is_empty() { redraw.request(); }
+    if !waits.items.is_empty() {
+        redraw.request();
+    }
     for wait in waits.items.iter_mut() {
         wait.timer.tick(time.delta());
     }
@@ -117,7 +138,9 @@ pub fn animate_visual_tweens(
         Option<&mut Visibility>,
     )>,
 ) {
-    if !visuals.is_empty() { redraw.request(); }
+    if !visuals.is_empty() {
+        redraw.request();
+    }
     for (
         entity,
         mut sprite,
@@ -222,7 +245,9 @@ pub fn animate_rule_transitions(
     mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
     mut transitions: Query<(Entity, &mut RuleTransitionPlayer)>,
 ) {
-    if !transitions.is_empty() { redraw.request(); }
+    if !transitions.is_empty() {
+        redraw.request();
+    }
     for (entity, mut transition) in &mut transitions {
         transition.timer.tick(time.delta());
         if let Some(mut material) = rule_materials.get_mut(&transition.material) {
@@ -266,7 +291,9 @@ pub fn animate_custom_effects(
     mut world_sprite_materials: ResMut<Assets<WorldSpriteMaterial>>,
     mut effects: Query<(Entity, &mut CustomScreenEffectPlayer)>,
 ) {
-    if !effects.is_empty() { redraw.request(); }
+    if !effects.is_empty() {
+        redraw.request();
+    }
     for (entity, mut effect) in &mut effects {
         effect.timer.tick(time.delta());
         if let Some(mut material) = materials.get_mut(&effect.material) {

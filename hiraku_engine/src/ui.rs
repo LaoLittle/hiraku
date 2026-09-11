@@ -33,7 +33,12 @@ impl UiShaderKeyframe {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum UiShaderBlend { #[default] Alpha, Multiply, Additive }
+pub enum UiShaderBlend {
+    #[default]
+    Alpha,
+    Multiply,
+    Additive,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiShaderSpec {
@@ -65,7 +70,9 @@ pub enum UiEffect {
         value: hiraku_script::Value,
     },
     /// Complete the nearest story-owned UI request, closing its nested modals.
-    CompleteUi { value: hiraku_script::Value },
+    CompleteUi {
+        value: hiraku_script::Value,
+    },
     Save {
         slot: String,
     },
@@ -771,10 +778,15 @@ pub struct OverlayUiState {
 impl ScreenUiState {
     /// Only the top modal receives input; overlays are interactive without a modal.
     pub(crate) fn accepts_input(&self, root: Entity, overlays: &OverlayUiState) -> bool {
-        self.closing_root.is_none() && self.pending_root.is_none()
+        self.closing_root.is_none()
+            && self.pending_root.is_none()
             && self.active_root.map_or_else(
                 || self.stack.is_empty() && overlays.roots.values().any(|entity| *entity == root),
-                |active| active == root || (self.allowed_overlay_owner == Some(active) && self.allowed_overlay_roots.contains(&root)),
+                |active| {
+                    active == root
+                        || (self.allowed_overlay_owner == Some(active)
+                            && self.allowed_overlay_roots.contains(&root))
+                },
             )
     }
 }

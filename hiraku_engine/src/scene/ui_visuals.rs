@@ -135,14 +135,18 @@ pub(crate) fn apply(
             Option<&mut TextColor>,
             Option<&mut TextShadow>,
             Option<&mut AppliedVisual>,
-            Option<&bevy::ui_render::ui_material::MaterialNode<crate::render::ui_quad::UiQuadMaterial>>,
+            Option<
+                &bevy::ui_render::ui_material::MaterialNode<crate::render::ui_quad::UiQuadMaterial>,
+            >,
         ),
         Or<(
             With<BackgroundColor>,
             With<ImageNode>,
             With<TextColor>,
             With<TextShadow>,
-            With<bevy::ui_render::ui_material::MaterialNode<crate::render::ui_quad::UiQuadMaterial>>,
+            With<
+                bevy::ui_render::ui_material::MaterialNode<crate::render::ui_quad::UiQuadMaterial>,
+            >,
         )>,
     >,
 ) {
@@ -182,10 +186,14 @@ pub(crate) fn apply(
             continue;
         }
         let mut next = cache.as_deref().cloned().unwrap_or_default();
-        if let Some(mut material)=material.and_then(|handle| materials.as_mut().and_then(|assets| assets.get_mut(&handle.0))) {
-            let mut color=Color::LinearRgba(material.color);
-            next.image.apply(&mut color,brightness,alpha);
-            material.color=color.to_linear();
+        if let Some(mut material) = material.and_then(|handle| {
+            materials
+                .as_mut()
+                .and_then(|assets| assets.get_mut(&handle.0))
+        }) {
+            let mut color = Color::LinearRgba(material.color);
+            next.image.apply(&mut color, brightness, alpha);
+            material.color = color.to_linear();
         }
         if let Some(mut color) = background {
             next.background.apply(&mut color.0, brightness, alpha);
@@ -292,25 +300,41 @@ mod tests {
             .init_resource::<ScreenUiState>()
             .init_resource::<OverlayUiState>()
             .add_systems(Update, apply);
-        let material = app.world_mut().resource_mut::<Assets<UiQuadMaterial>>().add(UiQuadMaterial {
-            color: LinearRgba::WHITE,
-            uv_u: Vec4::X,
-            uv_v: Vec4::Y,
-            image: Handle::default(),
-            parameters: Vec4::ZERO,
-            clock: Vec4::ZERO,
-            texture1: Handle::default(),
-            texture2: Handle::default(),
-            texture3: Handle::default(),
-            shader: None,
-            blend: crate::ui::UiShaderBlend::Alpha,
-        });
-        let entity = app.world_mut().spawn((MaterialNode(material.clone()), super::super::ui_keyframes::Opacity(0.0))).id();
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<UiQuadMaterial>>()
+            .add(UiQuadMaterial {
+                color: LinearRgba::WHITE,
+                uv_u: Vec4::X,
+                uv_v: Vec4::Y,
+                image: Handle::default(),
+                parameters: Vec4::ZERO,
+                clock: Vec4::ZERO,
+                texture1: Handle::default(),
+                texture2: Handle::default(),
+                texture3: Handle::default(),
+                shader: None,
+                blend: crate::ui::UiShaderBlend::Alpha,
+            });
+        let entity = app
+            .world_mut()
+            .spawn((
+                MaterialNode(material.clone()),
+                super::super::ui_keyframes::Opacity(0.0),
+            ))
+            .id();
         for opacity in [0.0, 0.0, 0.25, 1.0, 1.0, 0.0, 1.0] {
-            app.world_mut().entity_mut(entity).get_mut::<super::super::ui_keyframes::Opacity>().expect("opacity track").0 = opacity;
+            app.world_mut()
+                .entity_mut(entity)
+                .get_mut::<super::super::ui_keyframes::Opacity>()
+                .expect("opacity track")
+                .0 = opacity;
             app.update();
             let assets = app.world().resource::<Assets<UiQuadMaterial>>();
-            assert_eq!(assets.get(&material).expect("material").color.alpha, opacity);
+            assert_eq!(
+                assets.get(&material).expect("material").color.alpha,
+                opacity
+            );
         }
     }
 

@@ -22,8 +22,12 @@ impl ViewClip {
     pub(super) fn valid(self) -> bool {
         match self {
             Self::Full => true,
-            Self::Left(x, angle) | Self::Right(x, angle) =>
-                x.is_finite() && (0.0..=100.0).contains(&x) && angle.is_finite() && angle.abs() < 90.0,
+            Self::Left(x, angle) | Self::Right(x, angle) => {
+                x.is_finite()
+                    && (0.0..=100.0).contains(&x)
+                    && angle.is_finite()
+                    && angle.abs() < 90.0
+            }
         }
     }
     pub(super) fn plane(self, canvas: Vec2) -> Option<Vec3> {
@@ -43,8 +47,12 @@ mod tests {
     #[test]
     fn opposing_masks_share_the_same_diagonal_without_stretching_uvs() {
         let canvas = Vec2::new(1600.0, 900.0);
-        let left = ViewClip::Left(25.0, 10.0).plane(canvas).expect("left plane");
-        let right = ViewClip::Right(25.0, 10.0).plane(canvas).expect("right plane");
+        let left = ViewClip::Left(25.0, 10.0)
+            .plane(canvas)
+            .expect("left plane");
+        let right = ViewClip::Right(25.0, 10.0)
+            .plane(canvas)
+            .expect("right plane");
         assert_eq!(left, -right);
         for y in [-450.0, 0.0, 450.0] {
             let x = -400.0 + y * 10.0_f32.to_radians().tan();

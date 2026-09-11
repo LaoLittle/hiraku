@@ -2,5 +2,5 @@
 
 pub mod camera;
 pub mod character_part;
-pub mod world_sprite;
 pub(crate) mod ui_quad;
+pub mod world_sprite;

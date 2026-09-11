@@ -513,7 +513,10 @@ pub fn animate_camera_transition(
         tweens.active = None;
     }
 
-    if shared.as_ref().is_some_and(|shared| shared.0.spatial_stage.is_some()) {
+    if shared
+        .as_ref()
+        .is_some_and(|shared| shared.0.spatial_stage.is_some())
+    {
         *applied_state = None;
         return;
     }

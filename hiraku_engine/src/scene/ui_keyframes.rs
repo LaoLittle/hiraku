@@ -108,7 +108,7 @@ pub(crate) fn tick(
                         uv_u: u,
                         uv_v: v,
                         image: image.image.clone(),
-                        blend: source.map_or(crate::ui::UiShaderBlend::Alpha, |s|s.blend),
+                        blend: source.map_or(crate::ui::UiShaderBlend::Alpha, |s| s.blend),
                         parameters: source
                             .map_or(Vec4::ZERO, |s| shader_parameters(&s.keys, track.elapsed)),
                         clock: Vec4::new(track.elapsed as f32, 0., 0., 0.),

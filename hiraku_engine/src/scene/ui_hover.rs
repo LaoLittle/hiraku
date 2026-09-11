@@ -97,7 +97,9 @@ pub fn animate_hover(
     }
     for (entity, mut motion, mut transform) in &mut motions {
         let delta = time.delta(entity);
-        if delta.is_zero() { continue; }
+        if delta.is_zero() {
+            continue;
+        }
         let root = find_component_ancestor(entity, &roots, &parents);
         let interactive = root.is_some_and(|root| screen.accepts_input(root, &overlays));
         let revision = models.revision();
@@ -120,7 +122,9 @@ pub fn animate_hover(
         let active = motion.selected || (interactive && hovered.contains(&entity));
         let old_position = motion.current;
         let position = motion.advance(active, delta.as_secs_f32());
-        if position != old_position || motion.current != motion.target { redraw.request(); }
+        if position != old_position || motion.current != motion.target {
+            redraw.request();
+        }
         let translation = Val2::px(position.x, position.y);
         if transform.translation != translation {
             transform.translation = translation;
@@ -153,7 +157,8 @@ mod tests {
             .init_resource::<OverlayUiState>()
             .init_resource::<HoverMap>()
             .add_systems(Update, animate_hover);
-        let mut redraws = bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
+        let mut redraws =
+            bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
         let root = app.world_mut().spawn(ScreenUiRoot).id();
         let group = app
             .world_mut()
@@ -181,9 +186,25 @@ mod tests {
             .or_default()
             .insert(button, HitData::new(root, 0.0, None, None));
         app.update();
-        assert_eq!(redraws.read(app.world().resource::<Messages<bevy::window::RequestRedraw>>()).count(), 1);
+        assert_eq!(
+            redraws
+                .read(
+                    app.world()
+                        .resource::<Messages<bevy::window::RequestRedraw>>()
+                )
+                .count(),
+            1
+        );
         app.update();
-        assert_eq!(redraws.read(app.world().resource::<Messages<bevy::window::RequestRedraw>>()).count(), 0);
+        assert_eq!(
+            redraws
+                .read(
+                    app.world()
+                        .resource::<Messages<bevy::window::RequestRedraw>>()
+                )
+                .count(),
+            0
+        );
         assert_eq!(
             app.world()
                 .get::<UiTransform>(group)

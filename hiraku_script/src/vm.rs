@@ -736,14 +736,16 @@ fn emit_function(
                     value,
                     string,
                     emit_value,
+                    ..
                 } => Instruction::Statement {
                     value: register(*value),
                     string: *string,
                     emit_value: *emit_value,
                 },
             };
-            if let MirInstruction::Panic { span, .. } | MirInstruction::Call { span, .. } =
-                instruction
+            if let MirInstruction::Panic { span, .. }
+            | MirInstruction::Call { span, .. }
+            | MirInstruction::Statement { span, .. } = instruction
             {
                 locations.insert(emitted.len(), *span);
             }
@@ -1826,6 +1828,32 @@ impl Vm {
             .collect()
     }
 
+    /// Borrow source positions without cloning registers, heap, or source text.
+    /// Includes suspended callers so hosts can inspect their continuations.
+    pub fn source_positions(&self) -> impl Iterator<Item = (&str, crate::Span)> {
+        std::iter::once((self.location, self.pc))
+            .chain(
+                self.call_stack
+                    .iter()
+                    .rev()
+                    .map(|frame| (frame.location, frame.pc)),
+            )
+            .filter_map(|(location, pc)| {
+                let source = self.bytecode.debug.source.as_ref()?;
+                let info = match location {
+                    CodeLocation::Entry => &self.bytecode.debug.entry,
+                    CodeLocation::Function(index) => {
+                        self.bytecode.debug.functions.get(index as usize)?
+                    }
+                    CodeLocation::Region(index) => {
+                        self.bytecode.debug.regions.get(index as usize)?
+                    }
+                };
+                let (_, span) = info.locations.range(..=pc.saturating_sub(1)).next_back()?;
+                Some((source.path.as_str(), *span))
+            })
+    }
+
     fn validate_function_arguments(&self) -> Result<(), VmError> {
         let (parameters, signature) = match self.location {
             CodeLocation::Entry => return Ok(()),
@@ -2165,21 +2193,37 @@ fn argument_matches(
     })
 }
 
-fn cast_value_with_heap(value: &Value, target: &crate::ScriptType, heap: &crate::objects::ObjectHeap) -> Result<Value, VmError> {
+fn cast_value_with_heap(
+    value: &Value,
+    target: &crate::ScriptType,
+    heap: &crate::objects::ObjectHeap,
+) -> Result<Value, VmError> {
     use crate::ScriptType as T;
     match (value, target) {
         (_, T::Any) => Ok(value.clone()),
-        (Value::List(values), T::List(element)) => values.iter()
+        (Value::List(values), T::List(element)) => values
+            .iter()
             .map(|value| cast_value_with_heap(value, element, heap))
-            .collect::<Result<Vec<_>, _>>().map(Value::List),
-        (Value::Tuple(values), T::TupleOf(types)) if values.len()==types.len() => values.iter().zip(types)
-            .map(|(value, ty)|cast_value_with_heap(value, ty, heap))
-            .collect::<Result<Vec<_>, _>>().map(Value::Tuple),
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        (Value::Tuple(values), T::TupleOf(types)) if values.len() == types.len() => values
+            .iter()
+            .zip(types)
+            .map(|(value, ty)| cast_value_with_heap(value, ty, heap))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Tuple),
         (Value::Null | Value::Optional(None), T::Optional(_)) => Ok(Value::Optional(None)),
-        (Value::Optional(Some(value)), T::Optional(inner)) => cast_value_with_heap(value,inner,heap).map(|v|Value::Optional(Some(Box::new(v)))),
-        (value, T::Optional(inner)) => cast_value_with_heap(value,inner,heap).map(|v|Value::Optional(Some(Box::new(v)))),
-        (Value::Object(_), _) => heap.export(value).and_then(|exported|cast_value(&exported,target)).map(|_|value.clone()),
-        _ => cast_value(value,target),
+        (Value::Optional(Some(value)), T::Optional(inner)) => {
+            cast_value_with_heap(value, inner, heap).map(|v| Value::Optional(Some(Box::new(v))))
+        }
+        (value, T::Optional(inner)) => {
+            cast_value_with_heap(value, inner, heap).map(|v| Value::Optional(Some(Box::new(v))))
+        }
+        (Value::Object(_), _) => heap
+            .export(value)
+            .and_then(|exported| cast_value(&exported, target))
+            .map(|_| value.clone()),
+        _ => cast_value(value, target),
     }
 }
 
@@ -3380,18 +3424,21 @@ mod tests {
 
     #[test]
     fn collection_cast_validates_nested_heap_objects_without_copying_identity() {
-        let mut heap=crate::objects::ObjectHeap::default();
-        let value=heap.import(Value::List(vec![Value::List(vec![Value::Map(BTreeMap::from([
-            ("name".into(),Value::String("alice".into()))
-        ]))]) ]));
-        let target=crate::ScriptType::List(Box::new(crate::ScriptType::List(Box::new(crate::ScriptType::Record(BTreeMap::from([
-            ("name".into(),crate::ScriptType::String)
-        ]))))));
-        assert_eq!(cast_value_with_heap(&value,&target,&heap).expect("nested cast"),value);
-        let bad=heap.import(Value::List(vec![Value::List(vec![Value::Map(BTreeMap::from([
-            ("name".into(),Value::Number(1.0))
-        ]))])]));
-        assert!(cast_value_with_heap(&bad,&target,&heap).is_err());
+        let mut heap = crate::objects::ObjectHeap::default();
+        let value = heap.import(Value::List(vec![Value::List(vec![Value::Map(
+            BTreeMap::from([("name".into(), Value::String("alice".into()))]),
+        )])]));
+        let target = crate::ScriptType::List(Box::new(crate::ScriptType::List(Box::new(
+            crate::ScriptType::Record(BTreeMap::from([("name".into(), crate::ScriptType::String)])),
+        ))));
+        assert_eq!(
+            cast_value_with_heap(&value, &target, &heap).expect("nested cast"),
+            value
+        );
+        let bad = heap.import(Value::List(vec![Value::List(vec![Value::Map(
+            BTreeMap::from([("name".into(), Value::Number(1.0))]),
+        )])]));
+        assert!(cast_value_with_heap(&bad, &target, &heap).is_err());
     }
 
     #[test]

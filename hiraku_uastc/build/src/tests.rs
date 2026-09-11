@@ -115,7 +115,7 @@ fn manifests_share_one_encoded_texture_and_unreferenced_images_are_excluded() {
         b".{ image: \"../alice.png\", regions: .{ face: (0, 0, 4, 4) } }",
     )
     .expect("alias manifest");
-    fs::write(root.join("startup.hks"), b"log(\"alice\")").expect("script");
+    fs::write(root.join("startup.hks"), b"bg(\"alice\")").expect("script");
     let output = temp.path().join("test.hdp");
     let mut events = Vec::new();
     let packed = pack_directory_with_progress(
@@ -123,7 +123,7 @@ fn manifests_share_one_encoded_texture_and_unreferenced_images_are_excluded() {
         &output,
         PackOptions {
             chunk_size: 64,
-            max_volume_size: Some(2048),
+            max_volume_size: Some(4096),
             ..Default::default()
         },
         |event| events.push(event),
@@ -143,7 +143,7 @@ fn manifests_share_one_encoded_texture_and_unreferenced_images_are_excluded() {
         .find(|event| event.phase == "texture-done")
         .expect("texture completion");
     assert_eq!((completed.completed, completed.total), (1, 1));
-    assert!(packed.volume_sizes.iter().all(|size| *size <= 2048));
+    assert!(packed.volume_sizes.iter().all(|size| *size <= 4096));
     let archive = Archive::open(&output).expect("open package");
     let names = archive.files().collect::<Vec<_>>();
     let encoded = names
@@ -151,10 +151,34 @@ fn manifests_share_one_encoded_texture_and_unreferenced_images_are_excluded() {
         .filter(|name| name.ends_with(".uastc.ktx2"))
         .collect::<Vec<_>>();
     assert_eq!(encoded.len(), 1);
+    let dependencies: hiraku_hdp::dependencies::DependencyManifest = hson::from_slice(
+        &archive
+            .read_file(hiraku_hdp::dependencies::DEPENDENCY_MANIFEST)
+            .expect("dependency manifest"),
+    )
+    .expect("dependency schema");
+    assert_eq!(
+        dependencies.scripts["startup.hks"],
+        std::collections::BTreeSet::from([(*encoded[0]).to_owned()])
+    );
+    assert_eq!(dependencies.image_bytes[*encoded[0]], 8 * 8 * 4);
+    assert!(
+        dependencies.windows["startup.hks"]
+            .nodes
+            .iter()
+            .any(|node| node.images.contains(*encoded[0]))
+    );
+    assert!(
+        dependencies
+            .windows
+            .values()
+            .flat_map(|g| &g.nodes)
+            .all(|node| node.images.iter().all(|path| path.ends_with(".uastc.ktx2")))
+    );
     assert!(!names.iter().any(|name| name.ends_with(".png")));
     assert_eq!(
         archive.read_file("startup.hks").expect("script retained"),
-        b"log(\"alice\")"
+        b"bg(\"alice\")"
     );
     for manifest in [
         "textures/alice.texture.hson",

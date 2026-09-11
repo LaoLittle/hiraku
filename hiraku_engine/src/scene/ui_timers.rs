@@ -35,12 +35,20 @@ impl UiClock<'_, '_> {
         }
         loop {
             if let Ok(deps) = self.image_dependencies.get(entity) {
-                if !self.images.as_ref().is_some_and(|assets| deps.0.iter().all(|h| assets.contains(h))) {
+                if !self
+                    .images
+                    .as_ref()
+                    .is_some_and(|assets| deps.0.iter().all(|h| assets.contains(h)))
+                {
                     return std::time::Duration::ZERO;
                 }
             }
             if let Ok(deps) = self.shader_dependencies.get(entity) {
-                if !self.shaders.as_ref().is_some_and(|assets| deps.0.iter().all(|h| assets.contains(h))) {
+                if !self
+                    .shaders
+                    .as_ref()
+                    .is_some_and(|assets| deps.0.iter().all(|h| assets.contains(h)))
+                {
                     return std::time::Duration::ZERO;
                 }
             }

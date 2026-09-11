@@ -169,7 +169,9 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
-        clip_plane: sprite.clip_plane.map_or(Vec4::ZERO, |plane| plane.extend(1.0)),
+        clip_plane: sprite
+            .clip_plane
+            .map_or(Vec4::ZERO, |plane| plane.extend(1.0)),
         slice_borders: sprite.slice.map(Vec4::from_array).unwrap_or(Vec4::ZERO),
         slice_size: sprite.slice.map_or(Vec4::ZERO, |_| {
             sprite

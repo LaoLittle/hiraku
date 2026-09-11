@@ -1855,7 +1855,8 @@ mod tests {
         ] {
             parse_program(source).expect("condition body remains a statement block");
         }
-        parse_program("button(\"label\") { clicked() }").expect("ordinary trailing closures still parse");
+        parse_program("button(\"label\") { clicked() }")
+            .expect("ordinary trailing closures still parse");
     }
 
     #[test]

@@ -68,7 +68,9 @@ pub fn update_curtains(
     canvas: Res<crate::HirakuCanvas>,
     mut curtains: Query<(Entity, &mut WorldSprite, &PendingCurtain)>,
 ) {
-    if !curtains.is_empty() { redraw.request(); }
+    if !curtains.is_empty() {
+        redraw.request();
+    }
     for (entity, mut sprite, pending) in &mut curtains {
         if let Some(mask) = &pending.mask {
             if !images.contains(mask.image.id()) {

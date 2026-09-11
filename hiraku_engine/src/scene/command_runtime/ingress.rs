@@ -15,13 +15,13 @@ fn replay_signature(kind: &str, value: &impl serde::Serialize) -> Option<String>
 
 fn observe_replay_boundary(runtime: &mut ScriptRuntimeState, event: &StoryRuntimeEvent) {
     let script = runtime.current_script.clone().unwrap_or_default();
-    let journal = runtime
-        .replay
-        .get_or_insert_with(|| {
-            use std::hash::{BuildHasher, Hasher};
-            let seed=std::collections::hash_map::RandomState::new().build_hasher().finish();
-            ReplayJournal::new(script.clone(), seed)
-        });
+    let journal = runtime.replay.get_or_insert_with(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        ReplayJournal::new(script.clone(), seed)
+    });
     use crate::script::capabilities::{StoryEffect, StoryWait};
     let signature = match event {
         StoryRuntimeEvent::Effect(StoryEffect::Say { speaker, text }) => {
@@ -41,7 +41,7 @@ fn observe_replay_boundary(runtime: &mut ScriptRuntimeState, event: &StoryRuntim
             enabled,
         } => replay_signature("choice", &(prompt, options, enabled)),
         StoryRuntimeEvent::OpenUi { path, arguments } => replay_signature("ui", &(path, arguments)),
-        StoryRuntimeEvent::RandomInt { min, max } => replay_signature("random", &(min,max)),
+        StoryRuntimeEvent::RandomInt { min, max } => replay_signature("random", &(min, max)),
         _ => None,
     };
     if journal.destination.is_none() {
@@ -280,7 +280,9 @@ pub fn drive_story_runtime(
         }
     }
 
-    if !crate::storage::storage_ready() || dependencies.loading { return; }
+    if !crate::storage::storage_ready() || dependencies.loading {
+        return;
+    }
 
     if let Some(request) = runtime.wait_request
         && let Some(response) = runtime.take_response(request)
@@ -436,7 +438,11 @@ pub fn drive_story_runtime(
                 }
             }
             StoryRuntimeEvent::Effect(
-                crate::script::capabilities::StoryEffect::MountUiOverlay { name, component, lifetime },
+                crate::script::capabilities::StoryEffect::MountUiOverlay {
+                    name,
+                    component,
+                    lifetime,
+                },
             ) => {
                 let target = runtime
                     .ui_registry
@@ -462,12 +468,19 @@ pub fn drive_story_runtime(
                         // Timed notifications are presentation-only, not
                         // persistent UI roles restored from a save.
                         if lifetime.is_none() {
-                            runtime.mounted_ui_overlays.insert(name.clone(), target.clone());
+                            runtime
+                                .mounted_ui_overlays
+                                .insert(name.clone(), target.clone());
                         } else {
                             runtime.mounted_ui_overlays.remove(&name);
                         }
-                        pending_script_commands
-                            .enqueue(ScriptCommand::Ui(UiCommand::ShowOverlay { name, screen, lifetime }));
+                        pending_script_commands.enqueue(ScriptCommand::Ui(
+                            UiCommand::ShowOverlay {
+                                name,
+                                screen,
+                                lifetime,
+                            },
+                        ));
                     }
                     Err(error) => crate::script::emit_script_diagnostic(
                         &format!("failed to mount UI overlay `{name}` from `{target}`"),
@@ -644,12 +657,15 @@ pub fn drive_story_runtime(
                 }
             }
             StoryRuntimeEvent::RandomInt { min, max } => {
-                let journal = runtime.replay.as_mut().expect("observed story event has a journal");
+                let journal = runtime
+                    .replay
+                    .as_mut()
+                    .expect("observed story event has a journal");
                 let value = journal.random_int(min, max);
-                if let Some(story)=runtime.story.as_mut() {
-                    if let Err(error)=story.resume(hiraku_script::Value::Number(value as f64)) {
+                if let Some(story) = runtime.story.as_mut() {
+                    if let Err(error) = story.resume(hiraku_script::Value::Number(value as f64)) {
                         warn!("failed to resume randomInt: {error}");
-                        runtime.story=None;
+                        runtime.story = None;
                     }
                 }
             }
@@ -676,7 +692,10 @@ pub fn drive_story_runtime(
                     &user_settings,
                     textures.as_deref(),
                     terms.as_deref(),
-                    models.roots().map(|(name, value)| (name.to_owned(), value.clone())).collect(),
+                    models
+                        .roots()
+                        .map(|(name, value)| (name.to_owned(), value.clone()))
+                        .collect(),
                     &arguments,
                 );
                 let request = runtime.allocate_request();
@@ -921,7 +940,10 @@ pub fn drive_story_runtime(
                     }
                     ScriptCommand::Stage(StageCommand::Spatial(command)) => {
                         ScriptCommand::Animation(AnimationCommand::Scene {
-                            effect: super::super::effect_wait::SceneEffect::Spatial(command.clone()), done: request,
+                            effect: super::super::effect_wait::SceneEffect::Spatial(
+                                command.clone(),
+                            ),
+                            done: request,
                         })
                     }
                     ScriptCommand::Character(CharacterCommand::Hide { actor_id, .. }) => {

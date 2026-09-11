@@ -6,6 +6,7 @@ pub mod dependencies;
 mod effect;
 mod glossary;
 pub mod input;
+pub mod memory;
 mod movie;
 mod proto;
 mod redraw;
@@ -14,18 +15,18 @@ mod scene;
 pub use scene::DialogueHistoryState;
 pub use scene::clock::SceneClock;
 mod script;
-mod state;
 pub mod stage;
+mod state;
 mod storage;
 pub use storage::{PreferenceChange, UserSettings};
+mod rich_text;
 mod texture;
 mod ui;
 mod vfs;
-mod rich_text;
 
 pub use script::{UiContext, UiIntent};
-pub use ui::UiModels;
 pub use state::StoredValue;
+pub use ui::UiModels;
 
 /// Type-check a standalone story source against the engine capability schema.
 /// This does not launch Bevy, access assets, or execute script/native functions.
@@ -34,7 +35,11 @@ pub fn validate_story_source(path: &str, source: &str) -> Result<(), String> {
 }
 
 /// Compile and link the project's story modules without starting the game.
-pub fn validate_story_project(root: &std::path::Path, settings: &str, entry: &str) -> Result<(), String> {
+pub fn validate_story_project(
+    root: &std::path::Path,
+    settings: &str,
+    entry: &str,
+) -> Result<(), String> {
     let vfs = vfs::HdpVfs::new_with_config(root, settings, entry);
     let source = vfs.read_text(entry).map_err(|error| error.to_string())?;
     script::compile_story_program(&vfs, entry, &source).map(|_| ())
@@ -110,9 +115,11 @@ pub fn validate_ui_document_with_arguments(
     let source = vfs.read_text(path).map_err(|error| error.to_string())?;
     let textures = texture::load_texture_catalog(&vfs).map_err(|error| error.to_string())?;
     let terms = glossary::load_term_catalog(&vfs).map_err(|error| error.to_string())?;
-    script::evaluate_ui_component_named_with_args(path, &source, context, &textures, &terms, arguments)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    script::evaluate_ui_component_named_with_args(
+        path, &source, context, &textures, &terms, arguments,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 use std::sync::Arc;
@@ -271,7 +278,8 @@ impl Plugin for HirakuPlugin {
 
         let archive_path = archive_path_from_config(app.world().resource::<RuntimeLaunchConfig>());
         let archive_store = app.world().resource::<HdpArchiveStore>().clone();
-        let archive_root = std::path::PathBuf::from(&app.world().resource::<RuntimeLaunchConfig>().asset_root);
+        let archive_root =
+            std::path::PathBuf::from(&app.world().resource::<RuntimeLaunchConfig>().asset_root);
 
         app.init_asset::<HdpArchive>()
             .init_asset::<BytesAsset>()
@@ -291,15 +299,25 @@ impl Plugin for HirakuPlugin {
             .add_systems(First, storage::poll_runtime_storage)
             .init_resource::<ScriptRuntimeState>()
             .init_resource::<dependencies::ScriptDependencies>()
+            .add_systems(PostUpdate, dependencies::update_resource_window)
+            .init_resource::<memory::MemoryDiagnostics>()
+            .add_systems(PostUpdate, memory::sample)
             .init_resource::<dependencies::LoadingScreen>()
             .add_systems(PostUpdate, dependencies::loading_screen)
             .add_systems(PostUpdate, scene::loading::sync)
             .init_resource::<UiModels>()
             .init_resource::<scene::PendingMovieWaits>()
             .init_resource::<scene::playback::FastForward>()
-            .add_systems(PreUpdate, scene::playback::update_fast_forward.in_set(HirakuRuntimeSystems))
-            .add_systems(Update, scene::playback::skip_voices
-                .after(scene::process_script_commands).in_set(HirakuRuntimeSystems))
+            .add_systems(
+                PreUpdate,
+                scene::playback::update_fast_forward.in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                scene::playback::skip_voices
+                    .after(scene::process_script_commands)
+                    .in_set(HirakuRuntimeSystems),
+            )
             .add_message::<ScriptResponseMessage>()
             .add_message::<scene::UiEffectMessage>()
             .register_asset_loader(HdpArchiveLoader::new(archive_store, archive_root))
@@ -317,7 +335,12 @@ impl Plugin for HirakuPlugin {
             .configure_sets(PreUpdate, HirakuRuntimeSystems.run_if(runtime_initialized))
             .configure_sets(Update, HirakuRuntimeSystems.run_if(runtime_initialized))
             .configure_sets(PostUpdate, HirakuRuntimeSystems.run_if(runtime_initialized))
-            .add_systems(Update, boot_runtime.run_if(runtime_initialized).run_if(storage::storage_ready))
+            .add_systems(
+                Update,
+                boot_runtime
+                    .run_if(runtime_initialized)
+                    .run_if(storage::storage_ready),
+            )
             .add_systems(
                 Update,
                 reconcile_restored_characters
@@ -332,9 +355,20 @@ impl Plugin for HirakuPlugin {
             )
             .add_message::<scene::widgets::UiCallbackRequest>()
             .init_resource::<Time<scene::clock::SceneClock>>()
-            .add_systems(PostUpdate, (scene::ui_visuals::tick, scene::ui_visuals::apply).chain().in_set(HirakuRuntimeSystems))
-            .add_systems(PreUpdate, scene::clock::advance.in_set(HirakuRuntimeSystems))
-            .add_systems(Update, scene::clock::pause_voices.in_set(HirakuRuntimeSystems))
+            .add_systems(
+                PostUpdate,
+                (scene::ui_visuals::tick, scene::ui_visuals::apply)
+                    .chain()
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                PreUpdate,
+                scene::clock::advance.in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
+                scene::clock::pause_voices.in_set(HirakuRuntimeSystems),
+            )
             .add_message::<input::HirakuTextInput>()
             .init_resource::<input::HirakuTextFocus>()
             .init_resource::<scene::save_preview::SavePreview>()
@@ -345,10 +379,13 @@ impl Plugin for HirakuPlugin {
                     .before(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
-            .add_systems(Update, scene::ui_timers::tick
-                .after(cleanup_stale_screen_ui)
-                .after(scene::recompose_screen_ui)
-                .in_set(HirakuRuntimeSystems))
+            .add_systems(
+                Update,
+                scene::ui_timers::tick
+                    .after(cleanup_stale_screen_ui)
+                    .after(scene::recompose_screen_ui)
+                    .in_set(HirakuRuntimeSystems),
+            )
             .add_systems(
                 Update,
                 (
@@ -440,13 +477,26 @@ impl Plugin for HirakuPlugin {
                     .before(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
-            .add_systems(PostUpdate, scene::fit_screen_text
-                .after(bevy::ui::widget::text_system)
-                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
-            .add_systems(PostUpdate, scene::expire_overlays.in_set(HirakuRuntimeSystems))
-            .add_systems(PostUpdate, (scene::rich_text::reveal_glyphs, scene::rich_text::position_ruby).chain()
-                .after(bevy::ui::widget::text_system)
-                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
+            .add_systems(
+                PostUpdate,
+                scene::fit_screen_text
+                    .after(bevy::ui::widget::text_system)
+                    .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+            )
+            .add_systems(
+                PostUpdate,
+                scene::expire_overlays.in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    scene::rich_text::reveal_glyphs,
+                    scene::rich_text::position_ruby,
+                )
+                    .chain()
+                    .after(bevy::ui::widget::text_system)
+                    .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+            )
             .add_systems(
                 Update,
                 handle_choice_buttons

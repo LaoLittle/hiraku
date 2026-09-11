@@ -161,6 +161,8 @@ pub struct CurtainSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveGameData {
     #[serde(default)]
+    pub dialogue_history: Vec<DialogueSnapshot>,
+    #[serde(default)]
     pub replay: Option<crate::script::replay::ReplayJournal>,
     #[serde(default)]
     pub thumbnail_png: Vec<u8>,
@@ -208,6 +210,7 @@ fn default_save_version() -> u32 {
 impl Default for SaveGameData {
     fn default() -> Self {
         Self {
+            dialogue_history: Vec::new(),
             thumbnail_png: Vec::new(),
             version: CURRENT_SAVE_VERSION,
             replay: None,

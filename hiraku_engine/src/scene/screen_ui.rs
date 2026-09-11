@@ -38,16 +38,31 @@ pub(crate) struct FitText {
 }
 
 fn fitted_font_size(current: f32, maximum: f32, available: f32, measured: f32) -> f32 {
-    if available <= 0.0 || measured <= 0.0 { return current; }
+    if available <= 0.0 || measured <= 0.0 {
+        return current;
+    }
     (current * available / measured).min(maximum).max(0.1)
 }
 
 /// Uses shaped glyph bounds, not character counts (which break proportional
 /// fonts and localized text). Bevy stores text bounds in logical pixels;
 /// convert the physical UI node width before comparing, including on HiDPI.
-pub(crate) fn fit_screen_text(mut redraw: crate::redraw::Redraw, mut texts: Query<(&mut FitText, &Text, &ComputedNode, &bevy::text::TextLayoutInfo, &mut TextFont, &mut Visibility, &mut Node)>) {
+pub(crate) fn fit_screen_text(
+    mut redraw: crate::redraw::Redraw,
+    mut texts: Query<(
+        &mut FitText,
+        &Text,
+        &ComputedNode,
+        &bevy::text::TextLayoutInfo,
+        &mut TextFont,
+        &mut Visibility,
+        &mut Node,
+    )>,
+) {
     for (mut fit, text, node, measured, mut font, mut visibility, mut layout) in &mut texts {
-        let bevy::text::FontSize::Px(current) = font.font_size else { continue };
+        let bevy::text::FontSize::Px(current) = font.font_size else {
+            continue;
+        };
         if node.size().x <= 0.0 || measured.size.x <= 0.0 {
             visibility.set_if_neq(Visibility::Hidden);
             continue;
@@ -69,7 +84,9 @@ pub(crate) fn fit_screen_text(mut redraw: crate::redraw::Redraw, mut texts: Quer
         // to fill a subpixel gap: that can oscillate across adjacent sizes.
         let next = if measured.size.x > width {
             fitted_font_size(current, fit.maximum, width, measured.size.x)
-        } else { current };
+        } else {
+            current
+        };
         if (next - current).abs() > 0.05 {
             visibility.set_if_neq(Visibility::Hidden);
             font.font_size = next.into();
@@ -157,9 +174,14 @@ pub fn cleanup_stale_screen_ui(
     let depth_offset = screen_state.stack.len() as i32 * 3;
     if let Some(mut pending) = screen_state.pending_root.take() {
         let ready = screen_images_ready(&images, &pending.wait_images)
-            && shader_dependencies.get(pending.entity).map_or(true, |deps| shaders.as_ref().is_some_and(|assets| deps.0.iter().all(|h|assets.contains(h))));
-        if ready && pending.ready_frames_remaining == 0
-        {
+            && shader_dependencies
+                .get(pending.entity)
+                .map_or(true, |deps| {
+                    shaders
+                        .as_ref()
+                        .is_some_and(|assets| deps.0.iter().all(|h| assets.contains(h)))
+                });
+        if ready && pending.ready_frames_remaining == 0 {
             commands.entity(pending.entity).insert((
                 Visibility::Inherited,
                 GlobalZIndex(SCREEN_MODAL_ACTIVE_Z + depth_offset),
@@ -299,11 +321,17 @@ pub fn recompose_screen_ui(
             commands.entity(child).try_despawn();
         }
         commands.entity(root).add_children(&next);
-        commands.entity(root).insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
-        commands.entity(root).insert(super::clock::ScenePausePolicy(screen.pauses_scene));
         commands
             .entity(root)
-            .insert((screen_root_node(&screen), screen_root_background(&screen), AllowedOverlays(screen.allowed_overlays.clone())));
+            .insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
+        commands
+            .entity(root)
+            .insert(super::clock::ScenePausePolicy(screen.pauses_scene));
+        commands.entity(root).insert((
+            screen_root_node(&screen),
+            screen_root_background(&screen),
+            AllowedOverlays(screen.allowed_overlays.clone()),
+        ));
     }
 }
 
@@ -322,14 +350,26 @@ pub(crate) fn sync_allowed_overlays(
     let mut allowed = Vec::new();
     for (name, &root) in &overlays.roots {
         let admitted = policy.is_some_and(|policy| policy.0.contains(name));
-        if admitted { allowed.push(root); }
+        if admitted {
+            allowed.push(root);
+        }
         if let Ok(mut layer) = layers.get_mut(root) {
-            let z = if admitted { SCREEN_MODAL_ACTIVE_Z + state.stack.len() as i32 * 3 + 1 } else { SCREEN_ACTIVE_Z + 10 };
-            if layer.0 != z { layer.0 = z; }
+            let z = if admitted {
+                SCREEN_MODAL_ACTIVE_Z + state.stack.len() as i32 * 3 + 1
+            } else {
+                SCREEN_ACTIVE_Z + 10
+            };
+            if layer.0 != z {
+                layer.0 = z;
+            }
         }
     }
-    if state.allowed_overlay_roots != allowed { state.allowed_overlay_roots = allowed; }
-    if state.allowed_overlay_owner != state.active_root { state.allowed_overlay_owner = state.active_root; }
+    if state.allowed_overlay_roots != allowed {
+        state.allowed_overlay_roots = allowed;
+    }
+    if state.allowed_overlay_owner != state.active_root {
+        state.allowed_overlay_owner = state.active_root;
+    }
 }
 
 pub(super) fn spawn_screen_ui(
@@ -361,11 +401,22 @@ pub(super) fn spawn_screen_ui(
         .id();
 
     let mut image_handles = Vec::new();
-    commands.entity(root).insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
-    commands.entity(root).insert(super::clock::ScenePausePolicy(screen.pauses_scene));
-    if screen.fade_seconds > 0.0 { commands.entity(root).insert(super::ui_visuals::ScreenFade::new(screen.fade_seconds)); }
+    commands
+        .entity(root)
+        .insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
+    commands
+        .entity(root)
+        .insert(super::clock::ScenePausePolicy(screen.pauses_scene));
+    if screen.fade_seconds > 0.0 {
+        commands
+            .entity(root)
+            .insert(super::ui_visuals::ScreenFade::new(screen.fade_seconds));
+    }
     if !screen.timers.is_empty() {
-        commands.entity(root).insert((super::ui_timers::UiTimers::new(&screen.timers), super::ui_timers::UiTimersPaused(screen.timers_paused)));
+        commands.entity(root).insert((
+            super::ui_timers::UiTimers::new(&screen.timers),
+            super::ui_timers::UiTimersPaused(screen.timers_paused),
+        ));
     }
     if let Some(renderer) = &screen.composition {
         commands.entity(root).insert((
@@ -388,7 +439,9 @@ pub(super) fn spawn_screen_ui(
     commands.entity(root).add_children(&children);
 
     if !screen.timers.is_empty() {
-        commands.entity(root).insert(crate::render::ui_quad::UiImageAssets(image_handles.clone()));
+        commands
+            .entity(root)
+            .insert(crate::render::ui_quad::UiImageAssets(image_handles.clone()));
     }
 
     SpawnedScreenUi {
@@ -634,26 +687,51 @@ fn spawn_screen_node_entity(
             // can hide during fitting without overriding .visible(...) or
             // removing its box from Bevy layout.
             let fit_wrapper = layout.text_fit.then(|| {
-                commands.spawn((ScreenUiNode, Pickable::IGNORE, node.clone())).id()
+                commands
+                    .spawn((ScreenUiNode, Pickable::IGNORE, node.clone()))
+                    .id()
             });
             if fit_wrapper.is_some() {
-                node = Node { position_type: PositionType::Absolute, left: px(0), width: percent(100), height: percent(100), min_width: px(0), flex_shrink: 0.0, ..default() };
+                node = Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    width: percent(100),
+                    height: percent(100),
+                    min_width: px(0),
+                    flex_shrink: 0.0,
+                    ..default()
+                };
             }
             let entity = commands
                 .spawn((
                     ScreenUiNode,
                     Pickable::IGNORE,
                     node,
-                    Text::new(if layout.rich_text { String::new() } else { text.clone() }),
+                    Text::new(if layout.rich_text {
+                        String::new()
+                    } else {
+                        text.clone()
+                    }),
                     ui_text_font(ui_fonts, *size),
                     TextLayout::new(
                         justify_text_from_align(align.unwrap_or(0.0)),
-                        if layout.text_fit { LineBreak::NoWrap } else if layout.rich_text { LineBreak::WordBoundary } else { LineBreak::AnyCharacter },
+                        if layout.text_fit {
+                            LineBreak::NoWrap
+                        } else if layout.rich_text {
+                            LineBreak::WordBoundary
+                        } else {
+                            LineBreak::AnyCharacter
+                        },
                     ),
                     TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
                     if layout.text_shadow == Some(false) {
-                        TextShadow { offset: Vec2::ZERO, color: Color::NONE }
-                    } else { default_text_outline() },
+                        TextShadow {
+                            offset: Vec2::ZERO,
+                            color: Color::NONE,
+                        }
+                    } else {
+                        default_text_outline()
+                    },
                 ))
                 .id();
             if layout.rich_text {
@@ -664,7 +742,14 @@ fn spawn_screen_node_entity(
                 ));
             }
             if layout.text_fit {
-                commands.entity(entity).insert((FitText { maximum: *size, align: align.unwrap_or(0.0).clamp(0.0, 1.0), ..default() }, Visibility::Hidden));
+                commands.entity(entity).insert((
+                    FitText {
+                        maximum: *size,
+                        align: align.unwrap_or(0.0).clamp(0.0, 1.0),
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                ));
             }
             if let Some(template) = binding {
                 commands.entity(entity).insert(UiTextBinding {
@@ -681,7 +766,9 @@ fn spawn_screen_node_entity(
             let layout_entity = if let Some(wrapper) = fit_wrapper {
                 commands.entity(wrapper).add_child(entity);
                 wrapper
-            } else { entity };
+            } else {
+                entity
+            };
             apply_live_layout_bindings(commands, layout_entity, layout);
             layout_entity
         }
@@ -792,10 +879,18 @@ fn spawn_screen_node_entity(
                     Text::new(text.clone()),
                     ui_text_font(ui_fonts, *size),
                     TextColor(initial_text_color),
-                    TextLayout { justify: justify_text_from_align(align.unwrap_or(0.5)), ..default() },
+                    TextLayout {
+                        justify: justify_text_from_align(align.unwrap_or(0.5)),
+                        ..default()
+                    },
                     if layout.text_shadow == Some(false) {
-                        TextShadow { offset: Vec2::ZERO, color: Color::NONE }
-                    } else { default_text_outline() },
+                        TextShadow {
+                            offset: Vec2::ZERO,
+                            color: Color::NONE,
+                        }
+                    } else {
+                        default_text_outline()
+                    },
                 ))
                 .id();
             let button = commands
@@ -894,23 +989,34 @@ fn spawn_screen_node_entity(
                 .spawn((ScreenUiNode, Pickable::IGNORE, image, node))
                 .id();
             apply_live_layout_bindings(commands, entity, layout);
-            if let Some(shader)=&layout.shader {
+            if let Some(shader) = &layout.shader {
                 let handle: Handle<Shader> = asset_server.load(shader.path.clone());
                 let dependency = handle.clone();
                 commands.queue(move |world: &mut World| {
                     if let Ok(mut root) = world.get_entity_mut(root) {
-                        if let Some(mut deps) = root.get_mut::<crate::render::ui_quad::UiShaderAssets>() {
+                        if let Some(mut deps) =
+                            root.get_mut::<crate::render::ui_quad::UiShaderAssets>()
+                        {
                             deps.0.push(dependency);
                         } else {
                             root.insert(crate::render::ui_quad::UiShaderAssets(vec![dependency]));
                         }
                     }
                 });
-                let textures:Vec<_>=shader.textures.iter().map(|path| super::save_preview::load_image(asset_server,path)).collect();
+                let textures: Vec<_> = shader
+                    .textures
+                    .iter()
+                    .map(|path| super::save_preview::load_image(asset_server, path))
+                    .collect();
                 image_handles.extend(textures.iter().cloned());
-                commands.entity(entity).insert(crate::render::ui_quad::UiShaderSource {
-                    shader:handle,textures,keys:shader.keys.clone(),blend:shader.blend,
-                });
+                commands
+                    .entity(entity)
+                    .insert(crate::render::ui_quad::UiShaderSource {
+                        shader: handle,
+                        textures,
+                        keys: shader.keys.clone(),
+                        blend: shader.blend,
+                    });
             }
             entity
         }
@@ -1327,8 +1433,15 @@ pub(super) fn apply_live_layout_bindings(
     entity: Entity,
     layout: &ScreenLayout,
 ) {
-    if let Some(factor) = layout.hover_brightness { commands.entity(entity).insert(super::ui_visuals::HoverBrightness(factor)); }
-    commands.entity(entity).insert(UiTransform { rotation: Rot2::degrees(layout.rotation), ..default() });
+    if let Some(factor) = layout.hover_brightness {
+        commands
+            .entity(entity)
+            .insert(super::ui_visuals::HoverBrightness(factor));
+    }
+    commands.entity(entity).insert(UiTransform {
+        rotation: Rot2::degrees(layout.rotation),
+        ..default()
+    });
     commands.entity(entity).insert(if layout.hidden {
         Visibility::Hidden
     } else {
@@ -1347,7 +1460,10 @@ pub(super) fn apply_live_layout_bindings(
         });
     }
     if !layout.keyframes.is_empty() {
-        commands.entity(entity).insert((super::ui_keyframes::UiKeyframes::new(&layout.keyframes), super::ui_keyframes::Opacity(0.0)));
+        commands.entity(entity).insert((
+            super::ui_keyframes::UiKeyframes::new(&layout.keyframes),
+            super::ui_keyframes::Opacity(0.0),
+        ));
     }
     if layout.hover_offset.is_some() {
         let motion = super::ui_hover::HoverMotion::new(layout);
@@ -1385,7 +1501,9 @@ pub fn animate_screen_ui(
 ) {
     for (entity, mut player, mut transform) in &mut players {
         let delta = time.delta(entity);
-        if delta.is_zero() { continue; }
+        if delta.is_zero() {
+            continue;
+        }
         redraw.request();
         player.elapsed += delta.as_secs_f32();
         let duration = player.spec.duration().max(f32::EPSILON);
@@ -1440,7 +1558,11 @@ fn image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
 // Interactive images obey the same fit policy as non-interactive images.
 // Bevy Auto contains the source inside the node while preserving its aspect
 // ratio; the full node remains the button's hit area, including letterboxing.
-fn screen_image_node(image: Handle<Image>, rect: Option<[f32; 4]>, layout: &ScreenLayout) -> ImageNode {
+fn screen_image_node(
+    image: Handle<Image>,
+    rect: Option<[f32; 4]>,
+    layout: &ScreenLayout,
+) -> ImageNode {
     if layout.image_stretch {
         stretched_image_node(image, rect)
     } else {
@@ -1534,7 +1656,9 @@ pub fn handle_screen_buttons(
             continue;
         }
 
-        if !button.enabled && !(button.hovered_when_disabled && *interaction == PickingInteraction::Hovered) {
+        if !button.enabled
+            && !(button.hovered_when_disabled && *interaction == PickingInteraction::Hovered)
+        {
             transform.scale = Vec2::ONE;
             *color = button.insensitive_background.into();
             if let Ok(mut text_color) = text_query.get_mut(button.text_entity) {
@@ -1854,7 +1978,14 @@ pub fn update_builtin_ui_models(
     mut last_second: Local<Option<u64>>,
 ) {
     let elapsed = time.elapsed_secs_f64().floor().max(0.0) as u64;
-    if compositions.iter().any(|composition| composition.renderer.document.plan.read_globals.contains("time")) {
+    if compositions.iter().any(|composition| {
+        composition
+            .renderer
+            .document
+            .plan
+            .read_globals
+            .contains("time")
+    }) {
         redraw.request();
     }
     if *last_second != Some(elapsed) {
@@ -1894,7 +2025,12 @@ pub fn update_builtin_ui_models(
             ),
             ("text".to_string(), StoredValue::String(text.to_string())),
             ("visible".to_string(), StoredValue::Bool(dialogue.is_some())),
-            ("fastForwardEnabled".to_string(), StoredValue::Bool(dialogue_state.fast_forward_enabled || dialogue_state.fast_forward_held)),
+            (
+                "fastForwardEnabled".to_string(),
+                StoredValue::Bool(
+                    dialogue_state.fast_forward_enabled || dialogue_state.fast_forward_held,
+                ),
+            ),
             (
                 "autoEnabled".to_string(),
                 StoredValue::Bool(dialogue_state.auto_enabled),
@@ -1951,7 +2087,11 @@ pub fn update_builtin_ui_models(
 
 pub fn update_ui_text_bindings(
     models: Res<UiModels>,
-    mut text_bindings: Query<(&mut UiTextBinding, &mut Text, Option<&mut super::rich_text::RichTextSource>)>,
+    mut text_bindings: Query<(
+        &mut UiTextBinding,
+        &mut Text,
+        Option<&mut super::rich_text::RichTextSource>,
+    )>,
     mut visibility_bindings: Query<(&mut UiVisibilityBinding, &mut Visibility)>,
     mut button_bindings: Query<
         (
@@ -1975,7 +2115,9 @@ pub fn update_ui_text_bindings(
         }
         let rendered = expand_model_template(&binding.template, &models);
         if let Some(mut rich) = rich {
-            if rich.source != rendered { rich.source = rendered; }
+            if rich.source != rendered {
+                rich.source = rendered;
+            }
         } else if text.0 != rendered {
             text.0 = rendered;
         }
@@ -2043,7 +2185,12 @@ pub fn update_ui_reactive_bindings(
     models: Res<UiModels>,
     parents: Query<&ChildOf>,
     local_states: Query<&super::widgets::UiLocalState>,
-    mut text_bindings: Query<(Entity, &mut UiReactiveTextBinding, &mut Text, Option<&mut super::rich_text::RichTextSource>)>,
+    mut text_bindings: Query<(
+        Entity,
+        &mut UiReactiveTextBinding,
+        &mut Text,
+        Option<&mut super::rich_text::RichTextSource>,
+    )>,
     mut visibility_bindings: Query<(Entity, &mut UiReactiveVisibilityBinding, &mut Visibility)>,
     mut button_bindings: Query<
         (
@@ -2075,8 +2222,12 @@ pub fn update_ui_reactive_bindings(
         match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
             Ok(hiraku_script::Value::String(value)) => {
                 if let Some(mut rich) = rich {
-                    if rich.source != value { rich.source = value; }
-                } else if text.0 != value { text.0 = value; }
+                    if rich.source != value {
+                        rich.source = value;
+                    }
+                } else if text.0 != value {
+                    text.0 = value;
+                }
             }
             Ok(value) => warn!("reactive UI text returned {value:?}, expected String"),
             Err(error) => {
@@ -2241,24 +2392,58 @@ mod tests {
     fn admitted_overlay_retains_entity_and_nested_modal_revokes_access() {
         use super::*;
         let mut app = App::new();
-        app.init_resource::<ScreenUiState>().init_resource::<OverlayUiState>()
+        app.init_resource::<ScreenUiState>()
+            .init_resource::<OverlayUiState>()
             .add_systems(Update, sync_allowed_overlays);
-        let overlay = app.world_mut().spawn(GlobalZIndex(SCREEN_ACTIVE_Z + 10)).id();
-        let screen = app.world_mut().spawn(AllowedOverlays(vec!["tools".into()])).id();
+        let overlay = app
+            .world_mut()
+            .spawn(GlobalZIndex(SCREEN_ACTIVE_Z + 10))
+            .id();
+        let screen = app
+            .world_mut()
+            .spawn(AllowedOverlays(vec!["tools".into()]))
+            .id();
         let nested = app.world_mut().spawn(AllowedOverlays(Vec::new())).id();
-        app.world_mut().resource_mut::<OverlayUiState>().roots.insert("tools".into(), overlay);
+        app.world_mut()
+            .resource_mut::<OverlayUiState>()
+            .roots
+            .insert("tools".into(), overlay);
         app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(screen);
         app.update();
-        assert!(app.world().resource::<ScreenUiState>().accepts_input(overlay, app.world().resource::<OverlayUiState>()));
-        assert!(app.world().get::<GlobalZIndex>(overlay).expect("overlay layer").0 > SCREEN_MODAL_ACTIVE_Z);
+        assert!(
+            app.world()
+                .resource::<ScreenUiState>()
+                .accepts_input(overlay, app.world().resource::<OverlayUiState>())
+        );
+        assert!(
+            app.world()
+                .get::<GlobalZIndex>(overlay)
+                .expect("overlay layer")
+                .0
+                > SCREEN_MODAL_ACTIVE_Z
+        );
         app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(nested);
         // Even before synchronization, stale permission cannot leak into a new modal.
-        assert!(!app.world().resource::<ScreenUiState>().accepts_input(overlay, app.world().resource::<OverlayUiState>()));
+        assert!(
+            !app.world()
+                .resource::<ScreenUiState>()
+                .accepts_input(overlay, app.world().resource::<OverlayUiState>())
+        );
         app.update();
-        assert_eq!(app.world().get::<GlobalZIndex>(overlay).expect("retained overlay").0, SCREEN_ACTIVE_Z + 10);
+        assert_eq!(
+            app.world()
+                .get::<GlobalZIndex>(overlay)
+                .expect("retained overlay")
+                .0,
+            SCREEN_ACTIVE_Z + 10
+        );
         app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(screen);
         app.update();
-        assert!(app.world().resource::<ScreenUiState>().accepts_input(overlay, app.world().resource::<OverlayUiState>()));
+        assert!(
+            app.world()
+                .resource::<ScreenUiState>()
+                .accepts_input(overlay, app.world().resource::<OverlayUiState>())
+        );
     }
     #[test]
     fn unchanged_history_does_not_overwrite_or_rebuild_its_model() {
@@ -2272,32 +2457,73 @@ mod tests {
         app.update();
         // A sentinel detects a rebuild, even when UiModels::set would normally
         // hide redundant construction by comparing the full value for equality.
-        app.world_mut().resource_mut::<UiModels>().set("history", StoredValue::String("sentinel".into()));
-        for _ in 0..20 { app.update(); }
-        assert_eq!(app.world().resource::<UiModels>().get("history"), Some(&StoredValue::String("sentinel".into())));
-        app.world_mut().resource_mut::<DialogueHistoryState>().push(DialogueSnapshot { speaker: "alice".into(), text: "Hello".into() });
+        app.world_mut()
+            .resource_mut::<UiModels>()
+            .set("history", StoredValue::String("sentinel".into()));
+        for _ in 0..20 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<UiModels>().get("history"),
+            Some(&StoredValue::String("sentinel".into()))
+        );
+        app.world_mut()
+            .resource_mut::<DialogueHistoryState>()
+            .push(DialogueSnapshot {
+                speaker: "alice".into(),
+                text: "Hello".into(),
+            });
         app.update();
-        assert_eq!(app.world().resource::<UiModels>().get("history.text"), Some(&StoredValue::String("alice\nHello".into())));
+        assert_eq!(
+            app.world().resource::<UiModels>().get("history.text"),
+            Some(&StoredValue::String("alice\nHello".into()))
+        );
     }
 
     #[test]
     fn fitted_title_centers_shaped_line_inside_its_box() {
         let mut app = App::new();
         app.add_systems(Update, fit_screen_text);
-        let entity = app.world_mut().spawn((
-            FitText { maximum: 75.0, align: 0.5, ..default() },
-            Node { left: px(0), ..default() },
-            Text::new("Alice"),
-            ComputedNode { size: Vec2::new(1000.0, 200.0), inverse_scale_factor: 0.5, ..default() },
-            bevy::text::TextLayoutInfo { size: Vec2::new(200.0, 75.0), ..default() },
-            TextFont::from_font_size(75.0),
-            Visibility::Hidden,
-        )).id();
+        let entity = app
+            .world_mut()
+            .spawn((
+                FitText {
+                    maximum: 75.0,
+                    align: 0.5,
+                    ..default()
+                },
+                Node {
+                    left: px(0),
+                    ..default()
+                },
+                Text::new("Alice"),
+                ComputedNode {
+                    size: Vec2::new(1000.0, 200.0),
+                    inverse_scale_factor: 0.5,
+                    ..default()
+                },
+                bevy::text::TextLayoutInfo {
+                    size: Vec2::new(200.0, 75.0),
+                    ..default()
+                },
+                TextFont::from_font_size(75.0),
+                Visibility::Hidden,
+            ))
+            .id();
         app.update();
-        assert_eq!(app.world().get::<Node>(entity).expect("layout").left, px(150));
-        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Hidden);
+        assert_eq!(
+            app.world().get::<Node>(entity).expect("layout").left,
+            px(150)
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Hidden
+        );
         app.update();
-        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Inherited
+        );
     }
 
     #[test]
@@ -2306,15 +2532,23 @@ mod tests {
         app.insert_resource(Time::<()>::default())
             .init_resource::<OverlayUiState>()
             .add_systems(Update, expire_overlays);
-        let expired = app.world_mut().spawn(OverlayLifetime(Timer::from_seconds(1.0, TimerMode::Once))).id();
+        let expired = app
+            .world_mut()
+            .spawn(OverlayLifetime(Timer::from_seconds(1.0, TimerMode::Once)))
+            .id();
         let replacement = app.world_mut().spawn_empty().id();
-        let other = app.world_mut().spawn(OverlayLifetime(Timer::from_seconds(1.0, TimerMode::Once))).id();
+        let other = app
+            .world_mut()
+            .spawn(OverlayLifetime(Timer::from_seconds(1.0, TimerMode::Once)))
+            .id();
         {
             let mut overlays = app.world_mut().resource_mut::<OverlayUiState>();
             overlays.roots.insert("notification".into(), replacement);
             overlays.roots.insert("other".into(), other);
         }
-        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs(2));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(2));
         app.update();
         assert!(app.world().get_entity(expired).is_err());
         assert!(app.world().get_entity(other).is_err());
@@ -2329,10 +2563,16 @@ mod tests {
         app.init_resource::<OverlayUiState>();
         let callback = app.world_mut().spawn_empty().id();
         let root = app.world_mut().spawn_empty().add_child(callback).id();
-        app.world_mut().resource_mut::<OverlayUiState>().roots.insert("optionalPanel".into(), root);
-        app.add_systems(Update, |mut commands: Commands, mut overlays: ResMut<OverlayUiState>| {
-            clear_overlay_ui(&mut commands, &mut overlays);
-        });
+        app.world_mut()
+            .resource_mut::<OverlayUiState>()
+            .roots
+            .insert("optionalPanel".into(), root);
+        app.add_systems(
+            Update,
+            |mut commands: Commands, mut overlays: ResMut<OverlayUiState>| {
+                clear_overlay_ui(&mut commands, &mut overlays);
+            },
+        );
         app.update();
         assert!(app.world().resource::<OverlayUiState>().roots.is_empty());
         assert!(app.world().get_entity(root).is_err());
@@ -2343,36 +2583,101 @@ mod tests {
     fn single_line_fit_accounts_for_ui_scale() {
         let mut app = App::new();
         app.add_systems(Update, fit_screen_text);
-        let entity = app.world_mut().spawn((
-            FitText { maximum: 75.0, ..default() },
-            Node { left: px(0), ..default() },
-            Text::new("Alice"),
-            ComputedNode { size: Vec2::new(1000.0, 200.0), inverse_scale_factor: 0.5, ..default() },
-            bevy::text::TextLayoutInfo { size: Vec2::new(750.0, 75.0), ..default() },
-            TextFont::from_font_size(75.0),
-            Visibility::Hidden,
-        )).id();
+        let entity = app
+            .world_mut()
+            .spawn((
+                FitText {
+                    maximum: 75.0,
+                    ..default()
+                },
+                Node {
+                    left: px(0),
+                    ..default()
+                },
+                Text::new("Alice"),
+                ComputedNode {
+                    size: Vec2::new(1000.0, 200.0),
+                    inverse_scale_factor: 0.5,
+                    ..default()
+                },
+                bevy::text::TextLayoutInfo {
+                    size: Vec2::new(750.0, 75.0),
+                    ..default()
+                },
+                TextFont::from_font_size(75.0),
+                Visibility::Hidden,
+            ))
+            .id();
         app.update();
-        assert_eq!(app.world().get::<TextFont>(entity).expect("text font").font_size, bevy::text::FontSize::Px(50.0));
-        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Hidden);
+        assert_eq!(
+            app.world()
+                .get::<TextFont>(entity)
+                .expect("text font")
+                .font_size,
+            bevy::text::FontSize::Px(50.0)
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Hidden
+        );
         // Simulate Bevy's next text layout using the fitted font.
-        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 500.0;
+        app.world_mut()
+            .get_mut::<bevy::text::TextLayoutInfo>(entity)
+            .expect("layout")
+            .size
+            .x = 500.0;
         app.update();
-        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
-        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 499.0;
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Inherited
+        );
+        app.world_mut()
+            .get_mut::<bevy::text::TextLayoutInfo>(entity)
+            .expect("layout")
+            .size
+            .x = 499.0;
         app.update();
-        assert_eq!(app.world().get::<TextFont>(entity).expect("text font").font_size, bevy::text::FontSize::Px(50.0));
-        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
+        assert_eq!(
+            app.world()
+                .get::<TextFont>(entity)
+                .expect("text font")
+                .font_size,
+            bevy::text::FontSize::Px(50.0)
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Inherited
+        );
         // Replacing the text with a shorter label restores the maximum font
         // off-screen instead of briefly displaying an undersized label.
         app.world_mut().get_mut::<Text>(entity).expect("text").0 = "Bob".into();
-        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 250.0;
+        app.world_mut()
+            .get_mut::<bevy::text::TextLayoutInfo>(entity)
+            .expect("layout")
+            .size
+            .x = 250.0;
         app.update();
-        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Hidden);
-        assert_eq!(app.world().get::<TextFont>(entity).expect("text font").font_size, bevy::text::FontSize::Px(75.0));
-        app.world_mut().get_mut::<bevy::text::TextLayoutInfo>(entity).expect("layout").size.x = 375.0;
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Hidden
+        );
+        assert_eq!(
+            app.world()
+                .get::<TextFont>(entity)
+                .expect("text font")
+                .font_size,
+            bevy::text::FontSize::Px(75.0)
+        );
+        app.world_mut()
+            .get_mut::<bevy::text::TextLayoutInfo>(entity)
+            .expect("layout")
+            .size
+            .x = 375.0;
         app.update();
-        assert_eq!(*app.world().get::<Visibility>(entity).expect("visibility"), Visibility::Inherited);
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Inherited
+        );
     }
     #[test]
     fn single_line_fit_shrinks_and_restores_without_exceeding_authored_size() {
@@ -2488,33 +2793,64 @@ mod tests {
         use bevy::app::{HierarchyPropagatePlugin, PropagateSet};
         use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiSystems};
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, AssetPlugin::default(), bevy::text::TextPlugin));
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::text::TextPlugin,
+        ));
         app.init_resource::<bevy::ui::UiScale>()
             .init_resource::<bevy::ui::ui_surface::UiSurface>()
             .init_resource::<UiModels>()
             .add_message::<bevy::window::RequestRedraw>()
-            .add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate))
-            .add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate))
-            .configure_sets(PostUpdate, (
-                UiSystems::Prepare, UiSystems::Propagate, UiSystems::Content, UiSystems::Layout,
-            ).chain())
-            .configure_sets(PostUpdate, PropagateSet::<ComputedUiTargetCamera>::default().in_set(UiSystems::Propagate))
-            .configure_sets(PostUpdate, PropagateSet::<ComputedUiRenderTargetInfo>::default().in_set(UiSystems::Propagate))
+            .add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(
+                PostUpdate,
+            ))
+            .add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(
+                PostUpdate,
+            ))
+            .configure_sets(
+                PostUpdate,
+                (
+                    UiSystems::Prepare,
+                    UiSystems::Propagate,
+                    UiSystems::Content,
+                    UiSystems::Layout,
+                )
+                    .chain(),
+            )
+            .configure_sets(
+                PostUpdate,
+                PropagateSet::<ComputedUiTargetCamera>::default().in_set(UiSystems::Propagate),
+            )
+            .configure_sets(
+                PostUpdate,
+                PropagateSet::<ComputedUiRenderTargetInfo>::default().in_set(UiSystems::Propagate),
+            )
             .add_systems(Update, super::super::rich_text::update)
-            .add_systems(PostUpdate, (
-                bevy::ui::update::propagate_ui_target_cameras.in_set(UiSystems::Prepare),
-                bevy::ui::widget::measure_text_system.in_set(UiSystems::Content)
-                    .after(bevy::text::detect_text_needs_rerender)
-                    .after(bevy::text::load_font_assets_into_font_collection),
-                bevy::ui::ui_layout_system.in_set(UiSystems::Layout),
-            ));
-        app.world_mut().spawn((Camera2d, Camera {
-            computed: bevy::camera::ComputedCameraValues {
-                target_info: Some(bevy::camera::RenderTargetInfo {
-                    physical_size: UVec2::new(2560, 1440), scale_factor: 1.0,
-                }), ..default()
-            }, ..default()
-        }));
+            .add_systems(
+                PostUpdate,
+                (
+                    bevy::ui::update::propagate_ui_target_cameras.in_set(UiSystems::Prepare),
+                    bevy::ui::widget::measure_text_system
+                        .in_set(UiSystems::Content)
+                        .after(bevy::text::detect_text_needs_rerender)
+                        .after(bevy::text::load_font_assets_into_font_collection),
+                    bevy::ui::ui_layout_system.in_set(UiSystems::Layout),
+                ),
+            );
+        app.world_mut().spawn((
+            Camera2d,
+            Camera {
+                computed: bevy::camera::ComputedCameraValues {
+                    target_info: Some(bevy::camera::RenderTargetInfo {
+                        physical_size: UVec2::new(2560, 1440),
+                        scale_factor: 1.0,
+                    }),
+                    ..default()
+                },
+                ..default()
+            },
+        ));
         let screen = crate::script::evaluate_ui_component_named_with_args(
             "memory://history.ui.hks",
             r#"import ui.widgets.*
@@ -2546,21 +2882,41 @@ mod tests {
         let server = app.world().resource::<AssetServer>().clone();
         let root = app.world_mut().spawn(screen_root_node(&screen)).id();
         let entity = spawn_screen_node_entity(
-            &mut app.world_mut().commands(), root, &server,
-            &UiFonts { regular: Handle::default(), _fonts: vec![] }, &UiStyle::default(),
-            &screen.children[0], &mut vec![],
+            &mut app.world_mut().commands(),
+            root,
+            &server,
+            &UiFonts {
+                regular: Handle::default(),
+                _fonts: vec![],
+            },
+            &UiStyle::default(),
+            &screen.children[0],
+            &mut vec![],
         );
         app.world_mut().commands().entity(root).add_child(entity);
         app.world_mut().flush();
-        for _ in 0..5 { app.update(); }
+        for _ in 0..5 {
+            app.update();
+        }
         let world = app.world();
         let list = world.get::<Children>(entity).expect("list")[0];
-        for (index, row) in world.get::<Children>(list).expect("rows").iter().enumerate() {
+        for (index, row) in world
+            .get::<Children>(list)
+            .expect("rows")
+            .iter()
+            .enumerate()
+        {
             let size = world.get::<ComputedNode>(row).expect("measured row").size();
             if index == 3 {
-                assert!(size.y > 250.0 && size.y < 500.0, "wrapped history row measured {size:?}");
+                assert!(
+                    size.y > 250.0 && size.y < 500.0,
+                    "wrapped history row measured {size:?}"
+                );
             } else {
-                assert!(size.y > 190.0 && size.y < 240.0, "short history row measured {size:?}");
+                assert!(
+                    size.y > 190.0 && size.y < 240.0,
+                    "short history row measured {size:?}"
+                );
             }
         }
     }
@@ -2765,7 +3121,10 @@ mod tests {
         let region = Some([8.0, 16.0, 640.0, 360.0]);
         let contained = screen_image_node(Handle::default(), region, &layout);
         assert_eq!(contained.image_mode, NodeImageMode::Auto);
-        assert_eq!(contained.rect, Some(texture_rect(region.expect("test region"))));
+        assert_eq!(
+            contained.rect,
+            Some(texture_rect(region.expect("test region")))
+        );
         layout.image_stretch = true;
         assert_eq!(
             screen_image_node(Handle::default(), region, &layout).image_mode,
@@ -2776,13 +3135,16 @@ mod tests {
     #[test]
     fn nested_artwork_uses_canvas_dimensions_not_parent_percentages() {
         let mut node = Node::default();
-        apply_screen_layout(&mut node, &ScreenLayout {
-            left_percent: Some(8.0 / 25.6),
-            top_percent: Some(8.0 / 14.4),
-            width_percent: Some(640.0 / 25.6),
-            height_percent: Some(360.0 / 14.4),
-            ..default()
-        });
+        apply_screen_layout(
+            &mut node,
+            &ScreenLayout {
+                left_percent: Some(8.0 / 25.6),
+                top_percent: Some(8.0 / 14.4),
+                width_percent: Some(640.0 / 25.6),
+                height_percent: Some(360.0 / 14.4),
+                ..default()
+            },
+        );
         assert_eq!(node.width, vw(25.0));
         assert_eq!(node.height, vh(25.0));
         assert_eq!(node.left, vw(8.0 / 25.6));
@@ -3012,18 +3374,38 @@ mod tests {
 
         assert_eq!(app.world().resource::<ScreenUiState>().waiting, None);
         {
-            let mut appearance = app.world_mut().get_mut::<ScreenUiButton>(button).expect("button");
+            let mut appearance = app
+                .world_mut()
+                .get_mut::<ScreenUiButton>(button)
+                .expect("button");
             appearance.enabled = false;
             appearance.hovered_when_disabled = true;
             appearance.hovered_background = Color::WHITE;
         }
-        *app.world_mut().get_mut::<PickingInteraction>(button).expect("pointer") = PickingInteraction::Hovered;
+        *app.world_mut()
+            .get_mut::<PickingInteraction>(button)
+            .expect("pointer") = PickingInteraction::Hovered;
         app.update();
-        assert_eq!(app.world().get::<BackgroundColor>(button).expect("surface").0, Color::WHITE);
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(button)
+                .expect("surface")
+                .0,
+            Color::WHITE
+        );
         // A policy update must reset the appearance without pointer movement.
-        app.world_mut().get_mut::<ScreenUiButton>(button).expect("button").hovered_when_disabled = false;
+        app.world_mut()
+            .get_mut::<ScreenUiButton>(button)
+            .expect("button")
+            .hovered_when_disabled = false;
         app.update();
-        assert_eq!(app.world().get::<BackgroundColor>(button).expect("surface").0, Color::BLACK);
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(button)
+                .expect("surface")
+                .0,
+            Color::BLACK
+        );
     }
 
     #[test]

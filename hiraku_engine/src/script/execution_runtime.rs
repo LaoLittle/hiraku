@@ -116,6 +116,19 @@ pub struct ExecutionRuntime {
 }
 
 impl ExecutionRuntime {
+    pub(super) fn has_executions(&self) -> bool {
+        !self.executions.is_empty()
+    }
+    pub(super) fn resource_positions(&self) -> Vec<(String, usize)> {
+        self.executions
+            .values()
+            .flat_map(|state| {
+                std::iter::once(&state.vm).chain(state.callers.iter().map(|(_, vm)| vm))
+            })
+            .flat_map(|vm| vm.source_positions())
+            .map(|(path, span)| (path.to_owned(), span.start))
+            .collect()
+    }
     pub fn program_for_path(&self, path: &str) -> Option<super::StoryProgram> {
         let entry = self
             .program

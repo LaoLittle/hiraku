@@ -48,14 +48,23 @@ pub fn complete(
                     match command {
                         StageCommand::Close { .. } => false,
                         StageCommand::Clip { id, .. } => state.id == *id && !spatial.ready(state),
-                        StageCommand::Open { id, .. } | StageCommand::Place { id, .. } =>
-                            state.id == *id && !spatial.ready(state),
-                        StageCommand::Camera { id, view, name, .. } => state.id == *id &&
-                            (!spatial.ready(state) || state.views.get(view).is_some_and(|v|
-                                v.request.as_ref().is_some_and(|r| &r.0 == name)
-                                || (v.camera_name.as_ref() == Some(name) && v.tween.is_some()))),
-                        StageCommand::View { id, view, .. } => state.id == *id &&
-                            (!spatial.ready(state) || state.views.get(view).is_some_and(|v| v.fade.is_some())),
+                        StageCommand::Open { id, .. } | StageCommand::Place { id, .. } => {
+                            state.id == *id && !spatial.ready(state)
+                        }
+                        StageCommand::Camera { id, view, name, .. } => {
+                            state.id == *id
+                                && (!spatial.ready(state)
+                                    || state.views.get(view).is_some_and(|v| {
+                                        v.request.as_ref().is_some_and(|r| &r.0 == name)
+                                            || (v.camera_name.as_ref() == Some(name)
+                                                && v.tween.is_some())
+                                    }))
+                        }
+                        StageCommand::View { id, view, .. } => {
+                            state.id == *id
+                                && (!spatial.ready(state)
+                                    || state.views.get(view).is_some_and(|v| v.fade.is_some()))
+                        }
                     }
                 })
             }
@@ -90,7 +99,8 @@ pub fn complete(
                     unreachable!()
                 };
                 if let Some(picture) = shared.0.pictures.get(id) {
-                    let handle: Handle<Image> = assets.load(picture.path.clone());
+                    let handle: Handle<Image> =
+                        crate::texture::load_static_image(&assets, picture.path.clone());
                     if !matches!(command, P::Hide { .. } | P::Exit { .. })
                         && matches!(
                             assets.load_state(handle.id()),

@@ -27,18 +27,28 @@ mod tests {
     struct Active(bool);
 
     fn tick(active: Res<Active>, mut redraw: Redraw) {
-        if active.0 { redraw.request(); redraw.request(); }
+        if active.0 {
+            redraw.request();
+            redraw.request();
+        }
     }
 
     #[test]
     fn only_active_work_requests_one_redraw_each_frame() {
         let mut app = App::new();
-        app.add_message::<RequestRedraw>().init_resource::<Active>().add_systems(Update, tick);
+        app.add_message::<RequestRedraw>()
+            .init_resource::<Active>()
+            .add_systems(Update, tick);
         let mut cursor = bevy::ecs::message::MessageCursor::<RequestRedraw>::default();
         for (active, expected) in [(false, 0), (true, 1), (true, 1), (false, 0)] {
             app.world_mut().resource_mut::<Active>().0 = active;
             app.update();
-            assert_eq!(cursor.read(app.world().resource::<Messages<RequestRedraw>>()).count(), expected);
+            assert_eq!(
+                cursor
+                    .read(app.world().resource::<Messages<RequestRedraw>>())
+                    .count(),
+                expected
+            );
         }
     }
 

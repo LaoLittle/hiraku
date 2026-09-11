@@ -1,4 +1,5 @@
 use super::ToolError;
+mod window;
 use hiraku_hdp::dependencies::{DEPENDENCY_VERSION, DependencyManifest};
 use hiraku_script::{
     Block, Expr, ExprKind, Stmt,
@@ -28,8 +29,8 @@ impl Facts {
 }
 
 /// Includes both branches and closures; follows function/global references,
-/// not navigation edges. Unknown computed resource names include their whole
-/// catalog family and are recorded explicitly, never silently omitted.
+/// not navigation edges. Unknown computed resource names remain demand-loaded
+/// and are recorded explicitly. Source graphs allow bounded runtime lookahead.
 pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifest, ToolError> {
     let mut textures = BTreeMap::<String, BTreeSet<String>>::new();
     let mut characters = BTreeMap::<String, BTreeSet<String>>::new();
@@ -91,6 +92,8 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
     let mut definitions = BTreeMap::<String, Facts>::new();
     let mut definition_owners = BTreeMap::<String, String>::new();
     let mut local_definitions = BTreeMap::<(String, String), Facts>::new();
+    let mut function_names = BTreeSet::new();
+    let mut exports = BTreeMap::new();
     let programs: BTreeMap<_, _> = documents
         .iter()
         .filter(|(p, _)| p.ends_with(".hks"))
@@ -114,6 +117,10 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
                     exported,
                     ..
                 } => {
+                    function_names.insert((path.clone(), name.clone()));
+                    if *exported && !ui_files.contains(path) {
+                        exports.insert(name.clone(), path.clone());
+                    }
                     let mut body = Facts::default();
                     visit_stmt(stmt, &mut body);
                     local_definitions.insert((path.clone(), name.clone()), body.clone());
@@ -148,15 +155,16 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
         }
         scripts.insert(path.clone(), facts);
     }
-    let all_textures: BTreeSet<_> = textures.values().flatten().cloned().collect();
-    let all_characters: BTreeSet<_> = characters.values().flatten().cloned().collect();
     let mut result = DependencyManifest {
+        windows: BTreeMap::new(),
+        exports,
+        image_bytes: BTreeMap::new(),
         version: DEPENDENCY_VERSION,
         scripts: BTreeMap::new(),
         resident: BTreeSet::new(),
         conservative: BTreeMap::new(),
     };
-    for (path, mut facts) in scripts {
+    for (path, facts) in scripts {
         let mut scope = BTreeMap::new();
         for (module, program) in &programs {
             if module == &path {
@@ -175,82 +183,85 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
             }
         }
         let values = value_flow(&scope);
-        let mut visited = BTreeSet::new();
-        let mut pending: BTreeSet<_> = facts
-            .symbols
-            .iter()
-            .map(|name| (path.clone(), name.clone()))
-            .collect();
-        while let Some((module, name)) = pending.pop_first() {
-            if !visited.insert((module.clone(), name.clone())) {
-                continue;
-            }
-            let definition = local_definitions
-                .get(&(module.clone(), name.clone()))
-                .map(|body| (&module, body))
-                .or_else(|| {
-                    definitions
-                        .get(&name)
-                        .map(|body| (&definition_owners[&name], body))
-                });
-            if let Some((owner, body)) = definition {
-                pending.extend(
-                    body.symbols
-                        .iter()
-                        .map(|symbol| (owner.clone(), symbol.clone())),
-                );
-                facts.merge(body);
-            }
-        }
-        let mut images = BTreeSet::new();
-        for name in &facts.strings {
-            if let Some(paths) = textures.get(name) {
-                images.extend(paths.iter().cloned());
-            }
-        }
-        for image in &facts.paths {
-            images.insert(resolve(&path, image)?);
-        }
-        for actor in &facts.actors {
-            if let Some(paths) = characters.get(actor) {
-                images.extend(paths.iter().cloned());
-            }
-        }
-        let mut unresolved = BTreeSet::new();
-        for query in &facts.dynamic {
-            let (family, symbol) = query.split_once(':').expect("internal resource query");
-            if let Some(value) = values
-                .get(symbol)
-                .filter(|v| !v.unknown && !v.strings.is_empty())
-            {
-                for name in &value.strings {
-                    if let Some(paths) = textures.get(name).or_else(|| characters.get(name)) {
-                        images.extend(paths.iter().cloned());
-                    }
-                    if is_image(name) && !name.contains("://") {
-                        images.insert(resolve(&path, name)?);
-                    }
-                }
-            } else {
-                // An open-ended UI image parameter (gallery, thumbnail, etc.)
-                // must stay lazy. Pinning its entire family makes every game
-                // texture resident for the session, regardless of navigation.
-                if ui_files.contains(&path) {
-                    unresolved.insert(query.clone());
+        let resolve = |mut facts: Facts, follow_functions: bool| -> Result<_, ToolError> {
+            let mut visited = BTreeSet::new();
+            let mut pending: BTreeSet<_> = facts
+                .symbols
+                .iter()
+                .map(|name| (path.clone(), name.clone()))
+                .collect();
+            while let Some((module, name)) = pending.pop_first() {
+                if !visited.insert((module.clone(), name.clone())) {
                     continue;
                 }
-                images.extend(
-                    if family == "char" {
-                        &all_characters
-                    } else {
-                        &all_textures
+                let definition = local_definitions
+                    .get(&(module.clone(), name.clone()))
+                    .map(|body| (&module, body))
+                    .or_else(|| {
+                        definitions
+                            .get(&name)
+                            .map(|body| (&definition_owners[&name], body))
+                    });
+                if let Some((owner, body)) = definition {
+                    if !follow_functions && function_names.contains(&(owner.clone(), name.clone()))
+                    {
+                        continue;
                     }
-                    .iter()
-                    .cloned(),
-                );
-                unresolved.insert(query.clone());
+                    pending.extend(
+                        body.symbols
+                            .iter()
+                            .map(|symbol| (owner.clone(), symbol.clone())),
+                    );
+                    facts.merge(body);
+                }
             }
-        }
+            let mut images = BTreeSet::new();
+            for name in &facts.strings {
+                if let Some(paths) = textures.get(name) {
+                    images.extend(paths.iter().cloned());
+                }
+            }
+            for image in &facts.paths {
+                images.insert(resolve(&path, image)?);
+            }
+            for actor in &facts.actors {
+                if let Some(paths) = characters.get(actor) {
+                    images.extend(paths.iter().cloned());
+                }
+            }
+            let mut unresolved = BTreeSet::new();
+            for query in &facts.dynamic {
+                let (_, symbol) = query.split_once(':').expect("internal resource query");
+                if let Some(value) = values
+                    .get(symbol)
+                    .filter(|v| !v.unknown && !v.strings.is_empty())
+                {
+                    for name in &value.strings {
+                        if let Some(paths) = textures.get(name).or_else(|| characters.get(name)) {
+                            images.extend(paths.iter().cloned());
+                        }
+                        if is_image(name) && !name.contains("://") {
+                            images.insert(resolve(&path, name)?);
+                        }
+                    }
+                } else {
+                    // Unknown references are demand-loaded by the runtime, for
+                    // stories as well as UI. An optimization must never turn one
+                    // dynamic parameter into a preload of the entire game.
+                    unresolved.insert(query.clone());
+                }
+            }
+            Ok((images, unresolved))
+        };
+        let graph = window::build(&programs[&path].statements, |stmt| {
+            let mut facts = Facts::default();
+            visit_stmt(stmt, &mut facts);
+            let calls = facts.calls.iter().map(|(name, _)| name.clone()).collect();
+            let (images, _) = resolve(facts, false)?;
+            Ok((images, calls))
+        })?;
+        result.windows.insert(path.clone(), graph);
+        let (images, unresolved) = resolve(facts, true)?;
         if !unresolved.is_empty() {
             result.conservative.insert(path.clone(), unresolved);
         }
@@ -258,6 +269,15 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
             result.resident.extend(images.iter().cloned());
         }
         result.scripts.insert(path, images);
+    }
+    // Native calls have no script body to traverse. Keep only resolvable
+    // script edges, reducing package metadata and runtime graph work.
+    for graph in result.windows.values_mut() {
+        for node in &mut graph.nodes {
+            node.calls.retain(|name| {
+                graph.functions.contains_key(name) || result.exports.contains_key(name)
+            });
+        }
     }
     Ok(result)
 }
@@ -592,10 +612,22 @@ mod tests {
     #[test]
     fn open_ended_ui_images_do_not_make_the_texture_catalog_resident() {
         let docs = BTreeMap::from([
-            ("ui.texture.hson".into(), ".{ name: \"ui/frame\", image: \"ui.png\" }".into()),
-            ("alice.texture.hson".into(), ".{ name: \"alice\", image: \"alice.png\" }".into()),
-            ("bob.texture.hson".into(), ".{ name: \"bob\", image: \"bob.png\" }".into()),
-            ("ui/view.ui.hks".into(), "@ui fn view(name: String) { image(\"ui/frame\"); image(name) }".into()),
+            (
+                "ui.texture.hson".into(),
+                ".{ name: \"ui/frame\", image: \"ui.png\" }".into(),
+            ),
+            (
+                "alice.texture.hson".into(),
+                ".{ name: \"alice\", image: \"alice.png\" }".into(),
+            ),
+            (
+                "bob.texture.hson".into(),
+                ".{ name: \"bob\", image: \"bob.png\" }".into(),
+            ),
+            (
+                "ui/view.ui.hks".into(),
+                "@ui fn view(name: String) { image(\"ui/frame\"); image(name) }".into(),
+            ),
         ]);
         let manifest = analyze(&docs).expect("analyze dynamic UI");
         assert_eq!(manifest.resident, BTreeSet::from(["ui.png".into()]));
@@ -683,7 +715,7 @@ mod tests {
             ("scene.hks".into(), "bg(getBackground())".into()),
         ]);
         let manifest = analyze(&docs).expect("analyze computed reference");
-        assert!(manifest.scripts["scene.hks"].contains("atlas.png"));
+        assert!(manifest.scripts["scene.hks"].is_empty());
         assert!(manifest.conservative["scene.hks"].contains("texture:return:getBackground"));
     }
 }

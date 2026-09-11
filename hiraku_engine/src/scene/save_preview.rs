@@ -47,8 +47,7 @@ fn encode(image: &Image) -> Result<Vec<u8>, String> {
 
 pub fn load_image(server: &AssetServer, path: &str) -> Handle<Image> {
     load_image_with(server, path, |slot| {
-        crate::storage::load_save_thumbnail(slot)
-            .map_err(|error| error.to_string())
+        crate::storage::load_save_thumbnail(slot).map_err(|error| error.to_string())
     })
 }
 
@@ -58,14 +57,18 @@ fn load_image_with(
     read_preview: impl FnOnce(&str) -> Result<Vec<u8>, String>,
 ) -> Handle<Image> {
     let Some(slot) = path.strip_prefix("save-thumbnail://") else {
-        return server.load(path.to_owned());
+        return crate::texture::load_static_image(server, path);
     };
     let decoded = read_preview(slot).and_then(|png| {
         image::load_from_memory_with_format(&png, image::ImageFormat::Png)
             .map_err(|error| error.to_string())
     });
     match decoded {
-        Ok(image) => server.add(Image::from_dynamic(image, true, default())),
+        Ok(image) => server.add(Image::from_dynamic(
+            image,
+            true,
+            bevy::asset::RenderAssetUsages::RENDER_WORLD,
+        )),
         Err(error) => {
             warn!("failed to load thumbnail for `{slot}`: {error}");
             server.add(Image::from_dynamic(
@@ -83,7 +86,8 @@ mod tests {
     #[test]
     fn corrupt_png_returns_transparent_asset_without_panicking() {
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default())).init_asset::<Image>();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<Image>();
         let server = app.world().resource::<AssetServer>();
         let handle = load_image_with(server, "save-thumbnail://bob", |_| Ok(vec![0xff]));
         assert!(handle.path().is_none());

@@ -48,7 +48,9 @@ pub fn poll_sfx_playback(
     mut animations: ResMut<AnimationState>,
     sounds: Query<(Entity, &AudioPlayer, Option<&AudioSink>, &SfxCompletion)>,
 ) {
-    if !sounds.is_empty() { redraw.request(); }
+    if !sounds.is_empty() {
+        redraw.request();
+    }
     for (entity, player, sink, completion) in &sounds {
         let failed = matches!(
             asset_server.get_load_state(player.0.id()),
@@ -78,7 +80,9 @@ pub fn animate_audio_fades(
         Option<&SfxChannel>,
     )>,
 ) {
-    if !sources.is_empty() { redraw.request(); }
+    if !sources.is_empty() {
+        redraw.request();
+    }
     for (entity, sink, mut fade, bgm, voice, sfx) in &mut sources {
         let Some(mut sink) = sink else {
             // Asset loading is asynchronous. The fade starts with audible playback, not while
@@ -119,7 +123,9 @@ pub fn prepare_bgm_preludes(
     mut prelude_loop_audio: ResMut<Assets<PreludeLoopAudio>>,
     preludes: Query<(Entity, &BgmPrelude)>,
 ) {
-    if !preludes.is_empty() { redraw.request(); }
+    if !preludes.is_empty() {
+        redraw.request();
+    }
     for (entity, prelude) in &preludes {
         let Some(prelude_source) = file_audio.get(&prelude.prelude_audio) else {
             continue;
@@ -281,7 +287,9 @@ pub fn poll_voice_playback(
     mut voice_state: ResMut<VoiceState>,
     sinks: Query<&AudioSink>,
 ) {
-    if voice_state.active.is_some() || !voice_state.concurrent.is_empty() { redraw.request(); }
+    if voice_state.active.is_some() || !voice_state.concurrent.is_empty() {
+        redraw.request();
+    }
     let exclusive_finished = voice_state
         .active
         .as_ref()

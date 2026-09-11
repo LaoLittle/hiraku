@@ -5,7 +5,11 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StageCommand {
-    Clip { id: u64, view: String, clip: super::ViewClip },
+    Clip {
+        id: u64,
+        view: String,
+        clip: super::ViewClip,
+    },
     Open {
         id: u64,
         path: String,
@@ -107,9 +111,16 @@ impl StageSnapshot {
         }
         match command {
             StageCommand::Clip { view, clip, .. } => {
-                if !clip.valid() { return Err("invalid stage view clip".into()); }
-                state.as_mut().ok_or("stage is not open")?.views.get_mut(&view)
-                    .ok_or("configure a stage view camera before clipping it")?.clip = clip;
+                if !clip.valid() {
+                    return Err("invalid stage view clip".into());
+                }
+                state
+                    .as_mut()
+                    .ok_or("stage is not open")?
+                    .views
+                    .get_mut(&view)
+                    .ok_or("configure a stage view camera before clipping it")?
+                    .clip = clip;
             }
             StageCommand::Open { id, path } => {
                 *state = Some(Self {
@@ -184,7 +195,9 @@ impl StageSnapshot {
 
 impl StageViewSnapshot {
     fn valid(&self) -> bool {
-        if !self.clip.valid() { return false; }
+        if !self.clip.valid() {
+            return false;
+        }
         !(self
             .camera
             .as_ref()
@@ -238,7 +251,10 @@ pub(crate) struct StageRuntime {
     instantiated: bool,
     pub error: Option<String>,
     pub definition: Option<StageDefinition>,
-    materials: std::collections::HashMap<(AssetId<StandardMaterial>, Option<String>), Handle<StandardMaterial>>,
+    materials: std::collections::HashMap<
+        (AssetId<StandardMaterial>, Option<String>),
+        Handle<StandardMaterial>,
+    >,
 }
 impl StageRuntime {
     pub fn ready(&self, state: &StageSnapshot) -> bool {
@@ -446,7 +462,14 @@ pub(crate) fn prepare_surfaces(
     mut commands: Commands,
     mut runtime: ResMut<StageRuntime>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    surfaces: Query<(Entity, &MeshMaterial3d<StandardMaterial>, Option<&bevy::gltf::GltfMaterialName>), Without<StageSurface>>,
+    surfaces: Query<
+        (
+            Entity,
+            &MeshMaterial3d<StandardMaterial>,
+            Option<&bevy::gltf::GltfMaterialName>,
+        ),
+        Without<StageSurface>,
+    >,
     markers: Query<(Entity, &Name), Without<StageLightMarker>>,
     mut lights: Query<
         (Entity, Option<&mut PointLight>, Option<&mut SpotLight>),
@@ -462,7 +485,10 @@ pub(crate) fn prepare_surfaces(
     if let Some(definition) = &runtime.definition {
         for (entity, name) in &markers {
             if let Some(light) = definition.lights.get(name.as_str()) {
-                if parents.iter_ancestors(entity).any(|ancestor| ancestor == root) {
+                if parents
+                    .iter_ancestors(entity)
+                    .any(|ancestor| ancestor == root)
+                {
                     light.spawn(&mut commands, entity);
                     commands.entity(entity).insert(StageLightMarker);
                 }
@@ -476,9 +502,17 @@ pub(crate) fn prepare_surfaces(
             .iter_ancestors(entity)
             .any(|ancestor| ancestor == root)
         {
-            if let Some(radius) = runtime.definition.as_ref().and_then(|d| d.light_source_radius) {
-                if let Some(mut light) = point { light.radius = radius; }
-                if let Some(mut light) = spot { light.radius = radius; }
+            if let Some(radius) = runtime
+                .definition
+                .as_ref()
+                .and_then(|d| d.light_source_radius)
+            {
+                if let Some(mut light) = point {
+                    light.radius = radius;
+                }
+                if let Some(mut light) = spot {
+                    light.radius = radius;
+                }
             }
             commands
                 .entity(entity)
@@ -492,9 +526,14 @@ pub(crate) fn prepare_surfaces(
         {
             continue;
         }
-        let settings = name.and_then(|name| runtime.definition.as_ref()?.materials.get(&name.0)).cloned();
+        let settings = name
+            .and_then(|name| runtime.definition.as_ref()?.materials.get(&name.0))
+            .cloned();
         if unlit || settings.is_some() {
-            let key = (material.id(), settings.as_ref().and(name.map(|n| n.0.clone())));
+            let key = (
+                material.id(),
+                settings.as_ref().and(name.map(|n| n.0.clone())),
+            );
             let handle = if let Some(handle) = runtime.materials.get(&key) {
                 handle.clone()
             } else {
@@ -502,8 +541,12 @@ pub(crate) fn prepare_surfaces(
                     continue;
                 };
                 let mut source = source.clone();
-                if unlit { source.unlit = true; }
-                if let Some(settings) = &settings { settings.apply(&mut source); }
+                if unlit {
+                    source.unlit = true;
+                }
+                if let Some(settings) = &settings {
+                    settings.apply(&mut source);
+                }
                 let handle = materials.add(source);
                 runtime.materials.insert(key, handle.clone());
                 handle
@@ -536,7 +579,9 @@ pub(super) fn projection_kind_values(p: &Projection) -> (u8, f32, f32, f32, f32)
 }
 
 fn interpolate_angle(from: f32, to: f32, t: f32) -> f32 {
-    if t >= 1.0 { return to; }
+    if t >= 1.0 {
+        return to;
+    }
     from + ((to - from + 180.0).rem_euclid(360.0) - 180.0) * t
 }
 
@@ -601,17 +646,28 @@ mod tests {
     #[test]
     fn presentation_projection_detects_inherited_zoom_without_resetting_computed_area() {
         let mut lens = OrthographicProjection::default_3d();
-        lens.scaling_mode = bevy::camera::ScalingMode::FixedVertical { viewport_height: 1440.0 };
+        lens.scaling_mode = bevy::camera::ScalingMode::FixedVertical {
+            viewport_height: 1440.0,
+        };
         let expected = projection_kind_values(&Projection::Orthographic(lens.clone()));
         lens.scale = 0.5;
-        assert_ne!(projection_kind_values(&Projection::Orthographic(lens.clone())), expected);
+        assert_ne!(
+            projection_kind_values(&Projection::Orthographic(lens.clone())),
+            expected
+        );
         lens.scale = 1.0;
         lens.area = Rect::new(-1280.0, -720.0, 1280.0, 720.0);
-        assert_eq!(projection_kind_values(&Projection::Orthographic(lens)), expected);
+        assert_eq!(
+            projection_kind_values(&Projection::Orthographic(lens)),
+            expected
+        );
         let mut perspective = PerspectiveProjection::default();
         let expected = projection_kind_values(&Projection::Perspective(perspective.clone()));
         perspective.aspect_ratio = 16.0 / 9.0;
-        assert_eq!(projection_kind_values(&Projection::Perspective(perspective)), expected);
+        assert_eq!(
+            projection_kind_values(&Projection::Perspective(perspective)),
+            expected
+        );
     }
 
     #[test]
@@ -765,7 +821,10 @@ mod tests {
             .query_filtered::<&bevy::core_pipeline::tonemapping::Tonemapping, With<super::super::views::ViewCamera>>()
             .single(app.world())
             .expect("stage view tone mapping");
-        assert_eq!(*tonemapping, bevy::core_pipeline::tonemapping::Tonemapping::None);
+        assert_eq!(
+            *tonemapping,
+            bevy::core_pipeline::tonemapping::Tonemapping::None
+        );
         app.world_mut()
             .resource_mut::<crate::state::SceneSharedState>()
             .0
@@ -794,9 +853,22 @@ mod tests {
         let child = app.world_mut().spawn(ChildOf(root)).id();
         let light = app
             .world_mut()
-            .spawn((SpotLight { radius: 90.0, range: 90.0, ..default() }, ChildOf(child)))
+            .spawn((
+                SpotLight {
+                    radius: 90.0,
+                    range: 90.0,
+                    ..default()
+                },
+                ChildOf(child),
+            ))
             .id();
-        let external = app.world_mut().spawn(SpotLight { radius: 2.0, ..default() }).id();
+        let external = app
+            .world_mut()
+            .spawn(SpotLight {
+                radius: 2.0,
+                ..default()
+            })
+            .id();
         {
             let mut runtime = app.world_mut().resource_mut::<StageRuntime>();
             runtime.root = Some(root);
@@ -817,7 +889,13 @@ mod tests {
         let imported = app.world().get::<SpotLight>(light).expect("imported light");
         assert_eq!(imported.radius, 0.0);
         assert_eq!(imported.range, 90.0);
-        assert_eq!(app.world().get::<SpotLight>(external).expect("external light").radius, 2.0);
+        assert_eq!(
+            app.world()
+                .get::<SpotLight>(external)
+                .expect("external light")
+                .radius,
+            2.0
+        );
         app.update();
         assert!(app.world().get_entity(light).is_ok());
     }
@@ -829,16 +907,41 @@ mod tests {
             .init_resource::<StageRuntime>()
             .add_systems(Update, prepare_surfaces);
         let root = app.world_mut().spawn(StageRoot).id();
-        let source = app.world_mut().resource_mut::<Assets<StandardMaterial>>()
+        let source = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
             .add(StandardMaterial::default());
-        let a = app.world_mut().spawn((ChildOf(root), MeshMaterial3d(source.clone()),
-            bevy::gltf::GltfMaterialName("alice".into()))).id();
-        let b = app.world_mut().spawn((ChildOf(root), MeshMaterial3d(source.clone()),
-            bevy::gltf::GltfMaterialName("bob".into()))).id();
-        let external = app.world_mut().spawn((MeshMaterial3d(source.clone()),
-            bevy::gltf::GltfMaterialName("alice".into()))).id();
-        let marker = app.world_mut().spawn((ChildOf(root), Name::new("lamp"),
-            Transform::from_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)))).id();
+        let a = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                MeshMaterial3d(source.clone()),
+                bevy::gltf::GltfMaterialName("alice".into()),
+            ))
+            .id();
+        let b = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                MeshMaterial3d(source.clone()),
+                bevy::gltf::GltfMaterialName("bob".into()),
+            ))
+            .id();
+        let external = app
+            .world_mut()
+            .spawn((
+                MeshMaterial3d(source.clone()),
+                bevy::gltf::GltfMaterialName("alice".into()),
+            ))
+            .id();
+        let marker = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                Name::new("lamp"),
+                Transform::from_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            ))
+            .id();
         let definition: StageDefinition = hiraku_script::hson::from_str(r#".{
             materials: .{
                 alice: .{ baseColor: (0.5, 1, 0, 1), metallic: 0, roughness: 0.6,
@@ -858,29 +961,70 @@ mod tests {
             runtime.root = Some(root);
             runtime.definition = Some(definition.clone());
         }
-        for _ in 0..3 { app.update(); }
+        for _ in 0..3 {
+            app.update();
+        }
         let world = app.world();
-        let ah = &world.get::<MeshMaterial3d<StandardMaterial>>(a).expect("alice material").0;
-        let bh = &world.get::<MeshMaterial3d<StandardMaterial>>(b).expect("bob material").0;
+        let ah = &world
+            .get::<MeshMaterial3d<StandardMaterial>>(a)
+            .expect("alice material")
+            .0;
+        let bh = &world
+            .get::<MeshMaterial3d<StandardMaterial>>(b)
+            .expect("bob material")
+            .0;
         assert_ne!(ah, bh);
         assert_ne!(ah, &source);
         let materials = world.resource::<Assets<StandardMaterial>>();
         let a = materials.get(ah).expect("cloned material");
         assert_eq!(a.base_color, Color::srgba(0.5, 1.0, 0.0, 1.0));
         assert_eq!(a.alpha_mode, AlphaMode::Mask(0.5));
-        assert!(a.uv_transform.transform_point2(Vec2::ONE).abs_diff_eq(Vec2::new(2.1, 1.0), 0.0001));
-        assert_eq!(materials.get(bh).expect("bob material").perceptual_roughness, 0.2);
-        assert_eq!(materials.get(&source).expect("source").base_color, Color::WHITE);
-        assert_eq!(world.get::<MeshMaterial3d<StandardMaterial>>(external).expect("external").0, source);
+        assert!(
+            a.uv_transform
+                .transform_point2(Vec2::ONE)
+                .abs_diff_eq(Vec2::new(2.1, 1.0), 0.0001)
+        );
+        assert_eq!(
+            materials
+                .get(bh)
+                .expect("bob material")
+                .perceptual_roughness,
+            0.2
+        );
+        assert_eq!(
+            materials.get(&source).expect("source").base_color,
+            Color::WHITE
+        );
+        assert_eq!(
+            world
+                .get::<MeshMaterial3d<StandardMaterial>>(external)
+                .expect("external")
+                .0,
+            source
+        );
         let children = world.get::<Children>(marker).expect("attached light");
         assert_eq!(children.len(), 1);
         let light = children[0];
-        assert_eq!(world.get::<SpotLight>(light).expect("spot").intensity, 1200.0);
-        let direction = world.get::<Transform>(marker).expect("original transform").rotation
-            * world.get::<Transform>(light).expect("relative transform").rotation * Vec3::NEG_Z;
+        assert_eq!(
+            world.get::<SpotLight>(light).expect("spot").intensity,
+            1200.0
+        );
+        let direction = world
+            .get::<Transform>(marker)
+            .expect("original transform")
+            .rotation
+            * world
+                .get::<Transform>(light)
+                .expect("relative transform")
+                .rotation
+            * Vec3::NEG_Z;
         assert!(direction.abs_diff_eq(Vec3::NEG_Y, 0.0001));
         let mut invalid = definition;
-        invalid.materials.get_mut("alice").expect("settings").roughness = Some(2.0);
+        invalid
+            .materials
+            .get_mut("alice")
+            .expect("settings")
+            .roughness = Some(2.0);
         assert!(invalid.validate().is_err());
         app.world_mut().despawn(root);
         assert!(app.world().get_entity(light).is_err());
@@ -951,7 +1095,10 @@ mod tests {
             assert!((interpolate_angle(a, b, 0.5) - mid).abs() < 0.001);
             assert_eq!(interpolate_angle(a, b, 1.0), b);
             let pose = interpolate_camera(&view(a), &view(b), 0.5).pose.transform();
-            assert!(pose.translation.abs_diff_eq(view(mid).pose.transform().translation, 0.001));
+            assert!(
+                pose.translation
+                    .abs_diff_eq(view(mid).pose.transform().translation, 0.001)
+            );
         }
     }
 

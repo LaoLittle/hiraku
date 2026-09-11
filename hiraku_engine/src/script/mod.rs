@@ -15,12 +15,12 @@ pub(crate) mod capabilities;
 mod command;
 mod execution_runtime;
 pub(crate) mod navigation;
+mod project;
 pub mod replay;
 mod runtime;
 mod story_runtime;
 pub mod ui_runtime;
 mod ui_vm;
-mod project;
 pub(crate) use project::{StoryProgram, compile_story_program};
 pub(crate) use ui_vm::UiComposition;
 pub(crate) use ui_vm::ui_argument_to_stored;
@@ -162,7 +162,9 @@ pub(crate) fn script_command_from_effect(
             })
         }
         StoryEffect::Clip(clip) => ScriptCommand::Stage(StageCommand::Clip(clip)),
-        StoryEffect::SetActorDepth { id, depth } => ScriptCommand::Stage(StageCommand::SetActorDepth { id, depth }),
+        StoryEffect::SetActorDepth { id, depth } => {
+            ScriptCommand::Stage(StageCommand::SetActorDepth { id, depth })
+        }
         StoryEffect::Picture(mut picture) => {
             if let crate::scene::pictures::PictureCommand::Show { path, rect, .. } = &mut picture {
                 let texture = textures
@@ -173,7 +175,9 @@ pub(crate) fn script_command_from_effect(
             }
             ScriptCommand::Stage(StageCommand::Picture(picture))
         }
-        StoryEffect::StopActorMotion { actor_id } => ScriptCommand::Character(CharacterCommand::StopMotion { actor_id }),
+        StoryEffect::StopActorMotion { actor_id } => {
+            ScriptCommand::Character(CharacterCommand::StopMotion { actor_id })
+        }
         StoryEffect::ActorMotion {
             actor_id,
             revision,
@@ -330,7 +334,10 @@ pub fn start_story_runtime(
             let bytecode = match story.program_for_path(&frame.script) {
                 Some(code) => code,
                 None => {
-                    let source = vfs.0.read_text(&frame.script).map_err(|error| error.to_string())?;
+                    let source = vfs
+                        .0
+                        .read_text(&frame.script)
+                        .map_err(|error| error.to_string())?;
                     compile_story_program(&vfs.0, &frame.script, &source)?
                 }
             };
@@ -386,6 +393,7 @@ pub fn save_runtime_slot(
     runtime: &ScriptRuntimeState,
     shared_state: &SceneSharedState,
     thumbnail: &[u8],
+    history: &[crate::state::DialogueSnapshot],
 ) -> Result<(), StorageError> {
     let current_script = runtime.current_script.clone().unwrap_or_default();
     let values = runtime
@@ -414,6 +422,7 @@ pub fn save_runtime_slot(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let data = SaveGameData {
+        dialogue_history: history.to_vec(),
         replay: runtime.replay.clone(),
         thumbnail_png: thumbnail.to_vec(),
         version: crate::state::CURRENT_SAVE_VERSION,

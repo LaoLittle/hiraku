@@ -43,9 +43,14 @@ pub(crate) fn animate(
     mut parts: Query<(&character_composite::LogicalCharacterPart, &mut Transform)>,
 ) {
     for (actor, motion) in &mut shared.0.actor_motions {
-        if !motion.finished { redraw.request(); }
+        if !motion.finished {
+            redraw.request();
+        }
         if !stage.character_active_parts.contains_key(actor)
-            && !stage.pending_character_restore.iter().any(|part| part.id.starts_with(&format!("character::{actor}::")))
+            && !stage
+                .pending_character_restore
+                .iter()
+                .any(|part| part.id.starts_with(&format!("character::{actor}::")))
         {
             finish(motion, &mut animations);
         }
@@ -89,17 +94,30 @@ mod tests {
             .init_resource::<StageState>()
             .init_resource::<AnimationState>()
             .add_systems(Update, animate);
-        let mut motion = ActorMotion::new(1, ActorOffset {
-            target: [4.0, 8.0],
-            animation: crate::script::AnimationSpec::Linear(1.0, false),
-        }, [0.0; 2]);
+        let mut motion = ActorMotion::new(
+            1,
+            ActorOffset {
+                target: [4.0, 8.0],
+                animation: crate::script::AnimationSpec::Linear(1.0, false),
+            },
+            [0.0; 2],
+        );
         motion.animation_id = Some("alice-motion".into());
-        app.world_mut().resource_mut::<SceneSharedState>().0.actor_motions.insert("alice".into(), motion);
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .actor_motions
+            .insert("alice".into(), motion);
         app.update();
         let shared = app.world().resource::<SceneSharedState>();
         assert_eq!(shared.0.actor_motions["alice"].offset, [4.0, 8.0]);
         assert!(shared.0.actor_motions["alice"].finished);
-        assert!(app.world().resource::<AnimationState>().completed.contains("alice-motion"));
+        assert!(
+            app.world()
+                .resource::<AnimationState>()
+                .completed
+                .contains("alice-motion")
+        );
     }
 
     #[test]

@@ -228,7 +228,9 @@ fn start_pending_video(
     let Some(pending) = player.pending.front() else {
         return;
     };
-    if redraw.is_some() { commands.write_message(bevy::window::RequestRedraw); }
+    if redraw.is_some() {
+        commands.write_message(bevy::window::RequestRedraw);
+    }
     let Some(asset) = videos.get(&pending.asset) else {
         if let LoadState::Failed(error) = asset_server.load_state(&pending.asset) {
             let pending = player

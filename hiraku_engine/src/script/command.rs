@@ -37,7 +37,10 @@ pub enum RuntimeCommand {
 #[derive(Debug)]
 pub enum StageCommand {
     Spatial(crate::stage::runtime::StageCommand),
-    SetActorDepth { id: String, depth: f32 },
+    SetActorDepth {
+        id: String,
+        depth: f32,
+    },
     Clip(crate::scene::clipping::ClipCommand),
     AwaitCurtain {
         done: ScriptRequestId,
@@ -119,7 +122,9 @@ pub enum UiCommand {
 
 #[derive(Debug)]
 pub enum CharacterCommand {
-    StopMotion { actor_id: String },
+    StopMotion {
+        actor_id: String,
+    },
     Motion {
         actor_id: String,
         revision: u64,

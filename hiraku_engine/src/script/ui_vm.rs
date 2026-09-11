@@ -365,34 +365,64 @@ mod native_ui {
     }
 
     #[hks(name = "pauseTimers", receiver)]
-    fn pause_timers(context: &mut UiVmContext, node: UiNodeHandle, paused: bool) -> Result<UiNodeHandle, NativeError> {
+    fn pause_timers(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        paused: bool,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Screen) {
-            return Err(NativeError::message("pauseTimers requires a screen or canvas"));
+            return Err(NativeError::message(
+                "pauseTimers requires a screen or canvas",
+            ));
         }
         draft.timers_paused = paused;
         Ok(node)
     }
 
     #[hks(name = "fade", receiver)]
-    fn fade(context: &mut UiVmContext, node: UiNodeHandle, seconds: f64) -> Result<UiNodeHandle, NativeError> {
+    fn fade(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        seconds: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
-        if !matches!(draft.kind, UiDraftKind::Screen) { return Err(NativeError::message("fade requires a screen or canvas")); }
-        if !seconds.is_finite() || !(0.0..=60.0).contains(&seconds) { return Err(NativeError::message("fade duration must be within 0..60 seconds")); }
+        if !matches!(draft.kind, UiDraftKind::Screen) {
+            return Err(NativeError::message("fade requires a screen or canvas"));
+        }
+        if !seconds.is_finite() || !(0.0..=60.0).contains(&seconds) {
+            return Err(NativeError::message(
+                "fade duration must be within 0..60 seconds",
+            ));
+        }
         draft.fade_seconds = seconds as f32;
         Ok(node)
     }
 
     #[hks(name = "hoverBrightness", receiver)]
-    fn hover_brightness(context: &mut UiVmContext, node: UiNodeHandle, factor: f64) -> Result<UiNodeHandle, NativeError> {
-        if !factor.is_finite() || !(0.0..=4.0).contains(&factor) { return Err(NativeError::message("hover brightness must be within 0..4")); }
+    fn hover_brightness(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        factor: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if !factor.is_finite() || !(0.0..=4.0).contains(&factor) {
+            return Err(NativeError::message("hover brightness must be within 0..4"));
+        }
         context.node_mut(node)?.layout.hover_brightness = Some(factor as f32);
         Ok(node)
     }
 
     #[hks(name = "keyframes", receiver)]
-    fn keyframes(context: &mut UiVmContext, node: UiNodeHandle, frames: Vec<crate::ui::UiKeyframe>) -> Result<UiNodeHandle, NativeError> {
-        if !crate::scene::ui_keyframes::validate(&frames) { return Err(NativeError::message("keyframes require increasing non-negative times, finite rectangles and alpha in 0..1")); }
+    fn keyframes(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        frames: Vec<crate::ui::UiKeyframe>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if !crate::scene::ui_keyframes::validate(&frames) {
+            return Err(NativeError::message(
+                "keyframes require increasing non-negative times, finite rectangles and alpha in 0..1",
+            ));
+        }
         context.node_mut(node)?.layout.keyframes = frames;
         Ok(node)
     }
@@ -400,37 +430,75 @@ mod native_ui {
     /// Read-only collection size; element values never leave the Any boundary.
     #[hks]
     fn count(_context: &mut UiVmContext, values: Vec<Value>) -> Result<i32, NativeError> {
-        i32::try_from(values.len()).map_err(|_| NativeError::message("collection size exceeds Int range"))
+        i32::try_from(values.len())
+            .map_err(|_| NativeError::message("collection size exceeds Int range"))
     }
 
     #[hks]
-    fn item(_context: &mut UiVmContext, values: Vec<Value>, index: i32) -> Result<Value, NativeError> {
-        usize::try_from(index).ok().and_then(|index|values.get(index)).cloned()
+    fn item(
+        _context: &mut UiVmContext,
+        values: Vec<Value>,
+        index: i32,
+    ) -> Result<Value, NativeError> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| values.get(index))
+            .cloned()
             .ok_or_else(|| NativeError::message("collection index out of bounds"))
     }
 
     #[hks(name = "shader", receiver)]
-    fn shader(context: &mut UiVmContext, node: UiNodeHandle, path: String, textures: Vec<String>, keys: Vec<crate::ui::UiShaderKeyframe>) -> Result<UiNodeHandle, NativeError> {
-        if textures.len()>3 || !crate::render::ui_quad::valid_shader_keys(&keys) {
-            return Err(NativeError::message("shader accepts up to three auxiliary textures and increasing finite parameter keyframes"));
+    fn shader(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        path: String,
+        textures: Vec<String>,
+        keys: Vec<crate::ui::UiShaderKeyframe>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if textures.len() > 3 || !crate::render::ui_quad::valid_shader_keys(&keys) {
+            return Err(NativeError::message(
+                "shader accepts up to three auxiliary textures and increasing finite parameter keyframes",
+            ));
         }
-        let path=bevy::asset::AssetPath::parse(context.navigation_origin.as_deref().unwrap_or(""))
-            .resolve_embed_str(&path).map_err(|e| NativeError::message(e.to_string()))?.to_string();
-        let draft=context.node_mut(node)?;
-        if !matches!(draft.kind,UiDraftKind::Image(_)) { return Err(NativeError::message("shader requires an image node")); }
-        draft.layout.shader=Some(crate::ui::UiShaderSpec {path,textures,keys,blend:crate::ui::UiShaderBlend::Alpha});
+        let path =
+            bevy::asset::AssetPath::parse(context.navigation_origin.as_deref().unwrap_or(""))
+                .resolve_embed_str(&path)
+                .map_err(|e| NativeError::message(e.to_string()))?
+                .to_string();
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Image(_)) {
+            return Err(NativeError::message("shader requires an image node"));
+        }
+        draft.layout.shader = Some(crate::ui::UiShaderSpec {
+            path,
+            textures,
+            keys,
+            blend: crate::ui::UiShaderBlend::Alpha,
+        });
         Ok(node)
     }
 
     #[hks(name = "blend", receiver)]
-    fn blend(context: &mut UiVmContext, node: UiNodeHandle, mode: String) -> Result<UiNodeHandle, NativeError> {
+    fn blend(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        mode: String,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
-        let shader = draft.layout.shader.as_mut().ok_or_else(|| NativeError::message("blend requires shader(...) on an image"))?;
+        let shader = draft
+            .layout
+            .shader
+            .as_mut()
+            .ok_or_else(|| NativeError::message("blend requires shader(...) on an image"))?;
         shader.blend = match mode.as_str() {
             "alpha" => crate::ui::UiShaderBlend::Alpha,
             "multiply" => crate::ui::UiShaderBlend::Multiply,
             "additive" => crate::ui::UiShaderBlend::Additive,
-            _ => return Err(NativeError::message("UI shader blend must be alpha, multiply or additive")),
+            _ => {
+                return Err(NativeError::message(
+                    "UI shader blend must be alpha, multiply or additive",
+                ));
+            }
         };
         Ok(node)
     }
@@ -438,18 +506,30 @@ mod native_ui {
     /// Opt into scene suspension without teaching the engine about menus or
     /// minigames. UI timers/animations still belong to their own screen clock.
     #[hks(name = "allowOverlay", receiver)]
-    fn allow_overlay(context: &mut UiVmContext, node: UiNodeHandle, name: String) -> Result<UiNodeHandle, NativeError> {
+    fn allow_overlay(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        name: String,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Screen) {
-            return Err(NativeError::message("allowOverlay requires a screen or canvas"));
+            return Err(NativeError::message(
+                "allowOverlay requires a screen or canvas",
+            ));
         }
-        if !draft.allowed_overlays.contains(&name) { draft.allowed_overlays.push(name); }
+        if !draft.allowed_overlays.contains(&name) {
+            draft.allowed_overlays.push(name);
+        }
         Ok(node)
     }
 
     /// Constrain wrapping without fixing the text's content-driven height.
     #[hks(name = "width", receiver)]
-    fn width(context: &mut UiVmContext, node: UiNodeHandle, width: f64) -> Result<UiNodeHandle, NativeError> {
+    fn width(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        width: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
         let layout = &mut context.node_mut(node)?.layout;
         layout.width = Some(non_negative(width, "UI width")?);
         layout.width_percent = None;
@@ -457,19 +537,32 @@ mod native_ui {
     }
 
     #[hks(name = "pauseScene", receiver)]
-    fn pause_scene(context: &mut UiVmContext, node: UiNodeHandle, paused: bool) -> Result<UiNodeHandle, NativeError> {
+    fn pause_scene(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        paused: bool,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Screen) {
-            return Err(NativeError::message("pauseScene requires a screen or canvas"));
+            return Err(NativeError::message(
+                "pauseScene requires a screen or canvas",
+            ));
         }
         draft.pauses_scene = paused;
         Ok(node)
     }
 
     #[hks(name = "after", receiver)]
-    fn after(context: &mut UiVmContext, node: UiNodeHandle, seconds: f64, handler: HksCallable) -> Result<UiNodeHandle, NativeError> {
+    fn after(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        seconds: f64,
+        handler: HksCallable,
+    ) -> Result<UiNodeHandle, NativeError> {
         if !seconds.is_finite() || !(0.0..=86400.0).contains(&seconds) {
-            return Err(NativeError::message("after requires a finite duration in 0..=86400 seconds"));
+            return Err(NativeError::message(
+                "after requires a finite duration in 0..=86400 seconds",
+            ));
         }
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Screen) {
@@ -521,18 +614,30 @@ mod native_ui {
     }
 
     #[hks(name = "richText")]
-    fn rich_text(context: &mut UiVmContext, value: HksBindable<String>) -> Result<UiNodeHandle, NativeError> {
+    fn rich_text(
+        context: &mut UiVmContext,
+        value: HksBindable<String>,
+    ) -> Result<UiNodeHandle, NativeError> {
         let mut draft = UiDraft::new(UiDraftKind::Text(value), None);
         draft.layout.rich_text = true;
         Ok(context.insert(draft))
     }
 
     #[hks(name = "reveal", receiver)]
-    fn text_reveal(context: &mut UiVmContext, node: UiNodeHandle, count: HksBindable<u32>) -> Result<UiNodeHandle, NativeError> {
+    fn text_reveal(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        count: HksBindable<u32>,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
-        if !draft.layout.rich_text { return Err(NativeError::message("reveal requires richText")); }
+        if !draft.layout.rich_text {
+            return Err(NativeError::message("reveal requires richText"));
+        }
         match count {
-            HksBindable::Value(value) => { draft.layout.text_reveal = Some(value); draft.text_reveal = None; }
+            HksBindable::Value(value) => {
+                draft.layout.text_reveal = Some(value);
+                draft.text_reveal = None;
+            }
             HksBindable::Binding(binding) => draft.text_reveal = Some(binding),
         }
         Ok(node)
@@ -739,7 +844,10 @@ mod native_ui {
     }
 
     #[hks(name = "centered", receiver)]
-    fn centered(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
+    fn centered(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Row | UiDraftKind::Column) {
             return Err(NativeError::message("centered requires row or column"));
@@ -749,8 +857,14 @@ mod native_ui {
     }
 
     #[hks(name = "rotation", receiver)]
-    fn rotation(context: &mut UiVmContext, node: UiNodeHandle, degrees: f64) -> Result<UiNodeHandle, NativeError> {
-        if !degrees.is_finite() { return Err(NativeError::message("rotation requires a finite angle")); }
+    fn rotation(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        degrees: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if !degrees.is_finite() {
+            return Err(NativeError::message("rotation requires a finite angle"));
+        }
         context.node_mut(node)?.layout.rotation = (degrees % 360.0) as f32;
         Ok(node)
     }
@@ -850,7 +964,10 @@ mod native_ui {
     }
 
     #[hks(name = "stretch", receiver)]
-    fn ui_stretch(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
+    fn ui_stretch(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Image(_)) {
             return Err(NativeError::message("stretch requires an image node"));
@@ -860,16 +977,25 @@ mod native_ui {
     }
 
     #[hks(name = "textShadow", receiver)]
-    fn ui_text_shadow(context: &mut UiVmContext, node: UiNodeHandle, enabled: bool) -> Result<UiNodeHandle, NativeError> {
+    fn ui_text_shadow(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        enabled: bool,
+    ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.layout.text_shadow = Some(enabled);
         Ok(node)
     }
 
     #[hks(name = "fitText", receiver)]
-    fn ui_fit_text(context: &mut UiVmContext, node: UiNodeHandle) -> Result<UiNodeHandle, NativeError> {
+    fn ui_fit_text(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+    ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Text(_)) || draft.layout.rich_text {
-            return Err(NativeError::message("fitText requires a plain text node; richText uses wrapping layout"));
+            return Err(NativeError::message(
+                "fitText requires a plain text node; richText uses wrapping layout",
+            ));
         }
         draft.layout.text_fit = true;
         Ok(node)
@@ -1217,10 +1343,17 @@ fn close_ui(
 ) -> Result<Value, NativeError> {
     ui_result(context, call, false)
 }
-fn complete_ui(context: &mut UiVmContext, call: &hiraku_script::BuiltinCall) -> Result<Value, NativeError> {
+fn complete_ui(
+    context: &mut UiVmContext,
+    call: &hiraku_script::BuiltinCall,
+) -> Result<Value, NativeError> {
     ui_result(context, call, true)
 }
-fn ui_result(context: &mut UiVmContext, call: &hiraku_script::BuiltinCall, complete: bool) -> Result<Value, NativeError> {
+fn ui_result(
+    context: &mut UiVmContext,
+    call: &hiraku_script::BuiltinCall,
+    complete: bool,
+) -> Result<Value, NativeError> {
     let value = match call.arguments.as_slice() {
         [] => Value::Unit,
         [argument] => argument.value.clone(),
@@ -1232,7 +1365,11 @@ fn ui_result(context: &mut UiVmContext, call: &hiraku_script::BuiltinCall, compl
     };
     validate_ui_result(&value)?;
     Ok(context
-        .insert_effect(if complete { UiEffect::CompleteUi { value } } else { UiEffect::CloseUi { value } })
+        .insert_effect(if complete {
+            UiEffect::CompleteUi { value }
+        } else {
+            UiEffect::CloseUi { value }
+        })
         .into_hks_value())
 }
 
@@ -1271,9 +1408,9 @@ mod storage_actions {
             return Ok(None);
         }
         match crate::storage::load_save_metadata(&slot) {
-            Ok(data) => {
-                Ok(data.has_thumbnail.then(|| format!("save-thumbnail://{slot}")))
-            }
+            Ok(data) => Ok(data
+                .has_thumbnail
+                .then(|| format!("save-thumbnail://{slot}"))),
             Err(error) => {
                 bevy::log::warn!("cannot read preview for slot `{slot}`: {error}");
                 Ok(None)
@@ -1292,12 +1429,11 @@ mod storage_actions {
         }
         Ok(match crate::storage::load_save_metadata(&slot) {
             Ok(data) if data.version == crate::state::CURRENT_SAVE_VERSION => {
-                crate::storage::load_save_data(&slot).err().map(|error| error.to_string())
+                crate::storage::load_save_data(&slot)
+                    .err()
+                    .map(|error| error.to_string())
             }
-            Ok(data) => Some(format!(
-                "Incompatible save version {}",
-                data.version
-            )),
+            Ok(data) => Some(format!("Incompatible save version {}", data.version)),
             Err(error) => Some(error.to_string()),
         })
     }
@@ -1405,7 +1541,10 @@ mod preference_actions {
     }
 
     #[hks(name = "setFastForward")]
-    fn set_fast_forward(context: &mut UiVmContext, enabled: bool) -> Result<UiEffectHandle, NativeError> {
+    fn set_fast_forward(
+        context: &mut UiVmContext,
+        enabled: bool,
+    ) -> Result<UiEffectHandle, NativeError> {
         Ok(context.insert_effect(UiEffect::SetFastForward(enabled)))
     }
 }
@@ -1582,7 +1721,8 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
         .expect("UiPosition registration must be internally consistent");
     UiSize::register_hks(&mut registry).expect("UiSize registration must be internally consistent");
     crate::ui::UiKeyframe::register_hks(&mut registry).expect("UI keyframe registration");
-    crate::ui::UiShaderKeyframe::register_hks(&mut registry).expect("UI shader keyframe registration");
+    crate::ui::UiShaderKeyframe::register_hks(&mut registry)
+        .expect("UI shader keyframe registration");
     register_animation_api(&mut registry)
         .expect("animation API registration must be internally consistent");
     NavigationResetValue::register_hks(&mut registry)
@@ -1605,19 +1745,28 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
             },
         )
         .expect("UI open primitive is registered");
-    for (name, handler) in [("complete", complete_ui as fn(&mut UiVmContext, &hiraku_script::BuiltinCall) -> Result<Value, NativeError>), ("close", close_ui)] {
-    let close = registry.register_selector_raw_fn("ui", name, handler).expect("UI result primitive is unique");
-    registry
-        .set_signature(
-            close,
-            hiraku_script::FunctionSignature {
-                receiver: None,
-                parameters: Vec::new(),
-                variadic: Some(ScriptType::Any),
-                result: ScriptType::Named(ui_effect),
-            },
-        )
-        .expect("UI close signature is registered");
+    for (name, handler) in [
+        (
+            "complete",
+            complete_ui
+                as fn(&mut UiVmContext, &hiraku_script::BuiltinCall) -> Result<Value, NativeError>,
+        ),
+        ("close", close_ui),
+    ] {
+        let close = registry
+            .register_selector_raw_fn("ui", name, handler)
+            .expect("UI result primitive is unique");
+        registry
+            .set_signature(
+                close,
+                hiraku_script::FunctionSignature {
+                    receiver: None,
+                    parameters: Vec::new(),
+                    variadic: Some(ScriptType::Any),
+                    result: ScriptType::Named(ui_effect),
+                },
+            )
+            .expect("UI close signature is registered");
     }
     preference_actions::register_hks(&mut registry).expect("preference API registers once");
     storage_actions::register_hks(&mut registry)
@@ -2091,7 +2240,11 @@ fn materialize_screen(
         timers_paused: draft.timers_paused,
         fade_seconds: draft.fade_seconds,
         pauses_scene: draft.pauses_scene,
-        timers: draft.timers.into_iter().map(|(seconds, handler)| (seconds, ui_callback(handler, program, context))).collect(),
+        timers: draft
+            .timers
+            .into_iter()
+            .map(|(seconds, handler)| (seconds, ui_callback(handler, program, context)))
+            .collect(),
         composition: None,
         title: None,
         panel: draft.panel,
@@ -2298,7 +2451,9 @@ fn materialize_node(
     if let Some(binding) = &draft.text_reveal {
         let reactive = reactive_binding(binding, program, context);
         let value = evaluate_binding_value(&reactive, registry, context)?;
-        draft.layout.text_reveal = Some(u32::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?);
+        draft.layout.text_reveal = Some(
+            u32::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?,
+        );
         draft.layout.reactive_text_reveal = Some(reactive);
     }
     draft.layout.visible_binding = None;
@@ -2369,22 +2524,35 @@ fn materialize_node(
             "screen nodes may only appear at the document root".into(),
         )),
         UiDraftKind::Image(path) => {
-            let mut layout=draft.layout;
-            if let Some(shader)=&mut layout.shader {
-                if layout.keyframes.is_empty() { return Err(UiVmError::Invalid("shader images require a keyframe timeline".into())); }
+            let mut layout = draft.layout;
+            if let Some(shader) = &mut layout.shader {
+                if layout.keyframes.is_empty() {
+                    return Err(UiVmError::Invalid(
+                        "shader images require a keyframe timeline".into(),
+                    ));
+                }
                 for key in &mut shader.textures {
-                    let texture=resolve_texture(textures,key)?;
-                    if texture.rect.is_some() { return Err(UiVmError::Invalid("shader auxiliary textures must be whole textures".into())); }
-                    *key=texture.path;
+                    let texture = resolve_texture(textures, key)?;
+                    if texture.rect.is_some() {
+                        return Err(UiVmError::Invalid(
+                            "shader auxiliary textures must be whole textures".into(),
+                        ));
+                    }
+                    *key = texture.path;
                 }
             }
-            let texture=resolve_texture(textures,&path)?;
-            if (layout.shader.is_some() || layout.keyframes.iter().any(|key| matches!(key,crate::ui::UiKeyframe::Quad(..))))
-                && (texture.rect.is_some() || layout.flip_x) {
+            let texture = resolve_texture(textures, &path)?;
+            if (layout.shader.is_some()
+                || layout
+                    .keyframes
+                    .iter()
+                    .any(|key| matches!(key, crate::ui::UiKeyframe::Quad(..))))
+                && (texture.rect.is_some() || layout.flip_x)
+            {
                 return Err(UiVmError::Invalid("projected shader tracks require whole, unflipped images; encode reflection in quad axes".into()));
             }
-            Ok(ScreenNode::Image(ScreenImageNode { texture,layout }))
-        },
+            Ok(ScreenNode::Image(ScreenImageNode { texture, layout }))
+        }
         UiDraftKind::Text(binding) => {
             let (text, reactive) = match binding {
                 HksBindable::Value(value) => (value, None),
@@ -2852,11 +3020,21 @@ mod tests {
                     .at(.abs(2260, 0)).size(.abs(300, 238))
                     .onClick { ui.close() }
             }"#,
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("image button compiles");
-        let ScreenNode::ImageButton(button) = &screen.children[0] else { panic!("expected image button") };
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("image button compiles");
+        let ScreenNode::ImageButton(button) = &screen.children[0] else {
+            panic!("expected image button")
+        };
         assert!(button.on_click.is_some());
-        for layout in [&button.layout, button.hovered_layout.as_ref().expect("hover"), button.pressed_layout.as_ref().expect("press")] {
+        for layout in [
+            &button.layout,
+            button.hovered_layout.as_ref().expect("hover"),
+            button.pressed_layout.as_ref().expect("press"),
+        ] {
             assert_eq!(layout.left, Some(2260.0));
             assert_eq!(layout.top, Some(0.0));
             assert_eq!(layout.width, Some(300.0));
@@ -2889,17 +3067,25 @@ mod tests {
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("full history builds");
         assert_eq!(screen.children.len(), 3);
-        let ScreenNode::Scrollable(scroll) = &screen.children[1] else { panic!("scrollable expected") };
-        let ScreenNode::Column(content) = &scroll.children[0] else { panic!("content expected") };
+        let ScreenNode::Scrollable(scroll) = &screen.children[1] else {
+            panic!("scrollable expected")
+        };
+        let ScreenNode::Column(content) = &scroll.children[0] else {
+            panic!("content expected")
+        };
         assert!(content.layout.fit_content);
         assert_eq!(content.layout.height, None);
         assert_eq!(content.children.len(), 128);
         for row in &content.children {
-            let ScreenNode::Column(row) = row else { panic!("row expected") };
+            let ScreenNode::Column(row) = row else {
+                panic!("row expected")
+            };
             assert!(row.layout.fit_content);
             assert_eq!(row.children.len(), 2);
         }
-        assert!(matches!(&screen.children[2], ScreenNode::ImageButton(button) if button.on_click.is_some() && button.layout.left == Some(2260.0)));
+        assert!(
+            matches!(&screen.children[2], ScreenNode::ImageButton(button) if button.on_click.is_some() && button.layout.left == Some(2260.0))
+        );
     }
 
     #[test]
@@ -2909,15 +3095,24 @@ mod tests {
             "import ui.widgets.*; global var count = 1; canvas { richText(\"{ruby:reader}Alice{/ruby}\").reveal(count) }",
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("rich text builds");
-        let ScreenNode::Text(text) = &screen.children[0] else { panic!("expected text") };
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("expected text")
+        };
         assert_eq!(text.text, "{ruby:reader}Alice{/ruby}");
         assert!(text.layout.rich_text);
         assert_eq!(text.layout.text_reveal, Some(1));
         assert!(text.layout.reactive_text_reveal.is_some());
-        assert!(evaluate_ui_component_named_with_args(
-            "memory://invalid.ui.hks", "import ui.widgets.*; canvas { richText(\"{ruby:reader}Alice\") }",
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).is_err());
+        assert!(
+            evaluate_ui_component_named_with_args(
+                "memory://invalid.ui.hks",
+                "import ui.widgets.*; canvas { richText(\"{ruby:reader}Alice\") }",
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+                &[],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3043,21 +3238,34 @@ mod tests {
 
     #[test]
     fn button_keeps_authored_text_color_and_shadow() {
-        let evaluate = |source: &str| evaluate_ui_component_named_with_args(
-            "memory://typography.ui.hks", source, UiContext::default(),
-            &TextureCatalog::default(), &TermCatalog::default(), &[],
-        );
-        let screen = evaluate(r#"
+        let evaluate = |source: &str| {
+            evaluate_ui_component_named_with_args(
+                "memory://typography.ui.hks",
+                source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+                &[],
+            )
+        };
+        let screen = evaluate(
+            r#"
             import ui.widgets.*
             canvas {
                 button { text("Alice").color(0.2, 0.3, 0.4, 1).textShadow(false) }
                 text("Bob").textShadow(false).fitText()
             }
-        "#).expect("authored typography");
-        let ScreenNode::Button(button) = &screen.children[0] else { panic!("expected button"); };
+        "#,
+        )
+        .expect("authored typography");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected button");
+        };
         assert_eq!(button.color, Some([0.2, 0.3, 0.4, 1.0]));
         assert_eq!(button.layout.text_shadow, Some(false));
-        let ScreenNode::Text(text) = &screen.children[1] else { panic!("expected text"); };
+        let ScreenNode::Text(text) = &screen.children[1] else {
+            panic!("expected text");
+        };
         assert_eq!(text.layout.text_shadow, Some(false));
         assert!(text.layout.text_fit);
         assert!(evaluate("import ui.widgets.*; canvas { column {}.fitText() }").is_err());
@@ -3204,10 +3412,16 @@ mod tests {
         let screen = evaluate_ui_component_named_with_args(
             "memory://alice.ui.hks",
             "import ui.widgets.*; canvas { text(\"Alice\").width(400) }.allowOverlay(\"tools\")",
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("screen policy compiles");
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("screen policy compiles");
         assert_eq!(screen.allowed_overlays, ["tools"]);
-        let ScreenNode::Text(text) = &screen.children[0] else { panic!("expected text") };
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("expected text")
+        };
         assert_eq!(text.layout.width, Some(400.0));
         assert_eq!(text.layout.height, None);
     }
@@ -3221,13 +3435,21 @@ mod tests {
                     button { row { text("Alice") }.size(.fit()) }.size(.fit())
                 }.pauseScene(true)
             "#,
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("intrinsic button");
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("intrinsic button");
         assert!(screen.pauses_scene);
-        let ScreenNode::Button(button) = &screen.children[0] else { panic!("button") };
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("button")
+        };
         assert!(button.layout.fit_content);
         assert_eq!(button.padding_x, Some(0.0));
-        let ScreenNode::Row(row) = &button.children[0] else { panic!("row") };
+        let ScreenNode::Row(row) = &button.children[0] else {
+            panic!("row")
+        };
         assert!(row.layout.fit_content);
     }
 
@@ -3370,14 +3592,30 @@ screen {
     #[test]
     fn restored_record_fields_keep_numeric_comparison_types_in_ui() {
         let source = "import ui.widgets.*\nscreen { if progress.version > 0 { text(\"Alice\") } }";
-        let context = UiContext::new(BTreeMap::from([("progress".into(), StoredValue::Map(
-            BTreeMap::from([("version".into(), StoredValue::Int(1))])
-        ))]));
-        let screen = evaluate_ui_component_named("memory://record.ui.hks", source, context,
-            &TextureCatalog::default(), &TermCatalog::default()).expect("numeric fields compile");
+        let context = UiContext::new(BTreeMap::from([(
+            "progress".into(),
+            StoredValue::Map(BTreeMap::from([("version".into(), StoredValue::Int(1))])),
+        )]));
+        let screen = evaluate_ui_component_named(
+            "memory://record.ui.hks",
+            source,
+            context,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("numeric fields compile");
         assert_eq!(screen.children.len(), 1);
-        assert!(evaluate_ui_component_named("memory://record.ui.hks", source, UiContext::default(),
-            &TextureCatalog::default(), &TermCatalog::default()).is_err(), "missing saved state must not become dynamically truthy");
+        assert!(
+            evaluate_ui_component_named(
+                "memory://record.ui.hks",
+                source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default()
+            )
+            .is_err(),
+            "missing saved state must not become dynamically truthy"
+        );
     }
 
     #[test]
@@ -3693,7 +3931,8 @@ canvas {
             UiContext::default(),
             &TextureCatalog::default(),
             &TermCatalog::default(),
-        ).expect("custom button renders");
+        )
+        .expect("custom button renders");
         let ScreenNode::Button(button) = &screen.children[0] else {
             panic!("expected custom-content button");
         };
@@ -3702,7 +3941,10 @@ canvas {
         assert_eq!(button.pressed_background, Some([1.0; 4]));
         assert_eq!(button.hover_scale, 1.0);
         assert_eq!(button.press_scale, 1.0);
-        assert!(matches!(button.children.as_slice(), [ScreenNode::Column(_)]));
+        assert!(matches!(
+            button.children.as_slice(),
+            [ScreenNode::Column(_)]
+        ));
     }
 
     #[test]
@@ -3881,16 +4123,18 @@ global fn viewer(imageName: String, title: String) -> UiNode {
             "#,
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("projected material UI compiles");
-        let ScreenNode::Image(image)=&screen.children[0] else { panic!("image node") };
-        let shader=image.layout.shader.as_ref().expect("shader spec");
-        assert_eq!(shader.blend,crate::ui::UiShaderBlend::Multiply);
-        assert_eq!(shader.path,"memory://screens/shaders/fade.wgsl");
-        assert_eq!(shader.keys.len(),2);
+        let ScreenNode::Image(image) = &screen.children[0] else {
+            panic!("image node")
+        };
+        let shader = image.layout.shader.as_ref().expect("shader spec");
+        assert_eq!(shader.blend, crate::ui::UiShaderBlend::Multiply);
+        assert_eq!(shader.path, "memory://screens/shaders/fade.wgsl");
+        assert_eq!(shader.keys.len(), 2);
     }
 
     #[test]
     fn typed_collection_arguments_render_and_callbacks_capture_the_selected_record() {
-        let source=r#"import ui.widgets.*
+        let source = r#"import ui.widgets.*
             fn part(span: .{ text: String, id: String }) -> UiNode {
                 button { text(span.text) }.onClick { ui.close(span.id) }
             }
@@ -3910,16 +4154,42 @@ global fn viewer(imageName: String, title: String) -> UiNode {
                     }
                 } }
             }"#;
-        let arguments=[StoredValue::Array(vec![StoredValue::Array(vec![StoredValue::Map(BTreeMap::from([
-            ("text".into(),StoredValue::String("Alice".into())),
-            ("id".into(),StoredValue::String("bob".into())),
-        ]))])])];
-        let screen=evaluate_ui_component_named_with_args("memory://list.ui.hks",source,UiContext::default(),&TextureCatalog::default(),&TermCatalog::default(),&arguments).expect("typed rows render");
-        let ScreenNode::Column(column)=&screen.children[0] else { panic!("column") };
-        let ScreenNode::Row(row)=&column.children[0] else { panic!("row") };
-        let ScreenNode::Button(button)=&row.children[0] else { panic!("button") };
-        let (effects, _)=evaluate_ui_callback(button.on_click.as_ref().expect("callback"),&screen.composition.as_ref().expect("composition").globals,&crate::ui::UiModels::default()).expect("captured record callback");
-        assert_eq!(effects,vec![UiEffect::CloseUi { value:Value::String("bob".into()) }]);
+        let arguments = [StoredValue::Array(vec![StoredValue::Array(vec![
+            StoredValue::Map(BTreeMap::from([
+                ("text".into(), StoredValue::String("Alice".into())),
+                ("id".into(), StoredValue::String("bob".into())),
+            ])),
+        ])])];
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://list.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &arguments,
+        )
+        .expect("typed rows render");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("column")
+        };
+        let ScreenNode::Row(row) = &column.children[0] else {
+            panic!("row")
+        };
+        let ScreenNode::Button(button) = &row.children[0] else {
+            panic!("button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("callback"),
+            &screen.composition.as_ref().expect("composition").globals,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("captured record callback");
+        assert_eq!(
+            effects,
+            vec![UiEffect::CloseUi {
+                value: Value::String("bob".into())
+            }]
+        );
     }
 
     #[test]
@@ -3935,9 +4205,21 @@ global fn viewer(imageName: String, title: String) -> UiNode {
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("confirmation and keyframes compile");
         assert_eq!(screen.fade_seconds, 0.2);
-        let ScreenNode::Button(button) = &screen.children[0] else { panic!("confirmation button") };
-        let (effects, _) = evaluate_ui_callback(button.on_click.as_ref().expect("callback"), &screen.composition.as_ref().expect("composition").globals, &crate::ui::UiModels::default()).expect("completion callback");
-        assert_eq!(effects, vec![UiEffect::CompleteUi { value: Value::String("bob".into()) }]);
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("confirmation button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("callback"),
+            &screen.composition.as_ref().expect("composition").globals,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("completion callback");
+        assert_eq!(
+            effects,
+            vec![UiEffect::CompleteUi {
+                value: Value::String("bob".into())
+            }]
+        );
     }
 
     #[test]
@@ -3958,24 +4240,72 @@ global fn viewer(imageName: String, title: String) -> UiNode {
                     }
                 }.pauseTimers(selected).after(2) { ui.close("") }
             "#,
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("confirmation UI");
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("confirmation UI");
         let composition = screen.composition.as_ref().expect("composition");
-        let ScreenNode::Button(button) = &screen.children[0] else { panic!("select button") };
-        let (effects, selected) = evaluate_ui_callback(button.on_click.as_ref().expect("click"), &composition.globals, &crate::ui::UiModels::default()).expect("select");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("select button")
+        };
+        let (effects, selected) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("click"),
+            &composition.globals,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("select");
         assert!(effects.is_empty());
-        let paused = composition.render(&selected, &TextureCatalog::default(), &TermCatalog::default()).expect("confirmation tree");
+        let paused = composition
+            .render(
+                &selected,
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("confirmation tree");
         assert!(paused.timers_paused);
-        let ScreenNode::Button(confirm) = &paused.children[0] else { panic!("confirm") };
+        let ScreenNode::Button(confirm) = &paused.children[0] else {
+            panic!("confirm")
+        };
         assert_eq!(confirm.padding_x, Some(0.0));
         assert!(confirm.background_texture.is_some());
         assert!(confirm.hovered_background_texture.is_some());
-        let (effects, _) = evaluate_ui_callback(confirm.on_click.as_ref().expect("confirm handler"), &selected, &crate::ui::UiModels::default()).expect("confirm");
-        assert_eq!(effects, vec![UiEffect::StopVoice, UiEffect::CloseUi { value: Value::String("alice".into()) }]);
-        let ScreenNode::Button(cancel) = &paused.children[1] else { panic!("cancel") };
-        let (effects, resumed) = evaluate_ui_callback(cancel.on_click.as_ref().expect("cancel handler"), &selected, &crate::ui::UiModels::default()).expect("cancel");
-        assert!(effects.is_empty(), "cancel does not close or reopen the modal");
-        let resumed = composition.render(&resumed, &TextureCatalog::default(), &TermCatalog::default()).expect("resumed tree");
+        let (effects, _) = evaluate_ui_callback(
+            confirm.on_click.as_ref().expect("confirm handler"),
+            &selected,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("confirm");
+        assert_eq!(
+            effects,
+            vec![
+                UiEffect::StopVoice,
+                UiEffect::CloseUi {
+                    value: Value::String("alice".into())
+                }
+            ]
+        );
+        let ScreenNode::Button(cancel) = &paused.children[1] else {
+            panic!("cancel")
+        };
+        let (effects, resumed) = evaluate_ui_callback(
+            cancel.on_click.as_ref().expect("cancel handler"),
+            &selected,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("cancel");
+        assert!(
+            effects.is_empty(),
+            "cancel does not close or reopen the modal"
+        );
+        let resumed = composition
+            .render(
+                &resumed,
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("resumed tree");
         assert!(!resumed.timers_paused);
     }
 
@@ -4033,18 +4363,43 @@ global fn card(label: String, count: Int) -> UiNode {
             }
         "#;
         for mask in 0u32..256 {
-            let args = (0..8).map(|i| StoredValue::Bool(mask & (1 << i) != 0)).collect::<Vec<_>>();
-            let screen = evaluate_ui_component_named_with_args("memory://rooms.ui.hks", source,
-                UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &args)
-                .expect("availability UI builds");
-            let remaining = ["north", "south", "east", "west", "upper", "lower", "inner", "outer"].into_iter().enumerate()
-                .filter(|(i, _)| mask & (1 << i) == 0).map(|(_, name)| name).collect::<Vec<_>>();
+            let args = (0..8)
+                .map(|i| StoredValue::Bool(mask & (1 << i) != 0))
+                .collect::<Vec<_>>();
+            let screen = evaluate_ui_component_named_with_args(
+                "memory://rooms.ui.hks",
+                source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+                &args,
+            )
+            .expect("availability UI builds");
+            let remaining = [
+                "north", "south", "east", "west", "upper", "lower", "inner", "outer",
+            ]
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) == 0)
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>();
             assert_eq!(screen.children.len(), remaining.len());
             for (node, id) in screen.children.iter().zip(remaining) {
-                let ScreenNode::Button(button) = node else { panic!("expected room button") };
-                let (effects, _) = evaluate_ui_callback(button.on_click.as_ref().expect("selection callback"),
-                    &BTreeMap::new(), &crate::ui::UiModels::default()).expect("select room");
-                assert_eq!(effects, [UiEffect::CloseUi { value: Value::String(id.into()) }]);
+                let ScreenNode::Button(button) = node else {
+                    panic!("expected room button")
+                };
+                let (effects, _) = evaluate_ui_callback(
+                    button.on_click.as_ref().expect("selection callback"),
+                    &BTreeMap::new(),
+                    &crate::ui::UiModels::default(),
+                )
+                .expect("select room");
+                assert_eq!(
+                    effects,
+                    [UiEffect::CloseUi {
+                        value: Value::String(id.into())
+                    }]
+                );
             }
         }
     }

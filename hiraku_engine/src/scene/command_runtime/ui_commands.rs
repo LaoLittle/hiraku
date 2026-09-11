@@ -58,7 +58,11 @@ pub(super) fn dispatch_ui_command(
                 screen_state.waiting = None;
             }
         }
-        UiCommand::ShowOverlay { name, screen, lifetime } => {
+        UiCommand::ShowOverlay {
+            name,
+            screen,
+            lifetime,
+        } => {
             if let Some(root) = overlay_state.roots.remove(&name) {
                 commands.entity(root).try_despawn();
             }
@@ -68,9 +72,11 @@ pub(super) fn dispatch_ui_command(
                 .entity(spawned.root)
                 .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z + 10)));
             if let Some(seconds) = lifetime {
-                commands.entity(spawned.root).insert(super::super::screen_ui::OverlayLifetime(
-                    Timer::from_seconds(seconds, TimerMode::Once),
-                ));
+                commands
+                    .entity(spawned.root)
+                    .insert(super::super::screen_ui::OverlayLifetime(
+                        Timer::from_seconds(seconds, TimerMode::Once),
+                    ));
             }
             overlay_state.roots.insert(name, spawned.root);
         }

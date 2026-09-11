@@ -1,7 +1,7 @@
 //! Project-owned durable flags, deliberately outside SaveGameData.
-use hiraku_storage::{BufferedStorage as PlatformStorage, StorageError};
 #[cfg(test)]
 use hiraku_storage::ByteStorage;
+use hiraku_storage::{BufferedStorage as PlatformStorage, StorageError};
 
 pub(super) fn backend() -> PlatformStorage {
     PlatformStorage::new(

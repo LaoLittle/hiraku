@@ -56,6 +56,11 @@ struct HdpArchiveState {
 pub struct HdpArchiveStore(Arc<OnceLock<Arc<HdpArchiveState>>>);
 
 impl HdpArchiveStore {
+    pub fn resident_bytes(&self) -> usize {
+        self.0
+            .get()
+            .map_or(0, |state| state.archive.resident_bytes())
+    }
     pub fn publish(
         &self,
         archive: Arc<Archive>,

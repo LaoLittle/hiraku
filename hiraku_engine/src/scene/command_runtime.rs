@@ -160,8 +160,18 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
     while crate::storage::storage_ready() {
         // Inspect without consuming the command: its sequence and the caller
         // remain intact throughout asynchronous preload.
-        if let Some(SequencedScriptCommand { command: ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation)), .. }) = pending_script_commands.items.front() {
-            let target = vfs.0.resolve_path(navigation.origin.as_deref().or(script_runtime.current_script.as_deref()), &navigation.path);
+        if let Some(SequencedScriptCommand {
+            command: ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation)),
+            ..
+        }) = pending_script_commands.items.front()
+        {
+            let target = vfs.0.resolve_path(
+                navigation
+                    .origin
+                    .as_deref()
+                    .or(script_runtime.current_script.as_deref()),
+                &navigation.path,
+            );
             let mut required = vec![target];
             if navigation.kind == NavigationKind::Call {
                 required.extend(script_runtime.current_script.iter().cloned());
@@ -179,7 +189,9 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 Ok(true) => (),
             }
         }
-        let Some(queued) = pending_script_commands.dispatch_next() else { break; };
+        let Some(queued) = pending_script_commands.dispatch_next() else {
+            break;
+        };
         redraw.request();
         let command = queued.command;
         if screen_state.active_root.is_some()
@@ -191,7 +203,13 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
 
         match command {
             ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)) => {
-                if let Err(error) = save_runtime_slot(&slot, &script_runtime, &shared_state, &[]) {
+                if let Err(error) = save_runtime_slot(
+                    &slot,
+                    &script_runtime,
+                    &shared_state,
+                    &[],
+                    &dialogue_history.entries,
+                ) {
                     warn!("failed to save slot `{slot}`: {error}");
                 }
             }
@@ -205,9 +223,14 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
             }
             ScriptCommand::Stage(StageCommand::Spatial(mut command)) => {
                 if let crate::stage::runtime::StageCommand::Open { path, .. } = &mut command {
-                    *path = vfs.0.resolve_path(script_runtime.current_script.as_deref(), path);
+                    *path = vfs
+                        .0
+                        .resolve_path(script_runtime.current_script.as_deref(), path);
                 }
-                if let Err(error) = crate::stage::runtime::StageSnapshot::apply(&mut shared_state.0.spatial_stage, command) {
+                if let Err(error) = crate::stage::runtime::StageSnapshot::apply(
+                    &mut shared_state.0.spatial_stage,
+                    command,
+                ) {
                     crate::script::emit_script_diagnostic("stage command failed", &error);
                     script_runtime.story = None;
                     return;
@@ -244,7 +267,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 if let Some(transition) = stage.transition.take() {
                     commands.entity(transition).try_despawn();
                 }
-                let image = asset_server.load(path.clone());
+                let image = crate::texture::load_static_image(&asset_server, path.clone());
                 let mut sprite = WorldSprite::from_image(image);
                 let background = if let Some(duration) = fade {
                     sprite.color = sprite.color.with_alpha(0.0);
@@ -400,7 +423,9 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     SettingsCommand::FastForward(enabled) => {
                         dialogue_state.fast_forward_enabled = *enabled;
                         dialogue_state.fast_forward_elapsed = 0.0;
-                        if *enabled { dialogue_state.auto_enabled = false; }
+                        if *enabled {
+                            dialogue_state.auto_enabled = false;
+                        }
                         continue;
                     }
                     _ => {}
@@ -548,6 +573,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                             .load_builder()
                             .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
                                 settings.is_srgb = false;
+                                settings.asset_usage = bevy::asset::RenderAssetUsages::RENDER_WORLD;
                             })
                             .load(path.clone()),
                         path,
@@ -613,12 +639,20 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         .or(script_runtime.current_script.as_deref()),
                     &navigation.path,
                 );
-                let cached = script_runtime.story.as_ref().and_then(|story| story.program_for_path(&target));
-                let prepared = cached.map(Ok).unwrap_or_else(|| vfs
-                    .0
-                    .read_text(&target)
-                    .map_err(|error| error.to_string())
-                    .and_then(|source| crate::script::compile_story_program(&vfs.0, &target, &source)))
+                let cached = script_runtime
+                    .story
+                    .as_ref()
+                    .and_then(|story| story.program_for_path(&target));
+                let prepared = cached
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        vfs.0
+                            .read_text(&target)
+                            .map_err(|error| error.to_string())
+                            .and_then(|source| {
+                                crate::script::compile_story_program(&vfs.0, &target, &source)
+                            })
+                    })
                     .and_then(|bytecode| {
                         StoryRuntime::new(bytecode).map_err(|error| error.to_string())
                     });

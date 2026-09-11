@@ -121,7 +121,9 @@ pub enum PictureCommand {
         step_seconds: f32,
     },
     Clear,
-    StopMotion { id: String },
+    StopMotion {
+        id: String,
+    },
 }
 
 #[derive(Component)]
@@ -209,19 +211,22 @@ pub(super) fn apply_picture_command(
             seconds,
         } => {
             // Only an update to the same visible image may interpolate its pose.
-            let previous = pictures.get(&id).map(|old| {
-                let mut layers = old.previous.clone();
-                if (old.path != path || old.rect != rect) && old.alpha > 0.0 {
-                    let mut frozen = old.clone();
-                    frozen.previous.clear();
-                    frozen.motion = None;
-                    frozen.fade = None;
-                    frozen.tint_tween = None;
-                    frozen.blur_tween = None;
-                    layers.push(frozen);
-                }
-                layers
-            }).unwrap_or_default();
+            let previous = pictures
+                .get(&id)
+                .map(|old| {
+                    let mut layers = old.previous.clone();
+                    if (old.path != path || old.rect != rect) && old.alpha > 0.0 {
+                        let mut frozen = old.clone();
+                        frozen.previous.clear();
+                        frozen.motion = None;
+                        frozen.fade = None;
+                        frozen.tint_tween = None;
+                        frozen.blur_tween = None;
+                        layers.push(frozen);
+                    }
+                    layers
+                })
+                .unwrap_or_default();
             let blur = pictures
                 .get(&id)
                 .map(|p| (p.blur_radius, p.blur_tween.clone()))
@@ -320,7 +325,12 @@ pub(super) fn apply_picture_command(
                 });
             }
         }
-        PictureCommand::Exit { id, position, seconds, ease } => {
+        PictureCommand::Exit {
+            id,
+            position,
+            seconds,
+            ease,
+        } => {
             if seconds <= 0.0 {
                 pictures.remove(&id);
             } else if let Some(picture) = pictures.get_mut(&id) {
@@ -328,10 +338,22 @@ pub(super) fn apply_picture_command(
                 let mut to = from;
                 to[0] = position[0];
                 to[1] = position[1];
-                picture.motion = Some(PictureMotion { from, to, elapsed: 0.0,
-                    seconds, ease, remove: false, offsets_x: Vec::new() });
-                picture.fade = Some(PictureFade { from: picture.alpha, to: 0.0,
-                    elapsed: 0.0, seconds, remove: true });
+                picture.motion = Some(PictureMotion {
+                    from,
+                    to,
+                    elapsed: 0.0,
+                    seconds,
+                    ease,
+                    remove: false,
+                    offsets_x: Vec::new(),
+                });
+                picture.fade = Some(PictureFade {
+                    from: picture.alpha,
+                    to: 0.0,
+                    elapsed: 0.0,
+                    seconds,
+                    remove: true,
+                });
             }
         }
         PictureCommand::Hide { id, seconds } => {
@@ -382,9 +404,21 @@ pub fn sync_pictures(
     canvas: Res<crate::HirakuCanvas>,
     assets: Res<AssetServer>,
     images: Res<Assets<Image>>,
-    cameras: Query<(&Transform, &Projection), (With<crate::render::camera::WorldCamera3d>, Without<PictureEntity>)>,
+    cameras: Query<
+        (&Transform, &Projection),
+        (
+            With<crate::render::camera::WorldCamera3d>,
+            Without<PictureEntity>,
+        ),
+    >,
     mut shared: ResMut<SceneSharedState>,
-    mut entities: Query<(Entity, &PictureEntity, Option<&PreviousPicture>, &mut WorldSprite, &mut Transform)>,
+    mut entities: Query<(
+        Entity,
+        &PictureEntity,
+        Option<&PreviousPicture>,
+        &mut WorldSprite,
+        &mut Transform,
+    )>,
 ) {
     let crate::state::SceneSnapshot {
         pictures, clips, ..
@@ -394,7 +428,9 @@ pub fn sync_pictures(
     let ready: HashSet<_> = entities
         .iter()
         .filter_map(|(_, marker, previous, sprite, _)| {
-            if previous.is_some() { return None; }
+            if previous.is_some() {
+                return None;
+            }
             let image = sprite.image.as_ref()?;
             let picture = pictures.get(&marker.0)?;
             (images.contains(image.id())
@@ -406,23 +442,38 @@ pub fn sync_pictures(
         })
         .collect();
     pictures.retain(|id, picture| {
-        if picture.fade.is_some() || picture.motion.is_some() || picture.tint_tween.is_some()
-            || picture.blur_tween.is_some() || !ready.contains(id) {
+        if picture.fade.is_some()
+            || picture.motion.is_some()
+            || picture.tint_tween.is_some()
+            || picture.blur_tween.is_some()
+            || !ready.contains(id)
+        {
             redraw.request();
         }
         // Exit is independent of image readiness: hiding an unloaded image
         // must not retain it forever or wait for a failed download.
         let exiting = picture.fade.as_ref().is_some_and(|fade| fade.remove);
-        if !ready.contains(id) && !exiting { return true; }
+        if !ready.contains(id) && !exiting {
+            return true;
+        }
         let keep = tick_picture(picture, time.delta_secs());
-        if picture.fade.is_none() && picture.motion.is_none() { picture.previous.clear(); }
+        if picture.fade.is_none() && picture.motion.is_none() {
+            picture.previous.clear();
+        }
         keep
     });
-    let render_pictures: BTreeMap<_, _> = pictures.iter().flat_map(|(id, picture)| {
-        std::iter::once(((id.clone(), None), picture)).chain(
-            picture.previous.iter().enumerate().map(move |(i, p)| ((id.clone(), Some(i)), p))
-        )
-    }).collect();
+    let render_pictures: BTreeMap<_, _> = pictures
+        .iter()
+        .flat_map(|(id, picture)| {
+            std::iter::once(((id.clone(), None), picture)).chain(
+                picture
+                    .previous
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, p)| ((id.clone(), Some(i)), p)),
+            )
+        })
+        .collect();
     let mut existing = HashSet::new();
     for (entity, marker, previous, mut sprite, mut transform) in &mut entities {
         let key = (marker.0.clone(), previous.map(|p| p.0));
@@ -448,7 +499,10 @@ pub fn sync_pictures(
             .and_then(|image| image.path())
             .is_some_and(|path| path.to_string() == picture.path)
         {
-            sprite.image = Some(assets.load(picture.path.clone()));
+            sprite.image = Some(crate::texture::load_static_image(
+                &assets,
+                picture.path.clone(),
+            ));
         }
         if sprite.rect != picture.rect {
             sprite.rect = picture.rect;
@@ -474,8 +528,14 @@ pub fn sync_pictures(
             *transform = next;
         }
     }
-    for ((id, previous), picture) in render_pictures.iter().filter(|(key, _)| !existing.contains(*key)) {
-        let mut sprite = WorldSprite::from_image(assets.load(picture.path.clone()));
+    for ((id, previous), picture) in render_pictures
+        .iter()
+        .filter(|(key, _)| !existing.contains(*key))
+    {
+        let mut sprite = WorldSprite::from_image(crate::texture::load_static_image(
+            &assets,
+            picture.path.clone(),
+        ));
         sprite.custom_size = picture.size.map(Vec2::from_array);
         sprite.slice = picture.slice;
         sprite.clip = clips.picture(id);
@@ -484,11 +544,13 @@ pub fn sync_pictures(
         sprite.color = picture_color(picture);
         let mut transform = picture_transform(picture, canvas.size.as_vec2());
         if let Some(index) = previous {
-            transform.translation.z = pictures[id].layer - (pictures[id].previous.len() - index) as f32 * 0.001;
+            transform.translation.z =
+                pictures[id].layer - (pictures[id].previous.len() - index) as f32 * 0.001;
         }
         if picture.screen_space {
             if let Ok((camera, projection)) = cameras.single() {
-                transform = screen_picture_transform(transform, canvas.size.as_vec2(), camera, projection);
+                transform =
+                    screen_picture_transform(transform, canvas.size.as_vec2(), camera, projection);
             }
         }
         let mut entity = commands.spawn((
@@ -499,7 +561,9 @@ pub fn sync_pictures(
             sprite,
             transform,
         ));
-        if let Some(index) = previous { entity.insert(PreviousPicture(*index)); }
+        if let Some(index) = previous {
+            entity.insert(PreviousPicture(*index));
+        }
     }
 }
 
@@ -575,7 +639,9 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
             picture.fade = None;
         }
     }
-    if picture.fade.is_none() && picture.motion.is_none() { picture.previous.clear(); }
+    if picture.fade.is_none() && picture.motion.is_none() {
+        picture.previous.clear();
+    }
     true
 }
 
@@ -589,7 +655,12 @@ fn picture_transform(p: &PictureState, canvas: Vec2) -> Transform {
     .with_rotation(Quat::from_rotation_z(p.rotation.to_radians()))
 }
 
-fn screen_picture_transform(mut local: Transform, canvas: Vec2, camera: &Transform, projection: &Projection) -> Transform {
+fn screen_picture_transform(
+    mut local: Transform,
+    canvas: Vec2,
+    camera: &Transform,
+    projection: &Projection,
+) -> Transform {
     // Unproject screen coordinates onto a camera-facing plane. Derive pixel
     // scale from the actual projection, covering both orthographic and perspective.
     let clip = projection.get_clip_from_view();
@@ -601,10 +672,16 @@ fn screen_picture_transform(mut local: Transform, canvas: Vec2, camera: &Transfo
     };
     let distance = -clip.inverse().project_point3(Vec3::new(0.0, 0.0, depth)).z;
     let w = (clip * Vec4::new(0.0, 0.0, -distance, 1.0)).w;
-    let pixel_scale = Vec3::new(2.0 * w / (clip.x_axis.x * canvas.x),
-        2.0 * w / (clip.y_axis.y * canvas.y), 1.0);
-    local.translation = Vec3::new(local.translation.x * pixel_scale.x,
-        local.translation.y * pixel_scale.y, -distance);
+    let pixel_scale = Vec3::new(
+        2.0 * w / (clip.x_axis.x * canvas.x),
+        2.0 * w / (clip.y_axis.y * canvas.y),
+        1.0,
+    );
+    local.translation = Vec3::new(
+        local.translation.x * pixel_scale.x,
+        local.translation.y * pixel_scale.y,
+        -distance,
+    );
     local.scale *= pixel_scale;
     camera.mul_transform(local)
 }
@@ -620,20 +697,35 @@ mod tests {
         for perspective in [false, true] {
             for zoom in [1.0, 2.0, 3.0] {
                 let mut lens = if perspective {
-                    Projection::Perspective(PerspectiveProjection { fov: 60.0_f32.to_radians() / zoom, near: 0.1, far: 100.0, ..default() })
+                    Projection::Perspective(PerspectiveProjection {
+                        fov: 60.0_f32.to_radians() / zoom,
+                        near: 0.1,
+                        far: 100.0,
+                        ..default()
+                    })
                 } else {
                     Projection::Orthographic(OrthographicProjection {
-                        scaling_mode: bevy::camera::ScalingMode::FixedVertical { viewport_height: canvas.y },
-                        scale: 1.0 / zoom, ..OrthographicProjection::default_3d()
+                        scaling_mode: bevy::camera::ScalingMode::FixedVertical {
+                            viewport_height: canvas.y,
+                        },
+                        scale: 1.0 / zoom,
+                        ..OrthographicProjection::default_3d()
                     })
                 };
                 lens.update(canvas.x, canvas.y);
-                let camera = Transform::from_xyz(-6.0, 3.0, 10.0)
-                    .with_rotation(Quat::from_euler(EulerRot::XYZ, 0.1, -0.2, 0.3));
+                let camera = Transform::from_xyz(-6.0, 3.0, 10.0).with_rotation(Quat::from_euler(
+                    EulerRot::XYZ,
+                    0.1,
+                    -0.2,
+                    0.3,
+                ));
                 let sprite = screen_picture_transform(local, canvas, &camera, &lens);
                 let clip = lens.get_clip_from_view() * camera.to_matrix().inverse();
                 let center = clip.project_point3(sprite.translation);
-                assert!(center.z > 0.0 && center.z < 1.0, "overlay must not be clipped");
+                assert!(
+                    center.z > 0.0 && center.z < 1.0,
+                    "overlay must not be clipped"
+                );
                 let right = clip.project_point3(sprite.transform_point(Vec3::X));
                 assert!((center.x - 2.0 * local.translation.x / canvas.x).abs() < 0.00001);
                 assert!((center.y - 2.0 * local.translation.y / canvas.y).abs() < 0.00001);
@@ -646,15 +738,23 @@ mod tests {
     fn atomic_exit_survives_restore_and_large_fast_forward_steps() {
         let mut pictures = shown();
         tick_picture(pictures.get_mut("room").expect("picture"), 0.3);
-        apply_picture_command(&mut pictures, PictureCommand::Exit {
-            id: "room".into(), position: [20.0, 30.0], seconds: 0.4, ease: "easeInQuad".into(),
-        }).expect("one exit owns movement and removal");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Exit {
+                id: "room".into(),
+                position: [20.0, 30.0],
+                seconds: 0.4,
+                ease: "easeInQuad".into(),
+            },
+        )
+        .expect("one exit owns movement and removal");
         let picture = pictures.get_mut("room").expect("exiting picture");
         assert!(tick_picture(picture, 0.2));
         assert_eq!(picture.alpha, 0.5);
         assert_eq!(picture.position, [65.0, -18.75]);
         let saved = hiraku_script::hson::to_string(picture).expect("save exit");
-        let mut restored: PictureState = hiraku_script::hson::from_str(&saved).expect("restore exit");
+        let mut restored: PictureState =
+            hiraku_script::hson::from_str(&saved).expect("restore exit");
         assert!(!tick_picture(&mut restored, 1.0));
         // Nothing remains scheduled to address this identity after removal.
         assert_eq!(restored.alpha, 0.0);
@@ -666,11 +766,26 @@ mod tests {
         tick_picture(pictures.get_mut("room").expect("shown picture"), 1.0);
         let before = pictures["room"].clone();
         assert_eq!(before.alpha, 1.0);
-        apply_picture_command(&mut pictures, PictureCommand::Hide { id: "room".into(), seconds: 0.4 }).expect("exit fade");
-        apply_picture_command(&mut pictures, PictureCommand::Transform {
-            id: "room".into(), position: [None, Some(before.position[1] - 10.0)],
-            scale: None, rotation: None, seconds: 0.4, ease: "easeInQuad".into(),
-        }).expect("exit movement");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Hide {
+                id: "room".into(),
+                seconds: 0.4,
+            },
+        )
+        .expect("exit fade");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [None, Some(before.position[1] - 10.0)],
+                scale: None,
+                rotation: None,
+                seconds: 0.4,
+                ease: "easeInQuad".into(),
+            },
+        )
+        .expect("exit movement");
         let picture = pictures.get_mut("room").expect("exiting picture");
         assert!(tick_picture(picture, 0.2));
         assert!((picture.position[1] - (before.position[1] - 2.5)).abs() < 0.001);
@@ -685,17 +800,37 @@ mod tests {
     #[test]
     fn scale_after_cancel_uses_displayed_pose_and_restores_without_reshowing() {
         let mut pictures = shown();
-        apply_picture_command(&mut pictures, PictureCommand::Transform {
-            id: "room".into(), position: [Some(20.0), None], scale: None, rotation: None,
-            seconds: 2.0, ease: "linear".into(),
-        }).expect("start motion");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [Some(20.0), None],
+                scale: None,
+                rotation: None,
+                seconds: 2.0,
+                ease: "linear".into(),
+            },
+        )
+        .expect("start motion");
         tick_picture(pictures.get_mut("room").expect("picture"), 0.4);
-        apply_picture_command(&mut pictures, PictureCommand::StopMotion { id: "room".into() }).expect("cancel");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::StopMotion { id: "room".into() },
+        )
+        .expect("cancel");
         let before = pictures["room"].clone();
-        apply_picture_command(&mut pictures, PictureCommand::Transform {
-            id: "room".into(), position: [None; 2], scale: Some(1.5), rotation: Some(20.0),
-            seconds: 2.0, ease: "easeOutQuad".into(),
-        }).expect("retarget only scale and rotation");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [None; 2],
+                scale: Some(1.5),
+                rotation: Some(20.0),
+                seconds: 2.0,
+                ease: "easeOutQuad".into(),
+            },
+        )
+        .expect("retarget only scale and rotation");
         let picture = pictures.get_mut("room").expect("picture");
         assert_eq!(picture.position, before.position);
         assert_eq!(picture.path, before.path);
@@ -720,10 +855,18 @@ mod tests {
         expected.scale = 2.0;
         expected.position[1] = 25.0;
         expected.motion = None;
-        apply_picture_command(&mut pictures, PictureCommand::Transform {
-            id: "room".into(), position: [None, Some(25.0)], scale: Some(2.0), rotation: None,
-            seconds: 0.0, ease: "linear".into(),
-        }).expect("immediate transform");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [None, Some(25.0)],
+                scale: Some(2.0),
+                rotation: None,
+                seconds: 0.0,
+                ease: "linear".into(),
+            },
+        )
+        .expect("immediate transform");
         assert_eq!(pictures["room"], expected);
     }
 
@@ -731,15 +874,24 @@ mod tests {
     fn smoothstep_motion_restores_without_changing_its_curve() {
         let mut pictures = shown();
         let origin = pictures["room"].position;
-        apply_picture_command(&mut pictures, PictureCommand::Transform {
-            id: "room".into(), position: [origin[0], origin[1] + 8.0].map(Some), scale: None, rotation: None,
-            seconds: 1.0, ease: "smoothStep".into(),
-        }).expect("move");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [origin[0], origin[1] + 8.0].map(Some),
+                scale: None,
+                rotation: None,
+                seconds: 1.0,
+                ease: "smoothStep".into(),
+            },
+        )
+        .expect("move");
         let picture = pictures.get_mut("room").expect("picture");
         tick_picture(picture, 0.25);
         assert!((picture.position[1] - origin[1] - 1.25).abs() < 0.001);
         let bytes = hiraku_script::hson::to_vec(picture).expect("serialize motion");
-        let mut restored: PictureState = hiraku_script::hson::from_slice(&bytes).expect("restore motion");
+        let mut restored: PictureState =
+            hiraku_script::hson::from_slice(&bytes).expect("restore motion");
         tick_picture(picture, 0.75);
         tick_picture(&mut restored, 0.75);
         assert_eq!(picture, &restored);
@@ -922,21 +1074,38 @@ mod tests {
     #[test]
     fn stopping_motion_preserves_pose_and_independent_fade() {
         let mut pictures = shown();
-        apply_picture_command(&mut pictures, PictureCommand::Transform {
-            id: "room".into(), position: [20.0, 25.0].map(Some), scale: None, rotation: None, seconds: 1.0, ease: "linear".into(),
-        }).expect("start movement");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [20.0, 25.0].map(Some),
+                scale: None,
+                rotation: None,
+                seconds: 1.0,
+                ease: "linear".into(),
+            },
+        )
+        .expect("start movement");
         tick_picture(pictures.get_mut("room").expect("picture exists"), 0.25);
         let before = pictures["room"].clone();
         assert!(before.motion.is_some());
         assert_eq!(before.position, [65.0, -20.0]);
         assert!(before.fade.is_some());
-        apply_picture_command(&mut pictures, PictureCommand::StopMotion { id: "room".into() })
-            .expect("stop shown picture");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::StopMotion { id: "room".into() },
+        )
+        .expect("stop shown picture");
         let mut expected = before;
         expected.motion = None;
         assert_eq!(pictures["room"], expected);
-        apply_picture_command(&mut pictures, PictureCommand::StopMotion { id: "absent".into() })
-            .expect("stopping an absent picture is idempotent");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::StopMotion {
+                id: "absent".into(),
+            },
+        )
+        .expect("stopping an absent picture is idempotent");
     }
 
     #[test]
@@ -946,7 +1115,9 @@ mod tests {
             &mut pictures,
             PictureCommand::Transform {
                 id: "room".into(),
-                position: [60.0, -20.0].map(Some), scale: None, rotation: None,
+                position: [60.0, -20.0].map(Some),
+                scale: None,
+                rotation: None,
                 seconds: 0.4,
                 ease: "easeOutBack".into(),
             },
@@ -982,7 +1153,9 @@ mod tests {
             &mut pictures,
             PictureCommand::Transform {
                 id: "room".into(),
-                position: [60.0, -20.0].map(Some), scale: None, rotation: None,
+                position: [60.0, -20.0].map(Some),
+                scale: None,
+                rotation: None,
                 seconds: 1.0,
                 ease: "linear".into(),
             },
@@ -1006,7 +1179,9 @@ mod tests {
                 &mut pictures,
                 PictureCommand::Transform {
                     id: "missing".into(),
-                    position: [0.0, 0.0].map(Some), scale: None, rotation: None,
+                    position: [0.0, 0.0].map(Some),
+                    scale: None,
+                    rotation: None,
                     seconds: 1.0,
                     ease: "linear".into()
                 }
@@ -1050,17 +1225,33 @@ mod tests {
     fn immediate_hide_then_same_image_show_restarts_fade_at_new_pose() {
         let mut pictures = shown();
         tick_picture(pictures.get_mut("room").expect("initial picture"), 0.3);
-        apply_picture_command(&mut pictures, PictureCommand::Hide {
-            id: "room".into(), seconds: 0.0,
-        }).expect("remove old presentation immediately");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Hide {
+                id: "room".into(),
+                seconds: 0.0,
+            },
+        )
+        .expect("remove old presentation immediately");
         assert!(!pictures.contains_key("room"));
-        apply_picture_command(&mut pictures, PictureCommand::Show {
-            screen_space: false,
-            id: "room".into(), path: "background/room".into(),
-            size: None, slice: None, color: None, rect: None,
-            position: [-40.0, 15.0], scale: 1.0, rotation: 0.0,
-            layer: 5.0, seconds: 0.4,
-        }).expect("restart presentation");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Show {
+                screen_space: false,
+                id: "room".into(),
+                path: "background/room".into(),
+                size: None,
+                slice: None,
+                color: None,
+                rect: None,
+                position: [-40.0, 15.0],
+                scale: 1.0,
+                rotation: 0.0,
+                layer: 5.0,
+                seconds: 0.4,
+            },
+        )
+        .expect("restart presentation");
         let picture = pictures.get_mut("room").expect("replacement picture");
         assert_eq!(picture.position, [-40.0, 15.0]);
         assert_eq!(picture.alpha, 0.0);
@@ -1104,7 +1295,8 @@ mod tests {
         assert_eq!(picture.alpha, 0.5);
         assert_eq!(picture.previous[0].alpha, 1.0);
         let encoded = hiraku_script::hson::to_string(picture).expect("save replacement layers");
-        let mut restored: PictureState = hiraku_script::hson::from_str(&encoded).expect("restore replacement layers");
+        let mut restored: PictureState =
+            hiraku_script::hson::from_str(&encoded).expect("restore replacement layers");
         tick_picture(&mut restored, 0.5);
         assert!(restored.previous.is_empty());
         assert_eq!(restored.path, "pictures/bob.png");

@@ -197,7 +197,10 @@ pub(super) fn restore_scene_snapshot(
                     BackgroundLayer {
                         path: background.path.clone(),
                     },
-                    WorldSprite::from_image(asset_server.load(background.path.clone())),
+                    WorldSprite::from_image(crate::texture::load_static_image(
+                        asset_server,
+                        background.path.clone(),
+                    )),
                     Transform::from_xyz(0.0, 0.0, STAGE_Z_BACKGROUND),
                 ))
                 .id(),
@@ -211,7 +214,10 @@ pub(super) fn restore_scene_snapshot(
         if sprite.id.starts_with("character::") {
             continue;
         }
-        let mut entity_sprite = WorldSprite::from_image(asset_server.load(sprite.path.clone()));
+        let mut entity_sprite = WorldSprite::from_image(crate::texture::load_static_image(
+            asset_server,
+            sprite.path.clone(),
+        ));
         entity_sprite.color.set_alpha(sprite.alpha);
         entity_sprite.rect = sprite.rect.map(source_rect_from_corners);
         let entity = commands
@@ -274,6 +280,7 @@ pub(super) fn restore_scene_snapshot(
                         .load_builder()
                         .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
                             settings.is_srgb = false;
+                            settings.asset_usage = bevy::asset::RenderAssetUsages::RENDER_WORLD;
                         })
                         .load(path.clone()),
                     path,

@@ -42,7 +42,16 @@ pub(super) fn sync(
             Without<ViewCamera>,
         ),
     >,
-    mut cameras: Query<(&mut Camera, &mut Transform, &mut Projection, &mut bevy::camera::Exposure, Option<&AmbientLight>), With<ViewCamera>>,
+    mut cameras: Query<
+        (
+            &mut Camera,
+            &mut Transform,
+            &mut Projection,
+            &mut bevy::camera::Exposure,
+            Option<&AmbientLight>,
+        ),
+        With<ViewCamera>,
+    >,
     mut surfaces: Query<&mut WorldSprite>,
     mut redraw: crate::redraw::Redraw,
 ) {
@@ -67,22 +76,33 @@ pub(super) fn sync(
             .spawn((Transform::default(), Visibility::default()))
             .id()
     });
-    let exposure = stage.definition.as_ref().map(|d| d.camera_exposure()).unwrap_or_default();
+    let exposure = stage
+        .definition
+        .as_ref()
+        .map(|d| d.camera_exposure())
+        .unwrap_or_default();
     let ambient = stage.definition.as_ref().and_then(|d| d.ambient_brightness);
     for (name, view) in &state.views {
         let Some(preset) = &view.camera else { continue };
         let visible = view.alpha > 0.0 || view.fade.is_some();
         let next = preset.projection.projection();
         if let Some(entities) = rendered.views.get(name) {
-            if let Ok((mut camera, mut pose, mut lens, mut current_exposure, current_ambient)) = cameras.get_mut(entities.camera) {
+            if let Ok((mut camera, mut pose, mut lens, mut current_exposure, current_ambient)) =
+                cameras.get_mut(entities.camera)
+            {
                 if current_ambient.map(|light| light.brightness) != ambient {
                     if let Some(brightness) = ambient {
-                        commands.entity(entities.camera).insert(AmbientLight { brightness, ..default() });
+                        commands.entity(entities.camera).insert(AmbientLight {
+                            brightness,
+                            ..default()
+                        });
                     } else {
                         commands.entity(entities.camera).remove::<AmbientLight>();
                     }
                 }
-                if current_exposure.ev100 != exposure.ev100 { *current_exposure = exposure; }
+                if current_exposure.ev100 != exposure.ev100 {
+                    *current_exposure = exposure;
+                }
                 if camera.is_active != visible {
                     camera.is_active = visible;
                 }
@@ -95,7 +115,9 @@ pub(super) fn sync(
             }
             if let Ok(mut surface) = surfaces.get_mut(entities.surface) {
                 let clip = view.clip.plane(canvas.size.as_vec2());
-                if surface.clip_plane != clip { surface.clip_plane = clip; }
+                if surface.clip_plane != clip {
+                    surface.clip_plane = clip;
+                }
                 let color = Color::linear_rgba(1.0, 1.0, 1.0, view.alpha);
                 if surface.color != color {
                     surface.color = color;
@@ -133,7 +155,10 @@ pub(super) fn sync(
             ))
             .id();
         if let Some(brightness) = ambient {
-            commands.entity(camera).insert(AmbientLight { brightness, ..default() });
+            commands.entity(camera).insert(AmbientLight {
+                brightness,
+                ..default()
+            });
         }
         let mut sprite = WorldSprite::from_image(image.clone());
         sprite.clip_plane = view.clip.plane(canvas.size.as_vec2());

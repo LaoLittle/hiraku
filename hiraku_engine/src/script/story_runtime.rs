@@ -62,7 +62,10 @@ enum ChoiceState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoryRuntimeEvent {
-    RandomInt { min: i64, max: i64 },
+    RandomInt {
+        min: i64,
+        max: i64,
+    },
     Effect(StoryEffect),
     Wait(StoryWait),
     OpenUi {
@@ -102,6 +105,12 @@ pub struct StoryRuntimeSnapshot {
 }
 
 impl StoryRuntime {
+    pub(crate) fn has_executions(&self) -> bool {
+        self.execution.has_executions()
+    }
+    pub(crate) fn resource_positions(&self) -> Vec<(String, usize)> {
+        self.execution.resource_positions()
+    }
     pub fn program_for_path(&self, path: &str) -> Option<super::StoryProgram> {
         self.execution.program_for_path(path)
     }
@@ -797,8 +806,7 @@ fn animation_effect(effect: &StoryEffect) -> bool {
     matches!(
         effect,
         StoryEffect::Spatial(_)
-            |
-        StoryEffect::SetCamera { .. }
+            | StoryEffect::SetCamera { .. }
             | StoryEffect::SetBackground { .. }
             | StoryEffect::ShowCharacter { .. }
             | StoryEffect::HideCharacter { .. }
@@ -846,15 +854,25 @@ mod tests {
 
     #[test]
     fn random_draw_is_a_host_boundary_and_does_not_reexecute_after_resume() {
-        let code=compile_story_bytecode("memory://random.hks", "global let variant = randomInt(2, 4)\nlog(variant.toString())").expect("random signature compiles");
-        let mut runtime=StoryRuntime::new(code).expect("runtime initializes");
-        let event=loop { if let Some(event)=runtime.step().expect("advance") { break event; } };
-        assert_eq!(event,StoryRuntimeEvent::RandomInt { min:2,max:4 });
+        let code = compile_story_bytecode(
+            "memory://random.hks",
+            "global let variant = randomInt(2, 4)\nlog(variant.toString())",
+        )
+        .expect("random signature compiles");
+        let mut runtime = StoryRuntime::new(code).expect("runtime initializes");
+        let event = loop {
+            if let Some(event) = runtime.step().expect("advance") {
+                break event;
+            }
+        };
+        assert_eq!(event, StoryRuntimeEvent::RandomInt { min: 2, max: 4 });
         runtime.resume(Value::Number(3.0)).expect("host response");
         for _ in 0..20 {
-            if let Some(event)=runtime.step().expect("continue") {
-                assert!(!matches!(event,StoryRuntimeEvent::RandomInt { .. }));
-                if matches!(event,StoryRuntimeEvent::Completed(_)) { return; }
+            if let Some(event) = runtime.step().expect("continue") {
+                assert!(!matches!(event, StoryRuntimeEvent::RandomInt { .. }));
+                if matches!(event, StoryRuntimeEvent::Completed(_)) {
+                    return;
+                }
             }
         }
         panic!("story did not complete");
@@ -862,7 +880,9 @@ mod tests {
 
     #[test]
     fn modal_visits_survive_restore_before_selection_and_after_each_visit() {
-        let code = compile_story_bytecode("memory://visits.hks", r#"
+        let code = compile_story_bytecode(
+            "memory://visits.hks",
+            r#"
             global var north = false
             global var south = false
             global var east = false
@@ -878,36 +898,62 @@ mod tests {
                 "Visited"
             }
             log("complete")
-        "#).expect("typed visit loop compiles");
+        "#,
+        )
+        .expect("typed visit loop compiles");
         let names = ["north", "south", "east", "west"];
         for a in 0..4 {
             for b in 0..4 {
                 for c in 0..4 {
                     for d in 0..4 {
-                        let order = [a,b,c,d];
-                        if order.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != 4 { continue; }
+                        let order = [a, b, c, d];
+                        if order
+                            .iter()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len()
+                            != 4
+                        {
+                            continue;
+                        }
                         let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
                         let mut visited = [false; 4];
                         for room in order {
                             let event = runtime.step().expect("next map");
-                            assert!(matches!(event, Some(StoryRuntimeEvent::OpenUi { arguments, .. })
-                                if arguments == visited.map(Value::Bool).to_vec()));
-                            runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("map boundary"))
-                                .expect("restore pending map");
-                            runtime.resume(Value::String(names[room].into())).expect("select room");
+                            assert!(
+                                matches!(event, Some(StoryRuntimeEvent::OpenUi { arguments, .. })
+                                if arguments == visited.map(Value::Bool).to_vec())
+                            );
+                            runtime = StoryRuntime::restore(
+                                code.clone(),
+                                runtime.snapshot().expect("map boundary"),
+                            )
+                            .expect("restore pending map");
+                            runtime
+                                .resume(Value::String(names[room].into()))
+                                .expect("select room");
                             visited[room] = true;
                             let mut waiting = false;
                             for _ in 0..16 {
-                                if matches!(runtime.step().expect("visit dialogue"), Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))) {
-                                    waiting = true; break;
+                                if matches!(
+                                    runtime.step().expect("visit dialogue"),
+                                    Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+                                ) {
+                                    waiting = true;
+                                    break;
                                 }
                             }
                             assert!(waiting, "visit must reach dialogue");
-                            runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("dialogue boundary"))
-                                .expect("restore visited room");
+                            runtime = StoryRuntime::restore(
+                                code.clone(),
+                                runtime.snapshot().expect("dialogue boundary"),
+                            )
+                            .expect("restore visited room");
                             runtime.resume(Value::Unit).expect("leave visited room");
                         }
-                        assert!(matches!(runtime.step().expect("all rooms visited"), Some(StoryRuntimeEvent::Effect(StoryEffect::Log(s))) if s == "complete"));
+                        assert!(
+                            matches!(runtime.step().expect("all rooms visited"), Some(StoryRuntimeEvent::Effect(StoryEffect::Log(s))) if s == "complete")
+                        );
                     }
                 }
             }
@@ -917,11 +963,23 @@ mod tests {
     #[test]
     fn eight_room_visits_restore_in_both_directions_at_each_boundary() {
         let names = (0..8).map(|i| format!("visited{i}")).collect::<Vec<_>>();
-        let declarations = names.iter().map(|name| format!("global var {name} = false\n")).collect::<String>();
-        let branches = names.iter().enumerate().map(|(i, name)| format!(
-            "if room == {i} {{ if {name} {{ panic(\"duplicate\") }}; {name} = true }}\n"
-        )).collect::<String>();
-        let code = compile_story_bytecode("memory://eight-rooms.hks", &format!(r#"
+        let declarations = names
+            .iter()
+            .map(|name| format!("global var {name} = false\n"))
+            .collect::<String>();
+        let branches = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                format!(
+                    "if room == {i} {{ if {name} {{ panic(\"duplicate\") }}; {name} = true }}\n"
+                )
+            })
+            .collect::<String>();
+        let code = compile_story_bytecode(
+            "memory://eight-rooms.hks",
+            &format!(
+                r#"
             {declarations}
             global var count = 0
             while count < 8 {{
@@ -932,30 +990,51 @@ mod tests {
                 "Visited"
             }}
             log("complete")
-        "#, names.join(", "))).expect("eight-room script compiles");
+        "#,
+                names.join(", ")
+            ),
+        )
+        .expect("eight-room script compiles");
         for start in 0..8 {
             for reverse in [false, true] {
                 let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
                 let mut visited = [false; 8];
                 for step in 0..8 {
                     let room = (start + if reverse { 8 - step } else { step }) % 8;
-                    assert!(matches!(runtime.step().expect("map"), Some(StoryRuntimeEvent::OpenUi { arguments, .. })
-                        if arguments == visited.map(Value::Bool).to_vec()));
-                    runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("map snapshot")).expect("restore map");
-                    runtime.resume(Value::Number(room as f64)).expect("choose room");
+                    assert!(
+                        matches!(runtime.step().expect("map"), Some(StoryRuntimeEvent::OpenUi { arguments, .. })
+                        if arguments == visited.map(Value::Bool).to_vec())
+                    );
+                    runtime = StoryRuntime::restore(
+                        code.clone(),
+                        runtime.snapshot().expect("map snapshot"),
+                    )
+                    .expect("restore map");
+                    runtime
+                        .resume(Value::Number(room as f64))
+                        .expect("choose room");
                     visited[room] = true;
                     let mut waiting = false;
                     for _ in 0..16 {
-                        if matches!(runtime.step().expect("room dialogue"), Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))) {
+                        if matches!(
+                            runtime.step().expect("room dialogue"),
+                            Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+                        ) {
                             waiting = true;
                             break;
                         }
                     }
                     assert!(waiting);
-                    runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("room snapshot")).expect("restore room");
+                    runtime = StoryRuntime::restore(
+                        code.clone(),
+                        runtime.snapshot().expect("room snapshot"),
+                    )
+                    .expect("restore room");
                     runtime.resume(Value::Unit).expect("return to map");
                 }
-                assert!(matches!(runtime.step().expect("complete"), Some(StoryRuntimeEvent::Effect(StoryEffect::Log(message))) if message == "complete"));
+                assert!(
+                    matches!(runtime.step().expect("complete"), Some(StoryRuntimeEvent::Effect(StoryEffect::Log(message))) if message == "complete")
+                );
             }
         }
     }
@@ -1014,7 +1093,8 @@ mod tests {
     #[test]
     fn hidden_actor_sequence_commits_final_offsets_without_tween_or_deadlock() {
         for hide in ["alice.hide(0)", "scene.hideCharacters(0)"] {
-            let source = format!(r#"
+            let source = format!(
+                r#"
                 let alice = char("alice").show()
                 let jump = seq {{
                     alice.offset(.pos(0, 20)).animation(.linear(1.0))
@@ -1023,20 +1103,35 @@ mod tests {
                 {hide}
                 jump.await()
                 "Done"
-            "#);
+            "#
+            );
             let code = compile_story_bytecode("hidden.hks", &source).expect("fixture");
             let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
             let mut targets = Vec::new();
             let mut reached_dialogue = false;
             for _ in 0..128 {
                 match runtime.step().expect("hidden offsets are valid") {
-                    Some(StoryRuntimeEvent::TaskEffect { task, effect: effect @ StoryEffect::ActorMotion { .. } }) => {
-                        let StoryEffect::ActorMotion { transition, .. } = &effect else { unreachable!() };
+                    Some(StoryRuntimeEvent::TaskEffect {
+                        task,
+                        effect: effect @ StoryEffect::ActorMotion { .. },
+                    }) => {
+                        let StoryEffect::ActorMotion { transition, .. } = &effect else {
+                            unreachable!()
+                        };
                         assert_eq!(transition.animation.duration(), 0.0);
                         targets.push(transition.target);
-                        runtime = StoryRuntime::restore(code.clone(), runtime.snapshot().expect("snapshot")).expect("restore hidden sequence");
-                        assert!(matches!(runtime.step().expect("reattach"), Some(StoryRuntimeEvent::TaskEffect { .. })));
-                        runtime.complete_task_effect(task, &effect).expect("immediate completion");
+                        runtime = StoryRuntime::restore(
+                            code.clone(),
+                            runtime.snapshot().expect("snapshot"),
+                        )
+                        .expect("restore hidden sequence");
+                        assert!(matches!(
+                            runtime.step().expect("reattach"),
+                            Some(StoryRuntimeEvent::TaskEffect { .. })
+                        ));
+                        runtime
+                            .complete_task_effect(task, &effect)
+                            .expect("immediate completion");
                     }
                     Some(StoryRuntimeEvent::Wait(_)) if targets.len() == 2 => {
                         reached_dialogue = true;
@@ -1184,7 +1279,9 @@ mod tests {
 
     #[test]
     fn picture_sequence_keeps_local_noise_and_order_across_restore() {
-        let bytecode = compile_story_bytecode("sequence.hks", r#"
+        let bytecode = compile_story_bytecode(
+            "sequence.hks",
+            r#"
             let group = seq {
                 var seed: Float = 7.0
                 var pulse = 0
@@ -1199,7 +1296,9 @@ mod tests {
                 }
             }
             group.await()
-        "#).expect("sequence compiles");
+        "#,
+        )
+        .expect("sequence compiles");
         let mut runs = Vec::new();
         for restore in [false, true] {
             let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime");
@@ -1207,15 +1306,25 @@ mod tests {
             loop {
                 match runtime.step().expect("step") {
                     Some(StoryRuntimeEvent::TaskEffect { task, effect }) => {
-                        let StoryEffect::Picture(crate::scene::pictures::PictureCommand::Transform { position, .. }) = &effect else {
+                        let StoryEffect::Picture(
+                            crate::scene::pictures::PictureCommand::Transform { position, .. },
+                        ) = &effect
+                        else {
                             panic!("expected a picture move, got {effect:?}");
                         };
-                        positions.push(position.map(|value| value.expect("both movement axes are specified")));
+                        positions.push(
+                            position.map(|value| value.expect("both movement axes are specified")),
+                        );
                         assert_eq!(runtime.step().expect("waiting"), None);
-                        runtime.complete_task_effect(task, &effect).expect("animation finishes");
+                        runtime
+                            .complete_task_effect(task, &effect)
+                            .expect("animation finishes");
                         if restore && positions.len() == 4 {
-                            runtime = StoryRuntime::restore(bytecode.clone(), runtime.snapshot().expect("snapshot"))
-                                .expect("restore local state");
+                            runtime = StoryRuntime::restore(
+                                bytecode.clone(),
+                                runtime.snapshot().expect("snapshot"),
+                            )
+                            .expect("restore local state");
                         }
                     }
                     Some(StoryRuntimeEvent::Completed(_)) => break,
@@ -1510,13 +1619,17 @@ mod tests {
         let bytecode = compile_story_bytecode(
             "notification.hks",
             "ui.mountFor(\"notice\", \"ui/notice.ui.hks\", 3.0)",
-        ).expect("timed mount must compile");
+        )
+        .expect("timed mount must compile");
         let mut runtime = StoryRuntime::new(bytecode).expect("runtime must initialize");
-        assert_eq!(runtime.step().expect("mount must run"), Some(
-            StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
-                name: "notice".into(), component: "ui/notice.ui.hks".into(), lifetime: Some(3.0),
-            }),
-        ));
+        assert_eq!(
+            runtime.step().expect("mount must run"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
+                name: "notice".into(),
+                component: "ui/notice.ui.hks".into(),
+                lifetime: Some(3.0),
+            }),)
+        );
     }
 
     #[test]

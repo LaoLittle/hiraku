@@ -194,13 +194,22 @@ impl StageDefinition {
                 return Err(format!("invalid stage light `{name}`"));
             }
         }
-        if self.light_source_radius.is_some_and(|v| !v.is_finite() || v < 0.0) {
+        if self
+            .light_source_radius
+            .is_some_and(|v| !v.is_finite() || v < 0.0)
+        {
             return Err("lightSourceRadius must be finite and non-negative".into());
         }
-        if self.ambient_brightness.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        if self
+            .ambient_brightness
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
             return Err("ambientBrightness must be finite and non-negative".into());
         }
-        if self.exposure.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        if self
+            .exposure
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
             return Err("exposure must be finite and greater than zero".into());
         }
         if self
@@ -230,9 +239,12 @@ impl StageDefinition {
     }
 
     pub(super) fn camera_exposure(&self) -> bevy::camera::Exposure {
-        self.exposure.map_or_else(bevy::camera::Exposure::default, |value| bevy::camera::Exposure {
-            ev100: -((value as f64) * 1.2).log2() as f32,
-        })
+        self.exposure
+            .map_or_else(bevy::camera::Exposure::default, |value| {
+                bevy::camera::Exposure {
+                    ev100: -((value as f64) * 1.2).log2() as f32,
+                }
+            })
     }
 }
 
@@ -268,7 +280,10 @@ mod tests {
     #[test]
     fn linear_exposure_preserves_units_and_rejects_invalid_values() {
         let mut stage: StageDefinition = hiraku_script::hson::from_str(SOURCE).expect("stage");
-        assert_eq!(stage.camera_exposure().ev100, bevy::camera::Exposure::default().ev100);
+        assert_eq!(
+            stage.camera_exposure().ev100,
+            bevy::camera::Exposure::default().ev100
+        );
         for factor in [0.25, 1.0, 4.0] {
             stage.exposure = Some(factor);
             stage.validate().expect("positive exposure");

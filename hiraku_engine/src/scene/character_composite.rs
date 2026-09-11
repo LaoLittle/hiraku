@@ -14,7 +14,7 @@ pub(crate) struct CharacterGroup {
     display: Option<Entity>,
     atlas: Option<Handle<TextureAtlasLayout>>,
     error: Option<String>,
-    hidden_seconds: f32,
+    last_active_revision: u64,
 }
 struct GroupTween {
     from: f32,
@@ -41,35 +41,56 @@ fn install_runtime_systems(app: &mut App) {
         PostUpdate,
         (advance_group_fades, compose_groups, retire_hidden_groups)
             .chain()
+            .after(crate::dependencies::update_resource_window)
             // Stage resources are created only after runtime content has loaded.
             .run_if(crate::runtime_initialized)
             .before(Sprite3dSync),
     );
 }
 
-/// Short reuse window for hide/show cuts; persistent actor state lives in the
+/// Execution-based reuse window for hide/show cuts; persistent actor state lives in the
 /// story model, not these rendering entities. Retire the entire hierarchy so
 /// both logical sprites and GPU materials release their atlas handles.
 fn retire_hidden_groups(
     mut commands: Commands,
-    time: Res<Time>,
+    window: Option<Res<crate::dependencies::ScriptDependencies>>,
     mut stage: ResMut<StageState>,
     pending: Res<PendingCharacterShows>,
+    children: Query<&Children>,
+    parts: Query<&LogicalCharacterPart>,
     mut roots: Query<(Entity, &CharacterRoot, &mut CharacterGroup)>,
 ) {
+    let Some(window) = window else {
+        return;
+    };
     for (entity, identity, mut group) in &mut roots {
         let name = &identity.actor_id;
         let prefix = format!("character::{name}::");
         let reusable = stage.character_active_parts.contains_key(name)
             || pending.items.iter().any(|show| &show.actor_id == name)
-            || stage.pending_character_restore.iter().any(|part| part.id.starts_with(&prefix))
-            || group.tween.is_some() || group.alpha != 0.0;
+            || stage
+                .pending_character_restore
+                .iter()
+                .any(|part| part.id.starts_with(&prefix))
+            || group.tween.is_some()
+            || group.alpha != 0.0;
         if reusable {
-            if group.hidden_seconds != 0.0 { group.hidden_seconds = 0.0; }
+            group.last_active_revision = window.revision;
             continue;
         }
-        group.hidden_seconds += time.delta_secs();
-        if group.hidden_seconds < 5.0 { continue; }
+        if (!window.closed
+            && window.revision.saturating_sub(group.last_active_revision)
+                <= window.retain_steps as u64)
+            || children.get(entity).is_ok_and(|children| {
+                children.iter().any(|child| {
+                    parts
+                        .get(child)
+                        .is_ok_and(|part| window.protects(&part.0.path))
+                })
+            })
+        {
+            continue;
+        }
         if stage.character_roots.get(name) == Some(&entity) {
             stage.character_roots.remove(name);
             stage.sprites.retain(|id, _| !id.starts_with(&prefix));
@@ -264,12 +285,20 @@ fn compose_groups(
         // Rotate the composed surface, not each part: mask coordinates and
         // premultiplied composition remain in their shared unrotated plane.
         let mut transform = composite_transform(center, placement.map(|p| p.current));
-        if let Some(anchor) = shared.0.spatial_stage.as_ref()
-            .and_then(|stage| stage.actors.get(&identity.actor_id)) {
-            let anchor = spatial.as_ref().and_then(|runtime| runtime.definition.as_ref())
+        if let Some(anchor) = shared
+            .0
+            .spatial_stage
+            .as_ref()
+            .and_then(|stage| stage.actors.get(&identity.actor_id))
+        {
+            let anchor = spatial
+                .as_ref()
+                .and_then(|runtime| runtime.definition.as_ref())
                 .and_then(|definition| definition.anchor(anchor).ok());
             let Some(anchor) = anchor else {
-                if let Some(entity) = group.display { commands.entity(entity).try_insert(Visibility::Hidden); }
+                if let Some(entity) = group.display {
+                    commands.entity(entity).try_insert(Visibility::Hidden);
+                }
                 continue;
             };
             // Pixel-space composition (including intrinsic alpha/masks) remains
@@ -279,7 +308,12 @@ fn compose_groups(
         } else if let Some(depth) = shared.0.actor_depths.get(&identity.actor_id) {
             transform.translation.z = *depth;
         }
-        let render_layers = if shared.0.spatial_stage.as_ref().is_some_and(|s| s.actors.contains_key(&identity.actor_id)) {
+        let render_layers = if shared
+            .0
+            .spatial_stage
+            .as_ref()
+            .is_some_and(|s| s.actors.contains_key(&identity.actor_id))
+        {
             crate::stage::views::spatial_layer()
         } else if selected.iter().any(|p| p.4) {
             focus_layer()
@@ -438,35 +472,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_actor_cache_expires_without_removing_active_actor_or_story_identity() {
+    fn hidden_actor_cache_follows_execution_not_time_and_preserves_story_identity() {
         let mut app = App::new();
         app.init_resource::<Time>()
+            .init_resource::<crate::dependencies::ScriptDependencies>()
             .init_resource::<StageState>()
             .init_resource::<PendingCharacterShows>()
             .add_systems(Update, retire_hidden_groups);
         let mut roots = Vec::new();
         for name in ["alice", "bob"] {
             let child = app.world_mut().spawn_empty().id();
-            let root = app.world_mut().spawn((
-                CharacterRoot { actor_id: name.into() },
-                CharacterGroup::default(),
-            )).add_child(child).id();
+            let root = app
+                .world_mut()
+                .spawn((
+                    CharacterRoot {
+                        actor_id: name.into(),
+                    },
+                    CharacterGroup::default(),
+                ))
+                .add_child(child)
+                .id();
             let mut stage = app.world_mut().resource_mut::<StageState>();
             stage.character_roots.insert(name.into(), root);
-            stage.sprites.insert(format!("character::{name}::body"), child);
-            stage.character_catalog_names.insert(name.into(), name.into());
+            stage
+                .sprites
+                .insert(format!("character::{name}::body"), child);
+            stage
+                .character_catalog_names
+                .insert(name.into(), name.into());
             stage.character_order.push(name.into());
             roots.push((root, child));
         }
-        app.world_mut().resource_mut::<StageState>().character_active_parts.insert("alice".into(), HashSet::from(["body".into()]));
-        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs(2));
+        app.world_mut()
+            .resource_mut::<StageState>()
+            .character_active_parts
+            .insert("alice".into(), HashSet::from(["body".into()]));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(2));
         app.update();
-        assert!(app.world().get_entity(roots[1].0).is_ok(), "short hide/show cuts reuse the cache");
-        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs(4));
+        assert!(
+            app.world().get_entity(roots[1].0).is_ok(),
+            "short hide/show cuts reuse the cache"
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(600));
+        app.update();
+        assert!(
+            app.world().get_entity(roots[1].0).is_ok(),
+            "idle time cannot evict artwork"
+        );
+        app.world_mut()
+            .resource_mut::<crate::dependencies::ScriptDependencies>()
+            .revision = 5;
         app.update();
         assert!(app.world().get_entity(roots[0].0).is_ok());
         assert!(app.world().get_entity(roots[1].0).is_err());
-        assert!(app.world().get_entity(roots[1].1).is_err(), "all child asset owners retire with the root");
+        assert!(
+            app.world().get_entity(roots[1].1).is_err(),
+            "all child asset owners retire with the root"
+        );
         let stage = app.world().resource::<StageState>();
         assert!(!stage.character_roots.contains_key("bob"));
         assert!(!stage.sprites.contains_key("character::bob::body"));
@@ -672,7 +738,14 @@ mod tests {
             .expect("one composed sprite");
         assert_eq!(composed.color.alpha(), 0.5);
         assert_eq!(composed.clip, Some(expected_clip));
-        assert_eq!(app.world().get::<Transform>(display).expect("display transform").translation.z, 14.0);
+        assert_eq!(
+            app.world()
+                .get::<Transform>(display)
+                .expect("display transform")
+                .translation
+                .z,
+            14.0
+        );
         assert_eq!(composed.layers[0].color.alpha(), 0.4);
         assert_eq!(
             app.world().get::<CharacterGroup>(root).expect("root").alpha,

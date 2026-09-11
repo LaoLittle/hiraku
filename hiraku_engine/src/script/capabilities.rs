@@ -17,8 +17,8 @@ use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
 mod scene_visuals;
-mod spatial_stage;
 mod sound;
+mod spatial_stage;
 
 /// Engine-facing effects produced by HKS native functions.
 ///
@@ -33,7 +33,10 @@ pub enum StoryEffect {
     },
     Picture(crate::scene::pictures::PictureCommand),
     Clip(crate::scene::clipping::ClipCommand),
-    SetActorDepth { id: String, depth: f32 },
+    SetActorDepth {
+        id: String,
+        depth: f32,
+    },
     Log(String),
     ClearDialogue,
     DialogueSpeed(f32),
@@ -117,7 +120,9 @@ pub enum StoryEffect {
         scale: f32,
         focused: bool,
     },
-    StopActorMotion { actor_id: String },
+    StopActorMotion {
+        actor_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,8 +409,14 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
 mod random_api {
     use super::*;
     #[hks(name = "randomInt")]
-    fn random_int(_context: &mut CharacterContext, _min: i32, _max: i32) -> Result<i32, NativeError> {
-        Err(NativeError::message("randomInt requires a story host response"))
+    fn random_int(
+        _context: &mut CharacterContext,
+        _min: i32,
+        _max: i32,
+    ) -> Result<i32, NativeError> {
+        Err(NativeError::message(
+            "randomInt requires a story host response",
+        ))
     }
 }
 
@@ -460,9 +471,11 @@ mod ui_api {
         name: String,
         component: String,
     ) -> Result<(), NativeError> {
-        context
-            .commands
-            .push(StoryEffect::MountUiOverlay { name, component, lifetime: None });
+        context.commands.push(StoryEffect::MountUiOverlay {
+            name,
+            component,
+            lifetime: None,
+        });
         Ok(())
     }
 
@@ -475,10 +488,14 @@ mod ui_api {
         seconds: f32,
     ) -> Result<(), NativeError> {
         if !seconds.is_finite() || seconds < 0.0 {
-            return Err(NativeError::message("overlay duration must be finite and non-negative"));
+            return Err(NativeError::message(
+                "overlay duration must be finite and non-negative",
+            ));
         }
         context.commands.push(StoryEffect::MountUiOverlay {
-            name, component, lifetime: Some(seconds),
+            name,
+            component,
+            lifetime: Some(seconds),
         });
         Ok(())
     }
@@ -519,7 +536,9 @@ struct StoryControlBuiltins {
 impl StoryControlBuiltins {
     fn new(manifest: &BuiltinManifest) -> Self {
         Self {
-            random_int: manifest.resolve("randomInt").expect("random API is registered"),
+            random_int: manifest
+                .resolve("randomInt")
+                .expect("random API is registered"),
             open_ui_any: manifest
                 .resolve_selector("ui", "open_any")
                 .expect("raw UI API is registered"),
@@ -558,9 +577,10 @@ impl Default for StoryNativeHost {
 
 impl StoryNativeHost {
     pub(super) fn actor_motion_is_current(&self, display: &str, revision: u64) -> bool {
-        self.context.actors.values().any(|actor| {
-            actor.display_instance == display && actor.motion_revision == revision
-        })
+        self.context
+            .actors
+            .values()
+            .any(|actor| actor.display_instance == display && actor.motion_revision == revision)
     }
 
     pub fn new() -> Self {
@@ -672,13 +692,38 @@ impl StoryNativeHost {
             ));
         }
         if call.builtin == self.controls.random_int {
-            let values = call.arguments.iter().map(|a| match a.value {
-                Value::Number(n) if n.is_finite() && n.fract()==0.0 && n>=i32::MIN as f64 && n<=i32::MAX as f64 => Some(n as i64),
-                _ => None,
-            }).collect::<Option<Vec<_>>>().ok_or(CharacterCapabilityError::InvalidArguments("randomInt expects exact integers"))?;
-            let [min,max] = values.as_slice() else { return Err(CharacterCapabilityError::InvalidArguments("randomInt requires min and exclusive max")); };
-            if min>=max { return Err(CharacterCapabilityError::InvalidArguments("randomInt requires min < max")); }
-            return Ok(StoryCallOutcome::Control(StoryControl::RandomInt { min:*min,max:*max }));
+            let values = call
+                .arguments
+                .iter()
+                .map(|a| match a.value {
+                    Value::Number(n)
+                        if n.is_finite()
+                            && n.fract() == 0.0
+                            && n >= i32::MIN as f64
+                            && n <= i32::MAX as f64 =>
+                    {
+                        Some(n as i64)
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or(CharacterCapabilityError::InvalidArguments(
+                    "randomInt expects exact integers",
+                ))?;
+            let [min, max] = values.as_slice() else {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "randomInt requires min and exclusive max",
+                ));
+            };
+            if min >= max {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "randomInt requires min < max",
+                ));
+            }
+            return Ok(StoryCallOutcome::Control(StoryControl::RandomInt {
+                min: *min,
+                max: *max,
+            }));
         }
         if call.builtin == self.controls.open_ui || call.builtin == self.controls.open_ui_any {
             let path = call
@@ -1430,11 +1475,19 @@ mod native_api {
     }
 
     #[hks(name = "stopMotion", selector = "Actor", receiver)]
-    fn native_actor_stop_motion(context: &mut CharacterContext, actor: ActorHandle) -> Result<ActorHandle, NativeError> {
-        let actor_id = context.actor_mut(actor.0)
-            .map_err(|e| NativeError::message(e.to_string()))?.display_instance.clone();
+    fn native_actor_stop_motion(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+    ) -> Result<ActorHandle, NativeError> {
+        let actor_id = context
+            .actor_mut(actor.0)
+            .map_err(|e| NativeError::message(e.to_string()))?
+            .display_instance
+            .clone();
         context.invalidate_actor_motions(Some(&actor_id))?;
-        context.commands.push(StoryEffect::StopActorMotion { actor_id });
+        context
+            .commands
+            .push(StoryEffect::StopActorMotion { actor_id });
         Ok(actor)
     }
 
@@ -1545,13 +1598,25 @@ mod native_api {
     /// Scene-space depth, shared by aliases but independent for clones. Leave
     /// one unit below the curtain for stable ordering within each depth band.
     #[hks(name = "depth", selector = "Actor", receiver)]
-    pub(super) fn native_actor_depth(context: &mut CharacterContext, actor: ActorHandle, depth: f64) -> Result<ActorHandle, NativeError> {
+    pub(super) fn native_actor_depth(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        depth: f64,
+    ) -> Result<ActorHandle, NativeError> {
         if !depth.is_finite() || !(0.0..=29.0).contains(&depth) {
-            return Err(NativeError::message("actor depth must be finite and in 0..=29 (below the curtain)"));
+            return Err(NativeError::message(
+                "actor depth must be finite and in 0..=29 (below the curtain)",
+            ));
         }
-        let id = context.actor_mut(actor.0)
-            .map_err(|error| NativeError::message(error.to_string()))?.display_instance.clone();
-        context.commands.push(StoryEffect::SetActorDepth { id, depth: depth as f32 });
+        let id = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?
+            .display_instance
+            .clone();
+        context.commands.push(StoryEffect::SetActorDepth {
+            id,
+            depth: depth as f32,
+        });
         Ok(actor)
     }
 
@@ -1961,18 +2026,29 @@ mod tests {
             .expect("typed depth API");
         let mut host = StoryNativeHost::new();
         let alice = host.context.char("alice".into()).expect("actor");
-        let alias = native_api::native_alias(&mut host.context, alice, "alternate".into()).expect("alias");
-        let copy = native_api::native_clone(&mut host.context, alice, "closeup".into()).expect("clone");
+        let alias =
+            native_api::native_alias(&mut host.context, alice, "alternate".into()).expect("alias");
+        let copy =
+            native_api::native_clone(&mut host.context, alice, "closeup".into()).expect("clone");
         native_api::native_actor_depth(&mut host.context, alias, 12.0).expect("alias depth");
         native_api::native_actor_depth(&mut host.context, copy, 14.0).expect("clone depth");
         for invalid in [f64::NAN, f64::INFINITY, -1.0, 30.0] {
             assert!(native_api::native_actor_depth(&mut host.context, copy, invalid).is_err());
         }
         host.context.commit().expect("commit");
-        assert_eq!(host.drain_effects(), vec![
-            StoryEffect::SetActorDepth { id: "alice".into(), depth: 12.0 },
-            StoryEffect::SetActorDepth { id: "closeup".into(), depth: 14.0 },
-        ]);
+        assert_eq!(
+            host.drain_effects(),
+            vec![
+                StoryEffect::SetActorDepth {
+                    id: "alice".into(),
+                    depth: 12.0
+                },
+                StoryEffect::SetActorDepth {
+                    id: "closeup".into(),
+                    depth: 14.0
+                },
+            ]
+        );
     }
 
     #[test]

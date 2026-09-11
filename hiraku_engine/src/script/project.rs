@@ -137,7 +137,10 @@ mod tests {
         let mut runtime = crate::script::story_runtime::StoryRuntime::new(code).expect("runtime");
         let mut said = false;
         for _ in 0..20 {
-            if let Some(crate::script::story_runtime::StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::Say { speaker, text })) = runtime.step().expect("native actor argument") {
+            if let Some(crate::script::story_runtime::StoryRuntimeEvent::Effect(
+                crate::script::capabilities::StoryEffect::Say { speaker, text },
+            )) = runtime.step().expect("native actor argument")
+            {
                 assert_eq!((speaker.as_str(), text.as_str()), ("alice", "Hello"));
                 said = true;
                 break;

@@ -1,5 +1,11 @@
 use bevy::{
-    asset::{AssetMetaCheck, AssetPlugin}, camera::{ScalingMode, visibility::RenderLayers}, picking::pointer::PointerId, prelude::*, sprite::{SpritePickingCamera, SpritePickingMode, SpritePickingSettings}, window::WindowPlugin, winit::WinitSettings,
+    asset::{AssetMetaCheck, AssetPlugin},
+    camera::{ScalingMode, visibility::RenderLayers},
+    picking::pointer::PointerId,
+    prelude::*,
+    sprite::{SpritePickingCamera, SpritePickingMode, SpritePickingSettings},
+    window::WindowPlugin,
+    winit::WinitSettings,
 };
 use bevy::{input::mouse::MouseScrollUnit, picking::events::Scroll};
 use hiraku_engine::input::{HirakuPointerId, HirakuScrollInput, HirakuScrollUnit};
@@ -79,7 +85,8 @@ fn bridge_host_actions(
     windows: Query<&Window>,
     mut was_fast_forward_held: Local<bool>,
 ) {
-    let held = focus.0.is_none() && windows.iter().any(|window| window.focused)
+    let held = focus.0.is_none()
+        && windows.iter().any(|window| window.focused)
         && keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     if held != *was_fast_forward_held {
         actions.write(HirakuActionInput(HirakuAction::FastForwardHeld(held)));

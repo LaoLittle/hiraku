@@ -7,6 +7,17 @@ use thiserror::Error;
 
 use crate::vfs::{HdpVfs, VfsError};
 
+/// Immutable artwork keeps its metadata, but transfers pixel ownership to the
+/// renderer. Use the same settings for speculative and demand loads.
+pub(crate) fn load_static_image(server: &AssetServer, path: impl Into<String>) -> Handle<Image> {
+    server
+        .load_builder()
+        .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+            settings.asset_usage = bevy::asset::RenderAssetUsages::RENDER_WORLD;
+        })
+        .load(path.into())
+}
+
 #[derive(Clone, Debug, Default, Resource)]
 pub struct TextureCatalog {
     textures: BTreeMap<String, TextureDefinition>,
@@ -138,6 +149,27 @@ fn insert_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_artwork_extraction_preserves_layout_metadata_without_cpu_pixels() {
+        use bevy::{
+            asset::RenderAssetUsages,
+            render::{render_asset::RenderAsset, texture::GpuImage},
+        };
+        let mut image = Image::from_dynamic(
+            image::DynamicImage::new_rgba8(16, 8),
+            true,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        let upload = GpuImage::take_gpu_data(&mut image, None).expect("extract static artwork");
+        assert_eq!(
+            upload.data.as_ref().expect("upload pixels").len(),
+            16 * 8 * 4
+        );
+        assert!(image.data.is_none());
+        assert_eq!(image.size(), UVec2::new(16, 8));
+        assert_eq!(image.texture_descriptor, upload.texture_descriptor);
+    }
 
     #[test]
     fn startup_reads_descriptors_without_an_asset_server_or_image_payload() {

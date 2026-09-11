@@ -28,4 +28,4 @@ blake3 = "1"
 rand_pcg.workspace = true
 
 [dev-dependencies]
-naga = { version = "29", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in"] }

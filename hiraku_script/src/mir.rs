@@ -136,6 +136,7 @@ pub enum MirInstruction {
         fallback: VirtualRegister,
     },
     Statement {
+        span: crate::Span,
         value: VirtualRegister,
         string: bool,
         emit_value: bool,
@@ -429,6 +430,7 @@ impl<'types> MirBuilder<'types> {
                 let value = self.lower_expression(value, errors)?;
                 self.push(MirInstruction::StoreLocal { local, src: value });
                 self.push(MirInstruction::Statement {
+                    span: statement.span,
                     value,
                     string: false,
                     emit_value: false,
@@ -458,6 +460,7 @@ impl<'types> MirBuilder<'types> {
                 };
                 self.push(MirInstruction::StoreGlobal { global, src: value });
                 self.push(MirInstruction::Statement {
+                    span: statement.span,
                     value,
                     string: false,
                     emit_value: false,
@@ -470,6 +473,7 @@ impl<'types> MirBuilder<'types> {
                 let value = self.lower_expression(value, errors)?;
                 self.store_place(target, value);
                 self.push(MirInstruction::Statement {
+                    span: statement.span,
                     value,
                     string: false,
                     emit_value: false,
@@ -479,6 +483,7 @@ impl<'types> MirBuilder<'types> {
             HirStmtKind::Expr(expression) => {
                 let value = self.lower_expression(expression, errors)?;
                 self.push(MirInstruction::Statement {
+                    span: statement.span,
                     value,
                     string: matches!(expression.kind, HirExprKind::Literal(HirLiteral::String(_))),
                     emit_value: true,

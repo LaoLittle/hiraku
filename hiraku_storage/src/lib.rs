@@ -11,7 +11,13 @@ pub use platform::AsyncPlatformStorage;
 pub use platform::{BufferedStorage, initialize_runtime, runtime_status};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RuntimeStorageStatus { Uninitialized, Loading, Ready, Writing, Failed(String) }
+pub enum RuntimeStorageStatus {
+    Uninitialized,
+    Loading,
+    Ready,
+    Writing,
+    Failed(String),
+}
 
 /// Acknowledges queued work, not durable completion. Poll runtime_status before
 /// allowing operations dependent on this write to continue.
@@ -29,12 +35,18 @@ pub struct GenerationRecord {
 }
 
 pub(crate) fn validate_generation(records: &[GenerationRecord]) -> Result<(), StorageError> {
-    if records.is_empty() { return Err(StorageError::InvalidKey) }
+    if records.is_empty() {
+        return Err(StorageError::InvalidKey);
+    }
     let mut keys = std::collections::BTreeSet::new();
     for record in records {
         validate_key(&record.key)?;
-        if record.extension.is_empty() || !record.extension.bytes().all(|c| c.is_ascii_alphanumeric())
-            || !keys.insert(&record.key) { return Err(StorageError::InvalidKey) }
+        if record.extension.is_empty()
+            || !record.extension.bytes().all(|c| c.is_ascii_alphanumeric())
+            || !keys.insert(&record.key)
+        {
+            return Err(StorageError::InvalidKey);
+        }
     }
     Ok(())
 }

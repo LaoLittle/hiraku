@@ -19,10 +19,18 @@ pub struct StoryTime<'w> {
 
 impl StoryTime<'_> {
     pub fn delta(&self) -> Duration {
-        self.clock.as_ref().map_or(self.time.delta(), |clock| clock.delta())
-            .mul_f32(if self.pacing.as_ref().is_some_and(|p| p.active) { 32.0 } else { 1.0 })
+        self.clock
+            .as_ref()
+            .map_or(self.time.delta(), |clock| clock.delta())
+            .mul_f32(if self.pacing.as_ref().is_some_and(|p| p.active) {
+                32.0
+            } else {
+                1.0
+            })
     }
-    pub fn delta_secs(&self) -> f32 { self.delta().as_secs_f32() }
+    pub fn delta_secs(&self) -> f32 {
+        self.delta().as_secs_f32()
+    }
 }
 
 pub(crate) fn update_fast_forward(
@@ -40,7 +48,9 @@ pub(crate) fn update_fast_forward(
     for event in input.read() {
         match event.0 {
             HirakuAction::FastForwardHeld(held) => dialogue.fast_forward_held = held,
-            HirakuAction::ToggleFastForward => dialogue.fast_forward_enabled = !dialogue.fast_forward_enabled,
+            HirakuAction::ToggleFastForward => {
+                dialogue.fast_forward_enabled = !dialogue.fast_forward_enabled
+            }
             HirakuAction::NextDialogue | HirakuAction::Back => {
                 dialogue.fast_forward_enabled = false;
                 dialogue.fast_forward_held = false;
@@ -48,13 +58,17 @@ pub(crate) fn update_fast_forward(
             _ => {}
         }
     }
-    let stop = choice.waiting.is_some() || screens.active_root.is_some()
-        || screens.pending_root.is_some() || movies.is_waiting() || focus.0.is_some();
+    let stop = choice.waiting.is_some()
+        || screens.active_root.is_some()
+        || screens.pending_root.is_some()
+        || movies.is_waiting()
+        || focus.0.is_some();
     if stop {
         dialogue.fast_forward_enabled = false;
         dialogue.fast_forward_held = false;
     }
-    pacing.active = !dependencies.loading && !stop
+    pacing.active = !dependencies.loading
+        && !stop
         && (dialogue.fast_forward_enabled || dialogue.fast_forward_held);
     if pacing.active {
         dialogue.auto_enabled = false;
@@ -104,8 +118,14 @@ mod tests {
                 notice: None,
                 runtime_started: false,
             })
-            .configure_sets(PreUpdate, crate::HirakuRuntimeSystems.run_if(crate::runtime_initialized))
-            .add_systems(PreUpdate, update_fast_forward.in_set(crate::HirakuRuntimeSystems));
+            .configure_sets(
+                PreUpdate,
+                crate::HirakuRuntimeSystems.run_if(crate::runtime_initialized),
+            )
+            .add_systems(
+                PreUpdate,
+                update_fast_forward.in_set(crate::HirakuRuntimeSystems),
+            );
         app
     }
 
@@ -113,10 +133,18 @@ mod tests {
     fn pacing_waits_for_stage_initialization() {
         let mut app = app();
         let world = app.world_mut();
-        let frontend = world.remove_resource::<FrontendState>().expect("frontend fixture");
-        let dialogue = world.remove_resource::<DialogueState>().expect("dialogue fixture");
-        let choice = world.remove_resource::<ChoiceState>().expect("choice fixture");
-        let screens = world.remove_resource::<ScreenUiState>().expect("screen fixture");
+        let frontend = world
+            .remove_resource::<FrontendState>()
+            .expect("frontend fixture");
+        let dialogue = world
+            .remove_resource::<DialogueState>()
+            .expect("dialogue fixture");
+        let choice = world
+            .remove_resource::<ChoiceState>()
+            .expect("choice fixture");
+        let screens = world
+            .remove_resource::<ScreenUiState>()
+            .expect("screen fixture");
 
         // Asset loading can take multiple frames; stage resources do not exist yet.
         app.update();
@@ -136,7 +164,8 @@ mod tests {
     #[test]
     fn modal_and_choice_stop_fast_forward_until_explicitly_reenabled() {
         let mut app = app();
-        app.world_mut().write_message(HirakuActionInput(HirakuAction::FastForwardHeld(true)));
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::FastForwardHeld(true)));
         app.update();
         assert!(app.world().resource::<FastForward>().active);
         app.world_mut().resource_mut::<ChoiceState>().waiting = Some(ScriptRequestId(1));
@@ -145,7 +174,8 @@ mod tests {
         app.world_mut().resource_mut::<ChoiceState>().waiting = None;
         app.update();
         assert!(!app.world().resource::<FastForward>().active);
-        app.world_mut().write_message(HirakuActionInput(HirakuAction::ToggleFastForward));
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::ToggleFastForward));
         app.update();
         assert!(app.world().resource::<FastForward>().active);
         let modal = app.world_mut().spawn_empty().id();
@@ -158,28 +188,44 @@ mod tests {
     #[test]
     fn loading_pauses_pacing_and_release_during_loading_is_not_lost() {
         let mut app = app();
-        app.world_mut().write_message(HirakuActionInput(HirakuAction::FastForwardHeld(true)));
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::FastForwardHeld(true)));
         app.update();
-        app.world_mut().resource_mut::<crate::dependencies::ScriptDependencies>().loading = true;
-        app.world_mut().write_message(HirakuActionInput(HirakuAction::FastForwardHeld(false)));
+        app.world_mut()
+            .resource_mut::<crate::dependencies::ScriptDependencies>()
+            .loading = true;
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::FastForwardHeld(false)));
         app.update();
-        app.world_mut().resource_mut::<crate::dependencies::ScriptDependencies>().loading = false;
+        app.world_mut()
+            .resource_mut::<crate::dependencies::ScriptDependencies>()
+            .loading = false;
         app.update();
         assert!(!app.world().resource::<FastForward>().active);
     }
 
     #[test]
     fn story_clock_accelerates_without_changing_application_clock() {
-        #[derive(Resource, Default)] struct Sample(f32);
-        fn sample(time: StoryTime, mut sample: ResMut<Sample>) { sample.0 = time.delta_secs(); }
+        #[derive(Resource, Default)]
+        struct Sample(f32);
+        fn sample(time: StoryTime, mut sample: ResMut<Sample>) {
+            sample.0 = time.delta_secs();
+        }
         let mut app = app();
         app.init_resource::<Sample>().add_systems(Update, sample);
-        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_millis(10));
-        app.world_mut().write_message(HirakuActionInput(HirakuAction::ToggleFastForward));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(10));
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::ToggleFastForward));
         app.update();
         assert!((app.world().resource::<Sample>().0 - 0.32).abs() < 0.0001);
-        assert_eq!(app.world().resource::<Time>().delta(), Duration::from_millis(10));
-        app.world_mut().write_message(HirakuActionInput(HirakuAction::NextDialogue));
+        assert_eq!(
+            app.world().resource::<Time>().delta(),
+            Duration::from_millis(10)
+        );
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::NextDialogue));
         app.update();
         assert!((app.world().resource::<Sample>().0 - 0.01).abs() < 0.0001);
     }
@@ -188,14 +234,24 @@ mod tests {
     fn voice_completion_releases_sequential_and_parallel_waits() {
         let mut app = App::new();
         app.insert_resource(FastForward { active: true })
-            .init_resource::<VoiceState>().init_resource::<AnimationState>()
+            .init_resource::<VoiceState>()
+            .init_resource::<AnimationState>()
             .add_systems(Update, skip_voices);
         let alice = app.world_mut().spawn_empty().id();
         let bob = app.world_mut().spawn_empty().id();
         {
             let mut voices = app.world_mut().resource_mut::<VoiceState>();
-            voices.active = Some(ActiveVoice { entity: alice, animation_id: Some("alice".into()) });
-            voices.concurrent.insert(bob, ActiveVoice { entity: bob, animation_id: Some("bob".into()) });
+            voices.active = Some(ActiveVoice {
+                entity: alice,
+                animation_id: Some("alice".into()),
+            });
+            voices.concurrent.insert(
+                bob,
+                ActiveVoice {
+                    entity: bob,
+                    animation_id: Some("bob".into()),
+                },
+            );
         }
         app.update();
         assert!(app.world().get_entity(alice).is_err());

@@ -55,8 +55,19 @@ mod api {
     use super::*;
 
     #[hks(name = "clipView", selector = "Stage", receiver)]
-    fn clip_view(context: &mut CharacterContext, stage: Stage, name: String, clip: crate::stage::ViewClip) -> Result<(), NativeError> {
-        context.commands.push(StoryEffect::Spatial(StageCommand::Clip { id: stage.0, view: name, clip }));
+    fn clip_view(
+        context: &mut CharacterContext,
+        stage: Stage,
+        name: String,
+        clip: crate::stage::ViewClip,
+    ) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::Spatial(StageCommand::Clip {
+                id: stage.0,
+                view: name,
+                clip,
+            }));
         Ok(())
     }
 
@@ -106,27 +117,55 @@ mod api {
     }
 
     #[hks(name = "track", selector = "SceneTransition", receiver)]
-    fn track(context: &mut CharacterContext, handle: SceneTransitionHandle, name: String) -> Result<SceneTransitionHandle, NativeError> {
-        if name.trim().is_empty() { return Err(NativeError::message("stage view name must not be empty")); }
-        let Some((SceneVisualTarget::Spatial(StageCommand::Camera { view, .. }), _)) = context.scene_visuals.pending.get_mut(&handle.0) else {
-            return Err(NativeError::message("track requires an uncommitted stage camera transition"));
+    fn track(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        name: String,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if name.trim().is_empty() {
+            return Err(NativeError::message("stage view name must not be empty"));
+        }
+        let Some((SceneVisualTarget::Spatial(StageCommand::Camera { view, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "track requires an uncommitted stage camera transition",
+            ));
         };
         *view = name;
         Ok(handle)
     }
 
     #[hks(name = "showView", selector = "Stage", receiver)]
-    fn show_view(context: &mut CharacterContext, stage: Stage, name: String) -> Result<SceneTransitionHandle, NativeError> {
-        context.scene_visuals.begin(SceneVisualTarget::Spatial(StageCommand::View {
-            id: stage.0, view: name, visible: true, animation: crate::script::AnimationSpec::Linear(0.0, false),
-        }))
+    fn show_view(
+        context: &mut CharacterContext,
+        stage: Stage,
+        name: String,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        context
+            .scene_visuals
+            .begin(SceneVisualTarget::Spatial(StageCommand::View {
+                id: stage.0,
+                view: name,
+                visible: true,
+                animation: crate::script::AnimationSpec::Linear(0.0, false),
+            }))
     }
 
     #[hks(name = "hideView", selector = "Stage", receiver)]
-    fn hide_view(context: &mut CharacterContext, stage: Stage, name: String) -> Result<SceneTransitionHandle, NativeError> {
-        context.scene_visuals.begin(SceneVisualTarget::Spatial(StageCommand::View {
-            id: stage.0, view: name, visible: false, animation: crate::script::AnimationSpec::Linear(0.0, false),
-        }))
+    fn hide_view(
+        context: &mut CharacterContext,
+        stage: Stage,
+        name: String,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        context
+            .scene_visuals
+            .begin(SceneVisualTarget::Spatial(StageCommand::View {
+                id: stage.0,
+                view: name,
+                visible: false,
+                animation: crate::script::AnimationSpec::Linear(0.0, false),
+            }))
     }
 
     #[hks(name = "place", selector = "Stage", receiver)]

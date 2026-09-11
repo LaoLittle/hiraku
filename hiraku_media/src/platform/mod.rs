@@ -7,7 +7,7 @@ cfg_select! {
         mod software;
         mod native;
         cfg_select! {
-            all(target_os = "macos", feature = "video-toolbox") => {
+            all(target_vendor = "apple", feature = "video-toolbox") => {
                 mod macos;
             },
             all(target_os = "android", feature = "media-codec") => {

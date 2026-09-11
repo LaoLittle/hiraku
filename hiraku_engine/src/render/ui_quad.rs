@@ -53,10 +53,21 @@ impl UiMaterial for UiQuadMaterial {
     }
     fn specialize(descriptor: &mut RenderPipelineDescriptor, key: UiMaterialKey<Self>) {
         if key.bind_group_data.1 == crate::ui::UiShaderBlend::Additive {
-            use bevy::render::render_resource::{BlendComponent, BlendFactor, BlendOperation, BlendState};
-            let component=BlendComponent { src_factor:BlendFactor::SrcAlpha,dst_factor:BlendFactor::One,operation:BlendOperation::Add };
-            if let Some(fragment)=&mut descriptor.fragment {
-                for target in fragment.targets.iter_mut().flatten() { target.blend=Some(BlendState { color:component,alpha:component }); }
+            use bevy::render::render_resource::{
+                BlendComponent, BlendFactor, BlendOperation, BlendState,
+            };
+            let component = BlendComponent {
+                src_factor: BlendFactor::SrcAlpha,
+                dst_factor: BlendFactor::One,
+                operation: BlendOperation::Add,
+            };
+            if let Some(fragment) = &mut descriptor.fragment {
+                for target in fragment.targets.iter_mut().flatten() {
+                    target.blend = Some(BlendState {
+                        color: component,
+                        alpha: component,
+                    });
+                }
             }
         }
         if key.bind_group_data.1 == crate::ui::UiShaderBlend::Multiply {

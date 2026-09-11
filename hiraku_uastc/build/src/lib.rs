@@ -66,6 +66,11 @@ pub fn pack_directory_with_progress(
     let mut paths = Vec::new();
     collect(&root, &root, &mut paths)?;
     paths.sort();
+    let mut dependencies = hiraku_tools::analyze_directory(&root)?;
+    let dependency_name = hiraku_hdp::dependencies::DEPENDENCY_MANIFEST;
+    if paths.iter().any(|path| path == Path::new(dependency_name)) {
+        return Err(format!("{dependency_name} is generated; remove the source copy").into());
+    }
     let mut textures = BTreeMap::<PathBuf, String>::new();
     let mut manifests = BTreeMap::new();
     for (index, path) in paths.iter().enumerate() {
@@ -129,7 +134,28 @@ pub fn pack_directory_with_progress(
             textures.len()
         ),
     ));
+    let remapping: BTreeMap<_, _> = textures
+        .iter()
+        .map(|(source, target)| {
+            Ok((
+                source
+                    .strip_prefix(&root)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                target.clone(),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    remap_dependencies(&mut dependencies, &remapping);
     let mut writer = StreamPackageBuilder::new(options)?;
+    writer.add_reader(
+        dependency_name,
+        hson::to_vec(&dependencies)?.as_slice(),
+        FileOptions {
+            bootstrap: true,
+            ..Default::default()
+        },
+    )?;
     for (index, path) in paths.iter().enumerate() {
         let name = path.to_string_lossy().replace('\\', "/");
         let options = FileOptions {
@@ -202,4 +228,38 @@ pub fn pack_directory_with_progress(
         ),
     ));
     Ok(package)
+}
+
+/// Keep estimates conservative (RGBA fallback), but make every dependency
+/// point at its actual packaged image. Unpackaged raw images stay on-demand.
+fn remap_dependencies(
+    manifest: &mut hiraku_hdp::dependencies::DependencyManifest,
+    paths: &BTreeMap<String, String>,
+) {
+    for node in manifest
+        .windows
+        .values_mut()
+        .flat_map(|graph| &mut graph.nodes)
+    {
+        node.images = node
+            .images
+            .iter()
+            .filter_map(|path| paths.get(path).cloned())
+            .collect();
+    }
+    for images in manifest
+        .scripts
+        .values_mut()
+        .chain(std::iter::once(&mut manifest.resident))
+    {
+        *images = images
+            .iter()
+            .filter_map(|path| paths.get(path).cloned())
+            .collect();
+    }
+    manifest.image_bytes = manifest
+        .image_bytes
+        .iter()
+        .filter_map(|(path, bytes)| paths.get(path).map(|target| (target.clone(), *bytes)))
+        .collect();
 }

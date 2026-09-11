@@ -21,9 +21,13 @@ pub(crate) fn request_input_redraw(
     mut actions: MessageReader<HirakuActionInput>,
     mut text: MessageReader<HirakuTextInput>,
 ) {
-    let pending = pointers.read().count() + scrolls.read().count()
-        + actions.read().count() + text.read().count();
-    if pending != 0 { redraw.request(); }
+    let pending = pointers.read().count()
+        + scrolls.read().count()
+        + actions.read().count()
+        + text.read().count();
+    if pending != 0 {
+        redraw.request();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,35 +154,72 @@ mod tests {
         use bevy::{ecs::message::MessageCursor, picking::events::Scroll, window::RequestRedraw};
         for pointer in [HirakuPointerId::Pointer(0), HirakuPointerId::Touch(7)] {
             let mut app = App::new();
-            app.insert_resource(HirakuCanvas { image: Handle::default(), size: UVec2::new(800, 600) })
-                .insert_resource(HirakuInputTarget(Handle::default()))
-                .add_message::<HirakuPointerInput>()
-                .add_message::<HirakuScrollInput>()
-                .add_message::<HirakuActionInput>()
-                .add_message::<HirakuTextInput>()
-                .add_message::<PointerInput>()
-                .add_message::<Pointer<Scroll>>()
-                .add_message::<RequestRedraw>()
-                .add_systems(First, bridge_virtual_pointers)
-                // Host picking happens after First; no animation or subsequent
-                // physical input is available to drive another frame here.
-                .add_systems(Update, move |mut sent: Local<bool>, mut output: MessageWriter<HirakuPointerInput>| {
+            app.insert_resource(HirakuCanvas {
+                image: Handle::default(),
+                size: UVec2::new(800, 600),
+            })
+            .insert_resource(HirakuInputTarget(Handle::default()))
+            .add_message::<HirakuPointerInput>()
+            .add_message::<HirakuScrollInput>()
+            .add_message::<HirakuActionInput>()
+            .add_message::<HirakuTextInput>()
+            .add_message::<PointerInput>()
+            .add_message::<Pointer<Scroll>>()
+            .add_message::<RequestRedraw>()
+            .add_systems(First, bridge_virtual_pointers)
+            // Host picking happens after First; no animation or subsequent
+            // physical input is available to drive another frame here.
+            .add_systems(
+                Update,
+                move |mut sent: Local<bool>, mut output: MessageWriter<HirakuPointerInput>| {
                     if !*sent {
                         *sent = true;
-                        output.write(HirakuPointerInput { pointer, uv: Vec2::splat(0.5), phase: HirakuPointerPhase::Press });
+                        output.write(HirakuPointerInput {
+                            pointer,
+                            uv: Vec2::splat(0.5),
+                            phase: HirakuPointerPhase::Press,
+                        });
                     }
-                })
-                .add_systems(Last, request_input_redraw);
+                },
+            )
+            .add_systems(Last, request_input_redraw);
             let mut redraws = MessageCursor::<RequestRedraw>::default();
             let mut inputs = MessageCursor::<PointerInput>::default();
             app.update();
-            assert_eq!(inputs.read(app.world().resource::<Messages<PointerInput>>()).count(), 0);
-            assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 1);
+            assert_eq!(
+                inputs
+                    .read(app.world().resource::<Messages<PointerInput>>())
+                    .count(),
+                0
+            );
+            assert_eq!(
+                redraws
+                    .read(app.world().resource::<Messages<RequestRedraw>>())
+                    .count(),
+                1
+            );
             app.update();
-            assert!(inputs.read(app.world().resource::<Messages<PointerInput>>()).any(|event| matches!(event.action, PointerAction::Press(PointerButton::Primary))));
-            assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 1);
+            assert!(
+                inputs
+                    .read(app.world().resource::<Messages<PointerInput>>())
+                    .any(|event| matches!(
+                        event.action,
+                        PointerAction::Press(PointerButton::Primary)
+                    ))
+            );
+            assert_eq!(
+                redraws
+                    .read(app.world().resource::<Messages<RequestRedraw>>())
+                    .count(),
+                1
+            );
             app.update();
-            assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 0);
+            assert_eq!(
+                redraws
+                    .read(app.world().resource::<Messages<RequestRedraw>>())
+                    .count(),
+                0
+            );
         }
     }
 
@@ -193,15 +234,30 @@ mod tests {
             .add_message::<RequestRedraw>()
             .add_systems(Last, request_input_redraw);
         let mut redraws = MessageCursor::<RequestRedraw>::default();
-        app.world_mut().write_message(HirakuActionInput(HirakuAction::NextDialogue));
-        app.world_mut().write_message(HirakuTextInput::Insert("Alice".into()));
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::NextDialogue));
+        app.world_mut()
+            .write_message(HirakuTextInput::Insert("Alice".into()));
         app.world_mut().write_message(HirakuScrollInput {
-            pointer: HirakuPointerId::Pointer(0), uv: Vec2::splat(0.5), delta: Vec2::Y, unit: HirakuScrollUnit::Line,
+            pointer: HirakuPointerId::Pointer(0),
+            uv: Vec2::splat(0.5),
+            delta: Vec2::Y,
+            unit: HirakuScrollUnit::Line,
         });
         app.update();
-        assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 1);
+        assert_eq!(
+            redraws
+                .read(app.world().resource::<Messages<RequestRedraw>>())
+                .count(),
+            1
+        );
         app.update();
-        assert_eq!(redraws.read(app.world().resource::<Messages<RequestRedraw>>()).count(), 0);
+        assert_eq!(
+            redraws
+                .read(app.world().resource::<Messages<RequestRedraw>>())
+                .count(),
+            0
+        );
     }
 
     #[test]

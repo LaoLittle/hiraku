@@ -13,29 +13,211 @@ pub struct LoadingScreen {
     pub custom: bool,
 }
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct ScriptDependencies {
+    /// Budget for speculative uploads; visible scene/UI owners are independent.
+    pub preload_budget_bytes: u64,
+    pub lookahead_steps: usize,
+    pub retain_steps: usize,
     manifests: BTreeMap<String, Option<DependencyManifest>>,
     handles: BTreeMap<String, Handle<Image>>,
-    resident: BTreeSet<String>,
     requested: Option<BTreeSet<String>>,
+    frontier: BTreeSet<(String, usize)>,
+    positions: Vec<(String, usize)>,
+    history: std::collections::VecDeque<Vec<String>>,
+    desired: BTreeSet<String>,
+    pub(crate) revision: u64,
+    pub(crate) closed: bool,
     pub loading: bool,
     pub error: Option<String>,
 }
 
+impl Default for ScriptDependencies {
+    fn default() -> Self {
+        Self {
+            preload_budget_bytes: 128 * 1024 * 1024,
+            lookahead_steps: 32,
+            retain_steps: 4,
+            manifests: BTreeMap::new(),
+            handles: BTreeMap::new(),
+            requested: None,
+            frontier: BTreeSet::new(),
+            positions: Vec::new(),
+            history: Default::default(),
+            desired: BTreeSet::new(),
+            revision: 0,
+            closed: false,
+            loading: false,
+            error: None,
+        }
+    }
+}
+
+mod window;
+
+/// Only execution progress changes cache ownership, never wall-clock time.
+pub(crate) fn update_resource_window(
+    runtime: Res<crate::script::ScriptRuntimeState>,
+    vfs: Option<Res<crate::vfs::VfsResource>>,
+    assets: Res<AssetServer>,
+    mut state: ResMut<ScriptDependencies>,
+) {
+    if state.loading || state.error.is_some() {
+        return;
+    }
+    let Some(vfs) = vfs else {
+        return;
+    };
+    if !runtime
+        .story
+        .as_ref()
+        .is_some_and(|story| story.has_executions())
+        && runtime.call_stack.is_empty()
+    {
+        state.finish();
+        return;
+    }
+    state.closed = false;
+    let mut positions = Vec::new();
+    if let Some(story) = &runtime.story {
+        positions.extend(story.resource_positions());
+    }
+    for frame in &runtime.call_stack {
+        positions.extend(frame.story.resource_positions());
+    }
+    if positions.is_empty() {
+        return;
+    }
+    state.requested = None;
+    if state.positions == positions {
+        return;
+    }
+    state.positions = positions.clone();
+    let mut frontier = BTreeSet::new();
+    for (path, offset) in positions {
+        if let Err(error) = state.ensure_manifest(&vfs.0, &path) {
+            warn!("resource window remains lazy: {error}");
+            continue;
+        }
+        let (root, relative) = package_path(&path);
+        if let Some(Some(manifest)) = state.manifests.get(&root)
+            && let Some(graph) = manifest.windows.get(&relative)
+            && let Some(node) = window::locate(graph, offset)
+        {
+            frontier.insert((path, node));
+        }
+    }
+    state.move_window(frontier, &assets);
+}
+
 impl ScriptDependencies {
+    fn finish(&mut self) {
+        self.closed = true;
+        self.handles.clear();
+        self.history.clear();
+        self.desired.clear();
+        self.frontier.clear();
+        self.positions.clear();
+        self.requested = None;
+    }
+    pub fn retained_images(&self) -> usize {
+        self.handles.len()
+    }
+    pub(crate) fn protects(&self, path: &str) -> bool {
+        self.desired.contains(path)
+    }
     pub fn progress(&self, assets: &AssetServer) -> f64 {
         if self.handles.is_empty() {
             return 1.0;
         }
         self.handles
             .values()
-            .filter(|handle| matches!(assets.get_load_state(handle.id()), Some(LoadState::Loaded)))
+            .filter(|h| matches!(assets.get_load_state(h.id()), Some(LoadState::Loaded)))
             .count() as f64
             / self.handles.len() as f64
     }
-    /// Polling is cheap after request construction. No blocking waits, locks,
-    /// direct GPU eviction, or script execution while the dependency set loads.
+    fn ensure_manifest(&mut self, vfs: &HdpVfs, script: &str) -> Result<(), String> {
+        let (root, _) = package_path(script);
+        if self.manifests.contains_key(&root) {
+            return Ok(());
+        }
+        let path = format!("{root}{DEPENDENCY_MANIFEST}");
+        let manifest = if vfs.exists(&path) {
+            let source = vfs.read_text(&path).map_err(|e| e.to_string())?;
+            let manifest: DependencyManifest =
+                hiraku_script::hson::from_str(&source).map_err(|e| format!("{path}: {e}"))?;
+            if manifest.version != DEPENDENCY_VERSION {
+                return Err(format!(
+                    "unsupported dependency manifest version {}; rebuild the package",
+                    manifest.version
+                ));
+            }
+            Some(manifest)
+        } else {
+            None
+        };
+        self.manifests.insert(root, manifest);
+        Ok(())
+    }
+
+    fn move_window(&mut self, frontier: BTreeSet<(String, usize)>, assets: &AssetServer) {
+        self.closed = false;
+        if self.frontier == frontier {
+            return;
+        }
+        self.frontier = frontier;
+        self.revision = self.revision.saturating_add(1);
+        let mut ahead = Vec::new();
+        let mut costs = BTreeMap::new();
+        for (root, manifest) in &self.manifests {
+            let Some(manifest) = manifest else {
+                continue;
+            };
+            let seeds = self.frontier.iter().filter_map(|(path, node)| {
+                let (owner, relative) = package_path(path);
+                (owner == *root).then_some((relative, *node))
+            });
+            ahead.extend(
+                window::collect(manifest, seeds, self.lookahead_steps, 256)
+                    .into_iter()
+                    .map(|path| asset_path(root, &path)),
+            );
+            costs.extend(
+                manifest
+                    .image_bytes
+                    .iter()
+                    .map(|(path, bytes)| (asset_path(root, path), *bytes)),
+            );
+        }
+        // Near future wins the budget; recently traversed windows are lower priority.
+        self.history.push_front(ahead.clone());
+        self.history.truncate(self.retain_steps.saturating_add(1));
+        let candidates: Vec<_> = self.history.iter().flatten().cloned().collect();
+        self.desired = candidates.iter().cloned().collect();
+        let mut admitted = BTreeSet::new();
+        let mut remaining = self.preload_budget_bytes;
+        for path in candidates {
+            if admitted.contains(&path) {
+                continue;
+            }
+            let Some(&cost) = costs.get(&path) else {
+                continue;
+            };
+            if cost > remaining {
+                continue;
+            }
+            remaining -= cost;
+            admitted.insert(path);
+        }
+        self.handles.retain(|path, _| admitted.contains(path));
+        for path in admitted {
+            self.handles
+                .entry(path.clone())
+                .or_insert_with(|| crate::texture::load_static_image(assets, path));
+        }
+    }
+
+    /// Navigation waits for the target's entry window, not the whole script.
     pub(crate) fn prepare(
         &mut self,
         vfs: &HdpVfs,
@@ -47,55 +229,19 @@ impl ScriptDependencies {
         }
         let request: BTreeSet<_> = scripts.iter().cloned().collect();
         if self.requested.as_ref() != Some(&request) {
-            let mut needed = BTreeSet::new();
-            for script in scripts {
+            let mut frontier = BTreeSet::new();
+            if let Some(script) = scripts.first() {
+                self.ensure_manifest(vfs, script)?;
                 let (root, relative) = package_path(script);
-                let manifest_path = format!("{root}{DEPENDENCY_MANIFEST}");
-                if !self.manifests.contains_key(&root) {
-                    let manifest = if vfs.exists(&manifest_path) {
-                        let source = vfs.read_text(&manifest_path).map_err(|e| e.to_string())?;
-                        let manifest: DependencyManifest =
-                            hiraku_script::hson::from_str(&source)
-                                .map_err(|e| format!("{manifest_path}: {e}"))?;
-                        if manifest.version != DEPENDENCY_VERSION {
-                            return Err(format!(
-                                "unsupported dependency manifest version {}",
-                                manifest.version
-                            ));
-                        }
-                        Some(manifest)
-                    } else {
-                        None
-                    }; // Loose examples without a build step remain lazy.
-                    self.manifests.insert(root.clone(), manifest);
-                }
-                if let Some(manifest) = &self.manifests[&root] {
-                    let paths = manifest.scripts.get(&relative).ok_or_else(|| {
-                        format!(
-                            "script `{script}` is missing from {manifest_path}; rebuild the package"
-                        )
-                    })?;
-                    needed.extend(paths.iter().map(|p| asset_path(&root, p)));
-                    self.resident
-                        .extend(manifest.resident.iter().map(|p| asset_path(&root, p)));
+                if let Some(Some(manifest)) = self.manifests.get(&root) {
+                    let graph = manifest.windows.get(&relative).ok_or_else(|| format!("script `{script}` is missing from the dependency manifest; rebuild the package"))?;
+                    if let Some(entry) = graph.entry {
+                        frontier.insert((script.clone(), entry));
+                    }
                 }
             }
-            needed.extend(self.resident.iter().cloned());
-            self.handles.retain(|path, _| needed.contains(path));
-            for path in needed {
-                self.handles
-                    .entry(path.clone())
-                    .or_insert_with(|| assets.load(path));
-            }
+            self.move_window(frontier, assets);
             self.requested = Some(request);
-            self.loading = self.handles.values().any(|handle| {
-                !matches!(assets.get_load_state(handle.id()), Some(LoadState::Loaded))
-            });
-            // Yield only for real I/O. A metadata-only call/goto with already
-            // resident dependencies must not flash a loading screen.
-            if self.loading {
-                return Ok(false);
-            }
         }
         self.loading = false;
         for (path, handle) in &self.handles {
@@ -140,7 +286,9 @@ pub(crate) fn loading_screen(
     config: Res<LoadingScreen>,
     roots: Query<Entity, With<LoadingScreenRoot>>,
 ) {
-    if state.loading && state.error.is_none() { redraw.request(); }
+    if state.loading && state.error.is_none() {
+        redraw.request();
+    }
     if !state.loading {
         for root in &roots {
             commands.entity(root).try_despawn();
@@ -167,94 +315,4 @@ pub(crate) fn loading_screen(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn package_paths_preserve_archive_identity() {
-        assert_eq!(
-            package_path("hdp://story.hdp/scenes/first.hks"),
-            ("hdp://story.hdp/".into(), "scenes/first.hks".into())
-        );
-        assert_eq!(
-            package_path("scenes/first.hks"),
-            ("".into(), "scenes/first.hks".into())
-        );
-        assert_eq!(
-            asset_path("hdp://story.hdp/", "textures/alice.png"),
-            "hdp://story.hdp/textures/alice.png"
-        );
-    }
-
-    #[test]
-    fn navigation_releases_only_preload_ownership_and_pins_ui() {
-        let mut app = App::new();
-        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()));
-        app.init_asset::<Image>();
-        let assets = app.world().resource::<AssetServer>();
-        let manifest = DependencyManifest {
-            version: DEPENDENCY_VERSION,
-            scripts: BTreeMap::from([
-                ("alice.hks".into(), BTreeSet::from(["alice.png".into()])),
-                ("bob.hks".into(), BTreeSet::from(["bob.png".into()])),
-            ]),
-            resident: BTreeSet::from(["ui.png".into()]),
-            conservative: BTreeMap::new(),
-        };
-        let mut state = ScriptDependencies::default();
-        state.manifests.insert(String::new(), Some(manifest));
-        let vfs = HdpVfs::new("unused-test-root"); // Cached manifest; no filesystem reads.
-        assert!(
-            !state
-                .prepare(&vfs, assets, &["alice.hks".into()])
-                .expect("request alice")
-        );
-        let scene_owner = state.handles["alice.png"].clone();
-        let ui = state.handles["ui.png"].id();
-        assert!(
-            !state
-                .prepare(&vfs, assets, &["alice.hks".into(), "bob.hks".into()])
-                .expect("call retains caller")
-        );
-        assert!(state.handles.contains_key("alice.png"));
-        assert!(
-            !state
-                .prepare(&vfs, assets, &["bob.hks".into()])
-                .expect("goto bob")
-        );
-        assert!(!state.handles.contains_key("alice.png"));
-        assert!(scene_owner.is_strong());
-        assert_eq!(state.handles["ui.png"].id(), ui);
-        assert!(state.handles.contains_key("bob.png"));
-    }
-
-    #[test]
-    fn missing_manifest_stays_lazy_but_missing_entry_is_an_error() {
-        let mut app = App::new();
-        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()));
-        app.init_asset::<Image>();
-        let assets = app.world().resource::<AssetServer>();
-        let vfs = HdpVfs::new("unused-test-root");
-        let mut state = ScriptDependencies::default();
-        state.manifests.insert(String::new(), None);
-        assert!(
-            state
-                .prepare(&vfs, assets, &["alice.hks".into()])
-                .expect("loose example")
-        );
-        state.manifests.insert(
-            String::new(),
-            Some(DependencyManifest {
-                version: DEPENDENCY_VERSION,
-                scripts: BTreeMap::new(),
-                resident: BTreeSet::new(),
-                conservative: BTreeMap::new(),
-            }),
-        );
-        assert!(
-            state
-                .prepare(&vfs, assets, &["bob.hks".into()])
-                .expect_err("stale manifest")
-                .contains("rebuild")
-        );
-    }
-}
+mod tests;

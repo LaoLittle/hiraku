@@ -76,7 +76,14 @@ impl AssetLoader for StageLoader {
                 .path()
                 .resolve_embed_str(path)
                 .map_err(|error| StageError::Invalid(error.to_string()))?;
-            stage.scene_handle = Some(context.load(path));
+            stage.scene_handle = Some(
+                context
+                    .load_builder()
+                    .with_settings(|settings: &mut bevy::gltf::GltfLoaderSettings| {
+                        settings.load_materials = bevy::asset::RenderAssetUsages::RENDER_WORLD;
+                    })
+                    .load(path),
+            );
         }
         Ok(stage)
     }

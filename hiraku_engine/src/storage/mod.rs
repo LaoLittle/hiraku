@@ -22,11 +22,14 @@ const SAVE_ROOT: &str = "saves";
 const SAVE_EXTENSION: &str = "sav";
 const SAVE_NAMESPACE: &str = "hiraku.save";
 pub(crate) mod profile;
-mod user_settings;
 mod runtime;
 mod slots;
-pub use slots::{save_slot_exists, load_save_data, load_save_data_from_root, load_save_metadata, load_save_thumbnail, write_save_data_to_root};
+mod user_settings;
 pub(crate) use runtime::{initialize_runtime_storage, poll_runtime_storage, storage_ready};
+pub use slots::{
+    load_save_data, load_save_data_from_root, load_save_metadata, load_save_thumbnail,
+    save_slot_exists, write_save_data_to_root,
+};
 pub use user_settings::{PreferenceChange, UserSettings, read_user_settings, write_user_settings};
 
 #[derive(Debug, Error)]
@@ -65,6 +68,7 @@ fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
 impl From<&SaveGameData> for proto::SaveGameData {
     fn from(data: &SaveGameData) -> Self {
         Self {
+            dialogue_history: data.dialogue_history.iter().map(Into::into).collect(),
             version: data.version,
             resume_script: data.resume_script.clone(),
             replay_hson: hiraku_script::hson::to_vec(&data.replay)
@@ -108,6 +112,7 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
         }
         Ok(Self {
             thumbnail_png: Vec::new(),
+            dialogue_history: data.dialogue_history.into_iter().map(Into::into).collect(),
             version: data.version,
             resume_script: data.resume_script,
             replay: if data.replay_hson.is_empty() {
@@ -312,7 +317,8 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
-            spatial_stage_hson: hson::to_vec(&scene.spatial_stage).expect("serializable spatial stage"),
+            spatial_stage_hson: hson::to_vec(&scene.spatial_stage)
+                .expect("serializable spatial stage"),
             actor_depths: scene.actor_depths.clone(),
             clips_hson: hson::to_vec(&scene.clips)
                 .expect("clip state contains only serializable data"),
@@ -353,10 +359,16 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
-            spatial_stage: if scene.spatial_stage_hson.is_empty() { None } else {
-                let stage: Option<crate::stage::StageSnapshot> = hson::from_slice(&scene.spatial_stage_hson)
-                    .map_err(|error| StorageError::InvalidSave(format!("invalid spatial stage: {error}")))?;
-                if let Some(stage) = &stage { stage.validate().map_err(StorageError::InvalidSave)?; }
+            spatial_stage: if scene.spatial_stage_hson.is_empty() {
+                None
+            } else {
+                let stage: Option<crate::stage::StageSnapshot> =
+                    hson::from_slice(&scene.spatial_stage_hson).map_err(|error| {
+                        StorageError::InvalidSave(format!("invalid spatial stage: {error}"))
+                    })?;
+                if let Some(stage) = &stage {
+                    stage.validate().map_err(StorageError::InvalidSave)?;
+                }
                 stage
             },
             actor_depths: scene.actor_depths,
@@ -596,6 +608,31 @@ fn sanitize_slot_name(slot: &str) -> Result<&str, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialogue_history_round_trips_in_save_payload_in_order() {
+        let data = SaveGameData {
+            dialogue_history: vec![
+                DialogueSnapshot {
+                    speaker: "alice".into(),
+                    text: "Hello, Bob.".into(),
+                },
+                DialogueSnapshot {
+                    speaker: "bob".into(),
+                    text: "Hello, Alice.".into(),
+                },
+            ],
+            ..SaveGameData::default()
+        };
+        let bytes = proto::SaveGameData::from(&data).encode_to_vec();
+        let restored = SaveGameData::try_from(
+            proto::SaveGameData::decode(bytes.as_slice()).expect("save payload"),
+        )
+        .expect("restore history");
+        assert_eq!(restored.dialogue_history.len(), 2);
+        assert_eq!(restored.dialogue_history[0].speaker, "alice");
+        assert_eq!(restored.dialogue_history[1].text, "Hello, Alice.");
+    }
 
     #[test]
     fn instance_catalog_identity_survives_scene_storage() {

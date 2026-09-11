@@ -21,12 +21,25 @@ pub struct DialogueHistoryState {
 }
 
 impl Default for DialogueHistoryState {
-    fn default() -> Self { Self { entries: Vec::new(), max_entries: 128 } }
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries: 128,
+        }
+    }
 }
 
 impl DialogueHistoryState {
+    pub(super) fn restore(&mut self, mut entries: Vec<DialogueSnapshot>) {
+        let discard = entries.len().saturating_sub(self.max_entries);
+        entries.drain(..discard);
+        self.entries = entries;
+    }
     pub(super) fn push(&mut self, entry: DialogueSnapshot) {
-        if self.max_entries == 0 { self.entries.clear(); return; }
+        if self.max_entries == 0 {
+            self.entries.clear();
+            return;
+        }
         let discard = (self.entries.len() + 1).saturating_sub(self.max_entries);
         self.entries.drain(..discard);
         self.entries.push(entry);
@@ -38,10 +51,43 @@ mod history_tests {
     use super::*;
 
     #[test]
+    fn restore_replaces_future_history_and_obeys_current_limit() {
+        let mut history = DialogueHistoryState {
+            max_entries: 2,
+            ..default()
+        };
+        history.push(DialogueSnapshot {
+            speaker: "bob".into(),
+            text: "Future".into(),
+        });
+        history.restore(
+            (0..3)
+                .map(|i| DialogueSnapshot {
+                    speaker: "alice".into(),
+                    text: i.to_string(),
+                })
+                .collect(),
+        );
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|v| v.text.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        history.restore(Vec::new());
+        assert!(history.entries.is_empty());
+    }
+
+    #[test]
     fn default_history_is_bounded_to_128_utterances() {
         let mut history = DialogueHistoryState::default();
         for index in 0..256 {
-            history.push(DialogueSnapshot { speaker: "alice".into(), text: index.to_string() });
+            history.push(DialogueSnapshot {
+                speaker: "alice".into(),
+                text: index.to_string(),
+            });
         }
         assert_eq!(history.entries.len(), 128);
         assert_eq!(history.entries[0].text, "128");
@@ -50,16 +96,35 @@ mod history_tests {
 
     #[test]
     fn history_keeps_the_newest_entries_and_can_be_disabled() {
-        let mut history = DialogueHistoryState { max_entries: 3, ..default() };
+        let mut history = DialogueHistoryState {
+            max_entries: 3,
+            ..default()
+        };
         for index in 0..100 {
-            history.push(DialogueSnapshot { speaker: "alice".into(), text: index.to_string() });
+            history.push(DialogueSnapshot {
+                speaker: "alice".into(),
+                text: index.to_string(),
+            });
         }
-        assert_eq!(history.entries.iter().map(|entry| entry.text.as_str()).collect::<Vec<_>>(), ["97", "98", "99"]);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["97", "98", "99"]
+        );
         history.max_entries = 1;
-        history.push(DialogueSnapshot { speaker: "bob".into(), text: "latest".into() });
+        history.push(DialogueSnapshot {
+            speaker: "bob".into(),
+            text: "latest".into(),
+        });
         assert_eq!(history.entries.len(), 1);
         history.max_entries = 0;
-        history.push(DialogueSnapshot { speaker: "alice".into(), text: "ignored".into() });
+        history.push(DialogueSnapshot {
+            speaker: "alice".into(),
+            text: "ignored".into(),
+        });
         assert!(history.entries.is_empty());
     }
 }
@@ -192,7 +257,12 @@ pub fn advance_dialogue_on_input(
         if dialogue_state.fast_forward_elapsed >= 0.08 {
             dialogue_state.fast_forward_elapsed = 0.0;
             reveal_all_dialogue_chars(&mut dialogue_state, &mut dialogue_chars);
-            advance_dialogue(&mut dialogue_state, &mut animations, &mut dialogue_chars, &mut responses);
+            advance_dialogue(
+                &mut dialogue_state,
+                &mut animations,
+                &mut dialogue_chars,
+                &mut responses,
+            );
         }
         return;
     }
@@ -554,17 +624,42 @@ mod preference_tests {
         {
             let mut dialogue = app.world_mut().resource_mut::<DialogueState>();
             dialogue.fast_forward_enabled = true;
-            dialogue.waiting = Some(PendingDialogueAdvance { animation_id: Some("line".into()), request: None });
-            dialogue.reveal = Some(DialogueRevealState { spans: vec![], total_chars: 5, next_index: 0,
-                accumulator: 0.0, interval: 0.1, fade_seconds: 0.12, animation_id: None });
+            dialogue.waiting = Some(PendingDialogueAdvance {
+                animation_id: Some("line".into()),
+                request: None,
+            });
+            dialogue.reveal = Some(DialogueRevealState {
+                spans: vec![],
+                total_chars: 5,
+                next_index: 0,
+                accumulator: 0.0,
+                interval: 0.1,
+                fade_seconds: 0.12,
+                animation_id: None,
+            });
         }
-        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_millis(40));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(40));
         app.update();
         assert!(app.world().resource::<DialogueState>().waiting.is_some());
         app.update();
         assert!(app.world().resource::<DialogueState>().waiting.is_none());
-        assert_eq!(app.world().resource::<DialogueState>().reveal.as_ref().expect("reveal").next_index, 5);
-        assert!(app.world().resource::<AnimationState>().completed.contains("line"));
+        assert_eq!(
+            app.world()
+                .resource::<DialogueState>()
+                .reveal
+                .as_ref()
+                .expect("reveal")
+                .next_index,
+            5
+        );
+        assert!(
+            app.world()
+                .resource::<AnimationState>()
+                .completed
+                .contains("line")
+        );
         app.update();
         assert_eq!(app.world().resource::<AnimationState>().completed.len(), 1);
     }
