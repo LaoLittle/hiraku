@@ -9,6 +9,7 @@ pub(super) struct BootSection {
 
 #[derive(Debug, Default)]
 pub(super) struct SettingsFile {
+    pub(super) canvas_size: Option<[u32; 2]>,
     pub(super) startup: Option<String>,
     pub(super) fonts: FontsSettings,
     pub(super) backgrounds_dir: Option<String>,
@@ -28,6 +29,17 @@ pub(super) struct FontsSettings {
 }
 
 pub(super) fn settings_from_data(mut data: HsonMap, path: &str) -> Result<SettingsFile, VfsError> {
+    let canvas_size = data.remove("canvasSize").map(|value| {
+        if value.as_array().is_none_or(|items| items.len() != 2) {
+            return Err(invalid_settings_data(path, "`canvasSize` requires exactly two dimensions: (width, height)".into()));
+        }
+        let size: (u32, u32) = hiraku_script::hson::from_value(value)
+            .map_err(|_| invalid_settings_data(path, "`canvasSize` must be a tuple of two positive integers: (width, height)".into()))?;
+        if size.0 == 0 || size.1 == 0 {
+            return Err(invalid_settings_data(path, "`canvasSize` dimensions must be greater than zero".into()));
+        }
+        Ok([size.0, size.1])
+    }).transpose()?;
     let startup = take_data_string(&mut data, "startup", path)?;
     let backgrounds_dir = take_data_string(&mut data, "backgroundsDir", path)?;
     let soundeffects_dir = take_data_string(&mut data, "soundeffectsDir", path)?;
@@ -56,6 +68,7 @@ pub(super) fn settings_from_data(mut data: HsonMap, path: &str) -> Result<Settin
 
     ensure_empty_data_map(data, path, "settings")?;
     Ok(SettingsFile {
+        canvas_size,
         startup,
         fonts,
         backgrounds_dir,
@@ -109,4 +122,20 @@ pub(super) fn ensure_empty_data_map(
         path,
         format!("unknown {section} setting(s): {keys}"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn canvas_size_is_optional_and_requires_two_positive_integer_dimensions() {
+        let parse = |source: &str| {
+            settings_from_data(hiraku_script::hson::from_str(source).expect("fixture map"), "settings.hson")
+        };
+        assert_eq!(parse(".{}").expect("default").canvas_size, None);
+        assert_eq!(parse(".{canvasSize: (800, 1200)}").expect("portrait").canvas_size, Some([800, 1200]));
+        for source in [".{canvasSize: (0, 100)}", ".{canvasSize: (-1, 100)}", ".{canvasSize: (1.5, 100)}", ".{canvasSize: (1, 2, 3)}", ".{canvasSize: \"800x600\"}"] {
+            assert!(parse(source).expect_err("invalid size").to_string().contains("canvasSize"));
+        }
+    }
 }

@@ -230,6 +230,15 @@ impl HdpVfs {
         &self.settings_path
     }
 
+    /// Logical project resolution, independent of the host window dimensions.
+    pub fn load_canvas_size(&self) -> Result<Option<[u32; 2]>, VfsError> {
+        match self.load_settings_file() {
+            Ok(settings) => Ok(settings.canvas_size),
+            Err(VfsError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn default_startup_script(&self) -> &str {
         &self.default_startup_script
     }

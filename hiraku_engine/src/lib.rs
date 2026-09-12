@@ -168,7 +168,8 @@ pub struct RuntimeLaunchConfig {
     pub window_title: String,
     /// Stable project ID for browser storage, independent of window title.
     pub storage_namespace: String,
-    /// Fixed logical resolution rendered by Hiraku before presentation by the host game.
+    /// Fallback logical resolution. Project `settings.hson`'s `canvasSize`
+    /// takes precedence before the canvas and its cameras are created.
     pub canvas_size: UVec2,
     pub camera_order: isize,
     pub camera_clear_color: ClearColorConfig,
@@ -323,10 +324,14 @@ impl Plugin for HirakuPlugin {
             .register_asset_loader(HdpArchiveLoader::new(archive_store, archive_root))
             .init_asset_loader::<BytesAssetLoader>()
             .add_systems(Update, stream_requested_hdp_volumes)
+            .init_resource::<ProjectCanvasStatus>()
+            .add_systems(Update, prepare_project_canvas.run_if(runtime_content_ready))
             .add_systems(
                 Update,
                 (setup_frontend, setup_stage)
                     .chain()
+                    .after(prepare_project_canvas)
+                    .run_if(project_canvas_ready)
                     .run_if(runtime_content_ready)
                     .run_if(storage::storage_ready)
                     .run_if(runtime_not_initialized),
@@ -638,6 +643,77 @@ fn runtime_content_ready(
 
 fn runtime_not_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool {
     frontend.is_none()
+}
+
+/// Wait for the package bootstrap on every platform; do not read the desktop
+/// filesystem in the presentation host or resize an already-created target.
+#[derive(Resource, Default)]
+struct ProjectCanvasStatus(Option<bool>);
+
+fn project_canvas_ready(status: Res<ProjectCanvasStatus>) -> bool { status.0 == Some(true) }
+
+fn prepare_project_canvas(
+    vfs: Res<VfsResource>,
+    archives: Res<HdpArchiveStore>,
+    mut config: ResMut<RuntimeLaunchConfig>,
+    mut status: ResMut<ProjectCanvasStatus>,
+) {
+    if status.0.is_some() { return; }
+    if config.asset_mode == RuntimeAssetMode::Hdp && !archives.is_ready() { return; }
+    match vfs.0.load_canvas_size() {
+        Ok(size) => {
+            if let Some([width, height]) = size { config.canvas_size = UVec2::new(width, height); }
+            status.0 = Some(true);
+        }
+        Err(error) => {
+            script::emit_script_diagnostic("failed to configure project canvas", &error.to_string());
+            status.0 = Some(false);
+        }
+    }
+}
+
+#[cfg(test)]
+mod project_canvas_tests {
+    use super::*;
+
+    #[test]
+    fn waits_for_package_settings_before_consumers_observe_project_dimensions() {
+        #[derive(Resource)]
+        struct Observed(UVec2);
+        for (settings, expected, valid) in [
+            (".{canvasSize: (800, 1200)}", UVec2::new(800, 1200), true),
+            (".{}", UVec2::new(640, 480), true),
+            (".{canvasSize: (0, 1200)}", UVec2::new(640, 480), false),
+        ] {
+            let store = HdpArchiveStore::default();
+            let vfs = vfs::HdpVfs::new_with_config_and_store(
+                "unused-fixture-root", "hdp://fixture.hdp/settings.hson", "startup.hks", store.clone(),
+            );
+            let mut app = App::new();
+            app.insert_resource(VfsResource(Arc::new(vfs)))
+                .insert_resource(store.clone())
+                .insert_resource(RuntimeLaunchConfig { canvas_size: UVec2::new(640, 480), ..default() })
+                .init_resource::<ProjectCanvasStatus>()
+                .add_systems(Update, prepare_project_canvas)
+                .add_systems(Update, (|mut commands: Commands, config: Res<RuntimeLaunchConfig>| {
+                    commands.insert_resource(Observed(config.canvas_size));
+                }).after(prepare_project_canvas).run_if(project_canvas_ready));
+            app.update();
+            assert!(!app.world().contains_resource::<Observed>(), "must wait for asynchronous package availability");
+            let mut package = hiraku_hdp::PackageBuilder::new();
+            package.add_file("settings.hson", settings.as_bytes()).expect("settings fixture");
+            let packed = package.build(hiraku_hdp::PackOptions::default()).expect("fixture package");
+            let archive = hiraku_hdp::Archive::from_bytes(Arc::<[u8]>::from(packed.volumes[0].clone())).expect("archive");
+            store.publish(Arc::new(archive), "fixture.hdp".into()).expect("publish");
+            app.update();
+            assert_eq!(app.world().resource::<RuntimeLaunchConfig>().canvas_size, expected);
+            if valid {
+                assert_eq!(app.world().resource::<Observed>().0, expected);
+            } else {
+                assert!(!app.world().contains_resource::<Observed>(), "invalid configuration must not create a canvas");
+            }
+        }
+    }
 }
 
 fn runtime_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool {

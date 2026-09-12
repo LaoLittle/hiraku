@@ -1,3 +1,4 @@
 fn main() {
-    hiraku_app::run_app(hiraku_engine::RuntimeLaunchConfig::default());
+    let config = hiraku_engine::RuntimeLaunchConfig::default();
+    hiraku_app::run_app(config);
 }

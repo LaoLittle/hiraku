@@ -3,6 +3,20 @@
 Every example owns an ordinary asset directory and selects
 `RuntimeAssetMode::Directory`; no HDP package or build script is involved.
 
+Set the project's logical resolution in `settings.hson`, for example:
+
+```hks
+.{
+    canvasSize: (1920, 1080),
+    startup: "startup.hks",
+}
+```
+
+Hiraku reads this before creating the render target, including when settings
+come from an asynchronously loaded HDP package. The app presents the resulting
+canvas with its aspect ratio and pointer coordinates intact. `canvasSize`
+overrides the launch configuration's fallback size; it is not a window size.
+
 ```sh
 cargo run -p hiraku-app --example feature_showcase
 cargo run -p hiraku-app --example save_restore
