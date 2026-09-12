@@ -19,12 +19,12 @@ use hiraku_media::{
 pub struct MatroskaDemuxer {
     format: Box<dyn symphonia::core::formats::FormatReader>,
     video_track: u32,
-    audio_track: u32,
+    audio_track: Option<u32>,
     video_base: (u32, u32),
     audio_base: (u32, u32),
     first_video: bool,
     pub video_config: VideoDecoderConfig,
-    pub audio_config: AudioDecoderConfig,
+    pub audio_config: Option<AudioDecoderConfig>,
 }
 
 pub enum DemuxedChunk {
@@ -46,27 +46,26 @@ impl MatroskaDemuxer {
                     .is_some_and(|p| p.codec == video_codecs::CODEC_ID_AV1)
             })
             .ok_or(MediaError::MissingAv1)?;
-        let audio = format
-            .tracks()
-            .iter()
-            .find(|track| {
-                track
-                    .codec_params
-                    .as_ref()
-                    .and_then(|p| p.audio())
-                    .is_some_and(|p| p.codec == audio_codecs::CODEC_ID_OPUS)
-            })
-            .ok_or(MediaError::MissingOpus)?;
+        let audio = format.tracks().iter().find(|track| {
+            track
+                .codec_params
+                .as_ref()
+                .and_then(|p| p.audio())
+                .is_some_and(|p| p.codec == audio_codecs::CODEC_ID_OPUS)
+        });
         let vp = video
             .codec_params
             .as_ref()
             .and_then(|p| p.video())
             .ok_or(MediaError::MissingAv1)?;
-        let ap = audio
-            .codec_params
-            .as_ref()
-            .and_then(|p| p.audio())
-            .ok_or(MediaError::MissingOpus)?;
+        if audio.is_none()
+            && format
+                .tracks()
+                .iter()
+                .any(|t| t.codec_params.as_ref().and_then(|p| p.audio()).is_some())
+        {
+            return Err(MediaError::MissingOpus);
+        }
         let width = vp
             .width
             .filter(|v| *v != 0)
@@ -98,25 +97,32 @@ impl MatroskaDemuxer {
             .unwrap_or_else(|| "av01.0.04M.08".into());
         let mut video_config = VideoDecoderConfig::new(codec.as_str(), width.into(), height.into());
         video_config.description = description;
-        let channels = ap.channels.as_ref().map_or(2, |c| c.count());
-        let channels =
-            u16::try_from(channels).map_err(|_| MediaError::UnsupportedChannels(channels))?;
-        let rate = ap.sample_rate.unwrap_or(48000);
-        if channels == 0 {
-            return Err(MediaError::UnsupportedChannels(0));
-        }
-        if rate == 0 {
-            return Err(MediaError::InvalidSampleRate);
-        }
-        let audio_config = AudioDecoderConfig::new("opus", rate, channels);
+        let audio_config = if let Some(ap) = audio
+            .and_then(|t| t.codec_params.as_ref())
+            .and_then(|p| p.audio())
+        {
+            let channels = ap.channels.as_ref().map_or(2, |c| c.count());
+            let channels =
+                u16::try_from(channels).map_err(|_| MediaError::UnsupportedChannels(channels))?;
+            let rate = ap.sample_rate.unwrap_or(48000);
+            if channels == 0 {
+                return Err(MediaError::UnsupportedChannels(0));
+            }
+            if rate == 0 {
+                return Err(MediaError::InvalidSampleRate);
+            }
+            Some(AudioDecoderConfig::new("opus", rate, channels))
+        } else {
+            None
+        };
         let video_track = video.id;
-        let audio_track = audio.id;
+        let audio_track = audio.map(|t| t.id);
         let video_base = video
             .time_base
             .map(|b| (b.numer.get(), b.denom.get()))
             .unwrap_or((1, 1));
         let audio_base = audio
-            .time_base
+            .and_then(|t| t.time_base)
             .map(|b| (b.numer.get(), b.denom.get()))
             .unwrap_or((1, 1));
         Ok(Self {
@@ -141,7 +147,7 @@ impl MatroskaDemuxer {
                 return Ok(None);
             };
             let is_video = packet.track_id == self.video_track;
-            if !is_video && packet.track_id != self.audio_track {
+            if !is_video && Some(packet.track_id) != self.audio_track {
                 continue;
             }
             let base = if is_video {
@@ -219,7 +225,10 @@ pub fn inspect_media(bytes: &[u8], extension: &str) -> Result<MediaMetadata, Med
     Ok(MediaMetadata {
         width: demuxer.video_config.coded_width,
         height: demuxer.video_config.coded_height,
-        sample_rate: demuxer.audio_config.sample_rate,
-        channels: demuxer.audio_config.number_of_channels,
+        sample_rate: demuxer.audio_config.as_ref().map_or(0, |a| a.sample_rate),
+        channels: demuxer
+            .audio_config
+            .as_ref()
+            .map_or(0, |a| a.number_of_channels),
     })
 }

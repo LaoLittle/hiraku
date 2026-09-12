@@ -25,7 +25,7 @@ pub(crate) struct MediaDecoder {
     audio_sender: Sender<AudioEvent>,
     demuxer: MatroskaDemuxer,
     video_decoder: VideoDecoder,
-    audio_decoder: AudioDecoder,
+    audio_decoder: Option<AudioDecoder>,
     pending: Option<DemuxedChunk>,
     flushing: bool,
     failed: bool,
@@ -38,9 +38,14 @@ impl MediaDecoder {
             .map_err(|e| CodecError::Operation(e.to_string()))?;
         demuxer.video_config.software = settings;
         let mut video_decoder = VideoDecoder::new()?;
-        let mut audio_decoder = AudioDecoder::new()?;
         video_decoder.configure(demuxer.video_config.clone())?;
-        audio_decoder.configure(demuxer.audio_config.clone())?;
+        let audio_decoder = if let Some(config) = demuxer.audio_config.clone() {
+            let mut decoder = AudioDecoder::new()?;
+            decoder.configure(config)?;
+            Some(decoder)
+        } else {
+            None
+        };
         let (video_sender, video) = unbounded();
         let (audio_sender, audio) = unbounded();
         Ok(Self {
@@ -67,7 +72,9 @@ impl MediaDecoder {
         if let Err(error) = self.pump() {
             self.failed = true;
             self.video_decoder.close();
-            self.audio_decoder.close();
+            if let Some(decoder) = self.audio_decoder.as_mut() {
+                decoder.close();
+            }
             let _ = self.video_sender.send(VideoEvent::Error(error.to_string()));
             let _ = self.audio_sender.send(AudioEvent::End);
         }
@@ -93,12 +100,16 @@ impl MediaDecoder {
         }
 
         while self.audio.len() < 24 {
-            let Some(event) = self.audio_decoder.poll() else {
+            let Some(event) = self.audio_decoder.as_mut().and_then(|d| d.poll()) else {
                 break;
             };
             match event {
                 DecoderEvent::Output(data) => {
-                    let expected = &self.demuxer.audio_config;
+                    let expected = self.demuxer.audio_config.as_ref().ok_or_else(|| {
+                        CodecError::Operation(
+                            "unexpected audio output without an audio track".into(),
+                        )
+                    })?;
                     if data.sample_rate != expected.sample_rate
                         || data.number_of_channels != expected.number_of_channels
                     {
@@ -130,7 +141,11 @@ impl MediaDecoder {
 
             let Some(chunk) = self.pending.as_ref() else {
                 self.video_decoder.flush()?;
-                self.audio_decoder.flush()?;
+                if let Some(decoder) = self.audio_decoder.as_mut() {
+                    decoder.flush()?;
+                } else {
+                    let _ = self.audio_sender.send(AudioEvent::End);
+                }
                 self.flushing = true;
                 return Ok(());
             };
@@ -143,10 +158,11 @@ impl MediaDecoder {
                         >= 3
                 }
                 DemuxedChunk::Audio(_) => {
-                    self.audio.len()
-                        + self.audio_decoder.pending_output()
-                        + self.audio_decoder.decode_queue_size()
-                        >= 24
+                    let decoder = self
+                        .audio_decoder
+                        .as_ref()
+                        .ok_or_else(|| CodecError::Operation("unexpected audio packet".into()))?;
+                    self.audio.len() + decoder.pending_output() + decoder.decode_queue_size() >= 24
                 }
             };
 
@@ -156,7 +172,11 @@ impl MediaDecoder {
 
             match self.pending.take().expect("pending chunk was inspected") {
                 DemuxedChunk::Video(chunk) => self.video_decoder.decode(chunk)?,
-                DemuxedChunk::Audio(chunk) => self.audio_decoder.decode(chunk)?,
+                DemuxedChunk::Audio(chunk) => self
+                    .audio_decoder
+                    .as_mut()
+                    .ok_or_else(|| CodecError::Operation("unexpected audio packet".into()))?
+                    .decode(chunk)?,
             }
         }
 

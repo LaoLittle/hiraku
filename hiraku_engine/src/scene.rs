@@ -3,6 +3,7 @@ pub mod clock;
 pub(crate) mod ui_keyframes;
 pub(crate) mod ui_visuals;
 
+use crate::audio::EngineAudioSource as AudioSource;
 use bevy::{
     app::AppExit,
     audio::{AudioSink, AudioSinkPlayback, Volume},
@@ -12,6 +13,7 @@ use bevy::{
     prelude::*,
 };
 use hiraku_video::VideoPlayer;
+type AudioPlayer = bevy::audio::AudioPlayer<AudioSource>;
 
 use crate::{
     audio::{AudioCatalog, PreludeLoopAudio, load_audio_catalog},

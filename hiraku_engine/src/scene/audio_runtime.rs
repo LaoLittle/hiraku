@@ -35,6 +35,12 @@ pub(crate) struct SfxChannel {
 }
 
 #[derive(Component)]
+pub(crate) struct NamedSfxChannel(pub String);
+
+#[derive(Component)]
+pub(crate) struct StopSoundAfterFade;
+
+#[derive(Component)]
 pub(crate) struct SfxCompletion {
     pub animation_id: Option<String>,
 }
@@ -78,12 +84,14 @@ pub fn animate_audio_fades(
         Option<&BgmChannel>,
         Option<&VoiceChannel>,
         Option<&SfxChannel>,
+        Option<&StopSoundAfterFade>,
+        Option<&SfxCompletion>,
     )>,
 ) {
     if !sources.is_empty() {
         redraw.request();
     }
-    for (entity, sink, mut fade, bgm, voice, sfx) in &mut sources {
+    for (entity, sink, mut fade, bgm, voice, sfx, stop, completion) in &mut sources {
         let Some(mut sink) = sink else {
             // Asset loading is asynchronous. The fade starts with audible playback, not while
             // the source is still waiting to be decoded.
@@ -111,6 +119,13 @@ pub fn animate_audio_fades(
                 animations.completed.insert(animation_id);
             }
             commands.entity(entity).try_remove::<AudioFade>();
+            if stop.is_some() {
+                if let Some(id) = completion.and_then(|completion| completion.animation_id.as_ref())
+                {
+                    animations.completed.insert(id.clone());
+                }
+                commands.entity(entity).try_despawn();
+            }
         }
     }
 }
@@ -141,7 +156,7 @@ pub fn prepare_bgm_preludes(
         commands
             .entity(entity)
             .insert((
-                AudioPlayer(audio),
+                bevy::audio::AudioPlayer(audio),
                 PlaybackSettings::ONCE.with_volume(Volume::Linear(prelude.start_volume)),
             ))
             .try_remove::<BgmPrelude>();
@@ -187,7 +202,7 @@ pub fn reconcile_restored_bgm(
                     path: snapshot.path,
                     volume: snapshot.volume,
                 },
-                AudioPlayer::new(loop_audio),
+                bevy::audio::AudioPlayer::<AudioSource>(loop_audio),
                 PlaybackSettings::LOOP.with_volume(Volume::Linear(playback_volume)),
             ))
             .id()
@@ -286,14 +301,25 @@ pub fn poll_voice_playback(
     mut animations: ResMut<AnimationState>,
     mut voice_state: ResMut<VoiceState>,
     sinks: Query<&AudioSink>,
+    players: Query<&AudioPlayer>,
+    assets: Res<AssetServer>,
 ) {
     if voice_state.active.is_some() || !voice_state.concurrent.is_empty() {
         redraw.request();
     }
+    let finished = |entity| {
+        sinks.get(entity).is_ok_and(|sink| sink.empty())
+            || players.get(entity).is_ok_and(|player| {
+                matches!(
+                    assets.get_load_state(player.0.id()),
+                    Some(bevy::asset::LoadState::Failed(_))
+                )
+            })
+    };
     let exclusive_finished = voice_state
         .active
         .as_ref()
-        .is_some_and(|active| sinks.get(active.entity).is_ok_and(|sink| sink.empty()));
+        .is_some_and(|active| finished(active.entity));
     if exclusive_finished {
         finish_active_voice(&mut commands, &mut animations, &mut voice_state);
     }
@@ -302,7 +328,7 @@ pub fn poll_voice_playback(
         .concurrent
         .keys()
         .copied()
-        .filter(|entity| sinks.get(*entity).is_ok_and(|sink| sink.empty()))
+        .filter(|entity| finished(*entity))
         .collect::<Vec<_>>();
     for entity in completed {
         if let Some(active) = voice_state.concurrent.remove(&entity) {

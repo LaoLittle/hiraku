@@ -279,6 +279,9 @@ pub struct ScreenLayout {
     /// Opt into Unity-style RectTransform image stretching instead of contain.
     #[serde(default)]
     pub image_stretch: bool,
+    /// Multiplicative sRGBA tint; alpha preserves the image's own transparency.
+    #[serde(default)]
+    pub image_tint: Option<[f32; 4]>,
     /// None preserves the standard text shadow; false is useful on paper UI.
     #[serde(default)]
     pub text_shadow: Option<bool>,

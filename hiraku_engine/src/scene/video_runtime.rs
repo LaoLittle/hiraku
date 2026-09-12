@@ -23,11 +23,20 @@ pub(super) fn dispatch_video_command(
     waits: &mut PendingMovieWaits,
 ) {
     match command {
-        VideoCommand::Play { path, done } => {
+        VideoCommand::Play { path, done, fade_out } => {
             let asset: Handle<VideoAsset> = asset_server.load(path);
-            let playback = player.play(asset);
-            waits.0.insert(playback, done);
+            let playback = if done.is_some() {
+                player.play(asset)
+            } else {
+                player.play_under_ui(asset)
+            };
+            let configured = player.set_fade_out(playback, fade_out);
+            debug_assert!(configured, "newly queued movie accepts playback configuration");
+            if let Some(done) = done {
+                waits.0.insert(playback, done);
+            }
         }
+        VideoCommand::Stop => player.stop_all(),
     }
 }
 
@@ -60,6 +69,33 @@ pub fn complete_movie_waits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_video_completion_does_not_consume_a_dialogue_wait() {
+        let mut app = App::new();
+        app.init_resource::<PendingMovieWaits>()
+            .init_resource::<ScriptRuntimeState>()
+            .add_message::<VideoEvent>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, complete_movie_waits);
+        app.world_mut()
+            .resource_mut::<ScriptRuntimeState>()
+            .wait_request = Some(ScriptRequestId(4));
+        app.world_mut().write_message(VideoEvent::Finished {
+            id: VideoPlaybackId(1),
+        });
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Messages<ScriptResponseMessage>>()
+                .len(),
+            0
+        );
+        assert_eq!(
+            app.world().resource::<ScriptRuntimeState>().wait_request,
+            Some(ScriptRequestId(4))
+        );
+    }
 
     #[test]
     fn terminal_video_events_resume_only_the_matching_story_wait() {

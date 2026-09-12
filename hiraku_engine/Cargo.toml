@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+hiraku-opus = { git = "https://github.com/Hiraku-Project/opus-rs.git", version = "0.1.32" }
+ogg = "0.8"
+rodio = { version = "0.22", default-features = false }
 hiraku-uastc = { path = "../hiraku_uastc" }
 hiraku-sprite3d = { path = "../hiraku_sprite3d" }
 bevy.workspace = true

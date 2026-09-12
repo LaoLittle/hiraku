@@ -19,6 +19,8 @@ pub struct PictureState {
     #[serde(default)]
     pub blur_radius: f32,
     #[serde(default)]
+    pub noise: Option<PictureNoise>,
+    #[serde(default)]
     pub blur_tween: Option<PictureBlur>,
     pub id: String,
     pub path: String,
@@ -32,6 +34,23 @@ pub struct PictureState {
     pub motion: Option<PictureMotion>,
     #[serde(default)]
     pub fade: Option<PictureFade>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PictureNoise {
+    pub grid: [u32; 2],
+    pub interval: f64,
+    pub elapsed: f64,
+}
+
+impl PictureNoise {
+    fn parameters(&self) -> Vec3 {
+        Vec3::new(
+            ((self.elapsed / self.interval).floor() % 1048576.0) as f32 + 1.0,
+            self.grid[0] as f32,
+            self.grid[1] as f32,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,6 +92,11 @@ pub struct PictureMotion {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PictureCommand {
+    Noise {
+        id: String,
+        grid: [u32; 2],
+        interval: f64,
+    },
     Tint {
         id: String,
         color: [f32; 4],
@@ -141,6 +165,24 @@ pub(super) fn apply_picture_command(
     command: PictureCommand,
 ) -> Result<(), String> {
     match command {
+        PictureCommand::Noise { id, grid, interval } => {
+            if grid.iter().any(|size| *size == 0 || *size > 16384)
+                || !interval.is_finite()
+                || interval <= 0.0
+            {
+                return Err(
+                    "noise requires a positive interval and grid dimensions in 1..=16384".into(),
+                );
+            }
+            let picture = pictures
+                .get_mut(&id)
+                .ok_or_else(|| format!("picture `{id}` is not shown"))?;
+            picture.noise = Some(PictureNoise {
+                grid,
+                interval,
+                elapsed: 0.0,
+            });
+        }
         PictureCommand::StopMotion { id } => {
             if let Some(picture) = pictures.get_mut(&id) {
                 // State already contains the displayed interpolation sample.
@@ -275,6 +317,7 @@ pub(super) fn apply_picture_command(
                     tint,
                     tint_tween,
                     blur_radius: blur.0,
+                    noise: None,
                     blur_tween: blur.1,
                     id,
                     path,
@@ -446,6 +489,7 @@ pub fn sync_pictures(
             || picture.motion.is_some()
             || picture.tint_tween.is_some()
             || picture.blur_tween.is_some()
+            || picture.noise.is_some()
             || !ready.contains(id)
         {
             redraw.request();
@@ -510,6 +554,13 @@ pub fn sync_pictures(
         if sprite.blur_radius != picture.blur_radius {
             sprite.blur_radius = picture.blur_radius;
         }
+        let noise = picture
+            .noise
+            .as_ref()
+            .map_or(Vec3::ZERO, PictureNoise::parameters);
+        if sprite.noise != noise {
+            sprite.noise = noise;
+        }
         let color = picture_color(picture);
         if sprite.color != color {
             sprite.color = color;
@@ -541,6 +592,10 @@ pub fn sync_pictures(
         sprite.clip = clips.picture(id);
         sprite.rect = picture.rect;
         sprite.blur_radius = picture.blur_radius;
+        sprite.noise = picture
+            .noise
+            .as_ref()
+            .map_or(Vec3::ZERO, PictureNoise::parameters);
         sprite.color = picture_color(picture);
         let mut transform = picture_transform(picture, canvas.size.as_vec2());
         if let Some(index) = previous {
@@ -573,6 +628,9 @@ fn picture_color(picture: &PictureState) -> Color {
 }
 
 fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
+    if let Some(noise) = &mut picture.noise {
+        noise.elapsed += f64::from(delta);
+    }
     if let Some(tint) = &mut picture.tint_tween {
         tint.elapsed = (tint.elapsed + delta).min(tint.seconds);
         picture.tint = std::array::from_fn(|i| {
@@ -758,6 +816,44 @@ mod tests {
         assert!(!tick_picture(&mut restored, 1.0));
         // Nothing remains scheduled to address this identity after removal.
         assert_eq!(restored.alpha, 0.0);
+    }
+
+    #[test]
+    fn noise_clock_is_frame_stepped_pauseable_and_saved() {
+        let mut pictures = shown();
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Noise {
+                id: "room".into(),
+                grid: [800, 600],
+                interval: 0.1,
+            },
+        )
+        .expect("noise configuration");
+        let picture = pictures.get_mut("room").expect("picture");
+        tick_picture(picture, 0.05);
+        let first = picture.noise.as_ref().expect("noise").parameters();
+        assert_eq!(first, Vec3::new(1.0, 800.0, 600.0));
+        tick_picture(picture, 0.0);
+        assert_eq!(picture.noise.as_ref().expect("noise").parameters(), first);
+        let encoded = hiraku_script::hson::to_string(picture).expect("save noise");
+        let mut restored: PictureState =
+            hiraku_script::hson::from_str(&encoded).expect("restore noise");
+        tick_picture(picture, 0.06);
+        tick_picture(&mut restored, 0.06);
+        assert_eq!(picture.noise, restored.noise);
+        assert_eq!(picture.noise.as_ref().expect("noise").parameters().x, 2.0);
+        assert!(
+            apply_picture_command(
+                &mut pictures,
+                PictureCommand::Noise {
+                    id: "room".into(),
+                    grid: [0, 600],
+                    interval: 0.1,
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, time::Duration};
 use hiraku_script::native::{NativeError, NativeRegistry};
 use serde::{Deserialize, Serialize};
 
-use super::{CharacterContext, StoryEffect};
+use super::{CharacterContext, Position, StoryEffect};
 use crate::scene::clipping::{ClipCommand, ClipRegion};
 use crate::scene::pictures::PictureCommand;
 
@@ -238,6 +238,40 @@ mod api {
             }))
     }
 
+    #[hks(name = "at", selector = "SceneTransition", receiver)]
+    fn picture_at(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        position: Position,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let [x, y] = match position {
+            Position::Left => [25.0, 50.0],
+            Position::Center => [50.0, 50.0],
+            Position::Right => [75.0, 50.0],
+            Position::Relative(x, y) => [x, y],
+            Position::Absolute(x, y) => [(x / 1920.0 + 0.5) * 100.0, (y / 1080.0 + 0.5) * 100.0],
+        };
+        let Some((SceneVisualTarget::Picture(command), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "at requires an uncommitted picture or picture transform",
+            ));
+        };
+        match command {
+            PictureCommand::Show { position, .. } => *position = [x as f32, y as f32],
+            PictureCommand::Transform { position, .. } => {
+                *position = [Some(x as f32), Some(y as f32)]
+            }
+            _ => {
+                return Err(NativeError::message(
+                    "at requires a picture show or transform",
+                ));
+            }
+        }
+        Ok(handle)
+    }
+
     #[hks(name = "screenSpace", receiver)]
     fn screen_space(
         context: &mut CharacterContext,
@@ -292,6 +326,29 @@ mod api {
         *angle = rotation as f32;
         *z = layer as f32;
         Ok(SceneTransitionHandle(id))
+    }
+
+    /// Presentation order independent of position, size and rotation.
+    #[hks(name = "layer", selector = "SceneTransition", receiver)]
+    fn picture_layer(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        value: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if !value.is_finite() || !(0.0..30.0).contains(&value) {
+            return Err(NativeError::message(
+                "picture layer must be finite and in [0, 30)",
+            ));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { layer, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "layer requires an uncommitted picture",
+            ));
+        };
+        *layer = value as f32;
+        Ok(handle)
     }
 
     #[hks(name = "size", selector = "SceneTransition", receiver)]
@@ -392,6 +449,36 @@ mod api {
                 color: bytes.map(|v| v as f32 / 255.0),
                 seconds: 0.0,
             }))
+    }
+
+    /// A frame-stepped monochrome raster. Uses story time, independent of wall
+    /// time; pausing a story also pauses the noise. Dimensions are sample cells.
+    #[hks(name = "noisePicture", selector = "scene")]
+    fn noise_picture(
+        context: &mut CharacterContext,
+        id: String,
+        width: i32,
+        height: i32,
+        interval_ms: f64,
+    ) -> Result<(), NativeError> {
+        if id.trim().is_empty()
+            || !(1..=16384).contains(&width)
+            || !(1..=16384).contains(&height)
+            || !interval_ms.is_finite()
+            || interval_ms <= 0.0
+        {
+            return Err(NativeError::message(
+                "noisePicture requires an identity, grid in 1..=16384 and positive finite interval",
+            ));
+        }
+        context
+            .commands
+            .push(StoryEffect::Picture(PictureCommand::Noise {
+                id,
+                grid: [width as u32, height as u32],
+                interval: interval_ms / 1000.0,
+            }));
+        Ok(())
     }
 
     /// Radius is in source-image pixels, not a global camera blur amount.
@@ -855,6 +942,41 @@ mod tests {
     }
 
     #[test]
+    fn picture_convenience_positions_and_fractional_motion() {
+        assert_eq!(Position::Left.resolve(), [-600.0, -200.0]);
+        assert_eq!(Position::Center.resolve(), [0.0, -200.0]);
+        assert_eq!(Position::Right.resolve(), [600.0, -200.0]);
+        assert_eq!(Position::Relative(50.0, 50.0).resolve(), [0.0, 0.0]);
+        for (position, expected) in [
+            (".left", [25.0, 50.0]),
+            (".center", [50.0, 50.0]),
+            (".right", [75.0, 50.0]),
+            (".rel(-12.5, 50.078125)", [-12.5, 50.078125]),
+        ] {
+            let mut show = runtime(&format!(
+                "scene.picture(\"alice\", \"portrait\").at({position})"
+            ));
+            let StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                position,
+                ..
+            })) = event(&mut show)
+            else {
+                panic!("expected positioned picture");
+            };
+            assert_eq!(position, expected);
+        }
+        let mut movement = runtime("scene.transformPicture(\"alice\").at(.rel(37.5, 62.5))");
+        let StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Transform {
+            position,
+            ..
+        })) = event(&mut movement)
+        else {
+            panic!("expected positioned transform");
+        };
+        assert_eq!(position, [Some(37.5), Some(62.5)]);
+    }
+
+    #[test]
     fn validates_duration_without_panicking() {
         assert_eq!(milliseconds(1.8).expect("valid duration"), 1800);
         for value in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
@@ -1251,6 +1373,103 @@ mod tests {
             matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect { effect: StoryEffect::Picture(
             PictureCommand::Tint { id, color, seconds }
         ), .. } if id == "room" && color == [0.0, 128.0 / 255.0, 1.0, 1.0] && (seconds - 0.3).abs() < 0.001)
+        );
+    }
+
+    #[test]
+    fn picture_layer_is_independent_of_convenience_position() {
+        let mut runtime =
+            runtime("scene.picture(\"panel\", \"cover\").at(.center).size(1280, 720).layer(14)");
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                layer: 14.0,
+                position: [50.0, 50.0],
+                size: Some([1280.0, 720.0]),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn event_layer_fades_join_before_dialogue() {
+        let mut runtime = runtime(
+            r#"
+            par {
+                scene.picture("alice", "mask").at(.center).layer(12).fade(50)
+                scene.picture("bob", "cover").at(.center).layer(13).fade(100)
+            }.await()
+            "Ready"
+        "#,
+        );
+        let StoryRuntimeEvent::TaskEffect {
+            task: first,
+            effect: first_effect,
+        } = event(&mut runtime)
+        else {
+            panic!("first picture must start asynchronously")
+        };
+        let StoryRuntimeEvent::TaskEffect {
+            task: second,
+            effect: second_effect,
+        } = event(&mut runtime)
+        else {
+            panic!("second picture must start before the first completes")
+        };
+        assert!(runtime.step().expect("waiting for fades").is_none());
+        runtime
+            .complete_task_effect(first, &first_effect)
+            .expect("first fade finishes");
+        assert!(
+            runtime
+                .step()
+                .expect("second fade is still active")
+                .is_none()
+        );
+        runtime
+            .complete_task_effect(second, &second_effect)
+            .expect("second fade finishes");
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::Say { .. })
+        ));
+        assert!(matches!(event(&mut runtime), StoryRuntimeEvent::Wait(_)));
+    }
+
+    #[test]
+    fn entrance_wait_does_not_join_independent_camera_track() {
+        let mut runtime = runtime(
+            r#"
+            let entrance = par { scene.picture("panel", "room").fade(1000) }
+            par { scene.transformPicture("panel").scale(2).animation(.linear(80)) }
+            entrance.await()
+            log("entered")
+        "#,
+        );
+        let StoryRuntimeEvent::TaskEffect {
+            task: entrance,
+            effect: show,
+        } = event(&mut runtime)
+        else {
+            panic!("entrance starts first")
+        };
+        assert!(matches!(
+            show,
+            StoryEffect::Picture(PictureCommand::Show { .. })
+        ));
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::Picture(PictureCommand::Transform { seconds: 80.0, .. }),
+                ..
+            }
+        ));
+        assert!(runtime.step().expect("wait for entrance").is_none());
+        runtime
+            .complete_task_effect(entrance, &show)
+            .expect("entrance finished");
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Log(message)) if message == "entered")
         );
     }
 

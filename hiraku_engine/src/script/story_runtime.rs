@@ -168,13 +168,13 @@ impl StoryRuntime {
             let had_voice = effects.iter().any(|effect| {
                 matches!(
                     effect,
-                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }
+                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. } | StoryEffect::PlaySfxChannel { .. }
                 )
             });
             effects.retain(|effect| {
                 !matches!(
                     effect,
-                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. }
+                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. } | StoryEffect::PlaySfxChannel { .. }
                 )
             });
             if had_voice && effects.is_empty() {
@@ -762,6 +762,7 @@ impl StoryRuntime {
                 effect,
                 StoryEffect::PlayVoice { .. }
                     | StoryEffect::PlaySfx { .. }
+                    | StoryEffect::PlaySfxChannel { .. }
                     | StoryEffect::Delay { .. }
             ) || ((explicit || task_mode != Some(ExecutionMode::Interactive))
                 && animation_effect(&effect))
@@ -814,8 +815,10 @@ fn animation_effect(effect: &StoryEffect) -> bool {
             | StoryEffect::SetCurtain { .. }
             | StoryEffect::Picture(_)
             | StoryEffect::PlayBgm { .. }
+            | StoryEffect::StopBgm { .. }
             | StoryEffect::PlayVoice { .. }
             | StoryEffect::PlaySfx { .. }
+            | StoryEffect::PlaySfxChannel { .. }
     )
 }
 
@@ -2000,6 +2003,7 @@ mod tests {
             runtime.step().expect("movie must suspend its branch"),
             Some(StoryRuntimeEvent::Wait(StoryWait::Movie {
                 path: "opening".into(),
+                fade_out_ms: 0,
             }))
         );
         assert!(runtime.is_waiting_for_host_response());
@@ -2073,6 +2077,7 @@ mod tests {
             runtime.step().expect("movie must suspend"),
             Some(StoryRuntimeEvent::Wait(StoryWait::Movie {
                 path: "movies/opening.mkv".into(),
+                fade_out_ms: 0,
             }))
         );
         let snapshot = runtime.snapshot().expect("movie wait must be saveable");
@@ -2084,6 +2089,7 @@ mod tests {
             restored.restored_boundary_event(),
             Some(StoryRuntimeEvent::Wait(StoryWait::Movie {
                 path: "movies/opening.mkv".into(),
+                fade_out_ms: 0,
             }))
         );
         restored.resume(Value::Unit).expect("movie completion");

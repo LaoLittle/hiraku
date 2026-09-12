@@ -241,7 +241,19 @@ pub(crate) struct ScreenComposition {
     rendered: BTreeMap<String, hiraku_script::Value>,
 }
 
-/// Re-evaluate structural branches only when this mount's local state changes.
+/// Content systems must never observe the subtree retired by recomposition.
+/// Ordering these sets inserts Bevy's deferred-command barrier between them.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ScreenUiPhase {
+    Structure,
+    Content,
+}
+
+pub(crate) fn configure_screen_ui_phases(app: &mut App) {
+    app.configure_sets(Update, (ScreenUiPhase::Structure, ScreenUiPhase::Content).chain());
+}
+
+/// Re-evaluate structural branches when local state or an external model changes.
 /// Keep the modal root and its waiting request: rebuilding content is not ui.open.
 pub fn recompose_screen_ui(
     mut commands: Commands,
@@ -251,20 +263,19 @@ pub fn recompose_screen_ui(
     fonts: Res<UiFonts>,
     style: Res<UiStyle>,
     focus: Res<crate::input::HirakuTextFocus>,
+    models: Res<UiModels>,
     interactions: Query<(Entity, &PickingInteraction)>,
     parents: Query<&ChildOf>,
     mut screens: Query<(
         Entity,
-        &Children,
+        Option<&Children>,
         &super::widgets::UiLocalState,
         &mut ScreenComposition,
     )>,
 ) {
     for (root, children, local, mut composition) in &mut screens {
-        if composition.rendered == local.0 {
-            continue;
-        }
-        if !composition
+        let models_changed = composition.renderer.models_changed(&models);
+        if !models_changed && !composition
             .renderer
             .document
             .plan
@@ -297,6 +308,9 @@ pub fn recompose_screen_ui(
         }
         // Do not retry a failed state every frame or overwrite the visible UI.
         composition.rendered = local.0.clone();
+        if models_changed {
+            composition.renderer = std::sync::Arc::new(composition.renderer.with_models(&models));
+        }
         let screen = match composition.renderer.render(&local.0, &textures, &terms) {
             Ok(screen) => screen,
             Err(error) => {
@@ -317,7 +331,7 @@ pub fn recompose_screen_ui(
             &screen,
             &mut handles,
         );
-        for child in children.iter() {
+        for child in children.into_iter().flat_map(|children| children.iter()) {
             commands.entity(child).try_despawn();
         }
         commands.entity(root).add_children(&next);
@@ -1563,11 +1577,15 @@ fn screen_image_node(
     rect: Option<[f32; 4]>,
     layout: &ScreenLayout,
 ) -> ImageNode {
-    if layout.image_stretch {
+    let mut image = if layout.image_stretch {
         stretched_image_node(image, rect)
     } else {
         image_node(image, rect)
+    };
+    if let Some([r, g, b, a]) = layout.image_tint {
+        image.color = Color::srgba(r, g, b, a);
     }
+    image
 }
 
 fn stretched_image_node(image: Handle<Image>, rect: Option<[f32; 4]>) -> ImageNode {
@@ -1739,7 +1757,9 @@ pub fn process_ui_effects(
                 );
                 commands.spawn((
                     SfxChannel { volume: *volume },
-                    AudioPlayer::new(asset_server.load(definition.path.clone())),
+                    bevy::audio::AudioPlayer::<AudioSource>(
+                        asset_server.load(definition.path.clone()),
+                    ),
                     PlaybackSettings::DESPAWN.with_volume(Volume::Linear(playback_volume)),
                 ));
             }
@@ -3022,6 +3042,7 @@ mod tests {
             .init_resource::<UiStyle>()
             .init_resource::<crate::input::HirakuTextFocus>()
             .init_resource::<ScreenUiState>()
+            .init_resource::<UiModels>()
             .insert_resource(UiFonts {
                 regular: Handle::default(),
                 _fonts: vec![],
@@ -3068,6 +3089,92 @@ mod tests {
         );
         let mut texts = app.world_mut().query::<&Text>();
         assert!(texts.iter(app.world()).any(|text| text.0 == "Bob"));
+    }
+
+    #[test]
+    fn structural_rebuild_commits_before_rich_text_materialization() {
+        let model = |visible| StoredValue::Map(BTreeMap::from([
+            ("visible".into(), StoredValue::Bool(visible)),
+        ]));
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://dialogue.ui.hks",
+            "import ui.widgets.*\ncanvas { if dialogue.visible { richText(\"Alice\") } }",
+            UiContext::new(BTreeMap::from([("dialogue".into(), model(true))])),
+            &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("conditional UI compiles");
+        let renderer = screen.composition.expect("composition");
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_resource::<TextureCatalog>()
+            .init_resource::<TermCatalog>()
+            .init_resource::<UiStyle>()
+            .init_resource::<UiModels>()
+            .init_resource::<crate::input::HirakuTextFocus>()
+            .insert_resource(UiFonts { regular: Handle::default(), _fonts: vec![] })
+            .add_systems(Update, recompose_screen_ui.in_set(ScreenUiPhase::Structure))
+            .add_systems(Update, super::super::rich_text::update.in_set(ScreenUiPhase::Content));
+        configure_screen_ui_phases(&mut app);
+        let old = app.world_mut().spawn((
+            Text::new(""), TextFont::default(), TextColor::default(),
+            super::super::rich_text::RichTextSource::new("Bob".into(), &ScreenLayout::default()),
+        )).id();
+        let root = app.world_mut().spawn((
+            Node::default(), super::super::widgets::UiLocalState(renderer.globals.clone()),
+            ScreenComposition { rendered: renderer.globals.clone(), renderer },
+        )).add_child(old).id();
+        app.world_mut().resource_mut::<UiModels>().set("dialogue", model(false));
+        app.update();
+        assert!(app.world().get_entity(old).is_err());
+        assert!(app.world().get::<Children>(root).is_none_or(|children| children.is_empty()));
+        app.world_mut().resource_mut::<UiModels>().set("dialogue", model(true));
+        app.update();
+        let child = app.world().get::<Children>(root).expect("rebuilt children")[0];
+        assert_ne!(child, old);
+        app.update();
+        assert!(app.world().get_entity(child).is_ok());
+        // Repeated visibility changes must not leave unparented glyph spans.
+        for visible in [false, true, false, true, false] {
+            app.world_mut().resource_mut::<UiModels>().set("dialogue", model(visible));
+            app.update();
+            let mut spans = app.world_mut().query::<&TextSpan>();
+            assert_eq!(spans.iter(app.world()).count(), if visible { 5 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn initially_empty_screen_recomposes_when_host_model_changes() {
+        let model = |visible| StoredValue::Map(BTreeMap::from([
+            ("visible".into(), StoredValue::Bool(visible)),
+        ]));
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://dialogue.ui.hks",
+            "import ui.widgets.*\ncanvas { if dialogue.visible { text(\"Alice\") } }",
+            UiContext::new(BTreeMap::from([("dialogue".into(), model(false))])),
+            &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("empty UI is valid");
+        assert!(screen.children.is_empty());
+        let renderer = screen.composition.expect("composition");
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_resource::<TextureCatalog>()
+            .init_resource::<TermCatalog>()
+            .init_resource::<UiStyle>()
+            .init_resource::<UiModels>()
+            .init_resource::<crate::input::HirakuTextFocus>()
+            .insert_resource(UiFonts { regular: Handle::default(), _fonts: vec![] })
+            .add_systems(Update, recompose_screen_ui);
+        let root = app.world_mut().spawn((
+            Node::default(), super::super::widgets::UiLocalState(renderer.globals.clone()),
+            ScreenComposition { rendered: renderer.globals.clone(), renderer },
+        )).id();
+        for visible in [true, false, true] {
+            app.world_mut().resource_mut::<UiModels>().set("dialogue", model(visible));
+            app.update();
+            assert_eq!(app.world().get::<Children>(root).map_or(0, |c| c.len()), usize::from(visible));
+        }
+        let child = app.world().get::<Children>(root).expect("visible children")[0];
+        app.update();
+        assert_eq!(app.world().get::<Children>(root).expect("stable children")[0], child);
     }
 
     #[test]
@@ -3126,6 +3233,11 @@ mod tests {
             Some(texture_rect(region.expect("test region")))
         );
         layout.image_stretch = true;
+        layout.image_tint = Some([1.0, 0.5, 0.25, 166.0 / 255.0]);
+        assert_eq!(
+            screen_image_node(Handle::default(), region, &layout).color,
+            Color::srgba(1.0, 0.5, 0.25, 166.0 / 255.0),
+        );
         assert_eq!(
             screen_image_node(Handle::default(), region, &layout).image_mode,
             NodeImageMode::Stretch,

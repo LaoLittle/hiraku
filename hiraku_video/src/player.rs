@@ -79,6 +79,8 @@ impl VideoDecodeSettings {
 struct PendingPlayback {
     id: VideoPlaybackId,
     asset: Handle<VideoAsset>,
+    z_index: i32,
+    fade_out: Duration,
 }
 
 enum PlaybackControl {
@@ -103,13 +105,38 @@ pub struct VideoPlayer {
 
 impl VideoPlayer {
     pub fn play(&mut self, asset: Handle<VideoAsset>) -> VideoPlaybackId {
+        self.play_at_layer(asset, VIDEO_Z_INDEX)
+    }
+
+    /// Non-modal fullscreen video, below the host's positive-Z UI layers.
+    pub fn play_under_ui(&mut self, asset: Handle<VideoAsset>) -> VideoPlaybackId {
+        self.play_at_layer(asset, 0)
+    }
+
+    /// Configure natural completion before playback starts. The last frame
+    /// remains alive until its exit fade completes; skip still cancels at once.
+    pub fn set_fade_out(&mut self, id: VideoPlaybackId, duration: Duration) -> bool {
+        if let Some(pending) = self.pending.iter_mut().find(|pending| pending.id == id) {
+            pending.fade_out = duration;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn play_at_layer(&mut self, asset: Handle<VideoAsset>, z_index: i32) -> VideoPlaybackId {
         self.next_id = self
             .next_id
             .checked_add(1)
             .expect("video playback identifier space must not be exhausted");
         let id = VideoPlaybackId(self.next_id);
         self.states.insert(id, VideoPlaybackState::Loading);
-        self.pending.push_back(PendingPlayback { id, asset });
+        self.pending.push_back(PendingPlayback {
+            id,
+            asset,
+            z_index,
+            fade_out: Duration::ZERO,
+        });
         id
     }
 
@@ -143,6 +170,15 @@ impl VideoPlayer {
         }
     }
 
+    /// Cancel loading requests as well as active playback through normal terminal events.
+    pub fn stop_all(&mut self) {
+        let pending: Vec<_> = self.pending.iter().map(|request| request.id).collect();
+        for id in pending {
+            self.skip(id);
+        }
+        self.skip_active();
+    }
+
     pub fn active(&self) -> Option<VideoPlaybackId> {
         self.active
     }
@@ -170,6 +206,8 @@ struct ActivePlayback {
     audio_clock: VideoAudio,
     age: Duration,
     decoder: MediaDecoder,
+    fade_out: Duration,
+    exit_elapsed: Option<Duration>,
 }
 
 enum VideoSurface {
@@ -280,12 +318,20 @@ fn start_pending_video(
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::BLACK),
-            GlobalZIndex(VIDEO_Z_INDEX),
+            BackgroundColor(if pending.z_index == 0 {
+                Color::NONE
+            } else {
+                Color::BLACK
+            }),
+            GlobalZIndex(pending.z_index),
             Pickable::IGNORE,
         ))
         .id();
-    let audio_entity = spawn_movie_audio(&mut commands, &mut audio_assets, audio.clone());
+    let audio_entity = if asset.metadata.channels == 0 {
+        None
+    } else {
+        spawn_movie_audio(&mut commands, &mut audio_assets, audio.clone())
+    };
     player.active = Some(pending.id);
     active.0 = Some(ActivePlayback {
         id: pending.id,
@@ -302,6 +348,8 @@ fn start_pending_video(
         audio_clock: audio,
         age: Duration::ZERO,
         decoder: stream,
+        fade_out: pending.fade_out,
+        exit_elapsed: None,
     });
 }
 
@@ -380,6 +428,9 @@ fn update_video(
     mut active: NonSendMut<ActiveVideo>,
     mut events: MessageWriter<VideoEvent>,
     mut video_upload: ResMut<VideoUpload>,
+    material_nodes: Query<&MaterialNode<Yuv420Material>>,
+    mut image_nodes: Query<&mut ImageNode>,
+    mut backgrounds: Query<&mut BackgroundColor>,
 ) {
     let Some(playback) = active.0.as_mut() else {
         video_upload.clear();
@@ -392,7 +443,7 @@ fn update_video(
     playback.decoder.poll();
     if playback
         .audio_entity
-        .is_none_or(|audio_entity| sinks.get(audio_entity).is_err())
+        .is_some_and(|audio_entity| sinks.get(audio_entity).is_err())
         && playback.age >= AUDIO_SINK_TIMEOUT
     {
         let id = playback.id;
@@ -482,15 +533,46 @@ fn update_video(
     {
         sink.pause();
     }
-    let audio_finished = playback
-        .audio_entity
-        .and_then(|audio_entity| sinks.get(audio_entity).ok())
-        .is_some_and(AudioSinkPlayback::empty);
+    let audio_finished = audio_completed(
+        playback.audio_entity.is_some(),
+        playback
+            .audio_entity
+            .and_then(|entity| sinks.get(entity).ok())
+            .is_some_and(AudioSinkPlayback::empty),
+    );
     if playback.decoder_ended
         && playback.frames.is_empty()
         && playback.position >= playback.last_timestamp + LAST_FRAME_HOLD
         && audio_finished
     {
+        let elapsed = playback.exit_elapsed.get_or_insert(Duration::ZERO);
+        if !playback.paused {
+            *elapsed += time.delta();
+        }
+        let opacity = exit_opacity(*elapsed, playback.fade_out);
+        if let Ok(mut background) = backgrounds.get_mut(playback.root) {
+            if background.0.alpha() > 0.0 {
+                background.0.set_alpha(opacity);
+            }
+        }
+        if let Some(surface) = &playback.surface {
+            let image_entity = match surface {
+                VideoSurface::YuvI420 { image_entity, .. }
+                | VideoSurface::YuvNv12 { image_entity, .. }
+                | VideoSurface::Rgba { image_entity, .. } => *image_entity,
+            };
+            if let Ok(node) = material_nodes.get(image_entity)
+                && let Some(mut material) = materials.get_mut(&node.0)
+            {
+                material.opacity = opacity;
+            }
+            if let Ok(mut image) = image_nodes.get_mut(image_entity) {
+                image.color.set_alpha(opacity);
+            }
+        }
+        if opacity > 0.0 {
+            return;
+        }
         let id = playback.id;
         cleanup_playback(&mut commands, playback);
         active.0 = None;
@@ -498,6 +580,18 @@ fn update_video(
         player.states.insert(id, VideoPlaybackState::Finished);
         events.write(VideoEvent::Finished { id });
     }
+}
+
+fn exit_opacity(elapsed: Duration, duration: Duration) -> f32 {
+    if duration.is_zero() {
+        0.0
+    } else {
+        (1.0 - elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0) as f32
+    }
+}
+
+fn audio_completed(has_audio: bool, sink_empty: bool) -> bool {
+    !has_audio || sink_empty
 }
 
 fn present_frame(
@@ -596,6 +690,7 @@ fn present_frame(
     let u_image = images.add(plane_image(frame.chroma_width, frame.chroma_height, u));
     let v_image = images.add(plane_image(frame.chroma_width, frame.chroma_height, v));
     let material = materials.add(Yuv420Material {
+        opacity: 1.0,
         y: y_image.clone(),
         chroma0: u_image.clone(),
         chroma1: v_image.clone(),
@@ -653,6 +748,7 @@ fn present_strided_frame(
         let u_image = images.add(empty_plane_image(frame.chroma_width, frame.chroma_height));
         let v_image = images.add(empty_plane_image(frame.chroma_width, frame.chroma_height));
         let material = materials.add(Yuv420Material {
+            opacity: 1.0,
             y: y_image.clone(),
             chroma0: u_image.clone(),
             chroma1: v_image.clone(),
@@ -720,6 +816,7 @@ fn present_nv12_frame(
         let dummy_image = images.add(empty_plane_image(1, 1));
 
         let material = materials.add(Yuv420Material {
+            opacity: 1.0,
             y: y_image.clone(),
             chroma0: uv_image.clone(),
             chroma1: dummy_image.clone(),
@@ -918,6 +1015,30 @@ fn rgba_image(width: u32, height: u32, data: Vec<u8>) -> Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_video_can_finish_and_exit_fade_has_exact_endpoints() {
+        assert!(audio_completed(false, false));
+        assert!(!audio_completed(true, false));
+        assert!(audio_completed(true, true));
+        assert_eq!(exit_opacity(Duration::ZERO, Duration::from_secs(1)), 1.0);
+        assert_eq!(
+            exit_opacity(Duration::from_millis(500), Duration::from_secs(1)),
+            0.5
+        );
+        assert_eq!(
+            exit_opacity(Duration::from_secs(2), Duration::from_secs(1)),
+            0.0
+        );
+        assert_eq!(exit_opacity(Duration::ZERO, Duration::ZERO), 0.0);
+        let mut player = VideoPlayer::default();
+        let id = player.play_under_ui(Handle::default());
+        assert!(player.set_fade_out(id, Duration::from_secs(1)));
+        assert_eq!(
+            player.pending.front().expect("queued movie").fade_out,
+            Duration::from_secs(1)
+        );
+    }
 
     #[test]
     fn playback_ids_are_monotonic_and_controls_are_available_without_a_backend() {

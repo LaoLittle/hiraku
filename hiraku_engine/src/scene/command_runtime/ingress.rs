@@ -1,5 +1,6 @@
 use super::*;
 use crate::script::StoryRuntimeEvent;
+use crate::script::capabilities::StoryEffect;
 use crate::script::replay::{InputKind, ReplayJournal, ReplayPoint};
 use std::time::Duration;
 
@@ -371,6 +372,8 @@ pub fn drive_story_runtime(
                     .and_then(|catalog| catalog.resolve_sfx(&path))
                 {
                     pending_script_commands.enqueue(ScriptCommand::Audio(AudioCommand::PlaySfx {
+                        channel: None,
+                        looped: false,
                         path: definition.path.clone(),
                         volume,
                         fade_in: fade_in_ms.map(Duration::from_millis),
@@ -379,6 +382,16 @@ pub fn drive_story_runtime(
                 } else {
                     warn!("sound effect `{path}` is not defined");
                 }
+            }
+            StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlaySfxChannel {
+                channel, path, volume, fade_in_ms, looped,
+            }) => {
+                if let Some(definition) = audio.as_deref().and_then(|catalog| catalog.resolve_sfx(&path)) {
+                    pending_script_commands.enqueue(ScriptCommand::Audio(AudioCommand::PlaySfx {
+                        channel: Some(channel), looped, path: definition.path.clone(), volume,
+                        fade_in: fade_in_ms.map(Duration::from_millis), animation_id: None,
+                    }));
+                } else { warn!("sound effect `{path}` is not defined"); }
             }
             StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayVoice {
                 path,
@@ -554,17 +567,6 @@ pub fn drive_story_runtime(
                     }
                 }
             }
-            StoryRuntimeEvent::Effect(effect) => {
-                match script_command_from_effect(effect, textures.as_deref()) {
-                    Ok(command) => {
-                        pending_script_commands.enqueue(command);
-                    }
-                    Err(error) => crate::script::emit_script_diagnostic(
-                        "HKS native command rejected",
-                        &error.to_string(),
-                    ),
-                }
-            }
             StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::DialogueAdvance) => {
                 let request = runtime.allocate_request();
                 runtime.wait_request = Some(request);
@@ -584,7 +586,13 @@ pub fn drive_story_runtime(
                     },
                 ));
             }
-            StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Movie { path }) => {
+            event @ (StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Movie { .. })
+                | StoryRuntimeEvent::Effect(StoryEffect::MovieBackground { .. })) => {
+                let (path, blocking, fade_out_ms) = match event {
+                    StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Movie { path, fade_out_ms }) => (path, true, fade_out_ms),
+                    StoryRuntimeEvent::Effect(StoryEffect::MovieBackground { path, fade_out_ms }) => (path, false, fade_out_ms),
+                    _ => unreachable!("matched movie events"),
+                };
                 let target = movies
                     .as_deref()
                     .and_then(|catalog| catalog.resolve(&path))
@@ -599,12 +607,22 @@ pub fn drive_story_runtime(
                     runtime.story = None;
                     return;
                 };
-                let request = runtime.allocate_request();
-                runtime.wait_request = Some(request);
+                let done = if blocking {
+                    let request = runtime.allocate_request();
+                    runtime.wait_request = Some(request);
+                    Some(request)
+                } else { None };
                 pending_script_commands.enqueue(ScriptCommand::Video(VideoCommand::Play {
                     path: target,
-                    done: request,
+                    fade_out: Duration::from_millis(fade_out_ms),
+                    done,
                 }));
+            }
+            StoryRuntimeEvent::Effect(effect) => {
+                match script_command_from_effect(effect, textures.as_deref()) {
+                    Ok(command) => { pending_script_commands.enqueue(command); }
+                    Err(error) => crate::script::emit_script_diagnostic("HKS native command rejected", &error.to_string()),
+                }
             }
             StoryRuntimeEvent::Choice {
                 prompt,
@@ -799,13 +817,14 @@ pub fn drive_story_runtime(
             }
             StoryRuntimeEvent::TaskEffect {
                 task,
-                effect:
-                    crate::script::capabilities::StoryEffect::PlaySfx {
-                        path,
-                        volume,
-                        fade_in_ms,
-                    },
+                effect: effect @ (crate::script::capabilities::StoryEffect::PlaySfx { .. }
+                    | crate::script::capabilities::StoryEffect::PlaySfxChannel { .. }),
             } => {
+                let (path, volume, fade_in_ms, channel, looped) = match &effect {
+                    crate::script::capabilities::StoryEffect::PlaySfx { path, volume, fade_in_ms } => (path, *volume, *fade_in_ms, None, false),
+                    crate::script::capabilities::StoryEffect::PlaySfxChannel { path, volume, fade_in_ms, channel, looped } => (path, *volume, *fade_in_ms, Some(channel.clone()), *looped),
+                    _ => unreachable!("matched audio task effect"),
+                };
                 if let Some(definition) = audio
                     .as_deref()
                     .and_then(|catalog| catalog.resolve_sfx(&path))
@@ -816,14 +835,12 @@ pub fn drive_story_runtime(
                         request,
                         (
                             task,
-                            crate::script::capabilities::StoryEffect::PlaySfx {
-                                path: path.clone(),
-                                volume,
-                                fade_in_ms,
-                            },
+                            effect.clone(),
                         ),
                     );
                     pending_script_commands.enqueue(ScriptCommand::Audio(AudioCommand::PlaySfx {
+                        channel,
+                        looped,
                         path: definition.path.clone(),
                         volume,
                         fade_in: fade_in_ms.map(Duration::from_millis),
@@ -840,11 +857,7 @@ pub fn drive_story_runtime(
                     if let Some(story) = runtime.story.as_mut()
                         && let Err(error) = story.complete_task_effect(
                             task,
-                            &crate::script::capabilities::StoryEffect::PlaySfx {
-                                path: path.clone(),
-                                volume,
-                                fade_in_ms,
-                            },
+                            &effect,
                         )
                     {
                         crate::script::emit_script_diagnostic(
@@ -917,6 +930,7 @@ pub fn drive_story_runtime(
                 let id = format!("hks-effect-{}", request.0);
                 let wait = match &mut command {
                     ScriptCommand::Camera(CameraCommand::Set { animation_id, .. })
+                    | ScriptCommand::Audio(AudioCommand::StopBgm { animation_id, .. })
                     | ScriptCommand::Stage(StageCommand::SetBackground { animation_id, .. })
                     | ScriptCommand::Character(CharacterCommand::Motion { animation_id, .. })
                     | ScriptCommand::Dialogue(DialogueCommand::Say { animation_id, .. })

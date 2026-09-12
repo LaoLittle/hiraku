@@ -81,7 +81,9 @@ pub(crate) fn script_command_from_effect(
         StoryEffect::DialogueSpeed(multiplier) => {
             ScriptCommand::Dialogue(DialogueCommand::Speed(multiplier))
         }
-        StoryEffect::StopBgm => ScriptCommand::Audio(AudioCommand::StopBgm),
+        StoryEffect::StopBgm { fade_ms } => ScriptCommand::Audio(AudioCommand::StopBgm {
+            fade: Duration::from_millis(fade_ms), animation_id: None,
+        }),
         StoryEffect::Exit => ScriptCommand::Runtime(RuntimeCommand::Exit),
         StoryEffect::Navigate(navigation) => {
             ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation))
@@ -89,6 +91,7 @@ pub(crate) fn script_command_from_effect(
         StoryEffect::AdjustSetting { name, delta } => {
             ScriptCommand::Settings(SettingsCommand::Adjust { name, delta })
         }
+        StoryEffect::StopMovie => ScriptCommand::Video(VideoCommand::Stop),
         StoryEffect::Say { speaker, text } => ScriptCommand::Dialogue(DialogueCommand::Say {
             speaker,
             text,
@@ -214,11 +217,16 @@ pub(crate) fn script_command_from_effect(
                 .map(|animation| std::time::Duration::from_secs_f32(animation.duration())),
             animation_id: None,
         }),
+        StoryEffect::StopSfxChannel { channel, fade_ms } => ScriptCommand::Audio(AudioCommand::StopSfxChannel {
+            channel, fade: Duration::from_millis(fade_ms),
+        }),
         StoryEffect::SetUiRole { .. }
         | StoryEffect::MountUiOverlay { .. }
         | StoryEffect::UnmountUiOverlay { .. }
         | StoryEffect::PlayBgm { .. }
         | StoryEffect::PlaySfx { .. }
+        | StoryEffect::MovieBackground { .. }
+        | StoryEffect::PlaySfxChannel { .. }
         | StoryEffect::PlayVoice { .. } => {
             return Err("effect requires script runtime asset resolution".to_string());
         }

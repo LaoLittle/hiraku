@@ -21,6 +21,8 @@ pub(crate) struct Yuv420MaterialKey {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[bind_group_data(Yuv420MaterialKey)]
 pub(crate) struct Yuv420Material {
+    #[uniform(5)]
+    pub opacity: f32,
     #[texture(0)]
     #[sampler(3)]
     pub y: Handle<Image>,

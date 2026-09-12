@@ -24,6 +24,7 @@ mod texture;
 mod ui;
 mod vfs;
 
+pub use audio::{EngineAudioLoader, EngineAudioSource};
 pub use script::{UiContext, UiIntent};
 pub use state::StoredValue;
 pub use ui::UiModels;
@@ -260,6 +261,7 @@ struct HirakuRuntimeSystems;
 
 impl Plugin for HirakuPlugin {
     fn build(&self, app: &mut App) {
+        scene::screen_ui::configure_screen_ui_phases(app);
         app.add_plugins(stage::StagePlugin);
         render::ui_quad::register(app);
         app.add_plugins((
@@ -286,6 +288,8 @@ impl Plugin for HirakuPlugin {
             .init_asset::<BytesAsset>()
             .init_asset::<TextureAtlasLayout>()
             .add_audio_source::<audio::PreludeLoopAudio>()
+            .add_audio_source::<audio::EngineAudioSource>()
+            .init_asset_loader::<audio::EngineAudioLoader>()
             .init_resource::<HdpVolumeLoads>()
             .add_message::<input::HirakuPointerInput>()
             .add_message::<input::HirakuScrollInput>()
@@ -398,7 +402,10 @@ impl Plugin for HirakuPlugin {
                     scene::widgets::sync_toggles,
                     scene::recompose_screen_ui,
                 )
+                    .chain()
                     .after(handle_runtime_menu_buttons)
+                    .after(update_builtin_ui_models)
+                    .in_set(scene::screen_ui::ScreenUiPhase::Structure)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(Update, drive_story_runtime.in_set(HirakuRuntimeSystems))
@@ -416,8 +423,13 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
+                update_builtin_ui_models
+                    .after(process_script_commands)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
                 (
-                    update_builtin_ui_models,
                     update_ui_text_bindings,
                     update_ui_reactive_bindings,
                     scene::rich_text::update,
@@ -428,6 +440,7 @@ impl Plugin for HirakuPlugin {
                 )
                     .chain()
                     .after(process_script_commands)
+                    .in_set(scene::screen_ui::ScreenUiPhase::Content)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(

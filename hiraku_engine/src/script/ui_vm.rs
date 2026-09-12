@@ -976,6 +976,29 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "tint", receiver)]
+    fn ui_tint(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        red: f64,
+        green: f64,
+        blue: f64,
+        alpha: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let tint = [
+            color_component(red)?,
+            color_component(green)?,
+            color_component(blue)?,
+            color_component(alpha)?,
+        ];
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Image(_)) {
+            return Err(NativeError::message("tint requires an image node"));
+        }
+        draft.layout.image_tint = Some(tint);
+        Ok(node)
+    }
+
     #[hks(name = "textShadow", receiver)]
     fn ui_text_shadow(
         context: &mut UiVmContext,
@@ -1904,6 +1927,19 @@ pub(crate) struct UiComposition {
 }
 
 impl UiComposition {
+    pub(crate) fn models_changed(&self, models: &crate::ui::UiModels) -> bool {
+        self.document.plan.structural_globals.iter().any(|name| {
+            !self.document.owned_globals.contains(name)
+                && models.get(name).is_some_and(|value| self.values.story_value(name) != Some(value))
+        })
+    }
+
+    pub(crate) fn with_models(&self, models: &crate::ui::UiModels) -> Self {
+        let mut next = self.clone();
+        next.values.update_models(models);
+        next
+    }
+
     pub(crate) fn render(
         &self,
         globals: &BTreeMap<String, Value>,
@@ -3213,7 +3249,7 @@ mod tests {
                 canvas {
                     column {
                         image("save-thumbnail://alice").at(.abs(-10, -8))
-                            .size(.abs(100, 100)).flipX().stretch()
+                            .size(.abs(100, 100)).flipX().stretch().tint(1, 0.5, 0.25, 0.65)
                     }.size(.abs(80, 84)).clip()
                 }
             "#,
@@ -3232,6 +3268,7 @@ mod tests {
         };
         assert!(image.layout.flip_x);
         assert!(image.layout.image_stretch);
+        assert_eq!(image.layout.image_tint, Some([1.0, 0.5, 0.25, 0.65]));
         assert_eq!(image.layout.left, Some(-10.0));
         assert_eq!(image.layout.top, Some(-8.0));
     }

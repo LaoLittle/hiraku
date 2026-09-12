@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn domain_commands_share_one_deterministic_order() {
         let mut commands = PendingScriptCommands::default();
-        commands.enqueue(ScriptCommand::Audio(AudioCommand::StopBgm));
+        commands.enqueue(ScriptCommand::Audio(AudioCommand::StopBgm { fade: std::time::Duration::ZERO, animation_id: None }));
         commands.enqueue(ScriptCommand::Dialogue(DialogueCommand::Clear));
         commands.enqueue(ScriptCommand::Runtime(RuntimeCommand::Exit));
 
@@ -815,7 +815,7 @@ mod tests {
         );
         assert!(matches!(
             audio.command,
-            ScriptCommand::Audio(AudioCommand::StopBgm)
+            ScriptCommand::Audio(AudioCommand::StopBgm { .. })
         ));
         assert!(matches!(
             dialogue.command,

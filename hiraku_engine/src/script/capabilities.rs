@@ -18,6 +18,7 @@ use crate::storage::UserSettings;
 
 mod scene_visuals;
 mod sound;
+mod movie;
 mod spatial_stage;
 
 /// Engine-facing effects produced by HKS native functions.
@@ -25,6 +26,8 @@ mod spatial_stage;
 /// Engine code dispatches these effects directly to ECS-facing systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
+    MovieBackground { path: String, fade_out_ms: u64 },
+    StopMovie,
     Spatial(crate::stage::runtime::StageCommand),
     ActorMotion {
         actor_id: String,
@@ -45,7 +48,15 @@ pub enum StoryEffect {
         actor_id: Option<String>,
         fade_ms: u64,
     },
-    StopBgm,
+    StopBgm { fade_ms: u64 },
+    StopSfxChannel { channel: String, fade_ms: u64 },
+    PlaySfxChannel {
+        channel: String,
+        path: String,
+        volume: f32,
+        fade_in_ms: Option<u64>,
+        looped: bool,
+    },
     Exit,
     SetBackground {
         texture: String,
@@ -128,7 +139,7 @@ pub enum StoryEffect {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoryWait {
     DialogueAdvance,
-    Movie { path: String },
+    Movie { path: String, fade_out_ms: u64 },
     Delay { duration_ms: u64 },
 }
 
@@ -275,6 +286,7 @@ fn registry() -> NativeRegistry<CharacterContext> {
     scene_visuals::register(&mut registry);
     spatial_stage::register(&mut registry);
     sound::register(&mut registry);
+    movie::register(&mut registry);
     Position::register_hks(&mut registry)
         .expect("Position API registration must be internally consistent");
     CameraScope::register_hks(&mut registry)
@@ -800,6 +812,7 @@ impl StoryNativeHost {
             last_speaker: self.context.last_speaker.clone(),
             dialogue_buffer: self.context.dialogue_buffer.clone(),
             sound: self.context.sound.clone(),
+            movie: self.context.movie.clone(),
             next_camera_handle: self.context.next_camera_handle,
             pending_cameras: self.context.pending_cameras.clone(),
             scene_visuals: self.context.scene_visuals.clone(),
@@ -829,6 +842,7 @@ impl StoryNativeHost {
                 last_speaker: snapshot.last_speaker,
                 dialogue_buffer: snapshot.dialogue_buffer,
                 sound: snapshot.sound,
+                movie: snapshot.movie,
                 next_camera_handle: snapshot.next_camera_handle,
                 pending_cameras: snapshot.pending_cameras,
                 scene_visuals: snapshot.scene_visuals,
@@ -853,6 +867,7 @@ pub struct StoryNativeHostSnapshot {
     last_speaker: Option<String>,
     dialogue_buffer: Option<String>,
     sound: sound::SoundState,
+    movie: movie::MovieState,
     next_camera_handle: u64,
     pending_cameras: BTreeMap<u64, PendingCamera>,
 }
@@ -899,6 +914,7 @@ struct CharacterContext {
     last_speaker: Option<String>,
     dialogue_buffer: Option<String>,
     sound: sound::SoundState,
+    movie: movie::MovieState,
     next_camera_handle: u64,
     pending_cameras: BTreeMap<u64, PendingCamera>,
 }
@@ -1103,6 +1119,7 @@ impl CharacterContext {
             }
         }
         self.sound.commit(&mut self.commands);
+        self.movie.commit(&mut self.commands, &mut self.wait);
         let cameras = std::mem::take(&mut self.pending_cameras);
         for (_, pending) in cameras {
             if pending.blur.is_some()
@@ -1145,7 +1162,10 @@ hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Position {
     Absolute(f64, f64),
-    Relative(u16, u16),
+    Relative(f64, f64),
+    Left,
+    Center,
+    Right,
 }
 
 impl Position {
@@ -1154,30 +1174,30 @@ impl Position {
     }
 
     fn rel(x: f64, y: f64) -> Result<Position, NativeError> {
-        fn component(value: f64) -> Result<u16, NativeError> {
-            if !value.is_finite() || value.fract() != 0.0 || !(0.0..=100.0).contains(&value) {
+        fn component(value: f64) -> Result<f64, NativeError> {
+            if !value.is_finite() || value.abs() > 100000.0 {
                 return Err(NativeError::message(
-                    "relative position components must be integers from 0 through 100",
+                    "relative position components must be finite and within 100000 percent",
                 ));
             }
-            Ok(value as u16)
+            Ok(value)
         }
         Ok(Self::Relative(component(x)?, component(y)?))
     }
 
     #[getter]
     fn left() -> Position {
-        Self::Absolute(-600.0, -200.0)
+        Self::Left
     }
 
     #[getter]
     fn center() -> Position {
-        Self::Absolute(0.0, -200.0)
+        Self::Center
     }
 
     #[getter]
     fn right() -> Position {
-        Self::Absolute(600.0, -200.0)
+        Self::Right
     }
 }
 }
@@ -1244,11 +1264,14 @@ impl CameraProjection {
 impl Position {
     fn resolve(self) -> [f32; 2] {
         match self {
+            Self::Left => [-600.0, -200.0],
+            Self::Center => [0.0, -200.0],
+            Self::Right => [600.0, -200.0],
             Self::Absolute(x, y) => [x as f32, y as f32],
             // Relative coordinates use a bottom-left origin in the canonical 1920x1080 canvas.
             Self::Relative(x, y) => [
-                f32::from(x) / 100.0 * 1920.0 - 960.0,
-                f32::from(y) / 100.0 * 1080.0 - 540.0,
+                x as f32 / 100.0 * 1920.0 - 960.0,
+                y as f32 / 100.0 * 1080.0 - 540.0,
             ],
         }
     }
@@ -1664,12 +1687,6 @@ mod native_api {
     }
 
     #[hks]
-    fn native_stop_bgm(context: &mut CharacterContext) -> Result<(), NativeError> {
-        context.commands.push(StoryEffect::StopBgm);
-        Ok(())
-    }
-
-    #[hks]
     fn native_exit(context: &mut CharacterContext) -> Result<(), NativeError> {
         context.commands.push(StoryEffect::Exit);
         Ok(())
@@ -1953,14 +1970,6 @@ mod native_api {
         Ok(Value::Unit)
     }
 
-    #[hks]
-    fn native_movie(context: &mut CharacterContext, path: String) -> Result<(), NativeError> {
-        if path.trim().is_empty() {
-            return Err(NativeError::message("movie path must not be empty"));
-        }
-        context.wait = Some(StoryWait::Movie { path });
-        Ok(())
-    }
 }
 
 #[hiraku_script::hks_module("story")]
@@ -2294,6 +2303,7 @@ not_actor.at(.left)"#,
             runtime.step().expect("movie must execute"),
             Some(crate::script::StoryRuntimeEvent::Wait(StoryWait::Movie {
                 path: "movies/opening.webm".into(),
+                fade_out_ms: 0,
             }))
         );
     }

@@ -86,7 +86,7 @@ pub fn complete(
                         && groups.get(*root).is_ok_and(|group| group.is_animating())
                 })
             }
-            SceneEffect::Picture(P::Clear | P::StopMotion { .. }) => false,
+            SceneEffect::Picture(P::Clear | P::StopMotion { .. } | P::Noise { .. }) => false,
             SceneEffect::Picture(command) => {
                 let (P::Show { id, .. }
                 | P::Hide { id, .. }
@@ -124,7 +124,7 @@ pub fn complete(
                         P::Blur { .. } => picture.blur_tween.is_some(),
                         P::Tint { .. } => picture.tint_tween.is_some(),
                         P::Transform { .. } | P::AnimateX { .. } => picture.motion.is_some(),
-                        P::Clear | P::StopMotion { .. } => false,
+                        P::Clear | P::StopMotion { .. } | P::Noise { .. } => false,
                     }
                 } else {
                     false

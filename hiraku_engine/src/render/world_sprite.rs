@@ -37,6 +37,8 @@ pub struct WorldSprite {
     pub clip: Option<hiraku_sprite3d::ClipRect>,
     /// Sampling radius in source-image pixels; independent of camera effects.
     pub blur_radius: f32,
+    /// Noise frame (zero disables), grid width, grid height.
+    pub noise: Vec3,
     pub dissolve: Option<DissolveMask>,
     pub image: Option<Handle<Image>>,
     /// Source rectangle as `[left, top, width, height]` in pixels.
@@ -62,6 +64,7 @@ impl WorldSprite {
             slice: None,
             clip: None,
             blur_radius: 0.0,
+            noise: Vec3::ZERO,
             dissolve: None,
             image: Some(image),
             rect: None,
@@ -77,6 +80,7 @@ impl WorldSprite {
             slice: None,
             clip: None,
             blur_radius: 0.0,
+            noise: Vec3::ZERO,
             dissolve: None,
             image: None,
             rect: None,
@@ -186,7 +190,12 @@ fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
         clip_axes: sprite
             .clip
             .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[1]),
-        effects: Vec4::new(sprite.blur_radius, 0.0, 0.0, 0.0),
+        effects: Vec4::new(
+            sprite.blur_radius,
+            sprite.noise.x,
+            sprite.noise.y,
+            sprite.noise.z,
+        ),
         dissolve_mask: sprite.dissolve.as_ref().map(|mask| mask.image.clone()),
         dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| {
             Vec4::new(

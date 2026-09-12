@@ -51,6 +51,17 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         full_image,
     );
     var sampled = textureSample(color_texture, color_sampler, uv);
+    if material.effects.y > 0.0 {
+        let cell = vec2<u32>(floor(clamp(local_uv, vec2<f32>(0.0), vec2<f32>(0.999999)) * material.effects.zw));
+        var hash = cell.x * 1597334677u ^ cell.y * 3812015801u ^ u32(material.effects.y) * 2798796415u;
+        hash = (hash ^ (hash >> 16u)) * 2246822519u;
+        hash = (hash ^ (hash >> 13u)) * 3266489917u;
+        hash = hash ^ (hash >> 16u);
+        let gray = f32(hash & 255u) / 255.0;
+        // The original noise raster is display-referred, like an sRGB texture.
+        let linear = select(pow((gray + 0.055) / 1.055, 2.4), gray / 12.92, gray <= 0.04045);
+        sampled = vec4<f32>(vec3<f32>(linear), 1.0);
+    }
     if material.effects.x > 0.0 {
         let origin = select(material.rect.xy, vec2<f32>(0.0), full_image);
         let size = select(material.rect.zw, texture_size, full_image);

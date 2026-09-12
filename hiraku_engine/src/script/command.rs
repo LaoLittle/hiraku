@@ -167,7 +167,10 @@ pub enum AnimationCommand {
 
 #[derive(Debug)]
 pub enum AudioCommand {
+    StopSfxChannel { channel: String, fade: Duration },
     PlaySfx {
+        channel: Option<String>,
+        looped: bool,
         path: String,
         volume: f32,
         fade_in: Option<Duration>,
@@ -180,7 +183,7 @@ pub enum AudioCommand {
         fade_in: Option<Duration>,
         animation_id: Option<String>,
     },
-    StopBgm,
+    StopBgm { fade: Duration, animation_id: Option<String> },
     PlayVoice {
         path: String,
         volume: f32,
@@ -191,7 +194,8 @@ pub enum AudioCommand {
 
 #[derive(Debug)]
 pub enum VideoCommand {
-    Play { path: String, done: ScriptRequestId },
+    Play { path: String, done: Option<ScriptRequestId>, fade_out: Duration },
+    Stop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

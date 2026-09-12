@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 
+mod source;
+use EngineAudioSource as AudioSource;
+pub use source::{EngineAudioLoader, EngineAudioSource};
+
 use bevy::{
-    audio::{AudioSource, ChannelCount, Decodable, SampleRate, Source},
+    audio::{ChannelCount, Decodable, SampleRate, Source},
     prelude::{Asset, Resource},
     reflect::TypePath,
 };

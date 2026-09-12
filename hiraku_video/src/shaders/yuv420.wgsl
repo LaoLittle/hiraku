@@ -55,6 +55,8 @@ fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
 #endif
 }
 
+@group(1) @binding(5) var<uniform> opacity: f32;
+
 @fragment
 fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     let yuv = vec4<f32>(
@@ -70,5 +72,5 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
 
     let linear_rgb = to_linear_vec3(encoded_rgb);
 
-    return vec4<f32>(linear_rgb, 1.0);
+    return vec4<f32>(linear_rgb, opacity);
 }
