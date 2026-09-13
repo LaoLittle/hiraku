@@ -1,5 +1,7 @@
 #[path = "enums.rs"]
 mod enums;
+#[path = "strings.rs"]
+mod strings;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,10 +100,6 @@ pub enum HirExprKind<'hir> {
         object: &'hir HirExpr<'hir>,
         member: SymbolId,
         safe: bool,
-    },
-    Elvis {
-        value: &'hir HirExpr<'hir>,
-        fallback: &'hir HirExpr<'hir>,
     },
     NonNull(&'hir HirExpr<'hir>),
     OptionalSome(&'hir HirExpr<'hir>),
@@ -784,6 +782,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     statements: self.arena.alloc_slice_copy(&statements),
                     span: body.span,
                 })
+            } else if return_type.is_none() {
+                self.lower_value_block(body, false)
             } else {
                 self.lower_block(body, false)
             };
@@ -858,6 +858,33 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn lower_block(&mut self, block: &Block, scoped: bool) -> &'hir HirBlock<'hir> {
         self.lower_statements(block.statements.iter(), block.span, scoped)
+    }
+
+    fn lower_value_block(&mut self, block: &Block, scoped: bool) -> &'hir HirBlock<'hir> {
+        if scoped {
+            self.scopes.push(BTreeMap::new());
+        }
+        let mut statements = Vec::new();
+        for (index, statement) in block.statements.iter().enumerate() {
+            if index + 1 == block.statements.len()
+                && let Stmt::Expr(expression) = statement
+            {
+                let value = self.lower_expression(expression);
+                statements.push(self.arena.alloc(HirStmt {
+                    kind: HirStmtKind::Expr(value),
+                    span: expression.span,
+                }) as &HirStmt<'hir>);
+            } else if let Some(statement) = self.lower_statement(statement) {
+                statements.push(statement);
+            }
+        }
+        if scoped {
+            self.scopes.pop();
+        }
+        self.arena.alloc(HirBlock {
+            statements: self.arena.alloc_slice_copy(&statements),
+            span: block.span,
+        })
     }
 
     fn lower_refined_block(
@@ -1056,7 +1083,17 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 (HirStmtKind::Assign { target, value }, *span)
             }
             Stmt::Expr(expression) => {
-                let value = self.lower_expression(expression);
+                // The existing bare-string statement hook consumes a template.
+                // Ordinary expression contexts use eager String interpolation.
+                let value = if let ExprKind::String(text) = &expression.kind {
+                    self.alloc_expression(
+                        HirExprKind::Literal(HirLiteral::String(self.arena.alloc_str(text))),
+                        ScriptType::String,
+                        expression.span,
+                    )
+                } else {
+                    self.lower_expression(expression)
+                };
                 if is_untyped_none(self.expression_type(value)) {
                     self.error(
                         "`null`/`.none` needs an expected Optional<T> type",
@@ -1155,10 +1192,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     NumberUnit::Scalar => ScriptType::Float,
                 },
             ),
-            ExprKind::String(value) => (
-                HirExprKind::Literal(HirLiteral::String(self.arena.alloc_str(value))),
-                ScriptType::String,
-            ),
+            ExprKind::String(value) => return self.lower_string(value, expression.span),
             ExprKind::Binding(value) => {
                 let value = self.lower_expression(value);
                 let result = self.expression_type(value).clone();
@@ -1211,7 +1245,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         expression.span,
                     );
                 }
-                let ty = ScriptType::Symbol;
+                self.error(
+                    format!("cannot infer the type of `.{name}`; add an explicit type annotation or use it as an argument with a known parameter type"),
+                    expression.span,
+                );
+                let ty = ScriptType::Never;
                 (HirExprKind::Symbol(symbol), ty)
             }
             ExprKind::Not(value) => {
@@ -1328,17 +1366,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 )
             }
             ExprKind::Elvis { value, fallback } => {
-                let value = self.lower_expression(value);
-                if let ScriptType::Optional(inner) = self.expression_type(value).clone() {
-                    return self.lower_optional_fallback(value, fallback, *inner, expression.span);
-                }
-                let fallback = self.lower_expression(fallback);
-                let ty = match self.expression_type(value) {
-                    ScriptType::Optional(inner) => (**inner).clone(),
-                    ScriptType::Any => self.expression_type(fallback).clone(),
-                    ty => ty.clone(),
-                };
-                (HirExprKind::Elvis { value, fallback }, ty)
+                return self.lower_elvis(value, fallback, expected_result, expression.span);
             }
             ExprKind::NonNull(value) => {
                 let value = self.lower_expression(value);
@@ -1751,7 +1779,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         self.declare_local(&parameter.name, ty, false, parameter.span)
                     })
                     .collect::<Vec<_>>();
-                let body = self.lower_block(body, false);
+                let body = self.lower_value_block(body, false);
                 self.return_context.pop();
                 self.scopes.pop();
                 let result = self.checked_callable_result(body, None);
@@ -1781,7 +1809,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             ExprKind::Block(block) => {
                 self.return_context.push(None);
-                let block = self.lower_block(block, true);
+                let block = self.lower_value_block(block, true);
                 self.return_context.pop();
                 let result = self.checked_callable_result(block, None);
                 (
@@ -1835,6 +1863,33 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         &self.expression_type(left).clone(),
                         left.span,
                     );
+                }
+                if matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+                ) {
+                    let left_type = self.expression_type(left);
+                    let right_type = self.expression_type(right);
+                    let strings = *op == BinaryOp::Add
+                        && left_type == &ScriptType::String
+                        && right_type == &ScriptType::String;
+                    let numeric = |ty: &ScriptType| {
+                        // Preserve the existing numeric path for unresolved
+                        // host/global signatures; it still checks VM operands.
+                        matches!(
+                            ty,
+                            ScriptType::Int
+                                | ScriptType::Float
+                                | ScriptType::Never
+                                | ScriptType::Any
+                        )
+                    };
+                    if !strings && !(numeric(left_type) && numeric(right_type)) {
+                        self.error(
+                            format!("arithmetic operator {op:?} cannot accept {left_type:?} and {right_type:?}; use numeric operands, or String + String for concatenation (convert other values explicitly with toString())"),
+                            expression.span,
+                        );
+                    }
                 }
                 if matches!(
                     op,
@@ -1927,6 +1982,19 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if expected == Some(&ScriptType::Symbol)
+            && let ExprKind::Symbol(name) = &expression.kind
+        {
+            let symbol = self.symbol(name);
+            return self.alloc_expression(
+                HirExprKind::Symbol(symbol),
+                ScriptType::Symbol,
+                expression.span,
+            );
+        }
+        if let ExprKind::Elvis { value, fallback } = &expression.kind {
+            return self.lower_elvis(value, fallback, expected, expression.span);
+        }
         if let ExprKind::When { value, arms } = &expression.kind {
             return self.lower_when(value, arms, expected, expression.span);
         }
@@ -2605,10 +2673,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         if self.resolve_local(symbol).is_some() || self.global_names.contains_key(&symbol) {
             return None;
         }
-        let owner = self.type_from_ast(&TypeExpr {
-            kind: TypeExprKind::Named(name.clone()),
-            span: object.span,
-        })?;
+        // A namespace/value name is not necessarily a type. This is a lookup,
+        // not a type annotation, so a miss must not emit an unknown-type error.
+        let owner = self.instantiate_named_type(name, &[], object.span)?;
         let owner = self.types.intern(owner);
         let method_symbol = self.symbol(method);
         let getter = self.symbol(&format!("get#{method}"));
@@ -2632,6 +2699,20 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             );
         }
         None
+    }
+
+    fn native_callable_type(&self, builtin: BuiltinId) -> ScriptType {
+        self.manifest
+            .and_then(|manifest| manifest.signature(builtin))
+            .map_or(ScriptType::Any, |signature| ScriptType::Callable {
+                parameters: signature
+                    .receiver
+                    .iter()
+                    .cloned()
+                    .chain(signature.parameters.iter().cloned())
+                    .collect(),
+                result: Box::new(signature.result.clone()),
+            })
     }
 
     fn lower_identifier(&mut self, name: &str, span: Span) -> &'hir HirExpr<'hir> {
@@ -2669,7 +2750,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             );
         }
         if let Some(builtin) = self.manifest.and_then(|manifest| manifest.resolve(name)) {
-            return self.alloc_expression(HirExprKind::Builtin(builtin), ScriptType::Any, span);
+            let ty = self.native_callable_type(builtin);
+            return self.alloc_expression(HirExprKind::Builtin(builtin), ty, span);
         }
         if self
             .manifest
@@ -2683,6 +2765,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
         let imported = self.imported_name(name);
         let symbol = self.symbol(&imported);
+        if let Some(builtin) = self
+            .manifest
+            .and_then(|manifest| manifest.resolve(&imported))
+        {
+            let ty = self.native_callable_type(builtin);
+            return self.alloc_expression(HirExprKind::Builtin(builtin), ty, span);
+        }
+        if !self.external_functions.contains_key(&symbol) {
+            self.error(
+                format!(
+                    "unknown identifier `{name}`; declare it or import its definition before use"
+                ),
+                span,
+            );
+            return self.alloc_expression(HirExprKind::Unresolved(symbol), ScriptType::Never, span);
+        }
         let ty = self
             .external_functions
             .get(&symbol)
@@ -3045,14 +3143,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 {
                     return Some(parameter.clone());
                 }
-                self.instantiate_named_type(name, &[], ty.span)
+                self.require_named_type(name, &[], ty.span)
             }
             TypeExprKind::Applied { name, arguments } => {
                 let arguments = arguments
                     .iter()
                     .map(|argument| self.type_from_ast(argument))
                     .collect::<Option<Vec<_>>>()?;
-                self.instantiate_named_type(name, &arguments, ty.span)
+                self.require_named_type(name, &arguments, ty.span)
             }
             TypeExprKind::Nullable(inner) => {
                 let inner = self.type_from_ast(inner)?;
@@ -3074,6 +3172,23 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     .collect::<Option<_>>()?,
             )),
         }
+    }
+
+    fn require_named_type(
+        &mut self,
+        name: &str,
+        arguments: &[ScriptType],
+        span: Span,
+    ) -> Option<ScriptType> {
+        let previous_errors = self.errors.len();
+        let resolved = self.instantiate_named_type(name, arguments, span);
+        if resolved.is_none() && self.errors.len() == previous_errors {
+            self.error(
+                format!("unknown type `{name}`; declare or import the type before using it"),
+                span,
+            );
+        }
+        resolved
     }
 
     fn instantiate_named_type(
@@ -3223,9 +3338,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 fields,
             });
         }
-        self.manifest
+        let resolved = self
+            .manifest
             .and_then(|manifest| manifest.symbols().find(name))
-            .map(ScriptType::Named)
+            .map(ScriptType::Named);
+        resolved
     }
 
     fn alloc_expression(
@@ -3388,6 +3505,9 @@ fn member_type(object: &ScriptType, member: &str) -> ScriptType {
 
 fn binary_type(op: BinaryOp, left: &ScriptType, right: &ScriptType) -> ScriptType {
     match op {
+        BinaryOp::Add if left == &ScriptType::String && right == &ScriptType::String => {
+            ScriptType::String
+        }
         BinaryOp::And
         | BinaryOp::Or
         | BinaryOp::Equal
@@ -3730,6 +3850,72 @@ fn statement_span(statement: &Stmt) -> Span {
 mod tests {
     use super::*;
     use crate::parse_program;
+
+    #[test]
+    fn unknown_names_and_contextless_members_have_specific_diagnostics() {
+        for (source, expected) in [
+            ("let value = missing", "unknown identifier `missing`"),
+            ("missing()", "unknown identifier `missing`"),
+            ("let value: Missing = 1", "unknown type `Missing`"),
+            ("fn greet(value: Greeting) {}", "unknown type `Greeting`"),
+            ("let value = .abc", "cannot infer the type of `.abc`"),
+            (
+                "let value = .abc\nfn use(value: Choice) {}\nenum Choice { abc }\nuse(value)",
+                "cannot infer the type of `.abc`",
+            ),
+            (
+                r#"let value = "${missing}""#,
+                "unknown identifier `missing`",
+            ),
+        ] {
+            let syntax = parse_program(source).expect("syntax");
+            let arena = HirArena::new();
+            let errors = lower_to_hir(&arena, &syntax, None).expect_err("must fail statically");
+            assert!(
+                errors.iter().any(|error| error.message.contains(expected)),
+                "{source}: {errors:?}"
+            );
+        }
+        let syntax = parse_program(
+            r#"
+            enum Choice { abc, other }
+            fn accept(value: Choice) {}
+            let explicit: Choice = .abc
+            accept(explicit)
+            accept(.abc)
+            let raw: TextTemplate = "${missing}"
+        "#,
+        )
+        .expect("syntax");
+        let arena = HirArena::new();
+        lower_to_hir(&arena, &syntax, None)
+            .expect("explicit and parameter contexts determine variants");
+    }
+
+    #[test]
+    fn arithmetic_rejects_non_numeric_operands_except_string_addition() {
+        for source in [
+            r#"let value = "a" + 1"#,
+            r#"let value = 1 + "a""#,
+            r#"let value = "a" - "b""#,
+            r#"let value = "a" * "b""#,
+            r#"let value = "a" / "b""#,
+            r#"let value = true + false"#,
+            r#"let a: Any = "a"; let value = a + "b""#,
+            r#"let a: String? = "a"; let value = a + "b""#,
+        ] {
+            let syntax = parse_program(source).expect("syntax parses");
+            let arena = HirArena::new();
+            let errors =
+                lower_to_hir(&arena, &syntax, None).expect_err("invalid arithmetic must fail");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("arithmetic operator")),
+                "{source}: {errors:?}"
+            );
+        }
+    }
 
     #[test]
     fn standard_enums_require_payload_types_and_exhaustive_matches() {

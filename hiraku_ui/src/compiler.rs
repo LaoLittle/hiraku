@@ -322,10 +322,6 @@ impl<'h> Lower<'_, 'h> {
                 target,
                 mode,
             },
-            E::Elvis { value, fallback } => E::Elvis {
-                value: self.expr(value),
-                fallback: self.expr(fallback),
-            },
             E::Binary { left, op, right } => E::Binary {
                 left: self.expr(left),
                 op,

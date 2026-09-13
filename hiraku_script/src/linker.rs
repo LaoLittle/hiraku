@@ -532,8 +532,14 @@ mod tests {
             .require_capability(id, "dialogue.write")
             .expect("capability");
         let manifest = registry.manifest();
+        // Compile a relocation against a declared external name, then link
+        // against the actual implementation and capability policy.
+        registry
+            .register_fn("narrate", |_: &mut (), _: String| Ok(()))
+            .expect("external declaration");
+        let declarations = registry.manifest();
         let compile = |source: &str| {
-            compile_with_manifest(&parse_program(source).expect("parse"), 17, &manifest)
+            compile_with_manifest(&parse_program(source).expect("parse"), 17, &declarations)
                 .expect("compile")
         };
         let provider = compile("global fn narrate(text: String) { hostSay(text) }");
@@ -682,7 +688,17 @@ mod tests {
     }
 
     fn compile(source: &str) -> Bytecode {
-        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        // Untyped external declarations deliberately leave signature validation
+        // to these linker-defense tests. Production compilation rejects names
+        // which have no declaration at all.
+        let manifest = BuiltinManifest::new([
+            ("greet", BuiltinId(100)),
+            ("score", BuiltinId(101)),
+            ("scale", BuiltinId(102)),
+            ("ui.widgets.button", BuiltinId(103)),
+            ("missingFunction", BuiltinId(104)),
+            ("label", BuiltinId(105)),
+        ]);
         compile_with_manifest(
             &parse_program(source).expect("source parses"),
             17,

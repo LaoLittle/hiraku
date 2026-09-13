@@ -148,13 +148,9 @@ pub enum MirInstruction {
         argument_types: Vec<crate::runtime::ArgumentType>,
     },
     AssertNonNull {
+        span: Span,
         dst: VirtualRegister,
         value: VirtualRegister,
-    },
-    SelectNonNull {
-        dst: VirtualRegister,
-        value: VirtualRegister,
-        fallback: VirtualRegister,
     },
     Statement {
         span: crate::Span,
@@ -187,8 +183,7 @@ impl MirInstruction {
             | Self::MakeVariant { dst, .. }
             | Self::MakeMap { dst, .. }
             | Self::Call { dst, .. }
-            | Self::AssertNonNull { dst, .. }
-            | Self::SelectNonNull { dst, .. } => Some(*dst),
+            | Self::AssertNonNull { dst, .. } => Some(*dst),
             Self::StoreLocal { .. }
             | Self::StoreGlobal { .. }
             | Self::Statement { .. }
@@ -234,9 +229,6 @@ impl MirInstruction {
                 .chain(dynamic_callee.iter().copied())
                 .chain(arguments.iter().map(|(_, value)| *value))
                 .collect(),
-            Self::SelectNonNull {
-                value, fallback, ..
-            } => vec![*value, *fallback],
             Self::Statement { value, .. } => vec![*value],
         }
     }
@@ -729,21 +721,14 @@ impl<'types> MirBuilder<'types> {
                 });
                 Some(dst)
             }
-            HirExprKind::Elvis { value, fallback } => {
-                let value = self.lower_expression(value, errors)?;
-                let fallback = self.lower_expression(fallback, errors)?;
-                let dst = self.register();
-                self.push(MirInstruction::SelectNonNull {
-                    dst,
-                    value,
-                    fallback,
-                });
-                Some(dst)
-            }
             HirExprKind::NonNull(value) => {
                 let value = self.lower_expression(value, errors)?;
                 let dst = self.register();
-                self.push(MirInstruction::AssertNonNull { dst, value });
+                self.push(MirInstruction::AssertNonNull {
+                    span: expression.span,
+                    dst,
+                    value,
+                });
                 Some(dst)
             }
             HirExprKind::Cast {

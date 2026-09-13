@@ -321,12 +321,30 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
             intern_expression(left, symbols);
             intern_expression(right, symbols);
         }
+        ExprKind::String(text) => {
+            let mut remaining = text.as_str();
+            while let Some(start) = remaining.find("${") {
+                let source = &remaining[start + 2..];
+                let Some(end) = crate::template::expression_end(source) else {
+                    break;
+                };
+                if let Ok(program) =
+                    crate::parse::parse_interpolation(&source[..end], expression.span)
+                {
+                    for statement in &program.statements {
+                        if let Stmt::Expr(value) = statement {
+                            intern_expression(value, symbols);
+                        }
+                    }
+                }
+                remaining = &source[end + 1..];
+            }
+        }
         ExprKind::Unit
         | ExprKind::Null
         | ExprKind::Ellipsis
         | ExprKind::Bool(_)
-        | ExprKind::Number { .. }
-        | ExprKind::String(_) => {}
+        | ExprKind::Number { .. } => {}
     }
 }
 

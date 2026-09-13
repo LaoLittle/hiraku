@@ -57,7 +57,7 @@ inside an arm retain the existing VM wait/snapshot behavior.
 
 Enum construction uses a register slice and the existing typed/tagged value
 representation. Matching lowers to basic blocks with discriminant tests and payload
-access. Bytecode version is 19. UI compilation and asset/voice analysis traverse
+access. Bytecode version is 20. UI compilation and asset/voice analysis traverse
 match arms as conditional regions.
 
 Current limits: recursive enum schemas, nested/destructuring patterns, guards and
@@ -121,6 +121,14 @@ Evaluate `a` once. Evaluate `fallback()` only in the `none` arm. `null` construc
 `none` contextually; `.some(null)` remains distinct from outer `none` for nested
 optionals. Repeated `?` retains the existing normalization warning, while explicit
 `Optional<Optional<T>>` retains nesting.
+
+Elvis chains associate to the right: `a ?: b ?: c` means `a ?: (b ?: c)`.
+A literal `null ?: expression` has the type of that expression, including Never.
+A non-nullable left operand is returned without executing its fallback (the
+fallback is still type checked). A nullable fallback preserves optionality:
+`String? ?: null` is String?, while `String? ?: Never` is String.
+The old eager SelectNonNull instruction and HIR Elvis node have been removed;
+optional branches use the normal when/control-flow representation.
 
 Existing record-shaped `type` declarations retain their current semantics during
 this step; the new `struct` spelling does not silently reinterpret existing assets.

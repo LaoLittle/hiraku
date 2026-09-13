@@ -309,6 +309,8 @@ impl<C> NativeRegistry<C> {
             });
         }
         self.names.insert(name, id);
+        let signature = F::signature(self);
+        self.signatures.insert(id, signature);
         self.functions.insert(id, function.into_native_function());
         Ok(())
     }
@@ -986,6 +988,7 @@ impl<T: IntoHksValue> IntoHksValue for Vec<T> {
 }
 
 pub trait IntoNativeFunction<C, Args>: Send + Sync + 'static {
+    fn signature(registry: &mut NativeRegistry<C>) -> FunctionSignature;
     fn into_native_function(self) -> Box<NativeThunk<C>>;
 }
 
@@ -995,9 +998,17 @@ macro_rules! impl_native_function {
         where
             C: 'static,
             F: Fn(&mut C, $( $type ),*) -> Result<R, NativeError> + Send + Sync + 'static,
-            R: IntoHksValue,
-            $( $type: FromHksValue, )*
+            R: IntoHksValue + HksScriptType,
+            $( $type: FromHksValue + HksScriptType, )*
         {
+            fn signature(registry: &mut NativeRegistry<C>) -> FunctionSignature {
+                FunctionSignature {
+                    receiver: None,
+                    parameters: vec![$($type::hks_script_type(registry)),*],
+                    variadic: None,
+                    result: R::hks_script_type(registry),
+                }
+            }
             fn into_native_function(self) -> Box<NativeThunk<C>> {
                 Box::new(move |context, arguments| {
                     if arguments.len() != $count {

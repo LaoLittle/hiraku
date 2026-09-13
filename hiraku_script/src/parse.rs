@@ -33,6 +33,23 @@ pub(crate) fn parse_literal_program(source: &str) -> Result<Program, Vec<ParseEr
     parse_program_with_template_expressions(source, false)
 }
 
+/// Embedded source is decoded already; point diagnostics at its enclosing
+/// literal rather than inventing byte offsets after escape decoding.
+pub(crate) fn parse_interpolation(source: &str, literal: Span) -> Result<Program, Vec<ParseError>> {
+    let mut tokens = TokenAdapter::new(source, true)
+        .collect()
+        .map_err(|mut errors| {
+            for error in &mut errors {
+                error.span = literal;
+            }
+            errors
+        })?;
+    for token in &mut tokens {
+        token.span = literal;
+    }
+    Parser::new(tokens).parse_program()
+}
+
 fn parse_program_with_template_expressions(
     source: &str,
     template_expressions: bool,
@@ -2020,6 +2037,7 @@ mod tests {
         }
         for source in [
             "enum Packet { first, second }",
+            "enum Packet { first,\nsecond\n}",
             "enum Packet { first,\nsecond,\n}",
             "enum Packet { first }",
         ] {

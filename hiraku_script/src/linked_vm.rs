@@ -442,7 +442,10 @@ mod tests {
             "global fn greet(name: String) { nativeEcho(name) }",
             &natives,
         );
-        let consumer = compile("greet(\"alice\")", &natives);
+        let consumer = compile(
+            "greet(\"alice\")",
+            &BuiltinManifest::new([("greet", BuiltinId(100))]),
+        );
         let program =
             link_register_modules(vec![provider, consumer], &natives).expect("modules link");
         let mut vm = LinkedVm::new(program.clone(), ModuleId(1)).expect("entry starts");

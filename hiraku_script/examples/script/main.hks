@@ -1,0 +1,37 @@
+print("Hello, World")
+
+enum Foo {
+    foo(String),
+    bar
+}
+
+fn test(value: Foo) -> String? {
+    when value {
+        .foo(name) -> "foo, ${name}"
+        .bar -> null
+    }
+}
+
+let gr: Foo = .bar
+
+when test(gr) {
+    .some(v) -> { print(v) },
+    .none -> panic("x")
+}
+
+print(test(gr) ?: "xxx")
+
+let name: Optional<String> = .some("bar")
+print(name ?: "f")
+
+let result: Result<Int, String> = .success(67)
+when result {
+    .success(value) -> { print(value.toString()) }
+    .error(message) -> { print(message) }
+}
+
+var index = 0
+while index < 3 {
+    print("Iteration ${index}")
+    index += 1
+}

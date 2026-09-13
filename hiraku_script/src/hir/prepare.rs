@@ -166,7 +166,7 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                             },
                         ],
                         return_type: Some(crate::TypeExpr {
-                            kind: TypeExprKind::Named("Unit".into()),
+                            kind: TypeExprKind::Unit,
                             span: *span,
                         }),
                         body: body.clone(),

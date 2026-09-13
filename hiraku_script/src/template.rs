@@ -71,7 +71,7 @@ pub fn eval_template(
     Ok(output)
 }
 
-fn expression_end(source: &str) -> Option<usize> {
+pub(crate) fn expression_end(source: &str) -> Option<usize> {
     let mut braces = 0usize;
     let mut quote = None;
     let mut escaped = false;

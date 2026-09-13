@@ -284,6 +284,59 @@ mod tests {
     }
 
     #[test]
+    fn restored_null_assertion_includes_cross_module_callers() {
+        let natives = BuiltinManifest::new([("checkpoint", crate::BuiltinId(1))]);
+        let provider = "fn require(value: Int?) -> Int {\n    checkpoint()\n    value!\n}\nglobal fn second() -> Int { require(null) }";
+        let project = compile_project(
+            vec![
+                source("entry.hks", "fn outer() -> Int { second() }\nouter()"),
+                source("provider.hks", provider),
+            ],
+            &natives,
+        )
+        .expect("compile");
+        let mut vm =
+            crate::LinkedVm::new(project.program.clone(), project.paths["entry.hks"]).expect("VM");
+        let mut restored = false;
+        for _ in 0..1000 {
+            match vm.step() {
+                Ok(Some(crate::LinkedVmEvent::Call(_))) => {
+                    vm = crate::LinkedVm::restore(vm.snapshot(), project.program.clone())
+                        .expect("restore");
+                    vm.resume(crate::Value::Unit).expect("resume");
+                    restored = true;
+                }
+                Ok(Some(
+                    crate::LinkedVmEvent::Statement(_) | crate::LinkedVmEvent::BudgetExhausted,
+                )) => {}
+                Err(crate::LinkedVmError::Vm(error @ crate::VmError::Panic { .. })) => {
+                    assert!(restored);
+                    let crate::VmError::Panic { frames, span, .. } = &error else {
+                        unreachable!()
+                    };
+                    assert_eq!(&provider[span.range()], "value!");
+                    assert_eq!(
+                        frames
+                            .iter()
+                            .map(|frame| frame.function.as_str())
+                            .collect::<Vec<_>>(),
+                        ["require", "second", "outer", "entry"]
+                    );
+                    let report = error
+                        .render_diagnostic(crate::RenderOptions::plain())
+                        .expect("pretty diagnostic");
+                    assert!(report.contains("non-null assertion failed"), "{report}");
+                    assert!(report.contains("at require(provider.hks 3:5)"), "{report}");
+                    assert_eq!(report.matches("[HKS-PANIC]").count(), 3, "{report}");
+                    return;
+                }
+                result => panic!("expected assertion panic, got {result:?}"),
+            }
+        }
+        panic!("assertion did not fail");
+    }
+
+    #[test]
     fn restored_cross_module_panic_pretty_prints_the_bottom_three_frames() {
         let natives = BuiltinManifest::new([("checkpoint", crate::BuiltinId(1))]);
         let project = compile_project(vec![

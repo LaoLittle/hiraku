@@ -34,6 +34,36 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
     }
 
+    pub(super) fn lower_elvis(
+        &mut self,
+        source: &Expr,
+        fallback: &Expr,
+        expected: Option<&ScriptType>,
+        span: Span,
+    ) -> &'hir HirExpr<'hir> {
+        // A known none contributes no payload type. In particular, none ?:
+        // panic(...) is Never, not Any. Do not evaluate unreachable branches.
+        if matches!(source.kind, ExprKind::Null)
+            || matches!(&source.kind, ExprKind::Symbol(name) if name == "none")
+        {
+            return self.lower_expression_expected(fallback, expected);
+        }
+        let value = self.lower_expression(source);
+        let ty = self.expression_type(value).clone();
+        if let ScriptType::Optional(inner) = ty {
+            return self.lower_optional_fallback(value, fallback, *inner, span);
+        }
+        if ty == ScriptType::Any {
+            self.error("operator `?:` requires a known optional type; cast Any to Optional<T> with `as?` or `as!` first", source.span);
+        }
+        // Check the unreachable branch but omit it from executable HIR.
+        let fallback = self.lower_expression_expected(fallback, Some(&ty));
+        if ty != ScriptType::Never {
+            self.check_assignment(&ty, &self.expression_type(fallback).clone(), fallback.span);
+        }
+        value
+    }
+
     pub(super) fn lower_optional_fallback(
         &mut self,
         value: &'hir HirExpr<'hir>,
@@ -44,10 +74,37 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         // The fallback executes only in the none arm, just like an explicit when.
         self.scopes.push(BTreeMap::new());
         let local = self.declare_local("__optionalPayload", inner.clone(), false, span);
-        let payload = self.alloc_expression(HirExprKind::Local(local), inner.clone(), span);
+        let mut payload = self.alloc_expression(HirExprKind::Local(local), inner.clone(), span);
         self.scopes.pop();
-        let fallback = self.lower_expression_expected(fallback, Some(&inner));
-        self.check_assignment(&inner, &self.expression_type(fallback).clone(), span);
+        let context = if (matches!(fallback.kind, ExprKind::Null)
+            || matches!(&fallback.kind, ExprKind::Symbol(name) if name == "none"))
+            && !matches!(inner, ScriptType::Optional(_))
+        {
+            ScriptType::Optional(Box::new(inner.clone()))
+        } else {
+            inner.clone()
+        };
+        let fallback = self.lower_expression_expected(fallback, Some(&context));
+        let fallback_type = self.expression_type(fallback).clone();
+        let result = if inner.accepts(&fallback_type) {
+            inner.clone()
+        } else if fallback_type.accepts(&inner) {
+            fallback_type.clone()
+        } else {
+            self.check_assignment(&inner, &fallback_type, fallback.span);
+            inner.clone()
+        };
+        if result != inner && matches!(result, ScriptType::Optional(_)) {
+            payload = self.alloc_expression(
+                HirExprKind::Cast {
+                    value: payload,
+                    target: self.arena.alloc(result.clone()),
+                    mode: CastMode::Static,
+                },
+                result.clone(),
+                span,
+            );
+        }
         let some = self.symbol("some");
         let none = self.symbol("none");
         let name = self.symbol("Optional");
@@ -78,7 +135,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 type_name: name,
                 arms,
             },
-            inner,
+            result,
             span,
         )
     }

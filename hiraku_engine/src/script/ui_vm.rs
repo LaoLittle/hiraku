@@ -5030,7 +5030,7 @@ canvas { choiceOptions(renderOption) }
     }
 
     #[test]
-    fn live_text_bindings_capture_story_values_and_preserve_models() {
+    fn string_interpolation_captures_current_ui_model_values() {
         let screen = evaluate_ui_component_named(
             "memory://live_overlay.ui.hks",
             concat!(
@@ -5044,15 +5044,15 @@ canvas { choiceOptions(renderOption) }
             &TextureCatalog::default(),
             &TermCatalog::default(),
         )
-        .expect("live UI binding should evaluate");
+        .expect("String interpolation should evaluate");
 
         let ScreenNode::Text(text) = &screen.children[0] else {
             panic!("canvas child should be text");
         };
-        assert_eq!(
-            text.binding.as_deref(),
-            Some("Player alice, ${time.elapsedSeconds}s")
-        );
+        // text accepts String: interpolation must not leak a raw template into
+        // the renderer. Reactive reevaluation belongs to the UI compiler.
+        assert_eq!(text.text, "Player alice, 0s");
+        assert!(text.binding.is_none());
     }
 
     #[test]

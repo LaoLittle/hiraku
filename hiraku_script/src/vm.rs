@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 19;
+pub const BYTECODE_VERSION: u16 = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -184,11 +184,6 @@ pub enum Instruction {
     AssertNonNull {
         dst: Register,
         value: Register,
-    },
-    SelectNonNull {
-        dst: Register,
-        value: Register,
-        fallback: Register,
     },
     Statement {
         value: Register,
@@ -775,18 +770,9 @@ fn emit_function(
                         span: None,
                     }]);
                 }
-                MirInstruction::AssertNonNull { dst, value } => Instruction::AssertNonNull {
+                MirInstruction::AssertNonNull { dst, value, .. } => Instruction::AssertNonNull {
                     dst: register(*dst),
                     value: register(*value),
-                },
-                MirInstruction::SelectNonNull {
-                    dst,
-                    value,
-                    fallback,
-                } => Instruction::SelectNonNull {
-                    dst: register(*dst),
-                    value: register(*value),
-                    fallback: register(*fallback),
                 },
                 MirInstruction::Statement {
                     value,
@@ -800,6 +786,7 @@ fn emit_function(
                 },
             };
             if let MirInstruction::Panic { span, .. }
+            | MirInstruction::AssertNonNull { span, .. }
             | MirInstruction::Call { span, .. }
             | MirInstruction::Statement { span, .. } = instruction
             {
@@ -1175,15 +1162,7 @@ impl Vm {
                             "panic expects a String".into(),
                         ));
                     };
-                    let frames = self.stack_trace();
-                    return Err(VmError::Panic {
-                        message: message.clone(),
-                        span: frames
-                            .first()
-                            .and_then(|frame| frame.span)
-                            .unwrap_or(Span { start: 0, end: 0 }),
-                        frames,
-                    });
+                    return Err(self.panic_error(message.clone()));
                 }
                 Instruction::Udf(reason) => {
                     return Err(VmError::UndefinedInstruction(
@@ -1560,23 +1539,12 @@ impl Vm {
                     match value {
                         Value::Optional(Some(value)) => self.write(dst, *value)?,
                         Value::Optional(None) | Value::Null => {
-                            return Err(VmError::NullAssertion);
+                            return Err(self.panic_error(
+                                "non-null assertion failed: expected a value, got null",
+                            ));
                         }
                         value => self.write(dst, value)?,
                     }
-                }
-                Instruction::SelectNonNull {
-                    dst,
-                    value,
-                    fallback,
-                } => {
-                    let value = self.read(value)?.clone();
-                    let value = match value {
-                        Value::Optional(Some(value)) => *value,
-                        Value::Optional(None) | Value::Null => self.read(fallback)?.clone(),
-                        value => value,
-                    };
-                    self.write(dst, value)?;
                 }
                 Instruction::Statement {
                     value,
@@ -1903,6 +1871,18 @@ impl Vm {
         }
     }
 
+    fn panic_error(&self, message: impl Into<String>) -> VmError {
+        let frames = self.stack_trace();
+        VmError::Panic {
+            message: message.into(),
+            span: frames
+                .first()
+                .and_then(|frame| frame.span)
+                .unwrap_or(Span { start: 0, end: 0 }),
+            frames,
+        }
+    }
+
     pub fn stack_trace(&self) -> Vec<crate::debug::StackTraceFrame> {
         let source = self.bytecode.debug.source.clone().map(Arc::new);
         std::iter::once((self.location, self.pc))
@@ -2183,6 +2163,14 @@ fn set_member(value: &mut Value, name: &str, new_value: Value) -> Result<(), VmE
 
 fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmError> {
     use crate::BinaryOp;
+    if op == BinaryOp::Add
+        && let (Value::String(left), Value::String(right)) = (left, right)
+    {
+        let mut result = String::with_capacity(left.len() + right.len());
+        result.push_str(left);
+        result.push_str(right);
+        return Ok(Value::String(result));
+    }
     match op {
         BinaryOp::And | BinaryOp::Or => Err(VmError::TypeMismatch(
             "logical operators must be lowered to branches",
@@ -2527,7 +2515,6 @@ pub enum VmError {
     UnknownString(StringId),
     UnknownMember(String),
     NullMemberAccess(String),
-    NullAssertion,
     CastFailed(String),
     UninitializedLocal(u32),
     UninitializedGlobal(u32),
@@ -2614,6 +2601,279 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn elvis_chains_are_short_circuiting_and_preserve_bottom_types() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for (expression, expected, expected_calls) in [
+            (
+                r#"pick(true) ?: null ?: panic("some null")"#,
+                Some("Alice"),
+                1.0,
+            ),
+            (r#"pick(false) ?: null ?: panic("some null")"#, None, 1.0),
+            (
+                r#"pick(false) ?: "123" ?: panic("some null")"#,
+                Some("123"),
+                1.0,
+            ),
+            (
+                r#"pick(true) ?: "123" ?: panic("some null")"#,
+                Some("Alice"),
+                1.0,
+            ),
+            (r#""123" ?: panic("some null")"#, Some("123"), 0.0),
+            (r#"null ?: "123" ?: panic("some null")"#, Some("123"), 0.0),
+            (
+                r#"(pick(true) ?: null) ?: panic("some null")"#,
+                Some("Alice"),
+                1.0,
+            ),
+            (r#"(pick(false) ?: null) ?: panic("some null")"#, None, 1.0),
+            (
+                r#"pick(false) ?: pick(true) ?: panic("some null")"#,
+                Some("Alice"),
+                2.0,
+            ),
+        ] {
+            let source = format!(
+                r#"
+                global var calls: Int = 0
+                fn pick(present: Bool) -> String? {{
+                    calls += 1
+                    if present {{ return "Alice" }}
+                    return null
+                }}
+                global let result: String = {expression}
+            "#
+            );
+            let mut vm = Vm::new(compile(&source, &manifest)).expect("VM");
+            let mut finished = false;
+            for _ in 0..2000 {
+                match vm.step() {
+                    Ok(Some(VmEvent::Completed(_))) => {
+                        assert_eq!(
+                            vm.global("result"),
+                            expected.map(|s| Value::String(s.into())).as_ref(),
+                            "{expression}"
+                        );
+                        finished = true;
+                        break;
+                    }
+                    Err(VmError::Panic { message, .. }) => {
+                        assert!(
+                            expected.is_none(),
+                            "{expression}: unexpected panic {message}"
+                        );
+                        assert_eq!(message, "some null");
+                        finished = true;
+                        break;
+                    }
+                    Ok(Some(VmEvent::Statement(_) | VmEvent::BudgetExhausted)) => {}
+                    other => panic!("{expression}: {other:?}"),
+                }
+            }
+            assert!(finished, "{expression}");
+            assert_eq!(
+                vm.global("calls"),
+                Some(&Value::Number(expected_calls)),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn elvis_chain_restores_a_suspended_fallback() {
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            fn fallback() -> String { checkpoint(); "Bob" }
+            let absent: String? = null
+            global let result: String = absent ?: null ?: fallback() ?: panic("unreachable")
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        let mut restored = false;
+        for _ in 0..1000 {
+            match vm.step().expect("execute") {
+                Some(VmEvent::Call(_)) => {
+                    assert!(!restored);
+                    vm = Vm::restore(code.clone(), vm.snapshot()).expect("restore");
+                    vm.resume(Value::Unit).expect("resume");
+                    restored = true;
+                }
+                Some(VmEvent::Completed(_)) => {
+                    assert!(restored);
+                    assert_eq!(vm.global("result"), Some(&Value::String("Bob".into())));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("execution did not finish");
+    }
+
+    #[test]
+    fn null_assertion_uses_panic_diagnostics_and_exact_source_span() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let source = "fn require(value: String?) -> String {\n    value!\n}\nrequire(null)";
+        let mut code = compile(source, &manifest);
+        code.debug.source = Some(crate::debug::DebugSource {
+            path: "assertion.hks".into(),
+            text: source.into(),
+        });
+        let mut vm = Vm::new(code).expect("VM");
+        for _ in 0..1000 {
+            match vm.step() {
+                Err(error @ VmError::Panic { .. }) => {
+                    let VmError::Panic {
+                        message,
+                        span,
+                        frames,
+                    } = &error
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(&source[span.range()], "value!");
+                    assert!(message.contains("non-null assertion failed"));
+                    assert_eq!(
+                        frames
+                            .iter()
+                            .map(|frame| frame.function.as_str())
+                            .collect::<Vec<_>>(),
+                        ["require", "entry"]
+                    );
+                    let report = error
+                        .render_diagnostic(crate::RenderOptions::plain())
+                        .expect("pretty diagnostic");
+                    assert!(report.contains("assertion.hks:2:5"), "{report}");
+                    assert!(report.contains("value!"), "{report}");
+                    assert!(report.contains("non-null assertion failed"), "{report}");
+                    return;
+                }
+                Ok(Some(VmEvent::Statement(_))) | Ok(Some(VmEvent::BudgetExhausted)) => {}
+                result => panic!("expected assertion panic, got {result:?}"),
+            }
+        }
+        panic!("assertion did not fail");
+    }
+
+    #[test]
+    fn interpolation_uses_lexical_scope_and_calls_resume_normally() {
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            fn next(value: Int) -> Int { checkpoint(); value + 1 }
+            var index = 0
+            global var output = ""
+            while index < 3 {
+                let evaluated: String = "Iteration ${index}"
+                output += evaluated
+                index += 1
+            }
+            let raw: TextTemplate = "${undefinedName}"
+            global let savedTemplate: TextTemplate = raw
+            global let call = "Next: ${next(index)}"
+            let fallback: String? = null
+            global let nested = "Name: ${fallback ?: "Alice"}"
+            global let method = "Method: ${index.toString()}"
+            let producer = { "Captured: ${index}" }
+            global let captured = producer()
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        let mut resumed = false;
+        let mut completed = false;
+        for _ in 0..2000 {
+            match vm.step().expect("interpolation executes") {
+                Some(VmEvent::Call(_)) => {
+                    vm = Vm::restore(code.clone(), vm.snapshot()).expect("restore");
+                    vm.resume(Value::Unit).expect("resume");
+                    resumed = true;
+                }
+                Some(VmEvent::Completed(_)) => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(resumed && completed);
+        for (name, expected) in [
+            ("output", "Iteration 0Iteration 1Iteration 2"),
+            ("call", "Next: 4"),
+            ("nested", "Name: Alice"),
+            ("method", "Method: 3"),
+            ("captured", "Captured: 3"),
+        ] {
+            assert_eq!(vm.global(name), Some(&Value::String(expected.into())));
+        }
+        assert_eq!(
+            vm.global("savedTemplate"),
+            Some(&Value::TextTemplate("${undefinedName}".into()))
+        );
+    }
+
+    #[test]
+    fn string_addition_in_when_and_compound_assignment_survives_restore() {
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            enum Greeting { hello(String), goodbye }
+            fn greet(value: Greeting) -> String {
+                when value {
+                    .hello(name) -> "Hello, " + name
+                    .goodbye -> "Goodbye!"
+                }
+            }
+            global var message = greet(.hello("Alice"))
+            checkpoint()
+            message += "!"
+            global let empty = "" + ""
+            global let unicode = "こんにちは" + " 🌸"
+            global let chained = "a" + "b" + "c"
+            global let explicit = "value: " + 42.toString()
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM initializes");
+        let mut restored = false;
+        let mut completed = false;
+        for _ in 0..2000 {
+            match vm.step().expect("execute string concatenation") {
+                Some(VmEvent::Call(_)) => {
+                    vm = Vm::restore(code.clone(), vm.snapshot()).expect("restore");
+                    vm.resume(Value::Unit).expect("resume");
+                    restored = true;
+                }
+                Some(VmEvent::Completed(_)) => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(restored && completed);
+        for (name, expected) in [
+            ("message", "Hello, Alice!"),
+            ("empty", ""),
+            ("unicode", "こんにちは 🌸"),
+            ("chained", "abc"),
+            ("explicit", "value: 42"),
+        ] {
+            assert_eq!(vm.global(name), Some(&Value::String(expected.into())));
+        }
+        assert!(
+            binary(
+                crate::BinaryOp::Add,
+                &Value::String("a".into()),
+                &Value::Number(1.0)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4334,10 +4594,7 @@ mod tests {
                 ]),
                 Vec::new(),
             );
-        let bytecode = compile(
-            "narrate(\"Hello, ${name}\")\nlog(\"${notEvaluated}\")",
-            &manifest,
-        );
+        let bytecode = compile("narrate(\"Hello, ${name}\")\nlog(\"${1 + 2}\")", &manifest);
         let mut vm = Vm::new(bytecode).expect("VM initializes");
         let Some(VmEvent::Call(call)) = vm.step().expect("narrate yields") else {
             panic!("expected narrate call")
@@ -4351,10 +4608,7 @@ mod tests {
         let Some(VmEvent::Call(call)) = vm.step().expect("log yields") else {
             panic!("expected log call")
         };
-        assert_eq!(
-            call.arguments[0].value,
-            Value::String("${notEvaluated}".into())
-        );
+        assert_eq!(call.arguments[0].value, Value::String("3".into()));
     }
 
     #[test]
