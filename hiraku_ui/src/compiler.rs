@@ -157,6 +157,41 @@ impl<'h> Lower<'_, 'h> {
             self.property_depth += 1;
         }
         let kind = match expr.kind {
+            E::Variant {
+                type_name,
+                variant,
+                values,
+            } => {
+                let values = values.iter().map(|v| self.expr(v)).collect::<Vec<_>>();
+                E::Variant {
+                    type_name,
+                    variant,
+                    values: self.arena.alloc_slice_copy(&values),
+                }
+            }
+            E::When {
+                value,
+                type_name,
+                arms,
+            } => {
+                if self.property_depth == 0 {
+                    self.site(RegionKind::Conditional, expr.span);
+                }
+                let value = self.expr(value);
+                let arms = arms
+                    .iter()
+                    .map(|arm| hiraku_script::HirWhenArm {
+                        variant: arm.variant,
+                        bindings: arm.bindings,
+                        body: self.block(arm.body),
+                    })
+                    .collect::<Vec<_>>();
+                E::When {
+                    value,
+                    type_name,
+                    arms: self.arena.alloc_slice_copy(&arms),
+                }
+            }
             E::Global(id) => {
                 let name = self.program.globals[id.0 as usize].name;
                 if let Some(name) = self.program.symbols.resolve(name) {

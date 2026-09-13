@@ -84,8 +84,8 @@ pub use blocks::{BlockDocument, BlockDocumentError, BlockId, SourceBlock, parse_
 pub use hir::{
     HirArena, HirArgument, HirBlock, HirExpr, HirExprKind, HirFunction, HirFunctionId, HirGlobal,
     HirGlobalId, HirLiteral, HirLocal, HirLocalId, HirPlace, HirProgram, HirStmt, HirStmtKind,
-    LoweringError, ResolvedFunction, ScriptType, StatementValue, TypeId, TypeTable, lower_to_hir,
-    normalize_program_symbols,
+    HirWhenArm, LoweringError, ResolvedFunction, ScriptType, StatementValue, TypeId, TypeTable,
+    lower_to_hir, normalize_program_symbols,
 };
 pub use hiraku_errors::{
     Diagnostic, DiagnosticLabel, RenderOptions, Severity, SourceId, SourceMap,
@@ -96,8 +96,8 @@ pub use linked_vm::{
     LinkedVm, LinkedVmError, LinkedVmEvent, LinkedVmFrameSnapshot, LinkedVmSnapshot,
 };
 pub use linker::{
-    LinkError, LinkedBytecode, LinkedFunction, LinkedModule, LinkedProgram, ModuleId,
-    link_bytecode, link_named_modules, link_register_modules,
+    LinkError, LinkPolicy, LinkedBytecode, LinkedFunction, LinkedModule, LinkedProgram, ModuleId,
+    link_bytecode, link_named_modules, link_named_modules_with_policy, link_register_modules,
 };
 pub use mir::{
     MirBasicBlock, MirBlockId, MirConstant, MirFunction, MirInstruction, MirLoweringError,

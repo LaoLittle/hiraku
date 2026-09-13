@@ -168,13 +168,17 @@ impl StoryRuntime {
             let had_voice = effects.iter().any(|effect| {
                 matches!(
                     effect,
-                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. } | StoryEffect::PlaySfxChannel { .. }
+                    StoryEffect::PlayVoice { .. }
+                        | StoryEffect::PlaySfx { .. }
+                        | StoryEffect::PlaySfxChannel { .. }
                 )
             });
             effects.retain(|effect| {
                 !matches!(
                     effect,
-                    StoryEffect::PlayVoice { .. } | StoryEffect::PlaySfx { .. } | StoryEffect::PlaySfxChannel { .. }
+                    StoryEffect::PlayVoice { .. }
+                        | StoryEffect::PlaySfx { .. }
+                        | StoryEffect::PlaySfxChannel { .. }
                 )
             });
             if had_voice && effects.is_empty() {
@@ -1100,8 +1104,8 @@ mod tests {
                 r#"
                 let alice = char("alice").show()
                 let jump = seq {{
-                    alice.offset(.pos(0, 20)).animation(.linear(1.0))
-                    alice.offset(.pos(0, 0)).animation(.linear(1.0))
+                    alice.offset(.pos(0, 20)).time(1.0).easing(.linear)
+                    alice.offset(.pos(0, 0)).time(1.0).easing(.linear)
                 }}
                 {hide}
                 jump.await()
@@ -1162,8 +1166,8 @@ mod tests {
                 &r#"
             let alice = char("alice").show()
             let jump = seq {
-                alice.offset(.pos(0, 20)).animation(.linear(1.0))
-                alice.offset(.pos(0, 0)).animation(.linear(1.0))
+                alice.offset(.pos(0, 20)).time(1.0).easing(.linear)
+                alice.offset(.pos(0, 0)).time(1.0).easing(.linear)
             }
             "First"
             REPLACE_ACTOR
@@ -1852,7 +1856,7 @@ mod tests {
                 ease,
                 scope: crate::script::CameraEffectScope::Canvas,
                 ..
-            } if (*zoom - 1.25).abs() < f32::EPSILON && ease == "easeOut"
+            } if (*zoom - 1.25).abs() < f32::EPSILON && *ease == crate::script::animation::Easing::EaseOut
         )));
     }
 

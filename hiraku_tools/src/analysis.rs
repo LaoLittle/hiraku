@@ -502,7 +502,9 @@ fn visit_stmt(stmt: &Stmt, out: &mut Facts) {
             expr(condition, out);
             block(body, out);
         }
-        Stmt::Import { .. } | Stmt::TypeAlias { .. } => (),
+        Stmt::Import { .. } | Stmt::TypeAlias { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } => {
+            ()
+        }
     }
 }
 fn callable(expr: &Expr) -> String {
@@ -514,6 +516,12 @@ fn callable(expr: &Expr) -> String {
 }
 fn expr(value: &Expr, out: &mut Facts) {
     match &value.kind {
+        ExprKind::When { value, arms } => {
+            expr(value, out);
+            for arm in arms {
+                block(&arm.body, out);
+            }
+        }
         ExprKind::String(s) => {
             out.strings.insert(s.clone());
         }

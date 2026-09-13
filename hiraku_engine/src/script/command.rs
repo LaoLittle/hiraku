@@ -167,7 +167,10 @@ pub enum AnimationCommand {
 
 #[derive(Debug)]
 pub enum AudioCommand {
-    StopSfxChannel { channel: String, fade: Duration },
+    StopSfxChannel {
+        channel: String,
+        fade: Duration,
+    },
     PlaySfx {
         channel: Option<String>,
         looped: bool,
@@ -183,7 +186,10 @@ pub enum AudioCommand {
         fade_in: Option<Duration>,
         animation_id: Option<String>,
     },
-    StopBgm { fade: Duration, animation_id: Option<String> },
+    StopBgm {
+        fade: Duration,
+        animation_id: Option<String>,
+    },
     PlayVoice {
         path: String,
         volume: f32,
@@ -194,7 +200,11 @@ pub enum AudioCommand {
 
 #[derive(Debug)]
 pub enum VideoCommand {
-    Play { path: String, done: Option<ScriptRequestId>, fade_out: Duration },
+    Play {
+        path: String,
+        done: Option<ScriptRequestId>,
+        fade_out: Duration,
+    },
     Stop,
 }
 
@@ -211,14 +221,4 @@ pub struct ResolvedCharacterKeyframe {
     pub ease: CharacterEase,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum CharacterEase {
-    EaseOutSine,
-    EaseInOutSine,
-    Linear,
-    Ease,
-    EaseIn,
-    EaseOut,
-    EaseInOut,
-    Bounce,
-}
+pub type CharacterEase = crate::script::animation::Easing;

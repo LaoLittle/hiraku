@@ -640,6 +640,7 @@ mod tests {
         let mut motion = crate::script::actor_motion::ActorMotion::new(
             2,
             crate::script::actor_motion::ActorOffset {
+                oscillation: None,
                 target: [0.0, 20.0],
                 animation: crate::script::AnimationSpec::EaseOut(1.0, false),
             },

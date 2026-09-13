@@ -43,6 +43,7 @@ pub struct NativeRegistry<C> {
     signatures: BTreeMap<BuiltinId, FunctionSignature>,
     static_members: Vec<StaticMember>,
     globals: BTreeMap<String, crate::ScriptType>,
+    capabilities: BTreeMap<BuiltinId, String>,
 }
 
 impl<C> Default for NativeRegistry<C> {
@@ -63,7 +64,21 @@ impl<C> NativeRegistry<C> {
             signatures: BTreeMap::new(),
             static_members: Vec::new(),
             globals: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
         }
+    }
+
+    /// Protect every alias of this native function with the same capability.
+    pub fn require_capability(
+        &mut self,
+        builtin: BuiltinId,
+        capability: impl Into<String>,
+    ) -> Result<(), RegistrationError> {
+        if !self.functions.contains_key(&builtin) {
+            return Err(RegistrationError::UnknownBuiltin(builtin));
+        }
+        self.capabilities.insert(builtin, capability.into());
+        Ok(())
     }
 
     pub fn define_type(&mut self, name: impl Into<String>) -> SymbolId {
@@ -460,6 +475,7 @@ impl<C> NativeRegistry<C> {
             self.static_members.clone(),
         )
         .with_globals(self.globals.clone())
+        .with_capabilities(self.capabilities.clone())
     }
 
     pub fn call(&self, context: &mut C, call: &BuiltinCall) -> NativeResult {

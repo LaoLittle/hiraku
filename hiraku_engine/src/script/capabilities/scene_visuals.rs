@@ -538,7 +538,7 @@ mod api {
                 scale: None,
                 rotation: None,
                 seconds: seconds as f32,
-                ease,
+                ease: crate::script::animation::Easing::named(&ease)?,
             }))
     }
 
@@ -574,6 +574,23 @@ mod api {
             return Err(NativeError::message(
                 "picture transform requires finite coordinates and positive scale",
             ));
+        }
+        if let Some((
+            SceneVisualTarget::Picture(PictureCommand::Show {
+                position,
+                scale,
+                rotation,
+                ..
+            }),
+            _,
+        )) = context.scene_visuals.pending.get_mut(&handle.0)
+        {
+            match field {
+                0 | 1 => position[field] = value as f32,
+                2 => *scale = value as f32,
+                _ => *rotation = value as f32,
+            }
+            return Ok(handle);
         }
         let Some((
             SceneVisualTarget::Picture(PictureCommand::Transform {
@@ -634,57 +651,78 @@ mod api {
         transform_field(context, handle, 3, value)
     }
 
-    #[hks(name = "animation", selector = "SceneTransition", receiver)]
-    fn transform_animation(
+    fn transition_spec(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
-        animation: crate::script::animation::AnimationSpec,
+    ) -> Result<crate::script::animation::AnimationSpec, NativeError> {
+        use crate::{script::animation::AnimationSpec, stage::runtime::StageCommand};
+        match context.scene_visuals.pending.get(&handle.0) {
+            Some((
+                SceneVisualTarget::Spatial(
+                    StageCommand::Camera { animation, .. } | StageCommand::View { animation, .. },
+                ),
+                _,
+            )) => Ok(*animation),
+            Some((
+                SceneVisualTarget::Picture(
+                    PictureCommand::Transform { seconds, ease, .. }
+                    | PictureCommand::Exit { seconds, ease, .. },
+                ),
+                _,
+            )) => Ok(AnimationSpec::new(*seconds as f64, *ease, false)),
+            _ => Err(NativeError::message(
+                "time/easing requires an uncommitted scene transition",
+            )),
+        }
+    }
+    fn set_transition_spec(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        spec: crate::script::animation::AnimationSpec,
     ) -> Result<SceneTransitionHandle, NativeError> {
-        use crate::script::animation::AnimationSpec;
-        let (duration, curve) = match animation {
-            AnimationSpec::Linear(duration, _) => (duration, "linear"),
-            AnimationSpec::EaseIn(duration, _) => (duration, "easeInQuad"),
-            AnimationSpec::EaseOut(duration, _) => (duration, "easeOutQuad"),
-            AnimationSpec::EaseOutSine(duration, _) => (duration, "easeOutSine"),
-            AnimationSpec::EaseInOutSine(duration, _) => (duration, "easeInOutSine"),
-            AnimationSpec::EaseInOut(duration, _) => (duration, "easeInOutQuad"),
-        };
-        milliseconds(duration)?;
-        if animation.repeats() {
-            return Err(NativeError::message(
-                "scene command animations must complete",
-            ));
+        use crate::stage::runtime::StageCommand;
+        match context.scene_visuals.pending.get_mut(&handle.0) {
+            Some((
+                SceneVisualTarget::Spatial(
+                    StageCommand::Camera { animation, .. } | StageCommand::View { animation, .. },
+                ),
+                _,
+            )) => *animation = spec,
+            Some((
+                SceneVisualTarget::Picture(
+                    PictureCommand::Transform { seconds, ease, .. }
+                    | PictureCommand::Exit { seconds, ease, .. },
+                ),
+                _,
+            )) => {
+                *seconds = spec.duration();
+                *ease = spec.easing();
+            }
+            _ => {
+                return Err(NativeError::message(
+                    "time/easing requires an uncommitted scene transition",
+                ));
+            }
         }
-        if let Some((
-            SceneVisualTarget::Spatial(
-                crate::stage::runtime::StageCommand::Camera {
-                    animation: target, ..
-                }
-                | crate::stage::runtime::StageCommand::View {
-                    animation: target, ..
-                },
-            ),
-            _,
-        )) = context.scene_visuals.pending.get_mut(&handle.0)
-        {
-            *target = animation;
-            return Ok(handle);
-        }
-        let Some((
-            SceneVisualTarget::Picture(
-                PictureCommand::Transform { seconds, ease, .. }
-                | PictureCommand::Exit { seconds, ease, .. },
-            ),
-            _,
-        )) = context.scene_visuals.pending.get_mut(&handle.0)
-        else {
-            return Err(NativeError::message(
-                "animation requires an uncommitted picture transform",
-            ));
-        };
-        *seconds = duration as f32;
-        *ease = curve.into();
         Ok(handle)
+    }
+    #[hks(name = "time", selector = "SceneTransition", receiver)]
+    fn transition_time(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        seconds: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let spec = transition_spec(context, handle)?.with_time(seconds)?;
+        set_transition_spec(context, handle, spec)
+    }
+    #[hks(name = "easing", selector = "SceneTransition", receiver)]
+    fn transition_easing(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        easing: crate::script::animation::Easing,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let spec = transition_spec(context, handle)?.with_easing(easing)?;
+        set_transition_spec(context, handle, spec)
     }
 
     /// One owned exit: final position and alpha finish before removal.
@@ -901,6 +939,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn actor_and_camera_use_typed_bezier_and_invalid_controls_report_errors() {
+        use crate::script::animation::Easing;
+        let curve = Easing::CubicBezier(0.25, 0.1, 0.25, 1.0);
+        let mut camera =
+            runtime("camera().zoom(1.2).easing(.cubicBezier(0.25,0.1,0.25,1)).time(0.8)");
+        let StoryRuntimeEvent::Effect(StoryEffect::SetCamera {
+            ease, duration_ms, ..
+        }) = event(&mut camera)
+        else {
+            panic!("camera")
+        };
+        assert_eq!(ease, curve);
+        assert_eq!(duration_ms, 800);
+        let mut actor = runtime(
+            "char(\"alice\").at(.right).show().easing(.cubicBezier(0.25,0.1,0.25,1)).time(0.8)",
+        );
+        let StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
+            placement_animation: Some(spec),
+            ..
+        }) = event(&mut actor)
+        else {
+            panic!("actor")
+        };
+        assert_eq!(spec.easing(), curve);
+        assert!((spec.duration() - 0.8).abs() < 0.00001);
+        for source in [
+            "camera().zoom(1.2).easing(.cubicBezier(-1,0,1,1))",
+            "char(\"alice\").show().time(-1)",
+        ] {
+            let mut invalid = runtime(source);
+            let mut error = None;
+            for _ in 0..32 {
+                if let Err(e) = invalid.step() {
+                    error = Some(e);
+                    break;
+                }
+            }
+            assert!(error.is_some(), "invalid animation must fail: {source}");
+        }
+    }
+
+    #[test]
+    fn bezier_picture_parameters_commit_in_either_order_and_await() {
+        use crate::script::animation::Easing;
+        for modifiers in [
+            ".time(0.8).easing(.cubicBezier(0.25, 0.1, 0.25, 1))",
+            ".easing(.cubicBezier(0.25, 0.1, 0.25, 1)).time(0.8)",
+        ] {
+            let mut runtime = runtime(&format!(
+                "scene.transformPicture(\"panel\").scale(2){modifiers}.await()\nlog(\"done\")"
+            ));
+            let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut runtime) else {
+                panic!("expected awaited transition")
+            };
+            let StoryEffect::Picture(PictureCommand::Transform { seconds, ease, .. }) = &effect
+            else {
+                panic!("expected transform")
+            };
+            assert!((*seconds - 0.8).abs() < 0.00001);
+            assert_eq!(*ease, Easing::CubicBezier(0.25, 0.1, 0.25, 1.0));
+            assert!(runtime.step().expect("wait").is_none());
+            runtime
+                .complete_task_effect(task, &effect)
+                .expect("complete");
+            assert!(
+                matches!(event(&mut runtime),StoryRuntimeEvent::Effect(StoryEffect::Log(text)) if text=="done")
+            );
+        }
+    }
+
+    #[test]
     fn screen_space_and_atomic_exit_are_registered_native_builders() {
         let mut show = runtime("scene.picture(\"panel\", \"image/panel\").screenSpace()");
         assert!(matches!(
@@ -911,13 +1020,13 @@ mod tests {
             }))
         ));
         let mut exit =
-            runtime("scene.hidePicture(\"panel\").to(20, 30).animation(.easeIn(0.4)).await()");
+            runtime("scene.hidePicture(\"panel\").to(20, 30).time(0.4).easing(.easeIn).await()");
         let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut exit) else {
             panic!("exit must expose one awaitable effect");
         };
         assert!(
             matches!(&effect, StoryEffect::Picture(PictureCommand::Exit { position: [20.0, 30.0], seconds, ease, .. })
-            if (*seconds - 0.4).abs() < 0.0001 && ease == "easeInQuad")
+            if (*seconds - 0.4).abs() < 0.0001 && *ease == crate::script::animation::Easing::EaseIn)
         );
         assert!(exit.step().expect("wait for owned exit").is_none());
         exit.complete_task_effect(task, &effect)
@@ -934,17 +1043,19 @@ mod tests {
 
     #[test]
     fn sibling_motion_group_follows_entrance_group() {
-        let mut runtime = runtime(r#"
+        let mut runtime = runtime(
+            r#"
             let entrance = par {
                 scene.picture("room", "room").fade(500)
                 char("alice").at(.rel(50, 50)).show()
             }
             par {
-                scene.transformPicture("room").at(.right).animation(.linear(2))
-                char("alice").at(.rel(75, 50)).animation(.easeOut(0.5))
+                scene.transformPicture("room").at(.right).time(2).easing(.linear)
+                char("alice").at(.rel(75, 50)).time(0.5).easing(.easeOut)
             }
             entrance.await()
-        "#);
+        "#,
+        );
         let mut order = Vec::new();
         for _ in 0..64 {
             if let Some(StoryRuntimeEvent::TaskEffect { effect, .. }) =
@@ -952,17 +1063,30 @@ mod tests {
             {
                 match &effect {
                     StoryEffect::Picture(PictureCommand::Show { .. }) => order.push("picture show"),
-                    StoryEffect::Picture(PictureCommand::Transform { .. }) => order.push("picture move"),
-                    StoryEffect::ShowCharacter { placement_animation, .. } => order.push(
-                        if placement_animation.is_some() { "actor move" } else { "actor show" }),
+                    StoryEffect::Picture(PictureCommand::Transform { .. }) => {
+                        order.push("picture move")
+                    }
+                    StoryEffect::ShowCharacter {
+                        placement_animation,
+                        ..
+                    } => order.push(if placement_animation.is_some() {
+                        "actor move"
+                    } else {
+                        "actor show"
+                    }),
                     _ => panic!("unexpected effect: {effect:?}"),
                 }
                 // Keep all effects in flight: movement must start after the
                 // show commands, not after their fades have completed.
             }
-            if order.len() == 4 { break; }
+            if order.len() == 4 {
+                break;
+            }
         }
-        assert_eq!(order, ["picture show", "actor show", "picture move", "actor move"]);
+        assert_eq!(
+            order,
+            ["picture show", "actor show", "picture move", "actor move"]
+        );
     }
 
     fn event(runtime: &mut StoryRuntime) -> StoryRuntimeEvent {
@@ -1053,6 +1177,30 @@ mod tests {
     }
 
     #[test]
+    fn picture_entrance_rotation_and_smoothstep_are_native_builder_properties() {
+        let mut runtime = runtime(
+            r#"
+            scene.picture("panel", "alice/portrait").at(.center).rotation(25).fade(1000)
+            scene.transformPicture("panel").at(.left).time(0.4).easing(.smoothStep)
+        "#,
+        );
+        let StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+            rotation, ..
+        })) = event(&mut runtime)
+        else {
+            panic!("expected rotated entrance");
+        };
+        assert_eq!(rotation, 25.0);
+        let StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Transform {
+            ease, ..
+        })) = event(&mut runtime)
+        else {
+            panic!("expected smoothstep motion");
+        };
+        assert_eq!(ease, crate::script::animation::Easing::SmoothStep);
+    }
+
+    #[test]
     fn named_clip_builders_commit_in_order_and_share_actor_picture_coordinates() {
         let mut runtime = runtime(
             r#"
@@ -1123,7 +1271,7 @@ mod tests {
     fn picture_transform_is_statement_scoped_and_awaitable() {
         let mut runtime = runtime(
             r#"
-            scene.transformPicture("panel").scale(1.15).animation(.easeOut(2.4)).await()
+            scene.transformPicture("panel").scale(1.15).time(2.4).easing(.easeOut).await()
             log("finished")
         "#,
         );
@@ -1133,7 +1281,7 @@ mod tests {
         assert!(
             matches!(&effect, StoryEffect::Picture(PictureCommand::Transform {
             position: [None, None], scale: Some(scale), rotation: None, seconds, ease, ..
-        }) if (*scale - 1.15).abs() < 0.001 && (*seconds - 2.4).abs() < 0.001 && ease == "easeOutQuad")
+        }) if (*scale - 1.15).abs() < 0.001 && (*seconds - 2.4).abs() < 0.001 && *ease == crate::script::animation::Easing::EaseOut)
         );
         assert!(runtime.step().expect("waiting").is_none());
         runtime
@@ -1152,7 +1300,7 @@ mod tests {
             global fn present(texture: String) -> Task {
                 par {
                     scene.picture("panel", texture).size(500, 500).fade(400)
-                    scene.transformPicture("panel").y(60).animation(.easeOut(0.4))
+                    scene.transformPicture("panel").y(60).time(0.4).easing(.easeOut)
                 }
             }
             present("image/panel").await()
@@ -1204,8 +1352,8 @@ mod tests {
             let alice = char("alice")
             alice.show()
             let task = seq {
-                alice.offset(.pos(0, 20)).animation(.easeOut(0.2))
-                alice.offset(.pos(0, 0)).animation(.easeIn(0.2))
+                alice.offset(.pos(0, 20)).time(0.2).easing(.easeOut)
+                alice.offset(.pos(0, 0)).time(0.2).easing(.easeIn)
             }
             wait(task)
         "#,
@@ -1229,8 +1377,8 @@ mod tests {
             let alice = char("alice")
             alice.show()
             let jump = seq {
-                alice.offset(.pos(0, 20)).animation(.easeOut(0.2))
-                alice.offset(.pos(0, 0)).animation(.easeIn(0.2))
+                alice.offset(.pos(0, 20)).time(0.2).easing(.easeOut)
+                alice.offset(.pos(0, 0)).time(0.2).easing(.easeIn)
             }
             jump.await()
             log("joined")
@@ -1290,8 +1438,8 @@ mod tests {
             alice.show()
             bob.show()
             let group = par {
-                alice.offset(.pos(0, 20)).animation(.linear(2))
-                bob.offset(.pos(0, 10)).animation(.linear(1))
+                alice.offset(.pos(0, 20)).time(2).easing(.linear)
+                bob.offset(.pos(0, 10)).time(1).easing(.linear)
             }
             log("launched")
             group.await()
@@ -1328,7 +1476,7 @@ mod tests {
     fn actor_animation_is_statement_scoped_and_rejects_invalid_duration() {
         assert!(compile_story_bytecode("legacy.hks", r#"char("alice").motion([])"#).is_err());
         let mut runtime =
-            runtime(r#"char("alice").show().offset(.pos(0, 2)).animation(.linear(-1))"#);
+            runtime(r#"char("alice").show().offset(.pos(0, 2)).time(-1).easing(.linear)"#);
         assert!(runtime.step().is_err());
     }
 
@@ -1474,7 +1622,7 @@ mod tests {
         let mut runtime = runtime(
             r#"
             let entrance = par { scene.picture("panel", "room").fade(1000) }
-            par { scene.transformPicture("panel").scale(2).animation(.linear(80)) }
+            par { scene.transformPicture("panel").scale(2).time(80).easing(.linear) }
             entrance.await()
             log("entered")
         "#,
@@ -1641,7 +1789,7 @@ mod tests {
             "sfx(\"sound/bell\").await()",
             "bgm(\"music/theme\").fadeIn(500).await()",
             "char(\"alice\").show().await()",
-            "char(\"alice\").show().at(.pos(10, 20)).scale(1.2).animation(.linear(0.9)).await()",
+            "char(\"alice\").show().at(.pos(10, 20)).scale(1.2).time(0.9).easing(.linear).await()",
             "char(\"alice\").hide(300).await()",
             "scene.hideCharacters(300).await()",
         ] {
@@ -1687,7 +1835,7 @@ mod tests {
     fn fluent_await_joins_every_effect_committed_by_the_statement() {
         let mut runtime = runtime(
             r#"
-            char("alice").show().offset(.pos(0, 20)).animation(.linear(1)).await()
+            char("alice").show().offset(.pos(0, 20)).time(1).easing(.linear).await()
             log("after")
         "#,
         );

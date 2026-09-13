@@ -444,6 +444,8 @@ impl Parser {
                 "fn" => return self.parse_function(false),
                 "impl" => return self.parse_impl(),
                 "type" => return self.parse_type_alias(),
+                "struct" => return self.parse_struct(),
+                "enum" => return self.parse_enum(),
                 "const" => return self.parse_const(false),
                 "let" | "var" => return self.parse_let(),
                 "global" => return self.parse_global(),
@@ -787,6 +789,206 @@ impl Parser {
         }
     }
 
+    fn parse_when(&mut self, start: Span) -> Expr {
+        let value = self.parse_condition_expression();
+        self.skip_newlines();
+        self.expect(TokenKind::LBrace, "expected `{` after when subject");
+        self.skip_separators();
+        let mut arms = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let arm_start = self.current().span;
+            self.expect(
+                TokenKind::Dot,
+                "expected variant pattern such as .some(value)",
+            );
+            let variant = match self.advance().kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.error_here("expected variant name");
+                    "<error>".into()
+                }
+            };
+            let mut bindings = Vec::new();
+            if self.at(TokenKind::LParen) {
+                self.advance();
+                self.skip_newlines();
+                while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                    match self.advance().kind {
+                        TokenKind::Ident(name) => bindings.push(name),
+                        _ => self.error_here("expected payload binding or _"),
+                    }
+                    self.skip_newlines();
+                    if !self.at(TokenKind::Comma) {
+                        break;
+                    }
+                    self.advance();
+                    self.skip_newlines();
+                }
+                self.expect(TokenKind::RParen, "expected `)` after pattern");
+            }
+            self.expect(TokenKind::Minus, "expected `->` after pattern");
+            self.expect(TokenKind::Gt, "expected `->` after pattern");
+            self.skip_newlines();
+            let body = if self.at(TokenKind::LBrace) {
+                self.parse_block()
+            } else {
+                let expression = self.parse_expression();
+                Block {
+                    span: expression.span,
+                    statements: vec![Stmt::Expr(expression)],
+                }
+            };
+            let span = Span::join(&arm_start, &body.span);
+            arms.push(crate::ast::WhenArm {
+                variant,
+                bindings,
+                body,
+                span,
+            });
+            if self.at(TokenKind::Comma) {
+                self.advance();
+            }
+            self.skip_separators();
+        }
+        let end = self
+            .expect(TokenKind::RBrace, "expected `}` after when arms")
+            .span;
+        Expr {
+            kind: ExprKind::When {
+                value: Box::new(value),
+                arms,
+            },
+            span: Span::join(&start, &end),
+        }
+    }
+
+    fn parse_enum(&mut self) -> Stmt {
+        let start = self.advance().span;
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected enum name");
+                "<error>".into()
+            }
+        };
+        let type_parameters = self.parse_type_parameter_names();
+        self.skip_newlines();
+        self.expect(TokenKind::LBrace, "expected `{` after enum name");
+        self.skip_separators();
+        let mut variants = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let token = self.advance();
+            let name = match token.kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.error_here("expected variant name");
+                    "<error>".into()
+                }
+            };
+            let mut fields = Vec::new();
+            if self.at(TokenKind::LParen) {
+                self.advance();
+                self.skip_newlines();
+                while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                    fields.push(self.parse_type());
+                    self.skip_newlines();
+                    if !self.at(TokenKind::Comma) {
+                        break;
+                    }
+                    self.advance();
+                    self.skip_newlines();
+                }
+                self.expect(TokenKind::RParen, "expected `)` after variant payload");
+            }
+            if variants
+                .iter()
+                .any(|v: &crate::ast::EnumVariant| v.name == name)
+            {
+                self.error_here("duplicate enum variant");
+            }
+            variants.push(crate::ast::EnumVariant {
+                name,
+                fields,
+                span: Span::join(&token.span, &self.current().span),
+            });
+            self.skip_newlines();
+            if self.at(TokenKind::Comma) {
+                self.advance();
+            } else if !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                self.error_here("expected `,` between enum variants");
+            }
+            self.skip_separators();
+        }
+        let end = self
+            .expect(TokenKind::RBrace, "expected `}` after enum variants")
+            .span;
+        if variants.is_empty() {
+            self.error_here("enum requires at least one variant");
+        }
+        Stmt::Enum {
+            name,
+            type_parameters,
+            variants,
+            span: Span::join(&start, &end),
+        }
+    }
+
+    fn parse_struct(&mut self) -> Stmt {
+        let start = self.advance().span;
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected name after struct");
+                "<error>".into()
+            }
+        };
+        let type_parameters = self.parse_type_parameter_names();
+        self.skip_newlines();
+        self.expect(TokenKind::LBrace, "expected `{` after struct name");
+        let ty = self.parse_record_type_contents(start);
+        let span = ty.span;
+        Stmt::Struct {
+            name,
+            type_parameters,
+            ty,
+            span,
+        }
+    }
+
+    fn parse_record_type_contents(&mut self, start: Span) -> TypeExpr {
+        let mut fields = Vec::new();
+        self.skip_separators();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let field_start = self.current().span.clone();
+            let name = match self.advance().kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.error_here("expected record field name");
+                    "<error>".to_string()
+                }
+            };
+            self.expect(TokenKind::Colon, "expected `:` after record field name");
+            let field_type = self.parse_type();
+            let span = Span::join(&field_start, &field_type.span);
+            fields.push(TypeField {
+                name,
+                ty: field_type,
+                span,
+            });
+            if self.at(TokenKind::Comma) {
+                self.advance();
+            }
+            self.skip_separators();
+        }
+        let end = self
+            .expect(TokenKind::RBrace, "expected `}` after record type")
+            .span;
+        TypeExpr {
+            kind: TypeExprKind::Record(fields),
+            span: Span::join(&start, &end),
+        }
+    }
+
     fn parse_type_alias(&mut self) -> Stmt {
         let start = self.advance();
         let name = match self.advance().kind {
@@ -1007,37 +1209,7 @@ impl Parser {
         } else if self.at(TokenKind::Dot) && matches!(self.peek().kind, TokenKind::LBrace) {
             self.advance();
             self.advance();
-            let mut fields = Vec::new();
-            self.skip_separators();
-            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                let field_start = self.current().span.clone();
-                let name = match self.advance().kind {
-                    TokenKind::Ident(name) => name,
-                    _ => {
-                        self.error_here("expected record field name");
-                        "<error>".to_string()
-                    }
-                };
-                self.expect(TokenKind::Colon, "expected `:` after record field name");
-                let field_type = self.parse_type();
-                let span = Span::join(&field_start, &field_type.span);
-                fields.push(TypeField {
-                    name,
-                    ty: field_type,
-                    span,
-                });
-                if self.at(TokenKind::Comma) {
-                    self.advance();
-                }
-                self.skip_separators();
-            }
-            let end = self
-                .expect(TokenKind::RBrace, "expected `}` after record type")
-                .span;
-            TypeExpr {
-                kind: TypeExprKind::Record(fields),
-                span: Span::join(&start, &end),
-            }
+            self.parse_record_type_contents(start)
         } else {
             let token = self.advance();
             let TokenKind::Ident(name) = token.kind else {
@@ -1452,6 +1624,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Expr {
         let token = self.advance();
         match token.kind {
+            TokenKind::Ident(name) if name == "when" => self.parse_when(token.span),
             TokenKind::Ident(name) if name == "null" => Expr {
                 kind: ExprKind::Null,
                 span: token.span,
@@ -1753,6 +1926,30 @@ impl Parser {
             next += 1;
         }
         if next > self.index && matches!(self.tokens[next].kind, TokenKind::Dot) {
+            // A when arm begins with .variant(...) ->, not a fluent continuation.
+            let mut cursor = next + 2;
+            if matches!(
+                self.tokens.get(cursor).map(|t| &t.kind),
+                Some(TokenKind::LParen)
+            ) {
+                cursor += 1;
+                while !matches!(
+                    self.tokens.get(cursor).map(|t| &t.kind),
+                    None | Some(TokenKind::RParen) | Some(TokenKind::Eof)
+                ) {
+                    cursor += 1;
+                }
+                cursor += 1;
+            }
+            if matches!(
+                self.tokens.get(cursor).map(|t| &t.kind),
+                Some(TokenKind::Minus)
+            ) && matches!(
+                self.tokens.get(cursor + 1).map(|t| &t.kind),
+                Some(TokenKind::Gt)
+            ) {
+                return;
+            }
             self.index = next;
         }
     }
@@ -1811,6 +2008,25 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enum_variants_require_commas() {
+        for source in [
+            "enum Packet { first second }",
+            "enum Packet { first\nsecond }",
+            "enum Packet { first; second }",
+        ] {
+            let errors = super::parse_program(source).expect_err("missing comma must fail");
+            assert!(format!("{errors:?}").contains("between enum variants"));
+        }
+        for source in [
+            "enum Packet { first, second }",
+            "enum Packet { first,\nsecond,\n}",
+            "enum Packet { first }",
+        ] {
+            super::parse_program(source).expect("comma separated variants parse");
+        }
+    }
+
     use super::*;
 
     #[test]

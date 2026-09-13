@@ -1,3 +1,6 @@
+#[path = "enums.rs"]
+mod enums;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use bumpalo::Bump;
@@ -72,6 +75,11 @@ pub struct HirExpr<'hir> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HirExprKind<'hir> {
+    When {
+        value: &'hir HirExpr<'hir>,
+        type_name: SymbolId,
+        arms: &'hir [HirWhenArm<'hir>],
+    },
     Intrinsic {
         operation: crate::intrinsics::Intrinsic,
         argument: &'hir HirExpr<'hir>,
@@ -110,6 +118,11 @@ pub enum HirExprKind<'hir> {
     },
     Tuple(&'hir [&'hir HirExpr<'hir>]),
     List(&'hir [&'hir HirExpr<'hir>]),
+    Variant {
+        type_name: SymbolId,
+        variant: SymbolId,
+        values: &'hir [&'hir HirExpr<'hir>],
+    },
     Map {
         type_name: Option<SymbolId>,
         fields: &'hir [(SymbolId, &'hir HirExpr<'hir>)],
@@ -125,6 +138,13 @@ pub enum HirExprKind<'hir> {
         op: BinaryOp,
         right: &'hir HirExpr<'hir>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HirWhenArm<'hir> {
+    pub variant: SymbolId,
+    pub bindings: &'hir [HirLocalId],
+    pub body: &'hir HirBlock<'hir>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -355,6 +375,7 @@ struct Lowerer<'hir, 'manifest> {
     methods: BTreeMap<(TypeId, SymbolId), HirFunctionId>,
     static_methods: BTreeMap<(TypeId, SymbolId), HirFunctionId>,
     aliases: BTreeMap<String, TypeAliasDeclaration>,
+    enums: BTreeMap<String, (Vec<String>, Vec<crate::ast::EnumVariant>)>,
     type_parameters: Vec<BTreeMap<String, ScriptType>>,
     type_expansions: Vec<String>,
     named_imports: BTreeMap<String, String>,
@@ -435,6 +456,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             methods: BTreeMap::new(),
             static_methods: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            enums: BTreeMap::new(),
             type_parameters: Vec::new(),
             type_expansions: Vec::new(),
             named_imports,
@@ -464,7 +486,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             source.statements.iter().filter(|statement| {
                 !matches!(
                     statement,
-                    Stmt::Import { .. } | Stmt::TypeAlias { .. } | Stmt::Function { .. }
+                    Stmt::Enum { .. }
+                        | Stmt::Import { .. }
+                        | Stmt::TypeAlias { .. }
+                        | Stmt::Struct { .. }
+                        | Stmt::Function { .. }
                 )
             }),
             Span::new(
@@ -514,16 +540,39 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn declare_types(&mut self, program: &Program) {
         for statement in &program.statements {
-            let Stmt::TypeAlias {
+            if let Stmt::Enum {
+                name,
+                type_parameters,
+                variants,
+                span,
+            } = statement
+            {
+                if self
+                    .enums
+                    .insert(name.clone(), (type_parameters.clone(), variants.clone()))
+                    .is_some()
+                    || self.aliases.contains_key(name)
+                {
+                    self.error(format!("type `{name}` is defined more than once"), *span);
+                }
+                continue;
+            }
+            let (Stmt::TypeAlias {
                 name,
                 type_parameters,
                 ty,
                 span,
-            } = statement
+            }
+            | Stmt::Struct {
+                name,
+                type_parameters,
+                ty,
+                span,
+            }) = statement
             else {
                 continue;
             };
-            if self.aliases.contains_key(name) {
+            if self.aliases.contains_key(name) || self.enums.contains_key(name) {
                 self.error(format!("type `{name}` is defined more than once"), *span);
             } else {
                 self.aliases.insert(
@@ -864,7 +913,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 self.error("imports are only allowed at module scope", *span);
                 return None;
             }
-            Stmt::TypeAlias { .. } => return None,
+            Stmt::Enum { .. } | Stmt::TypeAlias { .. } | Stmt::Struct { .. } => return None,
             Stmt::Impl { span, .. } | Stmt::Property { span, .. } | Stmt::Const { span, .. } => {
                 self.error("impl declarations are only allowed at module scope", *span);
                 return None;
@@ -1078,7 +1127,13 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected_result: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if let Some(value) = self.lower_enum_constructor(expression, None) {
+            return value;
+        }
         let (kind, ty) = match &expression.kind {
+            ExprKind::When { value, arms } => {
+                return self.lower_when(value, arms, expected_result, expression.span);
+            }
             ExprKind::Unit => (HirExprKind::Literal(HirLiteral::Unit), ScriptType::Unit),
             ExprKind::Null => (
                 HirExprKind::Literal(HirLiteral::Null),
@@ -1274,6 +1329,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             ExprKind::Elvis { value, fallback } => {
                 let value = self.lower_expression(value);
+                if let ScriptType::Optional(inner) = self.expression_type(value).clone() {
+                    return self.lower_optional_fallback(value, fallback, *inner, expression.span);
+                }
                 let fallback = self.lower_expression(fallback);
                 let ty = match self.expression_type(value) {
                     ScriptType::Optional(inner) => (**inner).clone(),
@@ -1645,6 +1703,17 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 }
             }
             ExprKind::StructLiteral(fields) | ExprKind::TypedStructLiteral { fields, .. } => {
+                if let ExprKind::TypedStructLiteral { type_name, .. } = &expression.kind {
+                    if let Some(expected @ ScriptType::Struct { .. }) =
+                        self.instantiate_named_type(type_name, &[], expression.span)
+                    {
+                        let literal = Expr {
+                            kind: ExprKind::StructLiteral(fields.clone()),
+                            span: expression.span,
+                        };
+                        return self.lower_expression_expected(&literal, Some(&expected));
+                    }
+                }
                 let type_name = match &expression.kind {
                     ExprKind::TypedStructLiteral { type_name, .. } => Some(self.symbol(type_name)),
                     _ => None,
@@ -1858,6 +1927,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if let ExprKind::When { value, arms } = &expression.kind {
+            return self.lower_when(value, arms, expected, expression.span);
+        }
+        if let Some(value) = self.lower_enum_constructor(expression, expected) {
+            return value;
+        }
         if matches!(expression.kind, ExprKind::Call { .. }) && {
             let function = self.resolve_call(expression);
             self.generic_signature(function)
@@ -2138,32 +2213,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 expression.span,
             );
         }
-        if let Some(ScriptType::Optional(inner)) = expected {
-            if matches!(expression.kind, ExprKind::Null)
-                || matches!(&expression.kind, ExprKind::Symbol(name) if name == "none")
-            {
-                return self.alloc_expression(
-                    HirExprKind::Literal(HirLiteral::Null),
-                    ScriptType::Optional(inner.clone()),
-                    expression.span,
-                );
-            }
-            if let ExprKind::Call {
-                callee,
-                type_arguments: _,
-                arguments,
-                trailing_block: None,
-            } = &expression.kind
-                && matches!(&callee.kind, ExprKind::Symbol(name) if name == "some")
-                && arguments.len() == 1
-            {
-                let value = self.lower_expression_expected(&arguments[0].value, Some(inner));
-                return self.alloc_expression(
-                    HirExprKind::OptionalSome(value),
-                    ScriptType::Optional(inner.clone()),
-                    expression.span,
-                );
-            }
+        if let Some(ScriptType::Optional(inner)) = expected
+            && matches!(expression.kind, ExprKind::Null)
+        {
+            return self.alloc_expression(
+                HirExprKind::Literal(HirLiteral::Null),
+                ScriptType::Optional(inner.clone()),
+                expression.span,
+            );
         }
         if let Some(ScriptType::List(element)) = expected
             && let ExprKind::List(values) = &expression.kind
@@ -3025,6 +3082,51 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         arguments: &[ScriptType],
         span: Span,
     ) -> Option<ScriptType> {
+        if let Some((parameters, variants)) = self.enums.get(name).cloned() {
+            if parameters.len() != arguments.len() {
+                self.error(
+                    format!(
+                        "enum `{name}` expects {} type arguments; provide an explicit type context",
+                        parameters.len()
+                    ),
+                    span,
+                );
+                return None;
+            }
+            if self.type_expansions.iter().any(|v| v == name) {
+                self.error("recursive enum payloads are not supported yet", span);
+                return None;
+            }
+            self.type_expansions.push(name.to_string());
+            self.type_parameters.push(
+                parameters
+                    .into_iter()
+                    .zip(arguments.iter().cloned())
+                    .collect(),
+            );
+            let mut payloads = BTreeMap::new();
+            for variant in variants {
+                let fields = variant
+                    .fields
+                    .iter()
+                    .filter_map(|field| self.type_from_ast(field))
+                    .collect();
+                payloads.insert(variant.name, fields);
+            }
+            self.type_parameters.pop();
+            self.type_expansions.pop();
+            // Preserve the native Option ABI while the optional bytecode
+            // operations are migrated to ordinary enum operations. The schema
+            // itself is owned by std, just like every other enum declaration.
+            if name == "Optional" {
+                return Some(ScriptType::Optional(Box::new(arguments[0].clone())));
+            }
+            return Some(ScriptType::Enum {
+                name: self.symbol(name),
+                arguments: arguments.to_vec(),
+                variants: payloads,
+            });
+        }
         let builtin = match name {
             "Any" => Some(ScriptType::Any),
             "Never" => Some(ScriptType::Never),
@@ -3049,7 +3151,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             return Some(builtin);
         }
-        if matches!(name, "List" | "Binding" | "Optional") {
+        if matches!(name, "List" | "Binding") {
             if arguments.len() != 1 {
                 self.error(
                     format!("type `{name}` expects exactly one type argument"),
@@ -3060,7 +3162,6 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             return Some(match name {
                 "List" => ScriptType::List(Box::new(arguments[0].clone())),
                 "Binding" => ScriptType::Binding(Box::new(arguments[0].clone())),
-                "Optional" => ScriptType::Optional(Box::new(arguments[0].clone())),
                 _ => unreachable!(),
             });
         }
@@ -3448,6 +3549,20 @@ fn infer_type_argument(
                 infer_type_argument(parameter, actual, substitutions);
             }
         }
+        (
+            ScriptType::Enum {
+                name, arguments, ..
+            },
+            ScriptType::Enum {
+                name: actual_name,
+                arguments: actuals,
+                ..
+            },
+        ) if name == actual_name => {
+            for (p, a) in arguments.iter().zip(actuals) {
+                infer_type_argument(p, a, substitutions);
+            }
+        }
         (ScriptType::TypeParameter(parameter), actual) => {
             substitutions
                 .entry(*parameter)
@@ -3517,6 +3632,29 @@ pub(crate) fn substitute_type(
             Box::new(substitute_type(key, substitutions)),
             Box::new(substitute_type(value, substitutions)),
         ),
+        ScriptType::Enum {
+            name,
+            arguments,
+            variants,
+        } => ScriptType::Enum {
+            name: *name,
+            arguments: arguments
+                .iter()
+                .map(|ty| substitute_type(ty, substitutions))
+                .collect(),
+            variants: variants
+                .iter()
+                .map(|(n, fields)| {
+                    (
+                        n.clone(),
+                        fields
+                            .iter()
+                            .map(|ty| substitute_type(ty, substitutions))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        },
         ScriptType::Struct {
             name,
             arguments,
@@ -3573,6 +3711,8 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::Return { span, .. } => *span,
         Stmt::Import { span, .. }
         | Stmt::TypeAlias { span, .. }
+        | Stmt::Struct { span, .. }
+        | Stmt::Enum { span, .. }
         | Stmt::Impl { span, .. }
         | Stmt::Property { span, .. }
         | Stmt::Const { span, .. }
@@ -3590,6 +3730,84 @@ fn statement_span(statement: &Stmt) -> Span {
 mod tests {
     use super::*;
     use crate::parse_program;
+
+    #[test]
+    fn standard_enums_require_payload_types_and_exhaustive_matches() {
+        for source in [
+            "let value: Result = .success(1)",
+            "let value: Result<Int, String> = .error(1)",
+            "let value: Optional<Int> = .some(\"alice\")",
+            "let value: Optional<Int> = .missing",
+            "let value: Int? = null\nwhen value { .some(n) -> n }",
+            "let value: Int? = null\nvalue ?: \"alice\"",
+            "enum Optional { custom }\nlet value: Optional = .custom",
+        ] {
+            let syntax = parse_program(source).expect("syntax parses");
+            let arena = HirArena::new();
+            assert!(lower_to_hir(&arena, &syntax, None).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn enum_construction_and_when_are_strictly_typed() {
+        for (tail, message) in [
+            ("let p: Packet<Int> = .data(\"wrong\")", "expected"),
+            ("let p: Packet<Int> = .data()", "payload"),
+            ("let p: Packet = .empty", "type arguments"),
+            ("let p: Packet<Int> = .missing", "variant"),
+            (
+                "let p: Packet<Int> = .empty\nwhen p { .empty -> 1 }",
+                "non-exhaustive",
+            ),
+            (
+                "let p: Packet<Int> = .empty\nwhen p { .empty -> 1\n.empty -> 2\n.data(x) -> x }",
+                "duplicate",
+            ),
+            (
+                "let p: Packet<Int> = .empty\nwhen p { .empty -> 1\n.data(x) -> \"bad\" }",
+                "same type",
+            ),
+            (
+                "let p: Packet<Int> = .empty\nwhen p { .empty -> 1\n.data(x,y) -> x }",
+                "bindings",
+            ),
+        ] {
+            let syntax = parse_program(&format!("enum Packet<T> {{ data(T), empty }}\n{tail}"))
+                .expect("parse");
+            let arena = HirArena::new();
+            let errors = lower_to_hir(&arena, &syntax, None).expect_err("must reject");
+            assert!(
+                errors.iter().any(|e| e.message.contains(message)),
+                "{tail}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nominal_struct_declarations_support_generics_and_methods() {
+        let source = r#"
+            struct Player<T> { name: T, score: Int }
+            struct Counter { score: Int }
+            impl Counter { fn increment(self) { self.score += 1 } }
+            let player: Player<String?> = .{ name: null, score: 12 }
+            let counter = Counter.{ score: 1 }
+            counter.increment()
+            player.name = "Alice"
+        "#;
+        let syntax = parse_program(source).expect("parse nominal structs");
+        assert!(matches!(syntax.statements[0], Stmt::Struct { .. }));
+        let arena = HirArena::new();
+        lower_to_hir(&arena, &syntax, None).expect("generic records and receiver lowering");
+        for source in [
+            "struct Alice { value: Int }\nstruct Bob { value: Int }\nlet a = Alice.{value:1}\nlet b: Bob = a",
+            "struct Player<T> { value: T }\nlet p: Player = .{value:1}",
+            "struct Player { value: Int }\nlet p = Player.{value:\"wrong\"}",
+        ] {
+            let syntax = parse_program(source).expect("parse invalid types");
+            let arena = HirArena::new();
+            assert!(lower_to_hir(&arena, &syntax, None).is_err(), "{source}");
+        }
+    }
 
     #[test]
     fn arena_hir_uses_recursive_member_references() {

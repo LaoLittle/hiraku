@@ -50,6 +50,20 @@ pub enum Stmt {
         wildcard: bool,
         span: Span,
     },
+    /// A nominal record declaration; unlike a transparent type alias its
+    /// identity is the declaring module and name.
+    Enum {
+        name: String,
+        type_parameters: Vec<String>,
+        variants: Vec<EnumVariant>,
+        span: Span,
+    },
+    Struct {
+        name: String,
+        type_parameters: Vec<String>,
+        ty: TypeExpr,
+        span: Span,
+    },
     TypeAlias {
         name: String,
         type_parameters: Vec<String>,
@@ -98,6 +112,21 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WhenArm {
+    pub variant: String,
+    pub bindings: Vec<String>,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub fields: Vec<TypeExpr>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +182,10 @@ pub struct Expr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
+    When {
+        value: Box<Expr>,
+        arms: Vec<WhenArm>,
+    },
     Unit,
     Null,
     Ellipsis,

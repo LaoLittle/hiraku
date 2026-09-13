@@ -19,6 +19,9 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
+    // Optional is also referenced by nullable syntax and native Option<T>
+    // signatures, which need not contain its source-level name.
+    needed.insert("Optional".to_string());
     let mut selected = std::collections::BTreeSet::new();
     let declared = source
         .statements
@@ -32,7 +35,9 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
         let mut changed = false;
         for (index, declaration) in core.statements.iter().enumerate() {
             let referenced = match declaration {
-                Stmt::TypeAlias { name, .. } => needed.contains(name),
+                Stmt::Enum { name, .. }
+                | Stmt::TypeAlias { name, .. }
+                | Stmt::Struct { name, .. } => needed.contains(name),
                 Stmt::Function { name, .. } => {
                     needed.contains(name) && !declared.contains(name.as_str())
                 }

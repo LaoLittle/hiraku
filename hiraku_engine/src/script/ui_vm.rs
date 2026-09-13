@@ -1211,7 +1211,45 @@ mod native_ui {
         Ok(node)
     }
 
-    #[hks(name = "animation", receiver)]
+    #[hks(name = "time", receiver)]
+    fn ui_time(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        seconds: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let spec = ui_animation_spec(context, node)?.with_time(seconds)?;
+        ui_animation(context, node, spec)
+    }
+    #[hks(name = "easing", receiver)]
+    fn ui_easing(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        easing: crate::script::animation::Easing,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let spec = ui_animation_spec(context, node)?.with_easing(easing)?;
+        ui_animation(context, node, spec)
+    }
+    #[hks(name = "repeatForever", receiver)]
+    fn ui_repeat_forever(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let spec = ui_animation_spec(context, node)?.repeat_forever();
+        ui_animation(context, node, spec)
+    }
+
+    fn ui_animation_spec(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+    ) -> Result<AnimationSpec, NativeError> {
+        let draft = context.node_mut(node)?;
+        Ok(draft
+            .phase_animation
+            .as_ref()
+            .map(|p| p.spec)
+            .or(draft.animation)
+            .unwrap_or(AnimationSpec::Linear(0.3, false)))
+    }
     fn ui_animation(
         context: &mut UiVmContext,
         node: UiNodeHandle,
@@ -1222,7 +1260,12 @@ mod native_ui {
                 "UI animation duration must be greater than zero",
             ));
         }
-        context.node_mut(node)?.animation = Some(animation);
+        let draft = context.node_mut(node)?;
+        if let Some(phase) = draft.phase_animation.as_mut() {
+            phase.spec = animation;
+        } else {
+            draft.animation = Some(animation);
+        }
         Ok(node)
     }
 
@@ -1232,8 +1275,8 @@ mod native_ui {
         context: &mut UiVmContext,
         node: UiNodeHandle,
         phases: Vec<AnimationPhase>,
-        animation: AnimationSpec,
     ) -> Result<UiNodeHandle, NativeError> {
+        let animation = ui_animation_spec(context, node)?;
         validate_phase_animation(&phases, animation)?;
         context.node_mut(node)?.phase_animation = Some(UiPhaseAnimation {
             phases,
@@ -1930,7 +1973,9 @@ impl UiComposition {
     pub(crate) fn models_changed(&self, models: &crate::ui::UiModels) -> bool {
         self.document.plan.structural_globals.iter().any(|name| {
             !self.document.owned_globals.contains(name)
-                && models.get(name).is_some_and(|value| self.values.story_value(name) != Some(value))
+                && models
+                    .get(name)
+                    .is_some_and(|value| self.values.story_value(name) != Some(value))
         })
     }
 
@@ -3318,7 +3363,7 @@ mod tests {
                 global var selected: Bool = true
                 canvas {
                     column { text("alice") }
-                        .hoverOffset(-84, 0, ${selected}).animation(.linear(0.2))
+                        .hoverOffset(-84, 0, ${selected}).time(0.2).easing(.linear)
                     column { text("bob") }.hoverOffset(-20, 0)
                 }
             "#,
@@ -4835,9 +4880,9 @@ canvas { choiceOptions(renderOption) }
             concat!(
                 "import ui.widgets.*\n",
                 "canvas {\n",
-                "  text(\"Pulse\").animation(.linear(2.0).repeatForever())\n",
+                "  text(\"Pulse\").time(2.0).easing(.cubicBezier(0.25, 0.1, 0.25, 1)).repeatForever()\n",
                 "  text(\"Spinner\").spin(1.5)\n",
-                "  text(\"Phases\").phaseAnimator([.rotation(0), .rotation(90)], .easeInOut(0.4).repeatForever())\n",
+                "  text(\"Phases\").phaseAnimator([.rotation(0), .rotation(90)]).time(0.4).easing(.easeInOut).repeatForever()\n",
                 "  text(\"Pulse\").pulse()\n",
                 "  text(\"Bob\").bob()\n",
                 "}",
@@ -4853,6 +4898,10 @@ canvas { choiceOptions(renderOption) }
         };
         let animation = text.layout.animation.expect("animation is retained");
         assert_eq!(animation.duration(), 2.0);
+        assert_eq!(
+            animation.easing(),
+            crate::script::animation::Easing::CubicBezier(0.25, 0.1, 0.25, 1.0)
+        );
         assert!(animation.repeats());
         let ScreenNode::Text(spinner) = &screen.children[1] else {
             panic!("second child should be text")

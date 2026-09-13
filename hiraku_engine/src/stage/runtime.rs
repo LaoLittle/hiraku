@@ -231,14 +231,10 @@ impl StageViewSnapshot {
 }
 
 fn valid_animation(animation: AnimationSpec) -> bool {
-    let (seconds, repeat) = match animation {
-        AnimationSpec::Linear(seconds, repeat)
-        | AnimationSpec::EaseIn(seconds, repeat)
-        | AnimationSpec::EaseOut(seconds, repeat)
-        | AnimationSpec::EaseOutSine(seconds, repeat)
-        | AnimationSpec::EaseInOutSine(seconds, repeat)
-        | AnimationSpec::EaseInOut(seconds, repeat) => (seconds, repeat),
-    };
+    let (seconds, repeat) = (animation.seconds(), animation.repeats());
+    if animation.easing().validate().is_err() {
+        return false;
+    }
     seconds.is_finite() && seconds >= 0.0 && seconds <= f32::MAX as f64 && !repeat
 }
 

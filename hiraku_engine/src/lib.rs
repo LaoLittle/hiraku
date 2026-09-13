@@ -681,7 +681,9 @@ fn runtime_not_initialized(frontend: Option<Res<scene::FrontendState>>) -> bool 
 #[derive(Resource, Default)]
 struct ProjectCanvasStatus(Option<bool>);
 
-fn project_canvas_ready(status: Res<ProjectCanvasStatus>) -> bool { status.0 == Some(true) }
+fn project_canvas_ready(status: Res<ProjectCanvasStatus>) -> bool {
+    status.0 == Some(true)
+}
 
 fn prepare_project_canvas(
     vfs: Res<VfsResource>,
@@ -689,15 +691,24 @@ fn prepare_project_canvas(
     mut config: ResMut<RuntimeLaunchConfig>,
     mut status: ResMut<ProjectCanvasStatus>,
 ) {
-    if status.0.is_some() { return; }
-    if config.asset_mode == RuntimeAssetMode::Hdp && !archives.is_ready() { return; }
+    if status.0.is_some() {
+        return;
+    }
+    if config.asset_mode == RuntimeAssetMode::Hdp && !archives.is_ready() {
+        return;
+    }
     match vfs.0.load_canvas_size() {
         Ok(size) => {
-            if let Some([width, height]) = size { config.canvas_size = UVec2::new(width, height); }
+            if let Some([width, height]) = size {
+                config.canvas_size = UVec2::new(width, height);
+            }
             status.0 = Some(true);
         }
         Err(error) => {
-            script::emit_script_diagnostic("failed to configure project canvas", &error.to_string());
+            script::emit_script_diagnostic(
+                "failed to configure project canvas",
+                &error.to_string(),
+            );
             status.0 = Some(false);
         }
     }
@@ -718,30 +729,58 @@ mod project_canvas_tests {
         ] {
             let store = HdpArchiveStore::default();
             let vfs = vfs::HdpVfs::new_with_config_and_store(
-                "unused-fixture-root", "hdp://fixture.hdp/settings.hson", "startup.hks", store.clone(),
+                "unused-fixture-root",
+                "hdp://fixture.hdp/settings.hson",
+                "startup.hks",
+                store.clone(),
             );
             let mut app = App::new();
             app.insert_resource(VfsResource(Arc::new(vfs)))
                 .insert_resource(store.clone())
-                .insert_resource(RuntimeLaunchConfig { canvas_size: UVec2::new(640, 480), ..default() })
+                .insert_resource(RuntimeLaunchConfig {
+                    canvas_size: UVec2::new(640, 480),
+                    ..default()
+                })
                 .init_resource::<ProjectCanvasStatus>()
                 .add_systems(Update, prepare_project_canvas)
-                .add_systems(Update, (|mut commands: Commands, config: Res<RuntimeLaunchConfig>| {
-                    commands.insert_resource(Observed(config.canvas_size));
-                }).after(prepare_project_canvas).run_if(project_canvas_ready));
+                .add_systems(
+                    Update,
+                    (|mut commands: Commands, config: Res<RuntimeLaunchConfig>| {
+                        commands.insert_resource(Observed(config.canvas_size));
+                    })
+                    .after(prepare_project_canvas)
+                    .run_if(project_canvas_ready),
+                );
             app.update();
-            assert!(!app.world().contains_resource::<Observed>(), "must wait for asynchronous package availability");
+            assert!(
+                !app.world().contains_resource::<Observed>(),
+                "must wait for asynchronous package availability"
+            );
             let mut package = hiraku_hdp::PackageBuilder::new();
-            package.add_file("settings.hson", settings.as_bytes()).expect("settings fixture");
-            let packed = package.build(hiraku_hdp::PackOptions::default()).expect("fixture package");
-            let archive = hiraku_hdp::Archive::from_bytes(Arc::<[u8]>::from(packed.volumes[0].clone())).expect("archive");
-            store.publish(Arc::new(archive), "fixture.hdp".into()).expect("publish");
+            package
+                .add_file("settings.hson", settings.as_bytes())
+                .expect("settings fixture");
+            let packed = package
+                .build(hiraku_hdp::PackOptions::default())
+                .expect("fixture package");
+            let archive =
+                hiraku_hdp::Archive::from_bytes(Arc::<[u8]>::from(packed.volumes[0].clone()))
+                    .expect("archive");
+            store
+                .publish(Arc::new(archive), "fixture.hdp".into())
+                .expect("publish");
             app.update();
-            assert_eq!(app.world().resource::<RuntimeLaunchConfig>().canvas_size, expected);
+            assert_eq!(
+                app.world().resource::<RuntimeLaunchConfig>().canvas_size,
+                expected
+            );
             if valid {
                 assert_eq!(app.world().resource::<Observed>().0, expected);
             } else {
-                assert!(!app.world().contains_resource::<Observed>(), "invalid configuration must not create a canvas");
+                assert!(
+                    !app.world().contains_resource::<Observed>(),
+                    "invalid configuration must not create a canvas"
+                );
             }
         }
     }

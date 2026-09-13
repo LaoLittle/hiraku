@@ -46,7 +46,11 @@ impl UiContext {
     }
 
     pub(crate) fn update_models(&mut self, models: &crate::ui::UiModels) {
-        self.story.extend(models.roots().map(|(name, value)| (name.to_owned(), value.clone())));
+        self.story.extend(
+            models
+                .roots()
+                .map(|(name, value)| (name.to_owned(), value.clone())),
+        );
     }
 
     pub(crate) fn expand(&self, input: &str) -> Result<String, UiContextError> {

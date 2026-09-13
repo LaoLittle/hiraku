@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 18;
+pub const BYTECODE_VERSION: u16 = 19;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -137,6 +137,23 @@ pub enum Instruction {
     },
     MakeList {
         dst: Register,
+        values: RegisterSlice,
+    },
+    IsVariant {
+        dst: Register,
+        value: Register,
+        type_name: SymbolId,
+        variant: SymbolId,
+    },
+    VariantField {
+        dst: Register,
+        value: Register,
+        index: u32,
+    },
+    MakeVariant {
+        dst: Register,
+        type_name: SymbolId,
+        variant: SymbolId,
         values: RegisterSlice,
     },
     MakeMap {
@@ -578,6 +595,45 @@ fn emit_function(
                     max_window = max_window.max(values.len());
                     Instruction::MakeList {
                         dst: register(*dst),
+                        values: slice,
+                    }
+                }
+                MirInstruction::Move { dst, src } => Instruction::Move {
+                    dst: register(*dst),
+                    src: register(*src),
+                },
+                MirInstruction::IsVariant {
+                    dst,
+                    value,
+                    type_name,
+                    variant,
+                } => Instruction::IsVariant {
+                    dst: register(*dst),
+                    value: register(*value),
+                    type_name: *type_name,
+                    variant: *variant,
+                },
+                MirInstruction::VariantField { dst, value, index } => Instruction::VariantField {
+                    dst: register(*dst),
+                    value: register(*value),
+                    index: *index,
+                },
+                MirInstruction::MakeVariant {
+                    dst,
+                    type_name,
+                    variant,
+                    values,
+                } => {
+                    let slice = emit_register_window(
+                        &mut emitted,
+                        allocation.register_count,
+                        values.iter().map(|value| register(*value)),
+                    )?;
+                    max_window = max_window.max(values.len());
+                    Instruction::MakeVariant {
+                        dst: register(*dst),
+                        type_name: *type_name,
+                        variant: *variant,
                         values: slice,
                     }
                 }
@@ -1277,6 +1333,67 @@ impl Vm {
                 Instruction::MakeList { dst, values } => {
                     let values = self.read_slice(values)?;
                     self.write(dst, Value::List(values))?;
+                }
+                Instruction::IsVariant {
+                    dst,
+                    value,
+                    type_name,
+                    variant,
+                } => {
+                    let tag = self.symbol(variant)?;
+                    let matches = match self.read(value)? {
+                        Value::Optional(payload) if self.symbol(type_name)? == "Optional" => {
+                            if payload.is_some() {
+                                tag == "some"
+                            } else {
+                                tag == "none"
+                            }
+                        }
+                        Value::Null if self.symbol(type_name)? == "Optional" => tag == "none",
+                        Value::Typed { type_id, value } => {
+                            *type_id == type_name
+                                && matches!(value.as_ref(), Value::Tuple(fields) if matches!(fields.first(), Some(Value::Symbol(name)) if name == tag))
+                        }
+                        _ => false,
+                    };
+                    self.write(dst, Value::Bool(matches))?;
+                }
+                Instruction::VariantField { dst, value, index } => {
+                    if let Value::Optional(Some(payload)) = self.read(value)? {
+                        if index != 0 {
+                            return Err(VmError::TypeMismatch("invalid enum payload index"));
+                        }
+                        let field = payload.as_ref().clone();
+                        self.write(dst, field)?;
+                        continue;
+                    }
+                    let Value::Typed { value, .. } = self.read(value)? else {
+                        return Err(VmError::TypeMismatch("expected enum value"));
+                    };
+                    let Value::Tuple(fields) = value.as_ref() else {
+                        return Err(VmError::TypeMismatch("expected enum payload"));
+                    };
+                    let field = fields
+                        .get(index as usize + 1)
+                        .ok_or(VmError::TypeMismatch("invalid enum payload index"))?
+                        .clone();
+                    self.write(dst, field)?;
+                }
+                Instruction::MakeVariant {
+                    dst,
+                    type_name,
+                    variant,
+                    values,
+                } => {
+                    let mut payload = vec![Value::Symbol(self.symbol(variant)?.to_string())];
+                    payload.extend(self.read_slice(values)?);
+                    self.write(
+                        dst,
+                        Value::Typed {
+                            type_id: type_name,
+                            value: Box::new(Value::Tuple(payload)),
+                        },
+                    )?;
                 }
                 Instruction::MakeMap {
                     dst,
@@ -2186,6 +2303,26 @@ fn argument_matches(
         (T::Function | T::Callable { .. }, Value::Function { .. } | Value::Closure { .. })
         | (T::Binding(_), Value::Closure { .. })
         | (T::Named(_), Value::Handle { .. } | Value::Typed { .. }) => true,
+        (T::Enum { name, variants, .. }, Value::Typed { type_id, value }) if name == type_id => {
+            let Value::Tuple(fields) = value.as_ref() else {
+                return Ok(false);
+            };
+            let Some(Value::Symbol(tag)) = fields.first() else {
+                return Ok(false);
+            };
+            let Some(types) = variants.get(tag) else {
+                return Ok(false);
+            };
+            if types.len() + 1 != fields.len() {
+                return Ok(false);
+            }
+            for (value, ty) in fields[1..].iter().zip(types) {
+                if !argument_matches(value, ty, heap)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
         (T::Struct { fields, .. }, Value::Typed { value, .. }) => {
             argument_matches(value, &T::Record(fields.clone()), heap)?
         }
@@ -2260,6 +2397,34 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
         ScriptType::Named(expected) => match value {
             Value::Typed { type_id, .. } if type_id == expected => Ok(value.clone()),
             Value::Handle { type_id, .. } if *type_id == expected.0 => Ok(value.clone()),
+            _ => Err(mismatch()),
+        },
+        ScriptType::Enum { name, variants, .. } => match value {
+            Value::Typed {
+                type_id,
+                value: payload,
+            } if name == type_id => {
+                let Value::Tuple(fields) = payload.as_ref() else {
+                    return Err(mismatch());
+                };
+                let Some(Value::Symbol(tag)) = fields.first() else {
+                    return Err(mismatch());
+                };
+                let Some(types) = variants.get(tag) else {
+                    return Err(mismatch());
+                };
+                if types.len() + 1 != fields.len() {
+                    return Err(mismatch());
+                }
+                let mut values = vec![Value::Symbol(tag.clone())];
+                for (value, ty) in fields[1..].iter().zip(types) {
+                    values.push(cast_value(value, ty)?);
+                }
+                Ok(Value::Typed {
+                    type_id: *name,
+                    value: Box::new(Value::Tuple(values)),
+                })
+            }
             _ => Err(mismatch()),
         },
         ScriptType::Struct { name, fields, .. } => match value {
@@ -2449,6 +2614,145 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn std_result_and_nullable_share_typed_match_and_restore() {
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            fn wrap<T>(value: T) -> Result<T, String> { .success(value) }
+            let optional: Int? = Optional.some<Int>(42)
+            let result: Result<Optional<Int>, String> = wrap(optional)
+            global var answer = when result {
+                .success(value) -> when value {
+                    .some(number) -> { checkpoint(); number }
+                    .none -> 0
+                }
+                .error(message) -> -1
+            }
+            let failed: Result<Int, String> = .error("alice")
+            global var label = when failed {
+                .success(value) -> "bob"
+                .error(message) -> message
+            }
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("initialize");
+        let mut restored = false;
+        for _ in 0..2000 {
+            match vm.step().expect("execute") {
+                Some(VmEvent::Call(_)) => {
+                    vm = Vm::restore(code.clone(), vm.snapshot()).expect("restore");
+                    vm.resume(Value::Unit).expect("resume");
+                    restored = true;
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert!(restored);
+        assert_eq!(vm.global("answer"), Some(&Value::Number(42.0)));
+        assert_eq!(vm.global("label"), Some(&Value::String("alice".into())));
+    }
+
+    #[test]
+    fn std_optional_match_fallback_is_lazy() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile(
+            r#"
+            global var calls=0
+            fn fallback() -> Int { calls+=1; 7 }
+            let nested: Optional<Optional<Int>> = .some(.none)
+            global var result = when nested {
+                .some(inner) -> when inner {
+                    .some(value) -> value
+                    .none -> fallback()
+                }
+                .none -> fallback()
+            }
+            let present: Optional<Int> = .some(42)
+            global var lazy = present ?: fallback()
+            let absent: Int? = null
+            global var absentValue = absent ?: fallback()
+            global var second: Float = when present {
+                .some(value) -> 2
+                .none -> 3
+            }
+            global var preserved = when present {
+                .some(value) -> value
+                .none -> fallback()
+            }
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code).expect("initialize");
+        let mut completed = false;
+        for _ in 0..2000 {
+            if matches!(vm.step().expect("execute"), Some(VmEvent::Completed(_))) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(vm.global("calls"), Some(&Value::Number(2.0)));
+        assert_eq!(vm.global("lazy"), Some(&Value::Number(42.0)));
+        assert_eq!(vm.global("absentValue"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("result"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("preserved"), Some(&Value::Number(42.0)));
+        assert_eq!(vm.global("second"), Some(&Value::Number(2.0)));
+    }
+
+    #[test]
+    fn enum_when_evaluates_subject_once_and_restores_payload_scope() {
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            enum Packet<T> { data(T), empty }
+            global var calls=0
+            fn identity<T>(value: Packet<T>) -> Packet<T> { value }
+            fn subject() -> Packet<Int> {
+                calls += 1
+                return .data(42)
+            }
+            global var result = when identity(subject()) {
+                .data(item) -> {
+                    let capture = { item }
+                    checkpoint()
+                    capture()
+                }
+                .empty -> { 0 }
+            }
+            global var fallback = when Packet.empty<Int>() {
+                .data(item) -> item
+                .empty -> 7
+            }
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("initialize");
+        for _ in 0..1000 {
+            if matches!(vm.step().expect("execute"), Some(VmEvent::Call(_))) {
+                break;
+            }
+        }
+        assert_eq!(vm.global("calls"), Some(&Value::Number(1.0)));
+        let snapshot = crate::hson::to_string(&vm.snapshot()).expect("snapshot");
+        let mut vm =
+            Vm::restore(code, crate::hson::from_str(&snapshot).expect("decode")).expect("restore");
+        vm.resume(Value::Unit).expect("resume");
+        let mut completed = false;
+        for _ in 0..1000 {
+            if matches!(vm.step().expect("finish"), Some(VmEvent::Completed(_))) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(vm.global("result"), Some(&Value::Number(42.0)));
+        assert_eq!(vm.global("fallback"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("calls"), Some(&Value::Number(1.0)));
     }
 
     #[test]
@@ -3663,11 +3967,11 @@ mod tests {
     }
 
     #[test]
-    fn objects_keep_identity_across_aliases_calls_closures_and_restore() {
+    fn nominal_structs_keep_identity_across_aliases_calls_closures_and_restore() {
         let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
         let bytecode = compile(
             r#"
-            type Player = .{ score: Int }
+            struct Player { score: Int }
             impl Player { fn add(self, n: Int) { self.score += n } }
             global var player = Player.{ score: 1 }
             let alias = player

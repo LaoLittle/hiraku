@@ -1054,30 +1054,7 @@ fn interpolate_character_position(
 }
 
 pub(crate) fn apply_character_ease(ease: CharacterEase, t: f32) -> f32 {
-    match ease {
-        CharacterEase::EaseOutSine => (t * std::f32::consts::FRAC_PI_2).sin(),
-        CharacterEase::EaseInOutSine => (1.0 - (t * std::f32::consts::PI).cos()) * 0.5,
-        CharacterEase::Linear => t,
-        CharacterEase::Ease | CharacterEase::EaseInOut => t * t * (3.0 - 2.0 * t),
-        CharacterEase::EaseIn => t * t,
-        CharacterEase::EaseOut => 1.0 - (1.0 - t) * (1.0 - t),
-        CharacterEase::Bounce => {
-            let n1 = 7.5625;
-            let d1 = 2.75;
-            if t < 1.0 / d1 {
-                n1 * t * t
-            } else if t < 2.0 / d1 {
-                let t = t - 1.5 / d1;
-                n1 * t * t + 0.75
-            } else if t < 2.5 / d1 {
-                let t = t - 2.25 / d1;
-                n1 * t * t + 0.9375
-            } else {
-                let t = t - 2.625 / d1;
-                n1 * t * t + 0.984375
-            }
-        }
-    }
+    ease.sample(t)
 }
 
 pub(super) fn character_part_prefix(actor_id: &str) -> String {
@@ -1457,6 +1434,7 @@ mod tests {
                 ActorMotion::new(
                     1,
                     ActorOffset {
+                        oscillation: None,
                         target: [0.0, 20.0],
                         animation: crate::script::AnimationSpec::Linear(1.0, false),
                     },

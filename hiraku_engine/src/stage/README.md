@@ -50,7 +50,7 @@ let trial = stage.open("stages/trial.stage.hson")
 let alice = char("alice")
 trial.place(alice, "alice")
 alice.at(.pos(0, 0)).scale(1).show()
-trial.camera("wide").animation(.easeOut(1.2)).await()
+trial.camera("wide").time(1.2).easing(.easeOut).await()
 scene.hideCharacters(0).await()
 trial.close()
 ```
@@ -91,9 +91,9 @@ View entities and image handles are released when the stage closes or changes.
 ```hks
 trial.camera("wide").track("main").await()
 trial.camera("closeup").track("overlay").await()
-trial.camera("closeupEnd").track("overlay").animation(.easeOutSine(4))
-trial.showView("overlay").animation(.linear(0.35)).await()
-trial.hideView("overlay").animation(.linear(0.35)).await()
+trial.camera("closeupEnd").track("overlay").time(4).easing(.easeOutSine)
+trial.showView("overlay").time(0.35).easing(.linear).await()
+trial.hideView("overlay").time(0.35).easing(.linear).await()
 ```
 
 `main` starts visible. Other views start hidden; their order is their creation

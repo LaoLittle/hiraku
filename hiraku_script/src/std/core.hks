@@ -1,5 +1,15 @@
 type Unit = ()
 
+enum Optional<T> {
+    some(T),
+    none,
+}
+
+enum Result<T, E> {
+    success(T),
+    error(E),
+}
+
 @trackCaller
 fn panic(message: String) -> Never { __builtin_panic(message) }
 @trackCaller

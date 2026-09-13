@@ -636,13 +636,24 @@ mod tests {
         assert_eq!(shade.blend, CharacterBlendMode::Multiply);
         assert_eq!(shade.color, [255, 128, 64, 96]);
 
-        let loose = source.replace("path: \"alice.png\", slot: \"shade\"", "path: \"bob.png\", slot: \"shade\"");
+        let loose = source.replace(
+            "path: \"alice.png\", slot: \"shade\"",
+            "path: \"bob.png\", slot: \"shade\"",
+        );
         let config = parse_hks_data("characters/alice.char.hson", &loose).expect("loose config");
         let alice = character_definition_from_config(
-            &vfs, &TextureCatalog::default(), "alice".into(), "characters".into(),
-            "characters/alice.char.hson".into(), config,
-        ).expect("loose character");
-        assert!(alice.parts.iter().all(|part| part.pack_source), "load policy is stable across expression subsets");
+            &vfs,
+            &TextureCatalog::default(),
+            "alice".into(),
+            "characters".into(),
+            "characters/alice.char.hson".into(),
+            config,
+        )
+        .expect("loose character");
+        assert!(
+            alice.parts.iter().all(|part| part.pack_source),
+            "load policy is stable across expression subsets"
+        );
     }
 
     #[test]

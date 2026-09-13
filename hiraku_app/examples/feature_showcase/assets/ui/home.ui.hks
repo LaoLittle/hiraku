@@ -6,9 +6,8 @@ screen {
     column {
         text("Hiraku Feature Showcase")
             .phaseAnimator(
-                [.rotation(-2), .rotation(2)],
-                .easeInOut(0.7).repeatForever()
-            )
+                [.rotation(-2), .rotation(2)]
+            ).time(0.7).easing(.easeInOut).repeatForever()
 
         text("Glossary entries are project-owned HSON data:")
         row {

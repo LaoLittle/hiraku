@@ -11,14 +11,14 @@ use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, ren
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::script::animation::{AnimationSpec, register_animation_api};
+use crate::script::animation::{AnimationSpec, Easing, register_animation_api};
 use crate::script::navigation::{NavigationOptions, NavigationRequest, NavigationResetValue};
 use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
+mod movie;
 mod scene_visuals;
 mod sound;
-mod movie;
 mod spatial_stage;
 
 /// Engine-facing effects produced by HKS native functions.
@@ -26,7 +26,10 @@ mod spatial_stage;
 /// Engine code dispatches these effects directly to ECS-facing systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
-    MovieBackground { path: String, fade_out_ms: u64 },
+    MovieBackground {
+        path: String,
+        fade_out_ms: u64,
+    },
     StopMovie,
     Spatial(crate::stage::runtime::StageCommand),
     ActorMotion {
@@ -48,8 +51,13 @@ pub enum StoryEffect {
         actor_id: Option<String>,
         fade_ms: u64,
     },
-    StopBgm { fade_ms: u64 },
-    StopSfxChannel { channel: String, fade_ms: u64 },
+    StopBgm {
+        fade_ms: u64,
+    },
+    StopSfxChannel {
+        channel: String,
+        fade_ms: u64,
+    },
     PlaySfxChannel {
         channel: String,
         path: String,
@@ -119,7 +127,7 @@ pub enum StoryEffect {
         projection: Option<CameraProjectionMode>,
         scope: CameraEffectScope,
         duration_ms: u64,
-        ease: String,
+        ease: Easing,
     },
     ShowCharacter {
         rotation: f32,
@@ -291,8 +299,6 @@ fn registry() -> NativeRegistry<CharacterContext> {
         .expect("Position API registration must be internally consistent");
     CameraScope::register_hks(&mut registry)
         .expect("CameraScope API registration must be internally consistent");
-    CameraEase::register_hks(&mut registry)
-        .expect("CameraEase API registration must be internally consistent");
     CameraProjection::register_hks(&mut registry)
         .expect("CameraProjection API registration must be internally consistent");
     register_animation_api(&mut registry)
@@ -899,7 +905,7 @@ struct PendingCamera {
     projection: Option<CameraProjectionMode>,
     scope: CameraEffectScope,
     duration_ms: u64,
-    ease: String,
+    ease: Easing,
 }
 
 #[derive(Default)]
@@ -1028,7 +1034,7 @@ impl CharacterContext {
                     CameraScope::Canvas => CameraEffectScope::Canvas,
                 },
                 duration_ms: 0,
-                ease: "linear".to_string(),
+                ease: Easing::Linear,
             },
         );
         CameraHandle(handle)
@@ -1215,34 +1221,6 @@ impl CameraScope {
 
     #[getter]
     fn canvas() -> CameraScope { Self::Canvas }
-}
-}
-
-hiraku_script::hks_define! {
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum CameraEase {
-    Linear,
-    Ease,
-    EaseIn,
-    EaseOut,
-    EaseInOut,
-    Bounce,
-}
-
-#[allow(non_snake_case)]
-impl CameraEase {
-    #[getter]
-    fn linear() -> CameraEase { Self::Linear }
-    #[getter]
-    fn ease() -> CameraEase { Self::Ease }
-    #[getter]
-    fn easeIn() -> CameraEase { Self::EaseIn }
-    #[getter]
-    fn easeOut() -> CameraEase { Self::EaseOut }
-    #[getter]
-    fn easeInOut() -> CameraEase { Self::EaseInOut }
-    #[getter]
-    fn bounce() -> CameraEase { Self::Bounce }
 }
 }
 
@@ -1486,6 +1464,7 @@ mod native_api {
             ));
         };
         let transition = super::super::actor_motion::ActorOffset {
+            oscillation: None,
             target: [x as f32, y as f32],
             animation: AnimationSpec::EaseOut(0.3, false),
         };
@@ -1494,6 +1473,36 @@ mod native_api {
             .actor_mut(handle)
             .map_err(|e| NativeError::message(e.to_string()))?;
         actor.pending_offset = Some(transition);
+        Ok(ActorHandle(handle))
+    }
+
+    /// Add a transient two-axis wave to placement, sampled with story time.
+    #[hks(name = "oscillate", selector = "Actor", receiver)]
+    fn native_actor_oscillate(
+        context: &mut CharacterContext,
+        ActorHandle(handle): ActorHandle,
+        amplitude: Position,
+        period_x: f64,
+        period_y: f64,
+    ) -> Result<ActorHandle, NativeError> {
+        let Position::Absolute(x, y) = amplitude else {
+            return Err(NativeError::message(
+                "oscillation amplitude uses .pos(x, y) canvas units",
+            ));
+        };
+        let transition = super::super::actor_motion::ActorOffset {
+            target: [0.0; 2],
+            animation: AnimationSpec::Linear(0.3, false),
+            oscillation: Some(super::super::actor_motion::ActorOscillation {
+                amplitude: [x as f32, y as f32],
+                period: [period_x as f32, period_y as f32],
+            }),
+        };
+        transition.validate().map_err(NativeError::message)?;
+        context
+            .actor_mut(handle)
+            .map_err(|e| NativeError::message(e.to_string()))?
+            .pending_offset = Some(transition);
         Ok(ActorHandle(handle))
     }
 
@@ -1514,7 +1523,37 @@ mod native_api {
         Ok(actor)
     }
 
-    #[hks(name = "animation", selector = "Actor", receiver)]
+    #[hks(name = "time", selector = "Actor", receiver)]
+    fn actor_time(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        seconds: f64,
+    ) -> Result<ActorHandle, NativeError> {
+        let spec = actor_animation_spec(context, actor)?.with_time(seconds)?;
+        native_actor_animation(context, actor, spec)
+    }
+    #[hks(name = "easing", selector = "Actor", receiver)]
+    fn actor_easing(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+        easing: Easing,
+    ) -> Result<ActorHandle, NativeError> {
+        let spec = actor_animation_spec(context, actor)?.with_easing(easing)?;
+        native_actor_animation(context, actor, spec)
+    }
+    fn actor_animation_spec(
+        context: &mut CharacterContext,
+        actor: ActorHandle,
+    ) -> Result<AnimationSpec, NativeError> {
+        let actor = context
+            .actor_mut(actor.0)
+            .map_err(|e| NativeError::message(e.to_string()))?;
+        Ok(actor
+            .pending_offset
+            .map(|v| v.animation)
+            .or(actor.placement_animation)
+            .unwrap_or(AnimationSpec::EaseOut(0.3, false)))
+    }
     fn native_actor_animation(
         context: &mut CharacterContext,
         ActorHandle(handle): ActorHandle,
@@ -1525,6 +1564,7 @@ mod native_api {
             .map_err(|e| NativeError::message(e.to_string()))?;
         let Some(transition) = actor.pending_offset.as_mut() else {
             let validation = super::super::actor_motion::ActorOffset {
+                oscillation: None,
                 target: [0.0; 2],
                 animation,
             };
@@ -1826,11 +1866,7 @@ mod native_api {
         CameraHandle(handle): CameraHandle,
         seconds: f64,
     ) -> Result<CameraHandle, NativeError> {
-        if !seconds.is_finite() || seconds < 0.0 {
-            return Err(NativeError::message(
-                "camera animation time must be non-negative",
-            ));
-        }
+        AnimationSpec::Linear(0.0, false).with_time(seconds)?;
         context.camera_mut(handle)?.duration_ms = (seconds * 1000.0).round() as u64;
         Ok(CameraHandle(handle))
     }
@@ -1839,42 +1875,10 @@ mod native_api {
     fn native_camera_easing(
         context: &mut CharacterContext,
         CameraHandle(handle): CameraHandle,
-        easing: CameraEase,
+        easing: Easing,
     ) -> Result<CameraHandle, NativeError> {
-        context.camera_mut(handle)?.ease = match easing {
-            CameraEase::Linear => "linear",
-            CameraEase::Ease => "ease",
-            CameraEase::EaseIn => "easeIn",
-            CameraEase::EaseOut => "easeOut",
-            CameraEase::EaseInOut => "easeInOut",
-            CameraEase::Bounce => "bounce",
-        }
-        .to_string();
-        Ok(CameraHandle(handle))
-    }
-
-    #[hks(name = "animation", receiver)]
-    fn native_camera_animation(
-        context: &mut CharacterContext,
-        CameraHandle(handle): CameraHandle,
-        animation: AnimationSpec,
-    ) -> Result<CameraHandle, NativeError> {
-        if animation.repeats() {
-            return Err(NativeError::message(
-                "camera command animations must complete; repeatForever is only valid for persistent timelines",
-            ));
-        }
-        let pending = context.camera_mut(handle)?;
-        pending.duration_ms = (animation.duration() * 1000.0).round() as u64;
-        pending.ease = match animation {
-            AnimationSpec::Linear(..) => "linear",
-            AnimationSpec::EaseIn(..) => "easeIn",
-            AnimationSpec::EaseOut(..) => "easeOut",
-            AnimationSpec::EaseOutSine(..) => "easeOutSine",
-            AnimationSpec::EaseInOutSine(..) => "easeInOutSine",
-            AnimationSpec::EaseInOut(..) => "easeInOut",
-        }
-        .to_string();
+        easing.validate()?;
+        context.camera_mut(handle)?.ease = easing;
         Ok(CameraHandle(handle))
     }
 
@@ -1969,7 +1973,6 @@ mod native_api {
         }
         Ok(Value::Unit)
     }
-
 }
 
 #[hiraku_script::hks_module("story")]
@@ -2394,7 +2397,7 @@ not_actor.at(.left)"#,
     fn camera_consumes_the_shared_animation_spec() {
         compile_story_bytecode(
             "animation.hks",
-            "camera().zoom(1.2).animation(.easeInOut(0.5))",
+            "camera().zoom(1.2).time(0.5).easing(.easeInOut)",
         )
         .expect("camera animation spec should type-check");
         compile_story_bytecode(

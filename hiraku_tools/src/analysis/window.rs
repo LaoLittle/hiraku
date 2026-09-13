@@ -42,6 +42,8 @@ fn sequence(
             stmt,
             Stmt::Import { .. }
                 | Stmt::TypeAlias { .. }
+                | Stmt::Struct { .. }
+                | Stmt::Enum { .. }
                 | Stmt::Impl { .. }
                 | Stmt::Property { .. }
         ) {
@@ -129,6 +131,8 @@ fn span(stmt: &Stmt) -> [usize; 2] {
         | Stmt::Impl { span, .. }
         | Stmt::Import { span, .. }
         | Stmt::TypeAlias { span, .. }
+        | Stmt::Struct { span, .. }
+        | Stmt::Enum { span, .. }
         | Stmt::Function { span, .. }
         | Stmt::Let { span, .. }
         | Stmt::Global { span, .. }
@@ -141,6 +145,13 @@ fn span(stmt: &Stmt) -> [usize; 2] {
 
 fn prune(expr: &mut Expr, closures: &mut Vec<Block>) {
     match &mut expr.kind {
+        ExprKind::When { value, arms } => {
+            prune(value, closures);
+            for arm in arms {
+                closures.push(arm.body.clone());
+                arm.body.statements.clear();
+            }
+        }
         ExprKind::Lambda { body, .. } | ExprKind::Block(body) => {
             closures.push(body.clone());
             body.statements.clear();

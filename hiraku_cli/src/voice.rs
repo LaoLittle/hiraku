@@ -176,7 +176,11 @@ impl Collector<'_> {
 
     fn nested(&mut self, statement: &Stmt) {
         match statement {
-            Stmt::Import { .. } | Stmt::TypeAlias { .. } | Stmt::Const { .. } => {}
+            Stmt::Import { .. }
+            | Stmt::TypeAlias { .. }
+            | Stmt::Struct { .. }
+            | Stmt::Enum { .. }
+            | Stmt::Const { .. } => {}
             Stmt::Impl { methods, .. } => {
                 for method in methods {
                     self.nested(method);
@@ -218,6 +222,12 @@ impl Collector<'_> {
 
     fn expression(&mut self, expression: &Expr) {
         match &expression.kind {
+            ExprKind::When { value, arms } => {
+                self.expression(value);
+                for arm in arms {
+                    self.block(&arm.body);
+                }
+            }
             ExprKind::Call {
                 callee,
                 arguments,
@@ -361,7 +371,10 @@ fn string_argument(argument: &hiraku_script::Argument) -> Option<String> {
 
 fn statement_span(statement: &Stmt) -> &Span {
     match statement {
-        Stmt::Import { span, .. } | Stmt::TypeAlias { span, .. } => span,
+        Stmt::Import { span, .. }
+        | Stmt::TypeAlias { span, .. }
+        | Stmt::Struct { span, .. }
+        | Stmt::Enum { span, .. } => span,
         Stmt::Function { span, .. }
         | Stmt::Return { span, .. }
         | Stmt::Const { span, .. }

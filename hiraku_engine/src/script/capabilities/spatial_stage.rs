@@ -23,7 +23,7 @@ mod tests {
             r#"
             let room = stage.open("room.stage.hson")
             room.place(char("alice"), "desk")
-            room.camera("closeup").animation(.easeOut(0.5)).await()
+            room.camera("closeup").time(0.5).easing(.easeOut).await()
             room.close()
         "#,
         )
@@ -190,25 +190,5 @@ mod api {
         // Resolve anchor errors before allowing the next statement to continue.
         context.await_effects = true;
         Ok(())
-    }
-
-    #[hks(name = "time", selector = "SceneTransition", receiver)]
-    fn time(
-        context: &mut CharacterContext,
-        handle: SceneTransitionHandle,
-        seconds: f64,
-    ) -> Result<SceneTransitionHandle, NativeError> {
-        if !seconds.is_finite() || seconds < 0.0 || seconds > f32::MAX as f64 {
-            return Err(NativeError::message("invalid stage camera duration"));
-        }
-        let Some((SceneVisualTarget::Spatial(StageCommand::Camera { animation, .. }), _)) =
-            context.scene_visuals.pending.get_mut(&handle.0)
-        else {
-            return Err(NativeError::message(
-                "time requires an uncommitted stage camera transition",
-            ));
-        };
-        *animation = crate::script::animation::AnimationSpec::Linear(seconds, false);
-        Ok(handle)
     }
 }

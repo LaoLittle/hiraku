@@ -1,6 +1,6 @@
 //! Runtime linking for symbolic register bytecode calls.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
@@ -50,6 +50,25 @@ pub struct LinkError {
     pub message: String,
 }
 
+/// Host-owned grants. Deliberately not serializable: restore must re-authorize.
+#[derive(Clone, Debug, Default)]
+pub struct LinkPolicy {
+    grants: BTreeMap<ModuleId, BTreeSet<String>>,
+}
+impl LinkPolicy {
+    pub fn grant(&mut self, module: ModuleId, capability: impl Into<String>) {
+        self.grants
+            .entry(module)
+            .or_default()
+            .insert(capability.into());
+    }
+    pub fn allows(&self, module: ModuleId, capability: &str) -> bool {
+        self.grants
+            .get(&module)
+            .is_some_and(|grants| grants.contains(capability))
+    }
+}
+
 pub fn link_bytecode(
     bytecode: Bytecode,
     natives: &BuiltinManifest,
@@ -74,6 +93,15 @@ pub fn link_named_modules(
     modules: Vec<(Option<String>, Bytecode)>,
     natives: &BuiltinManifest,
 ) -> Result<LinkedProgram, Vec<LinkError>> {
+    link_named_modules_with_policy(modules, natives, &LinkPolicy::default())
+}
+
+/// Authorization is checked against each function's defining module, not its caller.
+pub fn link_named_modules_with_policy(
+    modules: Vec<(Option<String>, Bytecode)>,
+    natives: &BuiltinManifest,
+    policy: &LinkPolicy,
+) -> Result<LinkedProgram, Vec<LinkError>> {
     let mut exports = BTreeMap::<String, LinkedFunction>::new();
     let manifests = modules
         .iter()
@@ -94,6 +122,22 @@ pub fn link_named_modules(
     for (module_index, (namespace, module)) in modules.iter().enumerate() {
         let module_id = ModuleId(module_index as u32);
         for (function_index, function) in module.functions.iter().enumerate() {
+            let local_name = module.symbols.resolve(function.name).unwrap_or("");
+            let qualified = namespace
+                .as_ref()
+                .map(|ns| format!("{ns}.{local_name}"))
+                .unwrap_or_else(|| local_name.to_string());
+            if qualified == "intrinsics"
+                || qualified.starts_with("intrinsics.")
+                || local_name.starts_with("intrinsics.")
+            {
+                errors.push(LinkError {
+                    module: module_id,
+                    symbol: Some(function.name),
+                    message: "the intrinsics namespace is reserved for host-provided functions"
+                        .into(),
+                });
+            }
             if !function.exported {
                 continue;
             }
@@ -159,6 +203,24 @@ pub fn link_named_modules(
                     .flat_map(|region| &region.instructions),
             )
         {
+            // A direct intrinsic reference could otherwise escape through a returned
+            // function value. Standard modules must export script wrappers instead.
+            if let Instruction::Constant {
+                value: crate::vm::Constant::Function(symbol),
+                ..
+            } = instruction
+            {
+                if let Some(name) = bytecode.symbols.resolve(*symbol) {
+                    if let Some((_, builtin)) = natives
+                        .callable_name_candidates()
+                        .find(|(candidate, _)| candidate == name)
+                    {
+                        if natives.required_capability(builtin).is_some() {
+                            errors.push(LinkError {module: module_id, symbol: Some(*symbol), message: format!("restricted intrinsic `{name}` cannot be used as a function value; export a script wrapper")});
+                        }
+                    }
+                }
+            }
             let Instruction::Call {
                 function,
                 arguments,
@@ -199,6 +261,20 @@ pub fn link_named_modules(
                 });
             match target {
                 Some(target) => {
+                    if let LinkedFunction::Native(builtin) = target {
+                        if let Some(capability) = natives.required_capability(builtin) {
+                            if !policy.allows(module_id, capability) {
+                                errors.push(LinkError {
+                                    module: module_id,
+                                    symbol: Some(*function),
+                                    message: format!(
+                                        "call to `{name}` requires capability `{capability}`"
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     if let LinkedFunction::Script {
                         module,
                         function: index,
@@ -297,6 +373,29 @@ fn canonical_type(
         T::TypeParameter(id) => {
             T::TypeParameter(symbols.intern(format!("{}::{}", module.0, name(*id))))
         }
+        T::Enum {
+            name: id,
+            arguments,
+            variants,
+        } => T::Enum {
+            name: symbols.intern(format!("{}::{}", module.0, name(*id))),
+            arguments: arguments
+                .iter()
+                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .collect(),
+            variants: variants
+                .iter()
+                .map(|(n, fields)| {
+                    (
+                        n.clone(),
+                        fields
+                            .iter()
+                            .map(|ty| canonical_type(ty, manifest, module, symbols))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        },
         T::Struct {
             name: id,
             arguments,
@@ -381,6 +480,35 @@ fn parameter_accepts(
                     .zip(actual)
                     .all(|(expected, actual)| parameter_accepts(expected, actual, substitutions))
         }
+        (
+            T::Enum {
+                name,
+                arguments,
+                variants,
+            },
+            T::Enum {
+                name: actual_name,
+                arguments: actuals,
+                variants: actual_variants,
+            },
+        ) => {
+            name == actual_name
+                && arguments.len() == actuals.len()
+                && arguments
+                    .iter()
+                    .zip(actuals)
+                    .all(|(e, a)| parameter_accepts(e, a, substitutions))
+                && variants.len() == actual_variants.len()
+                && variants.iter().all(|(tag, fields)| {
+                    actual_variants.get(tag).is_some_and(|actual| {
+                        fields.len() == actual.len()
+                            && fields
+                                .iter()
+                                .zip(actual)
+                                .all(|(e, a)| parameter_accepts(e, a, substitutions))
+                    })
+                })
+        }
         (T::Map(ek, ev), T::Map(ak, av)) => {
             parameter_accepts(ek, ak, substitutions) && parameter_accepts(ev, av, substitutions)
         }
@@ -393,6 +521,86 @@ mod tests {
     use crate::{BuiltinManifest, compile_with_manifest, parse_program};
 
     use super::*;
+
+    #[test]
+    fn intrinsic_grants_are_module_local_and_default_deny() {
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        let id = registry
+            .register_fn("hostSay", |_: &mut (), _: String| Ok(()))
+            .expect("native");
+        registry
+            .require_capability(id, "dialogue.write")
+            .expect("capability");
+        let manifest = registry.manifest();
+        let compile = |source: &str| {
+            compile_with_manifest(&parse_program(source).expect("parse"), 17, &manifest)
+                .expect("compile")
+        };
+        let provider = compile("global fn narrate(text: String) { hostSay(text) }");
+        let consumer = compile("narrate(\"hello\")");
+        let modules = vec![(None, provider.clone()), (None, consumer.clone())];
+        assert!(
+            link_named_modules(modules.clone(), &manifest)
+                .expect_err("default deny")
+                .iter()
+                .any(|e| e.message.contains("dialogue.write"))
+        );
+        let mut policy = LinkPolicy::default();
+        policy.grant(ModuleId(0), "dialogue.write");
+        link_named_modules_with_policy(modules, &manifest, &policy).expect("authorized wrapper");
+        let untrusted = compile("hostSay(\"bypass\")");
+        let errors = link_named_modules_with_policy(
+            vec![(None, provider), (None, untrusted)],
+            &manifest,
+            &policy,
+        )
+        .expect_err("no privilege propagation");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.module == ModuleId(1) && e.message.contains("dialogue.write"))
+        );
+        policy.grant(ModuleId(1), "unrelated");
+        assert!(!policy.allows(ModuleId(1), "dialogue.write"));
+    }
+
+    #[test]
+    fn intrinsic_references_cannot_escape_even_from_authorized_modules() {
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        let id = registry
+            .register_fn("hostSay", |_: &mut (), _: String| Ok(()))
+            .expect("native");
+        registry
+            .require_capability(id, "dialogue.write")
+            .expect("capability");
+        let manifest = registry.manifest();
+        let code = compile_with_manifest(
+            &parse_program("let leaked = hostSay").expect("parse"),
+            17,
+            &manifest,
+        )
+        .expect("compile");
+        let mut policy = LinkPolicy::default();
+        policy.grant(ModuleId(0), "dialogue.write");
+        let errors = link_named_modules_with_policy(vec![(None, code)], &manifest, &policy)
+            .expect_err("reference must fail");
+        assert!(errors.iter().any(|e| e.message.contains("function value")));
+    }
+
+    #[test]
+    fn capability_requirements_affect_abi_hash_and_namespace_is_reserved() {
+        let registry = crate::native::NativeRegistry::<()>::new();
+        let public = registry.manifest();
+        let restricted = public
+            .clone()
+            .with_capabilities([(BuiltinId(0), "read".into())].into());
+        assert_ne!(public.hash(), restricted.hash());
+        let provider = compile("global fn forged() {}");
+        let errors =
+            link_named_modules(vec![(Some("intrinsics.engine".into()), provider)], &public)
+                .expect_err("reserved namespace");
+        assert!(errors.iter().any(|e| e.message.contains("reserved")));
+    }
 
     #[test]
     fn cross_module_concrete_types_are_checked_before_execution() {

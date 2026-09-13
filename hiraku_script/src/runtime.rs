@@ -56,6 +56,8 @@ pub struct BuiltinManifest {
     static_members: Vec<StaticMember>,
     #[serde(default)]
     globals: BTreeMap<String, ScriptType>,
+    #[serde(default)]
+    capabilities: BTreeMap<BuiltinId, String>,
 }
 
 impl BuiltinManifest {
@@ -90,6 +92,7 @@ impl BuiltinManifest {
             signatures: BTreeMap::new(),
             static_members: Vec::new(),
             globals: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
         };
         value.rehash();
         value
@@ -112,6 +115,16 @@ impl BuiltinManifest {
         self.globals = globals;
         self.rehash();
         self
+    }
+
+    /// Requirements are supplied by the embedding, never by user source.
+    pub fn with_capabilities(mut self, capabilities: BTreeMap<BuiltinId, String>) -> Self {
+        self.capabilities = capabilities;
+        self.rehash();
+        self
+    }
+    pub fn required_capability(&self, builtin: BuiltinId) -> Option<&str> {
+        self.capabilities.get(&builtin).map(String::as_str)
     }
 
     pub fn globals(&self) -> &BTreeMap<String, ScriptType> {
@@ -234,6 +247,16 @@ impl BuiltinManifest {
         }
         for (name, ty) in &self.globals {
             for byte in name.bytes().chain(format!("{ty:?}").bytes()) {
+                hash = hash_byte(hash, byte);
+            }
+        }
+        for (id, capability) in &self.capabilities {
+            for byte in
+                id.0.to_le_bytes()
+                    .into_iter()
+                    .chain((capability.len() as u64).to_le_bytes())
+                    .chain(capability.bytes())
+            {
                 hash = hash_byte(hash, byte);
             }
         }

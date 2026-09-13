@@ -206,6 +206,25 @@ mod tests {
     }
 
     #[test]
+    fn std_result_can_cross_modules() {
+        let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        let project = compile_project(vec![
+            source("entry.hks", "let value: Result<Int, String> = make()\nwhen value { .success(n) -> n\n.error(e) -> 0 }"),
+            source("api.hks", "global fn make() -> Result<Int, String> { .success(42) }"),
+        ], &natives).expect("std result links across modules");
+        let mut vm = crate::LinkedVm::new(project.program, project.paths["entry.hks"]).expect("VM");
+        for _ in 0..1000 {
+            if matches!(
+                vm.step().expect("execute"),
+                Some(crate::LinkedVmEvent::Completed(_))
+            ) {
+                return;
+            }
+        }
+        panic!("execution did not complete");
+    }
+
+    #[test]
     fn generic_module_exports_infer_result_and_check_runtime_casts() {
         let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
         for literal in ["1", "\"alice\""] {

@@ -10,7 +10,7 @@ use crate::{
 };
 
 pub(crate) mod actor_motion;
-mod animation;
+pub(crate) mod animation;
 pub(crate) mod capabilities;
 mod command;
 mod execution_runtime;
@@ -26,7 +26,7 @@ pub(crate) use ui_vm::UiComposition;
 pub(crate) use ui_vm::ui_argument_to_stored;
 pub(crate) use ui_vm::validate_ui_source;
 
-pub use animation::{AnimationPhase, AnimationSpec};
+pub use animation::{AnimationPhase, AnimationSpec, Easing};
 pub(crate) use command::{
     AnimationCommand, AudioCommand, CameraCommand, CharacterCommand, CharacterEase,
     DialogueCommand, ResolvedCharacterKeyframe, RuntimeCommand, ScriptCommand, SettingsCommand,
@@ -82,7 +82,8 @@ pub(crate) fn script_command_from_effect(
             ScriptCommand::Dialogue(DialogueCommand::Speed(multiplier))
         }
         StoryEffect::StopBgm { fade_ms } => ScriptCommand::Audio(AudioCommand::StopBgm {
-            fade: Duration::from_millis(fade_ms), animation_id: None,
+            fade: Duration::from_millis(fade_ms),
+            animation_id: None,
         }),
         StoryEffect::Exit => ScriptCommand::Runtime(RuntimeCommand::Exit),
         StoryEffect::Navigate(navigation) => {
@@ -122,7 +123,7 @@ pub(crate) fn script_command_from_effect(
             projection,
             scope,
             duration: Duration::from_millis(duration_ms),
-            ease: parse_camera_ease(&ease)?,
+            ease,
             animation_id: None,
         }),
         StoryEffect::Delay { .. } => {
@@ -217,9 +218,12 @@ pub(crate) fn script_command_from_effect(
                 .map(|animation| std::time::Duration::from_secs_f32(animation.duration())),
             animation_id: None,
         }),
-        StoryEffect::StopSfxChannel { channel, fade_ms } => ScriptCommand::Audio(AudioCommand::StopSfxChannel {
-            channel, fade: Duration::from_millis(fade_ms),
-        }),
+        StoryEffect::StopSfxChannel { channel, fade_ms } => {
+            ScriptCommand::Audio(AudioCommand::StopSfxChannel {
+                channel,
+                fade: Duration::from_millis(fade_ms),
+            })
+        }
         StoryEffect::SetUiRole { .. }
         | StoryEffect::MountUiOverlay { .. }
         | StoryEffect::UnmountUiOverlay { .. }
@@ -231,20 +235,6 @@ pub(crate) fn script_command_from_effect(
             return Err("effect requires script runtime asset resolution".to_string());
         }
     })
-}
-
-fn parse_camera_ease(name: &str) -> Result<CharacterEase, String> {
-    match name {
-        "" | "linear" => Ok(CharacterEase::Linear),
-        "ease" => Ok(CharacterEase::Ease),
-        "easeIn" | "ease_in" => Ok(CharacterEase::EaseIn),
-        "easeOut" | "ease_out" => Ok(CharacterEase::EaseOut),
-        "easeOutSine" => Ok(CharacterEase::EaseOutSine),
-        "easeInOutSine" => Ok(CharacterEase::EaseInOutSine),
-        "easeInOut" | "ease_in_out" => Ok(CharacterEase::EaseInOut),
-        "bounce" => Ok(CharacterEase::Bounce),
-        _ => Err(format!("unsupported camera easing `{name}`")),
-    }
 }
 
 #[derive(Debug, Clone)]

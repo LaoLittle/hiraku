@@ -22,7 +22,13 @@ pub(super) fn start(
         }
         complete_missing_animation(animations, previous.animation_id.take());
     }
-    let origin = motions.get(&actor).map_or([0.0; 2], |motion| motion.offset);
+    let origin = motions.get(&actor).map_or([0.0; 2], |motion| {
+        if motion.transition.oscillation.is_some() {
+            motion.origin
+        } else {
+            motion.offset
+        }
+    });
     let mut motion = ActorMotion::new(revision, transition, origin);
     motion.animation_id = completion;
     motions.insert(actor, motion);
@@ -97,6 +103,7 @@ mod tests {
         let mut motion = ActorMotion::new(
             1,
             ActorOffset {
+                oscillation: None,
                 target: [4.0, 8.0],
                 animation: crate::script::AnimationSpec::Linear(1.0, false),
             },
@@ -125,6 +132,7 @@ mod tests {
         let mut motions = BTreeMap::new();
         let mut animations = AnimationState::default();
         let transition = ActorOffset {
+            oscillation: None,
             target: [0.0, 8.0],
             animation: crate::script::AnimationSpec::Linear(1.0, false),
         };

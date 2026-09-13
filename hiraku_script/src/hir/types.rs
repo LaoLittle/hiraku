@@ -30,6 +30,11 @@ pub enum ScriptType {
     Task,
     TypeParameter(SymbolId),
     Named(SymbolId),
+    Enum {
+        name: SymbolId,
+        arguments: Vec<ScriptType>,
+        variants: BTreeMap<String, Vec<ScriptType>>,
+    },
     Struct {
         name: SymbolId,
         arguments: Vec<ScriptType>,

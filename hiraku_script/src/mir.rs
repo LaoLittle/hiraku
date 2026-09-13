@@ -111,6 +111,27 @@ pub enum MirInstruction {
         dst: VirtualRegister,
         values: Vec<VirtualRegister>,
     },
+    Move {
+        dst: VirtualRegister,
+        src: VirtualRegister,
+    },
+    IsVariant {
+        dst: VirtualRegister,
+        value: VirtualRegister,
+        type_name: SymbolId,
+        variant: SymbolId,
+    },
+    VariantField {
+        dst: VirtualRegister,
+        value: VirtualRegister,
+        index: u32,
+    },
+    MakeVariant {
+        dst: VirtualRegister,
+        type_name: SymbolId,
+        variant: SymbolId,
+        values: Vec<VirtualRegister>,
+    },
     MakeMap {
         dst: VirtualRegister,
         type_name: Option<SymbolId>,
@@ -160,6 +181,10 @@ impl MirInstruction {
             | Self::Binary { dst, .. }
             | Self::MakeTuple { dst, .. }
             | Self::MakeList { dst, .. }
+            | Self::Move { dst, .. }
+            | Self::IsVariant { dst, .. }
+            | Self::VariantField { dst, .. }
+            | Self::MakeVariant { dst, .. }
             | Self::MakeMap { dst, .. }
             | Self::Call { dst, .. }
             | Self::AssertNonNull { dst, .. }
@@ -181,16 +206,22 @@ impl MirInstruction {
             | Self::LoadLocal { .. }
             | Self::LoadGlobal { .. }
             | Self::GlobalInitialized { .. } => Vec::new(),
-            Self::StoreLocal { src, .. } | Self::StoreGlobal { src, .. } => vec![*src],
+            Self::Move { src, .. }
+            | Self::StoreLocal { src, .. }
+            | Self::StoreGlobal { src, .. } => vec![*src],
             Self::GetMember { object, .. } => vec![*object],
             Self::SetMember { object, value, .. } => vec![*object, *value],
             Self::UnaryMinus { value, .. }
             | Self::Cast { value, .. }
             | Self::ToString { value, .. }
+            | Self::IsVariant { value, .. }
+            | Self::VariantField { value, .. }
             | Self::MakeOptional { value, .. }
             | Self::AssertNonNull { value, .. } => vec![*value],
             Self::Binary { left, right, .. } => vec![*left, *right],
-            Self::MakeTuple { values, .. } | Self::MakeList { values, .. } => values.clone(),
+            Self::MakeVariant { values, .. }
+            | Self::MakeTuple { values, .. }
+            | Self::MakeList { values, .. } => values.clone(),
             Self::MakeMap { fields, .. } => fields.iter().map(|(_, value)| *value).collect(),
             Self::Call {
                 receiver,
@@ -547,6 +578,65 @@ impl<'types> MirBuilder<'types> {
         errors: &mut Vec<MirLoweringError>,
     ) -> Option<VirtualRegister> {
         match expression.kind {
+            HirExprKind::When {
+                value,
+                type_name,
+                arms,
+            } => {
+                let subject = self.lower_expression(value, errors)?;
+                let dst = self.constant(MirConstant::Unit);
+                let join = self.new_block();
+                for arm in arms {
+                    let selected = self.new_block();
+                    let next = self.new_block();
+                    let test = self.register();
+                    self.push(MirInstruction::IsVariant {
+                        dst: test,
+                        value: subject,
+                        type_name,
+                        variant: arm.variant,
+                    });
+                    self.current_block_mut().terminator = MirTerminator::Branch {
+                        condition: test,
+                        then_block: selected,
+                        else_block: next,
+                    };
+                    self.current = selected;
+                    for (index, local) in arm.bindings.iter().enumerate() {
+                        let field = self.register();
+                        self.push(MirInstruction::VariantField {
+                            dst: field,
+                            value: subject,
+                            index: index as u32,
+                        });
+                        self.push(MirInstruction::StoreLocal {
+                            local: *local,
+                            src: field,
+                        });
+                    }
+                    for (index, statement) in arm.body.statements.iter().enumerate() {
+                        if !matches!(self.current_block().terminator, MirTerminator::Unset) {
+                            break;
+                        }
+                        if index + 1 == arm.body.statements.len() {
+                            if let HirStmtKind::Expr(value) = statement.kind {
+                                let value = self.lower_expression(value, errors)?;
+                                self.push(MirInstruction::Move { dst, src: value });
+                                continue;
+                            }
+                        }
+                        self.lower_statement(statement, errors);
+                    }
+                    self.jump_if_unset(join);
+                    self.current = next;
+                }
+                self.push(MirInstruction::Udf(
+                    "enum value did not match an exhaustive when".into(),
+                ));
+                self.jump_if_unset(join);
+                self.current = join;
+                Some(dst)
+            }
             HirExprKind::Intrinsic {
                 operation,
                 argument,
@@ -769,6 +859,24 @@ impl<'types> MirBuilder<'types> {
                 } else {
                     self.push(MirInstruction::MakeList { dst, values });
                 }
+                Some(dst)
+            }
+            HirExprKind::Variant {
+                type_name,
+                variant,
+                values,
+            } => {
+                let values = values
+                    .iter()
+                    .map(|v| self.lower_expression(v, errors))
+                    .collect::<Option<Vec<_>>>()?;
+                let dst = self.register();
+                self.push(MirInstruction::MakeVariant {
+                    dst,
+                    type_name,
+                    variant,
+                    values,
+                });
                 Some(dst)
             }
             HirExprKind::Map { type_name, fields } => {

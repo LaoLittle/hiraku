@@ -84,7 +84,7 @@ pub struct PictureMotion {
     pub to: [f32; 5],
     pub elapsed: f32,
     pub seconds: f32,
-    pub ease: String,
+    pub ease: crate::script::animation::Easing,
     pub remove: bool,
     #[serde(default)]
     pub offsets_x: Vec<f32>,
@@ -127,7 +127,7 @@ pub enum PictureCommand {
         scale: Option<f32>,
         rotation: Option<f32>,
         seconds: f32,
-        ease: String,
+        ease: crate::script::animation::Easing,
     },
     Hide {
         id: String,
@@ -137,7 +137,7 @@ pub enum PictureCommand {
         id: String,
         position: [f32; 2],
         seconds: f32,
-        ease: String,
+        ease: crate::script::animation::Easing,
     },
     AnimateX {
         id: String,
@@ -650,17 +650,7 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
     if let Some(motion) = &mut picture.motion {
         motion.elapsed = (motion.elapsed + delta).min(motion.seconds);
         let p = (motion.elapsed / motion.seconds).clamp(0.0, 1.0);
-        let t = match motion.ease.as_str() {
-            "easeOutSine" => (p * std::f32::consts::FRAC_PI_2).sin(),
-            "easeInOutSine" => (1.0 - (p * std::f32::consts::PI).cos()) * 0.5,
-            "smoothStep" => p * p * (3.0 - 2.0 * p),
-            "easeOutQuad" => 1.0 - (1.0 - p).powi(2),
-            "easeInQuad" => p * p,
-            "easeInOutQuad" if p < 0.5 => 2.0 * p * p,
-            "easeInOutQuad" => 1.0 - (-2.0 * p + 2.0).powi(2) / 2.0,
-            "easeOutBack" => 1.0 + 2.70158 * (p - 1.0).powi(3) + 1.70158 * (p - 1.0).powi(2),
-            _ => p,
-        };
+        let t = motion.ease.sample(p);
         let v = std::array::from_fn::<_, 5, _>(|i| {
             motion.from[i] + (motion.to[i] - motion.from[i]) * t
         });

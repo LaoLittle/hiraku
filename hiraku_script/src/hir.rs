@@ -81,7 +81,30 @@ fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
                 symbols.intern(path.join("."));
             }
         }
+        Stmt::Enum {
+            name,
+            type_parameters,
+            variants,
+            ..
+        } => {
+            symbols.intern(name);
+            for parameter in type_parameters {
+                symbols.intern(parameter);
+            }
+            for variant in variants {
+                symbols.intern(&variant.name);
+                for field in &variant.fields {
+                    intern_type(field, symbols);
+                }
+            }
+        }
         Stmt::TypeAlias {
+            name,
+            type_parameters,
+            ty,
+            ..
+        }
+        | Stmt::Struct {
             name,
             type_parameters,
             ty,
@@ -217,6 +240,16 @@ fn intern_type(ty: &TypeExpr, symbols: &mut SymbolInterner) {
 
 fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
     match &expression.kind {
+        ExprKind::When { value, arms } => {
+            intern_expression(value, symbols);
+            for arm in arms {
+                symbols.intern(&arm.variant);
+                for name in &arm.bindings {
+                    symbols.intern(name);
+                }
+                intern_block(&arm.body, symbols);
+            }
+        }
         ExprKind::Ident(name) | ExprKind::Symbol(name) => {
             symbols.intern(name);
         }
