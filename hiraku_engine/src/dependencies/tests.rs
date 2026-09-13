@@ -29,6 +29,29 @@ fn manifest() -> DependencyManifest {
 }
 
 #[test]
+fn prefetch_uses_cpu_assets_for_loose_parts_and_render_assets_for_atlases() {
+    use crate::scene::character_composite::source::AtlasSource;
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+        .init_asset::<Image>()
+        .init_asset::<AtlasSource>();
+    let assets = app.world().resource::<AssetServer>();
+    let mut state = ScriptDependencies {
+        lookahead_steps: 1,
+        ..default()
+    };
+    state.set_cpu_sources(BTreeSet::from(["alice.png".into()]));
+    state.manifests.insert(String::new(), Some(manifest()));
+    state.move_window(BTreeSet::from([("scene.hks".into(), 0)]), assets);
+    let demand = assets.load::<AtlasSource>("alice.png");
+    assert_eq!(state.handles["alice.png"].id(), demand.id().untyped());
+    assert_eq!(
+        state.handles["bob.png"].id().type_id(),
+        std::any::TypeId::of::<Image>()
+    );
+}
+
+#[test]
 fn window_moves_by_execution_and_releases_only_its_own_handles() {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
@@ -42,7 +65,7 @@ fn window_moves_by_execution_and_releases_only_its_own_handles() {
     };
     state.manifests.insert(String::new(), Some(manifest()));
     state.move_window(BTreeSet::from([("scene.hks".into(), 0)]), assets);
-    let live = state.handles["alice.png"].clone();
+    let live = state.handles["alice.png"].clone().typed::<Image>();
     for _ in 0..100 {
         state.move_window(BTreeSet::from([("scene.hks".into(), 0)]), assets);
     }

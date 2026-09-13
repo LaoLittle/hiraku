@@ -35,6 +35,8 @@ pub struct CharacterPartDefinition {
     pub id: String,
     pub slot: Option<usize>,
     pub path: String,
+    /// Loose multi-image characters are decoded only for CPU atlas assembly.
+    pub(crate) pack_source: bool,
     /// Catalog rectangle in `[left, top, width, height]` form, retained so
     /// rendering can select the generated/declared atlas section.
     pub atlas_rect: Option<[f32; 4]>,
@@ -412,6 +414,7 @@ fn character_definition_from_config(
                     .as_deref()
                     .and_then(|name| slots.get(name).copied()),
                 path,
+                pack_source: false,
                 atlas_rect: texture_rect,
                 offset: part
                     .offset
@@ -425,6 +428,12 @@ fn character_definition_from_config(
             })
         })
         .collect::<Result<Vec<_>, CharacterCatalogError>>()?;
+    let pack_source = parts
+        .iter()
+        .any(|p| parts.first().is_some_and(|first| first.path != p.path));
+    for part in &mut parts {
+        part.pack_source = pack_source;
+    }
     parts.sort_by(|left, right| {
         left.layer
             .partial_cmp(&right.layer)
@@ -612,6 +621,7 @@ mod tests {
             .parts_for_expressions(&[])
             .expect("basis should resolve");
         assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|part| !part.pack_source));
         let shade = visible
             .iter()
             .find(|part| part.id == "shade")
@@ -625,6 +635,14 @@ mod tests {
         );
         assert_eq!(shade.blend, CharacterBlendMode::Multiply);
         assert_eq!(shade.color, [255, 128, 64, 96]);
+
+        let loose = source.replace("path: \"alice.png\", slot: \"shade\"", "path: \"bob.png\", slot: \"shade\"");
+        let config = parse_hks_data("characters/alice.char.hson", &loose).expect("loose config");
+        let alice = character_definition_from_config(
+            &vfs, &TextureCatalog::default(), "alice".into(), "characters".into(),
+            "characters/alice.char.hson".into(), config,
+        ).expect("loose character");
+        assert!(alice.parts.iter().all(|part| part.pack_source), "load policy is stable across expression subsets");
     }
 
     #[test]
@@ -706,6 +724,7 @@ mod tests {
                 id: id.to_string(),
                 slot: (id == "face_happy").then_some(1),
                 path: format!("{id}.png"),
+                pack_source: false,
                 atlas_rect: None,
                 offset: Vec2::ZERO,
                 layer: 0.0,

@@ -298,7 +298,7 @@ pub struct PendingCharacterShow {
     pub actor_id: String,
     pub entity_ids: Vec<String>,
     pub entities: Vec<Entity>,
-    pub handles: Vec<Handle<Image>>,
+    pub handles: Vec<UntypedHandle>,
     /// Tracks whether each pending entity was instantiated by this commit.
     /// Reused hidden children stay cached when a load or animation is cancelled.
     pub newly_spawned: Vec<bool>,
@@ -521,6 +521,18 @@ pub fn setup_frontend(
             .collect(),
     });
     commands.insert_resource(UiStyle::default());
+    let cpu_sources = character_catalog
+        .characters
+        .values()
+        .flat_map(|c| &c.parts)
+        .filter(|p| p.pack_source)
+        .map(|p| p.path.clone())
+        .collect();
+    commands.queue(move |world: &mut World| {
+        world
+            .resource_mut::<crate::dependencies::ScriptDependencies>()
+            .set_cpu_sources(cpu_sources);
+    });
     commands.insert_resource(character_catalog);
     commands.insert_resource(user_settings);
     commands.insert_resource(frontend);

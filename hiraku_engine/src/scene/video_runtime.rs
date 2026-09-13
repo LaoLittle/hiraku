@@ -23,7 +23,11 @@ pub(super) fn dispatch_video_command(
     waits: &mut PendingMovieWaits,
 ) {
     match command {
-        VideoCommand::Play { path, done, fade_out } => {
+        VideoCommand::Play {
+            path,
+            done,
+            fade_out,
+        } => {
             let asset: Handle<VideoAsset> = asset_server.load(path);
             let playback = if done.is_some() {
                 player.play(asset)
@@ -31,7 +35,10 @@ pub(super) fn dispatch_video_command(
                 player.play_under_ui(asset)
             };
             let configured = player.set_fade_out(playback, fade_out);
-            debug_assert!(configured, "newly queued movie accepts playback configuration");
+            debug_assert!(
+                configured,
+                "newly queued movie accepts playback configuration"
+            );
             if let Some(done) = done {
                 waits.0.insert(playback, done);
             }

@@ -20,7 +20,8 @@ pub struct ScriptDependencies {
     pub lookahead_steps: usize,
     pub retain_steps: usize,
     manifests: BTreeMap<String, Option<DependencyManifest>>,
-    handles: BTreeMap<String, Handle<Image>>,
+    handles: BTreeMap<String, UntypedHandle>,
+    cpu_sources: BTreeSet<String>,
     requested: Option<BTreeSet<String>>,
     frontier: BTreeSet<(String, usize)>,
     positions: Vec<(String, usize)>,
@@ -40,6 +41,7 @@ impl Default for ScriptDependencies {
             retain_steps: 4,
             manifests: BTreeMap::new(),
             handles: BTreeMap::new(),
+            cpu_sources: BTreeSet::new(),
             requested: None,
             frontier: BTreeSet::new(),
             positions: Vec::new(),
@@ -111,6 +113,11 @@ pub(crate) fn update_resource_window(
 }
 
 impl ScriptDependencies {
+    pub(crate) fn set_cpu_sources(&mut self, paths: BTreeSet<String>) {
+        self.handles
+            .retain(|path, _| self.cpu_sources.contains(path) == paths.contains(path));
+        self.cpu_sources = paths;
+    }
     fn finish(&mut self) {
         self.closed = true;
         self.handles.clear();
@@ -211,9 +218,15 @@ impl ScriptDependencies {
         }
         self.handles.retain(|path, _| admitted.contains(path));
         for path in admitted {
-            self.handles
-                .entry(path.clone())
-                .or_insert_with(|| crate::texture::load_static_image(assets, path));
+            self.handles.entry(path.clone()).or_insert_with(|| {
+                if self.cpu_sources.contains(&path) {
+                    assets
+                        .load::<crate::scene::character_composite::source::AtlasSource>(path)
+                        .untyped()
+                } else {
+                    crate::texture::load_static_image(assets, path).untyped()
+                }
+            });
         }
     }
 

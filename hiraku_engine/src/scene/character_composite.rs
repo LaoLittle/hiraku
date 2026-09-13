@@ -2,9 +2,14 @@
 use super::*;
 use hiraku_sprite3d::{BlendMode, MaskMode, Sprite3d, Sprite3dPlugin, Sprite3dSync, SpriteLayer};
 use std::time::Duration;
+mod atlas;
+pub(crate) mod source;
 
 #[derive(Component, Clone)]
-pub(crate) struct LogicalCharacterPart(pub CharacterPartDefinition);
+pub(crate) struct LogicalCharacterPart(
+    pub CharacterPartDefinition,
+    pub Option<Handle<source::AtlasSource>>,
+);
 #[derive(Component)]
 struct CompositeDisplay;
 #[derive(Component, Default)]
@@ -13,6 +18,7 @@ pub(crate) struct CharacterGroup {
     tween: Option<GroupTween>,
     display: Option<Entity>,
     atlas: Option<Handle<TextureAtlasLayout>>,
+    packed: atlas::PackedAtlas,
     error: Option<String>,
     last_active_revision: u64,
 }
@@ -30,6 +36,8 @@ impl CharacterGroup {
 }
 
 pub(crate) fn install(app: &mut App) {
+    app.init_asset::<source::AtlasSource>()
+        .init_asset_loader::<source::AtlasSourceLoader>();
     if !app.is_plugin_added::<Sprite3dPlugin>() {
         app.add_plugins(Sprite3dPlugin);
     }
@@ -185,9 +193,13 @@ fn advance_group_fades(
 }
 fn compose_groups(
     mut commands: Commands,
+    mut redraw: crate::redraw::Redraw,
     shared: Res<super::SceneSharedState>,
     spatial: Option<Res<crate::stage::runtime::StageRuntime>>,
-    images: Res<Assets<Image>>,
+    mut images: ResMut<Assets<Image>>,
+    mut cpu: source::AtlasSources,
+    device: Option<Res<bevy::render::renderer::RenderDevice>>,
+    mut image_events: MessageReader<AssetEvent<Image>>,
     mut atlases: ResMut<Assets<TextureAtlasLayout>>,
     mut roots: Query<(
         Entity,
@@ -208,7 +220,22 @@ fn compose_groups(
         (With<CompositeDisplay>, Without<LogicalCharacterPart>),
     >,
 ) {
+    let changed = image_events
+        .read()
+        .filter_map(|event| match event {
+            AssetEvent::Added { id } | AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let limit = device
+        .as_ref()
+        .map_or(8192, |device| device.limits().max_texture_dimension_2d);
+    let changed_sources = cpu.changed();
     for (root, children, mut group, identity, placement) in &mut roots {
+        group.packed.invalidate(&changed);
+        group.packed.invalidate_sources(&changed_sources);
         let mut selected = children
             .iter()
             .filter_map(|e| parts.get(e).ok())
@@ -226,20 +253,35 @@ fn compose_groups(
             }
             continue;
         }
-        let (image, rects, mut layers, size, center, _depth) =
-            match build_layers(&selected, &images) {
-                Ok(value) => value,
-                Err(error) => {
-                    if group.error.as_ref() != Some(&error) {
-                        warn!("character composition failed: {error}");
-                        group.error = Some(error);
-                    }
-                    if let Some(e) = group.display {
-                        commands.entity(e).try_insert(Visibility::Hidden);
-                    }
-                    continue;
+        // AssetServer gates initial reveal; expression changes keep the old
+        // composite while their new CPU sources are still arriving.
+        if selected.iter().any(|p| {
+            p.0.1
+                .as_ref()
+                .is_some_and(|h| cpu.assets.as_ref().is_none_or(|a| !a.contains(h)))
+        }) {
+            redraw.request();
+            continue;
+        }
+        let (image, rects, mut layers, size, center, _depth) = match build_layers(
+            &selected,
+            &mut images,
+            &mut group.packed,
+            limit,
+            cpu.assets.as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                if group.error.as_ref() != Some(&error) {
+                    warn!("character composition failed: {error}");
+                    group.error = Some(error);
                 }
-            };
+                if let Some(e) = group.display {
+                    commands.entity(e).try_insert(Visibility::Hidden);
+                }
+                continue;
+            }
+        };
         group.error = None;
         let atlas_size = images
             .get(&image)
@@ -326,6 +368,7 @@ fn compose_groups(
         {
             if *current != sprite {
                 *current = sprite;
+                redraw.request();
             }
             if *position != transform {
                 *position = transform;
@@ -335,6 +378,7 @@ fn compose_groups(
             }
             commands.entity(entity).try_insert(render_layers);
         } else {
+            redraw.request();
             group.display = Some(
                 commands
                     .spawn((
@@ -359,7 +403,13 @@ type PartView<'a> = (
     bool,
 );
 type CompositeLayers = (Handle<Image>, Vec<URect>, Vec<SpriteLayer>, Vec2, Vec2, f32);
-fn build_layers(parts: &[PartView<'_>], images: &Assets<Image>) -> Result<CompositeLayers, String> {
+fn build_layers(
+    parts: &[PartView<'_>],
+    images: &mut Assets<Image>,
+    packed: &mut atlas::PackedAtlas,
+    limit: u32,
+    sources: Option<&Assets<source::AtlasSource>>,
+) -> Result<CompositeLayers, String> {
     if parts.len() > hiraku_sprite3d::MAX_LAYERS {
         return Err(format!(
             "{} visible layers exceed the {} layer limit",
@@ -367,23 +417,31 @@ fn build_layers(parts: &[PartView<'_>], images: &Assets<Image>) -> Result<Compos
             hiraku_sprite3d::MAX_LAYERS
         ));
     }
-    let image = parts
-        .first()
-        .and_then(|p| p.1.image.clone())
-        .ok_or("character has no atlas image")?;
-    let image_size = images
-        .get(&image)
-        .ok_or("character atlas is still loading")?
-        .size();
+    let image = parts.first().and_then(|p| p.1.image.clone());
+    let single_image =
+        image.is_some() && parts.iter().all(|p| p.0.1.is_none() && p.1.image == image);
+    let mut requested = Vec::new();
     let mut source = Vec::new();
     let mut regions = Vec::new();
     let mut layers = Vec::new();
     let mut minimum = Vec2::splat(f32::INFINITY);
     let mut maximum = Vec2::splat(f32::NEG_INFINITY);
     for (part, sprite, transform, _, _) in parts {
-        if sprite.image.as_ref() != Some(&image) {
-            return Err("a composed character must use a single atlas image".into());
-        }
+        let part_image = if let Some(handle) = &part.1 {
+            atlas::SourceId::Cpu(handle.id())
+        } else {
+            atlas::SourceId::Render(
+                sprite
+                    .image
+                    .as_ref()
+                    .ok_or("character part has no image")?
+                    .id(),
+            )
+        };
+        let image_size = part_image
+            .get(images, sources)
+            .ok_or("character part image is still loading")?
+            .size();
         let r = part
             .0
             .rect
@@ -418,6 +476,10 @@ fn build_layers(parts: &[PartView<'_>], images: &Assets<Image>) -> Result<Compos
             r[2] as u32,
             r[3] as u32,
         ));
+        requested.push(atlas::Region {
+            image: part_image,
+            rect: *source.last().expect("part rectangle"),
+        });
         let mask = match part.0.mask {
             None => MaskMode::None,
             Some(mask) => {
@@ -457,6 +519,11 @@ fn build_layers(parts: &[PartView<'_>], images: &Assets<Image>) -> Result<Compos
             Vec2::new(max.x - minimum.x, maximum.y - min.y) / size,
         );
     }
+    let (image, source) = if single_image {
+        (image.expect("single atlas image"), source)
+    } else {
+        packed.resolve_with_sources(&requested, images, limit, sources)?
+    };
     Ok((
         image,
         source,
@@ -553,6 +620,7 @@ mod tests {
             .init_resource::<super::super::SceneSharedState>()
             .init_resource::<AnimationState>()
             .init_resource::<Assets<Image>>()
+            .add_message::<AssetEvent<Image>>()
             .init_resource::<Assets<TextureAtlasLayout>>()
             .insert_resource(FrontendState {
                 startup_script: "startup.hks".into(),
@@ -588,18 +656,62 @@ mod tests {
     }
 
     fn part(id: &str, rect: [f32; 4]) -> LogicalCharacterPart {
-        LogicalCharacterPart(CharacterPartDefinition {
-            id: id.into(),
-            slot: None,
-            path: "atlas.png".into(),
-            atlas_rect: None,
-            offset: Vec2::ZERO,
-            layer: 0.0,
-            rect: Some(rect),
-            mask: None,
-            blend: CharacterBlendMode::Normal,
-            color: [255; 4],
-        })
+        LogicalCharacterPart(
+            CharacterPartDefinition {
+                id: id.into(),
+                slot: None,
+                path: "atlas.png".into(),
+                pack_source: false,
+                atlas_rect: None,
+                offset: Vec2::ZERO,
+                layer: 0.0,
+                rect: Some(rect),
+                mask: None,
+                blend: CharacterBlendMode::Normal,
+                color: [255; 4],
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn cpu_only_part_builds_without_any_render_source_even_for_one_visible_part() {
+        let mut images = Assets::<Image>::default();
+        let mut sources = Assets::<source::AtlasSource>::default();
+        let mut pixels = Image::default();
+        pixels.resize(bevy::render::render_resource::Extent3d {
+            width: 16,
+            height: 16,
+            depth_or_array_layers: 1,
+        });
+        let handle = sources.add(source::AtlasSource(pixels));
+        let mut alice = part("alice/body", [0.0, 0.0, 16.0, 16.0]);
+        alice.0.pack_source = true;
+        alice.1 = Some(handle);
+        let sprite = WorldSprite::from_color(Color::WHITE, Vec2::ZERO);
+        let transform = Transform::default();
+        let visible = Visibility::Visible;
+        let parts = [(&alice, &sprite, &transform, &visible, false)];
+        let mut cache = atlas::PackedAtlas::default();
+        let first = build_layers(&parts, &mut images, &mut cache, 256, Some(&sources))
+            .expect("CPU-only composition");
+        assert_eq!(
+            images.len(),
+            1,
+            "only the generated atlas is a render asset"
+        );
+        assert_eq!(first.3, Vec2::splat(16.0));
+        let mut atlas = images.get_mut(&first.0).expect("atlas");
+        assert_eq!(
+            atlas.asset_usage,
+            bevy::asset::RenderAssetUsages::RENDER_WORLD
+        );
+        atlas.data = None;
+        drop(atlas);
+        let second = build_layers(&parts, &mut images, &mut cache, 256, Some(&sources))
+            .expect("reuse after GPU extraction");
+        assert_eq!(first.0, second.0);
+        assert_eq!(images.len(), 1);
     }
 
     #[test]
@@ -633,7 +745,10 @@ mod tests {
                 (&writer, &sprite, &a, &visible, false),
                 (&reader, &sprite, &b, &visible, false),
             ],
-            &images,
+            &mut images,
+            &mut atlas::PackedAtlas::default(),
+            8192,
+            None,
         )
         .expect("valid synthetic atlas");
         assert_eq!(rects[1], URect::new(16, 0, 32, 16));
@@ -650,12 +765,66 @@ mod tests {
     }
 
     #[test]
+    fn loose_parts_keep_geometry_masks_and_blend_when_packed() {
+        let mut images = Assets::<Image>::default();
+        let mut image = Image::default();
+        image.resize(bevy::render::render_resource::Extent3d {
+            width: 16,
+            height: 16,
+            depth_or_array_layers: 1,
+        });
+        let first = images.add(image.clone());
+        let second = images.add(image);
+        let writer = part("alice/eyes", [0.0, 0.0, 16.0, 16.0]);
+        let mut reader = part("alice/shadow", [0.0, 0.0, 8.0, 16.0]);
+        reader.0.mask = Some(crate::character::CharacterMaskDefinition {
+            kind: CharacterMaskKind::Read,
+            reference: 1,
+        });
+        reader.0.blend = CharacterBlendMode::Multiply;
+        let a = WorldSprite::from_image(first.clone());
+        let mut b = WorldSprite::from_image(second.clone());
+        b.color = Color::linear_rgba(1.0, 1.0, 1.0, 0.4);
+        let pose = Transform::default();
+        let visible = Visibility::Visible;
+        let parts = [
+            (&writer, &a, &pose, &visible, false),
+            (&reader, &b, &pose, &visible, false),
+        ];
+        let mut cache = atlas::PackedAtlas::default();
+        let (image, rects, layers, size, center, _) =
+            build_layers(&parts, &mut images, &mut cache, 256, None)
+                .expect("loose character parts compose");
+        assert_ne!(image, first);
+        assert_ne!(image, second);
+        assert_eq!(rects[1].size(), UVec2::new(8, 16));
+        assert_eq!(layers[1].bounds, Rect::new(0.25, 0.0, 0.75, 1.0));
+        assert_eq!(layers[1].color.alpha(), 0.4);
+        assert_eq!(layers[1].mask, MaskMode::Read(1));
+        assert_eq!(layers[1].blend, BlendMode::Multiply);
+        assert_eq!((size, center), (Vec2::splat(16.0), Vec2::ZERO));
+        let count = images.len();
+        assert_eq!(
+            build_layers(&parts, &mut images, &mut cache, 256, None)
+                .expect("cached composition")
+                .0,
+            image
+        );
+        assert_eq!(
+            images.len(),
+            count,
+            "unchanged frames must not allocate another image"
+        );
+    }
+
+    #[test]
     fn group_fade_preserves_intrinsic_part_alpha_and_hides_children() {
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<super::super::SceneSharedState>()
             .init_resource::<AnimationState>()
             .init_resource::<Assets<Image>>()
+            .add_message::<AssetEvent<Image>>()
             .init_resource::<Assets<TextureAtlasLayout>>()
             .add_systems(Update, (advance_group_fades, compose_groups).chain());
         let image = app

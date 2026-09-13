@@ -875,10 +875,7 @@ pub(super) fn queue_character_show(
             });
             entities.push(entity);
             entity_ids.push(sprite_id);
-            handles.push(crate::texture::load_static_image(
-                asset_server,
-                part.path.clone(),
-            ));
+            handles.push(load_part_source(asset_server, part));
             newly_spawned.push(false);
             continue;
         }
@@ -898,8 +895,18 @@ pub(super) fn queue_character_show(
             rect: part.rect,
         };
 
-        let handle = crate::texture::load_static_image(asset_server, part.path.clone());
-        let mut sprite = character_part_sprite(handle.clone(), part);
+        let handle = load_part_source(asset_server, part);
+        let cpu = part.pack_source.then(|| {
+            handle
+                .clone()
+                .typed::<super::character_composite::source::AtlasSource>()
+        });
+        let mut sprite = if part.pack_source {
+            WorldSprite::from_color(Color::WHITE, Vec2::ZERO)
+                .with_rect(part.rect.map(source_rect_from_corners))
+        } else {
+            character_part_sprite(handle.clone().typed::<Image>(), part)
+        };
         sprite.color = color;
         let entity = commands
             .spawn((
@@ -909,7 +916,7 @@ pub(super) fn queue_character_show(
                 },
                 sprite,
                 visual,
-                super::character_composite::LogicalCharacterPart(part.clone()),
+                super::character_composite::LogicalCharacterPart(part.clone(), cpu),
                 Visibility::Hidden,
                 transform,
             ))
@@ -1092,6 +1099,16 @@ fn character_part_id(actor_id: &str, part: &CharacterPartDefinition) -> String {
 // Keep ordinary part orders within the character band below the scene curtain.
 fn character_depth(layer: f32) -> f32 {
     STAGE_Z_SPRITE + layer * 0.001
+}
+
+fn load_part_source(server: &AssetServer, part: &CharacterPartDefinition) -> UntypedHandle {
+    if part.pack_source {
+        server
+            .load::<super::character_composite::source::AtlasSource>(part.path.clone())
+            .untyped()
+    } else {
+        crate::texture::load_static_image(server, part.path.clone()).untyped()
+    }
 }
 
 fn character_part_sprite(image: Handle<Image>, part: &CharacterPartDefinition) -> WorldSprite {
@@ -1382,18 +1399,22 @@ mod tests {
     ) -> Entity {
         world
             .spawn((
-                super::super::character_composite::LogicalCharacterPart(CharacterPartDefinition {
-                    id: id.into(),
-                    slot: None,
-                    path: "atlas.png".into(),
-                    atlas_rect: None,
-                    offset,
-                    layer: 0.0,
-                    rect: None,
-                    mask: None,
-                    blend: CharacterBlendMode::Normal,
-                    color: [255; 4],
-                }),
+                super::super::character_composite::LogicalCharacterPart(
+                    CharacterPartDefinition {
+                        id: id.into(),
+                        slot: None,
+                        path: "atlas.png".into(),
+                        pack_source: false,
+                        atlas_rect: None,
+                        offset,
+                        layer: 0.0,
+                        rect: None,
+                        mask: None,
+                        blend: CharacterBlendMode::Normal,
+                        color: [255; 4],
+                    },
+                    None,
+                ),
                 Transform::from_xyz(actor_x + offset.x, offset.y, character_depth(0.0)),
                 ChildOf(root),
             ))

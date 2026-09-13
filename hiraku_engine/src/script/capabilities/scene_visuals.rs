@@ -947,7 +947,7 @@ mod tests {
         "#);
         let mut order = Vec::new();
         for _ in 0..64 {
-            if let Some(StoryRuntimeEvent::TaskEffect { task, effect }) =
+            if let Some(StoryRuntimeEvent::TaskEffect { effect, .. }) =
                 runtime.step().expect("sibling groups execute")
             {
                 match &effect {
@@ -957,7 +957,8 @@ mod tests {
                         if placement_animation.is_some() { "actor move" } else { "actor show" }),
                     _ => panic!("unexpected effect: {effect:?}"),
                 }
-                runtime.complete_task_effect(task, &effect).expect("effect completion");
+                // Keep all effects in flight: movement must start after the
+                // show commands, not after their fades have completed.
             }
             if order.len() == 4 { break; }
         }
