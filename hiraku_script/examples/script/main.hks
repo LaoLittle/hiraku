@@ -12,7 +12,9 @@ fn test(value: Foo) -> String? {
     }
 }
 
-let gr: Foo = .bar
+fn identity<T>(value: T) -> T { value }
+
+let gr: Foo = .foo("222")
 
 when test(gr) {
     .some(v) -> { print(v) },
@@ -20,6 +22,8 @@ when test(gr) {
 }
 
 print(test(gr) ?: "xxx")
+let a = identity("ww")
+print(a)
 
 let name: Optional<String> = .some("bar")
 print(name ?: "f")

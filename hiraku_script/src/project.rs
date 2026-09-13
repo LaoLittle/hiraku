@@ -206,6 +206,33 @@ mod tests {
     }
 
     #[test]
+    fn numeric_rechecking_preserves_imported_generic_signatures_and_symbols() {
+        let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        let project = compile_project(vec![
+            source("entry.hks", r#"
+                import helpers.*
+                let width = 12
+                let constrained: Float = width
+                if identity<Float>(scale(constrained)) != 24.0 {
+                    panic("imported generic call returned the wrong value")
+                }
+            "#),
+            ScriptSource {
+                path: "helpers.hks".into(), namespace: Some("helpers".into()),
+                source: "global fn identity<T>(value: T) -> T { value }\nglobal fn scale(value: Float) -> Float { value * 2 }".into(),
+            },
+        ], &natives).expect("numeric rechecking retains the entire imported interface");
+        let mut vm = crate::LinkedVm::new(project.program, project.paths["entry.hks"]).expect("VM");
+        for _ in 0..1000 {
+            if let Some(crate::LinkedVmEvent::Completed(value)) = vm.step().expect("execute") {
+                assert_eq!(value, crate::Value::Unit);
+                return;
+            }
+        }
+        panic!("execution did not finish");
+    }
+
+    #[test]
     fn std_result_can_cross_modules() {
         let natives = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
         let project = compile_project(vec![

@@ -512,6 +512,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             // Solve use-site constraints before producing the final typed HIR. The
             // second pass also rechecks earlier uses against the resolved types.
             let mut resolved = Self::new(self.arena, source, self.manifest);
+            // Numeric inference rebuilds local typing state, not the project's
+            // imported interface. Its signatures refer to this symbol table.
+            resolved.symbols = SymbolInterner::from_manifest(self.symbols.manifest())
+                .expect("the existing project symbol table is valid");
+            resolved.external_functions = self.external_functions;
+            resolved.external_type_parameters = self.external_type_parameters;
             resolved.numeric_hints = hints;
             resolved.numeric_resolved = true;
             return resolved.lower(source);

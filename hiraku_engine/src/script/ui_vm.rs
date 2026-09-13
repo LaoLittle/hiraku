@@ -3701,6 +3701,32 @@ screen {
     }
 
     #[test]
+    fn ui_imports_survive_numeric_inference_in_parameterized_entry() {
+        let source = r#"
+            import ui.widgets.*
+            @ui global fn main(fraction: Float) -> UiNode {
+                var amount = fraction
+                if amount < 0 { amount = 0 }
+                if amount > 1 { amount = 1 }
+                canvas {
+                    column {}.size(.abs(320 * amount, 20)).surface(1, 1, 1, 1)
+                    text("Alice")
+                }
+            }
+        "#;
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://progress.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[StoredValue::Float(0.5)],
+        )
+        .expect("numeric rechecking must preserve widget imports");
+        assert_eq!(screen.children.len(), 2);
+    }
+
+    #[test]
     fn ui_entry_initializes_private_state_and_callbacks_share_it() {
         let source = r#"import ui.widgets.*
 global var name: String = "alice"
