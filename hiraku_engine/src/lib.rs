@@ -46,6 +46,24 @@ pub fn validate_story_project(
     script::compile_story_program(&vfs, entry, &source).map(|_| ())
 }
 
+/// Parse project audio descriptors using the runtime catalog loader, without
+/// starting playback. Audio file decoding is a separate validation step.
+pub fn validate_audio_catalog(root: &std::path::Path, settings: &str) -> Result<(), String> {
+    let vfs = vfs::HdpVfs::new_with_config(root, settings, "startup.hks");
+    audio::load_audio_catalog(&vfs)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Resolve character parts and expressions against the texture catalog without
+/// spawning entities or uploading textures.
+pub fn validate_character_catalog(root: &std::path::Path, settings: &str) -> Result<(), String> {
+    let vfs = vfs::HdpVfs::new_with_config(root, settings, "startup.hks");
+    character::load_character_catalog(&vfs)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// Type-check a UI source with the standard widget module, without rendering.
 pub fn validate_ui_source(path: &str, source: &str) -> Result<(), String> {
     script::validate_ui_source(path, source)

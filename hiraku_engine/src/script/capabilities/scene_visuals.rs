@@ -932,6 +932,38 @@ mod tests {
             .expect("runtime initializes")
     }
 
+    #[test]
+    fn sibling_motion_group_follows_entrance_group() {
+        let mut runtime = runtime(r#"
+            let entrance = par {
+                scene.picture("room", "room").fade(500)
+                char("alice").at(.rel(50, 50)).show()
+            }
+            par {
+                scene.transformPicture("room").at(.right).animation(.linear(2))
+                char("alice").at(.rel(75, 50)).animation(.easeOut(0.5))
+            }
+            entrance.await()
+        "#);
+        let mut order = Vec::new();
+        for _ in 0..64 {
+            if let Some(StoryRuntimeEvent::TaskEffect { task, effect }) =
+                runtime.step().expect("sibling groups execute")
+            {
+                match &effect {
+                    StoryEffect::Picture(PictureCommand::Show { .. }) => order.push("picture show"),
+                    StoryEffect::Picture(PictureCommand::Transform { .. }) => order.push("picture move"),
+                    StoryEffect::ShowCharacter { placement_animation, .. } => order.push(
+                        if placement_animation.is_some() { "actor move" } else { "actor show" }),
+                    _ => panic!("unexpected effect: {effect:?}"),
+                }
+                runtime.complete_task_effect(task, &effect).expect("effect completion");
+            }
+            if order.len() == 4 { break; }
+        }
+        assert_eq!(order, ["picture show", "actor show", "picture move", "actor move"]);
+    }
+
     fn event(runtime: &mut StoryRuntime) -> StoryRuntimeEvent {
         for _ in 0..100 {
             if let Some(event) = runtime.step().expect("runtime steps") {

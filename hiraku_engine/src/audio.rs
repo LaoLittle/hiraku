@@ -167,9 +167,10 @@ pub fn load_audio_catalog(vfs: &HdpVfs) -> Result<AudioCatalog, AudioCatalogErro
 }
 
 #[derive(Debug, Deserialize)]
-struct CharacterVoiceFile {
-    #[serde(rename = "char")]
-    _character: String,
+struct VoiceCollectionFile {
+    // Optional authoring metadata: a collection may cover a whole chapter.
+    #[serde(default, rename = "char")]
+    _character: Option<String>,
     voices: Vec<CharacterVoiceEntry>,
 }
 
@@ -182,7 +183,7 @@ struct CharacterVoiceEntry {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum VoiceDescriptor {
-    Character(CharacterVoiceFile),
+    Collection(VoiceCollectionFile),
     Single(AudioFile),
 }
 
@@ -211,7 +212,7 @@ fn load_voice_channel(
                 ),
             })?;
         let voices = match descriptor {
-            VoiceDescriptor::Character(file) => file.voices,
+            VoiceDescriptor::Collection(file) => file.voices,
             VoiceDescriptor::Single(file) => vec![CharacterVoiceEntry {
                 name: file.name,
                 file: file.audio,
@@ -279,6 +280,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn voice_collections_allow_chapters_and_character_metadata() {
+        for metadata in ["", "char: \"alice\","] {
+            let source = format!(
+                r#".{{ {metadata} voices: [
+                .{{ name: "alice/001", file: "alice_001.opus" }},
+                .{{ name: "bob/001", file: "bob_001.opus" }}
+            ] }}"#
+            );
+            let descriptor: VoiceDescriptor = hson::from_str(&source)
+                .expect("voice collection should accept optional character metadata");
+            let VoiceDescriptor::Collection(collection) = descriptor else {
+                panic!("expected a voice collection");
+            };
+            assert_eq!(collection.voices.len(), 2);
+            assert_eq!(collection.voices[1].file, "bob_001.opus");
+        }
+        assert!(
+            hson::from_str::<VoiceDescriptor>(r#".{ voices: [.{ name: "alice/001" }] }"#).is_err(),
+            "missing audio file must remain an error"
+        );
+    }
+
+    #[test]
     fn loads_audio_aliases_from_hks_descriptors() {
         let root = std::env::temp_dir().join(format!("hiraku-audio-test-{}", std::process::id()));
         std::fs::create_dir_all(root.join("bgm")).unwrap();
@@ -299,13 +323,18 @@ mod tests {
             root.join("voice/alice.voice.hson"),
             r#".{
                 char: "alice",
-                voices: (
+                voices: [
                     .{ name: "voice/scene01/hash1", file: "hash1.ogg" },
                     .{ name: "voice/scene01/hash2", file: "hash2.ogg" }
-                )
+                ]
             }"#,
         )
         .unwrap();
+        std::fs::write(
+            root.join("voice/chapter.voices.hson"),
+            r#".{ voices: [.{ name: "bob/001", file: "bob_001.opus" }] }"#,
+        )
+        .expect("write chapter voice collection");
         std::fs::write(
             root.join("soundeffects/click.sfx.hson"),
             ".{ name: \"ui/click\", audio: \"click.wav\" }",
@@ -314,6 +343,15 @@ mod tests {
 
         let vfs = HdpVfs::new_with_config(&root, "settings.hson", "startup.hks");
         let catalog = load_audio_catalog(&vfs).unwrap();
+        assert_eq!(
+            catalog
+                .resolve_voice("bob/001")
+                .expect("chapter voice")
+                .path,
+            "voice/bob_001.opus"
+        );
+        crate::validate_audio_catalog(&root, "settings.hson")
+            .expect("offline validation uses the same collection schema");
         assert_eq!(
             catalog.resolve_music("title").unwrap().path,
             "bgm/Title.ogg"
@@ -335,6 +373,14 @@ mod tests {
             "soundeffects/click.wav"
         );
 
+        std::fs::write(
+            root.join("voice/invalid.voices.hson"),
+            r#".{ voices: [.{ name: "bob/missing" }] }"#,
+        )
+        .expect("write invalid descriptor fixture");
+        let error = crate::validate_audio_catalog(&root, "settings.hson")
+            .expect_err("offline validation must reject invalid descriptors");
+        assert!(error.contains("invalid.voices.hson"), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
 }
