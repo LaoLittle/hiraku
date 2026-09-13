@@ -30,8 +30,21 @@ struct PresentationCamera;
 /// picking into the engine's virtual pointer boundary.
 pub struct HirakuPresentationPlugin;
 
+/// Wakes reactive window runners for asynchronous GPU pipeline work. Embeddings
+/// with their own presentation can install this without Hiraku's canvas sprite.
+pub struct HirakuRenderWakePlugin;
+
+impl Plugin for HirakuRenderWakePlugin {
+    fn build(&self, app: &mut App) {
+        platform::redraw::register(app);
+    }
+}
+
 impl Plugin for HirakuPresentationPlugin {
     fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<HirakuRenderWakePlugin>() {
+            app.add_plugins(HirakuRenderWakePlugin);
+        }
         app.insert_resource(SpritePickingSettings {
             require_markers: true,
             picking_mode: SpritePickingMode::BoundingBox,

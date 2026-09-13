@@ -64,6 +64,7 @@ impl HoverMotion {
 }
 
 pub fn animate_hover(
+    evaluator: Local<crate::script::UiPropertyEvaluator>,
     mut redraw: crate::redraw::Redraw,
     time: super::ui_timers::UiClock,
     models: Res<UiModels>,
@@ -108,13 +109,16 @@ pub fn animate_hover(
             let changed =
                 super::screen_ui::refresh_local_binding(entity, binding, &parents, &local_states);
             if changed || revision != old_revision {
-                match crate::script::evaluate_ui_reactive_binding(binding, &models) {
-                    Ok(hiraku_script::Value::Bool(value)) => motion.selected = value,
-                    Ok(_) => warn!("hover active expression must return Bool"),
-                    Err(error) => crate::script::emit_script_diagnostic(
-                        "hover expression failed",
-                        &error.to_string(),
-                    ),
+                let models_changed = crate::script::refresh_ui_property_models(binding, &models);
+                if old_revision == u64::MAX || changed || models_changed {
+                    match evaluator.evaluate(binding, &models) {
+                        Ok(hiraku_script::Value::Bool(value)) => motion.selected = value,
+                        Ok(_) => warn!("hover active expression must return Bool"),
+                        Err(error) => crate::script::emit_script_diagnostic(
+                            "hover expression failed",
+                            &error.to_string(),
+                        ),
+                    }
                 }
             }
         }

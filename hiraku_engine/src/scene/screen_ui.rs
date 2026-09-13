@@ -1341,6 +1341,7 @@ fn spawn_screen_node_entity(
                     ScreenUiScrollable {
                         speed: scrollable.speed,
                     },
+                    crate::ui::InitialScrollAnchor(scrollable.default_scroll_anchor),
                     ScrollPosition::default(),
                     node,
                 ))
@@ -1897,6 +1898,37 @@ pub fn handle_screen_image_buttons(
     }
 }
 
+pub(crate) fn initialize_scroll_anchors(
+    mut commands: Commands,
+    mut redraw: crate::redraw::Redraw,
+    mut scrollables: Query<(
+        Entity,
+        &crate::ui::InitialScrollAnchor,
+        &ComputedNode,
+        &Node,
+        &mut ScrollPosition,
+    )>,
+) {
+    for (entity, anchor, computed, node, mut position) in &mut scrollables {
+        // Bounds are only meaningful after Bevy has laid out the viewport.
+        if computed.size().y <= 0.0 {
+            continue;
+        }
+        let maximum = scroll_limit(computed, node);
+        let next = Vec2::new(
+            position.x.clamp(0.0, maximum.x),
+            maximum.y * anchor.0.fraction(),
+        );
+        if position.0 != next {
+            position.0 = next;
+            redraw.request();
+        }
+        commands
+            .entity(entity)
+            .try_remove::<crate::ui::InitialScrollAnchor>();
+    }
+}
+
 pub fn handle_screen_scroll(
     mut scrolls: MessageReader<Pointer<Scroll>>,
     mut scrollables: Query<(
@@ -2206,6 +2238,7 @@ pub fn update_ui_text_bindings(
 }
 
 pub fn update_ui_reactive_bindings(
+    evaluator: Local<crate::script::UiPropertyEvaluator>,
     models: Res<UiModels>,
     parents: Query<&ChildOf>,
     local_states: Query<&super::widgets::UiLocalState>,
@@ -2243,7 +2276,13 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision && !changed {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
+        let models_changed =
+            crate::script::refresh_ui_property_models(&mut binding.expression, &models);
+        if binding.rendered_revision != u64::MAX && !changed && !models_changed {
+            binding.rendered_revision = revision;
+            continue;
+        }
+        match evaluator.evaluate(&binding.expression, &models) {
             Ok(hiraku_script::Value::String(value)) => {
                 if let Some(mut rich) = rich {
                     if rich.source != value {
@@ -2266,7 +2305,13 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision && !changed {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
+        let models_changed =
+            crate::script::refresh_ui_property_models(&mut binding.expression, &models);
+        if binding.rendered_revision != u64::MAX && !changed && !models_changed {
+            binding.rendered_revision = revision;
+            continue;
+        }
+        match evaluator.evaluate(&binding.expression, &models) {
             Ok(hiraku_script::Value::Bool(visible)) => {
                 *visibility = if visible {
                     Visibility::Inherited
@@ -2288,7 +2333,13 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision && !changed {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
+        let models_changed =
+            crate::script::refresh_ui_property_models(&mut binding.expression, &models);
+        if binding.rendered_revision != u64::MAX && !changed && !models_changed {
+            binding.rendered_revision = revision;
+            continue;
+        }
+        match evaluator.evaluate(&binding.expression, &models) {
             Ok(hiraku_script::Value::Bool(enabled)) => {
                 button.enabled = enabled;
                 *background = if enabled {
@@ -2320,7 +2371,13 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision && !changed {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
+        let models_changed =
+            crate::script::refresh_ui_property_models(&mut binding.expression, &models);
+        if binding.rendered_revision != u64::MAX && !changed && !models_changed {
+            binding.rendered_revision = revision;
+            continue;
+        }
+        match evaluator.evaluate(&binding.expression, &models) {
             Ok(hiraku_script::Value::Bool(enabled)) => button.enabled = enabled,
             Ok(value) => warn!("reactive UI enabled expression returned {value:?}, expected Bool"),
             Err(error) => crate::script::emit_script_diagnostic(
@@ -2336,7 +2393,13 @@ pub fn update_ui_reactive_bindings(
         if binding.rendered_revision == revision && !changed {
             continue;
         }
-        match crate::script::evaluate_ui_reactive_binding(&binding.expression, &models) {
+        let models_changed =
+            crate::script::refresh_ui_property_models(&mut binding.expression, &models);
+        if binding.rendered_revision != u64::MAX && !changed && !models_changed {
+            binding.rendered_revision = revision;
+            continue;
+        }
+        match evaluator.evaluate(&binding.expression, &models) {
             Ok(hiraku_script::Value::Number(value)) => {
                 let span = (binding.max - binding.min).max(f32::EPSILON);
                 let progress = ((value as f32 - binding.min) / span).clamp(0.0, 1.0);
@@ -2362,6 +2425,9 @@ pub(super) fn refresh_local_binding(
         if let Ok(local) = local_states.get(entity) {
             let mut changed = false;
             for (name, value) in &local.0 {
+                if !expression.dependencies.contains(name) {
+                    continue;
+                }
                 if expression.globals.get(name) != Some(value) {
                     expression.globals.insert(name.clone(), value.clone());
                     changed = true;
@@ -3096,6 +3162,126 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_clock_ticks_do_not_evaluate_history_row_properties() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://history.ui.hks",
+            "import ui.widgets.*\n@ui\nglobal fn main() -> UiNode { let entry = .{ text: \"Alice\" }; canvas { text(entry.text) } }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("history property");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("text")
+        };
+        let property = text.reactive_text.as_ref().expect("property");
+        let mut app = App::new();
+        app.init_resource::<UiModels>()
+            .add_systems(Update, update_ui_reactive_bindings);
+        let rows = (0..128)
+            .map(|_| {
+                app.world_mut()
+                    .spawn((
+                        Text::new(""),
+                        UiReactiveTextBinding {
+                            expression: property.clone(),
+                            rendered_revision: u64::MAX,
+                        },
+                    ))
+                    .id()
+            })
+            .collect::<Vec<_>>();
+        app.update();
+        for &row in &rows {
+            assert_eq!(app.world().get::<Text>(row).expect("row").0, "Alice");
+            // A sentinel detects execution even if the real value would be unchanged.
+            app.world_mut().get_mut::<Text>(row).expect("row").0 = "Bob".into();
+        }
+        for second in 1..4 {
+            app.world_mut()
+                .resource_mut::<UiModels>()
+                .set("time", StoredValue::Int(second));
+            app.update();
+            for &row in &rows {
+                assert_eq!(
+                    app.world().get::<Text>(row).expect("same row").0,
+                    "Bob",
+                    "unrelated time must not run captured row getters"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typewriter_updates_preserve_structural_entities() {
+        let model = |visible, count| {
+            StoredValue::Map(BTreeMap::from([
+                ("visible".into(), StoredValue::Bool(visible)),
+                ("revealedCharacters".into(), StoredValue::Int(count)),
+            ]))
+        };
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://dialogue.ui.hks",
+            "import ui.widgets.*\ncanvas { if dialogue.visible { richText(\"Alice\").reveal(dialogue.revealedCharacters) } }",
+            UiContext::new(BTreeMap::from([("dialogue".into(), model(true, 0))])),
+            &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("dialogue UI");
+        let renderer = screen.composition.expect("composition");
+        assert!(
+            renderer
+                .document
+                .plan
+                .structural_paths
+                .contains("dialogue.visible")
+        );
+        assert!(!renderer.document.plan.structural_paths.contains("dialogue"));
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_resource::<TextureCatalog>()
+            .init_resource::<TermCatalog>()
+            .init_resource::<UiStyle>()
+            .init_resource::<UiModels>()
+            .init_resource::<crate::input::HirakuTextFocus>()
+            .insert_resource(UiFonts {
+                regular: Handle::default(),
+                _fonts: vec![],
+            })
+            .add_systems(Update, recompose_screen_ui);
+        let child = app.world_mut().spawn(Text::new("Alice")).id();
+        let root = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                super::super::widgets::UiLocalState(renderer.globals.clone()),
+                ScreenComposition {
+                    rendered: renderer.globals.clone(),
+                    renderer,
+                },
+            ))
+            .add_child(child)
+            .id();
+        for count in 0..6 {
+            app.world_mut()
+                .resource_mut::<UiModels>()
+                .set("dialogue", model(true, count));
+            app.world_mut()
+                .resource_mut::<UiModels>()
+                .set("time", StoredValue::Int(count));
+            app.update();
+            assert_eq!(
+                app.world().get::<Children>(root).expect("children")[0],
+                child,
+                "typewriter ticks must not replace animation/scroll entities"
+            );
+        }
+        app.world_mut()
+            .resource_mut::<UiModels>()
+            .set("dialogue", model(false, 5));
+        app.update();
+        assert!(
+            app.world().get_entity(child).is_err(),
+            "actual structural changes still update"
+        );
+    }
+
+    #[test]
     fn structural_rebuild_commits_before_rich_text_materialization() {
         let model = |visible| {
             StoredValue::Map(BTreeMap::from([(
@@ -3286,6 +3472,55 @@ mod tests {
             ),
             Vec2::ZERO
         );
+    }
+
+    #[test]
+    fn scroll_anchor_waits_for_layout_and_does_not_override_user_scroll() {
+        use crate::ui::{InitialScrollAnchor, ScrollAnchor};
+        for (anchor, expected) in [
+            (ScrollAnchor::Top, 0.0),
+            (ScrollAnchor::Center, 100.0),
+            (ScrollAnchor::Bottom, 200.0),
+        ] {
+            let mut app = App::new();
+            app.add_systems(Update, initialize_scroll_anchors);
+            let entity = app
+                .world_mut()
+                .spawn((
+                    InitialScrollAnchor(anchor),
+                    ScrollPosition::default(),
+                    ComputedNode::default(),
+                    Node {
+                        overflow: Overflow::scroll_y(),
+                        ..default()
+                    },
+                ))
+                .id();
+            app.update();
+            assert!(app.world().get::<InitialScrollAnchor>(entity).is_some());
+            *app.world_mut()
+                .get_mut::<ComputedNode>(entity)
+                .expect("layout") = ComputedNode {
+                size: Vec2::splat(100.0),
+                content_size: Vec2::new(100.0, 300.0),
+                ..default()
+            };
+            app.update();
+            assert_eq!(
+                app.world().get::<ScrollPosition>(entity).expect("scroll").y,
+                expected
+            );
+            assert!(app.world().get::<InitialScrollAnchor>(entity).is_none());
+            app.world_mut()
+                .get_mut::<ScrollPosition>(entity)
+                .expect("scroll")
+                .y = 42.0;
+            app.update();
+            assert_eq!(
+                app.world().get::<ScrollPosition>(entity).expect("scroll").y,
+                42.0
+            );
+        }
     }
 
     #[test]

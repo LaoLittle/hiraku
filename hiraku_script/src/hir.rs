@@ -68,10 +68,31 @@ fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
                 intern_block(body, symbols);
             }
         }
-        Stmt::Impl {
-            target, methods, ..
+        Stmt::Extend {
+            target,
+            protocol,
+            methods,
+            ..
         } => {
             intern_type(target, symbols);
+            if let Some(protocol) = protocol {
+                intern_type(protocol, symbols);
+            }
+            for method in methods {
+                intern_statement(method, symbols);
+            }
+        }
+        Stmt::Protocol {
+            name,
+            type_parameters,
+            associated_types,
+            methods,
+            ..
+        } => {
+            symbols.intern(name);
+            for name in type_parameters.iter().chain(associated_types) {
+                symbols.intern(name);
+            }
             for method in methods {
                 intern_statement(method, symbols);
             }
@@ -119,6 +140,8 @@ fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
         Stmt::Function {
             name,
             type_parameters,
+            bounds,
+            witnesses,
             parameters,
             return_type,
             body,
@@ -127,6 +150,18 @@ fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
             symbols.intern(name);
             for parameter in type_parameters {
                 symbols.intern(parameter);
+            }
+            for bound in bounds {
+                symbols.intern(&bound.parameter);
+                intern_type(&bound.protocol, symbols);
+            }
+            for witness in witnesses {
+                symbols.intern(&witness.parameter);
+                symbols.intern(&witness.method);
+                for parameter in &witness.parameters {
+                    intern_type(parameter, symbols);
+                }
+                intern_type(&witness.result, symbols);
             }
             for parameter in parameters {
                 symbols.intern(&parameter.name);
@@ -257,10 +292,15 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
             intern_expression(object, symbols);
             symbols.intern(name);
         }
-        ExprKind::Binding(value)
-        | ExprKind::Not(value)
-        | ExprKind::UnaryMinus(value)
-        | ExprKind::NonNull(value) => intern_expression(value, symbols),
+        ExprKind::Not(value) => {
+            symbols.intern("protocol#Not#not");
+            intern_expression(value, symbols);
+        }
+        ExprKind::UnaryMinus(value) => {
+            symbols.intern("protocol#Negate#negate");
+            intern_expression(value, symbols);
+        }
+        ExprKind::Binding(value) | ExprKind::NonNull(value) => intern_expression(value, symbols),
         ExprKind::Cast { value, ty, .. } => {
             intern_expression(value, symbols);
             intern_type(ty, symbols);
@@ -317,7 +357,10 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
             intern_block(body, symbols);
         }
         ExprKind::Block(block) => intern_block(block, symbols),
-        ExprKind::Binary { left, right, .. } => {
+        ExprKind::Binary { left, op, right } => {
+            if let Some((protocol, method)) = crate::intrinsics::binary_protocol(*op) {
+                symbols.intern(format!("protocol#{protocol}#{method}"));
+            }
             intern_expression(left, symbols);
             intern_expression(right, symbols);
         }

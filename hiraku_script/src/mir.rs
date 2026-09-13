@@ -5,6 +5,9 @@ use crate::{
     NumberUnit, ResolvedFunction, Span, SymbolId,
 };
 
+#[path = "mir/inline.rs"]
+mod inline;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtualRegister(pub u32);
 
@@ -340,7 +343,9 @@ pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLower
         })
         .collect();
     if errors.is_empty() {
-        Ok(MirProgram { entry, functions })
+        let mut program = MirProgram { entry, functions };
+        inline::run(&mut program, hir);
+        Ok(program)
     } else {
         Err(errors)
     }
@@ -635,6 +640,22 @@ impl<'types> MirBuilder<'types> {
             } => {
                 let value = self.lower_expression(argument, errors)?;
                 match operation {
+                    crate::intrinsics::Intrinsic::Negate => {
+                        let dst = self.register();
+                        self.push(MirInstruction::UnaryMinus { dst, value });
+                        Some(dst)
+                    }
+                    crate::intrinsics::Intrinsic::Not => {
+                        let dst = self.register();
+                        let right = self.constant(MirConstant::Bool(false));
+                        self.push(MirInstruction::Binary {
+                            dst,
+                            left: value,
+                            op: crate::BinaryOp::Equal,
+                            right,
+                        });
+                        Some(dst)
+                    }
                     crate::intrinsics::Intrinsic::ValueToString => {
                         let dst = self.register();
                         self.push(MirInstruction::ToString { dst, value });

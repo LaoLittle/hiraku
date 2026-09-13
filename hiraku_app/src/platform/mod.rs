@@ -7,3 +7,4 @@ mod wasm;
 pub(crate) use native::*;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use wasm::*;
+pub(crate) mod redraw;

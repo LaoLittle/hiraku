@@ -7,6 +7,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 mod encoder;
+mod parallel;
 pub mod progress;
 #[cfg(test)]
 mod tests;
@@ -171,45 +172,86 @@ pub fn pack_directory_with_progress(
         }
     }
     let texture_count = textures.len();
-    for (index, (source, target)) in textures.into_iter().enumerate() {
-        let name = source.strip_prefix(&root)?.display().to_string();
-        report(PackProgress::new("image", index, texture_count, &name));
-        if source.to_string_lossy().ends_with(".uastc.ktx2") {
-            report(PackProgress::new("compress", index, texture_count, &name));
-            writer.add_reader(&target, fs::File::open(source)?, FileOptions::default())?;
-        } else {
-            let image = image::open(&source)
+    let textures: Vec<_> = textures.into_iter().collect();
+    let budget = encoder::cpu_budget();
+    let threads = parallel::worker_threads(budget, texture_count);
+    report(PackProgress::new(
+        "workers",
+        0,
+        texture_count,
+        format!(
+            "CPU budget {budget}; {} encoding workers, threads per worker {threads:?}; ordered HDP writer",
+            threads.len()
+        ),
+    ));
+    parallel::ordered(
+        texture_count,
+        &threads,
+        |index, threads, progress| {
+            let (source, _) = &textures[index];
+            let name = source.strip_prefix(&root)?.display().to_string();
+            progress(PackProgress::new("image", 0, 0, &name));
+            if source.to_string_lossy().ends_with(".uastc.ktx2") {
+                // Keep pre-encoded input streaming; do not copy it into the queue.
+                return Ok(None);
+            }
+            let image = image::open(source)
                 .map_err(|error| format!("{}: {error}", source.display()))?
                 .to_rgba8();
-            report(PackProgress::new(
+            progress(PackProgress::new(
                 "encode",
-                index,
-                texture_count,
+                0,
+                0,
                 format!(
-                    "{name} ({}x{}, {:.1} MiB RGBA; level {}, {} threads)",
+                    "{name} ({}x{}, {:.1} MiB RGBA; level {}, {threads} threads)",
                     image.width(),
                     image.height(),
                     image.as_raw().len() as f64 / 1048576.0,
-                    UASTC_LEVEL,
-                    encoder_threads(),
+                    UASTC_LEVEL
                 ),
             ));
-            let encoded = encode_rgba(image.as_raw(), image.width(), image.height())?;
-            report(PackProgress::new(
-                "compress",
-                index,
-                texture_count,
-                format!("{name} ({:.1} MiB KTX2)", encoded.len() as f64 / 1048576.0),
+            let encoded =
+                encode_rgba_with_threads(image.as_raw(), image.width(), image.height(), threads)
+                    .map_err(|error| format!("{name}: {error}"))?;
+            progress(PackProgress::new(
+                "encoded",
+                0,
+                0,
+                format!(
+                    "{name} ({:.1} MiB KTX2; queued for ordered write)",
+                    encoded.len() as f64 / 1048576.0
+                ),
             ));
-            writer.add_reader(&target, encoded.as_slice(), FileOptions::default())?;
-        }
-        report(PackProgress::new(
-            "texture-done",
-            index + 1,
-            texture_count,
-            name,
-        ));
-    }
+            Ok(Some(encoded))
+        },
+        |event| {
+            match event {
+                parallel::Event::Progress(event) => report(event),
+                parallel::Event::Ready(index, encoded) => {
+                    let (source, target) = &textures[index];
+                    let name = source.strip_prefix(&root)?.display().to_string();
+                    report(PackProgress::new("compress", index, texture_count, &name));
+                    match encoded {
+                        Some(bytes) => {
+                            writer.add_reader(target, bytes.as_slice(), FileOptions::default())?
+                        }
+                        None => writer.add_reader(
+                            target,
+                            fs::File::open(source)?,
+                            FileOptions::default(),
+                        )?,
+                    }
+                    report(PackProgress::new(
+                        "texture-done",
+                        index + 1,
+                        texture_count,
+                        name,
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )?;
     report(PackProgress::new(
         "publish",
         0,

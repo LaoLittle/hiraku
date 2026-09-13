@@ -19,14 +19,14 @@
 //! Any requires an explicit cast before assignment to a concrete script type;
 //! native calls can accept dynamic values and validate them at the Rust boundary.
 //!
-//! `impl Player { fn score(self) -> Int { self.value } }` defines an instance
+//! `extend Player { fn score(self) -> Int { self.value } }` defines an instance
 //! method using the same function/bytecode machinery as ordinary functions.
-//! Methods without `self` are static: `impl Player { fn name() -> String {
+//! Methods without `self` are static: `extend Player { fn name() -> String {
 //! "Player" } }` is called with `Player.name()`, without creating an instance.
 //! Method lookup uses the canonical receiver type; primitive receivers are not
 //! boxed. Records, including `self`, use execution-owned object references;
 //! aliases and function arguments share field mutations. Primitive values are copied.
-//! Generic impl blocks and bound-method values are not supported yet.
+//! Generic extend blocks and bound-method values are not supported yet.
 //!
 //! Callable annotations use right-associative arrows: `(Int) -> (Int) -> ()`.
 //! The unit type is spelled `()`; the standard prelude defines the transparent
@@ -36,7 +36,7 @@
 //!
 //! `const` and `global const` require compile-time scalar initializers. Stored
 //! objects and native calls are intentionally not constant expressions.
-//! In an impl, `const A = 1` is accessed as `Player.A`. Computed properties use
+//! In an extend, `const A = 1` is accessed as `Player.A`. Computed properties use
 //! `var score: Int { ... }` or `var score: Int { get { ... } set(value) { ... } }`.
 //! Accessors lower to ordinary script functions; a setter parameter is mandatory.
 //!
@@ -66,7 +66,10 @@ mod fingerprint;
 pub use fingerprint::ProgramFingerprint;
 pub mod debug;
 pub mod project;
-pub use project::{CompiledProject, ProjectError, ScriptSource, compile_project};
+pub use project::{
+    CompiledProject, ProjectError, ProjectLinkPolicy, ScriptSource, compile_project,
+    compile_project_with_policy,
+};
 pub mod parse;
 pub mod register;
 pub mod runtime;

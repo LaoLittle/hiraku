@@ -478,7 +478,7 @@ fn visit_stmt(stmt: &Stmt, out: &mut Facts) {
                 block(b, out);
             }
         }
-        Stmt::Impl { methods, .. } => {
+        Stmt::Extend { methods, .. } | Stmt::Protocol { methods, .. } => {
             for s in methods {
                 visit_stmt(s, out);
             }

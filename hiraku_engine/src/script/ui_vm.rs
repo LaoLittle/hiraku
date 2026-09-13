@@ -117,6 +117,7 @@ struct UiDraft {
     text_reveal: Option<HksBinding<u32>>,
     press_scale: f32,
     scroll_speed: f32,
+    default_scroll_anchor: crate::ui::ScrollAnchor,
     gap: f32,
     padding: f32,
     surface: Option<[f32; 4]>,
@@ -163,6 +164,7 @@ impl UiDraft {
             text_reveal: None,
             press_scale: 1.0,
             scroll_speed: 48.0,
+            default_scroll_anchor: crate::ui::ScrollAnchor::Top,
             gap: 12.0,
             padding: 0.0,
             surface: None,
@@ -1127,6 +1129,22 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "defaultScrollAnchor", receiver)]
+    fn default_scroll_anchor(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        anchor: crate::ui::ScrollAnchor,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Scrollable) {
+            return Err(NativeError::message(
+                "defaultScrollAnchor requires scrollable",
+            ));
+        }
+        draft.default_scroll_anchor = anchor;
+        Ok(node)
+    }
+
     #[hks(name = "checked", receiver)]
     fn ui_checked(
         context: &mut UiVmContext,
@@ -1783,6 +1801,7 @@ fn color_component(value: f64) -> Result<f32, NativeError> {
 
 fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     let mut registry = NativeRegistry::new();
+    crate::ui::ScrollAnchor::register_hks(&mut registry).expect("scroll anchor registration");
     UiPosition::register_hks(&mut registry)
         .expect("UiPosition registration must be internally consistent");
     UiSize::register_hks(&mut registry).expect("UiSize registration must be internally consistent");
@@ -1971,11 +1990,12 @@ pub(crate) struct UiComposition {
 
 impl UiComposition {
     pub(crate) fn models_changed(&self, models: &crate::ui::UiModels) -> bool {
-        self.document.plan.structural_globals.iter().any(|name| {
-            !self.document.owned_globals.contains(name)
-                && models
-                    .get(name)
-                    .is_some_and(|value| self.values.story_value(name) != Some(value))
+        self.document.plan.structural_paths.iter().any(|path| {
+            let root = path.split('.').next().expect("dependency root");
+            // Invocation inputs can exist only in UiContext, not in UiModels.
+            !self.document.owned_globals.contains(root)
+                && models.get(root).is_some()
+                && models.get(path) != self.values.story_value(path)
         })
     }
 
@@ -2257,11 +2277,11 @@ fn reactive_binding<T>(
     program: &hiraku_script::LinkedProgram,
     context: &UiVmContext,
 ) -> PropertyComputation {
-    PropertyComputation {
-        program: program.clone(),
-        getter: binding.getter().value().clone(),
-        globals: context_globals(context),
-    }
+    PropertyComputation::new(
+        program.clone(),
+        binding.getter().value().clone(),
+        context_globals(context),
+    )
 }
 
 fn evaluate_binding_value(
@@ -2273,20 +2293,61 @@ fn evaluate_binding_value(
         .evaluate(registry, context, 100_000)
         .map_err(|error| UiVmError::Runtime(error.to_string()))
 }
+pub(crate) fn refresh_ui_property_models(
+    binding: &mut PropertyComputation,
+    models: &crate::ui::UiModels,
+) -> bool {
+    let mut changed = false;
+    for name in &binding.dependencies {
+        if let Some(value) = models.get(name) {
+            let next = stored_to_hks(value);
+            if binding.globals.get(name) != Some(&next) {
+                binding.globals.insert(name.clone(), next);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Per-system registry: immutable native definitions are reused, while each
+/// evaluation keeps its own VM/context and cannot leak state to another UI.
+pub(crate) struct UiPropertyEvaluator {
+    registry: NativeRegistry<UiVmContext>,
+}
+
+impl Default for UiPropertyEvaluator {
+    fn default() -> Self {
+        Self {
+            registry: ui_registry(&UiContext::default()),
+        }
+    }
+}
+
+impl UiPropertyEvaluator {
+    pub(crate) fn evaluate(
+        &self,
+        binding: &PropertyComputation,
+        models: &crate::ui::UiModels,
+    ) -> Result<Value, UiVmError> {
+        let mut binding = binding.clone();
+        for name in &binding.dependencies {
+            if let Some(value) = models.get(name) {
+                binding.globals.insert(name.clone(), stored_to_hks(value));
+            }
+        }
+        let values = UiContext::default();
+        let mut context = UiVmContext::new(values, TermCatalog::default());
+        evaluate_binding_value(&binding, &self.registry, &mut context)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn evaluate_ui_reactive_binding(
     binding: &PropertyComputation,
     models: &crate::ui::UiModels,
 ) -> Result<Value, UiVmError> {
-    let mut binding = binding.clone();
-    for (name, value) in models.roots() {
-        binding
-            .globals
-            .insert(name.to_string(), stored_to_hks(value));
-    }
-    let values = UiContext::default();
-    let registry = ui_registry(&values);
-    let mut context = UiVmContext::new(values, TermCatalog::default());
-    evaluate_binding_value(&binding, &registry, &mut context)
+    UiPropertyEvaluator::default().evaluate(binding, models)
 }
 
 fn materialize_screen(
@@ -2722,6 +2783,7 @@ fn materialize_node(
             Ok(ScreenNode::Scrollable(ScrollableNode {
                 children,
                 speed: draft.scroll_speed,
+                default_scroll_anchor: draft.default_scroll_anchor,
                 layout: draft.layout,
             }))
         }
@@ -3697,6 +3759,92 @@ screen {
             )
             .is_err(),
             "missing saved state must not become dynamically truthy"
+        );
+    }
+
+    #[test]
+    fn captured_history_properties_do_not_depend_on_unrelated_models() {
+        let screen = evaluate_ui_component_named(
+            "memory://history.ui.hks",
+            r#"import ui.widgets.*
+            @ui
+            global fn main() -> UiNode {
+                let entry = .{ text: "Alice" }
+                canvas { richText(entry.text) }
+            }"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("synthetic history");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("text node")
+        };
+        let mut property = text.reactive_text.clone().expect("captured property");
+        assert!(
+            property.dependencies.is_empty(),
+            "immutable capture has no global reads"
+        );
+        assert!(
+            property.globals.is_empty(),
+            "do not retain the document's unrelated globals"
+        );
+        let mut models = crate::ui::UiModels::default();
+        models.set("time", StoredValue::Int(1));
+        models.set("history", StoredValue::String("Bob".into()));
+        assert!(!refresh_ui_property_models(&mut property, &models));
+        assert_eq!(
+            evaluate_ui_reactive_binding(&property, &models).expect("captured text"),
+            Value::String("Alice".into())
+        );
+    }
+
+    #[test]
+    fn property_dependencies_include_script_helpers() {
+        let screen = evaluate_ui_component_named(
+            "memory://helper.ui.hks",
+            "import ui.widgets.*\nglobal var name: String = \"Alice\"\nfn label() -> String { name }\ncanvas { text(label()) }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(),
+        ).expect("helper UI");
+        let ScreenNode::Text(text) = &screen.children[0] else {
+            panic!("text node")
+        };
+        let property = text.reactive_text.as_ref().expect("property");
+        assert!(property.dependencies.contains("name"));
+    }
+
+    #[test]
+    fn scrollable_accepts_contextual_default_anchors() {
+        for (name, expected) in [
+            ("top", crate::ui::ScrollAnchor::Top),
+            ("center", crate::ui::ScrollAnchor::Center),
+            ("bottom", crate::ui::ScrollAnchor::Bottom),
+        ] {
+            let source = format!(
+                "import ui.widgets.*\ncanvas {{ scrollable {{ text(\"Alice\") }}.defaultScrollAnchor(.{name}) }}"
+            );
+            let screen = evaluate_ui_component_named(
+                "memory://scroll.ui.hks",
+                &source,
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("scroll anchor is a typed modifier");
+            let ScreenNode::Scrollable(scroll) = &screen.children[0] else {
+                panic!("scrollable");
+            };
+            assert_eq!(scroll.default_scroll_anchor, expected);
+        }
+        assert!(
+            evaluate_ui_component_named(
+                "memory://invalid.ui.hks",
+                "import ui.widgets.*\ncanvas { text(\"Alice\").defaultScrollAnchor(.bottom) }",
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .is_err()
         );
     }
 

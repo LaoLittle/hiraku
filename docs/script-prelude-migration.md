@@ -73,8 +73,9 @@ declaration references rather than infinite expansion.
    The declarations now live in std; Optional still has a specialized native ABI.
    Remove special Optional type/value/VM paths only after
    generic semantics cover nested options, casts, safe access and narrowing.
-4. Script operator declarations: lower `self` to a typed first parameter and
-   dispatch by static signatures. Operators generate ordinary calls.
+4. Script protocols now lower `self` to a typed first parameter and
+   dispatch operators by static conformance signatures. Extend this to imported extension interfaces
+   before moving engine-owned operators into separate library modules.
 5. Script-owned statement handlers with explicit transaction boundaries and
    resumable frames. Do not run handlers on arguments, declaration initializers,
    intermediate fluent values, or returned tail values. Suppress recursive
@@ -132,3 +133,165 @@ optional branches use the normal when/control-flow representation.
 
 Existing record-shaped `type` declarations retain their current semantics during
 this step; the new `struct` spelling does not silently reinterpret existing assets.
+
+## Type extensions
+
+`extend Type { ... }` adds instance methods, static functions, constants and
+computed properties to a named type. The former script `impl` keyword is rejected
+with a migration diagnostic. Rust implementation blocks are unaffected.
+Extensions lower to ordinary typed functions; they introduce neither a wrapper
+object nor an additional runtime dispatch layer.
+
+```hks
+protocol Colon<Rhs> {
+    type Output
+    fn colon(self, rhs: Rhs) -> Self.Output
+}
+
+// Colon is already supplied by std; applications only write this extension.
+extend String: Colon<TextTemplate> {
+    type Output = Unit
+    fn colon(self, text: TextTemplate) {
+        say(self, text)
+    }
+}
+
+"alice": "Hello ${player.name}"
+```
+
+`operator fn` has been removed. Colon resolution first checks the statically
+known receiver's Colon conformance.
+Its right operand receives the declared parameter context, so TextTemplate
+literals remain unevaluated. Other expressions are checked against that type.
+The operator executes in an ordinary resumable function frame, including host
+waits and snapshot restoration. Protocol arguments, required methods, associated
+type definitions and implementation signatures are checked before method lowering.
+`Output` and `Self.Output` resolve in the implementation signature's scope.
+Missing/duplicate requirements and incompatible associated return types are errors.
+
+Protocol methods also participate in ordinary receiver lookup: `value.test()`
+and calls such as `self.test()` inside another protocol implementation resolve
+statically. Inherent extension methods take precedence; otherwise exactly one
+protocol implementation must provide the member. Multiple protocol candidates
+produce an ambiguity diagnostic rather than selecting by declaration/import order.
+Taking a bound protocol method as a value requires a closure for now. The core
+library's demand-driven loader recognizes both operator use and explicit method
+names such as `number.add(other)`.
+
+Std defines Add, Subtract, Multiply, Divide, Equal, NotEqual, Less, LessEqual,
+Greater, GreaterEqual, Negate and Not alongside Colon. Int/Float implement
+arithmetic, comparison and negation; String implements concatenation and equality;
+Bool implements equality and negation. Their bodies call typed compiler
+intrinsics, which lower directly to existing arithmetic/comparison instructions.
+Primitive operator expressions resolve through the standard library's protocol
+functions. Those functions carry `@inline`; the MIR optimizer can remove their
+call frames without boxed values. Custom record implementations use the same
+ordinary resumable call machinery.
+Logical `&&`/`||` retain control-flow lowering and short-circuit evaluation.
+
+Remaining limitations: imported protocol interfaces, multiple RHS implementations of one protocol for one receiver,
+associated types in method-local declarations, recursive associated type
+projections, default methods and protocol objects. These are not yet a complete
+protocol type system. Nullable/structural equality retains its existing lowering.
+The engine's native colon registration remains a fallback during migration.
+
+`compile_project_with_policy` accepts a host-owned `ProjectLinkPolicy` with grants
+keyed by exact source path. Grants resolve after deterministic module sorting;
+unknown paths are errors. Ordinary project compilation grants nothing. The host
+must supply authenticated library contents; a privileged-looking filename alone
+does not authorize code. Policies are not serialized in snapshots. This adds the
+project compiler entry point for the existing capability-aware linker, not an
+automatic privilege grant to the engine's current embedded prelude.
+
+## Generic protocol constraints
+
+```hks
+protocol Test {
+    fn test(self) -> String
+}
+
+extend String: Test {
+    fn test(self) -> String { self }
+}
+
+fn what<T: Test>(value: T) { value.test() }
+fn forward<T: Test>(value: T) -> String { what(value) }
+
+let result = forward("alice")
+```
+
+Function bounds support multiple protocols (`T: Label + Append<Int>`) and
+generic protocol arguments. They also apply to generic methods in concrete
+extensions. Unconstrained method access, missing conformances and ambiguous
+methods are compile errors. The return type can be inferred from the bound's
+method signature. Generic forwarding must carry the required bounds itself.
+
+The compiler adds typed, implicit implementation-function parameters. Call sites
+prove conformance and provide these parameters; forwarding reuses the caller's
+evidence. Bodies remain type-erased: no monomorphization, string lookup, native
+function pointer serialization or protocol-specific VM opcode is introduced.
+Closures capture the implicit function parameters using ordinary captures, and
+host waits/snapshots preserve them using existing script function values.
+
+Current explicit restrictions:
+
+- Constrained function exports require a cross-module witness interface and are
+  rejected until that interface is implemented, rather than losing constraints.
+- Taking a constrained generic function/method as a value is rejected. A typed
+  closure can call it with concrete arguments and capture the required evidence.
+- Bounds on type aliases, structs, enums and generic extension targets remain
+  unsupported; protocols with associated types or no methods cannot yet be used
+  as generic bounds. Associated projections require an additional constraint
+  representation, not an Any fallback.
+- Protocol requirements cannot themselves have generic parameters yet.
+
+Next priorities are cross-module protocol/conformance identity and witness
+signatures, associated-type projections/equality constraints, then constrained
+generic types and generic extensions. These must share the same conformance
+checker rather than introducing separate runtime checks per syntax form.
+
+## Intrinsic namespace and authorization
+
+Compiler operations now use `intrinsics.panic`, `intrinsics.floatToInt`,
+`intrinsics.intToFloat`, `intrinsics.toString`, and typed operation namespaces
+such as `intrinsics.int.add`. Legacy `__builtin_*` calls are rejected.
+Only injected core functions receive compiler-intrinsic authorization during
+normalization. Parsed functions always start unprivileged; source attributes,
+shadowing a std function, and incoming AST privilege flags cannot grant access.
+Authorization is checked before lowering an intrinsic to inline bytecode, where
+there would no longer be a native relocation for the linker to inspect.
+
+Rust-provided module members use native capability requirements and the defining
+module's link policy. `engine` has no compiler-defined meaning: registration of
+`intrinsics.audio.invoke`, `intrinsics.graphics.invoke`, or `host.services.invoke`
+uses exactly the same member resolution and authorization. Qualified native
+function lookup respects local/global value bindings shadowing a module root.
+Project tests exercise an
+independent authorized HKS wrapper calling `intrinsics.engine.say` and reject
+the same call from an untrusted entry module. Compiler permission does not grant
+host permission, and permission is not inherited by a wrapper's callers.
+
+Engine API registrations have **not** all been renamed or moved into script
+wrappers yet. Actor/Colon and UI still require cross-module extension interfaces
+before their implementations can be removed from the existing native API.
+
+## Inline hints and runtime calls
+
+`@inline` is a compile-time optimization hint on functions and extension methods.
+An initial bounded MIR pass handles small straight-line value functions containing
+parameter reads, constants, moves, arithmetic, negation and string conversion.
+Argument evaluation remains in the caller, once each in source order, including
+unused parameters. Local registers are remapped rather than sharing callee locals.
+Four bounded bottom-up rounds allow small annotated wrappers around inline helpers.
+
+Host calls, recursive calls, statement commits, writes, closures, control flow,
+generic substitutions, Unit/Never-returning functions and trackCaller functions
+are not currently inline candidates. The hint falls back to an ordinary call;
+it does not grant intrinsic access or change waiting semantics. Host native
+capabilities are checked at link time, not every time the VM executes a Call.
+Compiler-only operations are authorized before lowering to machine-like bytecode;
+this is separate from runtime native dispatch. No runtime capability opcode was
+introduced.
+
+Cross-module inlining and inline-frame debug metadata remain future work. Exported
+or address-taken function bodies remain available even when direct calls inline.

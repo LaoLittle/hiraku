@@ -15,6 +15,9 @@ pub(crate) fn spatial_layer() -> RenderLayers {
 #[derive(Component)]
 pub(super) struct ViewCamera;
 
+#[derive(Component)]
+pub(super) struct ViewSurface;
+
 struct ViewEntities {
     camera: Entity,
     surface: Entity,
@@ -53,11 +56,12 @@ pub(super) fn sync(
         With<ViewCamera>,
     >,
     mut surfaces: Query<&mut WorldSprite>,
-    mut redraw: crate::redraw::Redraw,
+    mut redraw: super::redraw::StageRedraw,
 ) {
     let state = shared.0.spatial_stage.as_ref();
     let owner = state.map(|s| (s.id, s.path.clone()));
     if owner != rendered.owner {
+        redraw.request();
         if let Some(root) = rendered.root.take() {
             commands.entity(root).try_despawn();
         }
@@ -91,6 +95,7 @@ pub(super) fn sync(
                 cameras.get_mut(entities.camera)
             {
                 if current_ambient.map(|light| light.brightness) != ambient {
+                    redraw.request();
                     if let Some(brightness) = ambient {
                         commands.entity(entities.camera).insert(AmbientLight {
                             brightness,
@@ -101,25 +106,32 @@ pub(super) fn sync(
                     }
                 }
                 if current_exposure.ev100 != exposure.ev100 {
+                    redraw.request();
                     *current_exposure = exposure;
                 }
                 if camera.is_active != visible {
+                    redraw.request();
                     camera.is_active = visible;
                 }
-                pose.set_if_neq(preset.pose.transform());
+                if pose.set_if_neq(preset.pose.transform()) {
+                    redraw.request();
+                }
                 if super::runtime::projection_kind_values(&lens)
                     != super::runtime::projection_kind_values(&next)
                 {
                     *lens = next;
+                    redraw.request();
                 }
             }
             if let Ok(mut surface) = surfaces.get_mut(entities.surface) {
                 let clip = view.clip.plane(canvas.size.as_vec2());
                 if surface.clip_plane != clip {
+                    redraw.request();
                     surface.clip_plane = clip;
                 }
                 let color = Color::linear_rgba(1.0, 1.0, 1.0, view.alpha);
                 if surface.color != color {
+                    redraw.request();
                     surface.color = color;
                 }
             }
@@ -167,6 +179,7 @@ pub(super) fn sync(
         let surface = commands
             .spawn((
                 sprite,
+                ViewSurface,
                 Pickable::IGNORE,
                 Transform::from_xyz(0.0, 0.0, view.order as f32),
                 Visibility::default(),

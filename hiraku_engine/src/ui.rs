@@ -211,8 +211,41 @@ pub struct ScrollableNode {
     pub children: Vec<ScreenNode>,
     pub speed: f32,
     #[serde(default)]
+    pub default_scroll_anchor: ScrollAnchor,
+    #[serde(default)]
     pub layout: ScreenLayout,
 }
+
+hiraku_script::hks_define! {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum ScrollAnchor {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+impl ScrollAnchor {
+    #[getter]
+    fn top() -> ScrollAnchor { Self::Top }
+    #[getter]
+    fn center() -> ScrollAnchor { Self::Center }
+    #[getter]
+    fn bottom() -> ScrollAnchor { Self::Bottom }
+}
+}
+
+impl ScrollAnchor {
+    pub(crate) fn fraction(self) -> f32 {
+        match self {
+            Self::Top => 0.0,
+            Self::Center => 0.5,
+            Self::Bottom => 1.0,
+        }
+    }
+}
+
+#[derive(Component)]
+pub(crate) struct InitialScrollAnchor(pub ScrollAnchor);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToggleNode {

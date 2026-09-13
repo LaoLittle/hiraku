@@ -24,6 +24,8 @@ pub struct CompositionPlan {
     pub sites: Vec<RegionSite>,
     /// Conservative reads outside extracted property computations.
     pub structural_globals: BTreeSet<String>,
+    /// Exact member paths read by structure; whole-object reads remain roots.
+    pub structural_paths: BTreeSet<String>,
     /// All reads, including extracted properties and helper functions. Hosts
     /// can use this to schedule updates for time-dependent documents.
     pub read_globals: BTreeSet<String>,
@@ -85,6 +87,21 @@ fn is_property(ty: &ScriptType) -> bool {
 }
 
 impl<'h> Lower<'_, 'h> {
+    fn global_path(&self, expr: &HirExpr<'h>) -> Option<String> {
+        match expr.kind {
+            E::Global(id) => self
+                .program
+                .symbols
+                .resolve(self.program.globals[id.0 as usize].name)
+                .map(str::to_owned),
+            E::Member { object, member, .. } => Some(format!(
+                "{}.{}",
+                self.global_path(object)?,
+                self.program.symbols.resolve(member)?
+            )),
+            _ => None,
+        }
+    }
     fn site(&mut self, kind: RegionKind, span: Span) {
         self.plan.sites.push(RegionSite {
             id: self.plan.sites.len() as u32,
@@ -201,6 +218,7 @@ impl<'h> Lower<'_, 'h> {
                     let name = self.program.globals[id.0 as usize].name;
                     if let Some(name) = self.program.symbols.resolve(name) {
                         self.plan.structural_globals.insert(name.into());
+                        self.plan.structural_paths.insert(name.into());
                     }
                 }
                 expr.kind
@@ -297,11 +315,27 @@ impl<'h> Lower<'_, 'h> {
                 object,
                 member,
                 safe,
-            } => E::Member {
-                object: self.expr(object),
-                member,
-                safe,
-            },
+            } => {
+                let path = self.global_path(expr);
+                let structural = self.property_depth == 0 && path.is_some();
+                if structural {
+                    let path = path.as_ref().expect("member path");
+                    self.plan
+                        .structural_globals
+                        .insert(path.split('.').next().expect("root").into());
+                    self.plan.structural_paths.insert(path.clone());
+                    self.property_depth += 1;
+                }
+                let object = self.expr(object);
+                if structural {
+                    self.property_depth -= 1;
+                }
+                E::Member {
+                    object,
+                    member,
+                    safe,
+                }
+            }
             E::Intrinsic {
                 operation,
                 argument,

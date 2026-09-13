@@ -5,12 +5,27 @@ use super::LoweringError;
 use crate::{Program, Stmt, TypeExprKind};
 #[path = "constants.rs"]
 mod constants;
+#[path = "protocols.rs"]
+mod protocols;
 
 pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
     static CORE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
     let core = CORE.get_or_init(|| {
         crate::parse_program(include_str!("../std/core.hks"))
             .expect("the bundled script core library must parse")
+    });
+    let source = protocols::resolve(source, core)?;
+    let source = &source;
+    static NORMALIZED_CORE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+    let core = NORMALIZED_CORE.get_or_init(|| {
+        protocols::resolve(
+            core,
+            &Program {
+                statements: Vec::new(),
+                warnings: Vec::new(),
+            },
+        )
+        .expect("bundled standard library protocol implementations must be valid")
     });
     // Import only referenced standard declarations and their dependencies. The
     // resulting bytecode remains self-contained without copying unused helpers.
@@ -41,9 +56,16 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 Stmt::Function { name, .. } => {
                     needed.contains(name) && !declared.contains(name.as_str())
                 }
-                Stmt::Impl { methods, .. } => methods.iter().any(
-                    |method| matches!(method, Stmt::Function { name, .. } if needed.contains(name)),
-                ),
+                Stmt::Extend { methods, .. } => methods.iter().any(|method| {
+                    let Stmt::Function { name, .. } = method else {
+                        return false;
+                    };
+                    needed.contains(name)
+                        || name
+                            .strip_prefix("protocol#")
+                            .and_then(|name| name.split_once('#'))
+                            .is_some_and(|(_, member)| needed.contains(member))
+                }),
                 _ => false,
             };
             if referenced && selected.insert(index) {
@@ -66,16 +88,24 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
     }
     let mut statements = Vec::new();
     let mut errors = Vec::new();
-    for statement in source.statements.iter().chain(
-        core.statements
-            .iter()
-            .enumerate()
-            .filter_map(|(index, statement)| selected.contains(&index).then_some(statement)),
-    ) {
-        let Stmt::Impl {
+    for (statement, trusted) in source
+        .statements
+        .iter()
+        .map(|statement| (statement, false))
+        .chain(
+            core.statements
+                .iter()
+                .enumerate()
+                .filter_map(|(index, statement)| {
+                    selected.contains(&index).then_some((statement, true))
+                }),
+        )
+    {
+        let Stmt::Extend {
             target,
             methods,
             span,
+            ..
         } = statement
         else {
             if let Stmt::Function { name, span, .. } = statement {
@@ -87,12 +117,20 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                     });
                 }
             }
-            statements.push(statement.clone());
+            let mut statement = statement.clone();
+            if let Stmt::Function {
+                compiler_intrinsics,
+                ..
+            } = &mut statement
+            {
+                *compiler_intrinsics = trusted;
+            }
+            statements.push(statement);
             continue;
         };
         let TypeExprKind::Named(owner) = &target.kind else {
             errors.push(LoweringError {
-                message: "impl currently requires a concrete named type".into(),
+                message: "extend currently requires a concrete named type".into(),
                 span: *span,
             });
             continue;
@@ -115,9 +153,12 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 };
                 statements.push(Stmt::Function {
                     attributes: Vec::new(),
+                    compiler_intrinsics: trusted,
                     exported: false,
                     name: format!("{owner}::get#{name}"),
                     type_parameters: Vec::new(),
+                    bounds: Vec::new(),
+                    witnesses: Vec::new(),
                     parameters: Vec::new(),
                     return_type: type_annotation.clone(),
                     body: crate::Block {
@@ -143,9 +184,12 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 };
                 statements.push(Stmt::Function {
                     attributes: Vec::new(),
+                    compiler_intrinsics: trusted,
                     exported: false,
                     name: format!("{owner}::get#{name}"),
                     type_parameters: Vec::new(),
+                    bounds: Vec::new(),
+                    witnesses: Vec::new(),
                     parameters: vec![receiver.clone()],
                     return_type: Some(ty.clone()),
                     body: getter.clone(),
@@ -154,9 +198,12 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 if let Some((parameter, body)) = setter {
                     statements.push(Stmt::Function {
                         attributes: Vec::new(),
+                        compiler_intrinsics: trusted,
                         exported: false,
                         name: format!("{owner}::set#{name}"),
                         type_parameters: Vec::new(),
+                        bounds: Vec::new(),
+                        witnesses: Vec::new(),
                         parameters: vec![
                             receiver,
                             crate::FunctionParameter {
@@ -199,6 +246,13 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 parameters[0].ty = Some(target.clone());
             }
             *name = format!("{owner}::{name}");
+            if let Stmt::Function {
+                compiler_intrinsics,
+                ..
+            } = &mut method
+            {
+                *compiler_intrinsics = trusted;
+            }
             statements.push(method);
         }
     }

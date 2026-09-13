@@ -64,9 +64,10 @@ pub(crate) fn emit_script_diagnostic(context: &str, diagnostic: &str) {
 }
 
 pub use ui_runtime::{UiContext, UiIntent};
+pub(crate) use ui_vm::UiPropertyEvaluator;
 pub(crate) use ui_vm::evaluate_ui_callback_with_args;
 pub(crate) use ui_vm::evaluate_ui_component_named_with_args;
-pub(crate) use ui_vm::evaluate_ui_reactive_binding;
+pub(crate) use ui_vm::refresh_ui_property_models;
 
 pub(crate) fn script_command_from_effect(
     effect: capabilities::StoryEffect,

@@ -266,7 +266,7 @@ pub(crate) fn sync(
     mut runtime: ResMut<StageRuntime>,
     time: crate::scene::playback::StoryTime,
     canvas: Option<Res<crate::HirakuCanvas>>,
-    mut redraw: crate::redraw::Redraw,
+    mut redraw: super::redraw::StageRedraw,
     mut camera: Query<
         (&mut Transform, &mut Projection),
         With<crate::render::camera::WorldCamera3d>,
@@ -281,6 +281,7 @@ pub(crate) fn sync(
         .map(|stage| stage.path.clone());
     let id = shared.0.spatial_stage.as_ref().map(|stage| stage.id);
     if path != runtime.path || id != runtime.id {
+        redraw.request();
         if let Some(root) = runtime.root.take() {
             commands.entity(root).try_despawn();
         }
@@ -456,6 +457,7 @@ pub(crate) struct StageLightMarker;
 /// without modifying the source asset or materials shared with another scene.
 pub(crate) fn prepare_surfaces(
     mut commands: Commands,
+    mut redraw: super::redraw::StageRedraw,
     mut runtime: ResMut<StageRuntime>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     surfaces: Query<
@@ -486,6 +488,7 @@ pub(crate) fn prepare_surfaces(
                     .any(|ancestor| ancestor == root)
                 {
                     light.spawn(&mut commands, entity);
+                    redraw.request();
                     commands.entity(entity).insert(StageLightMarker);
                 }
             }
@@ -513,6 +516,7 @@ pub(crate) fn prepare_surfaces(
             commands
                 .entity(entity)
                 .insert((StageSurface, super::views::spatial_layer()));
+            redraw.request();
         }
     }
     for (entity, material, name) in &surfaces {
@@ -534,6 +538,7 @@ pub(crate) fn prepare_surfaces(
                 handle.clone()
             } else {
                 let Some(source) = materials.get(material) else {
+                    redraw.request();
                     continue;
                 };
                 let mut source = source.clone();
@@ -552,6 +557,7 @@ pub(crate) fn prepare_surfaces(
         commands
             .entity(entity)
             .insert((StageSurface, super::views::spatial_layer()));
+        redraw.request();
     }
 }
 
@@ -842,6 +848,9 @@ mod tests {
     #[test]
     fn imported_lights_use_the_stage_layer_without_touching_external_lights() {
         let mut app = App::new();
+        app.add_message::<bevy::window::RequestRedraw>();
+        let mut redraws =
+            bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
         app.init_resource::<Assets<StandardMaterial>>()
             .init_resource::<StageRuntime>()
             .add_systems(Update, prepare_surfaces);
@@ -882,6 +891,27 @@ mod tests {
         );
         assert!(app.world().get::<StageSurface>(light).is_some());
         assert!(app.world().get::<StageSurface>(external).is_none());
+        assert_eq!(
+            redraws
+                .read(
+                    app.world()
+                        .resource::<Messages<bevy::window::RequestRedraw>>()
+                )
+                .count(),
+            1,
+            "late scene decoration must wake a reactive runner"
+        );
+        app.update();
+        assert_eq!(
+            redraws
+                .read(
+                    app.world()
+                        .resource::<Messages<bevy::window::RequestRedraw>>()
+                )
+                .count(),
+            0,
+            "already prepared surfaces must not request continuous frames"
+        );
         let imported = app.world().get::<SpotLight>(light).expect("imported light");
         assert_eq!(imported.radius, 0.0);
         assert_eq!(imported.range, 90.0);

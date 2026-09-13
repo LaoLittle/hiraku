@@ -60,6 +60,35 @@ pub struct CharacterMaskDefinition {
     pub kind: CharacterMaskKind,
     #[serde(rename = "ref")]
     pub reference: u8,
+    #[serde(default = "mask_visible")]
+    /// Whether a writer also contributes its own color to the composition.
+    pub visible: bool,
+    #[serde(default)]
+    /// Stencil tests source alpha; alpha coverage preserves soft mask edges.
+    pub coverage: CharacterMaskCoverage,
+}
+
+fn mask_visible() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum CharacterMaskCoverage {
+    #[default]
+    Stencil,
+    Alpha,
+}
+
+impl Default for CharacterMaskDefinition {
+    fn default() -> Self {
+        Self {
+            kind: CharacterMaskKind::Write,
+            reference: 1,
+            visible: true,
+            coverage: CharacterMaskCoverage::Stencil,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -631,6 +660,7 @@ mod tests {
             Some(CharacterMaskDefinition {
                 kind: CharacterMaskKind::Read,
                 reference: 2,
+                ..Default::default()
             })
         );
         assert_eq!(shade.blend, CharacterBlendMode::Multiply);
@@ -691,6 +721,7 @@ mod tests {
             Some(CharacterMaskDefinition {
                 kind: CharacterMaskKind::Write,
                 reference: 1,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -698,6 +729,7 @@ mod tests {
             Some(CharacterMaskDefinition {
                 kind: CharacterMaskKind::Read,
                 reference: 1,
+                ..Default::default()
             })
         );
         assert_eq!(alice.parts[1].blend, CharacterBlendMode::Normal);

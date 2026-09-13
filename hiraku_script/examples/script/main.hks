@@ -39,3 +39,29 @@ while index < 3 {
     print("Iteration ${index}")
     index += 1
 }
+
+struct TestFoo {
+    name: String?
+}
+
+protocol Test { fn test(self) -> Unit }
+
+extend TestFoo: Test {
+    fn test(self) { print("name: ${self.name ?: "no way"}") }
+}
+
+extend TestFoo: Colon<String> {
+    type Output = Unit
+
+    fn colon(self, rhs: String) {
+        self.test()
+        print("rhs: ${rhs}")
+    }
+}
+
+
+let s: TestFoo = .{ name: "some name" }
+
+s: "123"
+
+//what(s)

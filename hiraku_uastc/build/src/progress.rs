@@ -101,16 +101,8 @@ fn render(receiver: mpsc::Receiver<Message>, mut output: impl Write) {
             Ok(Message::Update(next)) => {
                 let changed_phase = current.as_ref().is_none_or(|old| old.phase != next.phase);
                 if changed_phase {
-                    if let Some(old) = &current {
-                        if matches!(old.phase, "encode" | "compress" | "publish") {
-                            let _ = writeln!(
-                                output,
-                                "[HDP {} finished] {:.1}s",
-                                old.phase,
-                                stage_started.elapsed().as_secs_f64()
-                            );
-                        }
-                    }
+                    // Concurrent workers interleave phases. A new event does
+                    // not mean the previous worker's operation has finished.
                     stage_started = Instant::now();
                 }
                 if changed_phase || last_print.elapsed() >= Duration::from_secs(2) {

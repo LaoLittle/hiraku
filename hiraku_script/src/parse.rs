@@ -459,7 +459,12 @@ impl Parser {
             match name.as_str() {
                 "import" => return self.parse_import(),
                 "fn" => return self.parse_function(false),
-                "impl" => return self.parse_impl(),
+                "extend" => return self.parse_extend(),
+                "protocol" => return self.parse_protocol(),
+                "impl" => {
+                    self.error_here("`impl` is no longer supported; use `extend Type { ... }`");
+                    return self.parse_extend();
+                }
                 "type" => return self.parse_type_alias(),
                 "struct" => return self.parse_struct(),
                 "enum" => return self.parse_enum(),
@@ -603,6 +608,10 @@ impl Parser {
     }
 
     fn parse_function(&mut self, exported: bool) -> Stmt {
+        self.parse_function_declaration(exported, true)
+    }
+
+    fn parse_function_declaration(&mut self, exported: bool, has_body: bool) -> Stmt {
         let start = self.advance();
         let name = match self.advance().kind {
             TokenKind::Ident(name) => name,
@@ -611,7 +620,7 @@ impl Parser {
                 "<error>".to_string()
             }
         };
-        let type_parameters = self.parse_type_parameter_names();
+        let (type_parameters, bounds) = self.parse_generic_parameters();
         self.expect(TokenKind::LParen, "expected `(` after function name");
         let mut parameters = Vec::new();
         self.skip_newlines();
@@ -655,13 +664,23 @@ impl Parser {
         } else {
             None
         };
-        let body = self.parse_block();
+        let body = if has_body {
+            self.parse_block()
+        } else {
+            Block {
+                statements: Vec::new(),
+                span: self.current().span,
+            }
+        };
         let span = Span::join(&start.span, &body.span);
         Stmt::Function {
+            compiler_intrinsics: false,
             attributes: Vec::new(),
             exported,
             name,
             type_parameters,
+            bounds,
+            witnesses: Vec::new(),
             parameters,
             return_type,
             body,
@@ -669,30 +688,87 @@ impl Parser {
         }
     }
 
-    fn parse_impl(&mut self) -> Stmt {
+    fn parse_extend(&mut self) -> Stmt {
         let start = self.advance().span;
         let target = self.parse_type();
+        let protocol = if self.at(TokenKind::Colon) {
+            self.advance();
+            Some(self.parse_type())
+        } else {
+            None
+        };
         self.skip_newlines();
-        self.expect(TokenKind::LBrace, "expected `{` after impl type");
+        self.expect(TokenKind::LBrace, "expected `{` after extension type");
         self.skip_separators();
         let mut methods = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-            if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
+            if self.at(TokenKind::At) {
+                let method = self.parse_attributed_statement();
+                if !matches!(method, Stmt::Function { .. }) {
+                    self.error_here("extension attributes must annotate a function");
+                }
+                methods.push(method);
+            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "type") {
+                methods.push(self.parse_type_alias());
+            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
                 methods.push(self.parse_function(false));
             } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "var") {
                 methods.push(self.parse_property());
             } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "const") {
                 methods.push(self.parse_const(false));
             } else {
-                self.error_here("impl blocks accept functions and computed properties, not stored let/var fields");
+                self.error_here("extend blocks accept functions, constants and computed properties, not stored let/var fields");
                 self.parse_statement();
             }
             self.skip_separators();
         }
         let end = self.current().span;
-        self.expect(TokenKind::RBrace, "expected `}` after impl methods");
-        Stmt::Impl {
+        self.expect(TokenKind::RBrace, "expected `}` after extension members");
+        Stmt::Extend {
             target,
+            protocol,
+            methods,
+            span: Span::join(&start, &end),
+        }
+    }
+
+    fn parse_protocol(&mut self) -> Stmt {
+        let start = self.advance().span;
+        let name = match self.advance().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected protocol name");
+                "<error>".into()
+            }
+        };
+        let type_parameters = self.parse_type_parameter_names();
+        self.skip_newlines();
+        self.expect(TokenKind::LBrace, "expected `{` after protocol name");
+        self.skip_separators();
+        let mut associated_types = Vec::new();
+        let mut methods = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            if matches!(&self.current().kind, TokenKind::Ident(name) if name == "type") {
+                self.advance();
+                match self.advance().kind {
+                    TokenKind::Ident(name) => associated_types.push(name),
+                    _ => self.error_here("expected associated type name"),
+                }
+            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
+                methods.push(self.parse_function_declaration(false, false));
+            } else {
+                self.error_here("protocols accept associated types and function signatures");
+                self.advance();
+            }
+            self.skip_separators();
+        }
+        let end = self
+            .expect(TokenKind::RBrace, "expected `}` after protocol")
+            .span;
+        Stmt::Protocol {
+            name,
+            type_parameters,
+            associated_types,
             methods,
             span: Span::join(&start, &end),
         }
@@ -1028,11 +1104,23 @@ impl Parser {
     }
 
     fn parse_type_parameter_names(&mut self) -> Vec<String> {
+        let (parameters, bounds) = self.parse_generic_parameters();
+        for bound in bounds {
+            self.errors.push(ParseError {
+                message: "protocol bounds are currently supported on functions only".into(),
+                span: bound.protocol.span,
+            });
+        }
+        parameters
+    }
+
+    fn parse_generic_parameters(&mut self) -> (Vec<String>, Vec<crate::ast::ProtocolBound>) {
         if !self.at(TokenKind::Lt) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         self.advance();
         let mut parameters = Vec::new();
+        let mut bounds = Vec::new();
         while !self.at(TokenKind::Gt) && !self.at(TokenKind::Eof) {
             match self.advance().kind {
                 TokenKind::Ident(name) => {
@@ -1042,7 +1130,20 @@ impl Parser {
                             span: self.previous().span,
                         });
                     } else {
-                        parameters.push(name);
+                        parameters.push(name.clone());
+                    }
+                    if self.at(TokenKind::Colon) {
+                        self.advance();
+                        loop {
+                            bounds.push(crate::ast::ProtocolBound {
+                                parameter: name.clone(),
+                                protocol: self.parse_type(),
+                            });
+                            if !self.at(TokenKind::Plus) {
+                                break;
+                            }
+                            self.advance();
+                        }
                     }
                 }
                 _ => self.error_here("expected type parameter name"),
@@ -1054,7 +1155,7 @@ impl Parser {
             }
         }
         self.expect(TokenKind::Gt, "expected `>` after type parameters");
-        parameters
+        (parameters, bounds)
     }
 
     fn parse_if(&mut self) -> Stmt {
@@ -1229,13 +1330,21 @@ impl Parser {
             self.parse_record_type_contents(start)
         } else {
             let token = self.advance();
-            let TokenKind::Ident(name) = token.kind else {
+            let TokenKind::Ident(mut name) = token.kind else {
                 self.error_here("expected type name");
                 return TypeExpr {
                     kind: TypeExprKind::Named("<error>".to_string()),
                     span: token.span,
                 };
             };
+            if name == "Self" && self.at(TokenKind::Dot) {
+                self.advance();
+                if let TokenKind::Ident(member) = self.advance().kind {
+                    name = format!("Self.{member}");
+                } else {
+                    self.error_here("expected associated type after `Self.`");
+                }
+            }
             if self.at(TokenKind::Lt) {
                 self.advance();
                 let mut arguments = Vec::new();
@@ -2646,6 +2755,23 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_extension_members_and_rejects_old_keyword() {
+        let source = "extend Alice { const LIMIT = 3; fn name() -> String { \"Alice\" } var score: Int { get { 1 } set(value) { value } } }";
+        let program = parse_program(source).expect("extension members parse");
+        let Stmt::Extend { methods, .. } = &program.statements[0] else {
+            panic!("expected extension declaration")
+        };
+        assert_eq!(methods.len(), 3);
+        let errors = parse_program("impl Alice { fn name() -> String { \"Alice\" } }")
+            .expect_err("old keyword must not be accepted");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("use `extend"))
+        );
     }
 
     #[test]

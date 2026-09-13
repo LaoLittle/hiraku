@@ -124,6 +124,8 @@ impl UiDocument {
                 .extend(dependency.read_globals.iter().cloned());
             plan.structural_globals
                 .extend(dependency.structural_globals.iter().cloned());
+            plan.structural_paths
+                .extend(dependency.structural_paths.iter().cloned());
         }
         Ok(Self {
             program: project.program,

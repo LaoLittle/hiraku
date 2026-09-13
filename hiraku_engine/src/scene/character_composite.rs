@@ -490,10 +490,19 @@ fn build_layers(
                 }
                 match mask.kind {
                     CharacterMaskKind::Read => MaskMode::Read(reference),
+                    CharacterMaskKind::Write
+                        if mask.coverage == crate::character::CharacterMaskCoverage::Alpha =>
+                    {
+                        MaskMode::Write {
+                            reference,
+                            cutoff: 0.0,
+                            visible: mask.visible,
+                        }
+                    }
                     CharacterMaskKind::Write => MaskMode::StencilWrite {
                         reference,
                         cutoff: 1.0 / 255.0,
-                        visible: true,
+                        visible: mask.visible,
                     },
                 }
             }
@@ -728,11 +737,13 @@ mod tests {
         writer.0.mask = Some(crate::character::CharacterMaskDefinition {
             kind: CharacterMaskKind::Write,
             reference: 1,
+            ..Default::default()
         });
         let mut reader = part("alice/shadow", [16.0, 0.0, 32.0, 16.0]);
         reader.0.mask = Some(crate::character::CharacterMaskDefinition {
             kind: CharacterMaskKind::Read,
             reference: 1,
+            ..Default::default()
         });
         reader.0.blend = CharacterBlendMode::Multiply;
         let mut sprite = WorldSprite::from_image(handle);
@@ -762,6 +773,32 @@ mod tests {
             layers[0].mask,
             MaskMode::StencilWrite { visible: true, .. }
         ));
+        writer.0.mask = Some(
+            hiraku_script::hson::from_str(
+                r#".{ kind: "write", ref: 1, visible: false, coverage: "alpha" }"#,
+            )
+            .expect("alpha-only mask descriptor"),
+        );
+        let (_, _, layers, _, _, _) = build_layers(
+            &[
+                (&writer, &sprite, &a, &visible, false),
+                (&reader, &sprite, &b, &visible, false),
+            ],
+            &mut images,
+            &mut atlas::PackedAtlas::default(),
+            8192,
+            None,
+        )
+        .expect("invisible alpha writer composition");
+        assert_eq!(
+            layers[0].mask,
+            MaskMode::Write {
+                reference: 1,
+                cutoff: 0.0,
+                visible: false,
+            }
+        );
+        assert_eq!(layers[1].mask, MaskMode::Read(1));
     }
 
     #[test]
@@ -780,6 +817,7 @@ mod tests {
         reader.0.mask = Some(crate::character::CharacterMaskDefinition {
             kind: CharacterMaskKind::Read,
             reference: 1,
+            ..Default::default()
         });
         reader.0.blend = CharacterBlendMode::Multiply;
         let a = WorldSprite::from_image(first.clone());

@@ -4077,6 +4077,90 @@ mod tests {
     }
 
     #[test]
+    fn inline_hint_preserves_argument_evaluation_and_removes_small_calls() {
+        let manifest = BuiltinManifest::new([("host", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            @inline
+            fn twice(value: Int) -> Int { value + value }
+            @inline
+            fn first(left: Int, right: Int) -> Int { left }
+            fn argument(value: Int) -> Int { host(value); value }
+            global let result = first(twice(argument(3)), argument(4))
+        "#,
+            &manifest,
+        );
+        for instruction in &code.instructions {
+            if let Instruction::Call { function, .. } = instruction {
+                assert!(
+                    !matches!(code.symbols.resolve(*function), Some("twice" | "first")),
+                    "small annotated calls should be inlined"
+                );
+            }
+        }
+        let mut vm = Vm::new(code.clone()).expect("VM initializes");
+        let mut calls = Vec::new();
+        loop {
+            match vm.step().expect("inline program executes") {
+                Some(VmEvent::Call(call)) => {
+                    calls.push(call.arguments[0].value.clone());
+                    vm = Vm::restore(code.clone(), vm.snapshot()).expect("argument wait restores");
+                    vm.resume(Value::Unit).expect("host resumes");
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(calls, vec![Value::Number(3.0), Value::Number(4.0)]);
+        assert_eq!(vm.global("result"), Some(&Value::Number(6.0)));
+    }
+
+    #[test]
+    fn inline_hint_keeps_effectful_functions_as_ordinary_calls() {
+        let manifest = BuiltinManifest::new([("host", BuiltinId(1))]);
+        let code = compile(
+            "@inline\nfn effect(value: Int) -> Int { host(value); value }\neffect(2)",
+            &manifest,
+        );
+        assert!(code.instructions.iter().any(|instruction| matches!(instruction, Instruction::Call { function, .. } if code.symbols.resolve(*function) == Some("effect"))));
+    }
+
+    #[test]
+    fn compiler_intrinsics_are_only_available_to_injected_core_functions() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for source in [
+            "intrinsics.floatToInt(1.5)",
+            "fn bypass() { intrinsics.int.add(1, 2) }\nbypass()",
+            "fn panic(message: String) -> Never { intrinsics.panic(message) }\npanic(\"alice\")",
+            "extend String { fn bypass(self) { intrinsics.toString(self) } }\n\"alice\".bypass()",
+            "@compilerIntrinsics\nfn bypass() { intrinsics.intToFloat(1) }\nbypass()",
+        ] {
+            let syntax = crate::parse_program(source).expect("syntax parses");
+            let errors = compile_with_manifest(&syntax, 0, &manifest)
+                .expect_err("user functions must not gain intrinsic access");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("capability")),
+                "{errors:?}"
+            );
+        }
+        let mut syntax = crate::parse_program("fn bypass() { intrinsics.int.add(1, 2) }\nbypass()")
+            .expect("syntax parses");
+        if let crate::Stmt::Function {
+            compiler_intrinsics,
+            ..
+        } = &mut syntax.statements[0]
+        {
+            *compiler_intrinsics = true;
+        }
+        assert!(
+            compile_with_manifest(&syntax, 0, &manifest).is_err(),
+            "normalization must discard forged AST privileges"
+        );
+    }
+
+    #[test]
     fn explicit_to_float_uses_the_core_method_and_intrinsic() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let mut vm = Vm::new(compile(
@@ -4092,12 +4176,308 @@ mod tests {
     }
 
     #[test]
-    fn impl_methods_receive_self_and_use_the_ordinary_call_path() {
+    fn script_operators_dispatch_by_receiver_and_restore_host_waits() {
+        let manifest = BuiltinManifest::new([("host", BuiltinId(1))]);
+        let bytecode = compile(
+            r#"
+            struct Actor { name: String }
+            extend Actor: Colon<TextTemplate> {
+                type Output = Unit
+                fn colon(self, text: TextTemplate) { host(self.name, text) }
+            }
+            extend String: Colon<TextTemplate> {
+                type Output = Unit
+                fn colon(self, text: TextTemplate) { host(self, text) }
+            }
+            let alice = Actor.{ name: "alice" }
+            alice: "Hello ${1 + 2}"
+            "bob": "World"
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(bytecode.clone()).expect("VM initializes");
+        let mut calls = Vec::new();
+        loop {
+            match vm.step().expect("operator executes") {
+                Some(VmEvent::Call(call)) => {
+                    calls.push(
+                        call.arguments
+                            .iter()
+                            .map(|arg| arg.value.clone())
+                            .collect::<Vec<_>>(),
+                    );
+                    vm = Vm::restore(bytecode.clone(), vm.snapshot())
+                        .expect("operator frame restores");
+                    vm.resume(Value::Unit).expect("host resumes");
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                vec![
+                    Value::String("alice".into()),
+                    Value::TextTemplate("Hello ${1 + 2}".into())
+                ],
+                vec![
+                    Value::String("bob".into()),
+                    Value::TextTemplate("World".into())
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn protocol_methods_are_callable_by_name_from_other_implementations() {
+        let manifest = BuiltinManifest::new([("print", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            struct Player { name: String? }
+            protocol Test { fn test(self) -> Unit }
+            extend Player: Test {
+                fn test(self) { print("name: ${self.name ?: "alice"}") }
+            }
+            extend Player: Colon<String> {
+                type Output = Unit
+                fn colon(self, rhs: String) {
+                    self.test()
+                    print("rhs: ${rhs}")
+                }
+            }
+            let player = Player.{ name: null }
+            player: "bob"
+            player.test()
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM initializes");
+        let mut output = Vec::new();
+        loop {
+            match vm.step().expect("protocol method executes") {
+                Some(VmEvent::Call(call)) => {
+                    output.push(call.arguments[0].value.clone());
+                    vm = Vm::restore(code.clone(), vm.snapshot())
+                        .expect("cross-protocol frame restores");
+                    vm.resume(Value::Unit).expect("host resumes");
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            output,
+            vec![
+                Value::String("name: alice".into()),
+                Value::String("rhs: bob".into()),
+                Value::String("name: alice".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn primitive_protocol_methods_are_loaded_for_named_calls() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile(
+            r#"
+            let number = 3
+            let scale: Float = 2
+            global let sum = number.add(4)
+            global let product = scale.multiply(3)
+            global let greeting = "alice".add("bob")
+            global let same = "alice".equal("alice")
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("named primitive method executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("sum"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("product"), Some(&Value::Number(6.0)));
+        assert_eq!(
+            vm.global("greeting"),
+            Some(&Value::String("alicebob".into()))
+        );
+        assert_eq!(vm.global("same"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn ambiguous_protocol_method_names_are_compile_errors() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let syntax = crate::parse_program(
+            r#"
+            protocol First { fn test(self) -> Unit }
+            protocol Second { fn test(self) -> Unit }
+            extend String: First { fn test(self) {} }
+            extend String: Second { fn test(self) {} }
+            "alice".test()
+        "#,
+        )
+        .expect("syntax parses");
+        let errors = compile_with_manifest(&syntax, 0, &manifest)
+            .expect_err("ambiguous calls must not pick by declaration order");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("ambiguous protocol method"))
+        );
+    }
+
+    #[test]
+    fn protocol_bounds_pass_resumable_witnesses_through_generic_calls() {
+        let manifest = BuiltinManifest::new([("host", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            protocol Test { fn test(self) -> String }
+            extend String: Test { fn test(self) -> String { host(self); self } }
+            fn what<T: Test>(t: T) { t.test() }
+            fn forward<T: Test>(t: T) -> String { what(t) }
+            global let result = forward("alice")
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM initializes");
+        loop {
+            match vm.step().expect("bounded generic function executes") {
+                Some(VmEvent::Call(_)) => {
+                    vm = Vm::restore(code.clone(), vm.snapshot()).expect("witness frame restores");
+                    vm.resume(Value::Unit).expect("host resumes");
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(vm.global("result"), Some(&Value::String("alice".into())));
+    }
+
+    #[test]
+    fn generic_protocol_arguments_multiple_bounds_and_closures_are_checked() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile(
+            r#"
+            protocol Label { fn label(self) -> String }
+            protocol Append<Rhs> { fn append(self, rhs: Rhs) -> String }
+            extend String: Label { fn label(self) -> String { self } }
+            extend String: Append<Int> { fn append(self, rhs: Int) -> String { self + rhs.toString() } }
+            fn make<T: Label + Append<Int>>(value: T) -> () -> String {
+                { value.label() + value.append(2) }
+            }
+            struct Helper {}
+            extend Helper {
+                fn apply<T: Label>(self, value: T) -> String { value.label() }
+            }
+            let callback = make("alice")
+            global let result = callback()
+            global let methodResult = Helper.{}.apply("bob")
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("constrained closure executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(
+            vm.global("result"),
+            Some(&Value::String("alicealice2".into()))
+        );
+        assert_eq!(
+            vm.global("methodResult"),
+            Some(&Value::String("bob".into()))
+        );
+    }
+
+    #[test]
+    fn protocol_bounds_reject_missing_evidence_before_execution() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for source in [
+            "protocol Test { fn test(self) -> String }\nfn what<T: Test>(t: T) -> String { t.test() }\nwhat(1)",
+            "fn what<T: Missing>(t: T) {}",
+            "fn what<T>(t: T) { t.test() }",
+            "protocol Test { fn test(self) -> String }\nfn what<T: Test>(t: T) -> String { t.test() }\nlet callback = what",
+            "protocol Test { fn test(self) -> String }\nfn what<T: Test>(t: T) -> String { t.test() }\nfn forward<T>(t: T) -> String { what(t) }",
+        ] {
+            let syntax = crate::parse_program(source).expect("syntax parses");
+            assert!(
+                compile_with_manifest(&syntax, 0, &manifest).is_err(),
+                "must reject {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_associated_output_is_checked_and_custom_addition_executes() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile(
+            r#"
+            struct Counter { value: Int }
+            extend Counter: Add<Int> {
+                type Output = String
+                fn add(self, rhs: Int) -> Self.Output { (self.value + rhs).toString() }
+            }
+            extend Counter: Negate {
+                type Output = Int
+                fn negate(self) -> Output { -self.value }
+            }
+            global let result = Counter.{ value: 2 } + 3
+            global let negative = -Counter.{ value: 2 }
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code).expect("VM initializes");
+        while !matches!(
+            vm.step().expect("protocol call executes"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("result"), Some(&Value::String("5".into())));
+        assert_eq!(vm.global("negative"), Some(&Value::Number(-2.0)));
+        assert!(
+            crate::parse_program("extend String { operator fn colon(self, rhs: String) {} }")
+                .is_err()
+        );
+        for source in [
+            "protocol Invalid<T> { type T; fn call(self, rhs: T) -> T }",
+            "extend String: Colon<String> { type Output = Int; fn colon(self, rhs: String) { rhs } }",
+            "extend String: Colon { type Output = Unit; fn colon(self, rhs: String) {} }",
+            "extend String: Colon<String> { type Output = Unit; fn colon(self, rhs: String) {} }\nextend String: Colon<String> { type Output = Unit; fn colon(self, rhs: String) {} }",
+        ] {
+            let program = crate::parse_program(source).expect("syntax parses");
+            assert!(
+                compile_with_manifest(&program, 0, &manifest).is_err(),
+                "must reject {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_operator_signatures_are_checked_statically() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        for source in [
+            "extend String: Colon<String> { type Output = Unit; fn colon(self, value: String) {} }\n\"alice\": 42",
+            "extend String: Colon<String> { type Output = Unit; fn colon(value: String) {} }",
+            "extend String: Colon<String> { type Output = Unit; fn colon(self, value) {} }",
+            "extend String: Colon<String> { type Output = Unit; fn unknown(self, value: String) {} }",
+            "extend String: Colon<String> { fn colon(self, value: String) {} }",
+            "extend String: Colon<String> { type Output = Int; fn colon(self, value: String) -> String { value } }",
+        ] {
+            let syntax = crate::parse_program(source).expect("operator syntax parses");
+            assert!(
+                compile_with_manifest(&syntax, 0, &manifest).is_err(),
+                "must reject {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_methods_receive_self_and_use_the_ordinary_call_path() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
             r#"
             type Player = .{ score: Int }
-            impl Player {
+            extend Player {
                 fn some_fn(self) { () }
                 fn scorePlus(self, extra: Int) -> Int { self.score + extra }
             }
@@ -4122,7 +4502,7 @@ mod tests {
             "const score = todo()",
             "global const score = .{ value: 1 }",
             "const score = 1\nscore = 2",
-            "type Player = .{}\nimpl Player { var score: Int { 1 } }\nlet alice = Player.{}\nalice.score = 2",
+            "type Player = .{}\nextend Player { var score: Int { 1 } }\nlet alice = Player.{}\nalice.score = 2",
             "let callback: (Int) -> Int = { value -> value }\ncallback(\"wrong\")",
             "let callback: (Int) -> Int = { value -> value }\ncallback()",
             "let callback: (Int) -> Int = { value -> \"wrong\" }",
@@ -4135,9 +4515,9 @@ mod tests {
             );
         }
         for source in [
-            "type Player = .{}\nimpl Player { let score = 1 }",
-            "type Player = .{}\nimpl Player { var score: Int { get { 1 } set { 2 } } }",
-            "type Player = .{}\nimpl Player { var score: Int { get { 1 } set() { 2 } } }",
+            "type Player = .{}\nextend Player { let score = 1 }",
+            "type Player = .{}\nextend Player { var score: Int { get { 1 } set { 2 } } }",
+            "type Player = .{}\nextend Player { var score: Int { get { 1 } set() { 2 } } }",
         ] {
             assert!(
                 crate::parse_program(source).is_err(),
@@ -4180,7 +4560,7 @@ mod tests {
             const base = 2 * 3
             global const limit = base + 4
             type Player = .{ score: Int }
-            impl Player {
+            extend Player {
                 const A = 7
                 var doubled: Int { self.score * 2 }
                 var current: Int {
@@ -4232,7 +4612,7 @@ mod tests {
         let bytecode = compile(
             r#"
             struct Player { score: Int }
-            impl Player { fn add(self, n: Int) { self.score += n } }
+            extend Player { fn add(self, n: Int) { self.score += n } }
             global var player = Player.{ score: 1 }
             let alias = player
             let modify = { alias.add(2) }
@@ -4272,7 +4652,7 @@ mod tests {
         let bytecode = compile(
             r#"
             type Player = .{}
-            impl Player {
+            extend Player {
                 fn name() -> String { "Player" }
                 fn add(a: Int, b: Int) -> Int { a + b }
                 fn instance(self) -> Int { 7 }
@@ -4303,7 +4683,7 @@ mod tests {
         let bytecode = compile(
             r#"
             type Player = .{}
-            impl Player { fn score(n: Int) -> Int { host(n) n + 1 } }
+            extend Player { fn score(n: Int) -> Int { host(n) n + 1 } }
             global var result = Player.score(4)
         "#,
             &manifest,
@@ -4324,7 +4704,7 @@ mod tests {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
             r#"
-            impl Int { fn doubled(self) -> Int { self * 2 } }
+            extend Int { fn doubled(self) -> Int { self * 2 } }
             let value: Int = 3
             global var result = value.doubled()
         "#,
@@ -4371,10 +4751,6 @@ mod tests {
             ),
             ("fn stop() -> Never { todo() }\nstop()", "todo()"),
             ("unreachable()", "unreachable()"),
-            (
-                "__builtin_panic(\"failure\")",
-                "__builtin_panic(\"failure\")",
-            ),
         ] {
             let mut vm = Vm::new(compile(source, &manifest)).expect("VM initializes");
             loop {

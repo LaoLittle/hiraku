@@ -5,13 +5,17 @@ pub const UASTC_LEVEL: u32 = 3;
 
 /// Bound intra-image parallelism, respecting Cargo's available job budget.
 pub fn encoder_threads() -> u32 {
+    cpu_budget().clamp(1, 8) as u32
+}
+
+pub(crate) fn cpu_budget() -> usize {
     let hardware = std::thread::available_parallelism().map_or(1, |count| count.get());
     let jobs = std::env::var("NUM_JOBS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|jobs| *jobs > 0)
         .unwrap_or(hardware);
-    hardware.min(jobs).clamp(1, 8) as u32
+    hardware.min(jobs).max(1)
 }
 
 /// Encode one RGBA image and wrap its UASTC blocks in unsupercompressed KTX2.

@@ -244,6 +244,7 @@ pub struct HirGlobal {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HirFunction<'hir> {
+    pub inline: bool,
     pub track_caller: bool,
     pub name: SymbolId,
     pub exported: bool,
@@ -342,12 +343,22 @@ pub(crate) fn lower_with_project_interface<'hir>(
 }
 
 struct FunctionDeclaration {
+    compiler_intrinsics: bool,
     name: SymbolId,
     exported: bool,
     type_parameters: Vec<SymbolId>,
+    witnesses: Vec<FunctionWitness>,
     parameters: Vec<ScriptType>,
     result: ScriptType,
     span: Span,
+}
+
+#[derive(Clone)]
+struct FunctionWitness {
+    parameter: SymbolId,
+    protocol: String,
+    method: SymbolId,
+    signature: ScriptType,
 }
 
 #[derive(Clone)]
@@ -371,6 +382,9 @@ struct Lowerer<'hir, 'manifest> {
     global_names: BTreeMap<SymbolId, HirGlobalId>,
     function_names: BTreeMap<SymbolId, HirFunctionId>,
     methods: BTreeMap<(TypeId, SymbolId), HirFunctionId>,
+    protocol_methods: BTreeMap<(TypeId, SymbolId), Vec<HirFunctionId>>,
+    witness_locals: Vec<(FunctionWitness, HirLocalId)>,
+    direct_callee: bool,
     static_methods: BTreeMap<(TypeId, SymbolId), HirFunctionId>,
     aliases: BTreeMap<String, TypeAliasDeclaration>,
     enums: BTreeMap<String, (Vec<String>, Vec<crate::ast::EnumVariant>)>,
@@ -452,6 +466,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             global_names: BTreeMap::new(),
             function_names: BTreeMap::new(),
             methods: BTreeMap::new(),
+            protocol_methods: BTreeMap::new(),
+            witness_locals: Vec::new(),
+            direct_callee: false,
             static_methods: BTreeMap::new(),
             aliases: BTreeMap::new(),
             enums: BTreeMap::new(),
@@ -646,8 +663,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         for statement in &program.statements {
             let Stmt::Function {
                 exported,
+                compiler_intrinsics,
                 name,
                 type_parameters,
+                witnesses,
                 parameters,
                 return_type,
                 span,
@@ -694,26 +713,68 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         .is_some_and(|parameter| parameter.name == "self")
                     {
                         self.methods.insert((owner, method), id);
+                        if let Some((_, member)) = self
+                            .symbols
+                            .resolve(method)
+                            .and_then(|name| name.strip_prefix("protocol#"))
+                            .and_then(|name| name.split_once('#'))
+                        {
+                            let member = member.to_owned();
+                            let member = self.symbol(&member);
+                            self.protocol_methods
+                                .entry((owner, member))
+                                .or_default()
+                                .push(id);
+                        }
                     } else {
                         self.static_methods.insert((owner, method), id);
                     }
                 } else {
-                    self.error("impl refers to an unknown type", *span);
+                    self.error("extend refers to an unknown type", *span);
                 }
             }
             let result = return_type
                 .as_ref()
                 .and_then(|ty| self.type_from_ast(ty))
                 .unwrap_or(ScriptType::Any);
+            let witnesses = witnesses
+                .iter()
+                .map(|witness| {
+                    let parameter = self.symbol(&witness.parameter);
+                    let method = self.symbol(&witness.method);
+                    let parameters = witness
+                        .parameters
+                        .iter()
+                        .map(|ty| self.type_from_ast(ty).unwrap_or(ScriptType::Any))
+                        .collect();
+                    let result = self
+                        .type_from_ast(&witness.result)
+                        .unwrap_or(ScriptType::Any);
+                    FunctionWitness {
+                        parameter,
+                        protocol: witness.protocol.clone(),
+                        method,
+                        signature: ScriptType::Callable {
+                            parameters,
+                            result: Box::new(result),
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            if *exported && !witnesses.is_empty() {
+                self.error("exported protocol-constrained functions require cross-module witness interfaces, which are not supported yet", *span);
+            }
             self.type_parameters.pop();
             let generic_parameters = type_parameters
                 .iter()
                 .map(|name| self.symbol(name))
                 .collect();
             self.functions.push(FunctionDeclaration {
+                compiler_intrinsics: *compiler_intrinsics,
                 name: symbol,
                 exported: *exported,
                 type_parameters: generic_parameters,
+                witnesses,
                 parameters: parameter_types,
                 result,
                 span: *span,
@@ -742,6 +803,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             };
             self.current_function = Some(function_id);
             self.scopes.clear();
+            self.witness_locals.clear();
             self.scopes.push(BTreeMap::new());
             self.push_type_parameters(type_parameters);
             let mut lowered_parameters = Vec::new();
@@ -757,6 +819,21 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     false,
                     parameter.span,
                 ));
+            }
+            for (index, witness) in self.functions[function_id.0 as usize]
+                .witnesses
+                .clone()
+                .into_iter()
+                .enumerate()
+            {
+                let local = self.declare_local(
+                    &format!("#witness{index}"),
+                    witness.signature.clone(),
+                    false,
+                    body.span,
+                );
+                lowered_parameters.push(local);
+                self.witness_locals.push((witness, local));
             }
             let expected_result = self.functions[function_id.0 as usize].result.clone();
             self.return_context
@@ -811,6 +888,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             let parameters = self.arena.alloc_slice_copy(&lowered_parameters);
             let result = self.types.intern(declaration.result.clone());
             self.lowered_functions.push(HirFunction {
+                inline: attributes
+                    .iter()
+                    .any(|attribute| attribute.name == "inline"),
                 track_caller: attributes
                     .iter()
                     .any(|attribute| attribute.name == "trackCaller"),
@@ -822,6 +902,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 span: declaration.span,
             });
             self.type_parameters.pop();
+            self.witness_locals.clear();
         }
     }
 
@@ -947,8 +1028,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 return None;
             }
             Stmt::Enum { .. } | Stmt::TypeAlias { .. } | Stmt::Struct { .. } => return None,
-            Stmt::Impl { span, .. } | Stmt::Property { span, .. } | Stmt::Const { span, .. } => {
-                self.error("impl declarations are only allowed at module scope", *span);
+            Stmt::Extend { span, .. }
+            | Stmt::Protocol { span, .. }
+            | Stmt::Property { span, .. }
+            | Stmt::Const { span, .. } => {
+                self.error(
+                    "extend declarations are only allowed at module scope",
+                    *span,
+                );
                 return None;
             }
             Stmt::Function { span, .. } => {
@@ -1260,6 +1347,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             ExprKind::Not(value) => {
                 let value = self.lower_expression(value);
+                let method = self.symbol("protocol#Not#not");
+                if let Some(function) = self.methods.get(&(value.ty, method)).copied() {
+                    return self.accessor_call(function, &[value], expression.span);
+                }
                 if !ScriptType::Bool.accepts(self.expression_type(value)) {
                     self.error(
                         format!(
@@ -1285,12 +1376,38 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             ExprKind::UnaryMinus(value) => {
                 let value = self.lower_expression(value);
+                let method = self.symbol("protocol#Negate#negate");
+                // Preserve signed-literal provenance for contextual Float
+                // inference and cross-module argument checks.
+                if !matches!(value.kind, HirExprKind::Literal(HirLiteral::Number { .. }))
+                    && let Some(function) = self.methods.get(&(value.ty, method)).copied()
+                {
+                    return self.accessor_call(function, &[value], expression.span);
+                }
+                if !matches!(
+                    self.expression_type(value),
+                    ScriptType::Int | ScriptType::Float | ScriptType::Percent
+                ) {
+                    self.error(
+                        "unary minus requires a numeric value or a Negate implementation",
+                        expression.span,
+                    );
+                }
                 (
                     HirExprKind::UnaryMinus(value),
                     self.expression_type(value).clone(),
                 )
             }
             ExprKind::Member { object, name } | ExprKind::SafeMember { object, name } => {
+                if matches!(expression.kind, ExprKind::Member { .. })
+                    && let Some(builtin) = self.native_module_member(expression)
+                {
+                    return self.alloc_expression(
+                        HirExprKind::Builtin(builtin),
+                        self.native_callable_type(builtin),
+                        expression.span,
+                    );
+                }
                 if matches!(expression.kind, ExprKind::Member { .. })
                     && let Some(symbol) = self.external_selector(expression)
                     && let Some(signature) = self.external_functions.get(&symbol)
@@ -1309,6 +1426,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     if let Some(method) =
                         self.resolve_static_script_method(object, name, expression.span)
                     {
+                        if !self.direct_callee
+                            && !self.functions[method.0 as usize].witnesses.is_empty()
+                        {
+                            self.error("a constrained generic method must be called directly; use a typed closure before passing it as a value", expression.span);
+                        }
                         if self
                             .symbols
                             .resolve(self.functions[method.0 as usize].name)
@@ -1347,6 +1469,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 }
                 let object = self.lower_expression(object);
                 let member = self.symbol(name);
+                if !self.direct_callee && self.protocol_methods.contains_key(&(object.ty, member)) {
+                    self.error("taking a bound protocol method as a value is not supported; use a closure that calls the method", expression.span);
+                }
                 let safe = matches!(expression.kind, ExprKind::SafeMember { .. });
                 let getter = self.symbol(&format!("get#{name}"));
                 if !safe && let Some(getter) = self.methods.get(&(object.ty, getter)).copied() {
@@ -1444,16 +1569,64 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     .iter()
                     .filter_map(|ty| self.type_from_ast(ty))
                     .collect::<Vec<_>>();
-                if let ExprKind::Ident(name) = &syntax_callee.kind {
-                    if name.starts_with("__builtin_") && crate::intrinsics::resolve(name).is_none()
-                    {
+                let intrinsic_name = flatten_selector(syntax_callee);
+                if let Some(name) = intrinsic_name.as_deref() {
+                    if name.starts_with("__builtin_") {
                         self.error(
-                            format!("unknown compiler intrinsic `{name}`"),
+                            "legacy compiler intrinsic names are not supported",
                             expression.span,
                         );
                     }
+                    if crate::intrinsics::resolve(name).is_some()
+                        || crate::intrinsics::binary(name).is_some()
+                    {
+                        if !self.current_function.is_some_and(|function| {
+                            self.functions[function.0 as usize].compiler_intrinsics
+                        }) {
+                            self.error("compiler intrinsic access requires the standard-library capability; call a public standard-library function instead", expression.span);
+                            return self.alloc_expression(
+                                HirExprKind::Literal(HirLiteral::Unit),
+                                ScriptType::Never,
+                                expression.span,
+                            );
+                        }
+                    }
                 }
-                if let ExprKind::Ident(name) = &syntax_callee.kind
+                if let Some(name) = intrinsic_name.as_deref()
+                    && let Some((op, parameter, result)) = crate::intrinsics::binary(name)
+                {
+                    if arguments.len() != 2
+                        || trailing_block.is_some()
+                        || !type_arguments.is_empty()
+                    {
+                        self.error(
+                            format!("intrinsic `{name}` requires exactly two arguments"),
+                            expression.span,
+                        );
+                        return self.alloc_expression(
+                            HirExprKind::Literal(HirLiteral::Unit),
+                            ScriptType::Any,
+                            expression.span,
+                        );
+                    }
+                    let left =
+                        self.lower_expression_expected(&arguments[0].value, Some(&parameter));
+                    let right =
+                        self.lower_expression_expected(&arguments[1].value, Some(&parameter));
+                    for operand in [left, right] {
+                        self.check_assignment(
+                            &parameter,
+                            &self.expression_type(operand).clone(),
+                            operand.span,
+                        );
+                    }
+                    return self.alloc_expression(
+                        HirExprKind::Binary { left, op, right },
+                        result,
+                        expression.span,
+                    );
+                }
+                if let Some(name) = intrinsic_name.as_deref()
                     && let Some(definition) = crate::intrinsics::resolve(name)
                 {
                     if arguments.len() != 1
@@ -1505,13 +1678,40 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         expression.span,
                     );
                 }
+                let previous_direct = self.direct_callee;
+                self.direct_callee = matches!(
+                    syntax_callee.kind,
+                    ExprKind::Ident(_) | ExprKind::Member { .. }
+                );
                 let mut callee = self.lower_expression(syntax_callee);
+                self.direct_callee = previous_direct;
                 let mut function = self.resolve_call(expression);
                 if let HirExprKind::Function(id) = callee.kind {
                     function = ResolvedFunction::User(id);
                 }
                 let mut receiver = None;
                 if let HirExprKind::Member { object, member, .. } = callee.kind {
+                    if let ScriptType::TypeParameter(parameter) = self.expression_type(object) {
+                        let candidates = self
+                            .witness_locals
+                            .iter()
+                            .filter(|(witness, _)| {
+                                witness.parameter == *parameter && witness.method == member
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if let [(witness, local)] = candidates.as_slice() {
+                            callee = self.alloc_expression(
+                                HirExprKind::Local(*local),
+                                witness.signature.clone(),
+                                syntax_callee.span,
+                            );
+                            receiver = Some(object);
+                            function = ResolvedFunction::Dynamic;
+                        } else {
+                            self.error("generic method requires a unique protocol bound declaring this method", syntax_callee.span);
+                        }
+                    }
                     // Receiver-qualified native methods do not share a global
                     // method name. Resolve using the statically known owner,
                     // including receivers produced by fluent calls.
@@ -1532,7 +1732,29 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                             syntax_callee.span,
                         );
                     }
-                    if let Some(id) = self.methods.get(&(object.ty, member)).copied() {
+                    let method = self.methods.get(&(object.ty, member)).copied().or_else(|| {
+                        let candidates = self.protocol_methods.get(&(object.ty, member))?;
+                        if candidates.len() == 1 {
+                            Some(candidates[0])
+                        } else {
+                            None
+                        }
+                    });
+                    if method.is_none()
+                        && self
+                            .protocol_methods
+                            .get(&(object.ty, member))
+                            .is_some_and(|methods| methods.len() > 1)
+                    {
+                        let name = self.symbols.resolve(member).unwrap_or("<unknown>");
+                        self.error(format!("ambiguous protocol method `{name}`; multiple protocols provide this method for the receiver"), syntax_callee.span);
+                        return self.alloc_expression(
+                            HirExprKind::Literal(HirLiteral::Unit),
+                            ScriptType::Never,
+                            expression.span,
+                        );
+                    }
+                    if let Some(id) = method {
                         function = ResolvedFunction::User(id);
                         receiver = Some(object);
                         callee = self.alloc_expression(
@@ -1674,6 +1896,63 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 } else {
                     BTreeMap::new()
                 };
+                let witnesses = match function {
+                    ResolvedFunction::User(id) => self.functions[id.0 as usize].witnesses.clone(),
+                    _ => Vec::new(),
+                };
+                let mut actual_arguments = arguments.to_vec();
+                for witness in witnesses {
+                    let Some(actual) = bindings.get(&witness.parameter) else {
+                        self.error("cannot infer the constrained generic argument; specify a type argument", expression.span);
+                        continue;
+                    };
+                    let signature = substitute_type(&witness.signature, &bindings);
+                    let value = if let ScriptType::TypeParameter(parameter) = actual {
+                        let inherited = self
+                            .witness_locals
+                            .iter()
+                            .find(|(candidate, _)| {
+                                candidate.parameter == *parameter
+                                    && candidate.protocol == witness.protocol
+                                    && candidate.method == witness.method
+                                    && candidate.signature == signature
+                            })
+                            .cloned();
+                        inherited.map(|(_, local)| {
+                            self.alloc_expression(
+                                HirExprKind::Local(local),
+                                signature.clone(),
+                                expression.span,
+                            )
+                        })
+                    } else {
+                        let owner = self.types.intern(actual.clone());
+                        let method = self.symbols.resolve(witness.method).unwrap_or("<unknown>");
+                        let method =
+                            self.symbol(&format!("protocol#{}#{method}", witness.protocol));
+                        let implementation = self.methods.get(&(owner, method)).copied();
+                        implementation.and_then(|id| {
+                            if self.function_type(id) != signature {
+                                return None;
+                            }
+                            Some(self.alloc_expression(
+                                HirExprKind::Function(id),
+                                signature.clone(),
+                                expression.span,
+                            ))
+                        })
+                    };
+                    if let Some(value) = value {
+                        actual_arguments.push(HirArgument {
+                            label: None,
+                            value,
+                            span: expression.span,
+                        });
+                    } else {
+                        self.error(format!("type {actual:?} does not satisfy protocol `{}` with the required method signature", witness.protocol), expression.span);
+                    }
+                }
+                let arguments = self.arena.alloc_slice_copy(&actual_arguments);
                 let bindings = bindings
                     .into_iter()
                     .map(|(name, ty)| (name, self.types.intern(ty)))
@@ -1830,6 +2109,32 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let left_syntax = left;
                 let right_syntax = right;
                 let mut left = self.lower_expression(left);
+                if let Some((protocol, method)) = crate::intrinsics::binary_protocol(*op) {
+                    let method = self.symbol(&format!("protocol#{protocol}#{method}"));
+                    if let Some(function) = self.methods.get(&(left.ty, method)).copied() {
+                        // Resolve contextual numeric literals before selecting
+                        // their protocol implementation below.
+                        let primitive = matches!(
+                            self.expression_type(left),
+                            ScriptType::Int
+                                | ScriptType::Float
+                                | ScriptType::String
+                                | ScriptType::Bool
+                        );
+                        if !primitive || *op == BinaryOp::Colon {
+                            let expected =
+                                self.functions[function.0 as usize].parameters[1].clone();
+                            let right =
+                                self.lower_expression_expected(right_syntax, Some(&expected));
+                            self.check_assignment(
+                                &expected,
+                                &self.expression_type(right).clone(),
+                                right.span,
+                            );
+                            return self.accessor_call(function, &[left, right], expression.span);
+                        }
+                    }
+                }
                 let (truthy, falsy) = self.condition_refinements(left_syntax);
                 self.refinements.push(match op {
                     BinaryOp::And => truthy,
@@ -1963,6 +2268,18 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         self.call_result(ResolvedFunction::Builtin(builtin), arguments, &[]),
                         expression.span,
                     );
+                }
+                if let Some((protocol, method)) = crate::intrinsics::binary_protocol(*op) {
+                    let method = self.symbol(&format!("protocol#{protocol}#{method}"));
+                    if let Some(function) = self.methods.get(&(left.ty, method)).copied() {
+                        let expected = self.functions[function.0 as usize].parameters[1].clone();
+                        self.check_assignment(
+                            &expected,
+                            &self.expression_type(right).clone(),
+                            right.span,
+                        );
+                        return self.accessor_call(function, &[left, right], expression.span);
+                    }
                 }
                 let ty = binary_type(*op, self.expression_type(left), self.expression_type(right));
                 (
@@ -2691,7 +3008,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         if let Some(function) = self.static_methods.get(&(owner, method_symbol)) {
             return Some(*function);
         }
-        if self.methods.contains_key(&(owner, method_symbol)) {
+        if self.methods.contains_key(&(owner, method_symbol))
+            || self.protocol_methods.contains_key(&(owner, method_symbol))
+        {
             self.error(
                 format!(
                     "instance method `{method}` requires a receiver; call it on a {name} value"
@@ -2749,6 +3068,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             );
         }
         if let Some(function) = self.function_names.get(&symbol).copied() {
+            if !self.direct_callee && !self.functions[function.0 as usize].witnesses.is_empty() {
+                self.error("a constrained generic function must be called directly; use a typed closure to bind its type arguments before passing it as a value", span);
+            }
             return self.alloc_expression(
                 HirExprKind::Function(function),
                 self.function_type(function),
@@ -2950,6 +3272,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         let ExprKind::Call { callee, .. } = &expression.kind else {
             return ResolvedFunction::Dynamic;
         };
+        if let Some(builtin) = self.native_module_member(callee) {
+            return ResolvedFunction::Builtin(builtin);
+        }
         if matches!(callee.kind, ExprKind::Member { .. })
             && let Some(symbol) = self.external_selector(callee)
         {
@@ -3091,6 +3416,21 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         self.external_functions
             .contains_key(&symbol)
             .then_some(symbol)
+    }
+
+    /// A qualified native name is a module member only when its root is not
+    /// shadowed by a value binding. No host module name has special semantics.
+    fn native_module_member(&self, expression: &Expr) -> Option<BuiltinId> {
+        if !matches!(expression.kind, ExprKind::Member { .. }) {
+            return None;
+        }
+        let name = flatten_selector(expression)?;
+        if let Some(root) = self.symbols.get(name.split('.').next()?) {
+            if self.resolve_local(root).is_some() || self.global_names.contains_key(&root) {
+                return None;
+            }
+        }
+        self.manifest?.resolve(&name)
     }
 
     fn declare_local(
@@ -3839,7 +4179,8 @@ fn statement_span(statement: &Stmt) -> Span {
         | Stmt::TypeAlias { span, .. }
         | Stmt::Struct { span, .. }
         | Stmt::Enum { span, .. }
-        | Stmt::Impl { span, .. }
+        | Stmt::Extend { span, .. }
+        | Stmt::Protocol { span, .. }
         | Stmt::Property { span, .. }
         | Stmt::Const { span, .. }
         | Stmt::Function { span, .. }
@@ -3980,7 +4321,7 @@ mod tests {
         let source = r#"
             struct Player<T> { name: T, score: Int }
             struct Counter { score: Int }
-            impl Counter { fn increment(self) { self.score += 1 } }
+            extend Counter { fn increment(self) { self.score += 1 } }
             let player: Player<String?> = .{ name: null, score: 12 }
             let counter = Counter.{ score: 1 }
             counter.increment()
@@ -4329,16 +4670,16 @@ mod tests {
     fn methods_and_intrinsics_have_checked_signatures() {
         for (source, message) in [
             (
-                "type Player = .{}\nimpl Player { fn invalid(n: Int, self) {} }",
+                "type Player = .{}\nextend Player { fn invalid(n: Int, self) {} }",
                 "self",
             ),
-            ("impl Missing { fn invalid(self) {} }", "unknown type"),
+            ("extend Missing { fn invalid(self) {} }", "unknown type"),
             (
-                "type Player = .{}\nimpl Player { fn run(self, n: Int) {} }\nlet p = Player.{}\np.run(\"alice\")",
+                "type Player = .{}\nextend Player { fn run(self, n: Int) {} }\nlet p = Player.{}\np.run(\"alice\")",
                 "argument expects",
             ),
-            ("__builtin_f2i(\"alice\")", "expected Float"),
-            ("__builtin_unknown(1)", "unknown compiler intrinsic"),
+            ("intrinsics.floatToInt(1.5)", "capability"),
+            ("__builtin_unknown(1)", "legacy compiler intrinsic"),
             ("fn __builtin_f2i() {}", "reserved"),
         ] {
             let syntax = parse_program(source).expect("parses");
@@ -4369,7 +4710,7 @@ mod tests {
             ),
         ] {
             let source = format!(
-                "type Player = .{{}}\nimpl Player {{ fn name() -> String {{ \"Player\" }} fn value(self) -> Int {{ 1 }} fn add(n: Int) -> Int {{ n }} }}\n{tail}"
+                "type Player = .{{}}\nextend Player {{ fn name() -> String {{ \"Player\" }} fn value(self) -> Int {{ 1 }} fn add(n: Int) -> Int {{ n }} }}\n{tail}"
             );
             let syntax = parse_program(&source).expect("parses");
             let arena = HirArena::new();

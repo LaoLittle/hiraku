@@ -32,11 +32,35 @@ pub struct ProjectError {
     pub error: CompileError,
 }
 
+/// Host-owned grants for exact source paths. Never loaded from script metadata
+/// or snapshots; the embedding must authenticate its library sources first.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectLinkPolicy {
+    grants: BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl ProjectLinkPolicy {
+    pub fn grant(&mut self, path: impl Into<String>, capability: impl Into<String>) {
+        self.grants
+            .entry(path.into())
+            .or_default()
+            .insert(capability.into());
+    }
+}
+
+pub fn compile_project_with_policy(
+    sources: Vec<ScriptSource>,
+    natives: &BuiltinManifest,
+    policy: &ProjectLinkPolicy,
+) -> Result<CompiledProject, Vec<ProjectError>> {
+    compile_project_impl(sources, natives, None, Some(policy))
+}
+
 pub fn compile_project(
     sources: Vec<ScriptSource>,
     natives: &BuiltinManifest,
 ) -> Result<CompiledProject, Vec<ProjectError>> {
-    compile_project_impl(sources, natives, None)
+    compile_project_impl(sources, natives, None, None)
 }
 
 pub fn compile_project_with_hir_pass(
@@ -44,13 +68,14 @@ pub fn compile_project_with_hir_pass(
     natives: &BuiltinManifest,
     pass: &mut dyn crate::hir::HirPass,
 ) -> Result<CompiledProject, Vec<ProjectError>> {
-    compile_project_impl(sources, natives, Some(pass))
+    compile_project_impl(sources, natives, Some(pass), None)
 }
 
 fn compile_project_impl(
     mut sources: Vec<ScriptSource>,
     natives: &BuiltinManifest,
     mut pass: Option<&mut dyn crate::hir::HirPass>,
+    policy: Option<&ProjectLinkPolicy>,
 ) -> Result<CompiledProject, Vec<ProjectError>> {
     sources.sort_by(|a, b| a.path.cmp(&b.path));
     let mut errors = Vec::new();
@@ -145,18 +170,41 @@ fn compile_project_impl(
     if !errors.is_empty() {
         return Err(errors);
     }
-    let program = crate::link_named_modules(modules, natives).map_err(|link_errors| {
-        link_errors
-            .into_iter()
-            .map(|error| ProjectError {
-                path: sources[error.module.0 as usize].path.clone(),
-                error: CompileError {
-                    message: error.message,
-                    span: None,
-                },
-            })
-            .collect::<Vec<_>>()
-    })?;
+    let mut link_policy = crate::LinkPolicy::default();
+    if let Some(policy) = policy {
+        for (path, capabilities) in &policy.grants {
+            let Some(module) = paths.get(path) else {
+                errors.push(ProjectError {
+                    path: path.clone(),
+                    error: CompileError {
+                        message: "capability grant refers to a missing module".into(),
+                        span: None,
+                    },
+                });
+                continue;
+            };
+            for capability in capabilities {
+                link_policy.grant(*module, capability.clone());
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let program = crate::link_named_modules_with_policy(modules, natives, &link_policy).map_err(
+        |link_errors| {
+            link_errors
+                .into_iter()
+                .map(|error| ProjectError {
+                    path: sources[error.module.0 as usize].path.clone(),
+                    error: CompileError {
+                        message: error.message,
+                        span: None,
+                    },
+                })
+                .collect::<Vec<_>>()
+        },
+    )?;
     Ok(CompiledProject { paths, program })
 }
 
@@ -169,6 +217,94 @@ mod tests {
             source: source.into(),
             namespace: None,
         }
+    }
+
+    #[test]
+    fn arbitrary_native_modules_share_the_same_link_permissions() {
+        for module in ["intrinsics.audio", "intrinsics.graphics", "host.services"] {
+            let mut registry = crate::native::NativeRegistry::<()>::new();
+            let name = format!("{module}.invoke");
+            let builtin = registry
+                .register_fn(&name, |_: &mut (), _: String| Ok(()))
+                .expect("native module function registers");
+            registry
+                .require_capability(builtin, "service.invoke")
+                .expect("permission registers");
+            let manifest = registry.manifest();
+            let library = source(
+                "std/service.hks",
+                &format!("global fn invoke(value: String) {{ {name}(value) }}"),
+            );
+            let mut policy = ProjectLinkPolicy::default();
+            policy.grant("std/service.hks", "service.invoke");
+            compile_project_with_policy(
+                vec![library.clone(), source("entry.hks", "invoke(\"alice\")")],
+                &manifest,
+                &policy,
+            )
+            .expect("authorized module wrapper links");
+            let errors = compile_project_with_policy(
+                vec![library, source("entry.hks", &format!("{name}(\"bob\")"))],
+                &manifest,
+                &policy,
+            )
+            .expect_err("untrusted module is denied");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains("service.invoke")),
+                "{errors:?}"
+            );
+            let value = source("std/service.hks", &format!("let callback = {name}"));
+            assert!(
+                compile_project_with_policy(vec![value], &manifest, &policy).is_err(),
+                "privileged functions must not escape as values"
+            );
+        }
+    }
+
+    #[test]
+    fn module_capability_grants_follow_paths_not_input_order() {
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        let builtin = registry
+            .register_fn("intrinsics.engine.say", |_: &mut (), _: String| Ok(()))
+            .expect("native registers");
+        registry
+            .require_capability(builtin, "dialogue.write")
+            .expect("capability registers");
+        let natives = registry.manifest();
+        let library = source(
+            "std/dialogue.hks",
+            "global fn say(text: String) { intrinsics.engine.say(text) }",
+        );
+        let entry = source("entry.hks", "say(\"alice\")");
+        assert!(compile_project(vec![library.clone(), entry.clone()], &natives).is_err());
+        let mut policy = ProjectLinkPolicy::default();
+        policy.grant("std/dialogue.hks", "dialogue.write");
+        for sources in [
+            vec![library.clone(), entry.clone()],
+            vec![entry, library.clone()],
+        ] {
+            compile_project_with_policy(sources, &natives, &policy)
+                .expect("authorized library links");
+        }
+        let errors = compile_project_with_policy(
+            vec![
+                library,
+                source("entry.hks", "intrinsics.engine.say(\"bob\")"),
+            ],
+            &natives,
+            &policy,
+        )
+        .expect_err("calling a wrapper does not grant its privileges");
+        assert!(errors.iter().any(
+            |error| error.path == "entry.hks" && error.error.message.contains("dialogue.write")
+        ));
+        policy.grant("missing.hks", "dialogue.write");
+        assert!(
+            compile_project_with_policy(vec![source("entry.hks", "()")], &natives, &policy)
+                .is_err()
+        );
     }
 
     #[test]

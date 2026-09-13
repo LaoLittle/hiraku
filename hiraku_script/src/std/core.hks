@@ -1,5 +1,38 @@
 type Unit = ()
 
+protocol Colon<Rhs> {
+    type Output
+    fn colon(self, rhs: Rhs) -> Self.Output
+}
+
+protocol Negate {
+    type Output
+    fn negate(self) -> Output
+}
+
+protocol Not {
+    type Output
+    fn not(self) -> Output
+}
+
+extend Int: Negate {
+    type Output = Int
+    @inline
+    fn negate(self) -> Output { intrinsics.int.negate(self) }
+}
+
+extend Float: Negate {
+    type Output = Float
+    @inline
+    fn negate(self) -> Output { intrinsics.float.negate(self) }
+}
+
+extend Bool: Not {
+    type Output = Bool
+    @inline
+    fn not(self) -> Output { intrinsics.bool.not(self) }
+}
+
 enum Optional<T> {
     some(T),
     none,
@@ -11,28 +44,235 @@ enum Result<T, E> {
 }
 
 @trackCaller
-fn panic(message: String) -> Never { __builtin_panic(message) }
+fn panic(message: String) -> Never { intrinsics.panic(message) }
 @trackCaller
 fn unreachable() -> Never { panic("entered unreachable code") }
 @trackCaller
 fn todo() -> Never { panic("not yet implemented") }
 
-impl Float {
-    fn toString(self) -> String { __builtin_to_string(self) }
+extend Float {
+    @inline
+    fn toString(self) -> String { intrinsics.toString(self) }
     fn toFloat(self) -> Float { self }
-    fn toInt(self) -> Int { __builtin_f2i(self) }
+    @inline
+    fn toInt(self) -> Int { intrinsics.floatToInt(self) }
 }
 
-impl Int {
-    fn toString(self) -> String { __builtin_to_string(self) }
-    fn toFloat(self) -> Float { __builtin_i2f(self) }
+extend Int {
+    @inline
+    fn toString(self) -> String { intrinsics.toString(self) }
+    @inline
+    fn toFloat(self) -> Float { intrinsics.intToFloat(self) }
     fn toInt(self) -> Int { self }
 }
 
-impl Bool {
-    fn toString(self) -> String { __builtin_to_string(self) }
+extend Bool {
+    @inline
+    fn toString(self) -> String { intrinsics.toString(self) }
 }
 
-impl String {
+extend String {
     fn toString(self) -> String { self }
+}
+
+// Primitive operator contracts. Implementations remain script-owned.
+
+protocol Add<Rhs> {
+    type Output
+    fn add(self, rhs: Rhs) -> Self.Output
+}
+
+protocol Subtract<Rhs> {
+    type Output
+    fn subtract(self, rhs: Rhs) -> Self.Output
+}
+
+protocol Multiply<Rhs> {
+    type Output
+    fn multiply(self, rhs: Rhs) -> Self.Output
+}
+
+protocol Divide<Rhs> {
+    type Output
+    fn divide(self, rhs: Rhs) -> Self.Output
+}
+
+protocol Equal<Rhs> {
+    type Output
+    fn equal(self, rhs: Rhs) -> Self.Output
+}
+
+protocol NotEqual<Rhs> {
+    type Output
+    fn notEqual(self, rhs: Rhs) -> Self.Output
+}
+
+protocol Less<Rhs> {
+    type Output
+    fn less(self, rhs: Rhs) -> Self.Output
+}
+
+protocol LessEqual<Rhs> {
+    type Output
+    fn lessEqual(self, rhs: Rhs) -> Self.Output
+}
+
+protocol Greater<Rhs> {
+    type Output
+    fn greater(self, rhs: Rhs) -> Self.Output
+}
+
+protocol GreaterEqual<Rhs> {
+    type Output
+    fn greaterEqual(self, rhs: Rhs) -> Self.Output
+}
+
+extend Int: Add<Int> {
+    type Output = Int
+    @inline
+    fn add(self, rhs: Int) -> Output { intrinsics.int.add(self, rhs) }
+}
+
+extend Int: Subtract<Int> {
+    type Output = Int
+    @inline
+    fn subtract(self, rhs: Int) -> Output { intrinsics.int.subtract(self, rhs) }
+}
+
+extend Int: Multiply<Int> {
+    type Output = Int
+    @inline
+    fn multiply(self, rhs: Int) -> Output { intrinsics.int.multiply(self, rhs) }
+}
+
+extend Int: Divide<Int> {
+    type Output = Int
+    @inline
+    fn divide(self, rhs: Int) -> Output { intrinsics.int.divide(self, rhs) }
+}
+
+extend Int: Equal<Int> {
+    type Output = Bool
+    @inline
+    fn equal(self, rhs: Int) -> Output { intrinsics.int.equal(self, rhs) }
+}
+
+extend Int: NotEqual<Int> {
+    type Output = Bool
+    @inline
+    fn notEqual(self, rhs: Int) -> Output { intrinsics.int.notEqual(self, rhs) }
+}
+
+extend Int: Less<Int> {
+    type Output = Bool
+    @inline
+    fn less(self, rhs: Int) -> Output { intrinsics.int.less(self, rhs) }
+}
+
+extend Int: LessEqual<Int> {
+    type Output = Bool
+    @inline
+    fn lessEqual(self, rhs: Int) -> Output { intrinsics.int.lessEqual(self, rhs) }
+}
+
+extend Int: Greater<Int> {
+    type Output = Bool
+    @inline
+    fn greater(self, rhs: Int) -> Output { intrinsics.int.greater(self, rhs) }
+}
+
+extend Int: GreaterEqual<Int> {
+    type Output = Bool
+    @inline
+    fn greaterEqual(self, rhs: Int) -> Output { intrinsics.int.greaterEqual(self, rhs) }
+}
+
+extend Float: Add<Float> {
+    type Output = Float
+    @inline
+    fn add(self, rhs: Float) -> Output { intrinsics.float.add(self, rhs) }
+}
+
+extend Float: Subtract<Float> {
+    type Output = Float
+    @inline
+    fn subtract(self, rhs: Float) -> Output { intrinsics.float.subtract(self, rhs) }
+}
+
+extend Float: Multiply<Float> {
+    type Output = Float
+    @inline
+    fn multiply(self, rhs: Float) -> Output { intrinsics.float.multiply(self, rhs) }
+}
+
+extend Float: Divide<Float> {
+    type Output = Float
+    @inline
+    fn divide(self, rhs: Float) -> Output { intrinsics.float.divide(self, rhs) }
+}
+
+extend Float: Equal<Float> {
+    type Output = Bool
+    @inline
+    fn equal(self, rhs: Float) -> Output { intrinsics.float.equal(self, rhs) }
+}
+
+extend Float: NotEqual<Float> {
+    type Output = Bool
+    @inline
+    fn notEqual(self, rhs: Float) -> Output { intrinsics.float.notEqual(self, rhs) }
+}
+
+extend Float: Less<Float> {
+    type Output = Bool
+    @inline
+    fn less(self, rhs: Float) -> Output { intrinsics.float.less(self, rhs) }
+}
+
+extend Float: LessEqual<Float> {
+    type Output = Bool
+    @inline
+    fn lessEqual(self, rhs: Float) -> Output { intrinsics.float.lessEqual(self, rhs) }
+}
+
+extend Float: Greater<Float> {
+    type Output = Bool
+    @inline
+    fn greater(self, rhs: Float) -> Output { intrinsics.float.greater(self, rhs) }
+}
+
+extend Float: GreaterEqual<Float> {
+    type Output = Bool
+    @inline
+    fn greaterEqual(self, rhs: Float) -> Output { intrinsics.float.greaterEqual(self, rhs) }
+}
+
+extend String: Add<String> {
+    type Output = String
+    @inline
+    fn add(self, rhs: String) -> Output { intrinsics.string.add(self, rhs) }
+}
+
+extend String: Equal<String> {
+    type Output = Bool
+    @inline
+    fn equal(self, rhs: String) -> Output { intrinsics.string.equal(self, rhs) }
+}
+
+extend String: NotEqual<String> {
+    type Output = Bool
+    @inline
+    fn notEqual(self, rhs: String) -> Output { intrinsics.string.notEqual(self, rhs) }
+}
+
+extend Bool: Equal<Bool> {
+    type Output = Bool
+    @inline
+    fn equal(self, rhs: Bool) -> Output { intrinsics.bool.equal(self, rhs) }
+}
+
+extend Bool: NotEqual<Bool> {
+    type Output = Bool
+    @inline
+    fn notEqual(self, rhs: Bool) -> Output { intrinsics.bool.notEqual(self, rhs) }
 }

@@ -3,6 +3,36 @@ use bevy::image::CompressedImageFormats;
 use hiraku_hdp::Archive;
 
 #[test]
+fn parallel_encoding_matches_serial_texture_bytes() {
+    let pixels = [
+        [32, 64, 96, 255].repeat(64),
+        [96, 32, 64, 128].repeat(64),
+        [64, 96, 32, 255].repeat(64),
+    ];
+    let mut parallel = Vec::new();
+    super::parallel::ordered(
+        pixels.len(),
+        &[2, 2],
+        |index, threads, _| encode_rgba_with_threads(&pixels[index], 8, 8, threads),
+        |event| {
+            if let super::parallel::Event::Ready(index, bytes) = event {
+                assert_eq!(index, parallel.len());
+                parallel.push(bytes);
+            }
+            Ok(())
+        },
+    )
+    .expect("parallel encodes");
+    for (pixels, encoded) in pixels.iter().zip(parallel) {
+        assert_eq!(
+            encoded,
+            encode_rgba_with_threads(pixels, 8, 8, 1).expect("serial encode")
+        );
+        hiraku_uastc::decode(&encoded, CompressedImageFormats::NONE).expect("runtime decode");
+    }
+}
+
+#[test]
 fn asset_server_loads_uastc_with_standard_mask_settings() {
     use bevy::{
         asset::RenderAssetUsages,

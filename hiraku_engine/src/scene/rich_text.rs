@@ -89,6 +89,7 @@ pub(crate) fn reveal_glyphs(
 }
 
 pub(crate) fn update(
+    evaluator: Local<crate::script::UiPropertyEvaluator>,
     mut commands: Commands,
     mut redraw: crate::redraw::Redraw,
     models: Res<UiModels>,
@@ -107,18 +108,24 @@ pub(crate) fn update(
             let local_changed =
                 super::screen_ui::refresh_local_binding(entity, &mut expression, &parents, &locals);
             if rich.revision != models.revision() || local_changed {
-                use hiraku_script::native::FromHksValue;
-                match crate::script::evaluate_ui_reactive_binding(&expression, &models)
-                    .map_err(|e| e.to_string())
-                    .and_then(|value| u32::from_hks_value(&value).map_err(|e| e.to_string()))
-                {
-                    Ok(count) => rich.count = Some(count),
-                    Err(error) => crate::script::emit_script_diagnostic(
-                        "rich text reveal failed",
-                        &error.to_string(),
-                    ),
-                }
+                let models_changed =
+                    crate::script::refresh_ui_property_models(&mut expression, &models);
+                let evaluate = rich.revision == u64::MAX || local_changed || models_changed;
                 rich.revision = models.revision();
+                if evaluate {
+                    use hiraku_script::native::FromHksValue;
+                    match evaluator
+                        .evaluate(&expression, &models)
+                        .map_err(|e| e.to_string())
+                        .and_then(|value| u32::from_hks_value(&value).map_err(|e| e.to_string()))
+                    {
+                        Ok(count) => rich.count = Some(count),
+                        Err(error) => crate::script::emit_script_diagnostic(
+                            "rich text reveal failed",
+                            &error.to_string(),
+                        ),
+                    }
+                }
             }
             rich.expression = Some(expression);
         }

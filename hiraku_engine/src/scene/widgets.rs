@@ -23,6 +23,7 @@ pub(crate) struct ToggleCallback {
 }
 
 pub(crate) fn sync_toggles(
+    evaluator: Local<crate::script::UiPropertyEvaluator>,
     local_states: Query<&UiLocalState>,
     runtime: Res<ScriptRuntimeState>,
     models: Res<UiModels>,
@@ -52,7 +53,7 @@ pub(crate) fn sync_toggles(
             continue;
         };
         binding.globals.extend(globals.clone());
-        match crate::script::evaluate_ui_reactive_binding(&binding, &models) {
+        match evaluator.evaluate(&binding, &models) {
             Ok(Value::Bool(checked)) if checked != toggle.checked => {
                 toggle.checked = checked;
                 if checked {
@@ -550,6 +551,7 @@ fn propose_slider(
 }
 
 pub(crate) fn sync_inputs(
+    evaluator: Local<crate::script::UiPropertyEvaluator>,
     local_states: Query<&UiLocalState>,
     mut controls: Query<(Entity, &mut InputControl, &ComputedNode)>,
     mut texts: Query<&mut Text>,
@@ -572,7 +574,7 @@ pub(crate) fn sync_inputs(
             && let Some(mut binding) = control.spec.reactive_enabled.clone()
         {
             binding.globals.extend(globals.clone());
-            match crate::script::evaluate_ui_reactive_binding(&binding, &models) {
+            match evaluator.evaluate(&binding, &models) {
                 Ok(Value::Bool(enabled)) => control.spec.enabled = enabled,
                 Ok(_) => control.spec.enabled = false,
                 Err(error) => {
@@ -589,7 +591,7 @@ pub(crate) fn sync_inputs(
             && let Some(mut binding) = control.spec.reactive_value.clone()
         {
             binding.globals.extend(globals.clone());
-            match crate::script::evaluate_ui_reactive_binding(&binding, &models) {
+            match evaluator.evaluate(&binding, &models) {
                 Ok(Value::Bool(value)) if matches!(control.spec.kind, InputKind::Checkbox) => {
                     control.spec.value = StoredValue::Bool(value)
                 }

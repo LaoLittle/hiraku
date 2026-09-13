@@ -44,7 +44,8 @@ fn sequence(
                 | Stmt::TypeAlias { .. }
                 | Stmt::Struct { .. }
                 | Stmt::Enum { .. }
-                | Stmt::Impl { .. }
+                | Stmt::Extend { .. }
+                | Stmt::Protocol { .. }
                 | Stmt::Property { .. }
         ) {
             continue;
@@ -128,7 +129,8 @@ fn span(stmt: &Stmt) -> [usize; 2] {
         Stmt::Return { span, .. }
         | Stmt::Const { span, .. }
         | Stmt::Property { span, .. }
-        | Stmt::Impl { span, .. }
+        | Stmt::Extend { span, .. }
+        | Stmt::Protocol { span, .. }
         | Stmt::Import { span, .. }
         | Stmt::TypeAlias { span, .. }
         | Stmt::Struct { span, .. }

@@ -860,6 +860,25 @@ mod tests {
     };
 
     #[test]
+    fn masked_portrait_and_picture_wipe_use_regular_story_capabilities() {
+        compile_story_bytecode("memory://portrait.hks", r#"
+            scene.clipRect("letterbox", 1920, 705).at(.pos(0, 0))
+            let entrance = par {
+                scene.picture("frame", "ui/frame").at(.right).size(583.5, 715.5).layer(12).fade(400)
+                char("alice").e("portrait").at(.right).scale(1.5).depth(12.5).clip(null).show().time(1).easing(.linear)
+            }
+            par {
+                scene.transformPicture("frame").at(.rel(82, 64)).time(0.4).easing(.smoothStep)
+                char("alice").at(.rel(82, 64)).time(0.4).easing(.smoothStep)
+            }
+            entrance.await()
+            scene.curtain(1).color(255, 255, 255).dissolve("wipe", 0.25).fade(100).await()
+            scene.hidePicture("frame").fade(0)
+            scene.clipPicture("frame", null)
+        "#).expect("masked portrait and wipe compile without game-specific builtins");
+    }
+
+    #[test]
     fn random_draw_is_a_host_boundary_and_does_not_reexecute_after_resume() {
         let code = compile_story_bytecode(
             "memory://random.hks",

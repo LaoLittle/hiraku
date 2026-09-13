@@ -484,6 +484,21 @@ pub fn sync_pictures(
             .then(|| marker.0.clone())
         })
         .collect();
+    // A scene's pending entrances must start on the same renderable frame.
+    // Otherwise a small backing image fades in before its large foreground
+    // image has loaded, briefly exposing the wrong composition. Already
+    // running animations keep their own clocks.
+    let entrances_pending = pictures.iter().any(|(id, picture)| {
+        picture.fade.as_ref().is_some_and(|fade| {
+            !fade.remove
+                && fade.elapsed == 0.0
+                && !ready.contains(id)
+                && !assets
+                    .get_path_id(picture.path.clone())
+                    .and_then(|id| assets.get_load_state(id))
+                    .is_some_and(|state| state.is_failed())
+        })
+    });
     pictures.retain(|id, picture| {
         if picture.fade.is_some()
             || picture.motion.is_some()
@@ -494,17 +509,12 @@ pub fn sync_pictures(
         {
             redraw.request();
         }
-        // Exit is independent of image readiness: hiding an unloaded image
-        // must not retain it forever or wait for a failed download.
-        let exiting = picture.fade.as_ref().is_some_and(|fade| fade.remove);
-        if !ready.contains(id) && !exiting {
-            return true;
-        }
-        let keep = tick_picture(picture, time.delta_secs());
-        if picture.fade.is_none() && picture.motion.is_none() {
-            picture.previous.clear();
-        }
-        keep
+        tick_ready_picture(
+            picture,
+            ready.contains(id),
+            entrances_pending,
+            time.delta_secs(),
+        )
     });
     let render_pictures: BTreeMap<_, _> = pictures
         .iter()
@@ -520,7 +530,26 @@ pub fn sync_pictures(
         .collect();
     let mut existing = HashSet::new();
     for (entity, marker, previous, mut sprite, mut transform) in &mut entities {
-        let key = (marker.0.clone(), previous.map(|p| p.0));
+        // Preserve the already-renderable outgoing entity. Swapping its image
+        // and spawning a replacement backing quad creates a preparation gap
+        // in which neither image may be renderable.
+        let backing = previous.map(|p| p.0).or_else(|| {
+            let incoming = pictures.get(&marker.0)?;
+            let path = sprite.image.as_ref()?.path()?.to_string();
+            if path == incoming.path && sprite.rect == incoming.rect {
+                return None;
+            }
+            incoming
+                .previous
+                .iter()
+                .rposition(|old| old.path == path && old.rect == sprite.rect)
+        });
+        if previous.is_none()
+            && let Some(index) = backing
+        {
+            commands.entity(entity).insert(PreviousPicture(index));
+        }
+        let key = (marker.0.clone(), backing);
         let Some(picture) = render_pictures.get(&key) else {
             commands.entity(entity).try_despawn();
             continue;
@@ -625,6 +654,31 @@ pub fn sync_pictures(
 fn picture_color(picture: &PictureState) -> Color {
     let [r, g, b, a] = picture.tint;
     Color::srgba(r, g, b, a * picture.alpha)
+}
+
+fn tick_ready_picture(
+    picture: &mut PictureState,
+    ready: bool,
+    entrances_pending: bool,
+    delta: f32,
+) -> bool {
+    // Hiding an unloaded image must not retain it or await a failed download.
+    let exiting = picture.fade.as_ref().is_some_and(|fade| fade.remove);
+    if !exiting
+        && (!ready
+            || (entrances_pending
+                && picture
+                    .fade
+                    .as_ref()
+                    .is_some_and(|fade| fade.elapsed == 0.0)))
+    {
+        return true;
+    }
+    let keep = tick_picture(picture, delta);
+    if picture.fade.is_none() && picture.motion.is_none() {
+        picture.previous.clear();
+    }
+    keep
 }
 
 fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
@@ -737,6 +791,140 @@ fn screen_picture_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_reuses_the_outgoing_render_entity_as_its_backing() {
+        use bevy::asset::io::{
+            AssetSourceBuilder, AssetSourceId,
+            memory::{Dir, MemoryAssetReader},
+        };
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255; 4]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("synthetic image");
+        let dir = Dir::default();
+        for name in ["alice.png", "bob.png"] {
+            dir.insert_asset(std::path::Path::new(name), png.get_ref().clone());
+        }
+        let mut app = App::new();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || Box::new(MemoryAssetReader { root: dir.clone() })),
+        );
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<Image>()
+            .register_asset_loader(bevy::image::ImageLoader::new(
+                bevy::image::CompressedImageFormats::NONE,
+            ))
+            .init_resource::<SceneSharedState>()
+            .insert_resource(crate::HirakuCanvas {
+                image: Handle::default(),
+                size: UVec2::new(1920, 1080),
+            })
+            .add_systems(Update, sync_pictures);
+        let image = app
+            .world()
+            .resource::<AssetServer>()
+            .load::<Image>("alice.png");
+        let outgoing = app
+            .world_mut()
+            .spawn((
+                PictureEntity("room".into()),
+                WorldSprite::from_image(image.clone()),
+                Transform::default(),
+            ))
+            .id();
+        let mut pictures = shown();
+        let old = pictures.get_mut("room").expect("old picture");
+        old.path = "alice.png".into();
+        tick_picture(old, 1.0);
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Show {
+                screen_space: false,
+                size: None,
+                slice: None,
+                color: None,
+                id: "room".into(),
+                path: "bob.png".into(),
+                rect: None,
+                position: [50.0, 50.0],
+                scale: 1.0,
+                rotation: 0.0,
+                layer: 0.0,
+                seconds: 1.0,
+            },
+        )
+        .expect("replace");
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .pictures = pictures;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<PreviousPicture>(outgoing)
+                .expect("retained backing")
+                .0,
+            0
+        );
+        assert_eq!(
+            app.world()
+                .get::<WorldSprite>(outgoing)
+                .expect("original sprite")
+                .image,
+            Some(image)
+        );
+        let mut current = app
+            .world_mut()
+            .query_filtered::<Entity, (With<PictureEntity>, Without<PreviousPicture>)>();
+        assert_eq!(current.iter(app.world()).count(), 1);
+        assert_ne!(
+            current.single(app.world()).expect("incoming entity"),
+            outgoing
+        );
+    }
+
+    #[test]
+    fn pending_entrances_keep_backing_and_focus_at_their_initial_pose() {
+        let mut pictures = shown();
+        let focus = pictures.get_mut("room").expect("focus picture");
+        let mut backing = focus.clone();
+        assert!(tick_ready_picture(&mut backing, true, true, 1.0));
+        assert!(tick_ready_picture(focus, false, true, 1.0));
+        assert_eq!(backing.alpha, 0.0);
+        assert_eq!(focus.alpha, 0.0);
+        assert_eq!(focus.scale, 3.0);
+        assert_eq!(focus.position, [80.0, -35.0]);
+        tick_ready_picture(&mut backing, true, false, 0.1);
+        tick_ready_picture(focus, true, false, 0.1);
+        assert_eq!(backing.alpha, focus.alpha);
+        let alpha = focus.alpha;
+        tick_ready_picture(focus, true, true, 0.1);
+        assert!(
+            focus.alpha > alpha,
+            "another load must not freeze a running entrance"
+        );
+    }
+
+    #[test]
+    fn unloaded_exit_does_not_wait_for_other_entrances() {
+        let mut pictures = shown();
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Hide {
+                id: "room".into(),
+                seconds: 0.1,
+            },
+        )
+        .expect("hide picture");
+        assert!(!tick_ready_picture(
+            pictures.get_mut("room").expect("picture"),
+            false,
+            true,
+            1.0
+        ));
+    }
 
     #[test]
     fn screen_space_picture_keeps_projected_position_and_size_for_both_lenses() {

@@ -34,8 +34,10 @@ the engine's runtime/wasm dependency graph.
 5. Feeds KTX2 bytes to the HDP streaming writer. Unreferenced image files are
    excluded. Scripts, HSON, audio and other non-image files remain included.
 
-No intermediate `.basis` or `.ktx2` files are produced. The encoder still needs
-one full source texture and its encoded output in memory. HDP stores bounded
+No intermediate `.basis` or `.ktx2` files are produced. Each active encoder needs
+its source texture and internal buffers in memory. Completed outputs queue in
+memory without a memory cap until the single writer reaches their input index.
+HDP stores bounded
 compressed chunks in a temporary spool, then writes headers/index and copies
 those chunks into desktop or web volumes. The spool is removed on ordinary
 success/error; process termination can leave it behind.
@@ -45,7 +47,7 @@ Inputs currently supported by the encoder are PNG/JPEG/WebP/BMP/TGA and existing
 the source package; external URLs and symlinks are rejected. Existing KTX2
 payloads must satisfy the runtime loader's constraints.
 
-Manosabars uses this pipeline in `build.rs`. Changing source assets triggers
+Manosabars uses this pipeline for wasm builds in `build.rs`. Changing source assets triggers
 re-encoding on the next build; no persistent texture encoding cache is provided.
 
 ## Terminal build progress
@@ -53,8 +55,10 @@ re-encoding on the next build; no persistent texture encoding cache is provided.
 Manosabars enables `TerminalProgress` around `pack_directory_with_progress`.
 It reports discovery, manifest planning, ordinary asset compression, image
 decoding, UASTC encoding, KTX2 compression and volume publication. Texture counts
-mean completed textures, not encoder-internal percentages. Each encoding phase
-reports elapsed time, and a five-second heartbeat identifies the current stage
+mean written textures, not encoder-internal percentages. Concurrent encoding
+events identify individual files without presenting their index as a completed
+count. The worker-plan event reports the CPU/thread allocation. A five-second
+heartbeat identifies the latest reported stage
 during long operations. A heartbeat means the reporter is alive, not proof that
 the native encoder is making progress. Failures include the last operation.
 
@@ -67,8 +71,14 @@ The quiet `pack_directory` API remains available for library callers/tests.
 
 ## Encoder performance
 
-Encoding uses UASTC effort level 3 and up to eight threads per image, bounded by
-host parallelism and Cargo's `NUM_JOBS`. Textures are processed one at a time.
+Encoding uses UASTC effort level 3. The CPU budget is the minimum of host
+parallelism and Cargo's `NUM_JOBS`. When possible, one CPU is reserved for HDP
+compression; the remainder is distributed across image workers, aiming for four
+threads per image (up to eight when there are few images). Each worker repeatedly
+claims another image without waiting for earlier images to finish. The writer
+consumes outputs in sorted source order, preserving stable package ordering and
+descriptor deduplication. Queued output memory is not capped. Errors stop new
+jobs and join active encoders before returning; failed encoding is never published.
 Manosabars optimizes build dependencies even in debug builds. Other consuming
 workspaces should set `profile.dev/release.build-override.opt-level = 3`, or at
 least `profile.dev/release.package.basis-universal-sys.opt-level = 3`: Cargo

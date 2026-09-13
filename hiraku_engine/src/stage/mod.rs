@@ -4,6 +4,7 @@ mod definition;
 mod model;
 pub use model::{StageAlpha, StageLight, StageLightKind, StageMaterial};
 mod clip;
+mod redraw;
 pub use clip::ViewClip;
 pub(crate) mod runtime;
 pub(crate) mod views;
@@ -20,6 +21,7 @@ use bevy::{
 pub struct StagePlugin;
 impl Plugin for StagePlugin {
     fn build(&self, app: &mut App) {
+        redraw::register(app);
         app.init_asset::<StageDefinition>()
             .init_asset_loader::<StageLoader>();
         app.init_resource::<runtime::StageRuntime>().add_systems(

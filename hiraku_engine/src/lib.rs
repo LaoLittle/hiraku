@@ -515,6 +515,10 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 PostUpdate,
+                scene::screen_ui::initialize_scroll_anchors.after(bevy::ui::UiSystems::Layout),
+            )
+            .add_systems(
+                PostUpdate,
                 scene::fit_screen_text
                     .after(bevy::ui::widget::text_system)
                     .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),

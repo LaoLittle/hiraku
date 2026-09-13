@@ -21,6 +21,22 @@ pub struct Attribute {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolBound {
+    pub parameter: String,
+    pub protocol: TypeExpr,
+}
+
+/// Explicit normalized evidence parameters, generated from source bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolWitness {
+    pub parameter: String,
+    pub protocol: String,
+    pub method: String,
+    pub parameters: Vec<TypeExpr>,
+    pub result: TypeExpr,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     Return {
         value: Option<Expr>,
@@ -40,8 +56,16 @@ pub enum Stmt {
         setter: Option<(String, Block)>,
         span: Span,
     },
-    Impl {
+    Extend {
         target: TypeExpr,
+        protocol: Option<TypeExpr>,
+        methods: Vec<Stmt>,
+        span: Span,
+    },
+    Protocol {
+        name: String,
+        type_parameters: Vec<String>,
+        associated_types: Vec<String>,
         methods: Vec<Stmt>,
         span: Span,
     },
@@ -71,11 +95,16 @@ pub enum Stmt {
         span: Span,
     },
     Function {
+        /// Set only when the compiler injects its bundled standard library.
+        /// Source syntax cannot request this capability.
+        compiler_intrinsics: bool,
         attributes: Vec<Attribute>,
         /// Exported functions participate in runtime linking across scripts.
         exported: bool,
         name: String,
         type_parameters: Vec<String>,
+        bounds: Vec<ProtocolBound>,
+        witnesses: Vec<ProtocolWitness>,
         parameters: Vec<FunctionParameter>,
         return_type: Option<TypeExpr>,
         body: Block,
