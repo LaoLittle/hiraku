@@ -225,17 +225,25 @@ pub fn link_named_modules_with_policy(
                     }
                 }
             }
-            let Instruction::Call {
-                function,
-                arguments,
-                receiver,
-                argument_types,
-                ..
-            } = instruction
-            else {
-                continue;
+            // Taking a function's address needs the same relocation as calling
+            // it. Only direct calls carry call-site argument metadata.
+            let (function, call_site) = match instruction {
+                Instruction::Call {
+                    function,
+                    arguments,
+                    receiver,
+                    argument_types,
+                    ..
+                } => (function, Some((arguments, receiver, argument_types))),
+                Instruction::Constant {
+                    value: crate::vm::Constant::Function(function),
+                    ..
+                } => (function, None),
+                _ => continue,
             };
-            if argument_types.len() != arguments.count as usize + usize::from(receiver.is_some()) {
+            if call_site.is_some_and(|(arguments, receiver, argument_types)| {
+                argument_types.len() != arguments.count as usize + usize::from(receiver.is_some())
+            }) {
                 errors.push(LinkError {
                     module: module_id,
                     symbol: Some(*function),
@@ -283,6 +291,7 @@ pub fn link_named_modules_with_policy(
                         module,
                         function: index,
                     } = target
+                        && let Some((arguments, receiver, argument_types)) = call_site
                     {
                         let signature = &signatures[module.0 as usize][index as usize];
                         let expected =
@@ -513,6 +522,12 @@ fn parameter_accepts(
     if actual == &T::Any {
         return true;
     }
+    // Earlier arguments may have resolved T before a later argument uses it
+    // inside a callable (including compiler-generated protocol witnesses),
+    // nominal type or another nested signature. Use the same recursive type
+    // substitution as HIR, then retain the normal assignability/variance rules.
+    let resolved = crate::hir::substitute_type(expected, substitutions);
+    let expected = &resolved;
     match (expected, actual) {
         (T::TypeParameter(id), actual) => match substitutions.get(id) {
             Some(bound) => bound.accepts(actual),
@@ -574,6 +589,56 @@ mod tests {
     use crate::{BuiltinManifest, compile_with_manifest, parse_program};
 
     use super::*;
+
+    #[test]
+    fn substituted_callable_signatures_preserve_variance_and_reject_mismatches() {
+        use crate::ScriptType as T;
+        let parameter = SymbolId(0);
+        let expected = T::Callable {
+            parameters: vec![T::TypeParameter(parameter)],
+            result: Box::new(T::List(Box::new(T::TypeParameter(parameter)))),
+        };
+        let callback = |parameters, result| T::Callable {
+            parameters,
+            result: Box::new(result),
+        };
+        let mut substitutions = BTreeMap::new();
+        assert!(parameter_accepts(
+            &T::TypeParameter(parameter),
+            &T::String,
+            &mut substitutions
+        ));
+        for receiver in [T::String, T::Any, T::Optional(Box::new(T::String))] {
+            assert!(parameter_accepts(
+                &expected,
+                &callback(vec![receiver], T::List(Box::new(T::String))),
+                &mut substitutions
+            ));
+        }
+        for actual in [
+            callback(vec![T::Int], T::List(Box::new(T::String))),
+            callback(vec![T::String], T::List(Box::new(T::Int))),
+            callback(vec![T::String], T::Any),
+            callback(vec![], T::List(Box::new(T::String))),
+        ] {
+            assert!(
+                !parameter_accepts(&expected, &actual, &mut substitutions),
+                "must reject {actual:?}"
+            );
+        }
+        let optional = T::Callable {
+            parameters: vec![T::Optional(Box::new(T::TypeParameter(parameter)))],
+            result: Box::new(T::Unit),
+        };
+        assert!(
+            !parameter_accepts(
+                &optional,
+                &callback(vec![T::String], T::Unit),
+                &mut substitutions
+            ),
+            "a non-null callback cannot accept a nullable argument"
+        );
+    }
 
     #[test]
     fn intrinsic_grants_are_module_local_and_default_deny() {

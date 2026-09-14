@@ -59,9 +59,20 @@ extend TestFoo: Colon<String> {
     }
 }
 
+fn what<T: Test>(t: T) { t.test() }
 
 let s: TestFoo = .{ name: "some name" }
 
 s: "123"
 
-//what(s)
+what(s)
+
+//let decoy: () -> Int = { return 99 }
+global fn apply(callback: () -> Int) -> Int { callback() }
+
+let unused = 0
+let callback: () -> Int = { return 7 }
+
+ let result: Int = apply(callback)
+
+print(result.toString())

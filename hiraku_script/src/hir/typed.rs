@@ -1287,6 +1287,13 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 name, value, span, ..
             } => {
                 let symbol = self.symbol(name);
+                if self.resolve_local(symbol).is_some() {
+                    self.error(
+                        format!("global `{name}` conflicts with an existing local binding; a global declaration does not shadow a local variable; rename one of the bindings"),
+                        *span,
+                    );
+                    return None;
+                }
                 let global = self.global_names.get(&symbol).copied();
                 let Some(global) = global else {
                     self.error(format!("unknown global `{name}`"), *span);
@@ -2020,14 +2027,17 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 if function == ResolvedFunction::Dynamic
                     && let ExprKind::Member { name, .. } = &syntax_callee.kind
                     && let HirExprKind::Member { object, .. } = callee.kind
-                    && let ScriptType::Struct {
-                        name: owner,
-                        fields,
-                        ..
-                    } = self.expression_type(object)
-                    && !fields.contains_key(name)
+                    && let Some(owner) = match self.expression_type(object) {
+                        ScriptType::Struct {
+                            name: owner,
+                            fields,
+                            ..
+                        } if !fields.contains_key(name) => Some(*owner),
+                        ScriptType::Enum { name: owner, .. } => Some(*owner),
+                        _ => None,
+                    }
                 {
-                    let owner = self.symbols.resolve(*owner).unwrap_or("<unknown>");
+                    let owner = self.symbols.resolve(owner).unwrap_or("<unknown>");
                     self.error(format!("unknown method `{name}` for `{owner}`; cross-module extension methods must be exported with `global fn`"), syntax_callee.span);
                     return self.alloc_expression(
                         HirExprKind::Literal(HirLiteral::Unit),

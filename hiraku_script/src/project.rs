@@ -267,6 +267,127 @@ mod tests {
     }
 
     #[test]
+    fn imported_function_values_link_without_a_direct_call() {
+        for entry in [
+            "let callback: () -> Int = value; if callback() != 7 { panic(\"wrong callback\") }",
+            "let callback = value; let forwarded = callback; if forwarded() != 7 { panic(\"wrong callback\") }",
+        ] {
+            let project = compile_project(
+                vec![
+                    source("main.hks", entry),
+                    source("library.hks", "global fn value() -> Int { 7 }"),
+                ],
+                &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+            )
+            .expect("function value links");
+            let program = project.program;
+            let mut vm =
+                crate::LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+            let mut completed = false;
+            for _ in 0..1_000 {
+                if matches!(
+                    vm.step_with_budget(&mut 1).expect("invoke imported function"),
+                    Some(crate::LinkedVmEvent::Completed(_))
+                ) {
+                    completed = true;
+                    break;
+                }
+                vm = crate::LinkedVm::restore(vm.snapshot(), program.clone())
+                    .expect("restore callable state");
+            }
+            assert!(completed);
+        }
+    }
+
+    #[test]
+    fn missing_enum_method_is_not_reported_as_an_any_call() {
+        let errors = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+            let result: Result<Int, String> = .success(67)
+            result.toString()
+        "#,
+            )],
+            &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+        )
+        .expect_err("Result does not implement toString");
+        assert!(
+            errors.iter().any(|error| error
+                .error
+                .message
+                .contains("unknown method `toString` for `Result`")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.error.message.contains("cannot call Any"))
+        );
+    }
+
+    #[test]
+    fn global_declaration_reports_local_name_collision() {
+        let errors = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+            let result: Result<Int, String> = .success(67)
+            global let result: Int = 7
+        "#,
+            )],
+            &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+        )
+        .expect_err("ambiguous binding");
+        assert!(
+            errors.iter().any(|error| error
+                .error
+                .message
+                .contains("global `result` conflicts with an existing local binding")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn global_callable_result_retains_primitive_methods() {
+        let mut registry = crate::native::NativeRegistry::<Vec<String>>::new();
+        registry
+            .register_fn("print", |output: &mut Vec<String>, value: String| {
+                output.push(value);
+                Ok(())
+            })
+            .expect("register print");
+        let project = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+            global fn apply(callback: () -> Int) -> Int { callback() }
+            let unused = 0
+            let callback: () -> Int = { return 7 }
+            global let result: Int = apply(callback)
+            print(result.toString())
+        "#,
+            )],
+            &registry.manifest(),
+        )
+        .expect("global result compiles");
+        let mut vm =
+            crate::LinkedVm::new(project.program, project.paths["main.hks"]).expect("entry");
+        let mut output = Vec::new();
+        loop {
+            match vm.step().expect("execution") {
+                Some(crate::LinkedVmEvent::Call(call)) => {
+                    let value = registry.call(&mut output, &call).expect("native call");
+                    vm.resume(value).expect("resume");
+                }
+                Some(crate::LinkedVmEvent::Completed(_)) | None => break,
+                _ => {}
+            }
+        }
+        assert_eq!(output, ["7"]);
+    }
+
+    #[test]
     fn script_owned_builder_exports_type_methods_and_commit_without_native_handles() {
         let mut registry = crate::native::NativeRegistry::<()>::new();
         let submit = registry

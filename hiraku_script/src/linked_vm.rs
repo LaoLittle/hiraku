@@ -445,6 +445,79 @@ mod tests {
     }
 
     #[test]
+    fn project_links_protocol_witnesses_for_structs_and_restores_calls() {
+        let mut natives = crate::native::NativeRegistry::<Vec<String>>::new();
+        natives
+            .register_fn("print", |output: &mut Vec<String>, message: String| {
+                output.push(message);
+                Ok(())
+            })
+            .expect("register typed print");
+        let project = crate::compile_project(
+            vec![crate::ScriptSource {
+                path: "main.hks".into(),
+                namespace: None,
+                source: r#"
+                struct TestFoo { name: String? }
+                protocol Test { fn test(self) -> Unit }
+                extend TestFoo: Test {
+                    fn test(self) { print("name: ${self.name ?: "no way"}") }
+                }
+                extend TestFoo: Colon<String> {
+                    type Output = Unit
+                    fn colon(self, rhs: String) {
+                        self.test()
+                        print("rhs: ${rhs}")
+                    }
+                }
+                fn what<T: Test>(t: T) { t.test() }
+                fn forward<U: Test>(value: U) { what(value) }
+                let s: TestFoo = .{ name: "Alice" }
+                s: "123"
+                what(s)
+                forward(s)
+                what(TestFoo.{ name: null })
+            "#
+                .into(),
+            }],
+            &natives.manifest(),
+        )
+        .expect("generic protocol calls link through the project pipeline");
+        let program = project.program;
+        let mut vm = LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+        let mut output = Vec::new();
+        let mut completed = false;
+        for _ in 0..100 {
+            match vm.step().expect("linked generic call") {
+                Some(LinkedVmEvent::Call(call)) => {
+                    vm = LinkedVm::restore(vm.snapshot(), program.clone())
+                        .expect("restore witness call");
+                    let value = natives
+                        .call(&mut output, &call)
+                        .expect("typed native dispatch");
+                    vm.resume(value).expect("resume witness call");
+                }
+                Some(LinkedVmEvent::Completed(_)) => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(completed, "program must terminate");
+        assert_eq!(
+            output,
+            [
+                "name: Alice",
+                "rhs: 123",
+                "name: Alice",
+                "name: Alice",
+                "name: no way"
+            ]
+        );
+    }
+
+    #[test]
     fn executes_and_restores_cross_module_global_calls() {
         let natives = BuiltinManifest::new([("nativeEcho", BuiltinId(4))]);
         let provider = compile(
