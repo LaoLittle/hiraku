@@ -513,6 +513,24 @@ pub fn animate_camera_transition(
         tweens.active = None;
     }
 
+    // Stage owns spatial projections, but its composed output still passes
+    // through the presentation camera's post-processing.
+    for (_, _, _, mut blur) in &mut world_cameras {
+        let mut settings = *blur;
+        settings.set_radius(camera_state.blur_intensity);
+        settings.set_include_ui(matches!(
+            camera_state.effect_scope,
+            CameraEffectScope::Canvas
+        ));
+        settings.set_canvas_zoom(
+            if matches!(camera_state.effect_scope, CameraEffectScope::Canvas) {
+                camera_state.zoom
+            } else {
+                1.0
+            },
+        );
+        blur.set_if_neq(settings);
+    }
     if shared
         .as_ref()
         .is_some_and(|shared| shared.0.spatial_stage.is_some())
@@ -525,16 +543,15 @@ pub fn animate_camera_transition(
     }
     *applied_state = Some(camera_state.clone());
 
-    for (camera, mut projection, mut transform, mut blur) in &mut world_cameras {
-        blur.set_radius(camera_state.blur_intensity);
-        blur.set_include_ui(matches!(
-            camera_state.effect_scope,
-            CameraEffectScope::Canvas
-        ));
+    for (camera, mut projection, mut transform, _) in &mut world_cameras {
         // Bevy UI is a separate pass attached to this camera and does not use
         // its world projection. Camera transforms therefore always apply to the
         // 3D scene, including effects authored with canvas scope.
-        let zoom = camera_state.zoom.max(0.01);
+        let zoom = if matches!(camera_state.effect_scope, CameraEffectScope::Canvas) {
+            1.0 // Applied once to the composed frame, after the Bevy UI pass.
+        } else {
+            camera_state.zoom.max(0.01)
+        };
         match camera_state.projection {
             CameraProjectionMode::Orthographic => {
                 if !matches!(*projection, Projection::Orthographic(_)) {

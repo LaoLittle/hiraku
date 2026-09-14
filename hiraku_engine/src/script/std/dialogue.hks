@@ -1,0 +1,147 @@
+// Native identity is not a builder. All uncommitted changes live in this object.
+global struct Actor {
+    identity: ActorIdentity
+    name: String
+    expressions: List<String>
+    position: Position?
+    scaleValue: Float?
+    focused: Bool?
+    rotationValue: Float?
+    depthValue: Float?
+    clipValue: Optional<Optional<String>>
+    showing: Bool?
+    hiding: Float?
+    offsetValue: Position?
+    oscillation: Position?
+    periodX: Float
+    periodY: Float
+    stopping: Bool
+    seconds: Float?
+    curve: Easing?
+}
+
+fn makeActor(identity: ActorIdentity, name: String) -> Actor {
+    Actor.{ identity: identity, name: name, expressions: [], position: null,
+        scaleValue: null, focused: null, rotationValue: null, depthValue: null,
+        clipValue: null, showing: null, hiding: null, offsetValue: null,
+        oscillation: null, periodX: 0.0, periodY: 0.0, stopping: false,
+        seconds: null, curve: null }
+}
+
+global fn char(name: String) -> Actor {
+    makeActor(intrinsics.engine.actorIdentity(name), name)
+}
+
+fn clearActorPatch(actor: Actor) {
+    actor.expressions = []
+    actor.position = null
+    actor.scaleValue = null
+    actor.focused = null
+    actor.rotationValue = null
+    actor.depthValue = null
+    actor.clipValue = null
+    actor.showing = null
+    actor.hiding = null
+    actor.offsetValue = null
+    actor.oscillation = null
+    actor.stopping = false
+    actor.seconds = null
+    actor.curve = null
+}
+
+@statementCommit
+global fn onActorCommit(actor: Actor) {
+    commitActor(actor, false)
+}
+
+// Detach the patch before yielding to the host: seq may suspend at submission,
+// while another execution continues using the same script Actor object.
+fn submitActorPatch(actor: Actor, patch: Actor, wait: Bool) {
+    clearActorPatch(actor)
+    intrinsics.engine.submitActor(patch, wait)
+}
+
+fn commitActor(actor: Actor, wait: Bool) {
+    submitActorPatch(actor, Actor.{ identity: actor.identity, name: actor.name,
+        expressions: actor.expressions, position: actor.position,
+        scaleValue: actor.scaleValue, focused: actor.focused,
+        rotationValue: actor.rotationValue, depthValue: actor.depthValue,
+        clipValue: actor.clipValue, showing: actor.showing, hiding: actor.hiding,
+        offsetValue: actor.offsetValue, oscillation: actor.oscillation,
+        periodX: actor.periodX, periodY: actor.periodY, stopping: actor.stopping,
+        seconds: actor.seconds, curve: actor.curve }, wait)
+}
+
+extend Actor {
+    global fn e(self, emotion: String) -> Actor {
+        self.expressions = intrinsics.engine.appendExpression(self.expressions, emotion)
+        self
+    }
+    global fn at(self, position: Position) -> Actor { self.position = position; self }
+    global fn scale(self, scale: Float) -> Actor { self.scaleValue = scale; self }
+    global fn focus(self, focused: Bool?) -> Actor { self.focused = focused ?: true; self }
+    global fn rotation(self, degrees: Float) -> Actor { self.rotationValue = degrees; self }
+    global fn depth(self, depth: Float) -> Actor { self.depthValue = depth; self }
+    global fn clip(self, region: String?) -> Actor { self.clipValue = .some(region); self }
+    global fn show(self) -> Actor { self.showing = true; self.hiding = null; self }
+    global fn hide(self, fadeMs: Float?) -> Actor { self.hiding = fadeMs ?: 0.0; self.showing = false; self }
+    global fn offset(self, position: Position) -> Actor {
+        self.offsetValue = position; self.oscillation = null; self.stopping = false; self
+    }
+    global fn oscillate(self, amplitude: Position, periodX: Float, periodY: Float) -> Actor {
+        self.oscillation = amplitude; self.periodX = periodX; self.periodY = periodY
+        self.offsetValue = null; self.stopping = false; self
+    }
+    global fn stopMotion(self) -> Actor {
+        self.offsetValue = null; self.oscillation = null; self.stopping = true; self
+    }
+    global fn time(self, seconds: Float) -> Actor { self.seconds = seconds; self }
+    global fn easing(self, easing: Easing) -> Actor { self.curve = easing; self }
+    global fn await(self) {
+        commitActor(self, true)
+    }
+    global fn alias(self, name: String) -> Actor {
+        onActorCommit(self)
+        makeActor(intrinsics.engine.aliasActor(self.identity, name), self.name)
+    }
+    global fn clone(self, name: String) -> Actor {
+        onActorCommit(self)
+        makeActor(intrinsics.engine.cloneActor(self.identity, name), self.name)
+    }
+}
+
+extend Stage {
+    global fn place(self, actor: Actor, anchor: String) {
+        intrinsics.engine.placeActor(self, actor.identity, anchor)
+    }
+}
+
+// Only this embedded module receives the dialogue.write capability.
+global fn say(speaker: String, text: TextTemplate) {
+    intrinsics.engine.say(speaker, text)
+}
+
+extend Actor: Colon<TextTemplate> {
+    type Output = Unit
+
+    global fn colon(self, text: TextTemplate) {
+        onActorCommit(self)
+        say(self.name, text)
+    }
+}
+
+extend String: Colon<TextTemplate> {
+    type Output = Unit
+
+    global fn colon(self, text: TextTemplate) {
+        say(self, text)
+    }
+}
+
+extend Ellipsis: Colon<TextTemplate> {
+    type Output = Unit
+
+    global fn colon(self, text: TextTemplate) {
+        intrinsics.engine.continueDialogue(text)
+    }
+}

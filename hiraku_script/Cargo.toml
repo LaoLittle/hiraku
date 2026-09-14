@@ -10,7 +10,7 @@ license.workspace = true
 blake3 = "1"
 unicode-xid = "0.2.6"
 unic-emoji-char = "0.9.0"
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 rustc-hash.workspace = true
 indexmap = "2.14.0"
 bumpalo.workspace = true

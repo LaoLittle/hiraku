@@ -17,11 +17,10 @@
   authorized module. Export a script wrapper instead. Script functions may not
   occupy the reserved `intrinsics` namespace.
 
-This does **not** yet make the existing engine native API private. Its registrations
-must be moved behind the ABI incrementally. Engine compilation currently embeds
-some library code into user modules; privileged libraries must become separate
-link units before grants can safely be applied to them. Snapshot restoration must
-also receive freshly authorized link units rather than persisting grants.
+This does **not** yet make every engine native API private. Its registrations
+are moving behind the ABI incrementally. Actor and dialogue now use a separate
+privileged link unit. Snapshot restoration receives freshly authorized link units
+rather than persisting grants. Remaining prelude families still need migration.
 
 ## Enum and when support
 
@@ -57,7 +56,7 @@ inside an arm retain the existing VM wait/snapshot behavior.
 
 Enum construction uses a register slice and the existing typed/tagged value
 representation. Matching lowers to basic blocks with discriminant tests and payload
-access. Bytecode version is 20. UI compilation and asset/voice analysis traverse
+access. Bytecode version is 21. UI compilation and asset/voice analysis traverse
 match arms as conditional regions.
 
 Current limits: recursive enum schemas, nested/destructuring patterns, guards and
@@ -77,7 +76,7 @@ declaration references rather than infinite expansion.
    dispatch operators by static conformance signatures. Extend this to imported extension interfaces
    before moving engine-owned operators into separate library modules.
 5. Script-owned statement handlers with explicit transaction boundaries and
-   resumable frames. Do not run handlers on arguments, declaration initializers,
+   resumable frames. Do not run handlers on arguments,
    intermediate fluent values, or returned tail values. Suppress recursive
    handler invocation while retaining normal host waits.
 6. Separate privileged engine prelude modules; migrate dialogue, then Actor
@@ -272,8 +271,85 @@ the same call from an untrusted entry module. Compiler permission does not grant
 host permission, and permission is not inherited by a wrapper's callers.
 
 Engine API registrations have **not** all been renamed or moved into script
-wrappers yet. Actor/Colon and UI still require cross-module extension interfaces
-before their implementations can be removed from the existing native API.
+wrappers yet. The embedded `script/std/dialogue.hks` now exports `say` and
+`Colon<TextTemplate>` implementations for Actor, String and Ellipsis. The Rust
+operator dispatch branch has been removed. Ellipsis has a concrete language type;
+it no longer masquerades as Any. The three dialogue primitives are ordinary native
+functions with a link-time `dialogue.write` requirement. Only the authenticated
+embedded module receives this grant, in project, standalone and restore paths.
+
+Actor itself is still a native handle with Rust-owned pending builder state.
+Moving those fields and fluent methods into a script-defined struct is the next
+migration, not completed by moving Colon. It requires sharing nominal type
+declarations across library interfaces and preserving alias/clone, animation,
+await and snapshot behavior. Do not replace it with a script struct that merely
+wraps the same native builder and claim the ownership migration is complete.
+
+The cross-module prerequisite is now implemented: `global struct Actor { ... }`
+exports a nominal type, and `global fn` inside an extension exports its instance
+method. Public structs are collected before any function interfaces, independently
+of file ordering. Their identities are explicitly recorded in bytecode metadata;
+the linker shares only declared public identities, rather than treating every
+same-named private struct as the same type. Duplicate public types and a private
+declaration shadowing a public type are compile errors. This first export form
+covers structs, not exported enums or aliases.
+
+An end-to-end project test uses a script-only Actor, script-owned fields and dirty
+flag, exported `.at()` / `.e()` methods and an exported statement handler. The
+only native operation receives final primitive arguments. It verifies shared
+object identity, chain-level commits, field retention, numeric inference and
+snapshot restore while the host submission is suspended. Numeric re-lowering
+retains all imported types, receiver metadata and statement handlers.
+
+The embedded library now defines Actor and its fluent mutations in HKS. An Actor
+contains a native identity and a script-owned incremental patch. Native state is
+the authoritative committed presentation (including alias display identity and
+motion revision), not a second fluent builder. Empty fields retain prior state;
+clip uses nested Optional to distinguish unchanged from explicitly cleared.
+Only submitActor applies the patch and flushes that identity. The actor-wide Rust
+statement flush has been removed. Animation handles and hide cancellation remain
+owned by the existing effect lifecycle, not by a second script scheduler.
+
+Actor/String/Ellipsis Colon and Stage.place use ordinary script methods. Actor
+intrinsics require scene.actor; dialogue intrinsics require dialogue.write. The
+authenticated embedded module receives these grants at link time. Standalone
+compilation seeds the library's symbol table from its caller, preserving nominal
+type identity without exporting capabilities or user source into the library.
+
+Patch fields are detached and cleared before the submission can yield. This
+prevents a paused seq from later clearing another execution's changes. Public
+actor names, optional arguments and time units are preserved by this migration.
+Other fluent families and the Rust bare-string statement consumer remain to be
+migrated; this is not yet a complete engine prelude conversion.
+
+## Script statement handlers
+
+`@statementCommit fn onActorCommit(actor: Actor) -> Unit` is now compiled into an
+ordinary function call for a matching expression statement. An exported handler
+also works through project interfaces. It takes one concrete typed argument and
+returns Unit; duplicate local handlers for the same type are rejected. Fluent
+chains commit once, not once per member call. Initialized let/global bindings
+also dispatch their value's typed handler after storing the original value, so
+`let actor = char("alice").show()` still shows the actor. A restored global skips
+both initialization and its handler. Declarations do not emit bare-string dialogue
+events. Value-returning function tails still
+return values, rather than committing builders. A handler's own expression
+statements do not implicitly invoke statement handlers again. Explicit function
+calls retain ordinary call semantics.
+
+String handlers receive eagerly evaluated strings. A TextTemplate-only handler
+receives a lazy template; when both types are provided, String is preferred.
+Tests use a fully script-defined Actor builder and verify shared field updates,
+one commit per chain, and suspension/restoration inside the handler. The engine's
+existing Rust statement consumer has not yet been deleted.
+
+Lazy templates retain their lexical environment when passed through wrappers.
+Primitive bindings are captured by value, records retain shared heap identity;
+template captures are GC roots and participate in heap relocation and snapshots.
+The environment is shared when cloning a template, not recursively copied for
+each wrapper. Localization runs before evaluating the template against its
+captured scope, and may use a different captured variable. Computed String
+arguments remain strings and are not interpreted a second time.
 
 ## Inline hints and runtime calls
 

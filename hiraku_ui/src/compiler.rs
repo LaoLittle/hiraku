@@ -124,13 +124,23 @@ impl<'h> Lower<'_, 'h> {
         let kind = match stmt.kind {
             S::Expr(value) => S::Expr(self.expr(value)),
             S::Return(value) => S::Return(value.map(|v| self.expr(v))),
-            S::Let { local, value } => S::Let {
+            S::Let {
+                local,
+                value,
+                commit,
+            } => S::Let {
                 local,
                 value: self.expr(value),
+                commit: commit.map(|value| self.expr(value)),
             },
-            S::Global { global, value } => S::Global {
+            S::Global {
+                global,
+                value,
+                commit,
+            } => S::Global {
                 global,
                 value: value.map(|v| self.expr(v)),
+                commit: commit.map(|value| self.expr(value)),
             },
             S::Assign { target, value } => S::Assign {
                 target,

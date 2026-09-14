@@ -57,6 +57,7 @@ pub(super) fn sync(
     >,
     mut surfaces: Query<&mut WorldSprite>,
     mut redraw: super::redraw::StageRedraw,
+    camera_state: Option<Res<crate::render::camera::CameraState>>,
 ) {
     let state = shared.0.spatial_stage.as_ref();
     let owner = state.map(|s| (s.id, s.path.clone()));
@@ -89,10 +90,15 @@ pub(super) fn sync(
     for (name, view) in &state.views {
         let Some(preset) = &view.camera else { continue };
         let visible = view.alpha > 0.0 || view.fade.is_some();
-        let next = preset.projection.projection();
+        let (pose, next) = view_camera(preset, camera_state.as_deref());
         if let Some(entities) = rendered.views.get(name) {
-            if let Ok((mut camera, mut pose, mut lens, mut current_exposure, current_ambient)) =
-                cameras.get_mut(entities.camera)
+            if let Ok((
+                mut camera,
+                mut current_pose,
+                mut lens,
+                mut current_exposure,
+                current_ambient,
+            )) = cameras.get_mut(entities.camera)
             {
                 if current_ambient.map(|light| light.brightness) != ambient {
                     redraw.request();
@@ -113,7 +119,7 @@ pub(super) fn sync(
                     redraw.request();
                     camera.is_active = visible;
                 }
-                if pose.set_if_neq(preset.pose.transform()) {
+                if current_pose.set_if_neq(pose) {
                     redraw.request();
                 }
                 if super::runtime::projection_kind_values(&lens)
@@ -160,7 +166,7 @@ pub(super) fn sync(
                     ..default()
                 },
                 RenderTarget::Image(image.clone().into()),
-                preset.pose.transform(),
+                pose,
                 next,
                 spatial_layer(),
                 ChildOf(root),
@@ -195,5 +201,83 @@ pub(super) fn sync(
                 _image: image,
             },
         );
+    }
+}
+
+// Compose story camera effects with the authored stage lens, never with the
+// previous frame. Canvas pictures and UI retain their presentation coordinates.
+fn view_camera(
+    preset: &super::StageCamera,
+    state: Option<&crate::render::camera::CameraState>,
+) -> (Transform, Projection) {
+    let mut pose = preset.pose.transform();
+    let mut projection = preset.projection.projection();
+    if let Some(state) = state {
+        let zoom = if matches!(state.effect_scope, crate::script::CameraEffectScope::Canvas) {
+            1.0
+        } else {
+            state.zoom.max(0.01)
+        };
+        match &mut projection {
+            Projection::Orthographic(lens) => lens.scale /= zoom,
+            Projection::Perspective(lens) => {
+                lens.fov = (lens.fov / zoom).clamp(5_f32.to_radians(), 170_f32.to_radians());
+            }
+            _ => {}
+        }
+        pose.translation += pose.rotation * state.offset;
+        pose.rotation *= Quat::from_euler(
+            EulerRot::XYZ,
+            state.rotation.x.to_radians(),
+            state.rotation.y.to_radians(),
+            state.rotation.z.to_radians(),
+        );
+    }
+    (pose, projection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_zoom_uses_authored_lens_and_canvas_zoom_is_not_applied_twice() {
+        let mut preset = super::super::StageCamera {
+            pose: super::super::StageCameraPose::Fixed(super::super::StagePose {
+                position: (0.0, 0.0, 10.0),
+                rotation: (0.0, 0.0, 0.0),
+                scale: (1.0, 1.0, 1.0),
+            }),
+            projection: super::super::StageProjection::Perspective {
+                fov: 48.0,
+                near: 0.1,
+                far: 1000.0,
+            },
+        };
+        let mut state = crate::render::camera::CameraState {
+            zoom: 2.0,
+            ..default()
+        };
+        for _ in 0..3 {
+            let (_, Projection::Perspective(lens)) = view_camera(&preset, Some(&state)) else {
+                panic!("perspective");
+            };
+            assert!((lens.fov.to_degrees() - 24.0).abs() < 0.0001);
+        }
+        state.effect_scope = crate::script::CameraEffectScope::Canvas;
+        let (_, Projection::Perspective(lens)) = view_camera(&preset, Some(&state)) else {
+            panic!("perspective");
+        };
+        assert!((lens.fov.to_degrees() - 48.0).abs() < 0.0001);
+        state.effect_scope = crate::script::CameraEffectScope::World;
+        preset.projection = super::super::StageProjection::Orthographic {
+            height: 12.0,
+            near: 0.1,
+            far: 1000.0,
+        };
+        let (_, Projection::Orthographic(lens)) = view_camera(&preset, Some(&state)) else {
+            panic!("orthographic");
+        };
+        assert_eq!(lens.scale, 0.5);
     }
 }

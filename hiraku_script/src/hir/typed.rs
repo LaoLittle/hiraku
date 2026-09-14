@@ -60,6 +60,7 @@ impl HirArena {
 
 #[derive(Debug)]
 pub struct HirProgram<'hir> {
+    pub global_types: Vec<SymbolId>,
     pub symbols: SymbolManifest,
     pub types: TypeTable,
     pub locals: &'hir [HirLocal],
@@ -185,10 +186,12 @@ pub enum HirStmtKind<'hir> {
     Let {
         local: HirLocalId,
         value: &'hir HirExpr<'hir>,
+        commit: Option<&'hir HirExpr<'hir>>,
     },
     Global {
         global: HirGlobalId,
         value: Option<&'hir HirExpr<'hir>>,
+        commit: Option<&'hir HirExpr<'hir>>,
     },
     Assign {
         target: &'hir HirPlace<'hir>,
@@ -280,6 +283,7 @@ pub(crate) fn collect_project_exports(
     let program = super::prepare::prepare(program)?;
     let arena = HirArena::new();
     let mut lowerer = Lowerer::new(&arena, &program, Some(manifest));
+    lowerer.external_structs = interface.structs.clone();
     lowerer.symbols = SymbolInterner::from_manifest(super::normalize_program_symbols(
         &program,
         Some(&interface.symbols),
@@ -287,7 +291,7 @@ pub(crate) fn collect_project_exports(
     .expect("project symbols are unique");
     lowerer.declare_types(&program);
     lowerer.declare_functions(&program);
-    for function in &lowerer.functions {
+    for (index, function) in lowerer.functions.iter().enumerate() {
         if !function.exported {
             continue;
         }
@@ -300,6 +304,12 @@ pub(crate) fn collect_project_exports(
             |namespace| format!("{namespace}.{name}"),
         );
         let symbol = lowerer.symbols.intern(&name);
+        if lowerer.methods.values().any(|id| id.0 as usize == index) {
+            interface.receiver_functions.insert(symbol);
+        }
+        if function.statement_commit {
+            interface.statement_hooks.insert(symbol);
+        }
         let signature = crate::FunctionSignature {
             receiver: None,
             parameters: function.parameters.clone(),
@@ -338,12 +348,16 @@ pub(crate) fn lower_with_project_interface<'hir>(
     ))
     .expect("project symbols are unique");
     lowerer.external_functions = interface.functions.clone();
+    lowerer.external_receiver_functions = interface.receiver_functions.clone();
+    lowerer.external_structs = interface.structs.clone();
+    lowerer.external_statement_hooks = interface.statement_hooks.clone();
     lowerer.external_type_parameters = interface.type_parameters.clone();
     lowerer.lower(&program)
 }
 
 struct FunctionDeclaration {
     compiler_intrinsics: bool,
+    statement_commit: bool,
     name: SymbolId,
     exported: bool,
     type_parameters: Vec<SymbolId>,
@@ -376,6 +390,9 @@ struct Lowerer<'hir, 'manifest> {
     globals: Vec<HirGlobal>,
     functions: Vec<FunctionDeclaration>,
     external_functions: BTreeMap<SymbolId, crate::FunctionSignature>,
+    external_receiver_functions: BTreeSet<SymbolId>,
+    external_structs: Vec<Stmt>,
+    external_statement_hooks: BTreeSet<SymbolId>,
     external_type_parameters: BTreeMap<SymbolId, Vec<SymbolId>>,
     lowered_functions: Vec<HirFunction<'hir>>,
     scopes: Vec<BTreeMap<SymbolId, HirLocalId>>,
@@ -383,6 +400,7 @@ struct Lowerer<'hir, 'manifest> {
     function_names: BTreeMap<SymbolId, HirFunctionId>,
     methods: BTreeMap<(TypeId, SymbolId), HirFunctionId>,
     protocol_methods: BTreeMap<(TypeId, SymbolId), Vec<HirFunctionId>>,
+    external_methods: BTreeMap<(TypeId, SymbolId), SymbolId>,
     witness_locals: Vec<(FunctionWitness, HirLocalId)>,
     direct_callee: bool,
     static_methods: BTreeMap<(TypeId, SymbolId), HirFunctionId>,
@@ -460,6 +478,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             globals: Vec::new(),
             functions: Vec::new(),
             external_functions: BTreeMap::new(),
+            external_receiver_functions: BTreeSet::new(),
+            external_structs: Vec::new(),
+            external_statement_hooks: BTreeSet::new(),
             external_type_parameters: BTreeMap::new(),
             lowered_functions: Vec::new(),
             scopes: vec![BTreeMap::new()],
@@ -467,6 +488,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             function_names: BTreeMap::new(),
             methods: BTreeMap::new(),
             protocol_methods: BTreeMap::new(),
+            external_methods: BTreeMap::new(),
             witness_locals: Vec::new(),
             direct_callee: false,
             static_methods: BTreeMap::new(),
@@ -493,6 +515,25 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         self.declare_types(source);
         self.declare_globals(source);
         self.declare_functions(source);
+        for (name, signature) in self.external_functions.clone() {
+            if !self.external_receiver_functions.contains(&name) {
+                continue;
+            }
+            let Some((_, member)) = self
+                .symbols
+                .resolve(name)
+                .and_then(|name| name.split_once("::"))
+            else {
+                continue;
+            };
+            let member = member.to_owned();
+            let Some(receiver) = signature.parameters.first() else {
+                continue;
+            };
+            let owner = self.types.intern(receiver.clone());
+            let member = self.symbol(&member);
+            self.external_methods.insert((owner, member), name);
+        }
         self.lower_functions(source);
         self.current_function = None;
         self.scopes.clear();
@@ -534,6 +575,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             resolved.symbols = SymbolInterner::from_manifest(self.symbols.manifest())
                 .expect("the existing project symbol table is valid");
             resolved.external_functions = self.external_functions;
+            resolved.external_receiver_functions = self.external_receiver_functions;
+            resolved.external_structs = self.external_structs;
+            resolved.external_statement_hooks = self.external_statement_hooks;
             resolved.external_type_parameters = self.external_type_parameters;
             resolved.numeric_hints = hints;
             resolved.numeric_resolved = true;
@@ -545,7 +589,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         let locals = self.arena.alloc_slice_copy(&self.locals);
         let globals = self.arena.alloc_slice_copy(&self.globals);
         let functions = self.arena.alloc_slice_copy(&self.lowered_functions);
+        let global_names = self
+            .external_structs
+            .iter()
+            .chain(&source.statements)
+            .filter_map(|statement| match statement {
+                Stmt::Struct {
+                    exported: true,
+                    name,
+                    ..
+                } => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let global_types = global_names.iter().map(|name| self.symbol(name)).collect();
         Ok(HirProgram {
+            global_types,
             symbols: self.symbols.manifest(),
             types: self.types,
             locals,
@@ -560,6 +619,37 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     }
 
     fn declare_types(&mut self, program: &Program) {
+        for declaration in self.external_structs.clone() {
+            let Stmt::Struct {
+                name,
+                type_parameters,
+                ty,
+                ..
+            } = declaration
+            else {
+                continue;
+            };
+            if let Some(local) = program.statements.iter().find(
+                |statement| matches!(statement, Stmt::Struct { name: local, .. } if local == &name),
+            ) {
+                if let Stmt::Struct {
+                    exported: false,
+                    span,
+                    ..
+                } = local
+                {
+                    self.error(format!("private type `{name}` conflicts with an exported type; use a distinct name"), *span);
+                }
+                continue;
+            }
+            self.aliases.insert(
+                name,
+                TypeAliasDeclaration {
+                    parameters: type_parameters,
+                    body: ty,
+                },
+            );
+        }
         for statement in &program.statements {
             if let Stmt::Enum {
                 name,
@@ -589,6 +679,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 type_parameters,
                 ty,
                 span,
+                ..
             }) = statement
             else {
                 continue;
@@ -664,6 +755,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             let Stmt::Function {
                 exported,
                 compiler_intrinsics,
+                attributes,
                 name,
                 type_parameters,
                 witnesses,
@@ -733,10 +825,17 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     self.error("extend refers to an unknown type", *span);
                 }
             }
+            let statement_commit = attributes
+                .iter()
+                .any(|attribute| attribute.name == "statementCommit");
             let result = return_type
                 .as_ref()
                 .and_then(|ty| self.type_from_ast(ty))
-                .unwrap_or(ScriptType::Any);
+                .unwrap_or(if statement_commit {
+                    ScriptType::Unit
+                } else {
+                    ScriptType::Any
+                });
             let witnesses = witnesses
                 .iter()
                 .map(|witness| {
@@ -769,8 +868,30 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .iter()
                 .map(|name| self.symbol(name))
                 .collect();
+            if statement_commit
+                && (parameter_types.len() != 1
+                    || !type_parameters.is_empty()
+                    || result != ScriptType::Unit
+                    || parameter_types.first() == Some(&ScriptType::Any))
+            {
+                self.error(
+                    "@statementCommit requires one concrete typed parameter and a Unit result",
+                    *span,
+                );
+            }
+            if statement_commit
+                && self.functions.iter().any(|function| {
+                    function.statement_commit && function.parameters == parameter_types
+                })
+            {
+                self.error(
+                    "a statement type can have only one @statementCommit handler",
+                    *span,
+                );
+            }
             self.functions.push(FunctionDeclaration {
                 compiler_intrinsics: *compiler_intrinsics,
+                statement_commit,
                 name: symbol,
                 exported: *exported,
                 type_parameters: generic_parameters,
@@ -836,8 +957,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 self.witness_locals.push((witness, local));
             }
             let expected_result = self.functions[function_id.0 as usize].result.clone();
+            let statement_commit = self.functions[function_id.0 as usize].statement_commit;
             self.return_context
-                .push(return_type.as_ref().map(|_| expected_result.clone()));
+                .push((return_type.is_some() || statement_commit).then(|| expected_result.clone()));
             let body = if return_type.is_some()
                 && !matches!(expected_result, ScriptType::Unit | ScriptType::Never)
             {
@@ -865,7 +987,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     statements: self.arena.alloc_slice_copy(&statements),
                     span: body.span,
                 })
-            } else if return_type.is_none() {
+            } else if return_type.is_none() && !statement_commit {
                 self.lower_value_block(body, false)
             } else {
                 self.lower_block(body, false)
@@ -876,7 +998,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             if return_type.is_some() && expected_result != ScriptType::Unit {
                 self.check_assignment(&expected_result, &inferred_result, body.span);
             }
-            if return_type.is_none() {
+            if return_type.is_none() && !statement_commit {
                 self.functions[function_id.0 as usize].result = inferred_result;
             }
             if self.functions[function_id.0 as usize].result == ScriptType::Never
@@ -904,6 +1026,69 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             self.type_parameters.pop();
             self.witness_locals.clear();
         }
+    }
+
+    /// A declaration commits its initialized value, without replacing the binding
+    /// with the handler's Unit return. Restored globals skip this with initialization.
+    fn statement_commit_call(&mut self, value: &'hir HirExpr<'hir>) -> Option<&'hir HirExpr<'hir>> {
+        if self
+            .current_function
+            .is_some_and(|id| self.functions[id.0 as usize].statement_commit)
+        {
+            return None;
+        }
+        if let Some(index) = self.functions.iter().position(|function| {
+            function.statement_commit
+                && function.parameters.first() == Some(self.expression_type(value))
+        }) {
+            return Some(self.accessor_call(HirFunctionId(index as u32), &[value], value.span));
+        }
+        let candidates = self
+            .external_statement_hooks
+            .iter()
+            .copied()
+            .filter(|symbol| {
+                !self.function_names.contains_key(symbol)
+                    && self
+                        .external_functions
+                        .get(symbol)
+                        .is_some_and(|signature| {
+                            signature.parameters.first() == Some(self.expression_type(value))
+                        })
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() > 1 {
+            self.error(
+                "multiple exported @statementCommit handlers match this statement type",
+                value.span,
+            );
+            return None;
+        }
+        let symbol = candidates.first().copied()?;
+        let signature = self.external_functions[&symbol].clone();
+        let callee = self.alloc_expression(
+            HirExprKind::Unresolved(symbol),
+            ScriptType::Callable {
+                parameters: signature.parameters,
+                result: Box::new(signature.result.clone()),
+            },
+            value.span,
+        );
+        let arguments = self.arena.alloc_slice_copy(&[HirArgument {
+            label: None,
+            value,
+            span: value.span,
+        }]);
+        Some(self.alloc_expression(
+            HirExprKind::Call {
+                type_bindings: &[],
+                callee,
+                arguments,
+                function: ResolvedFunction::External(symbol),
+            },
+            signature.result,
+            value.span,
+        ))
     }
 
     fn block_diverges(&self, block: &HirBlock<'hir>) -> bool {
@@ -1083,7 +1268,20 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     self.inferred_numeric.insert(local);
                     self.numeric_dependencies.insert(span.start, dependencies);
                 }
-                (HirStmtKind::Let { local, value }, *span)
+                let reference = self.alloc_typed_expression(
+                    HirExprKind::Local(local),
+                    self.locals[local.0 as usize].ty,
+                    *span,
+                );
+                let commit = self.statement_commit_call(reference);
+                (
+                    HirStmtKind::Let {
+                        local,
+                        value,
+                        commit,
+                    },
+                    *span,
+                )
             }
             Stmt::Global {
                 name, value, span, ..
@@ -1115,7 +1313,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     let actual = self.expression_type(value).clone();
                     self.check_assignment(&expected, &actual, value.span);
                 }
-                (HirStmtKind::Global { global, value }, *span)
+                let commit = value.and_then(|_| {
+                    let reference = self.alloc_typed_expression(
+                        HirExprKind::Global(global),
+                        self.globals[global.0 as usize].ty,
+                        *span,
+                    );
+                    self.statement_commit_call(reference)
+                });
+                (
+                    HirStmtKind::Global {
+                        global,
+                        value,
+                        commit,
+                    },
+                    *span,
+                )
             }
             Stmt::Assign {
                 target,
@@ -1176,9 +1389,31 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 (HirStmtKind::Assign { target, value }, *span)
             }
             Stmt::Expr(expression) => {
+                let inside_hook = self
+                    .current_function
+                    .is_some_and(|id| self.functions[id.0 as usize].statement_commit);
+                let string_hook_type = if !inside_hook
+                    && matches!(expression.kind, ExprKind::String(_))
+                {
+                    [ScriptType::String, ScriptType::TextTemplate]
+                        .into_iter()
+                        .find(|ty| {
+                            self.functions.iter().any(|function| {
+                                function.statement_commit && function.parameters.first() == Some(ty)
+                            }) || self.external_statement_hooks.iter().any(|name| {
+                                self.external_functions.get(name).is_some_and(|signature| {
+                                    signature.parameters.first() == Some(ty)
+                                })
+                            })
+                        })
+                } else {
+                    None
+                };
                 // The existing bare-string statement hook consumes a template.
                 // Ordinary expression contexts use eager String interpolation.
-                let value = if let ExprKind::String(text) = &expression.kind {
+                let value = if let Some(expected) = string_hook_type {
+                    self.lower_expression_expected(expression, Some(&expected))
+                } else if let ExprKind::String(text) = &expression.kind {
                     self.alloc_expression(
                         HirExprKind::Literal(HirLiteral::String(self.arena.alloc_str(text))),
                         ScriptType::String,
@@ -1193,6 +1428,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         expression.span,
                     );
                 }
+                let value = self.statement_commit_call(value).unwrap_or(value);
                 (HirStmtKind::Expr(value), expression.span)
             }
             Stmt::If {
@@ -1269,7 +1505,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 HirExprKind::Literal(HirLiteral::Null),
                 ScriptType::Optional(Box::new(ScriptType::Any)),
             ),
-            ExprKind::Ellipsis => (HirExprKind::Literal(HirLiteral::Ellipsis), ScriptType::Any),
+            ExprKind::Ellipsis => (
+                HirExprKind::Literal(HirLiteral::Ellipsis),
+                ScriptType::Ellipsis,
+            ),
             ExprKind::Bool(value) => (
                 HirExprKind::Literal(HirLiteral::Bool(*value)),
                 ScriptType::Bool,
@@ -1762,7 +2001,39 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                             ScriptType::Function,
                             syntax_callee.span,
                         );
+                    } else if let Some(symbol) =
+                        self.external_methods.get(&(object.ty, member)).copied()
+                    {
+                        let signature = self.external_functions[&symbol].clone();
+                        function = ResolvedFunction::External(symbol);
+                        receiver = Some(object);
+                        callee = self.alloc_expression(
+                            HirExprKind::Unresolved(symbol),
+                            ScriptType::Callable {
+                                parameters: signature.parameters,
+                                result: Box::new(signature.result),
+                            },
+                            syntax_callee.span,
+                        );
                     }
+                }
+                if function == ResolvedFunction::Dynamic
+                    && let ExprKind::Member { name, .. } = &syntax_callee.kind
+                    && let HirExprKind::Member { object, .. } = callee.kind
+                    && let ScriptType::Struct {
+                        name: owner,
+                        fields,
+                        ..
+                    } = self.expression_type(object)
+                    && !fields.contains_key(name)
+                {
+                    let owner = self.symbols.resolve(*owner).unwrap_or("<unknown>");
+                    self.error(format!("unknown method `{name}` for `{owner}`; cross-module extension methods must be exported with `global fn`"), syntax_callee.span);
+                    return self.alloc_expression(
+                        HirExprKind::Literal(HirLiteral::Unit),
+                        ScriptType::Never,
+                        expression.span,
+                    );
                 }
                 if function == ResolvedFunction::Dynamic
                     && let ExprKind::Member { name, .. } = &syntax_callee.kind
@@ -1862,6 +2133,28 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         value: closure,
                         span: block.span,
                     });
+                }
+                // Match native optional-argument semantics with ordinary calls:
+                // omitted trailing Optional parameters are explicit none values.
+                if !matches!(function, ResolvedFunction::Builtin(_))
+                    && let Some(parameters) = &expected_parameters
+                    && arguments.len() < parameters.len()
+                    && parameters[arguments.len()..]
+                        .iter()
+                        .all(|ty| matches!(ty, ScriptType::Optional(_)))
+                {
+                    for ty in &parameters[arguments.len()..] {
+                        let value = self.alloc_expression(
+                            HirExprKind::Literal(HirLiteral::Null),
+                            ty.clone(),
+                            expression.span,
+                        );
+                        arguments.push(HirArgument {
+                            label: None,
+                            value,
+                            span: expression.span,
+                        });
+                    }
                 }
                 let arguments = self.arena.alloc_slice_copy(&arguments);
                 self.check_call(
@@ -2111,6 +2404,50 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 let mut left = self.lower_expression(left);
                 if let Some((protocol, method)) = crate::intrinsics::binary_protocol(*op) {
                     let method = self.symbol(&format!("protocol#{protocol}#{method}"));
+                    if !self.methods.contains_key(&(left.ty, method))
+                        && let Some(symbol) = self.external_methods.get(&(left.ty, method)).copied()
+                    {
+                        let signature = self.external_functions[&symbol].clone();
+                        let right = self
+                            .lower_expression_expected(right_syntax, signature.parameters.get(1));
+                        let callee = self.alloc_expression(
+                            HirExprKind::Unresolved(symbol),
+                            ScriptType::Callable {
+                                parameters: signature.parameters.clone(),
+                                result: Box::new(signature.result.clone()),
+                            },
+                            expression.span,
+                        );
+                        let arguments = self.arena.alloc_slice_copy(&[
+                            HirArgument {
+                                label: None,
+                                value: left,
+                                span: left.span,
+                            },
+                            HirArgument {
+                                label: None,
+                                value: right,
+                                span: right.span,
+                            },
+                        ]);
+                        self.check_call(
+                            ResolvedFunction::External(symbol),
+                            callee,
+                            arguments,
+                            &[],
+                            expression.span,
+                        );
+                        return self.alloc_expression(
+                            HirExprKind::Call {
+                                type_bindings: &[],
+                                callee,
+                                arguments,
+                                function: ResolvedFunction::External(symbol),
+                            },
+                            signature.result,
+                            expression.span,
+                        );
+                    }
                     if let Some(function) = self.methods.get(&(left.ty, method)).copied() {
                         // Resolve contextual numeric literals before selecting
                         // their protocol implementation below.
@@ -3596,6 +3933,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             "Float" => Some(ScriptType::Float),
             "String" => Some(ScriptType::String),
             "TextTemplate" => Some(ScriptType::TextTemplate),
+            "Ellipsis" => Some(ScriptType::Ellipsis),
             "Symbol" => Some(ScriptType::Symbol),
             "Selector" => Some(ScriptType::Selector),
             "Function" => Some(ScriptType::Function),

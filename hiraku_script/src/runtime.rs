@@ -268,6 +268,29 @@ fn hash_byte(hash: u64, byte: u8) -> u64 {
     (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
 }
 
+/// A lazy template retains its lexical values when passed to another function.
+/// Primitive bindings are captured by value; records retain their shared heap identity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TemplateValue {
+    pub source: String,
+    pub captures: std::sync::Arc<BTreeMap<String, Value>>,
+}
+
+impl From<String> for TemplateValue {
+    fn from(source: String) -> Self {
+        Self {
+            source,
+            captures: Default::default(),
+        }
+    }
+}
+
+impl From<&str> for TemplateValue {
+    fn from(source: &str) -> Self {
+        source.to_owned().into()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Object(crate::ObjectId),
@@ -284,7 +307,7 @@ pub enum Value {
     Number(f64),
     Percent(f64),
     String(String),
-    TextTemplate(String),
+    TextTemplate(TemplateValue),
     Symbol(String),
     Selector(String),
     Function {

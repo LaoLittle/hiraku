@@ -45,11 +45,12 @@ impl Plugin for BlurEffectPlugin {
     }
 }
 
-#[derive(Component, Clone, Copy, ExtractComponent, ShaderType)]
+#[derive(Component, Clone, Copy, PartialEq, ExtractComponent, ShaderType)]
 pub struct BlurSettings {
     intensity: f32,
     include_ui: u32,
-    _padding: Vec2,
+    canvas_zoom: f32,
+    _padding: f32,
 }
 
 impl BlurSettings {
@@ -66,6 +67,15 @@ impl BlurSettings {
     pub fn set_include_ui(&mut self, include_ui: bool) {
         self.include_ui = u32::from(include_ui);
     }
+
+    pub fn set_canvas_zoom(&mut self, zoom: f32) {
+        self.canvas_zoom = zoom.max(0.01);
+    }
+
+    fn enabled(&self, include_ui: bool) -> bool {
+        (self.include_ui != 0) == include_ui
+            && (self.intensity > f32::EPSILON || (self.canvas_zoom - 1.0).abs() > f32::EPSILON)
+    }
 }
 
 impl Default for BlurSettings {
@@ -73,8 +83,35 @@ impl Default for BlurSettings {
         Self {
             intensity: 0.0,
             include_ui: 0,
-            _padding: Vec2::ZERO,
+            canvas_zoom: 1.0,
+            _padding: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canvas_zoom_shader_validates_without_blur() {
+        let module = naga::front::wgsl::parse_str(include_str!("shaders/blur_effect.wgsl"))
+            .expect("canvas effect WGSL parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("canvas effect WGSL validates");
+        let mut settings = BlurSettings::default();
+        settings.set_include_ui(true);
+        settings.set_canvas_zoom(1.05);
+        assert_eq!(settings.intensity, 0.0);
+        assert_eq!(settings.canvas_zoom, 1.05);
+        assert!(settings.enabled(true));
+        assert!(!settings.enabled(false));
+        settings.set_canvas_zoom(1.0);
+        assert!(!settings.enabled(true));
     }
 }
 
@@ -153,7 +190,7 @@ fn run_blur_pass(
     };
 
     let (view_target, settings, settings_index) = view.into_inner();
-    if settings.intensity <= f32::EPSILON || (settings.include_ui != 0) != include_ui {
+    if !settings.enabled(include_ui) {
         return;
     }
     let post_process = view_target.post_process_write();

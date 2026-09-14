@@ -11,6 +11,7 @@ pub enum ScriptType {
     Never,
     Any,
     Unit,
+    Ellipsis,
     Bool,
     Int,
     Float,

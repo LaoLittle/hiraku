@@ -712,6 +712,13 @@ impl Parser {
                 methods.push(self.parse_type_alias());
             } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
                 methods.push(self.parse_function(false));
+            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "global") {
+                self.advance();
+                if !matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
+                    self.error_here("only functions can be exported from an extension");
+                    break;
+                }
+                methods.push(self.parse_function(true));
             } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "var") {
                 methods.push(self.parse_property());
             } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "const") {
@@ -1041,6 +1048,7 @@ impl Parser {
         let ty = self.parse_record_type_contents(start);
         let span = ty.span;
         Stmt::Struct {
+            exported: false,
             name,
             type_parameters,
             ty,
@@ -1224,6 +1232,13 @@ impl Parser {
 
     fn parse_global(&mut self) -> Stmt {
         let start = self.advance();
+        if matches!(&self.current().kind, TokenKind::Ident(name) if name == "struct") {
+            let mut declaration = self.parse_struct();
+            if let Stmt::Struct { exported, .. } = &mut declaration {
+                *exported = true;
+            }
+            return declaration;
+        }
         if matches!(&self.current().kind, TokenKind::Ident(name) if name == "const") {
             return self.parse_const(true);
         }
@@ -1237,7 +1252,7 @@ impl Parser {
                 mutable
             }
             _ => {
-                self.error_here("expected `let`, `var`, or `fn` after `global`; use `global let` for a fixed binding or `global var` for a reassignable binding");
+                self.error_here("expected `let`, `var`, `const`, `fn`, or `struct` after `global`; use `global let` for a fixed binding or `global var` for a reassignable binding");
                 false
             }
         };

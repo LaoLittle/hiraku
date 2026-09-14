@@ -1,7 +1,8 @@
 struct BlurSettings {
     intensity: f32,
     include_ui: u32,
-    _padding: vec2<f32>,
+    canvas_zoom: f32,
+    _padding: f32,
 };
 
 @group(0) @binding(0) var screen_texture: texture_2d<f32>;
@@ -12,7 +13,7 @@ struct BlurSettings {
 fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let sigma = settings.intensity;
     let texel = 1.0 / vec2<f32>(textureDimensions(screen_texture));
-    let uv = position.xy * texel;
+    let uv = (position.xy * texel - vec2<f32>(0.5)) / settings.canvas_zoom + vec2<f32>(0.5);
 
     if (sigma <= 0.01) {
         return textureSample(screen_texture, screen_sampler, uv);

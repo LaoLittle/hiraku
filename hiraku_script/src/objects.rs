@@ -129,6 +129,9 @@ impl ObjectHeap {
                     }
                 }
                 Value::Map(fields) => pending.extend(fields.into_values()),
+                Value::TextTemplate(template) => {
+                    pending.extend(template.captures.values().cloned())
+                }
                 Value::Typed { value, .. } | Value::Optional(Some(value)) => pending.push(*value),
                 Value::Tuple(values) | Value::List(values) => pending.extend(values),
                 Value::Closure {
@@ -146,6 +149,15 @@ impl ObjectHeap {
     /// already part of the execution and must retain their identity.
     pub fn import(&mut self, value: Value) -> Value {
         match value {
+            Value::TextTemplate(mut template) => {
+                template.captures = template
+                    .captures
+                    .iter()
+                    .map(|(name, value)| (name.clone(), self.import(value.clone())))
+                    .collect::<BTreeMap<_, _>>()
+                    .into();
+                Value::TextTemplate(template)
+            }
             Value::Map(fields) => {
                 let fields = fields
                     .into_iter()
@@ -249,6 +261,7 @@ impl ObjectHeap {
                     }
                 }
                 Value::Map(fields) => pending.extend(fields.values()),
+                Value::TextTemplate(template) => pending.extend(template.captures.values()),
                 Value::Typed { value, .. } | Value::Optional(Some(value)) => pending.push(value),
                 Value::Tuple(values) | Value::List(values) => pending.extend(values),
                 Value::Closure {
@@ -280,6 +293,15 @@ impl ObjectHeap {
         visiting: &mut BTreeSet<ObjectId>,
     ) -> Result<Value, crate::VmError> {
         Ok(match value {
+            Value::TextTemplate(template) => Value::TextTemplate(crate::runtime::TemplateValue {
+                source: template.source.clone(),
+                captures: template
+                    .captures
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), self.export_inner(value, visiting)?)))
+                    .collect::<Result<BTreeMap<_, _>, crate::VmError>>()?
+                    .into(),
+            }),
             Value::Object(id) => {
                 if !visiting.insert(*id) {
                     return Err(crate::VmError::CyclicHostValue);
@@ -347,6 +369,17 @@ impl ObjectHeap {
         ids: &mut BTreeMap<ObjectId, Value>,
     ) -> Result<Value, crate::VmError> {
         Ok(match value {
+            Value::TextTemplate(template) => Value::TextTemplate(crate::runtime::TemplateValue {
+                source: template.source.clone(),
+                captures: template
+                    .captures
+                    .iter()
+                    .map(|(name, value)| {
+                        Ok((name.clone(), self.copy_reachable(value, target, ids)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, crate::VmError>>()?
+                    .into(),
+            }),
             Value::Object(id) => {
                 if let Some(value) = ids.get(id) {
                     return Ok(value.clone());
@@ -412,6 +445,15 @@ impl ObjectHeap {
 
 fn relocate(value: Value, base: u32) -> Value {
     match value {
+        Value::TextTemplate(mut template) => {
+            template.captures = template
+                .captures
+                .iter()
+                .map(|(name, value)| (name.clone(), relocate(value.clone(), base)))
+                .collect::<BTreeMap<_, _>>()
+                .into();
+            Value::TextTemplate(template)
+        }
         Value::Object(ObjectId(id)) => Value::Object(ObjectId(
             id.checked_add(base).expect("object heap capacity exceeded"),
         )),

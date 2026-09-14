@@ -108,6 +108,10 @@ pub fn link_named_modules_with_policy(
         .map(|(_, module)| module.symbols.clone())
         .collect::<Vec<_>>();
     let mut type_symbols = crate::SymbolInterner::default();
+    let global_types = modules
+        .iter()
+        .map(|(_, module)| module.global_types.clone())
+        .collect::<Vec<_>>();
     let signatures = modules
         .iter()
         .map(|(_, module)| {
@@ -303,6 +307,7 @@ pub fn link_named_modules_with_policy(
                                 &manifests[module.0 as usize],
                                 module,
                                 &mut type_symbols,
+                                &global_types[module.0 as usize],
                             );
                             let numeric_literal = actual.numeric_literal;
                             let actual = canonical_type(
@@ -310,6 +315,7 @@ pub fn link_named_modules_with_policy(
                                 &bytecode.symbols,
                                 module_id,
                                 &mut type_symbols,
+                                &bytecode.global_types,
                             );
                             if numeric_literal
                                 && expected == crate::ScriptType::Float
@@ -365,6 +371,7 @@ fn canonical_type(
     manifest: &crate::SymbolManifest,
     module: ModuleId,
     symbols: &mut crate::SymbolInterner,
+    global_types: &[SymbolId],
 ) -> crate::ScriptType {
     use crate::ScriptType as T;
     let name = |id| manifest.resolve(id).unwrap_or("<invalid type symbol>");
@@ -378,10 +385,14 @@ fn canonical_type(
             arguments,
             variants,
         } => T::Enum {
-            name: symbols.intern(format!("{}::{}", module.0, name(*id))),
+            name: symbols.intern(if global_types.contains(id) {
+                format!("global::{}", name(*id))
+            } else {
+                format!("{}::{}", module.0, name(*id))
+            }),
             arguments: arguments
                 .iter()
-                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .map(|ty| canonical_type(ty, manifest, module, symbols, global_types))
                 .collect(),
             variants: variants
                 .iter()
@@ -390,7 +401,7 @@ fn canonical_type(
                         n.clone(),
                         fields
                             .iter()
-                            .map(|ty| canonical_type(ty, manifest, module, symbols))
+                            .map(|ty| canonical_type(ty, manifest, module, symbols, global_types))
                             .collect(),
                     )
                 })
@@ -401,48 +412,90 @@ fn canonical_type(
             arguments,
             fields,
         } => T::Struct {
-            name: symbols.intern(format!("{}::{}", module.0, name(*id))),
+            name: symbols.intern(if global_types.contains(id) {
+                format!("global::{}", name(*id))
+            } else {
+                format!("{}::{}", module.0, name(*id))
+            }),
             arguments: arguments
                 .iter()
-                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .map(|ty| canonical_type(ty, manifest, module, symbols, global_types))
                 .collect(),
             fields: fields
                 .iter()
-                .map(|(key, ty)| (key.clone(), canonical_type(ty, manifest, module, symbols)))
+                .map(|(key, ty)| {
+                    (
+                        key.clone(),
+                        canonical_type(ty, manifest, module, symbols, global_types),
+                    )
+                })
                 .collect(),
         },
         T::Callable { parameters, result } => T::Callable {
             parameters: parameters
                 .iter()
-                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .map(|ty| canonical_type(ty, manifest, module, symbols, global_types))
                 .collect(),
-            result: Box::new(canonical_type(result, manifest, module, symbols)),
+            result: Box::new(canonical_type(
+                result,
+                manifest,
+                module,
+                symbols,
+                global_types,
+            )),
         },
         T::TupleOf(values) => T::TupleOf(
             values
                 .iter()
-                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .map(|ty| canonical_type(ty, manifest, module, symbols, global_types))
                 .collect(),
         ),
         T::Union(values) => T::Union(
             values
                 .iter()
-                .map(|ty| canonical_type(ty, manifest, module, symbols))
+                .map(|ty| canonical_type(ty, manifest, module, symbols, global_types))
                 .collect(),
         ),
-        T::List(inner) => T::List(Box::new(canonical_type(inner, manifest, module, symbols))),
-        T::Optional(inner) => {
-            T::Optional(Box::new(canonical_type(inner, manifest, module, symbols)))
-        }
-        T::Binding(inner) => T::Binding(Box::new(canonical_type(inner, manifest, module, symbols))),
+        T::List(inner) => T::List(Box::new(canonical_type(
+            inner,
+            manifest,
+            module,
+            symbols,
+            global_types,
+        ))),
+        T::Optional(inner) => T::Optional(Box::new(canonical_type(
+            inner,
+            manifest,
+            module,
+            symbols,
+            global_types,
+        ))),
+        T::Binding(inner) => T::Binding(Box::new(canonical_type(
+            inner,
+            manifest,
+            module,
+            symbols,
+            global_types,
+        ))),
         T::Map(key, value) => T::Map(
-            Box::new(canonical_type(key, manifest, module, symbols)),
-            Box::new(canonical_type(value, manifest, module, symbols)),
+            Box::new(canonical_type(key, manifest, module, symbols, global_types)),
+            Box::new(canonical_type(
+                value,
+                manifest,
+                module,
+                symbols,
+                global_types,
+            )),
         ),
         T::Record(fields) => T::Record(
             fields
                 .iter()
-                .map(|(key, ty)| (key.clone(), canonical_type(ty, manifest, module, symbols)))
+                .map(|(key, ty)| {
+                    (
+                        key.clone(),
+                        canonical_type(ty, manifest, module, symbols, global_types),
+                    )
+                })
                 .collect(),
         ),
         ty => ty.clone(),

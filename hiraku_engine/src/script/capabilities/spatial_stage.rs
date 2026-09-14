@@ -168,11 +168,11 @@ mod api {
             }))
     }
 
-    #[hks(name = "place", selector = "Stage", receiver)]
+    #[hks(name = "intrinsics.engine.placeActor")]
     fn place(
         context: &mut CharacterContext,
         stage: Stage,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         anchor: String,
     ) -> Result<(), NativeError> {
         let actor = context

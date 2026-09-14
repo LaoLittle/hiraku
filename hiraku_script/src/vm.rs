@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 20;
+pub const BYTECODE_VERSION: u16 = 21;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -28,6 +28,7 @@ pub struct Bytecode {
     pub source_hash: u64,
     pub builtin_manifest_hash: u64,
     pub symbols: SymbolManifest,
+    pub global_types: Vec<SymbolId>,
     pub strings: StringPool,
     pub globals: Vec<SymbolId>,
     pub locals: Vec<SymbolId>,
@@ -352,6 +353,7 @@ fn compile_program(
         source_hash,
         builtin_manifest_hash: manifest.hash(),
         symbols: symbols.manifest(),
+        global_types: hir.global_types.clone(),
         strings: strings.finish(),
         globals: hir.globals.iter().map(|global| global.name).collect(),
         locals: hir.locals.iter().map(|local| local.name).collect(),
@@ -1798,29 +1800,55 @@ impl Vm {
         template: &str,
         rewrite: impl FnOnce(&str) -> Result<String, crate::TemplateError>,
     ) -> Result<String, crate::TemplateError> {
+        let mut context = self.template_context();
+        let template = rewrite(template)?;
+        crate::eval_template(&template, &mut context)
+    }
+
+    /// Evaluate after localization, using the literal's lexical capture scope.
+    pub fn eval_template_value_with(
+        &self,
+        template: &crate::runtime::TemplateValue,
+        rewrite: impl FnOnce(&str) -> Result<String, crate::TemplateError>,
+    ) -> Result<String, crate::TemplateError> {
+        let source = rewrite(&template.source)?;
+        let mut context = self.template_context();
+        context.extend(template.captures.iter().map(|(name, value)| {
+            (
+                name.clone(),
+                self.objects.export(value).unwrap_or_else(|_| value.clone()),
+            )
+        }));
+        crate::eval_template(&source, &mut context)
+    }
+
+    fn template_context(&self) -> BTreeMap<String, Value> {
+        self.template_captures()
+            .into_iter()
+            .map(|(name, value)| {
+                let value = self.objects.export(&value).unwrap_or(value);
+                (name, value)
+            })
+            .collect()
+    }
+
+    fn template_captures(&self) -> BTreeMap<String, Value> {
         let mut context = BTreeMap::new();
         for (symbol, value) in self.bytecode.globals.iter().zip(self.globals.iter()) {
             if value != &Value::Uninitialized
                 && let Some(name) = self.bytecode.symbols.resolve(*symbol)
             {
-                context.insert(
-                    name.to_string(),
-                    self.objects.export(value).unwrap_or_else(|_| value.clone()),
-                );
+                context.insert(name.to_string(), value.clone());
             }
         }
         for (symbol, value) in self.bytecode.locals.iter().zip(self.locals.iter()) {
             if value != &Value::Uninitialized
                 && let Some(name) = self.bytecode.symbols.resolve(*symbol)
             {
-                context.insert(
-                    name.to_string(),
-                    self.objects.export(value).unwrap_or_else(|_| value.clone()),
-                );
+                context.insert(name.to_string(), value.clone());
             }
         }
-        let template = rewrite(template)?;
-        crate::eval_template(&template, &mut context)
+        context
     }
 
     fn constant_value(&self, value: Constant) -> Result<Value, VmError> {
@@ -1833,7 +1861,10 @@ impl Vm {
             Constant::Number(value) => Value::Number(value),
             Constant::Percent(value) => Value::Percent(value),
             Constant::String(id) => Value::String(self.string(id)?.to_owned()),
-            Constant::TextTemplate(id) => Value::TextTemplate(self.string(id)?.to_owned()),
+            Constant::TextTemplate(id) => Value::TextTemplate(crate::runtime::TemplateValue {
+                source: self.string(id)?.to_owned(),
+                captures: self.template_captures().into(),
+            }),
             Constant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
             Constant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
             Constant::Function(symbol) => Value::Function {
@@ -2227,6 +2258,7 @@ fn argument_matches(
     }
     Ok(match (ty, value) {
         (T::Unit, Value::Unit)
+        | (T::Ellipsis, Value::Ellipsis)
         | (T::Bool, Value::Bool(_))
         | (T::Float, Value::Number(_))
         | (T::Percent, Value::Percent(_))
@@ -2359,6 +2391,7 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
     match target {
         ScriptType::Any => Ok(value.clone()),
         ScriptType::Unit if matches!(value, Value::Unit) => Ok(value.clone()),
+        ScriptType::Ellipsis if matches!(value, Value::Ellipsis) => Ok(value.clone()),
         ScriptType::Bool if matches!(value, Value::Bool(_)) => Ok(value.clone()),
         ScriptType::Int => match value {
             Value::Number(number) if number.is_finite() => {
@@ -2811,9 +2844,9 @@ mod tests {
         ] {
             assert_eq!(vm.global(name), Some(&Value::String(expected.into())));
         }
-        assert_eq!(
-            vm.global("savedTemplate"),
-            Some(&Value::TextTemplate("${undefinedName}".into()))
+        assert!(
+            matches!(vm.global("savedTemplate"), Some(Value::TextTemplate(template))
+            if template.source == "${undefinedName}")
         );
     }
 
@@ -4214,19 +4247,14 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(
-            calls,
-            vec![
-                vec![
-                    Value::String("alice".into()),
-                    Value::TextTemplate("Hello ${1 + 2}".into())
-                ],
-                vec![
-                    Value::String("bob".into()),
-                    Value::TextTemplate("World".into())
-                ],
-            ]
-        );
+        assert_eq!(calls.len(), 2);
+        for (call, (speaker, source)) in calls
+            .iter()
+            .zip([("alice", "Hello ${1 + 2}"), ("bob", "World")])
+        {
+            assert_eq!(call[0], Value::String(speaker.into()));
+            assert!(matches!(&call[1], Value::TextTemplate(template) if template.source == source));
+        }
     }
 
     #[test]
@@ -5004,5 +5032,219 @@ mod tests {
             })
             .expect("rewritten template evaluates against runtime values");
         assert_eq!(rendered, "Bonjour, Alice");
+    }
+
+    #[test]
+    fn returned_template_retains_lexical_values_after_serialization_and_rewrite() {
+        let code = compile(
+            r#"
+            fn message() -> TextTemplate {
+                let name = "alice"
+                let translated = "bob"
+                "Hello ${name}"
+            }
+            global let text = message()
+        "#,
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(code).expect("VM");
+        while !matches!(
+            vm.step().expect("template function runs"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        let bytes = crate::hson::to_vec(vm.global("text").expect("returned template"))
+            .expect("template serializes");
+        let Value::TextTemplate(template) =
+            crate::hson::from_slice::<Value>(&bytes).expect("template restores")
+        else {
+            panic!("expected template")
+        };
+        assert_eq!(
+            vm.eval_template_value_with(&template, |source| Ok(source.to_owned()))
+                .expect("original lexical value"),
+            "Hello alice"
+        );
+        assert_eq!(
+            vm.eval_template_value_with(&template, |_| Ok("Hello ${translated}".into()))
+                .expect("rewritten template can reference a different lexical value"),
+            "Hello bob"
+        );
+    }
+
+    #[test]
+    fn script_builder_statement_commit_is_once_per_chain_and_restores() {
+        let manifest = BuiltinManifest::new([("submit", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            struct Actor { name: String, x: Int, emotion: String }
+            extend Actor {
+                fn at(self, x: Int) -> Actor { self.x = x; self }
+                fn e(self, emotion: String) -> Actor { self.emotion = emotion; self }
+            }
+            global var commits = 0
+            @statementCommit
+            fn onActorCommit(actor: Actor) -> Unit {
+                commits += 1
+                submit(actor.name, actor.x, actor.emotion)
+                actor // A handler's own statements must not recursively submit.
+            }
+            let alice = Actor.{ name: "alice", x: 0, emotion: "normal" }
+            alice.at(4).e("happy")
+            alice.e("sad")
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        let mut emotions = Vec::new();
+        loop {
+            match vm.step().expect("builder executes") {
+                Some(VmEvent::Call(call)) => {
+                    assert_eq!(call.arguments[0].value, Value::String("alice".into()));
+                    assert_eq!(
+                        call.arguments[1].value,
+                        Value::Number(if emotions.is_empty() { 0.0 } else { 4.0 })
+                    );
+                    emotions.push(call.arguments[2].value.clone());
+                    vm = Vm::restore(code.clone(), vm.snapshot())
+                        .expect("commit resumes after restore");
+                    vm.resume(Value::Unit).expect("submit completes");
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            emotions,
+            vec![
+                Value::String("normal".into()),
+                Value::String("happy".into()),
+                Value::String("sad".into())
+            ]
+        );
+        assert_eq!(vm.global("commits"), Some(&Value::Number(3.0)));
+    }
+
+    #[test]
+    fn script_optional_parameters_are_filled_without_skipping_required_arguments() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile(
+            r#"
+            fn label(name: String, suffix: String?) -> String { name + (suffix ?: "!") }
+            let callback: (String, String?) -> String = label
+            global let first = label("alice")
+            global let second = callback("bob")
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code).expect("VM");
+        while !matches!(
+            vm.step().expect("optional arguments"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("first"), Some(&Value::String("alice!".into())));
+        assert_eq!(vm.global("second"), Some(&Value::String("bob!".into())));
+        let program = crate::parse_program("fn label(name: String, suffix: String?) {}\nlabel()")
+            .expect("parse");
+        assert!(compile_with_manifest(&program, 0, &manifest).is_err());
+    }
+
+    #[test]
+    fn restored_global_initialization_does_not_repeat_statement_handler() {
+        let manifest = BuiltinManifest::new([("submit", BuiltinId(1))]);
+        let code = compile(
+            r#"
+            struct Item { name: String }
+            @statementCommit fn commit(item: Item) { submit(item.name) }
+            global let item = Item.{ name: "alice" }
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        let mut calls = 0;
+        while let Some(event) = vm.step().expect("initialize") {
+            match event {
+                VmEvent::Call(_) => {
+                    calls += 1;
+                    vm.resume(Value::Unit).expect("submit");
+                }
+                VmEvent::Completed(_) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(calls, 1);
+        let values = vm
+            .globals()
+            .iter()
+            .map(|value| vm.export_value(value).expect("export global"))
+            .collect();
+        let mut restarted = Vm::new(code).expect("VM");
+        restarted
+            .set_global_values(values)
+            .expect("restore initialized globals");
+        while let Some(event) = restarted.step().expect("skip initialization") {
+            assert!(
+                !matches!(event, VmEvent::Call(_)),
+                "restored declaration must not submit again"
+            );
+            if matches!(event, VmEvent::Completed(_)) {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn template_object_captures_keep_identity_through_collection_and_restore() {
+        let code = compile(
+            r#"
+            fn message() -> TextTemplate {
+                let player = .{ name: "alice" }
+                let text: TextTemplate = "Hello ${player.name}"
+                player.name = "bob"
+                text
+            }
+            global let text = message()
+        "#,
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        while !matches!(
+            vm.step().expect("template captures record"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        vm.collect_objects(&[]).expect("template is a heap root");
+        let bytes = crate::hson::to_vec(&vm.snapshot()).expect("snapshot");
+        let vm = Vm::restore(
+            code,
+            crate::hson::from_slice(&bytes).expect("decode snapshot"),
+        )
+        .expect("restore template heap");
+        let Some(Value::TextTemplate(template)) = vm.global("text") else {
+            panic!("template")
+        };
+        assert_eq!(
+            vm.eval_template_value_with(template, |source| Ok(source.to_owned()))
+                .expect("captured record remains alive"),
+            "Hello bob"
+        );
+    }
+
+    #[test]
+    fn string_statement_handler_receives_evaluated_text() {
+        let code = compile(
+            r#"
+            global var output = ""
+            @statementCommit
+            fn onText(text: String) { output = text }
+            let name = "alice"
+            "Hello ${name}"
+        "#,
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(code).expect("VM");
+        while !matches!(vm.step().expect("string hook"), Some(VmEvent::Completed(_))) {}
+        assert_eq!(
+            vm.global("output"),
+            Some(&Value::String("Hello alice".into()))
+        );
     }
 }

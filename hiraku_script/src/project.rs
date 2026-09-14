@@ -15,6 +15,9 @@ pub struct ScriptSource {
 
 #[derive(Clone, Debug, Default)]
 pub struct ProjectInterface {
+    pub(crate) receiver_functions: std::collections::BTreeSet<SymbolId>,
+    pub(crate) structs: Vec<crate::Stmt>,
+    pub(crate) statement_hooks: std::collections::BTreeSet<SymbolId>,
     pub(crate) type_parameters: BTreeMap<SymbolId, Vec<SymbolId>>,
     pub(crate) symbols: SymbolManifest,
     pub(crate) functions: BTreeMap<SymbolId, FunctionSignature>,
@@ -45,6 +48,17 @@ impl ProjectLinkPolicy {
             .entry(path.into())
             .or_default()
             .insert(capability.into());
+    }
+}
+
+impl ProjectInterface {
+    /// Compile an independent library with an existing module's symbol identities.
+    /// This imports no functions and grants no native capabilities.
+    pub fn with_symbols(symbols: SymbolManifest) -> Self {
+        Self {
+            symbols,
+            ..Self::default()
+        }
     }
 }
 
@@ -113,10 +127,43 @@ fn compile_project_impl(
         return Err(errors);
     }
     let mut interface = ProjectInterface {
+        receiver_functions: Default::default(),
+        structs: Vec::new(),
+        statement_hooks: Default::default(),
         type_parameters: BTreeMap::new(),
         symbols: natives.symbols().clone(),
         functions: BTreeMap::new(),
     };
+    let mut type_owners = BTreeMap::new();
+    for (source, program) in sources.iter().zip(&parsed) {
+        for declaration in &program.statements {
+            let crate::Stmt::Struct {
+                exported: true,
+                name,
+                span,
+                ..
+            } = declaration
+            else {
+                continue;
+            };
+            if let Some(previous) = type_owners.insert(name.clone(), source.path.clone()) {
+                errors.push(ProjectError {
+                    path: source.path.clone(),
+                    error: CompileError {
+                        message: format!(
+                            "exported type `{name}` is already declared in `{previous}`"
+                        ),
+                        span: Some(*span),
+                    },
+                });
+            } else {
+                interface.structs.push(declaration.clone());
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
     for (source, program) in sources.iter().zip(&parsed) {
         if let Err(declarations) = crate::hir::collect_project_exports(
             program,
@@ -217,6 +264,204 @@ mod tests {
             source: source.into(),
             namespace: None,
         }
+    }
+
+    #[test]
+    fn script_owned_builder_exports_type_methods_and_commit_without_native_handles() {
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        let submit = registry
+            .register_fn(
+                "intrinsics.scene.submit",
+                |_: &mut (), _: String, _: f64, _: String| Ok(()),
+            )
+            .expect("primitive");
+        registry
+            .require_capability(submit, "scene.write")
+            .expect("capability");
+        let library = r#"
+            global struct Actor { name: String, x: Float, emotion: String, dirty: Bool }
+            global fn actor(name: String) -> Actor {
+                Actor.{ name: name, x: 0.0, emotion: "normal", dirty: false }
+            }
+            extend Actor {
+                global fn at(self, x: Float) -> Actor { self.x = x; self.dirty = true; self }
+                global fn e(self, emotion: String) -> Actor { self.emotion = emotion; self.dirty = true; self }
+            }
+            @statementCommit
+            global fn onActorCommit(actor: Actor) {
+                if actor.dirty {
+                    intrinsics.scene.submit(actor.name, actor.x, actor.emotion)
+                    actor.dirty = false
+                }
+            }
+        "#;
+        let mut policy = ProjectLinkPolicy::default();
+        policy.grant("z-library.hks", "scene.write");
+        let project = compile_project_with_policy(
+            vec![
+                source(
+                    "a-entry.hks",
+                    r#"
+                let alice: Actor = actor("alice")
+                let same = alice
+                let offset = 4
+                alice.at(offset).e("happy")
+                same.e("sad")
+            "#,
+                ),
+                source("z-library.hks", library),
+            ],
+            &registry.manifest(),
+            &policy,
+        )
+        .expect("script type is available before its provider is compiled");
+        let program = project.program;
+        let mut vm =
+            crate::LinkedVm::new(program.clone(), project.paths["a-entry.hks"]).expect("VM");
+        let mut calls = Vec::new();
+        loop {
+            match vm.step().expect("script builder runs") {
+                Some(crate::LinkedVmEvent::Call(call)) => {
+                    assert_eq!(
+                        call.arguments[0].value,
+                        crate::Value::String("alice".into())
+                    );
+                    assert_eq!(call.arguments[1].value, crate::Value::Number(4.0));
+                    calls.push(call.arguments[2].value.clone());
+                    let bytes = crate::hson::to_vec(&vm.snapshot())
+                        .expect("save builder and handler frame");
+                    vm = crate::LinkedVm::restore(
+                        crate::hson::from_slice(&bytes).expect("decode"),
+                        program.clone(),
+                    )
+                    .expect("restore shared script object");
+                    vm.resume(crate::Value::Unit).expect("resume submit");
+                }
+                Some(crate::LinkedVmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                crate::Value::String("happy".into()),
+                crate::Value::String("sad".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn exported_struct_identity_and_method_arguments_are_statically_checked() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        let library = r#"
+            global struct Actor { x: Float }
+            extend Actor { global fn at(self, x: Float) -> Actor { self.x = x; self } }
+        "#;
+        for (entry, expected) in [
+            ("let a: Actor = Actor.{ x: 0.0 }\na.at(\"bad\")", "Float"),
+            (
+                "struct Actor { x: Float }",
+                "conflicts with an exported type",
+            ),
+            ("global struct Actor { x: Float }", "already declared"),
+        ] {
+            let errors = compile_project(
+                vec![source("entry.hks", entry), source("library.hks", library)],
+                &manifest,
+            )
+            .err()
+            .expect("invalid public type usage is rejected");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains(expected)),
+                "{errors:?}"
+            );
+        }
+        compile_project(
+            vec![
+                source("entry.hks", "let a: Actor = Actor.{ x: 0.0 }\na.at(2)"),
+                source("library.hks", library),
+            ],
+            &manifest,
+        )
+        .expect("public struct literals and contextual float literals compile");
+    }
+
+    #[test]
+    fn exported_protocol_operator_links_to_a_privileged_library() {
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        let builtin = registry
+            .register_fn(
+                "intrinsics.dialogue.say",
+                |_: &mut (), _: String, _: crate::native::TextTemplate| Ok(()),
+            )
+            .expect("register");
+        registry
+            .require_capability(builtin, "dialogue.write")
+            .expect("capability");
+        let manifest = registry.manifest();
+        let library = source(
+            "std/dialogue.hks",
+            r#"
+            extend String: Colon<TextTemplate> {
+                type Output = Unit
+                global fn colon(self, text: TextTemplate) { intrinsics.dialogue.say(self, text) }
+            }
+        "#,
+        );
+        let mut policy = ProjectLinkPolicy::default();
+        policy.grant("std/dialogue.hks", "dialogue.write");
+        let project = compile_project_with_policy(
+            vec![
+                source("entry.hks", "\"alice\": \"Hello ${1 + 2}\""),
+                library,
+            ],
+            &manifest,
+            &policy,
+        )
+        .expect("external protocol compiles and links");
+        let mut vm = crate::LinkedVm::new(project.program, project.paths["entry.hks"]).expect("VM");
+        loop {
+            match vm.step().expect("protocol executes") {
+                Some(crate::LinkedVmEvent::Call(call)) => {
+                    assert_eq!(
+                        call.arguments[0].value,
+                        crate::Value::String("alice".into())
+                    );
+                    assert_eq!(
+                        call.arguments[1].value,
+                        crate::Value::TextTemplate("Hello ${1 + 2}".into())
+                    );
+                    break;
+                }
+                Some(crate::LinkedVmEvent::Completed(_)) | None => panic!("expected host call"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn exported_statement_commit_is_an_ordinary_linked_call() {
+        let manifest = BuiltinManifest::new([("submit", crate::BuiltinId(1))]);
+        let project = compile_project(vec![
+            source("entry.hks", "4"),
+            source("library.hks", "@statementCommit\nglobal fn commit(value: Int) -> Unit { submit(value)\nvalue }"),
+        ], &manifest).expect("exported hook compiles");
+        let mut vm = crate::LinkedVm::new(project.program, project.paths["entry.hks"]).expect("VM");
+        let mut calls = 0;
+        loop {
+            match vm.step().expect("hook runs") {
+                Some(crate::LinkedVmEvent::Call(call)) => {
+                    assert_eq!(call.arguments[0].value, crate::Value::Number(4.0));
+                    calls += 1;
+                    vm.resume(crate::Value::Unit).expect("host resumes");
+                }
+                Some(crate::LinkedVmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -504,7 +504,11 @@ impl ExecutionRuntime {
                         .executions
                         .get(&execution)
                         .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
-                    evaluate_call_templates(&mut call, |text| state.vm.eval_template(text))?;
+                    evaluate_call_templates(&mut call, |text| {
+                        state
+                            .vm
+                            .eval_template_value_with(text, |source| Ok(source.to_owned()))
+                    })?;
                     Ok(Some(ExecutionEvent::Call { execution, call }))
                 }
                 VmEvent::Statement(value) => {
@@ -704,14 +708,14 @@ fn evaluate_statement_template(
 
 fn evaluate_call_templates(
     call: &mut BuiltinCall,
-    mut evaluate: impl FnMut(&str) -> Result<String, TemplateError>,
+    mut evaluate: impl FnMut(&hiraku_script::runtime::TemplateValue) -> Result<String, TemplateError>,
 ) -> Result<(), TemplateError> {
     if let Some(Value::TextTemplate(text)) = &mut call.receiver {
-        *text = evaluate(text)?;
+        *text = evaluate(text)?.into();
     }
     for argument in &mut call.arguments {
         if let Value::TextTemplate(text) = &mut argument.value {
-            *text = evaluate(text)?;
+            *text = evaluate(text)?.into();
         }
     }
     Ok(())

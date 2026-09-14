@@ -83,6 +83,7 @@ pub enum Stmt {
         span: Span,
     },
     Struct {
+        exported: bool,
         name: String,
         type_parameters: Vec<String>,
         ty: TypeExpr,

@@ -804,7 +804,7 @@ impl TextTemplate {
 impl FromHksValue for TextTemplate {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         match value {
-            Value::TextTemplate(value) => Ok(Self(value.clone())),
+            Value::TextTemplate(value) => Ok(Self(value.source.clone())),
             // A computed String has no template expressions left to preserve and
             // is therefore a valid degenerate TextTemplate.
             Value::String(value) => Ok(Self(value.clone())),
@@ -815,7 +815,7 @@ impl FromHksValue for TextTemplate {
 
 impl IntoHksValue for TextTemplate {
     fn into_hks_value(self) -> Value {
-        Value::TextTemplate(self.0)
+        Value::TextTemplate(self.0.into())
     }
 }
 

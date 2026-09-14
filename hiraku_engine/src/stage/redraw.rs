@@ -51,6 +51,7 @@ struct ExtractedFrame {
     meshes: Vec<AssetId<Mesh>>,
     materials: Vec<bevy::asset::UntypedAssetId>,
     surfaces_ready: bool,
+    visible_entities: Vec<Entity>,
 }
 
 fn extract(
@@ -58,15 +59,22 @@ fn extract(
     pending: Extract<Res<PendingFrame>>,
     surfaces: Extract<
         Query<
-            (Option<&Mesh3d>, Option<&MeshMaterial3d<StandardMaterial>>),
+            (
+                Entity,
+                Option<&Mesh3d>,
+                Option<&MeshMaterial3d<StandardMaterial>>,
+                Option<&ViewVisibility>,
+            ),
             With<super::runtime::StageSurface>,
         >,
     >,
     views: Extract<
         Query<
             (
+                Entity,
                 Option<&Mesh3d>,
                 Option<&MeshMaterial3d<crate::render::world_sprite::WorldSpriteMaterial>>,
+                &crate::render::world_sprite::WorldSprite,
             ),
             With<super::views::ViewSurface>,
         >,
@@ -75,8 +83,15 @@ fn extract(
     let mut meshes = Vec::new();
     let mut materials = Vec::new();
     let mut surfaces_ready = true;
+    let mut visible_entities = Vec::new();
     if pending.pending() {
-        for (mesh, material) in &surfaces {
+        for (entity, mesh, material, visibility) in &surfaces {
+            if mesh.is_some()
+                && material.is_some()
+                && visibility.is_some_and(|visible| visible.get())
+            {
+                visible_entities.push(entity);
+            }
             if let Some(mesh) = mesh {
                 meshes.push(mesh.id());
             }
@@ -86,7 +101,13 @@ fn extract(
         }
         // The offscreen target is not visible until its canvas sprite has
         // acquired a mesh/material too; this can occur a schedule later.
-        for (mesh, material) in &views {
+        for (entity, mesh, material, sprite) in &views {
+            if sprite.color.alpha() <= 0.0 {
+                continue;
+            }
+            // A new compositor quad must actually enter specialization, not
+            // merely have prepared asset handles while visibility catches up.
+            visible_entities.push(entity);
             match (mesh, material) {
                 (Some(mesh), Some(material)) => {
                     meshes.push(mesh.id());
@@ -102,6 +123,7 @@ fn extract(
         meshes,
         materials,
         surfaces_ready,
+        visible_entities,
     });
 }
 
@@ -110,6 +132,7 @@ fn acknowledge(
     pipelines: Res<PipelineCache>,
     meshes: Option<Res<RenderAssets<RenderMesh>>>,
     materials: Option<Res<ErasedRenderAssets<bevy::pbr::PreparedMaterial>>>,
+    specialized: Option<Res<bevy::pbr::SpecializedMaterialPipelineCache>>,
 ) {
     let Some(frame) = frame else { return };
     if !frame.surfaces_ready
@@ -127,11 +150,35 @@ fn acknowledge(
     {
         return;
     }
+    if !draws_ready(&frame.visible_entities, specialized.as_deref(), |id| {
+        matches!(
+            pipelines.get_render_pipeline_state(id),
+            bevy::render::render_resource::CachedPipelineState::Ok(_)
+                | bevy::render::render_resource::CachedPipelineState::Err(_)
+        )
+    }) {
+        return;
+    }
     // A pipelined render frame may be older than the main world's request.
     // Acknowledge only the generation actually extracted into this frame.
     frame
         .completed
         .fetch_max(frame.generation, Ordering::Release);
+}
+
+fn draws_ready(
+    entities: &[Entity],
+    specialized: Option<&bevy::pbr::SpecializedMaterialPipelineCache>,
+    ready: impl Fn(bevy::render::render_resource::CachedRenderPipelineId) -> bool,
+) -> bool {
+    entities.iter().all(|entity| {
+        let main_entity = bevy::render::sync_world::MainEntity::from(*entity);
+        specialized.is_some_and(|views| {
+            views
+                .values()
+                .any(|view| view.get(&main_entity).is_some_and(|id| ready(*id)))
+        })
+    })
 }
 
 fn keep_awake(pending: Res<PendingFrame>, mut redraw: crate::redraw::Redraw) {
@@ -156,6 +203,19 @@ pub(super) fn register(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_assets_are_not_enough_until_draw_pipeline_is_ready() {
+        let entity = Entity::from_bits(42);
+        let main = bevy::render::sync_world::MainEntity::from(entity);
+        let mut cache = bevy::pbr::SpecializedMaterialPipelineCache::default();
+        assert!(!draws_ready(&[entity], Some(&cache), |_| true));
+        let view = bevy::render::view::RetainedViewEntity::new(main, None, 0);
+        let pipeline = bevy::render::render_resource::CachedRenderPipelineId::INVALID;
+        cache.entry(view).or_default().insert(main, pipeline);
+        assert!(!draws_ready(&[entity], Some(&cache), |_| false));
+        assert!(draws_ready(&[entity], Some(&cache), |_| true));
+        assert!(draws_ready(&[], None, |_| false));
+    }
     #[test]
     fn headless_registration_does_not_wait_for_a_render_world() {
         let mut app = App::new();

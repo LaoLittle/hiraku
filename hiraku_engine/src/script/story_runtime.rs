@@ -1172,6 +1172,47 @@ mod tests {
     }
 
     #[test]
+    fn script_actor_patches_retain_state_and_commit_once_per_public_statement() {
+        let code = compile_story_bytecode(
+            "actors.hks",
+            r#"
+            let alice = char("alice").e("normal").scale(0.5).show()
+            char("alice").e("happy").rotation(12)
+            alice.at(.pos(20, 30))
+            alice
+        "#,
+        )
+        .expect("script-owned Actor API");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let mut shows = Vec::new();
+        for _ in 0..32 {
+            match runtime.step().expect("commit patch") {
+                Some(StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
+                    actor_id,
+                    expressions,
+                    scale,
+                    position,
+                    rotation,
+                    ..
+                })) => shows.push((actor_id, expressions, scale, position, rotation)),
+                Some(StoryRuntimeEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            shows.len(),
+            3,
+            "empty patches do not re-submit presentation"
+        );
+        assert!(shows.iter().all(|show| show.0 == "alice" && show.2 == 0.5));
+        assert_eq!(shows[0].1, ["normal"]);
+        assert_eq!(shows[1].1, ["normal", "happy"]);
+        assert_eq!(shows[2].1, ["normal", "happy"]);
+        assert_eq!(shows[2].3, [20.0, 30.0]);
+        assert_eq!(shows[2].4, 12.0);
+    }
+
+    #[test]
     fn hiding_and_reshowing_cancels_old_offset_sequence_and_resolves_join() {
         for replacement in [
             "scene.hideCharacters(0)",

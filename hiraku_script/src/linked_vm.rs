@@ -354,6 +354,15 @@ pub enum LinkedVmError {
 
 pub fn bind_value_module(value: Value, module: ModuleId) -> Value {
     match value {
+        Value::TextTemplate(mut template) => {
+            template.captures = template
+                .captures
+                .iter()
+                .map(|(name, value)| (name.clone(), bind_value_module(value.clone(), module)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into();
+            Value::TextTemplate(template)
+        }
         Value::Optional(value) => {
             Value::Optional(value.map(|value| Box::new(bind_value_module(*value, module))))
         }

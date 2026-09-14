@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use hiraku_script::native::{NativeError, NativeRegistry};
 use hiraku_script::{
     BuiltinCall, BuiltinId, BuiltinManifest, Bytecode, ScriptType, TextTemplate, Value,
-    compile_with_manifest,
 };
 use hiraku_script::{RenderOptions, SourceMap, StatementValue, parse_program, render_diagnostics};
 use serde::{Deserialize, Serialize};
@@ -16,6 +15,7 @@ use crate::script::navigation::{NavigationOptions, NavigationRequest, Navigation
 use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
+mod actor_patch;
 mod movie;
 mod scene_visuals;
 mod sound;
@@ -220,21 +220,15 @@ pub fn compile_story_bytecode_with_options(
         let rendered = render_diagnostics(&diagnostics, &sources, render_options);
         super::emit_script_diagnostic("HKS compiler warning:", &rendered);
     }
-    compile_with_manifest(&program, source_hash(path, source), &story_manifest())
-        .map(|mut bytecode| {
-            bytecode.debug.source = Some(hiraku_script::debug::DebugSource {
-                path: path.into(),
-                text: source.into(),
-            });
-            bytecode
-        })
-        .map_err(|errors| {
-            let diagnostics = errors
-                .into_iter()
-                .map(|error| error.diagnostic(source_id.clone()))
-                .collect::<Vec<_>>();
-            render_diagnostics(&diagnostics, &sources, render_options)
-        })
+    let project = super::project::compile_library_project(
+        vec![hiraku_script::ScriptSource {
+            path: path.into(),
+            source: source.into(),
+            namespace: None,
+        }],
+        render_options,
+    )?;
+    Ok((*project.program.modules[project.paths[path].0 as usize].bytecode).clone())
 }
 
 pub fn engine_globals(settings: &UserSettings) -> BTreeMap<String, Value> {
@@ -280,15 +274,6 @@ fn setting_number(fields: &BTreeMap<String, Value>, name: &str) -> Result<f32, S
     Ok(*value as f32)
 }
 
-fn source_hash(path: &str, source: &str) -> u64 {
-    path.bytes()
-        .chain([0])
-        .chain(source.bytes())
-        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
-        })
-}
-
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
     scene_visuals::register(&mut registry);
@@ -317,21 +302,34 @@ fn registry() -> NativeRegistry<CharacterContext> {
         .expect("engine settings schema must be defined once");
     native_api::register_hks(&mut registry)
         .expect("story native API registration must be internally consistent");
-    let dialogue_operator = registry
-        .manifest()
-        .resolve_operator(":")
-        .expect("dialogue operator must be registered");
-    registry
-        .set_signature(
-            dialogue_operator,
-            hiraku_script::FunctionSignature {
-                receiver: None,
-                parameters: vec![ScriptType::Any, ScriptType::TextTemplate],
-                variadic: None,
-                result: ScriptType::Unit,
-            },
-        )
-        .expect("dialogue operator signature must target its registered builtin");
+    for name in [
+        "intrinsics.engine.say",
+        "intrinsics.engine.continueDialogue",
+    ] {
+        let id = registry
+            .manifest()
+            .resolve(name)
+            .expect("dialogue primitive is registered");
+        registry
+            .require_capability(id, super::stdlib::DIALOGUE_CAPABILITY)
+            .expect("dialogue primitive capability is valid");
+    }
+    for name in [
+        "intrinsics.engine.actorIdentity",
+        "intrinsics.engine.aliasActor",
+        "intrinsics.engine.cloneActor",
+        "intrinsics.engine.appendExpression",
+        "intrinsics.engine.submitActor",
+        "intrinsics.engine.placeActor",
+    ] {
+        let id = registry
+            .manifest()
+            .resolve(name)
+            .expect("actor primitive is registered");
+        registry
+            .require_capability(id, super::stdlib::ACTOR_CAPABILITY)
+            .expect("actor capability");
+    }
     story_api::register_hks(&mut registry)
         .expect("story navigation API registration must be internally consistent");
     registry
@@ -868,7 +866,7 @@ pub struct StoryNativeHostSnapshot {
     await_effects: bool,
     scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
-    actors: BTreeMap<u64, PendingActor>,
+    actors: BTreeMap<u64, ActorPresentation>,
     handles_by_name: BTreeMap<String, u64>,
     last_speaker: Option<String>,
     dialogue_buffer: Option<String>,
@@ -879,7 +877,7 @@ pub struct StoryNativeHostSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct PendingActor {
+struct ActorPresentation {
     rotation: f32,
     display_instance: String,
     placement_animation: Option<AnimationSpec>,
@@ -913,7 +911,7 @@ struct CharacterContext {
     await_effects: bool,
     scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
-    actors: BTreeMap<u64, PendingActor>,
+    actors: BTreeMap<u64, ActorPresentation>,
     handles_by_name: BTreeMap<String, u64>,
     commands: Vec<StoryEffect>,
     wait: Option<StoryWait>,
@@ -938,7 +936,7 @@ impl CharacterContext {
         Ok(())
     }
 
-    fn char(&mut self, name: String) -> Result<ActorHandle, CharacterCapabilityError> {
+    fn char(&mut self, name: String) -> Result<ActorIdentity, CharacterCapabilityError> {
         self.character_instance(name.clone(), name)
     }
 
@@ -946,7 +944,7 @@ impl CharacterContext {
         &mut self,
         name: String,
         instance: String,
-    ) -> Result<ActorHandle, CharacterCapabilityError> {
+    ) -> Result<ActorIdentity, CharacterCapabilityError> {
         if instance.is_empty() || instance.contains("::") {
             return Err(CharacterCapabilityError::InvalidArguments(
                 "actor instance must be nonempty and cannot contain ::",
@@ -958,7 +956,7 @@ impl CharacterContext {
                     "actor instance is already assigned to another character",
                 ));
             }
-            return Ok(ActorHandle(handle));
+            return Ok(ActorIdentity(handle));
         }
         self.next_handle += 1;
         let handle = self.next_handle;
@@ -967,36 +965,36 @@ impl CharacterContext {
         actor.instance = instance;
         actor.display_instance = actor.instance.clone();
         self.actors.insert(handle, actor);
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
     fn emotion(
         &mut self,
-        ActorHandle(handle): ActorHandle,
+        ActorIdentity(handle): ActorIdentity,
         emotion: String,
-    ) -> Result<ActorHandle, CharacterCapabilityError> {
+    ) -> Result<ActorIdentity, CharacterCapabilityError> {
         let pending = self.actor_mut(handle)?;
         pending.expressions.retain(|previous| previous != &emotion);
         pending.expressions.push(emotion);
         pending.dirty = true;
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
     fn at(
         &mut self,
-        ActorHandle(handle): ActorHandle,
+        ActorIdentity(handle): ActorIdentity,
         position: Position,
-    ) -> Result<ActorHandle, CharacterCapabilityError> {
+    ) -> Result<ActorIdentity, CharacterCapabilityError> {
         self.actor_mut(handle)?.position = position.resolve();
         self.actor_mut(handle)?.dirty = true;
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
     fn scale(
         &mut self,
-        ActorHandle(handle): ActorHandle,
+        ActorIdentity(handle): ActorIdentity,
         scale: f64,
-    ) -> Result<ActorHandle, CharacterCapabilityError> {
+    ) -> Result<ActorIdentity, CharacterCapabilityError> {
         if scale <= 0.0 {
             return Err(CharacterCapabilityError::InvalidArguments(
                 "scale must be positive",
@@ -1004,17 +1002,17 @@ impl CharacterContext {
         }
         self.actor_mut(handle)?.scale = scale as f32;
         self.actor_mut(handle)?.dirty = true;
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
     fn focus(
         &mut self,
-        ActorHandle(handle): ActorHandle,
+        ActorIdentity(handle): ActorIdentity,
         focused: bool,
-    ) -> Result<ActorHandle, CharacterCapabilityError> {
+    ) -> Result<ActorIdentity, CharacterCapabilityError> {
         self.actor_mut(handle)?.focused = focused;
         self.actor_mut(handle)?.dirty = true;
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
     fn camera(&mut self, scope: CameraScope) -> CameraHandle {
@@ -1066,7 +1064,10 @@ impl CharacterContext {
         Ok(())
     }
 
-    fn actor_mut(&mut self, handle: u64) -> Result<&mut PendingActor, CharacterCapabilityError> {
+    fn actor_mut(
+        &mut self,
+        handle: u64,
+    ) -> Result<&mut ActorPresentation, CharacterCapabilityError> {
         self.actors
             .get_mut(&handle)
             .ok_or(CharacterCapabilityError::UnknownActor(handle))
@@ -1096,36 +1097,48 @@ impl CharacterContext {
 
     fn commit(&mut self) -> Result<(), CharacterCapabilityError> {
         self.scene_visuals.commit(&mut self.commands);
-        let handles = self.actors.keys().copied().collect::<Vec<_>>();
-        for handle in handles {
-            self.flush(handle)?;
-            let next_revision = self
-                .actors
-                .values()
-                .map(|actor| actor.motion_revision)
-                .max()
-                .unwrap_or(0);
-            let actor = self.actor_mut(handle)?;
-            if let Some(mut transition) = actor.pending_offset.take() {
-                if !actor.visible {
-                    // A child sequence can reach its first offset after the
-                    // root story has hidden the actor. Commit the target and
-                    // complete normally, without resurrecting the actor.
-                    transition.animation = super::AnimationSpec::Linear(0.0, false);
-                }
-                actor.motion_revision = next_revision.checked_add(1).ok_or(
-                    CharacterCapabilityError::InvalidArguments("actor motion revisions exhausted"),
-                )?;
-                let effect = StoryEffect::ActorMotion {
-                    actor_id: actor.display_instance.clone(),
-                    revision: actor.motion_revision,
-                    transition,
-                };
-                self.commands.push(effect);
-            }
-        }
         self.sound.commit(&mut self.commands);
         self.movie.commit(&mut self.commands, &mut self.wait);
+        self.commit_cameras();
+        Ok(())
+    }
+
+    fn commit_actor(&mut self, handle: u64) -> Result<(), CharacterCapabilityError> {
+        self.flush(handle)?;
+        if self.actor_mut(handle)?.pending_offset.is_none() {
+            return Ok(());
+        }
+        let next_revision = self
+            .actors
+            .values()
+            .map(|actor| actor.motion_revision)
+            .max()
+            .unwrap_or(0);
+        let actor = self.actor_mut(handle)?;
+        if let Some(mut transition) = actor.pending_offset.take() {
+            if !actor.visible {
+                // A child sequence can reach its first offset after the
+                // root story has hidden the actor. Commit the target and
+                // complete normally, without resurrecting the actor.
+                transition.animation = super::AnimationSpec::Linear(0.0, false);
+            }
+            actor.motion_revision =
+                next_revision
+                    .checked_add(1)
+                    .ok_or(CharacterCapabilityError::InvalidArguments(
+                        "actor motion revisions exhausted",
+                    ))?;
+            let effect = StoryEffect::ActorMotion {
+                actor_id: actor.display_instance.clone(),
+                revision: actor.motion_revision,
+                transition,
+            };
+            self.commands.push(effect);
+        }
+        Ok(())
+    }
+
+    fn commit_cameras(&mut self) {
         let cameras = std::mem::take(&mut self.pending_cameras);
         for (_, pending) in cameras {
             if pending.blur.is_some()
@@ -1147,13 +1160,12 @@ impl CharacterContext {
                 });
             }
         }
-        Ok(())
     }
 }
 
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
-#[hks(name = "Actor", handle_type = ACTOR_HANDLE_TYPE)]
-struct ActorHandle(u64);
+#[hks(name = "ActorIdentity", handle_type = ACTOR_HANDLE_TYPE)]
+struct ActorIdentity(u64);
 
 pub(super) const CHOICE_OPTION_HANDLE_TYPE: u32 = 0x434f5054;
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
@@ -1269,6 +1281,26 @@ fn hide_duration(value: Option<f64>) -> Result<u64, NativeError> {
 mod native_api {
     use super::*;
 
+    #[hks(name = "intrinsics.engine.appendExpression")]
+    fn append_expression(
+        _: &mut CharacterContext,
+        mut expressions: Vec<String>,
+        emotion: String,
+    ) -> Result<Vec<String>, NativeError> {
+        expressions.retain(|previous| previous != &emotion);
+        expressions.push(emotion);
+        Ok(expressions)
+    }
+
+    #[hks(name = "intrinsics.engine.submitActor")]
+    fn submit_actor(
+        context: &mut CharacterContext,
+        patch: Value,
+        await_effects: bool,
+    ) -> Result<(), NativeError> {
+        actor_patch::apply(context, patch, await_effects)
+    }
+
     #[hks(name = "enable", receiver)]
     fn native_option_enable(
         _context: &mut CharacterContext,
@@ -1280,22 +1312,22 @@ mod native_api {
         ))
     }
 
-    #[hks(name = "char")]
+    #[hks(name = "intrinsics.engine.actorIdentity")]
     fn native_char(
         context: &mut CharacterContext,
         name: String,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         context
             .char(name)
             .map_err(|error| NativeError::message(error.to_string()))
     }
 
-    #[hks(name = "clone", receiver)]
+    #[hks(name = "intrinsics.engine.cloneActor")]
     pub(super) fn native_clone(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         instance: String,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let name = context
             .actor_mut(actor.0)
             .map_err(|e| NativeError::message(e.to_string()))?
@@ -1316,12 +1348,12 @@ mod native_api {
             .map_err(|e| NativeError::message(e.to_string()))
     }
 
-    #[hks(name = "alias", receiver)]
+    #[hks(name = "intrinsics.engine.aliasActor")]
     pub(super) fn native_alias(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         alias: String,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let display = context
             .actor_mut(actor.0)
             .map_err(|e| NativeError::message(e.to_string()))?
@@ -1354,22 +1386,20 @@ mod native_api {
         Ok(handle)
     }
 
-    #[hks(name = "e", receiver)]
-    fn native_emotion(
+    pub(super) fn native_emotion(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         emotion: String,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         context
             .emotion(actor, emotion)
             .map_err(|error| NativeError::message(error.to_string()))
     }
 
-    #[hks(name = "show", receiver)]
     pub(super) fn native_show(
         context: &mut CharacterContext,
-        actor: ActorHandle,
-    ) -> Result<ActorHandle, NativeError> {
+        actor: ActorIdentity,
+    ) -> Result<ActorIdentity, NativeError> {
         let display = context
             .actor_mut(actor.0)
             .map_err(|e| NativeError::message(e.to_string()))?
@@ -1394,12 +1424,11 @@ mod native_api {
         Ok(actor)
     }
 
-    #[hks(name = "hide", receiver)]
     pub(super) fn native_hide(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         fade_ms: Option<f64>,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let fade_ms = hide_duration(fade_ms)?;
         let pending = context
             .actor_mut(actor.0)
@@ -1452,12 +1481,11 @@ mod native_api {
         Ok(())
     }
 
-    #[hks(name = "offset", selector = "Actor", receiver)]
-    fn native_actor_offset(
+    pub(super) fn native_actor_offset(
         context: &mut CharacterContext,
-        ActorHandle(handle): ActorHandle,
+        ActorIdentity(handle): ActorIdentity,
         position: Position,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let Position::Absolute(x, y) = position else {
             return Err(NativeError::message(
                 "offset uses pixel coordinates: .pos(x, y)",
@@ -1473,18 +1501,17 @@ mod native_api {
             .actor_mut(handle)
             .map_err(|e| NativeError::message(e.to_string()))?;
         actor.pending_offset = Some(transition);
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
     /// Add a transient two-axis wave to placement, sampled with story time.
-    #[hks(name = "oscillate", selector = "Actor", receiver)]
-    fn native_actor_oscillate(
+    pub(super) fn native_actor_oscillate(
         context: &mut CharacterContext,
-        ActorHandle(handle): ActorHandle,
+        ActorIdentity(handle): ActorIdentity,
         amplitude: Position,
         period_x: f64,
         period_y: f64,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let Position::Absolute(x, y) = amplitude else {
             return Err(NativeError::message(
                 "oscillation amplitude uses .pos(x, y) canvas units",
@@ -1503,14 +1530,13 @@ mod native_api {
             .actor_mut(handle)
             .map_err(|e| NativeError::message(e.to_string()))?
             .pending_offset = Some(transition);
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
-    #[hks(name = "stopMotion", selector = "Actor", receiver)]
-    fn native_actor_stop_motion(
+    pub(super) fn native_actor_stop_motion(
         context: &mut CharacterContext,
-        actor: ActorHandle,
-    ) -> Result<ActorHandle, NativeError> {
+        actor: ActorIdentity,
+    ) -> Result<ActorIdentity, NativeError> {
         let actor_id = context
             .actor_mut(actor.0)
             .map_err(|e| NativeError::message(e.to_string()))?
@@ -1523,27 +1549,25 @@ mod native_api {
         Ok(actor)
     }
 
-    #[hks(name = "time", selector = "Actor", receiver)]
-    fn actor_time(
+    pub(super) fn actor_time(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         seconds: f64,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let spec = actor_animation_spec(context, actor)?.with_time(seconds)?;
         native_actor_animation(context, actor, spec)
     }
-    #[hks(name = "easing", selector = "Actor", receiver)]
-    fn actor_easing(
+    pub(super) fn actor_easing(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         easing: Easing,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let spec = actor_animation_spec(context, actor)?.with_easing(easing)?;
         native_actor_animation(context, actor, spec)
     }
     fn actor_animation_spec(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
     ) -> Result<AnimationSpec, NativeError> {
         let actor = context
             .actor_mut(actor.0)
@@ -1556,9 +1580,9 @@ mod native_api {
     }
     fn native_actor_animation(
         context: &mut CharacterContext,
-        ActorHandle(handle): ActorHandle,
+        ActorIdentity(handle): ActorIdentity,
         animation: AnimationSpec,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let actor = context
             .actor_mut(handle)
             .map_err(|e| NativeError::message(e.to_string()))?;
@@ -1575,7 +1599,7 @@ mod native_api {
                 ));
             }
             actor.placement_animation = Some(animation);
-            return Ok(ActorHandle(handle));
+            return Ok(ActorIdentity(handle));
         };
         let updated = super::super::actor_motion::ActorOffset {
             animation,
@@ -1583,13 +1607,12 @@ mod native_api {
         };
         updated.validate().map_err(NativeError::message)?;
         *transition = updated;
-        Ok(ActorHandle(handle))
+        Ok(ActorIdentity(handle))
     }
 
-    #[hks(name = "await", selector = "Actor", receiver)]
-    fn await_actor(
+    pub(super) fn await_actor(
         context: &mut CharacterContext,
-        ActorHandle(id): ActorHandle,
+        ActorIdentity(id): ActorIdentity,
     ) -> Result<(), NativeError> {
         let actor = context
             .actor_mut(id)
@@ -1619,34 +1642,31 @@ mod native_api {
         Ok(())
     }
 
-    #[hks(name = "at", receiver)]
-    fn native_at(
+    pub(super) fn native_at(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         position: Position,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         context
             .at(actor, position)
             .map_err(|error| NativeError::message(error.to_string()))
     }
 
-    #[hks(name = "scale", receiver)]
-    fn native_scale(
+    pub(super) fn native_scale(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         scale: f64,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         context
             .scale(actor, scale)
             .map_err(|error| NativeError::message(error.to_string()))
     }
 
-    #[hks(name = "rotation", selector = "Actor", receiver)]
     pub(super) fn native_actor_rotation(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         degrees: f64,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         if !degrees.is_finite() || !(degrees as f32).is_finite() {
             return Err(NativeError::message("actor rotation must be finite"));
         }
@@ -1660,12 +1680,11 @@ mod native_api {
 
     /// Scene-space depth, shared by aliases but independent for clones. Leave
     /// one unit below the curtain for stable ordering within each depth band.
-    #[hks(name = "depth", selector = "Actor", receiver)]
     pub(super) fn native_actor_depth(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         depth: f64,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         if !depth.is_finite() || !(0.0..=29.0).contains(&depth) {
             return Err(NativeError::message(
                 "actor depth must be finite and in 0..=29 (below the curtain)",
@@ -1684,12 +1703,11 @@ mod native_api {
     }
 
     /// Clipping belongs to the display identity, shared by aliases but not clones.
-    #[hks(name = "clip", selector = "Actor", receiver)]
-    fn native_actor_clip(
+    pub(super) fn native_actor_clip(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         region: Option<String>,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         let id = context
             .actor_mut(actor.0)
             .map_err(|error| NativeError::message(error.to_string()))?
@@ -1701,12 +1719,11 @@ mod native_api {
         Ok(actor)
     }
 
-    #[hks(name = "focus", receiver)]
-    fn native_focus(
+    pub(super) fn native_focus(
         context: &mut CharacterContext,
-        actor: ActorHandle,
+        actor: ActorIdentity,
         focused: Option<bool>,
-    ) -> Result<ActorHandle, NativeError> {
+    ) -> Result<ActorIdentity, NativeError> {
         context
             .focus(actor, focused.unwrap_or(true))
             .map_err(|error| NativeError::message(error.to_string()))
@@ -1918,7 +1935,7 @@ mod native_api {
         Ok(())
     }
 
-    #[hks]
+    #[hks(name = "intrinsics.engine.say")]
     fn native_say(
         context: &mut CharacterContext,
         speaker: String,
@@ -1932,46 +1949,23 @@ mod native_api {
         Ok(())
     }
 
-    #[hks(raw, operator = ":")]
-    fn native_dialogue_operator(
+    #[hks(name = "intrinsics.engine.continueDialogue")]
+    fn native_continue_dialogue(
         context: &mut CharacterContext,
-        call: &BuiltinCall,
-    ) -> Result<Value, NativeError> {
-        if call.receiver.is_some() || call.arguments.len() != 2 {
-            return Err(NativeError::message("operator `:` expects two operands"));
-        }
-        let continuation = matches!(call.arguments[0].value, Value::Ellipsis);
-        let speaker = match &call.arguments[0].value {
-            Value::Handle {
-                type_id: ACTOR_HANDLE_TYPE,
-                id,
-            } => context
-                .actors
-                .get(id)
-                .map(|actor| actor.name.clone())
-                .ok_or_else(|| NativeError::message(format!("unknown actor handle {id}")))?,
-            Value::Ellipsis => context.last_speaker.clone().unwrap_or_default(),
-            _ => return Err(NativeError::TypeMismatch("actor or ellipsis")),
-        };
-        let text = match &call.arguments[1].value {
-            Value::TextTemplate(text) | Value::String(text) => text,
-            _ => return Err(NativeError::TypeMismatch("TextTemplate")),
-        };
-        if continuation {
-            if let Some(buffer) = context.dialogue_buffer.as_mut() {
-                buffer.push_str(text);
-                context
-                    .commands
-                    .push(StoryEffect::ContinueDialogue { text: text.clone() });
-                context.wait = Some(StoryWait::DialogueAdvance);
-            } else {
-                bevy::log::warn!("`...` has no dialogue buffer; treating it as narration");
-                native_narrate(context, TextTemplate(text.clone()))?;
-            }
+        text: TextTemplate,
+    ) -> Result<(), NativeError> {
+        let text = text.into_string();
+        if let Some(buffer) = context.dialogue_buffer.as_mut() {
+            buffer.push_str(&text);
+            context
+                .commands
+                .push(StoryEffect::ContinueDialogue { text: text.clone() });
+            context.wait = Some(StoryWait::DialogueAdvance);
         } else {
-            native_say(context, speaker, TextTemplate(text.clone()))?;
+            bevy::log::warn!("`...` has no dialogue buffer; treating it as narration");
+            native_narrate(context, TextTemplate(text.clone()))?;
         }
-        Ok(Value::Unit)
+        Ok(())
     }
 }
 
@@ -2000,8 +1994,8 @@ mod story_api {
     }
 }
 
-fn pending_actor(name: &str) -> PendingActor {
-    PendingActor {
+fn pending_actor(name: &str) -> ActorPresentation {
+    ActorPresentation {
         rotation: 0.0,
         placement_animation: None,
         name: name.to_string(),
@@ -2090,7 +2084,8 @@ mod tests {
         assert!(host.context.actors[&copy.0].visible);
         assert_eq!(host.context.actors[&alice.0].expressions, ["happy"]);
         assert_eq!(host.context.actors[&middle.0].expressions, ["sad"]);
-        host.context.commit().expect("commit");
+        host.context.commit_actor(middle.0).expect("commit alias");
+        host.context.commit_actor(copy.0).expect("commit clone");
         let effects = host.drain_effects();
         let mut displays = effects
             .iter()
@@ -2124,7 +2119,9 @@ mod tests {
             .emotion(middle, "happy".into())
             .expect("expression");
         native_api::native_show(&mut host.context, middle).expect("show instance");
-        host.context.commit().expect("commit");
+        host.context
+            .commit_actor(middle.0)
+            .expect("commit instance");
         assert!(
             matches!(&host.drain_effects()[0], StoryEffect::ShowCharacter { actor_id, character_name, .. }
             if actor_id == "alice-middle" && character_name == "alice")
@@ -2167,10 +2164,12 @@ mod tests {
         host.context
             .emotion(alice, "happy".into())
             .expect("emotion");
-        host.context.commit().expect("commit hidden actor");
+        host.context
+            .commit_actor(alice.0)
+            .expect("commit hidden actor");
         assert!(host.drain_effects().is_empty());
         native_api::native_show(&mut host.context, alice).expect("show");
-        host.context.commit().expect("commit show");
+        host.context.commit_actor(alice.0).expect("commit show");
         host.drain_effects();
         let mut host = StoryNativeHost::restore(host.snapshot());
         assert_eq!(
@@ -2189,10 +2188,14 @@ mod tests {
         host.context
             .emotion(alice, "sad".into())
             .expect("edit hidden actor");
-        host.context.commit().expect("commit while hidden");
+        host.context
+            .commit_actor(alice.0)
+            .expect("commit while hidden");
         assert!(host.drain_effects().is_empty());
         native_api::native_show(&mut host.context, alice).expect("show retained actor");
-        host.context.commit().expect("commit");
+        host.context
+            .commit_actor(alice.0)
+            .expect("commit retained actor");
         assert!(
             matches!(host.drain_effects().as_slice(),[StoryEffect::ShowCharacter {scale,expressions,..}] if *scale==0.5 && expressions==&["happy","sad"])
         );
@@ -2232,7 +2235,10 @@ mod tests {
 not_actor.at(.left)"#,
         )
         .expect_err("a string must not be accepted as an Actor receiver");
-        assert!(error.contains("receiver expects Named"));
+        assert!(
+            error.contains("cannot call") || error.contains("receiver expects"),
+            "{error}"
+        );
     }
 
     #[test]

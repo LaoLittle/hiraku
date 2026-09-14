@@ -454,9 +454,16 @@ impl<'types> MirBuilder<'types> {
             return None;
         }
         match statement.kind {
-            HirStmtKind::Let { local, value } => {
+            HirStmtKind::Let {
+                local,
+                value,
+                commit,
+            } => {
                 let value = self.lower_expression(value, errors)?;
                 self.push(MirInstruction::StoreLocal { local, src: value });
+                if let Some(commit) = commit {
+                    self.lower_expression(commit, errors)?;
+                }
                 self.push(MirInstruction::Statement {
                     span: statement.span,
                     value,
@@ -465,7 +472,11 @@ impl<'types> MirBuilder<'types> {
                 });
                 Some(value)
             }
-            HirStmtKind::Global { global, value } => {
+            HirStmtKind::Global {
+                global,
+                value,
+                commit,
+            } => {
                 // A declaration initializes session state; it is not an
                 // assignment. Guard the entire initializer, including calls
                 // and their side effects, when the host supplies existing state.
@@ -487,6 +498,9 @@ impl<'types> MirBuilder<'types> {
                     None => self.constant(MirConstant::Uninitialized),
                 };
                 self.push(MirInstruction::StoreGlobal { global, src: value });
+                if let Some(commit) = commit {
+                    self.lower_expression(commit, errors)?;
+                }
                 self.push(MirInstruction::Statement {
                     span: statement.span,
                     value,
