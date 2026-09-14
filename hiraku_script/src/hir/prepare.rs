@@ -7,6 +7,8 @@ use crate::{Program, Stmt, TypeExprKind};
 mod constants;
 #[path = "protocols.rs"]
 mod protocols;
+#[path = "type_context.rs"]
+mod type_context;
 
 pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
     static CORE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
@@ -135,8 +137,14 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
             });
             continue;
         };
+        let mut constant_values = std::collections::BTreeMap::new();
         for method in methods {
-            if let Stmt::Const {
+            let mut normalized = method.clone();
+            type_context::TypeContext::new(target.clone(), None)
+                .statement(&mut normalized, &mut errors);
+            let method = &normalized;
+            if let Stmt::Let {
+                mutable: false,
                 name,
                 type_annotation,
                 value,
@@ -144,13 +152,25 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 ..
             } = method
             {
-                let value = match constants::evaluate(value, &Default::default()) {
+                let value = match constants::evaluate(value, &constant_values) {
                     Ok(value) => value,
                     Err(error) => {
                         errors.push(error);
                         continue;
                     }
                 };
+                constant_values.insert(name.clone(), value.clone());
+                // A private global gives the constant one identity per runtime.
+                // Declare its slot here, but initialize it lazily in the getter:
+                // linked callers need not execute this module's entry first.
+                let storage = format!("{owner}::static#{name}");
+                statements.push(Stmt::Global {
+                    mutable: false,
+                    name: storage.clone(),
+                    type_annotation: type_annotation.clone(),
+                    value: None,
+                    span: *span,
+                });
                 statements.push(Stmt::Function {
                     attributes: Vec::new(),
                     compiler_intrinsics: trusted,
@@ -162,7 +182,19 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                     parameters: Vec::new(),
                     return_type: type_annotation.clone(),
                     body: crate::Block {
-                        statements: vec![Stmt::Expr(value)],
+                        statements: vec![
+                            Stmt::Global {
+                                mutable: false,
+                                name: storage.clone(),
+                                type_annotation: type_annotation.clone(),
+                                value: Some(value),
+                                span: *span,
+                            },
+                            Stmt::Expr(crate::Expr {
+                                kind: crate::ExprKind::Ident(storage),
+                                span: *span,
+                            }),
+                        ],
                         span: *span,
                     },
                     span: *span,
@@ -170,10 +202,12 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 continue;
             }
             if let Stmt::Property {
+                exported,
                 name,
                 ty,
                 getter,
                 setter,
+                instance,
                 span,
             } = method
             {
@@ -185,12 +219,16 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                 statements.push(Stmt::Function {
                     attributes: Vec::new(),
                     compiler_intrinsics: trusted,
-                    exported: false,
+                    exported: *exported,
                     name: format!("{owner}::get#{name}"),
                     type_parameters: Vec::new(),
                     bounds: Vec::new(),
                     witnesses: Vec::new(),
-                    parameters: vec![receiver.clone()],
+                    parameters: if *instance {
+                        vec![receiver.clone()]
+                    } else {
+                        Vec::new()
+                    },
                     return_type: Some(ty.clone()),
                     body: getter.clone(),
                     span: *span,
@@ -199,19 +237,24 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
                     statements.push(Stmt::Function {
                         attributes: Vec::new(),
                         compiler_intrinsics: trusted,
-                        exported: false,
+                        exported: *exported,
                         name: format!("{owner}::set#{name}"),
                         type_parameters: Vec::new(),
                         bounds: Vec::new(),
                         witnesses: Vec::new(),
-                        parameters: vec![
-                            receiver,
-                            crate::FunctionParameter {
+                        parameters: {
+                            let mut parameters = if *instance {
+                                vec![receiver]
+                            } else {
+                                Vec::new()
+                            };
+                            parameters.push(crate::FunctionParameter {
                                 name: parameter.clone(),
                                 ty: Some(ty.clone()),
                                 span: *span,
-                            },
-                        ],
+                            });
+                            parameters
+                        },
                         return_type: Some(crate::TypeExpr {
                             kind: TypeExprKind::Unit,
                             span: *span,
@@ -259,7 +302,6 @@ pub(super) fn prepare(source: &Program) -> Result<Program, Vec<LoweringError>> {
     if !errors.is_empty() {
         return Err(errors);
     }
-    constants::normalize(&mut statements)?;
     Ok(Program {
         statements,
         warnings: source.warnings.clone(),

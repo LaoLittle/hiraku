@@ -179,8 +179,7 @@ impl Collector<'_> {
             Stmt::Import { .. }
             | Stmt::TypeAlias { .. }
             | Stmt::Struct { .. }
-            | Stmt::Enum { .. }
-            | Stmt::Const { .. } => {}
+            | Stmt::Enum { .. } => {}
             Stmt::Extend { methods, .. } | Stmt::Protocol { methods, .. } => {
                 for method in methods {
                     self.nested(method);
@@ -377,7 +376,6 @@ fn statement_span(statement: &Stmt) -> &Span {
         | Stmt::Enum { span, .. } => span,
         Stmt::Function { span, .. }
         | Stmt::Return { span, .. }
-        | Stmt::Const { span, .. }
         | Stmt::Extend { span, .. }
         | Stmt::Protocol { span, .. }
         | Stmt::Property { span, .. }

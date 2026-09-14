@@ -323,6 +323,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             return None;
         };
         let Some(fields) = variants.get(&variant) else {
+            let owner = self.types.intern(ty.clone());
+            let member = self.symbol(&variant);
+            let getter = self.symbol(&format!("get#{variant}"));
+            if self.static_methods.contains_key(&(owner, member))
+                || self.static_methods.contains_key(&(owner, getter))
+            {
+                return None;
+            }
             self.error(format!("enum has no variant `{variant}`"), expression.span);
             return Some(self.alloc_expression(
                 HirExprKind::Literal(HirLiteral::Unit),

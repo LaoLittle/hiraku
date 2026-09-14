@@ -142,7 +142,6 @@ impl Server {
                         let (name, kind) = match statement {
                             Stmt::Function { name, .. } => (name, 12),
                             Stmt::Let { name, .. } | Stmt::Global { name, .. } => (name, 13),
-                            Stmt::Const { name, .. } => (name, 14),
                             Stmt::Struct { name, .. } => (name, 23),
                             Stmt::Enum { name, .. } => (name, 10),
                             Stmt::TypeAlias { name, .. } | Stmt::Protocol { name, .. } => {

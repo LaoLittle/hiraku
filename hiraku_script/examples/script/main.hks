@@ -67,12 +67,45 @@ s: "123"
 
 what(s)
 
-//let decoy: () -> Int = { return 99 }
-global fn apply(callback: () -> Int) -> Int { callback() }
+enum TestEnum {
+    a(Int),
+    b(Float),
+    c(String)
+}
 
-let unused = 0
-let callback: () -> Int = { return 7 }
+extend TestEnum: Test {
+    fn test(self) {
+        let s = when self {
+            .a(i) -> i.toString(),
+            .b(f) -> f.toString(),
+            .c(s) -> s
+        }
 
- let result: Int = apply(callback)
+        print(s)
+    }
+}
 
-print(result.toString())
+extend TestEnum {
+    fn someStatic() -> Self { .a(12) }
+}
+
+let sa: TestEnum = .someStatic()
+
+struct MyFoo { a: Int }
+
+extend MyFoo { 
+    let instance: MyFoo = .{ a: 1 }
+    var staticCalc: Int {
+        get() { 12 }
+        set(newVal) { print(newVal.toString()) }
+    }
+
+    var nonStaticCalc: Int {
+        get(self) { self.a }
+        set(self, newVal) { self.a = newVal }
+    }
+}
+
+let aw = MyFoo.staticCalc
+
+MyFoo.staticCalc = 2211

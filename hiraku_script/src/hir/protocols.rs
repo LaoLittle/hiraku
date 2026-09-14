@@ -123,18 +123,19 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
                 errors.push(LoweringError { message: "associated-type constraints and marker-only protocol bounds are not supported yet".into(), span: bound.protocol.span });
                 continue;
             }
-            let mut substitutions: BTreeMap<String, TypeExpr> = type_parameters
+            let substitutions: BTreeMap<String, TypeExpr> = type_parameters
                 .iter()
                 .cloned()
                 .zip(arguments.iter().cloned())
                 .collect();
-            substitutions.insert(
-                "Self".into(),
+            let mut context = super::type_context::TypeContext::new(
                 TypeExpr {
                     kind: TypeExprKind::Named(bound.parameter.clone()),
                     span: *span,
                 },
+                Some(bound.protocol.clone()),
             );
+            context.aliases.extend(substitutions);
             for method in methods {
                 let Stmt::Function {
                     name: method,
@@ -153,16 +154,22 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
                         .iter()
                         .map(|parameter| {
                             if parameter.name == "self" {
-                                substitutions["Self"].clone()
+                                context.resolve(
+                                    &TypeExpr {
+                                        kind: TypeExprKind::Named("Self".into()),
+                                        span: parameter.span,
+                                    },
+                                    &mut errors,
+                                )
                             } else {
-                                substitute(
+                                context.resolve(
                                     parameter.ty.as_ref().expect("protocol signature checked"),
-                                    &substitutions,
+                                    &mut errors,
                                 )
                             }
                         })
                         .collect(),
-                    result: substitute(return_type, &substitutions),
+                    result: context.resolve(return_type, &mut errors),
                 });
             }
         }
@@ -214,12 +221,14 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
             });
             continue;
         }
-        let mut substitutions: BTreeMap<String, TypeExpr> = type_parameters
+        let substitutions: BTreeMap<String, TypeExpr> = type_parameters
             .iter()
             .cloned()
             .zip(arguments.iter().cloned())
             .collect();
-        substitutions.insert("Self".into(), target.clone());
+        let mut context =
+            super::type_context::TypeContext::new(target.clone(), Some(protocol.clone()));
+        context.aliases.extend(substitutions);
         let mut associated = BTreeSet::new();
         for member in methods.iter() {
             if let Stmt::TypeAlias {
@@ -238,8 +247,7 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
                         span: *span,
                     });
                 }
-                substitutions.insert(member.clone(), ty.clone());
-                substitutions.insert(format!("Self.{member}"), ty.clone());
+                context.associated.insert(member.clone(), ty.clone());
             }
         }
         for member in associated_types {
@@ -306,8 +314,11 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
                 let expected = expected
                     .ty
                     .as_ref()
-                    .map(|ty| substitute(ty, &substitutions));
-                let actual_type = actual.ty.as_ref().map(|ty| substitute(ty, &substitutions));
+                    .map(|ty| context.resolve(ty, &mut errors));
+                let actual_type = actual
+                    .ty
+                    .as_ref()
+                    .map(|ty| context.resolve(ty, &mut errors));
                 if expected.is_none()
                     || actual_type.as_ref().map(canonical) != expected.as_ref().map(canonical)
                 {
@@ -323,9 +334,9 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
             }
             let expected = required_result
                 .as_ref()
-                .map(|ty| substitute(ty, &substitutions));
+                .map(|ty| context.resolve(ty, &mut errors));
             if let Some(actual) = return_type.as_ref() {
-                if Some(canonical(&substitute(actual, &substitutions)))
+                if Some(canonical(&context.resolve(actual, &mut errors)))
                     != expected.as_ref().map(canonical)
                 {
                     errors.push(LoweringError {
@@ -338,6 +349,7 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
             }
             *return_type = expected;
             *method_name = format!("protocol#{name}#{method_name}");
+            context.statement(method, &mut errors);
         }
         for requirement in requirements {
             if let Stmt::Function { name: member, .. } = requirement {
@@ -357,51 +369,19 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
     }
 }
 
-fn substitute(ty: &TypeExpr, substitutions: &BTreeMap<String, TypeExpr>) -> TypeExpr {
-    if let TypeExprKind::Named(name) = &ty.kind {
-        if let Some(value) = substitutions.get(name) {
-            let mut remaining = substitutions.clone();
-            remaining.remove(name);
-            return substitute(value, &remaining);
-        }
-    }
+pub(super) fn canonical(ty: &TypeExpr) -> TypeExpr {
     let mut result = ty.clone();
-    match &mut result.kind {
-        TypeExprKind::Tuple(types)
-        | TypeExprKind::Applied {
-            arguments: types, ..
-        } => {
-            for ty in types {
-                *ty = substitute(ty, substitutions);
-            }
-        }
-        TypeExprKind::Function { parameters, result } => {
-            for ty in parameters {
-                *ty = substitute(ty, substitutions);
-            }
-            **result = substitute(result, substitutions);
-        }
-        TypeExprKind::Nullable(ty) | TypeExprKind::List(ty) | TypeExprKind::Binding(ty) => {
-            **ty = substitute(ty, substitutions)
-        }
-        TypeExprKind::Record(fields) => {
-            for field in fields {
-                field.ty = substitute(&field.ty, substitutions);
-            }
-        }
-        _ => {}
-    }
-    result
-}
-
-fn canonical(ty: &TypeExpr) -> TypeExpr {
-    let mut result = substitute(ty, &BTreeMap::new());
     fn clear(ty: &mut TypeExpr) {
         ty.span = crate::Span { start: 0, end: 0 };
         if matches!(&ty.kind, TypeExprKind::Named(name) if name == "Unit") {
             ty.kind = TypeExprKind::Unit;
         }
         match &mut ty.kind {
+            TypeExprKind::Member { object, .. } => clear(object),
+            TypeExprKind::Qualified { owner, protocol } => {
+                clear(owner);
+                clear(protocol);
+            }
             TypeExprKind::Tuple(types)
             | TypeExprKind::Applied {
                 arguments: types, ..

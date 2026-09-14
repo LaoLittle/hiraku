@@ -23,12 +23,14 @@ pub struct LinkedVmFrameSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedVmSnapshot {
     pub objects: crate::ObjectHeap,
+    pub module_globals: std::collections::BTreeMap<u32, Vec<Value>>,
     pub modules: Vec<crate::ProgramFingerprint>,
     pub frames: Vec<LinkedVmFrameSnapshot>,
 }
 
 pub struct LinkedVm {
     objects: crate::ObjectHeap,
+    module_globals: std::collections::BTreeMap<u32, Vec<Value>>,
     program: LinkedProgram,
     frames: Vec<(ModuleId, Vm)>,
 }
@@ -42,6 +44,7 @@ impl LinkedVm {
         let vm = Vm::new(module.bytecode.clone())?;
         Ok(Self {
             objects: crate::ObjectHeap::default(),
+            module_globals: Default::default(),
             program,
             frames: vec![(entry, vm)],
         })
@@ -87,6 +90,7 @@ impl LinkedVm {
         vm.swap_objects(&mut objects);
         Ok(Self {
             objects,
+            module_globals: Default::default(),
             program,
             frames: vec![(module, vm)],
         })
@@ -119,6 +123,7 @@ impl LinkedVm {
             self.frames
                 .iter()
                 .flat_map(|(_, vm)| vm.object_roots())
+                .chain(self.module_globals.values().flatten())
                 .chain(host_roots),
         )
     }
@@ -162,6 +167,8 @@ impl LinkedVm {
             vm.swap_objects(&mut self.objects);
             let event = vm.step_with_budget(remaining);
             vm.swap_objects(&mut self.objects);
+            self.module_globals
+                .insert(module_id.0, vm.globals().to_vec());
             if let Err(mut error) = event {
                 if let VmError::Panic { frames, .. } = &mut error {
                     for (_, caller) in self.frames.iter().rev().skip(1) {
@@ -188,7 +195,13 @@ impl LinkedVm {
                         return Ok(Some(LinkedVmEvent::Completed(self.objects.export(&value)?)));
                     }
                     self.frames.pop();
-                    if let Some((_, caller)) = self.frames.last_mut() {
+                    if let Some((caller_module, caller)) = self.frames.last_mut() {
+                        if let Some(globals) = self.module_globals.get(&caller_module.0) {
+                            caller.swap_objects(&mut self.objects);
+                            let result = caller.set_global_values(globals.clone());
+                            caller.swap_objects(&mut self.objects);
+                            result?;
+                        }
                         caller.resume(value)?;
                         continue;
                     }
@@ -242,6 +255,12 @@ impl LinkedVm {
                             let mut callee = Vm::from_function(bytecode, function, arguments)?;
                             callee.set_type_bindings(call.type_bindings);
                             callee.set_read_only_globals(vm.read_only_globals().clone());
+                            if let Some(globals) = self.module_globals.get(&module.0) {
+                                callee.swap_objects(&mut self.objects);
+                                let result = callee.set_global_values(globals.clone());
+                                callee.swap_objects(&mut self.objects);
+                                result?;
+                            }
                             self.frames.push((module, callee));
                         }
                         None => return Err(LinkedVmError::UnlinkedCall(call.function)),
@@ -289,6 +308,7 @@ impl LinkedVm {
     pub fn snapshot(&self) -> LinkedVmSnapshot {
         LinkedVmSnapshot {
             objects: self.objects.clone(),
+            module_globals: self.module_globals.clone(),
             modules: self
                 .program
                 .modules
@@ -336,6 +356,7 @@ impl LinkedVm {
             program,
             frames,
             objects: snapshot.objects,
+            module_globals: snapshot.module_globals,
         })
     }
 }

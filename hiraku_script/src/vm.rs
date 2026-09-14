@@ -3206,11 +3206,14 @@ mod tests {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let code = Arc::new(compile(
             r#"
-            const ready: Bool = !false && (1 <= 2 || false)
-            const same = "alice" == "alice"
-            const other = 2 != 1 && 3 >= 2 && 3 > 1
-            const shortCircuit = true || (1 / 0 > 0)
-            global let result = ready && same && other && shortCircuit
+            struct Flags {}
+            extend Flags {
+                let ready: Bool = !false && (1 <= 2 || false)
+                let same = "alice" == "alice"
+                let other = 2 != 1 && 3 >= 2 && 3 > 1
+                let shortCircuit = true || (1 / 0 > 0)
+            }
+            global let result = Flags.ready && Flags.same && Flags.other && Flags.shortCircuit
         "#,
             &manifest,
         ));
@@ -3220,7 +3223,7 @@ mod tests {
                 vm.step().expect("constant program runs"),
                 Some(VmEvent::Completed(_))
             ) {
-                assert_eq!(vm.globals(), &[Value::Bool(true)]);
+                assert_eq!(vm.global("result"), Some(&Value::Bool(true)));
                 return;
             }
         }
@@ -4527,10 +4530,10 @@ mod tests {
     fn rejects_invalid_constants_properties_and_callable_arguments() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         for source in [
-            "const score = todo()",
-            "global const score = .{ value: 1 }",
-            "const score = 1\nscore = 2",
-            "type Player = .{}\nextend Player { var score: Int { 1 } }\nlet alice = Player.{}\nalice.score = 2",
+            "struct Player {}\nextend Player { let score = todo() }",
+            "global let score = .{ value: 1 }\nscore = .{ value: 2 }",
+            "let score = 1\nscore = 2",
+            "type Player = .{}\nextend Player { var score: Int { get(self) { 1 } } }\nlet alice = Player.{}\nalice.score = 2",
             "let callback: (Int) -> Int = { value -> value }\ncallback(\"wrong\")",
             "let callback: (Int) -> Int = { value -> value }\ncallback()",
             "let callback: (Int) -> Int = { value -> \"wrong\" }",
@@ -4543,7 +4546,7 @@ mod tests {
             );
         }
         for source in [
-            "type Player = .{}\nextend Player { let score = 1 }",
+            "type Player = .{}\nextend Player { var score: Int = 1 }",
             "type Player = .{}\nextend Player { var score: Int { get { 1 } set { 2 } } }",
             "type Player = .{}\nextend Player { var score: Int { get { 1 } set() { 2 } } }",
         ] {
@@ -4585,15 +4588,15 @@ mod tests {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
             r#"
-            const base = 2 * 3
-            global const limit = base + 4
+            let base = 2 * 3
+            global let limit = base + 4
             type Player = .{ score: Int }
             extend Player {
-                const A = 7
-                var doubled: Int { self.score * 2 }
+                let A = 7
+                var doubled: Int { get(self) { self.score * 2 } }
                 var current: Int {
-                    get { self.score }
-                    set(value) { self.score = value }
+                    get(self) { self.score }
+                    set(self, value) { self.score = value }
                 }
             }
             let alice = Player.{ score: 1 }

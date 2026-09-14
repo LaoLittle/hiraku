@@ -755,6 +755,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extension_static_identity_survives_serialized_restore() {
+        let bytecode = crate::script::compile_story_bytecode(
+            "static_test.hks",
+            r#"
+                struct Counter { value: Int }
+                extend Counter { let shared: Counter = .{ value: 1 } }
+                let first = Counter.shared
+                first.value = 42
+                let second = Counter.shared
+                if second.value != 42 { panic("static was recreated") }
+                second.value = 7
+                if first.value != 7 { panic("static lost its alias") }
+            "#,
+        )
+        .expect("static story compiles");
+        let mut runtime = ExecutionRuntime::new(bytecode.clone()).expect("runtime initializes");
+        for _ in 0..500 {
+            match runtime.step().expect("static story executes") {
+                Some(ExecutionEvent::Completed { .. }) => return,
+                Some(ExecutionEvent::Call { .. }) => panic!("unexpected host call"),
+                _ => {}
+            }
+            let encoded = hiraku_script::hson::to_string(&runtime.snapshot())
+                .expect("static state serializes");
+            let snapshot =
+                hiraku_script::hson::from_str(&encoded).expect("static state deserializes");
+            runtime = ExecutionRuntime::restore(bytecode.clone(), snapshot)
+                .expect("static state restores");
+        }
+        panic!("static story did not complete");
+    }
+
+    #[test]
     fn child_execution_shares_captured_records_after_snapshot_restore() {
         check_child_record_identity(false);
     }

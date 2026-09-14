@@ -468,7 +468,6 @@ impl Parser {
                 "type" => return self.parse_type_alias(),
                 "struct" => return self.parse_struct(),
                 "enum" => return self.parse_enum(),
-                "const" => return self.parse_const(false),
                 "let" | "var" => return self.parse_let(),
                 "global" => return self.parse_global(),
                 "if" => return self.parse_if(),
@@ -542,6 +541,14 @@ impl Parser {
                     "<error>".to_string()
                 }
             };
+            if name == "getter" {
+                self.errors.push(ParseError {
+                    message:
+                        "@getter has been removed; declare a var property with get() or get(self)"
+                            .into(),
+                    span: token.span,
+                });
+            }
             attributes.push(Attribute {
                 name,
                 span: Span::join(&start, &token.span),
@@ -714,17 +721,22 @@ impl Parser {
                 methods.push(self.parse_function(false));
             } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "global") {
                 self.advance();
+                if matches!(&self.current().kind, TokenKind::Ident(name) if name == "var") {
+                    methods.push(self.parse_property(true));
+                    self.skip_separators();
+                    continue;
+                }
                 if !matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
-                    self.error_here("only functions can be exported from an extension");
+                    self.error_here("expected fn or var after global in an extension");
                     break;
                 }
                 methods.push(self.parse_function(true));
             } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "var") {
-                methods.push(self.parse_property());
-            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "const") {
-                methods.push(self.parse_const(false));
+                methods.push(self.parse_property(false));
+            } else if matches!(&self.current().kind, TokenKind::Ident(name) if name == "let") {
+                methods.push(self.parse_let());
             } else {
-                self.error_here("extend blocks accept functions, constants and computed properties, not stored let/var fields");
+                self.error_here("extend blocks accept fn, let constants and var computed properties; stored instance fields are not allowed");
                 self.parse_statement();
             }
             self.skip_separators();
@@ -781,28 +793,7 @@ impl Parser {
         }
     }
 
-    fn parse_const(&mut self, exported: bool) -> Stmt {
-        let statement = self.parse_let();
-        let Stmt::Let {
-            name,
-            type_annotation,
-            value,
-            span,
-            ..
-        } = statement
-        else {
-            unreachable!("binding parser returns Let")
-        };
-        Stmt::Const {
-            exported,
-            name,
-            type_annotation,
-            value,
-            span,
-        }
-    }
-
-    fn parse_property(&mut self) -> Stmt {
+    fn parse_property(&mut self, exported: bool) -> Stmt {
         let start = self.advance().span;
         let name = match self.advance().kind {
             TokenKind::Ident(name) => name,
@@ -822,20 +813,10 @@ impl Parser {
             "expected `{` before computed property body",
         );
         self.skip_separators();
-        if !matches!(&self.current().kind, TokenKind::Ident(name) if name == "get" || name == "set")
-        {
-            let getter = self.parse_block_contents(start.start);
-            let span = Span::join(&start, &getter.span);
-            return Stmt::Property {
-                name,
-                ty,
-                getter,
-                setter: None,
-                span,
-            };
-        }
         let mut getter = None;
         let mut setter = None;
+        let mut getter_instance = None;
+        let mut setter_instance = None;
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             match self.advance().kind {
                 TokenKind::Ident(accessor) if accessor == "get" => {
@@ -843,25 +824,30 @@ impl Parser {
                         self.error_here("duplicate property getter");
                     }
                     self.skip_newlines();
+                    let parameters = self.parse_accessor_parameters();
+                    let instance = parameters.as_slice() == ["self"];
+                    if !parameters.is_empty() && !instance {
+                        self.error_here("getter must declare get() or get(self)");
+                    }
+                    getter_instance = Some(instance);
                     getter = Some(self.parse_block());
                 }
                 TokenKind::Ident(accessor) if accessor == "set" => {
                     if setter.is_some() {
                         self.error_here("duplicate property setter");
                     }
-                    self.expect(
-                        TokenKind::LParen,
-                        "setter requires an explicit parameter: set(value) { ... }",
-                    );
-                    let parameter = if let TokenKind::Ident(parameter) = &self.current().kind {
-                        let parameter = parameter.clone();
-                        self.advance();
-                        parameter
-                    } else {
-                        self.error_here("setter requires a named parameter");
-                        "<error>".into()
+                    let parameters = self.parse_accessor_parameters();
+                    let (instance, parameter) = match parameters.as_slice() {
+                        [value] if value != "self" => (false, value.clone()),
+                        [receiver, value] if receiver == "self" && value != "self" => {
+                            (true, value.clone())
+                        }
+                        _ => {
+                            self.error_here("setter must declare set(value) or set(self, value); a new-value parameter name is required");
+                            (false, "<error>".into())
+                        }
                     };
-                    self.expect(TokenKind::RParen, "expected `)` after setter parameter");
+                    setter_instance = Some(instance);
                     self.skip_newlines();
                     setter = Some((parameter, self.parse_block()));
                 }
@@ -877,9 +863,17 @@ impl Parser {
         if getter.is_none() {
             self.error_here("computed property requires a getter");
         }
+        if getter_instance.is_some()
+            && setter_instance.is_some()
+            && getter_instance != setter_instance
+        {
+            self.error_here("getter and setter must both declare self, or both omit self");
+        }
         Stmt::Property {
+            exported,
             name,
             ty,
+            instance: getter_instance.unwrap_or(false),
             getter: getter.unwrap_or(Block {
                 statements: Vec::new(),
                 span: start,
@@ -887,6 +881,38 @@ impl Parser {
             setter,
             span: Span::join(&start, &end),
         }
+    }
+
+    fn parse_accessor_parameters(&mut self) -> Vec<String> {
+        if !self.at(TokenKind::LParen) {
+            self.error_here("accessors require an explicit parameter list: get(), get(self), set(value), or set(self, value)");
+            return Vec::new();
+        }
+        self.advance();
+        self.skip_newlines();
+        let mut parameters = Vec::new();
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::LBrace) && !self.at(TokenKind::Eof)
+        {
+            match self.advance().kind {
+                TokenKind::Ident(name) => parameters.push(name),
+                _ => {
+                    self.error_here("expected an accessor parameter name");
+                    break;
+                }
+            }
+            self.skip_newlines();
+            if !self.at(TokenKind::Comma) {
+                break;
+            }
+            self.advance();
+            self.skip_newlines();
+        }
+        if self.at(TokenKind::RParen) {
+            self.advance();
+        } else {
+            self.error_here("expected `)` after accessor parameters");
+        }
+        parameters
     }
 
     fn parse_when(&mut self, start: Span) -> Expr {
@@ -1239,9 +1265,6 @@ impl Parser {
             }
             return declaration;
         }
-        if matches!(&self.current().kind, TokenKind::Ident(name) if name == "const") {
-            return self.parse_const(true);
-        }
         if matches!(&self.current().kind, TokenKind::Ident(name) if name == "fn") {
             return self.parse_function(true);
         }
@@ -1252,7 +1275,7 @@ impl Parser {
                 mutable
             }
             _ => {
-                self.error_here("expected `let`, `var`, `const`, `fn`, or `struct` after `global`; use `global let` for a fixed binding or `global var` for a reassignable binding");
+                self.error_here("expected `let`, `var`, `fn`, or `struct` after `global`; use `global let` for a fixed binding or `global var` for a reassignable binding");
                 false
             }
         };
@@ -1345,21 +1368,13 @@ impl Parser {
             self.parse_record_type_contents(start)
         } else {
             let token = self.advance();
-            let TokenKind::Ident(mut name) = token.kind else {
+            let TokenKind::Ident(name) = token.kind else {
                 self.error_here("expected type name");
                 return TypeExpr {
                     kind: TypeExprKind::Named("<error>".to_string()),
                     span: token.span,
                 };
             };
-            if name == "Self" && self.at(TokenKind::Dot) {
-                self.advance();
-                if let TokenKind::Ident(member) = self.advance().kind {
-                    name = format!("Self.{member}");
-                } else {
-                    self.error_here("expected associated type after `Self.`");
-                }
-            }
             if self.at(TokenKind::Lt) {
                 self.advance();
                 let mut arguments = Vec::new();
@@ -1383,6 +1398,22 @@ impl Parser {
                 }
             }
         };
+        while self.at(TokenKind::Dot) {
+            self.advance();
+            let member = self.advance();
+            let TokenKind::Ident(name) = member.kind else {
+                self.error_here("expected type member after `.`");
+                break;
+            };
+            let span = Span::join(&ty.span, &member.span);
+            ty = TypeExpr {
+                kind: TypeExprKind::Member {
+                    object: Box::new(ty),
+                    name,
+                },
+                span,
+            };
+        }
         let mut nullable_suffixes = 0usize;
         while self.at(TokenKind::Question) {
             let end = self.advance();
@@ -2774,7 +2805,7 @@ mod tests {
 
     #[test]
     fn parses_extension_members_and_rejects_old_keyword() {
-        let source = "extend Alice { const LIMIT = 3; fn name() -> String { \"Alice\" } var score: Int { get { 1 } set(value) { value } } }";
+        let source = "extend Alice { let LIMIT = 3; fn name() -> String { \"Alice\" } var score: Int { get() { 1 } set(value) { value } } }";
         let program = parse_program(source).expect("extension members parse");
         let Stmt::Extend { methods, .. } = &program.statements[0] else {
             panic!("expected extension declaration")

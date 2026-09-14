@@ -42,16 +42,11 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
-    Const {
+    Property {
         exported: bool,
         name: String,
-        type_annotation: Option<TypeExpr>,
-        value: Expr,
-        span: Span,
-    },
-    Property {
-        name: String,
         ty: TypeExpr,
+        instance: bool,
         getter: Block,
         setter: Option<(String, Block)>,
         span: Span,
@@ -181,6 +176,17 @@ pub enum TypeExprKind {
         result: Box<TypeExpr>,
     },
     Named(String),
+    /// A type member projection, independent of the spelling of its owner.
+    Member {
+        object: Box<TypeExpr>,
+        name: String,
+    },
+    /// Compiler-generated conformance view, analogous to `<Owner as Protocol>`.
+    /// Removed by type normalization; never represented in runtime values.
+    Qualified {
+        owner: Box<TypeExpr>,
+        protocol: Box<TypeExpr>,
+    },
     Applied {
         name: String,
         arguments: Vec<TypeExpr>,

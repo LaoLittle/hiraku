@@ -135,12 +135,7 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
                         facts.merge(&body);
                     }
                 }
-                Stmt::Global { name, .. }
-                | Stmt::Const {
-                    name,
-                    exported: true,
-                    ..
-                } => {
+                Stmt::Global { name, .. } => {
                     let mut body = Facts::default();
                     visit_stmt(stmt, &mut body);
                     local_definitions.insert((path.clone(), name.clone()), body.clone());
@@ -174,9 +169,7 @@ pub fn analyze(documents: &BTreeMap<String, String>) -> Result<DependencyManifes
                 exports.statements.retain(|s| {
                     matches!(
                         s,
-                        Stmt::Function { exported: true, .. }
-                            | Stmt::Global { .. }
-                            | Stmt::Const { exported: true, .. }
+                        Stmt::Function { exported: true, .. } | Stmt::Global { .. }
                     )
                 });
                 scope.insert(module.clone(), exports);
@@ -426,7 +419,7 @@ fn block(block: &Block, out: &mut Facts) {
 }
 fn visit_stmt(stmt: &Stmt, out: &mut Facts) {
     match stmt {
-        Stmt::Let { name, value, .. } | Stmt::Const { name, value, .. } => {
+        Stmt::Let { name, value, .. } => {
             out.values
                 .entry(name.clone())
                 .or_default()
@@ -467,7 +460,7 @@ fn visit_stmt(stmt: &Stmt, out: &mut Facts) {
                 expr(v, out);
             }
         }
-        Stmt::Const { value, .. } | Stmt::Let { value, .. } | Stmt::Expr(value) => expr(value, out),
+        Stmt::Let { value, .. } | Stmt::Expr(value) => expr(value, out),
         Stmt::Assign { target, value, .. } => {
             expr(target, out);
             expr(value, out);

@@ -174,13 +174,7 @@ fn intern_statement(statement: &Stmt, symbols: &mut SymbolInterner) {
             }
             intern_block(body, symbols);
         }
-        Stmt::Const {
-            name,
-            type_annotation,
-            value,
-            ..
-        }
-        | Stmt::Let {
+        Stmt::Let {
             name,
             type_annotation,
             value,
@@ -254,6 +248,14 @@ fn intern_type(ty: &TypeExpr, symbols: &mut SymbolInterner) {
         }
         TypeExprKind::Named(name) => {
             symbols.intern(name);
+        }
+        TypeExprKind::Member { object, name } => {
+            intern_type(object, symbols);
+            symbols.intern(name);
+        }
+        TypeExprKind::Qualified { owner, protocol } => {
+            intern_type(owner, symbols);
+            intern_type(protocol, symbols);
         }
         TypeExprKind::Applied { name, arguments } => {
             symbols.intern(name);

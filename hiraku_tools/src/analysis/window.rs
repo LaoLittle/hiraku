@@ -99,9 +99,7 @@ fn sequence(
                     prune(value, &mut closures);
                 }
             }
-            Stmt::Expr(value) | Stmt::Let { value, .. } | Stmt::Const { value, .. } => {
-                prune(value, &mut closures)
-            }
+            Stmt::Expr(value) | Stmt::Let { value, .. } => prune(value, &mut closures),
             Stmt::Assign { target, value, .. } => {
                 prune(target, &mut closures);
                 prune(value, &mut closures);
@@ -127,7 +125,6 @@ fn span(stmt: &Stmt) -> [usize; 2] {
     let span = match stmt {
         Stmt::Expr(expr) => expr.span,
         Stmt::Return { span, .. }
-        | Stmt::Const { span, .. }
         | Stmt::Property { span, .. }
         | Stmt::Extend { span, .. }
         | Stmt::Protocol { span, .. }

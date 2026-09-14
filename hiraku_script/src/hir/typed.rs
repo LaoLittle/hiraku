@@ -1215,8 +1215,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             Stmt::Enum { .. } | Stmt::TypeAlias { .. } | Stmt::Struct { .. } => return None,
             Stmt::Extend { span, .. }
             | Stmt::Protocol { span, .. }
-            | Stmt::Property { span, .. }
-            | Stmt::Const { span, .. } => {
+            | Stmt::Property { span, .. } => {
                 self.error(
                     "extend declarations are only allowed at module scope",
                     *span,
@@ -1320,7 +1319,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     let actual = self.expression_type(value).clone();
                     self.check_assignment(&expected, &actual, value.span);
                 }
-                let commit = value.and_then(|_| {
+                let commit = value.filter(|_| !name.contains("::static#")).and_then(|_| {
                     let reference = self.alloc_typed_expression(
                         HirExprKind::Global(global),
                         self.globals[global.0 as usize].ty,
@@ -1343,6 +1342,34 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 span,
             } => {
                 if let ExprKind::Member { object, name } = &target.kind {
+                    if let Some(getter) = self.resolve_static_script_method(object, name, *span) {
+                        let getter_name = self
+                            .symbols
+                            .resolve(self.functions[getter.0 as usize].name)
+                            .expect("static accessor name exists")
+                            .to_owned();
+                        let Some((owner, _)) = getter_name.split_once("::get#") else {
+                            self.error(format!("static method `{name}` is not assignable"), *span);
+                            return None;
+                        };
+                        let setter_name = self.symbol(&format!("{owner}::set#{name}"));
+                        let Some(setter) = self.function_names.get(&setter_name).copied() else {
+                            self.error(format!("static member `{name}` is read-only"), *span);
+                            return None;
+                        };
+                        let expected = self.functions[setter.0 as usize].parameters[0].clone();
+                        let value = self.lower_expression_expected(value, Some(&expected));
+                        self.check_assignment(
+                            &expected,
+                            &self.expression_type(value).clone(),
+                            value.span,
+                        );
+                        let call = self.accessor_call(setter, &[value], *span);
+                        return Some(self.arena.alloc(HirStmt {
+                            kind: HirStmtKind::Expr(call),
+                            span: *span,
+                        }));
+                    }
                     let object = self.lower_expression(object);
                     let getter = self.symbol(&format!("get#{name}"));
                     let setter = self.symbol(&format!("set#{name}"));
@@ -2668,6 +2695,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         if let ExprKind::When { value, arms } = &expression.kind {
             return self.lower_when(value, arms, expected, expression.span);
         }
+        if let Some(value) = self.lower_contextual_static(expression, expected) {
+            return value;
+        }
         if let Some(value) = self.lower_enum_constructor(expression, expected) {
             return value;
         }
@@ -3329,6 +3359,82 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         )
     }
 
+    /// Resolve leading-dot members from their expected owner type, then use
+    /// ordinary function-call lowering (including generic/closure arguments).
+    fn lower_contextual_static(
+        &mut self,
+        expression: &Expr,
+        expected: Option<&ScriptType>,
+    ) -> Option<&'hir HirExpr<'hir>> {
+        let expected = expected?;
+        let owner = self.types.intern(expected.clone());
+        let (name, called) = match &expression.kind {
+            ExprKind::Symbol(name) => (name, false),
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Symbol(name) => (name, true),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let member = self.symbol(&if called {
+            name.clone()
+        } else {
+            format!("get#{name}")
+        });
+        let function_name =
+            if let Some(function) = self.static_methods.get(&(owner, member)).copied() {
+                if !called {
+                    return Some(self.accessor_call(function, &[], expression.span));
+                }
+                self.symbols
+                    .resolve(self.functions[function.0 as usize].name)
+                    .expect("static method name is interned")
+                    .to_owned()
+            } else {
+                let owner_name = match expected {
+                    ScriptType::Struct { name, .. }
+                    | ScriptType::Enum { name, .. }
+                    | ScriptType::Named(name) => *name,
+                    _ => return None,
+                };
+                let function_name = format!(
+                    "{}::{}",
+                    self.symbols.resolve(owner_name)?,
+                    self.symbols.resolve(member)?
+                );
+                let symbol = self.symbol(&function_name);
+                if !self.external_functions.contains_key(&symbol)
+                    || self
+                        .external_methods
+                        .values()
+                        .any(|method| *method == symbol)
+                {
+                    return None;
+                }
+                function_name
+            };
+        if !called {
+            let qualified = Expr {
+                kind: ExprKind::Call {
+                    callee: Box::new(Expr {
+                        kind: ExprKind::Ident(function_name),
+                        span: expression.span,
+                    }),
+                    type_arguments: Vec::new(),
+                    arguments: Vec::new(),
+                    trailing_block: None,
+                },
+                span: expression.span,
+            };
+            return Some(self.lower_expression_in_context(&qualified, Some(expected)));
+        }
+        let mut qualified = expression.clone();
+        if let ExprKind::Call { callee, .. } = &mut qualified.kind {
+            callee.kind = ExprKind::Ident(function_name);
+        }
+        Some(self.lower_expression_in_context(&qualified, Some(expected)))
+    }
+
     fn resolve_static_script_method(
         &mut self,
         object: &Expr,
@@ -3345,7 +3451,13 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
         // A namespace/value name is not necessarily a type. This is a lookup,
         // not a type annotation, so a miss must not emit an unknown-type error.
-        let owner = self.instantiate_named_type(name, &[], object.span)?;
+        let owner = self
+            .type_parameters
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .cloned()
+            .or_else(|| self.instantiate_named_type(name, &[], object.span))?;
         let owner = self.types.intern(owner);
         let method_symbol = self.symbol(method);
         let getter = self.symbol(&format!("get#{method}"));
@@ -3813,6 +3925,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
 
     fn type_from_ast(&mut self, ty: &TypeExpr) -> Option<ScriptType> {
         match &ty.kind {
+            TypeExprKind::Member { .. } => {
+                self.error(
+                    "associated type projection requires a known protocol implementation context",
+                    ty.span,
+                );
+                None
+            }
+            TypeExprKind::Qualified { owner, .. } => self.type_from_ast(owner),
             TypeExprKind::Unit => Some(ScriptType::Unit),
             TypeExprKind::Tuple(values) => Some(ScriptType::TupleOf(
                 values
@@ -4530,7 +4650,6 @@ fn statement_span(statement: &Stmt) -> Span {
         | Stmt::Extend { span, .. }
         | Stmt::Protocol { span, .. }
         | Stmt::Property { span, .. }
-        | Stmt::Const { span, .. }
         | Stmt::Function { span, .. }
         | Stmt::Let { span, .. }
         | Stmt::Global { span, .. }

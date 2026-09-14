@@ -267,6 +267,505 @@ mod tests {
     }
 
     #[test]
+    fn explicit_static_and_instance_properties_execute_and_restore() {
+        let project = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+            struct MyFoo { a: Int }
+            global var recorded = 0
+            extend MyFoo {
+                let instance: MyFoo = .{ a: 1 }
+                let base = 2
+                let limit = base + 3
+                var staticCalc: Int {
+                    get() { 12 }
+                    set(val) { recorded = val }
+                }
+                var nonStaticCalc: Int {
+                    get(self) { self.a }
+                    set(self, newVal) { self.a = newVal }
+                }
+                var readOnly: Int { get(self) { self.a } }
+            }
+            let foo: MyFoo = .instance
+            let alias = foo
+            if foo.nonStaticCalc != 1 { panic("constant initializer") }
+            alias.nonStaticCalc = 7
+            alias.nonStaticCalc += 2
+            if foo.readOnly != 9 { panic("shared instance setter") }
+            let again: MyFoo = .instance
+            if again.a != 9 { panic("static object was reconstructed") }
+            MyFoo.staticCalc = 6
+            if recorded != 6 { panic("static setter") }
+            MyFoo.staticCalc += 1
+            if recorded != 13 { panic("static compound assignment") }
+            if MyFoo.limit != 5 { panic("constant dependency") }
+        "#,
+            )],
+            &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+        )
+        .expect("explicit accessors compile");
+        let program = project.program;
+        let mut vm =
+            crate::LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+        for _ in 0..2_000 {
+            if matches!(
+                vm.step_with_budget(&mut 1).expect("accessors execute"),
+                Some(crate::LinkedVmEvent::Completed(_))
+            ) {
+                return;
+            }
+            vm =
+                crate::LinkedVm::restore(vm.snapshot(), program.clone()).expect("restore accessor");
+        }
+        panic!("script did not complete");
+    }
+
+    #[test]
+    fn static_objects_survive_linked_calls_collection_and_restore() {
+        let project = compile_project(
+            vec![
+                source(
+                    "main.hks",
+                    r#"
+                    let first = shared()
+                    first.a = 42
+                    let second = shared()
+                    if second.a != 42 { panic("linked static lost identity") }
+                    second.a = 7
+                    if first.a != 7 { panic("linked static was copied") }
+                "#,
+                ),
+                source(
+                    "library.hks",
+                    r#"
+                    struct MyFoo { a: Int }
+                    extend MyFoo { let instance: MyFoo = .{ a: 1 } }
+                    global fn shared() -> MyFoo { MyFoo.instance }
+                "#,
+                ),
+            ],
+            &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+        )
+        .expect("linked static compiles");
+        let program = project.program;
+        let mut vm =
+            crate::LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+        for _ in 0..2_000 {
+            if matches!(
+                vm.step_with_budget(&mut 1).expect("static executes"),
+                Some(crate::LinkedVmEvent::Completed(_))
+            ) {
+                return;
+            }
+            vm.collect_objects(&[]).expect("collect linked roots");
+            vm = crate::LinkedVm::restore(vm.snapshot(), program.clone()).expect("restore static");
+        }
+        panic!("script did not complete");
+    }
+
+    #[test]
+    fn accessor_receivers_and_removed_declarations_are_checked() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for members in [
+            "var value: Int { get(self) { self.a } set(value) {} }",
+            "var value: Int { get() { 1 } set(self, value) {} }",
+            "var value: Int { get() { 1 } set() {} }",
+            "var value: Int { get(self) { 1 } set(self) {} }",
+            "var value: Int { get(self) { 1 } set(self, self) {} }",
+            "var value: Int { get(other) { 1 } }",
+            "var value: Int = 1",
+            "var value: Int { get { 1 } }",
+            "var value: Int { 1 }",
+            "const value = 1",
+            "@getter fn value() -> Int { 1 }",
+        ] {
+            let source = format!("struct MyFoo {{ a: Int }}\nextend MyFoo {{ {members} }}");
+            assert!(
+                compile_project(vec![self::source("main.hks", &source)], &manifest).is_err(),
+                "accepted {members}"
+            );
+        }
+        for source in [
+            "const value = 1",
+            "global const value = 1",
+            "struct MyFoo {}\nextend MyFoo { let value = 1 }\nMyFoo.value = 2",
+            "struct MyFoo {}\nextend MyFoo { var value: Int { get() { 1 } set(value) {} } }\nMyFoo.value = \"bad\"",
+        ] {
+            assert!(
+                compile_project(vec![self::source("main.hks", source)], &manifest).is_err(),
+                "accepted {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn associated_types_are_qualified_by_protocol_in_bodies_and_signatures() {
+        let mut registry = crate::native::NativeRegistry::<Vec<String>>::new();
+        registry
+            .register_fn("print", |output: &mut Vec<String>, value: String| {
+                output.push(value);
+                Ok(())
+            })
+            .expect("register print");
+        let project = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+            enum Item { a(Int) }
+            protocol Read { type Output
+                fn read(self) -> Self.Output
+            }
+            protocol Notify { type Output
+                fn notify(self) -> Output
+            }
+            extend Item: Read {
+                type Output = Int
+                fn read(self) -> Self.Output {
+                    let copy: Self = self
+                    let callback: (Self.Output) -> Output = { value: Output -> value }
+                    let values: List<Self.Output> = [12]
+                    when copy { .a(value) -> callback(value) }
+                }
+            }
+            extend Item: Notify {
+                type Output = Unit
+                fn notify(self) -> Self.Output {
+                    let value: Self.Output = ()
+                    let callback: (Output) -> Self.Output = { value: Self.Output -> value }
+                    print("notified")
+                    callback(value)
+                }
+            }
+            extend Item {
+                fn make() -> Self { .a(12) }
+                fn identity(value: Self) -> Self { value }
+            }
+            let item: Item = .make()
+            let value: Int = item.read()
+            if value != 12 { panic("wrong Read.Output") }
+            let unit: Unit = item.notify()
+        "#,
+            )],
+            &registry.manifest(),
+        )
+        .expect("qualified associated types compile");
+        let program = project.program;
+        let mut vm =
+            crate::LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+        let mut output = Vec::new();
+        let mut completed = false;
+        for _ in 0..2_000 {
+            match vm
+                .step_with_budget(&mut 1)
+                .expect("qualified types execute")
+            {
+                Some(crate::LinkedVmEvent::Call(call)) => {
+                    let value = registry.call(&mut output, &call).expect("native call");
+                    vm.resume(value).expect("resume");
+                }
+                Some(crate::LinkedVmEvent::Completed(_)) => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+            vm = crate::LinkedVm::restore(vm.snapshot(), program.clone())
+                .expect("restore projection-free state");
+        }
+        assert!(completed);
+        assert_eq!(output, ["notified"]);
+    }
+
+    #[test]
+    fn qualified_associated_signatures_export_as_concrete_types() {
+        let project = compile_project(
+            vec![
+                source(
+                    "library.hks",
+                    r#"
+                global struct Item { value: Int }
+                protocol Read { type Output; fn read(self) -> Self.Output }
+                extend Item: Read {
+                    type Output = Int
+                    global fn read(self) -> Output {
+                        let result: Self.Output = self.value
+                        result
+                    }
+                }
+                global fn fetch(item: Item) -> Int { item.read() }
+            "#,
+                ),
+                source(
+                    "main.hks",
+                    r#"
+                let item: Item = .{ value: 12 }
+                let value: Int = fetch(item)
+                if value != 12 { panic("exported projection") }
+            "#,
+                ),
+            ],
+            &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+        )
+        .expect("concrete exported associated signature");
+        let read = project
+            .program
+            .modules
+            .iter()
+            .flat_map(|module| {
+                module.bytecode.functions.iter().filter(|function| {
+                    module
+                        .bytecode
+                        .symbols
+                        .resolve(function.name)
+                        .is_some_and(|name| name.ends_with("::protocol#Read#read"))
+                })
+            })
+            .next()
+            .expect("exported protocol method");
+        assert_eq!(read.signature.result, crate::ScriptType::Int);
+        let mut vm =
+            crate::LinkedVm::new(project.program, project.paths["main.hks"]).expect("entry");
+        for _ in 0..1_000 {
+            if matches!(
+                vm.step().expect("exported projection executes"),
+                Some(crate::LinkedVmEvent::Completed(_))
+            ) {
+                return;
+            }
+        }
+        panic!("script did not complete");
+    }
+
+    #[test]
+    fn associated_type_cycles_and_unqualified_projections_are_errors() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for (script, message) in [
+            (
+                "struct Item {}\nprotocol Read { type Output; fn read(self) -> Self.Output }\nextend Item: Read { type Output = Self.Output; fn read(self) -> Self.Output { () } }",
+                "cyclic associated type",
+            ),
+            (
+                "struct Item {}\nextend Item { fn read(self) -> Self.Output { () } }",
+                "projection requires",
+            ),
+            (
+                "struct Item {}\nprotocol Read { type Output; fn read(self) -> Self.Output }\nextend Item: Read { type Output = Int; fn read(self) -> Self.Output { let bad: Self.Missing = 1; 1 } }",
+                "no associated type `Missing`",
+            ),
+        ] {
+            let errors = compile_project(vec![source("main.hks", script)], &manifest)
+                .expect_err("invalid projection");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains(message)),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_static_members_and_self_alias_execute() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        let project = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+            enum TestEnum { a(Int), b }
+            extend TestEnum {
+                fn someStatic() -> Self { .a(12) }
+                var defaultValue: Self { get() { Self.someStatic() } }
+                fn identity(value: Self) -> Self { value }
+                fn test(self) -> Int { when self { .a(value) -> value, .b -> 0 } }
+            }
+            let value: TestEnum = .someStatic()
+            if value.test() != 12 { panic("static method") }
+            let defaultValue: TestEnum = .defaultValue
+            if defaultValue.test() != 12 { panic("static getter") }
+            let same: TestEnum = .identity(.someStatic())
+            if same.test() != 12 { panic("Self parameter") }
+            let optional: TestEnum? = .someStatic()
+            if optional!.test() != 12 { panic("optional context") }
+            if TestEnum.someStatic().test() != 12 { panic("qualified method") }
+            if TestEnum.defaultValue.test() != 12 { panic("qualified getter") }
+            struct Point { x: Int }
+            extend Point {
+                fn make(value: Int) -> Self { .{ x: value } }
+                var origin: Self { get() { .make(0) } }
+                fn copy(value: Self?) -> Self? { value }
+            }
+            let point: Point = .make(42)
+            let origin: Point = .origin
+            if point.x != 42 || origin.x != 0 { panic("struct static members") }
+            let copied: Point? = Point.copy(point)
+            if copied!.x != 42 { panic("nested Self type") }
+        "#,
+            )],
+            &manifest,
+        )
+        .expect("contextual static members compile");
+        let mut vm =
+            crate::LinkedVm::new(project.program, project.paths["main.hks"]).expect("entry");
+        for _ in 0..1_000 {
+            if matches!(
+                vm.step().expect("static members execute"),
+                Some(crate::LinkedVmEvent::Completed(_))
+            ) {
+                return;
+            }
+        }
+        panic!("script did not complete");
+    }
+
+    #[test]
+    fn imported_static_members_use_exported_self_signatures() {
+        let project = compile_project(
+            vec![
+                source(
+                    "library.hks",
+                    r#"
+                global struct Point { x: Int }
+                extend Point {
+                    global fn make(x: Int) -> Self { .{ x: x } }
+                    global var origin: Self { get() { .make(0) } }
+                }
+            "#,
+                ),
+                source(
+                    "main.hks",
+                    r#"
+                let point: Point = .make(12)
+                let origin: Point = .origin
+                if point.x != 12 || origin.x != 0 { panic("imported static member") }
+            "#,
+                ),
+            ],
+            &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+        )
+        .expect("exported static signatures");
+        let mut vm =
+            crate::LinkedVm::new(project.program, project.paths["main.hks"]).expect("entry");
+        for _ in 0..1_000 {
+            if matches!(
+                vm.step().expect("imported member executes"),
+                Some(crate::LinkedVmEvent::Completed(_))
+            ) {
+                return;
+            }
+        }
+        panic!("script did not complete");
+    }
+
+    #[test]
+    fn leading_dot_requires_context_and_getters_reject_parameters() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for (script, message) in [
+            (
+                "enum Item { a }\nextend Item { fn make() -> Self { .a } }\nlet value = .make()",
+                "cannot infer",
+            ),
+            (
+                "struct Item {}\nextend Item { @getter fn value(a: Int) -> Self { .{} } }",
+                "@getter has been removed",
+            ),
+            ("let value: Self = 1", "unknown type `Self`"),
+        ] {
+            let errors = compile_project(vec![source("main.hks", script)], &manifest)
+                .expect_err("invalid static member use");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains(message)),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_callables_reject_explicit_non_unit_returns() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for script in [
+            "fn invalid() -> Unit { return 7 }",
+            "let invalid: () -> Unit = { return 7 }",
+        ] {
+            let errors = compile_project(vec![source("main.hks", script)], &manifest)
+                .expect_err("only implicit tail values may be discarded");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains("expected Unit, got Int")),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_callable_results_discard_tail_values_but_keep_effects() {
+        let mut registry = crate::native::NativeRegistry::<Vec<String>>::new();
+        registry
+            .register_fn("print", |output: &mut Vec<String>, value: String| {
+                output.push(value);
+                Ok(())
+            })
+            .expect("register print");
+        let project = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+            type Ccc = (Int) -> () -> ()
+            let cc: Ccc = { a: Int -> { a } }
+            fn printu(u: Unit) { print("Unit") }
+            let value: Unit = cc(1)()
+            printu(value)
+            fn effect() -> Int { print("effect"); 42 }
+            fn discard() -> Unit { effect() }
+            @inline
+            fn inlineDiscard() -> Unit { effect() }
+            let callback: () -> Unit = { effect() }
+            printu(discard())
+            printu(inlineDiscard())
+            printu(callback())
+            let inferred = { 7 }
+            print(inferred().toString())
+        "#,
+            )],
+            &registry.manifest(),
+        )
+        .expect("unit callables compile");
+        let program = project.program;
+        let mut vm =
+            crate::LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+        let mut output = Vec::new();
+        let mut completed = false;
+        for _ in 0..2_000 {
+            match vm.step_with_budget(&mut 1).expect("typed unit result") {
+                Some(crate::LinkedVmEvent::Call(call)) => {
+                    vm = crate::LinkedVm::restore(vm.snapshot(), program.clone())
+                        .expect("restore host wait");
+                    let value = registry.call(&mut output, &call).expect("native call");
+                    vm.resume(value).expect("resume");
+                }
+                Some(crate::LinkedVmEvent::Completed(_)) => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+            vm = crate::LinkedVm::restore(vm.snapshot(), program.clone())
+                .expect("restore instruction");
+        }
+        assert!(completed);
+        assert_eq!(
+            output,
+            [
+                "Unit", "effect", "Unit", "effect", "Unit", "effect", "Unit", "7"
+            ]
+        );
+    }
+
+    #[test]
     fn imported_function_values_link_without_a_direct_call() {
         for entry in [
             "let callback: () -> Int = value; if callback() != 7 { panic(\"wrong callback\") }",
@@ -286,7 +785,8 @@ mod tests {
             let mut completed = false;
             for _ in 0..1_000 {
                 if matches!(
-                    vm.step_with_budget(&mut 1).expect("invoke imported function"),
+                    vm.step_with_budget(&mut 1)
+                        .expect("invoke imported function"),
                     Some(crate::LinkedVmEvent::Completed(_))
                 ) {
                     completed = true;

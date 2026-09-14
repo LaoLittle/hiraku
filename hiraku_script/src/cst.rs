@@ -174,7 +174,6 @@ pub fn statement_span(statement: &Stmt) -> Span {
     match statement {
         Stmt::Expr(expr) => expr.span,
         Stmt::Return { span, .. }
-        | Stmt::Const { span, .. }
         | Stmt::Property { span, .. }
         | Stmt::Extend { span, .. }
         | Stmt::Protocol { span, .. }

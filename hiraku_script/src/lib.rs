@@ -34,11 +34,14 @@
 //! expected callable signature. Native adapters may still use the erased
 //! `Function` capability when a concrete signature is not available.
 //!
-//! `const` and `global const` require compile-time scalar initializers. Stored
-//! objects and native calls are intentionally not constant expressions.
-//! In an extend, `const A = 1` is accessed as `Player.A`. Computed properties use
-//! `var score: Int { ... }` or `var score: Int { get { ... } set(value) { ... } }`.
-//! Accessors lower to ordinary script functions; a setter parameter is mandatory.
+//! In an extend, `let A = 1` declares a static constant accessed as `Player.A`.
+//! Constant expressions may contain scalar or aggregate literals, but no calls.
+//! Extension constants initialize once per runtime on first access. Repeated
+//! reads share the same object; the binding is immutable, its fields are not.
+//! Computed properties use `var score: Int { get() { ... } set(value) { ... } }`
+//! for static access, or `get(self)` and `set(self, value)` for instance access.
+//! Accessors lower to ordinary script functions. Both accessors must agree on
+//! their receiver; setters must name their new-value parameter.
 //!
 //! Object collection is non-moving mark-and-sweep. Shared-heap owners enumerate
 //! all VM and host roots at safe points. IDs are never reused, and snapshots
@@ -51,10 +54,9 @@
 //! unused core definitions are omitted from the self-contained bytecode.
 
 pub mod ast;
+pub mod blocks;
 pub mod cst;
 pub mod format;
-pub mod source_text;
-pub mod blocks;
 pub mod hir;
 pub mod hson;
 pub mod intrinsics;
@@ -64,6 +66,7 @@ pub mod linker;
 pub mod mir;
 pub mod native;
 pub mod objects;
+pub mod source_text;
 pub use objects::{ObjectHeap, ObjectId};
 mod fingerprint;
 pub use fingerprint::ProgramFingerprint;

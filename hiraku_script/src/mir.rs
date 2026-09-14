@@ -296,7 +296,14 @@ pub struct MirLoweringError {
 
 pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLoweringError>> {
     let mut errors = Vec::new();
-    let entry = MirBuilder::lower(hir.entry, false, false, Vec::new(), &hir.types, &mut errors);
+    let entry = MirBuilder::lower(
+        hir.entry,
+        false,
+        TailMode::Discard,
+        Vec::new(),
+        &hir.types,
+        &mut errors,
+    );
     let functions = hir
         .functions
         .iter()
@@ -304,10 +311,10 @@ pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLower
             let mut lowered = MirBuilder::lower(
                 function.body,
                 true,
-                !matches!(
+                TailMode::expression(!matches!(
                     hir.types.get(function.result),
                     Some(crate::ScriptType::Unit | crate::ScriptType::Never)
-                ),
+                )),
                 function.parameters.to_vec(),
                 &hir.types,
                 &mut errors,
@@ -351,6 +358,25 @@ pub fn lower_hir_to_mir(hir: &HirProgram<'_>) -> Result<MirProgram, Vec<MirLower
     }
 }
 
+/// Returning a value and emitting a statement hook are independent decisions.
+/// Untyped block closures retain statement hooks, even for their tail value.
+#[derive(Clone, Copy)]
+enum TailMode {
+    Discard,
+    Expression,
+    Statement,
+}
+
+impl TailMode {
+    fn expression(returns_value: bool) -> Self {
+        if returns_value {
+            Self::Expression
+        } else {
+            Self::Discard
+        }
+    }
+}
+
 struct MirBuilder<'types> {
     types: &'types crate::TypeTable,
     blocks: Vec<MirBasicBlock>,
@@ -363,7 +389,7 @@ impl<'types> MirBuilder<'types> {
     fn lower(
         block: &HirBlock<'_>,
         function: bool,
-        return_value: bool,
+        tail: TailMode,
         parameters: Vec<crate::HirLocalId>,
         types: &'types crate::TypeTable,
         errors: &mut Vec<MirLoweringError>,
@@ -378,7 +404,7 @@ impl<'types> MirBuilder<'types> {
             current: MirBlockId(0),
             next_register: 0,
         };
-        let result = if return_value
+        let result = if matches!(tail, TailMode::Expression)
             && let Some((last, preceding)) = block.statements.split_last()
             && let HirStmtKind::Expr(expression) = last.kind
         {
@@ -391,7 +417,14 @@ impl<'types> MirBuilder<'types> {
                 None
             }
         } else {
-            builder.lower_block(block, errors)
+            // A Unit callable still evaluates/commits its statements, but the
+            // last statement's value is not its return value.
+            let value = builder.lower_block(block, errors);
+            if matches!(tail, TailMode::Discard) {
+                None
+            } else {
+                value
+            }
         };
         if matches!(builder.current_block().terminator, MirTerminator::Unset) {
             builder.current_block_mut().terminator = if function {
@@ -958,8 +991,17 @@ impl<'types> MirBuilder<'types> {
                 Some(dst)
             }
             HirExprKind::Block(block) => {
-                let mut region = Self::lower(block, true, false, Vec::new(), self.types, errors);
-                region.signature = self.closure_signature(expression);
+                let signature = self.closure_signature(expression);
+                let tail = if matches!(
+                    signature.result,
+                    crate::ScriptType::Unit | crate::ScriptType::Never
+                ) {
+                    TailMode::Discard
+                } else {
+                    TailMode::Statement
+                };
+                let mut region = Self::lower(block, true, tail, Vec::new(), self.types, errors);
+                region.signature = signature;
                 let region_id = self.regions.len() as u32;
                 self.regions.push(region);
                 let dst = self.register();
@@ -977,7 +1019,7 @@ impl<'types> MirBuilder<'types> {
                 let mut region = Self::lower(
                     body,
                     true,
-                    return_value,
+                    TailMode::expression(return_value),
                     parameters.to_vec(),
                     self.types,
                     errors,
