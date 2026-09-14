@@ -316,11 +316,35 @@ authenticated embedded module receives these grants at link time. Standalone
 compilation seeds the library's symbol table from its caller, preserving nominal
 type identity without exporting capabilities or user source into the library.
 
-Patch fields are detached and cleared before the submission can yield. This
-prevents a paused seq from later clearing another execution's changes. Public
+Patch fields are detached and cleared before submission. Recorded animation
+steps own these values independently of subsequent builder mutations. Public
 actor names, optional arguments and time units are preserved by this migration.
 Other fluent families and the Rust bare-string statement consumer remain to be
 migrated; this is not yet a complete engine prelude conversion.
+
+### Recorded sequence and parallel plans
+
+`seq` and `par` now evaluate their closure synchronously into an engine-owned
+`AnimationPlan`. Variables, conditions and templates are evaluated while building
+the plan. The temporary execution is removed before the first effect is returned
+to ECS; playback does not retain or resume that closure's stack.
+
+Sequence playback submits one statement batch at a time and advances on effect
+completion (including automatic dialogue completion). Parallel playback submits
+all batches up to an explicit animation `.await()` barrier. Voice effects use
+concurrent playback; dialogue in `par` is warned about and skipped. The returned
+handle joins playback, not closure evaluation. Snapshots store remaining batches
+and active effects, and restoration never repeats build-time variable mutations.
+
+Each recorded actor offset retains its own revision for ECS reattachment. The
+plan separately remembers the final authored revision per actor for cancellation
+checks; sharing one revision between all steps would incorrectly treat later
+steps as restored instances of the first tween.
+
+Construction has a finite instruction budget. Interactive host requests and
+nested plan construction are currently rejected explicitly, not silently queued;
+hierarchical plan composition remains a follow-up. Choice callbacks still use
+ordinary resumable script executions because they can ask the player for input.
 
 ## Script statement handlers
 

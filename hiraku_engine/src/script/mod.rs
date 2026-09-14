@@ -20,6 +20,7 @@ pub mod replay;
 mod runtime;
 mod story_runtime;
 mod stdlib;
+mod animation_plan;
 pub mod ui_runtime;
 mod ui_vm;
 pub(crate) use project::{StoryProgram, compile_story_program};

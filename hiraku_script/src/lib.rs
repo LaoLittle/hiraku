@@ -51,6 +51,9 @@
 //! unused core definitions are omitted from the self-contained bytecode.
 
 pub mod ast;
+pub mod cst;
+pub mod format;
+pub mod source_text;
 pub mod blocks;
 pub mod hir;
 pub mod hson;

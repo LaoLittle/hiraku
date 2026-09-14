@@ -276,8 +276,6 @@ mod tests {
         )
         .expect("parallel sounds must compile");
         let mut runtime = StoryRuntime::new(bytecode).expect("valid runtime");
-        runtime.step().expect("dialogue event");
-        runtime.step().expect("dialogue wait");
         let mut tasks = Vec::new();
         for expected in ["sound/first", "sound/second"] {
             match runtime.step().expect("concurrent sound event") {
@@ -292,6 +290,8 @@ mod tests {
             }
         }
         assert_eq!(tasks[0], tasks[1]);
+        runtime.step().expect("dialogue event after plan submission");
+        runtime.step().expect("dialogue wait");
         for task in tasks {
             runtime.resume_task(task).expect("sound completion");
         }

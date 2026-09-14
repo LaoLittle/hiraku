@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use super::animation_plan::{AnimationPlan, PlanMode};
 use hiraku_script::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,12 +21,12 @@ use crate::script::capabilities::{
 /// Engine-facing whole-story driver. It translates generic VM boundaries into
 /// story effects without introducing a second executable representation.
 pub struct StoryRuntime {
+    plans: BTreeMap<ExecutionId, AnimationPlan>,
     execution: ExecutionRuntime,
     host: StoryNativeHost,
     pending: VecDeque<StoryRuntimeEvent>,
     active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
     deferred_task_completions: BTreeMap<ExecutionId, Value>,
-    deferred_dialogue: BTreeMap<ExecutionId, Vec<StoryEffect>>,
     completed_groups: std::collections::BTreeSet<ExecutionId>,
     waiting_task: Option<ExecutionId>,
     waiting_interactive_task: Option<ExecutionId>,
@@ -86,13 +87,12 @@ pub enum StoryRuntimeEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryRuntimeSnapshot {
+    plans: BTreeMap<ExecutionId, AnimationPlan>,
     awaiting_effects: std::collections::BTreeSet<ExecutionId>,
     execution: ExecutionRuntimeSnapshot,
     host: StoryNativeHostSnapshot,
     active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
     deferred_task_completions: BTreeMap<ExecutionId, Value>,
-    #[serde(default)]
-    deferred_dialogue: BTreeMap<ExecutionId, Vec<StoryEffect>>,
     #[serde(default)]
     completed_groups: std::collections::BTreeSet<ExecutionId>,
     waiting_task: Option<ExecutionId>,
@@ -105,8 +105,123 @@ pub struct StoryRuntimeSnapshot {
 }
 
 impl StoryRuntime {
+    fn build_plan(
+        &mut self,
+        kind: StoryTaskKind,
+        closure: &Value,
+    ) -> Result<ExecutionId, StoryRuntimeError> {
+        let mode = match kind {
+            StoryTaskKind::Sequence => PlanMode::Sequence,
+            StoryTaskKind::Parallel => PlanMode::Parallel,
+        };
+        let task = self.execution.spawn(closure, ExecutionMode::Interactive)?;
+        let mut plan = AnimationPlan::new(mode);
+        let result = (|| {
+            let mut budget = 1_000_000;
+            loop {
+                let event = self
+                    .execution
+                    .step_execution(task, &mut budget)?
+                    .ok_or(StoryRuntimeError::PlanBuildBudgetExceeded)?;
+                match event {
+                    ExecutionEvent::Call { call, .. } => match self.host.call(&call)? {
+                        StoryCallOutcome::Return(value) => self.execution.resume(task, value)?,
+                        StoryCallOutcome::Control(StoryControl::Navigate(request)) => {
+                            plan.record(vec![StoryEffect::Navigate(request)], true);
+                            self.execution.cancel_child(task);
+                            break;
+                        }
+                        StoryCallOutcome::Control(control) => {
+                            return Err(StoryRuntimeError::UnsupportedTaskControl(control));
+                        }
+                    },
+                    ExecutionEvent::Statement { value, .. } => {
+                        self.host.handle_statement(&value)?;
+                        let barrier = self.host.take_animation_await();
+                        if let Some(wait @ StoryWait::Movie { .. }) = self.host.take_wait() {
+                            return Err(StoryRuntimeError::UnsupportedTaskWait(wait));
+                        }
+                        let effects = self
+                            .host
+                            .drain_effects()
+                            .into_iter()
+                            .filter(|effect| {
+                                if mode == PlanMode::Parallel
+                                    && matches!(
+                                        effect,
+                                        StoryEffect::Say { .. }
+                                            | StoryEffect::ContinueDialogue { .. }
+                                    )
+                                {
+                                    bevy::log::warn!(
+                                        "say/narrate are not allowed in par; statement skipped"
+                                    );
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect();
+                        plan.record(effects, barrier);
+                    }
+                    ExecutionEvent::Completed { .. } => break,
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.execution.cancel_child(task);
+            return Err(error);
+        }
+        self.plans.insert(task, plan);
+        self.advance_plan(task)?;
+        Ok(task)
+    }
+
+    fn advance_plan(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
+        loop {
+            let batch = self.plans.get_mut(&task).and_then(AnimationPlan::next);
+            let Some(batch) = batch else {
+                self.plans.remove(&task);
+                self.completed_groups.insert(task);
+                if self.waiting_task == Some(task) {
+                    self.waiting_task = None;
+                    self.execution.resume(ExecutionId::MAIN, Value::Unit)?;
+                }
+                return Ok(());
+            };
+            for effect in batch {
+                if matches!(effect, StoryEffect::Navigate(_)) {
+                    self.terminated = true;
+                    self.plans.clear();
+                    self.active_task_effects.clear();
+                    self.pending.push_back(StoryRuntimeEvent::Effect(effect));
+                    return Ok(());
+                }
+                if animation_effect(&effect)
+                    || matches!(
+                        effect,
+                        StoryEffect::Say { .. } | StoryEffect::ContinueDialogue { .. }
+                    )
+                {
+                    self.active_task_effects
+                        .entry(task)
+                        .or_default()
+                        .push(effect.clone());
+                    self.pending
+                        .push_back(StoryRuntimeEvent::TaskEffect { task, effect });
+                } else {
+                    self.pending.push_back(StoryRuntimeEvent::Effect(effect));
+                }
+            }
+            if self.active_task_effects.contains_key(&task) {
+                return Ok(());
+            }
+        }
+    }
+
     pub(crate) fn has_executions(&self) -> bool {
-        self.execution.has_executions()
+        self.execution.has_executions() || !self.plans.is_empty()
     }
     pub(crate) fn resource_positions(&self) -> Vec<(String, usize)> {
         self.execution.resource_positions()
@@ -117,12 +232,12 @@ impl StoryRuntime {
 
     pub fn new(bytecode: impl Into<super::StoryProgram>) -> Result<Self, StoryRuntimeError> {
         Ok(Self {
+            plans: BTreeMap::new(),
             execution: ExecutionRuntime::new(bytecode)?,
             host: StoryNativeHost::new(),
             pending: VecDeque::new(),
             active_task_effects: BTreeMap::new(),
             deferred_task_completions: BTreeMap::new(),
-            deferred_dialogue: BTreeMap::new(),
             completed_groups: Default::default(),
             waiting_task: None,
             waiting_interactive_task: None,
@@ -139,12 +254,12 @@ impl StoryRuntime {
             return Err(StoryRuntimeError::NotAtSnapshotBoundary);
         }
         Ok(StoryRuntimeSnapshot {
+            plans: self.plans.clone(),
             awaiting_effects: self.awaiting_effects.clone(),
             execution: self.execution.snapshot(),
             host: self.host.snapshot(),
             active_task_effects: self.active_task_effects.clone(),
             deferred_task_completions: self.deferred_task_completions.clone(),
-            deferred_dialogue: self.deferred_dialogue.clone(),
             completed_groups: self.completed_groups.clone(),
             waiting_task: self.waiting_task,
             waiting_interactive_task: self.waiting_interactive_task,
@@ -199,13 +314,13 @@ impl StoryRuntime {
             })
             .collect();
         let mut runtime = Self {
+            plans: snapshot.plans,
             awaiting_effects: snapshot.awaiting_effects,
             execution: ExecutionRuntime::restore(bytecode, snapshot.execution)?,
             host: StoryNativeHost::restore(snapshot.host),
             pending,
             active_task_effects: snapshot.active_task_effects,
             deferred_task_completions: snapshot.deferred_task_completions,
-            deferred_dialogue: snapshot.deferred_dialogue,
             completed_groups: snapshot.completed_groups,
             waiting_task: snapshot.waiting_task,
             waiting_interactive_task: snapshot.waiting_interactive_task,
@@ -229,12 +344,10 @@ impl StoryRuntime {
     }
 
     pub(crate) fn voice_playback_mode(&self, task: ExecutionId) -> super::VoicePlaybackMode {
-        match self.execution.mode(task) {
-            Some(ExecutionMode::Parallel | ExecutionMode::Sequence) => {
-                super::VoicePlaybackMode::Concurrent
-            }
-            _ => super::VoicePlaybackMode::Exclusive,
+        if self.plans.contains_key(&task) {
+            return super::VoicePlaybackMode::Concurrent;
         }
+        super::VoicePlaybackMode::Exclusive
     }
 
     /// Native handles and their retained state belong to the story session,
@@ -365,14 +478,18 @@ impl StoryRuntime {
         // Hiding/replacing an actor cancels its old animation continuation,
         // not just the current ECS tween. Never let the next offset target a
         // hidden actor or a newly shown incarnation of the same display.
-        if self.execution.mode(task) == Some(ExecutionMode::Sequence)
+        if let Some(plan) = self.plans.get(&task)
+            && plan.mode == PlanMode::Sequence
             && let StoryEffect::ActorMotion {
                 actor_id, revision, ..
             } = completed
-            && !self.host.actor_motion_is_current(actor_id, *revision)
+            && !self.host.actor_motion_is_current(
+                actor_id,
+                plan.motion_revision(actor_id).unwrap_or(*revision),
+            )
         {
             self.execution.cancel_child(task);
-            self.deferred_dialogue.remove(&task);
+            self.plans.remove(&task);
             self.deferred_task_completions.insert(task, Value::Unit);
         }
         if effects.is_empty() {
@@ -394,20 +511,10 @@ impl StoryRuntime {
     }
 
     fn finish_task_effects(&mut self, task: ExecutionId) -> Result<(), StoryRuntimeError> {
-        if let Some(dialogue) = self.deferred_dialogue.remove(&task) {
-            for effect in dialogue {
-                self.active_task_effects
-                    .entry(task)
-                    .or_default()
-                    .push(effect.clone());
-                self.pending
-                    .push_back(StoryRuntimeEvent::TaskEffect { task, effect });
-            }
+        if self.plans.contains_key(&task) {
             return Ok(());
         }
-        if self.awaiting_effects.remove(&task)
-            || self.execution.mode(task) == Some(ExecutionMode::Sequence)
-        {
+        if self.awaiting_effects.remove(&task) {
             let _ = self.execution.unpause(task);
         }
         if let Some(value) = self.deferred_task_completions.remove(&task) {
@@ -447,6 +554,19 @@ impl StoryRuntime {
             self.mark_host_boundary(&event);
             return Ok(Some(event));
         }
+        let ready = self
+            .plans
+            .keys()
+            .copied()
+            .filter(|task| !self.active_task_effects.contains_key(task))
+            .collect::<Vec<_>>();
+        for task in ready {
+            self.advance_plan(task)?;
+        }
+        if let Some(event) = self.pending.pop_front() {
+            self.mark_host_boundary(&event);
+            return Ok(Some(event));
+        }
         if self.blocked {
             loop {
                 let Some(event) = self.execution.step_children_with_budget(&mut budget)? else {
@@ -474,13 +594,13 @@ impl StoryRuntime {
                             self.execution.resume(ExecutionId::MAIN, value)?
                         }
                         StoryCallOutcome::Control(StoryControl::SpawnTask { kind, closure }) => {
-                            let mode = match kind {
-                                StoryTaskKind::Sequence => ExecutionMode::Sequence,
-                                StoryTaskKind::Parallel => ExecutionMode::Parallel,
-                            };
-                            let task = self.execution.spawn(&closure, mode)?;
+                            let task = self.build_plan(kind, &closure)?;
                             self.execution
                                 .resume(ExecutionId::MAIN, Value::Task(task.task_handle()))?;
+                            if let Some(event) = self.pending.pop_front() {
+                                self.mark_host_boundary(&event);
+                                return Ok(Some(event));
+                            }
                         }
                         StoryCallOutcome::Control(StoryControl::BeginChoice {
                             prompt,
@@ -739,23 +859,6 @@ impl StoryRuntime {
         let mut interactive_delay = None;
         let task_mode = self.execution.mode(task);
         for effect in self.host.drain_effects() {
-            let dialogue = matches!(
-                effect,
-                StoryEffect::Say { .. } | StoryEffect::ContinueDialogue { .. }
-            );
-            if dialogue && task_mode == Some(ExecutionMode::Parallel) {
-                bevy::log::warn!(
-                    "say/narrate and dialogue continuation are not allowed in par; statement skipped"
-                );
-                continue;
-            }
-            if dialogue
-                && task_mode == Some(ExecutionMode::Sequence)
-                && self.active_task_effects.contains_key(&task)
-            {
-                self.deferred_dialogue.entry(task).or_default().push(effect);
-                continue;
-            }
             if let StoryEffect::Delay { duration_ms } = effect
                 && task_mode == Some(ExecutionMode::Interactive)
             {
@@ -770,7 +873,6 @@ impl StoryRuntime {
                     | StoryEffect::Delay { .. }
             ) || ((explicit || task_mode != Some(ExecutionMode::Interactive))
                 && animation_effect(&effect))
-                || (dialogue && task_mode == Some(ExecutionMode::Sequence))
             {
                 self.active_task_effects
                     .entry(task)
@@ -797,9 +899,7 @@ impl StoryRuntime {
             self.waiting_interactive_task = Some(task);
             self.pending.push_back(StoryRuntimeEvent::Wait(wait));
         }
-        if (explicit || task_mode == Some(ExecutionMode::Sequence))
-            && self.active_task_effects.contains_key(&task)
-        {
+        if explicit && self.active_task_effects.contains_key(&task) {
             self.awaiting_effects.insert(task);
             self.execution.pause(task)?;
         }
@@ -821,6 +921,7 @@ fn animation_effect(effect: &StoryEffect) -> bool {
             | StoryEffect::PlayBgm { .. }
             | StoryEffect::StopBgm { .. }
             | StoryEffect::PlayVoice { .. }
+            | StoryEffect::Delay { .. }
             | StoryEffect::PlaySfx { .. }
             | StoryEffect::PlaySfxChannel { .. }
     )
@@ -828,6 +929,10 @@ fn animation_effect(effect: &StoryEffect) -> bool {
 
 #[derive(Debug, Error)]
 pub enum StoryRuntimeError {
+    #[error(
+        "seq/par construction exceeded its instruction budget; these closures must finish before playback"
+    )]
+    PlanBuildBudgetExceeded,
     #[error("story execution has terminated; it cannot accept a host response")]
     Terminated,
     #[error(transparent)]
@@ -858,6 +963,63 @@ mod tests {
     use crate::script::capabilities::{
         StoryEffect, StoryNativeHost, compile_story_bytecode, story_manifest,
     };
+
+    #[test]
+    fn plans_finish_script_evaluation_before_first_effect_and_restore_without_closure_frames() {
+        let code = compile_story_bytecode(
+            "plan.hks",
+            r#"
+            global var built = 0
+            let plan = seq {
+                built += 1
+                sleep(0.1)
+                built += 1
+                sleep(0.2)
+            }
+            plan.await()
+            "Done"
+        "#,
+        )
+        .expect("compile recorded sequence");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+        let Some(StoryRuntimeEvent::TaskEffect { task, effect }) =
+            runtime.step().expect("first effect")
+        else {
+            panic!("first delay");
+        };
+        assert_eq!(runtime.globals().get("built"), Some(&Value::Number(2.0)));
+        assert!(
+            runtime.execution.mode(task).is_none(),
+            "finished closure is not retained during playback"
+        );
+        assert!(runtime.step().expect("wait for first delay").is_none());
+        let bytes =
+            hiraku_script::hson::to_vec(&runtime.snapshot().expect("snapshot")).expect("serialize");
+        runtime = StoryRuntime::restore(
+            code,
+            hiraku_script::hson::from_slice(&bytes).expect("decode"),
+        )
+        .expect("restore plan");
+        assert!(matches!(
+            runtime.step().expect("reattach first effect"),
+            Some(StoryRuntimeEvent::TaskEffect { .. })
+        ));
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("first completes");
+        assert!(matches!(
+            runtime.step().expect("next recorded step"),
+            Some(StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::Delay { duration_ms: 200 },
+                ..
+            })
+        ));
+        assert_eq!(
+            runtime.globals().get("built"),
+            Some(&Value::Number(2.0)),
+            "restoring playback must not repeat build-time assignments"
+        );
+    }
 
     #[test]
     fn masked_portrait_and_picture_wipe_use_regular_story_capabilities() {
@@ -1122,11 +1284,11 @@ mod tests {
             let source = format!(
                 r#"
                 let alice = char("alice").show()
+                {hide}
                 let jump = seq {{
                     alice.offset(.pos(0, 20)).time(1.0).easing(.linear)
                     alice.offset(.pos(0, 0)).time(1.0).easing(.linear)
                 }}
-                {hide}
                 jump.await()
                 "Done"
             "#
@@ -1251,6 +1413,11 @@ mod tests {
                     }
                 }
                 let (task, effect) = motion.expect("sequence starts while dialogue is waiting");
+                while !runtime.is_waiting_for_host_response() {
+                    runtime
+                        .step()
+                        .expect("reach root dialogue after synchronous plan construction");
+                }
                 runtime.resume(Value::Unit).expect("advance dialogue early");
                 for _ in 0..32 {
                     if runtime.step().expect("hide and re-show").is_none() {
@@ -1596,7 +1763,7 @@ mod tests {
         };
         assert_eq!(kind, StoryTaskKind::Parallel);
         let child = runtime
-            .spawn(&closure, ExecutionMode::Parallel)
+            .spawn(&closure, ExecutionMode::Interactive)
             .expect("child execution must spawn");
         runtime
             .resume(ExecutionId::MAIN, Value::Task(child.task_handle()))
@@ -2174,14 +2341,6 @@ mod tests {
         )
         .expect("parallel story must compile");
         let mut runtime = StoryRuntime::new(bytecode).expect("story driver must initialize");
-        assert!(matches!(
-            runtime.step().expect("dialogue effect must run"),
-            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { .. }))
-        ));
-        assert_eq!(
-            runtime.step().expect("dialogue must block the main VM"),
-            Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
-        );
         let task = match runtime.step().expect("parallel voice must keep advancing") {
             Some(StoryRuntimeEvent::TaskEffect {
                 task,
@@ -2196,6 +2355,16 @@ mod tests {
                 effect: StoryEffect::PlayVoice { ref path, .. },
             }) if second_task == task && path == "voice/second"
         ));
+        assert!(matches!(
+            runtime
+                .step()
+                .expect("root dialogue follows plan submission"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { .. }))
+        ));
+        assert_eq!(
+            runtime.step().expect("root waits"),
+            Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+        );
         runtime
             .resume_task(task)
             .expect("one parallel audio completion must be recorded");
@@ -2224,14 +2393,6 @@ mod tests {
         )
         .expect("sequence story must compile");
         let mut runtime = StoryRuntime::new(bytecode).expect("story driver must initialize");
-        assert!(matches!(
-            runtime.step().expect("dialogue effect must run"),
-            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { .. }))
-        ));
-        assert!(matches!(
-            runtime.step().expect("dialogue must block"),
-            Some(StoryRuntimeEvent::Wait(_))
-        ));
         let first = match runtime.step().expect("first voice must start") {
             Some(StoryRuntimeEvent::TaskEffect {
                 task,
@@ -2239,6 +2400,14 @@ mod tests {
             }) if path == "voice/first" => task,
             event => panic!("unexpected first sequence event: {event:?}"),
         };
+        assert!(matches!(
+            runtime.step().expect("root dialogue follows submission"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { .. }))
+        ));
+        assert!(matches!(
+            runtime.step().expect("root waits"),
+            Some(StoryRuntimeEvent::Wait(_))
+        ));
         assert_eq!(
             runtime
                 .step()

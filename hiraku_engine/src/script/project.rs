@@ -374,7 +374,7 @@ mod tests {
             }
         };
         let child = runtime
-            .spawn(&call.arguments[0].value, ExecutionMode::Parallel)
+            .spawn(&call.arguments[0].value, ExecutionMode::Interactive)
             .expect("provider closure");
         runtime
             .resume(ExecutionId::MAIN, Value::Unit)

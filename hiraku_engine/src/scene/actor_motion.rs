@@ -93,6 +93,149 @@ mod tests {
     use super::*;
 
     #[test]
+    fn concurrent_recorded_jump_sequences_play_every_step_and_restore_mid_jump() {
+        use crate::script::capabilities::StoryEffect;
+        use crate::script::{StoryRuntime, StoryRuntimeEvent, compile_story_bytecode};
+
+        let code = compile_story_bytecode(
+            "jumps.hks",
+            r#"
+            let alice = char("alice")
+            let bob = char("bob")
+            alice.show()
+            bob.show()
+            let first = seq {
+                alice.offset(.pos(0, 86.4)).time(0.15).easing(.easeOut)
+                alice.offset(.pos(0, -28.8)).time(0.15).easing(.easeIn)
+                alice.offset(.pos(0, 86.4)).time(0.15).easing(.easeOut)
+                alice.offset(.pos(0, -28.8)).time(0.15).easing(.easeIn)
+                alice.offset(.pos(0, 0)).time(0.1).easing(.easeOut)
+            }
+            let second = seq {
+                bob.offset(.pos(0, 86.4)).time(0.15).easing(.easeOut)
+                bob.offset(.pos(0, -28.8)).time(0.15).easing(.easeIn)
+                bob.offset(.pos(0, 86.4)).time(0.15).easing(.easeOut)
+                bob.offset(.pos(0, -28.8)).time(0.15).easing(.easeIn)
+                bob.offset(.pos(0, 0)).time(0.1).easing(.easeOut)
+            }
+            first.await()
+            second.await()
+            log("done")
+        "#,
+        )
+        .expect("compile independent jump plans");
+
+        for restore in [false, true] {
+            let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+            let mut motions = BTreeMap::<String, ActorMotion>::new();
+            let mut animations = AnimationState::default();
+            let mut active = BTreeMap::new();
+            let mut targets = BTreeMap::<String, Vec<f32>>::new();
+            let mut done = false;
+            for tick in 0..30 {
+                while let Some(event) = runtime.step().expect("advance script") {
+                    match event {
+                        StoryRuntimeEvent::TaskEffect { task, effect } => {
+                            let StoryEffect::ActorMotion {
+                                actor_id,
+                                revision,
+                                transition,
+                            } = &effect
+                            else {
+                                panic!("expected offset");
+                            };
+                            let reattach = motions
+                                .get(actor_id)
+                                .is_some_and(|motion| motion.revision == *revision);
+                            let previous_offset = motions
+                                .get(actor_id)
+                                .map_or([0.0; 2], |motion| motion.offset);
+                            start(
+                                &mut motions,
+                                &mut animations,
+                                actor_id.clone(),
+                                *revision,
+                                *transition,
+                                Some(format!("{actor_id}:{revision}")),
+                            );
+                            if !reattach {
+                                assert!(
+                                    !motions[actor_id].finished,
+                                    "each new step must start a tween"
+                                );
+                                assert_eq!(motions[actor_id].origin, previous_offset);
+                                targets
+                                    .entry(actor_id.clone())
+                                    .or_default()
+                                    .push(transition.target[1]);
+                            }
+                            active.insert(task, effect);
+                        }
+                        StoryRuntimeEvent::Effect(StoryEffect::Log(message)) => {
+                            assert_eq!(message, "done");
+                            done = true;
+                        }
+                        StoryRuntimeEvent::Completed(_) => break,
+                        _ => {}
+                    }
+                }
+                if done {
+                    break;
+                }
+                if tick == 0 {
+                    assert_eq!(
+                        active.len(),
+                        2,
+                        "both plans start without waiting for each other"
+                    );
+                }
+                if restore && tick == 1 {
+                    let snapshot = hiraku_script::hson::to_vec(
+                        &runtime.snapshot().expect("snapshot at host wait"),
+                    )
+                    .expect("encode runtime");
+                    runtime = StoryRuntime::restore(
+                        code.clone(),
+                        hiraku_script::hson::from_slice(&snapshot).expect("decode runtime"),
+                    )
+                    .expect("restore runtime");
+                    let snapshot =
+                        hiraku_script::hson::to_vec(&motions).expect("encode scene motions");
+                    motions =
+                        hiraku_script::hson::from_slice(&snapshot).expect("restore scene motions");
+                    animations = AnimationState::default();
+                    continue;
+                }
+                for motion in motions.values_mut() {
+                    motion.advance(0.075);
+                }
+                let completed = active
+                    .iter()
+                    .filter_map(|(task, effect)| {
+                        let StoryEffect::ActorMotion { actor_id, .. } = effect else {
+                            return None;
+                        };
+                        motions[actor_id]
+                            .finished
+                            .then_some((*task, effect.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (task, effect) in completed {
+                    runtime
+                        .complete_task_effect(task, &effect)
+                        .expect("complete ECS motion");
+                    active.remove(&task);
+                }
+            }
+            assert!(done, "both sequences must complete");
+            for actor in ["alice", "bob"] {
+                assert_eq!(targets[actor], vec![86.4, -28.8, 86.4, -28.8, 0.0]);
+                assert_eq!(motions[actor].offset, [0.0; 2]);
+            }
+        }
+    }
+
+    #[test]
     fn hidden_motion_without_render_root_finishes_at_target_and_releases_wait() {
         let mut app = App::new();
         app.init_resource::<Time>()

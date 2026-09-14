@@ -54,8 +54,8 @@ global fn onActorCommit(actor: Actor) {
     commitActor(actor, false)
 }
 
-// Detach the patch before yielding to the host: seq may suspend at submission,
-// while another execution continues using the same script Actor object.
+// Submitted steps own their patch. Clear the reusable builder before publishing;
+// seq/par record these detached values and do not keep a suspended closure.
 fn submitActorPatch(actor: Actor, patch: Actor, wait: Bool) {
     clearActorPatch(actor)
     intrinsics.engine.submitActor(patch, wait)

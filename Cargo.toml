@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "hiraku_lsp",
     "hiraku_engine", 
     "hiraku_app", 
     "hiraku_script", 

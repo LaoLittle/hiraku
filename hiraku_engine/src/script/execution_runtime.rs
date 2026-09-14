@@ -46,8 +46,6 @@ impl fmt::Display for ExecutionId {
 pub enum ExecutionMode {
     Main,
     Interactive,
-    Sequence,
-    Parallel,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -378,7 +376,7 @@ impl ExecutionRuntime {
         Ok(None)
     }
 
-    fn step_execution(
+    pub(super) fn step_execution(
         &mut self,
         execution: ExecutionId,
         budget: &mut u32,
@@ -810,7 +808,7 @@ mod tests {
             }
         };
         let child = runtime
-            .spawn(&closure, ExecutionMode::Parallel)
+            .spawn(&closure, ExecutionMode::Interactive)
             .expect("child starts");
         if update_from_host {
             let mut globals = runtime.globals().clone();

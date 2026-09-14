@@ -15,6 +15,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Format an HKS source file (stdout unless --write or --check is supplied).
+    Fmt {
+        file: PathBuf,
+        #[arg(long, conflicts_with = "write")]
+        check: bool,
+        #[arg(long)]
+        write: bool,
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=16))]
+        indent_width: u8,
+    },
     /// Build a Hiraku Data Package from a directory.
     HdpPack {
         source: PathBuf,
@@ -57,6 +67,46 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Command::Fmt {
+            file,
+            check,
+            write,
+            indent_width,
+        } => {
+            let source = std::fs::read_to_string(&file)?;
+            let formatted = hiraku_script::format::format_source(
+                &source,
+                hiraku_script::format::FormatOptions {
+                    indent_width: indent_width as usize,
+                    insert_spaces: true,
+                },
+            )
+            .map_err(|errors| {
+                let mut sources = hiraku_script::SourceMap::new();
+                let id = sources.insert(file.to_string_lossy().into_owned(), source.clone());
+                let diagnostics = errors
+                    .iter()
+                    .map(|error| error.diagnostic(id.clone()))
+                    .collect::<Vec<_>>();
+                hiraku_script::render_diagnostics(
+                    &diagnostics,
+                    &sources,
+                    hiraku_script::RenderOptions::terminal(),
+                )
+            })?;
+            if check {
+                if source != formatted {
+                    return Err(format!("{} needs formatting", file.display()).into());
+                }
+            } else if write {
+                if source != formatted {
+                    std::fs::write(&file, formatted)?;
+                }
+            } else {
+                use std::io::Write;
+                std::io::stdout().lock().write_all(formatted.as_bytes())?;
+            }
+        }
         Command::HdpPack {
             source,
             output,
