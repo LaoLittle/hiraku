@@ -180,7 +180,7 @@ mod tests {
         assert!(!valid_shader_keys(&[keys[1], keys[0]]));
         assert!(!valid_shader_keys(&[At(0., f64::NAN, 0., 0., 0.)]));
     }
-    
+
     #[test]
     fn projected_uv_preserves_shear_and_reflection() {
         for (u, v) in [

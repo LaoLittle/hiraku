@@ -313,7 +313,6 @@ pub(crate) fn sync_sprites(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -118,10 +118,14 @@ pub(crate) fn encode_stream(
     }
 }
 
-pub(crate) fn decode(method: CompressionMethod, input: &[u8]) -> Result<Vec<u8>, HdpError> {
+pub(crate) fn decode(
+    method: CompressionMethod,
+    input: &[u8],
+    dest: &mut Vec<u8>,
+) -> Result<(), HdpError> {
     match method {
-        CompressionMethod::STORED => Ok(input.to_vec()),
-        CompressionMethod::ZSTD => Ok(zstd::stream::decode_all(Cursor::new(input))?),
+        CompressionMethod::STORED => Ok(dest.extend_from_slice(input)),
+        CompressionMethod::ZSTD => Ok(zstd::stream::copy_decode(Cursor::new(input), dest)?),
         other => Err(HdpError::UnsupportedCompression(other.id())),
     }
 }

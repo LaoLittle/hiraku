@@ -290,7 +290,9 @@ mod tests {
             }
         }
         assert_eq!(tasks[0], tasks[1]);
-        runtime.step().expect("dialogue event after plan submission");
+        runtime
+            .step()
+            .expect("dialogue event after plan submission");
         runtime.step().expect("dialogue wait");
         for task in tasks {
             runtime.resume_task(task).expect("sound completion");

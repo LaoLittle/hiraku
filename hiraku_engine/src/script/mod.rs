@@ -11,6 +11,7 @@ use crate::{
 
 pub(crate) mod actor_motion;
 pub(crate) mod animation;
+mod animation_plan;
 pub(crate) mod capabilities;
 mod command;
 mod execution_runtime;
@@ -18,9 +19,8 @@ pub(crate) mod navigation;
 mod project;
 pub mod replay;
 mod runtime;
-mod story_runtime;
 mod stdlib;
-mod animation_plan;
+mod story_runtime;
 pub mod ui_runtime;
 mod ui_vm;
 pub(crate) use project::{StoryProgram, compile_story_program};

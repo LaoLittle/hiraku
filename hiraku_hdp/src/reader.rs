@@ -313,8 +313,7 @@ impl Archive {
 
         // Bound scratch memory to one chunk, not a second complete decoded file.
         for (index, chunk) in file.chunks.iter().enumerate() {
-            let decoded = self.decode_chunk(index, chunk, path)?;
-            output.extend_from_slice(&decoded);
+            self.decode_chunk(index, chunk, path, &mut output)?;
         }
 
         if output.len() != capacity {
@@ -330,7 +329,8 @@ impl Archive {
         chunk_index: usize,
         chunk: &ChunkDescriptor,
         path: &str,
-    ) -> Result<Vec<u8>, HdpError> {
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), HdpError> {
         if chunk.encryption.id() != 0 {
             return Err(HdpError::UnsupportedEncryption(chunk.encryption.id()));
         }
@@ -373,17 +373,25 @@ impl Archive {
                     chunk: chunk_index,
                 })?
         };
-        let decoded = decode(chunk.compression, stored).map_err(|_| HdpError::CorruptChunk {
+        let last = buffer.len();
+        buffer.reserve(
+            chunk
+                .decoded_size
+                .try_into()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::FileTooLarge))?,
+        );
+        decode(chunk.compression, stored, buffer).map_err(|_| HdpError::CorruptChunk {
             path: path.to_string(),
             chunk: chunk_index,
         })?;
-        if decoded.len() as u64 != chunk.decoded_size || checksum64(&decoded) != chunk.checksum {
+        let decoded = &buffer[last..];
+        if decoded.len() as u64 != chunk.decoded_size || checksum64(decoded) != chunk.checksum {
             return Err(HdpError::CorruptChunk {
                 path: path.to_string(),
                 chunk: chunk_index,
             });
         }
 
-        Ok(decoded)
+        Ok(())
     }
 }
