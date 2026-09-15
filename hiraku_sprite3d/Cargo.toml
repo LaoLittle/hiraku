@@ -8,6 +8,3 @@ license.workspace = true
 [dependencies]
 bevy.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-naga = { version = "29", features = ["wgsl-in"] }

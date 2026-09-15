@@ -8,10 +8,10 @@ license.workspace = true
 
 [dependencies]
 hiraku-opus = { git = "https://github.com/Hiraku-Project/opus-rs.git", version = "0.1.32" }
-ogg = "0.8"
+ogg = "0.9"
 rodio = { version = "0.22", default-features = false }
-hiraku-uastc = { path = "../hiraku_uastc" }
-hiraku-sprite3d = { path = "../hiraku_sprite3d" }
+hiraku-uastc.workspace = true
+hiraku-sprite3d.workspace = true
 bevy.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 event-listener.workspace = true
@@ -19,7 +19,7 @@ futures-lite.workspace = true
 hiraku-hdp.workspace = true
 hiraku-errors.workspace = true
 hiraku-script.workspace = true
-hiraku-ui = { path = "../hiraku_ui" }
+hiraku-ui.workspace = true
 hiraku-storage.workspace = true
 hiraku-video.workspace = true
 prost.workspace = true
@@ -29,6 +29,3 @@ uuid.workspace = true
 time.workspace = true
 blake3 = "1"
 rand_pcg.workspace = true
-
-[dev-dependencies]
-naga = { version = "30", features = ["wgsl-in"] }

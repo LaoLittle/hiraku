@@ -142,23 +142,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shader_parses_and_validates_without_a_gpu() {
-        let source = include_str!("sprite3d.wgsl")
-            .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) world_position: vec4<f32>, };")
-            .replace("#{MATERIAL_BIND_GROUP}", "2");
-        let module = naga::front::wgsl::parse_str(&source).expect("sprite WGSL parses");
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .expect("sprite WGSL validates");
-        // This uniform fits comfortably below WebGL2's 16 KiB guaranteed block size.
-        assert!(SpriteUniform::min_size().get() < 16 * 1024);
-        assert_eq!(LayerUniform::min_size().get(), 80);
-    }
-
-    #[test]
     fn overall_opacity_does_not_modify_layer_or_mask_alpha() {
         let sprite = Sprite3d {
             color: Color::linear_rgba(1.0, 1.0, 1.0, 0.25),

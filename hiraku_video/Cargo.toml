@@ -10,7 +10,7 @@ license.workspace = true
 bevy.workspace = true
 thiserror.workspace = true
 hiraku-media.workspace = true
-crossbeam-channel = "0.5.16"
+crossbeam-channel.workspace = true
 
 [dependencies.symphonia]
 version = "0.6.1"

@@ -7,5 +7,5 @@ license.workspace = true
 
 [dependencies]
 bevy.workspace = true
-basisu = { git = "https://github.com/Hiraku-Project/basisu", rev = "cca5a1c8f90147a5f2b74bcabbc6329d30c9d6f2", default-features = false, features = ["std"] }
+basisu = { git = "https://github.com/Hiraku-Project/basisu", default-features = false, features = ["std"] }
 thiserror.workspace = true

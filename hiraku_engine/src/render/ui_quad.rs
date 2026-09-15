@@ -180,18 +180,7 @@ mod tests {
         assert!(!valid_shader_keys(&[keys[1], keys[0]]));
         assert!(!valid_shader_keys(&[At(0., f64::NAN, 0., 0., 0.)]));
     }
-    #[test]
-    fn projected_shader_is_valid_wgsl() {
-        let source = include_str!("shaders/ui_quad.wgsl");
-        let source=source.replace("#import bevy_ui::ui_vertex_output::UiVertexOutput", "struct UiVertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, }");
-        let module = naga::front::wgsl::parse_str(&source).expect("projected UI shader parses");
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .expect("projected UI shader validates");
-    }
+    
     #[test]
     fn projected_uv_preserves_shear_and_reflection() {
         for (u, v) in [

@@ -16,8 +16,9 @@ members = [
     "hiraku_sprite3d",
     "hiraku_ui",
     "hiraku_uastc",
-    "hiraku_uastc/build"
-, "hiraku_tools"]
+    "hiraku_uastc/build", 
+    "hiraku_tools"
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -67,6 +68,18 @@ version = "0.1.0"
 path = "hiraku_video"
 version = "0.1.0"
 
+[workspace.dependencies.hiraku-sprite3d]
+path = "hiraku_sprite3d"
+version = "0.1.0"
+
+[workspace.dependencies.hiraku-ui]
+path = "hiraku_ui"
+version = "0.1.0"
+
+[workspace.dependencies.hiraku-uastc]
+path = "hiraku_uastc"
+version = "0.1.0"
+
 [workspace.dependencies.bevy]
 version = "0.19.1"
 default-features = false
@@ -79,6 +92,9 @@ features = ["wasm-bindgen"]
 [workspace.dependencies.rand_pcg]
 version = "0.10.2"
 default-features = false
+
+[workspace.dependencies.crossbeam-channel]
+version = "0.5.17"
 
 [profile.app-release]
 inherits = "release"

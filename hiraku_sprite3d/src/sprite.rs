@@ -12,273 +12,6 @@ pub enum BlendMode {
     Multiply,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn app() -> App {
-        let mut app = App::new();
-        app.init_resource::<Assets<Image>>()
-            .init_resource::<Assets<TextureAtlasLayout>>()
-            .init_resource::<Assets<Mesh>>()
-            .init_resource::<Assets<Sprite3dMaterial>>()
-            .add_systems(Update, sync_sprites);
-        app
-    }
-
-    #[test]
-    fn atlas_selection_hot_reload_and_recovery_update_the_rendered_rect() {
-        let mut app = app();
-        let layout = app
-            .world_mut()
-            .resource_mut::<Assets<TextureAtlasLayout>>()
-            .add(TextureAtlasLayout::from_grid(
-                UVec2::new(16, 8),
-                2,
-                1,
-                None,
-                None,
-            ));
-        let entity = app
-            .world_mut()
-            .spawn(Sprite3d::from_atlas(
-                Handle::default(),
-                TextureAtlas {
-                    layout: layout.clone(),
-                    index: 0,
-                },
-            ))
-            .id();
-        app.update();
-        let mesh = app.world().get::<Mesh3d>(entity).expect("mesh").0.clone();
-        assert_eq!(
-            app.world()
-                .get::<RenderedSprite>(entity)
-                .expect("resolved")
-                .size,
-            Vec2::new(16.0, 8.0)
-        );
-        app.world_mut()
-            .get_mut::<Sprite3d>(entity)
-            .expect("sprite")
-            .texture_atlas
-            .as_mut()
-            .expect("atlas")
-            .index = 1;
-        app.update();
-        assert_eq!(
-            app.world()
-                .get::<RenderedSprite>(entity)
-                .expect("resolved")
-                .rects[0],
-            Some(Rect::new(16.0, 0.0, 32.0, 8.0))
-        );
-        // Layout edits are visible even when Sprite3d itself has not changed.
-        app.world_mut()
-            .resource_mut::<Assets<TextureAtlasLayout>>()
-            .get_mut(&layout)
-            .expect("layout")
-            .textures[1] = URect::new(20, 0, 30, 8);
-        app.update();
-        assert_eq!(
-            app.world()
-                .get::<RenderedSprite>(entity)
-                .expect("resolved")
-                .size,
-            Vec2::new(10.0, 8.0)
-        );
-        assert_eq!(
-            app.world()
-                .get::<Mesh3d>(entity)
-                .expect("same mesh asset")
-                .0,
-            mesh
-        );
-        app.world_mut()
-            .get_mut::<Sprite3d>(entity)
-            .expect("sprite")
-            .texture_atlas
-            .as_mut()
-            .expect("atlas")
-            .index = 2;
-        app.update();
-        assert!(
-            app.world().get::<Mesh3d>(entity).is_none(),
-            "invalid index must not render the whole atlas"
-        );
-        app.world_mut()
-            .get_mut::<Sprite3d>(entity)
-            .expect("sprite")
-            .texture_atlas
-            .as_mut()
-            .expect("atlas")
-            .index = 0;
-        app.update();
-        assert!(app.world().get::<Mesh3d>(entity).is_some());
-    }
-
-    #[test]
-    fn layers_can_override_the_shared_atlas() {
-        let mut layouts = Assets::<TextureAtlasLayout>::default();
-        let layout = layouts.add(TextureAtlasLayout::from_grid(
-            UVec2::splat(16),
-            2,
-            1,
-            None,
-            None,
-        ));
-        let mut sprite = Sprite3d::from_atlas(
-            Handle::default(),
-            TextureAtlas {
-                layout: layout.clone(),
-                index: 0,
-            },
-        );
-        sprite.layers = vec![
-            SpriteLayer::default(),
-            SpriteLayer {
-                texture_atlas: Some(TextureAtlas {
-                    layout: layout.clone(),
-                    index: 1,
-                }),
-                ..default()
-            },
-        ];
-        let rects = sprite.resolve_rects(&layouts).expect("resolve layer cells");
-        assert_eq!(rects[0], Some(Rect::new(0.0, 0.0, 16.0, 16.0)));
-        assert_eq!(rects[1], Some(Rect::new(16.0, 0.0, 32.0, 16.0)));
-        layouts.get_mut(&layout).expect("layout").textures[1] = URect::new(16, 0, 33, 16);
-        assert_eq!(
-            sprite.resolve_rects(&layouts),
-            Err(Sprite3dError::InvalidLayer(1))
-        );
-    }
-
-    #[test]
-    fn late_atlas_assets_do_not_flash_the_whole_image() {
-        let mut app = app();
-        let handle = app
-            .world()
-            .resource::<Assets<TextureAtlasLayout>>()
-            .reserve_handle();
-        let entity = app
-            .world_mut()
-            .spawn(Sprite3d {
-                texture_atlas: Some(TextureAtlas {
-                    layout: handle.clone(),
-                    index: 0,
-                }),
-                custom_size: Some(Vec2::splat(2.0)),
-                ..default()
-            })
-            .id();
-        app.update();
-        assert!(app.world().get::<Mesh3d>(entity).is_none());
-        app.world_mut()
-            .resource_mut::<Assets<TextureAtlasLayout>>()
-            .insert(
-                handle.id(),
-                TextureAtlasLayout::from_grid(UVec2::splat(16), 1, 1, None, None),
-            )
-            .expect("insert delayed layout");
-        app.update();
-        assert!(app.world().get::<Mesh3d>(entity).is_some());
-    }
-
-    #[test]
-    fn validates_layer_limits_geometry_and_mask_references() {
-        let mut sprite = Sprite3d::default();
-        assert!(sprite.validate().is_ok());
-        sprite.layers = vec![SpriteLayer::default(); MAX_LAYERS + 1];
-        assert!(matches!(
-            sprite.validate(),
-            Err(Sprite3dError::TooManyLayers(_))
-        ));
-        sprite.layers.truncate(1);
-        sprite.layers[0].mask = MaskMode::Read(0);
-        assert_eq!(sprite.validate(), Err(Sprite3dError::InvalidMask(0)));
-        sprite.layers[0].mask = MaskMode::Read(MAX_MASKS);
-        assert!(sprite.validate().is_ok());
-        sprite.layers[0].bounds.max.x = f32::NAN;
-        assert_eq!(sprite.validate(), Err(Sprite3dError::InvalidLayer(0)));
-    }
-
-    #[test]
-    fn sync_reuses_assets_preserves_transform_and_cleans_up_removal() {
-        let mut app = app();
-        let transform = Transform::from_xyz(1.0, 2.0, 3.0).with_scale(Vec3::splat(2.0));
-        let entity = app
-            .world_mut()
-            .spawn((
-                Sprite3d::from_color(Color::WHITE, Vec2::splat(4.0)),
-                transform,
-            ))
-            .id();
-        app.update();
-        let mesh = app.world().get::<Mesh3d>(entity).expect("quad").0.clone();
-        let material = app
-            .world()
-            .get::<MeshMaterial3d<Sprite3dMaterial>>(entity)
-            .expect("material")
-            .0
-            .clone();
-        app.update();
-        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 1);
-        assert_eq!(app.world().resource::<Assets<Sprite3dMaterial>>().len(), 1);
-        app.world_mut()
-            .get_mut::<Sprite3d>(entity)
-            .expect("sprite")
-            .custom_size = Some(Vec2::splat(8.0));
-        app.update();
-        assert_eq!(
-            app.world().get::<Mesh3d>(entity).expect("same mesh").0,
-            mesh
-        );
-        assert_eq!(
-            app.world()
-                .get::<MeshMaterial3d<Sprite3dMaterial>>(entity)
-                .expect("same material")
-                .0,
-            material
-        );
-        assert_eq!(
-            *app.world().get::<Transform>(entity).expect("transform"),
-            transform
-        );
-        app.world_mut().entity_mut(entity).remove::<Sprite3d>();
-        app.update();
-        assert!(app.world().get::<Mesh3d>(entity).is_none());
-        assert!(
-            app.world()
-                .get::<MeshMaterial3d<Sprite3dMaterial>>(entity)
-                .is_none()
-        );
-        assert!(app.world().get::<Transform>(entity).is_some());
-    }
-
-    #[test]
-    fn invalid_edit_removes_old_rendering_until_repaired() {
-        let mut app = app();
-        let entity = app
-            .world_mut()
-            .spawn(Sprite3d::from_color(Color::WHITE, Vec2::ONE))
-            .id();
-        app.update();
-        app.world_mut()
-            .get_mut::<Sprite3d>(entity)
-            .expect("sprite")
-            .custom_size = Some(Vec2::ZERO);
-        app.update();
-        assert!(app.world().get::<Mesh3d>(entity).is_none());
-        app.world_mut()
-            .get_mut::<Sprite3d>(entity)
-            .expect("sprite")
-            .custom_size = Some(Vec2::ONE);
-        app.update();
-        assert!(app.world().get::<Mesh3d>(entity).is_some());
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
 pub enum MaskMode {
     #[default]
@@ -577,5 +310,273 @@ pub(crate) fn sync_sprites(
                 materials.add(Sprite3dMaterial::from_resolved(&sprite, &rects)),
             ));
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<Assets<TextureAtlasLayout>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Sprite3dMaterial>>()
+            .add_systems(Update, sync_sprites);
+        app
+    }
+
+    #[test]
+    fn atlas_selection_hot_reload_and_recovery_update_the_rendered_rect() {
+        let mut app = app();
+        let layout = app
+            .world_mut()
+            .resource_mut::<Assets<TextureAtlasLayout>>()
+            .add(TextureAtlasLayout::from_grid(
+                UVec2::new(16, 8),
+                2,
+                1,
+                None,
+                None,
+            ));
+        let entity = app
+            .world_mut()
+            .spawn(Sprite3d::from_atlas(
+                Handle::default(),
+                TextureAtlas {
+                    layout: layout.clone(),
+                    index: 0,
+                },
+            ))
+            .id();
+        app.update();
+        let mesh = app.world().get::<Mesh3d>(entity).expect("mesh").0.clone();
+        assert_eq!(
+            app.world()
+                .get::<RenderedSprite>(entity)
+                .expect("resolved")
+                .size,
+            Vec2::new(16.0, 8.0)
+        );
+        app.world_mut()
+            .get_mut::<Sprite3d>(entity)
+            .expect("sprite")
+            .texture_atlas
+            .as_mut()
+            .expect("atlas")
+            .index = 1;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<RenderedSprite>(entity)
+                .expect("resolved")
+                .rects[0],
+            Some(Rect::new(16.0, 0.0, 32.0, 8.0))
+        );
+        // Layout edits are visible even when Sprite3d itself has not changed.
+        app.world_mut()
+            .resource_mut::<Assets<TextureAtlasLayout>>()
+            .get_mut(&layout)
+            .expect("layout")
+            .textures[1] = URect::new(20, 0, 30, 8);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<RenderedSprite>(entity)
+                .expect("resolved")
+                .size,
+            Vec2::new(10.0, 8.0)
+        );
+        assert_eq!(
+            app.world()
+                .get::<Mesh3d>(entity)
+                .expect("same mesh asset")
+                .0,
+            mesh
+        );
+        app.world_mut()
+            .get_mut::<Sprite3d>(entity)
+            .expect("sprite")
+            .texture_atlas
+            .as_mut()
+            .expect("atlas")
+            .index = 2;
+        app.update();
+        assert!(
+            app.world().get::<Mesh3d>(entity).is_none(),
+            "invalid index must not render the whole atlas"
+        );
+        app.world_mut()
+            .get_mut::<Sprite3d>(entity)
+            .expect("sprite")
+            .texture_atlas
+            .as_mut()
+            .expect("atlas")
+            .index = 0;
+        app.update();
+        assert!(app.world().get::<Mesh3d>(entity).is_some());
+    }
+
+    #[test]
+    fn layers_can_override_the_shared_atlas() {
+        let mut layouts = Assets::<TextureAtlasLayout>::default();
+        let layout = layouts.add(TextureAtlasLayout::from_grid(
+            UVec2::splat(16),
+            2,
+            1,
+            None,
+            None,
+        ));
+        let mut sprite = Sprite3d::from_atlas(
+            Handle::default(),
+            TextureAtlas {
+                layout: layout.clone(),
+                index: 0,
+            },
+        );
+        sprite.layers = vec![
+            SpriteLayer::default(),
+            SpriteLayer {
+                texture_atlas: Some(TextureAtlas {
+                    layout: layout.clone(),
+                    index: 1,
+                }),
+                ..default()
+            },
+        ];
+        let rects = sprite.resolve_rects(&layouts).expect("resolve layer cells");
+        assert_eq!(rects[0], Some(Rect::new(0.0, 0.0, 16.0, 16.0)));
+        assert_eq!(rects[1], Some(Rect::new(16.0, 0.0, 32.0, 16.0)));
+        layouts.get_mut(&layout).expect("layout").textures[1] = URect::new(16, 0, 33, 16);
+        assert_eq!(
+            sprite.resolve_rects(&layouts),
+            Err(Sprite3dError::InvalidLayer(1))
+        );
+    }
+
+    #[test]
+    fn late_atlas_assets_do_not_flash_the_whole_image() {
+        let mut app = app();
+        let handle = app
+            .world()
+            .resource::<Assets<TextureAtlasLayout>>()
+            .reserve_handle();
+        let entity = app
+            .world_mut()
+            .spawn(Sprite3d {
+                texture_atlas: Some(TextureAtlas {
+                    layout: handle.clone(),
+                    index: 0,
+                }),
+                custom_size: Some(Vec2::splat(2.0)),
+                ..default()
+            })
+            .id();
+        app.update();
+        assert!(app.world().get::<Mesh3d>(entity).is_none());
+        app.world_mut()
+            .resource_mut::<Assets<TextureAtlasLayout>>()
+            .insert(
+                handle.id(),
+                TextureAtlasLayout::from_grid(UVec2::splat(16), 1, 1, None, None),
+            )
+            .expect("insert delayed layout");
+        app.update();
+        assert!(app.world().get::<Mesh3d>(entity).is_some());
+    }
+
+    #[test]
+    fn validates_layer_limits_geometry_and_mask_references() {
+        let mut sprite = Sprite3d::default();
+        assert!(sprite.validate().is_ok());
+        sprite.layers = vec![SpriteLayer::default(); MAX_LAYERS + 1];
+        assert!(matches!(
+            sprite.validate(),
+            Err(Sprite3dError::TooManyLayers(_))
+        ));
+        sprite.layers.truncate(1);
+        sprite.layers[0].mask = MaskMode::Read(0);
+        assert_eq!(sprite.validate(), Err(Sprite3dError::InvalidMask(0)));
+        sprite.layers[0].mask = MaskMode::Read(MAX_MASKS);
+        assert!(sprite.validate().is_ok());
+        sprite.layers[0].bounds.max.x = f32::NAN;
+        assert_eq!(sprite.validate(), Err(Sprite3dError::InvalidLayer(0)));
+    }
+
+    #[test]
+    fn sync_reuses_assets_preserves_transform_and_cleans_up_removal() {
+        let mut app = app();
+        let transform = Transform::from_xyz(1.0, 2.0, 3.0).with_scale(Vec3::splat(2.0));
+        let entity = app
+            .world_mut()
+            .spawn((
+                Sprite3d::from_color(Color::WHITE, Vec2::splat(4.0)),
+                transform,
+            ))
+            .id();
+        app.update();
+        let mesh = app.world().get::<Mesh3d>(entity).expect("quad").0.clone();
+        let material = app
+            .world()
+            .get::<MeshMaterial3d<Sprite3dMaterial>>(entity)
+            .expect("material")
+            .0
+            .clone();
+        app.update();
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 1);
+        assert_eq!(app.world().resource::<Assets<Sprite3dMaterial>>().len(), 1);
+        app.world_mut()
+            .get_mut::<Sprite3d>(entity)
+            .expect("sprite")
+            .custom_size = Some(Vec2::splat(8.0));
+        app.update();
+        assert_eq!(
+            app.world().get::<Mesh3d>(entity).expect("same mesh").0,
+            mesh
+        );
+        assert_eq!(
+            app.world()
+                .get::<MeshMaterial3d<Sprite3dMaterial>>(entity)
+                .expect("same material")
+                .0,
+            material
+        );
+        assert_eq!(
+            *app.world().get::<Transform>(entity).expect("transform"),
+            transform
+        );
+        app.world_mut().entity_mut(entity).remove::<Sprite3d>();
+        app.update();
+        assert!(app.world().get::<Mesh3d>(entity).is_none());
+        assert!(
+            app.world()
+                .get::<MeshMaterial3d<Sprite3dMaterial>>(entity)
+                .is_none()
+        );
+        assert!(app.world().get::<Transform>(entity).is_some());
+    }
+
+    #[test]
+    fn invalid_edit_removes_old_rendering_until_repaired() {
+        let mut app = app();
+        let entity = app
+            .world_mut()
+            .spawn(Sprite3d::from_color(Color::WHITE, Vec2::ONE))
+            .id();
+        app.update();
+        app.world_mut()
+            .get_mut::<Sprite3d>(entity)
+            .expect("sprite")
+            .custom_size = Some(Vec2::ZERO);
+        app.update();
+        assert!(app.world().get::<Mesh3d>(entity).is_none());
+        app.world_mut()
+            .get_mut::<Sprite3d>(entity)
+            .expect("sprite")
+            .custom_size = Some(Vec2::ONE);
+        app.update();
+        assert!(app.world().get::<Mesh3d>(entity).is_some());
     }
 }

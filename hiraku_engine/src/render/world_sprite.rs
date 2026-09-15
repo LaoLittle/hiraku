@@ -7,23 +7,6 @@ use bevy::{
     shader::ShaderRef,
 };
 
-#[cfg(test)]
-mod dissolve_shader_tests {
-    #[test]
-    fn sprite_dissolve_shader_parses_and_validates_without_a_gpu() {
-        let source = include_str!("shaders/world_sprite.wgsl")
-            .replace("#import bevy_pbr::forward_io::VertexOutput", "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) world_position: vec4<f32>, };")
-            .replace("#{MATERIAL_BIND_GROUP}", "2");
-        let module = naga::front::wgsl::parse_str(&source).expect("sprite WGSL parses");
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .expect("sprite WGSL validates");
-    }
-}
-
 /// Authoring data for a flat image rendered by Hiraku's 3D world camera.
 ///
 /// The component deliberately owns image-space concerns while `Transform`

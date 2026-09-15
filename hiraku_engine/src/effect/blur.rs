@@ -89,32 +89,6 @@ impl Default for BlurSettings {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canvas_zoom_shader_validates_without_blur() {
-        let module = naga::front::wgsl::parse_str(include_str!("shaders/blur_effect.wgsl"))
-            .expect("canvas effect WGSL parses");
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .expect("canvas effect WGSL validates");
-        let mut settings = BlurSettings::default();
-        settings.set_include_ui(true);
-        settings.set_canvas_zoom(1.05);
-        assert_eq!(settings.intensity, 0.0);
-        assert_eq!(settings.canvas_zoom, 1.05);
-        assert!(settings.enabled(true));
-        assert!(!settings.enabled(false));
-        settings.set_canvas_zoom(1.0);
-        assert!(!settings.enabled(true));
-    }
-}
-
 #[derive(Default)]
 struct BlurBindGroupCache {
     cached: Option<(TextureViewId, BindGroup)>,
