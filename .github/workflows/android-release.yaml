@@ -1,0 +1,78 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-android:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: android-arm64
+            target: aarch64-linux-android
+            arch: arm64-v8a
+            artifact_name: libhiraku_app.so
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build with cargo-ndk
+        run: |
+          cargo ndk \
+          -t ${{ matrix.arch }} -P 30 \
+          --link-libcxx-shared \
+          -o android/app/src/main/jniLibs/${{ matrix.arch }} \
+          build \
+          --profile app-release --lib
+
+      - name: Package Artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "android/app/src/main/jniLibs/${{ matrix.arch }}/${{ matrix.artifact_name }}" "dist/hiraku-app-${{ matrix.name }}.so"
+          
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: hiraku-${{ matrix.name }}
+          path: dist/*
+
+  release-android:
+    name: Upload Release
+    needs: build-android
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/**/*
