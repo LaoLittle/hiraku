@@ -42,7 +42,7 @@ jobs:
           cargo ndk \
           -t ${{ matrix.arch }} -P 30 \
           --link-libcxx-shared \
-          -o android/app/src/main/jniLibs/${{ matrix.arch }} \
+          -o android/app/src/main/jniLibs \
           build \
           --profile app-release --lib
 
