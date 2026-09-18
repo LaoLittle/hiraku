@@ -4,10 +4,10 @@ use crate::{
     ui::{PropertyComputation, UiModels},
 };
 
-fn span_color(document: &RichText, index: usize, fallback: TextColor) -> TextColor {
+fn span_color(document: &RichText, index: u32, fallback: TextColor) -> TextColor {
     document
         .colors
-        .get(index)
+        .get(index as usize)
         .copied()
         .flatten()
         .map_or(fallback, |[r, g, b, a]| {
@@ -26,7 +26,7 @@ pub(crate) struct RichTextSource {
     document: RichText,
     spans: Vec<Entity>,
     labels: Vec<Entity>,
-    previous_count: usize,
+    previous_count: u32,
 }
 
 impl RichTextSource {
@@ -56,7 +56,7 @@ pub(crate) struct RubyLabel {
 pub(crate) struct RichGlyphs {
     glyphs: Vec<bevy::text::PositionedGlyph>,
     scale: f32,
-    shown: Option<usize>,
+    shown: Option<u32>,
 }
 
 /// Preserve the complete shaped layout, exposing only revealed glyphs to the
@@ -156,6 +156,7 @@ pub(crate) fn update(
             }
             let old_len = rich.spans.len();
             for (index, ch) in document.text.chars().enumerate().skip(old_len) {
+                let index = index as u32;
                 // Word joiners keep a ruby base on one line without entering
                 // the stored text or the dialogue character counter.
                 let joined = document
@@ -220,9 +221,10 @@ pub(crate) fn update(
             || shadow.as_ref().is_some_and(|s| s.is_changed())
         {
             for (index, &span) in rich.spans.iter().enumerate() {
-                commands
-                    .entity(span)
-                    .insert(((*font).clone(), span_color(&rich.document, index, *color)));
+                commands.entity(span).insert((
+                    (*font).clone(),
+                    span_color(&rich.document, index as u32, *color),
+                ));
             }
             let mut reading_font = (*font).clone();
             if let bevy::text::FontSize::Px(size) = font.font_size {
@@ -239,7 +241,8 @@ pub(crate) fn update(
         }
         let count = rich
             .count
-            .map_or(rich.spans.len(), |n| (n as usize).min(rich.spans.len()));
+            .map_or(rich.spans.len(), |n| (n as usize).min(rich.spans.len()))
+            as u32;
         if count != rich.previous_count {
             rich.previous_count = count;
             redraw.request();
@@ -390,7 +393,7 @@ mod tests {
         );
     }
 
-    fn glyph(section_index: usize) -> bevy::text::PositionedGlyph {
+    fn glyph(section_index: u32) -> bevy::text::PositionedGlyph {
         bevy::text::PositionedGlyph {
             position: Vec2::new(section_index as f32 * 20.0, 30.0),
             atlas_info: bevy::text::GlyphAtlasInfo {
@@ -431,7 +434,7 @@ mod tests {
                     .expect("layout")
                     .glyphs
                     .len(),
-                count
+                count as usize
             );
             assert_eq!(
                 app.world()

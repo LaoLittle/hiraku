@@ -9,7 +9,7 @@ use hiraku_media::{TransferFunction, YuvPixelFormat};
 use crate::color::YuvColorTransform;
 
 pub(crate) fn load_internal_shader(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "shaders/yuv420.wgsl");
+    bevy::asset::embedded_asset!(app, "shaders/yuv420.wesl");
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -51,7 +51,7 @@ impl From<&Yuv420Material> for Yuv420MaterialKey {
 
 impl UiMaterial for Yuv420Material {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_video/shaders/yuv420.wgsl".into()
+        "embedded://hiraku_video/shaders/yuv420.wesl".into()
     }
 
     fn specialize(descriptor: &mut RenderPipelineDescriptor, key: UiMaterialKey<Self>) {

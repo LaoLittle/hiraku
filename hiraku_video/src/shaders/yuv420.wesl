@@ -1,14 +1,21 @@
-#import bevy_ui::ui_vertex_output::UiVertexOutput
+import bevy_ui_render::ui_vertex_output::UiVertexOutput;
 
-#ifdef FORMAT_I420
+@if(FORMAT_I420) {
+
 @group(1) @binding(0) var y_texture: texture_2d<f32>;
 @group(1) @binding(1) var u_texture: texture_2d<f32>;
 @group(1) @binding(2) var v_texture: texture_2d<f32>;
-#else ifdef FORMAT_NV12
+
+}
+
+@elif(FORMAT_NV12) {
+
 @group(1) @binding(0) var y_texture: texture_2d<f32>;
 @group(1) @binding(1) var uv_texture: texture_2d<f32>;
 @group(1) @binding(2) var _dummy: texture_2d<f32>;
-#endif
+
+}
+
 @group(1) @binding(3) var main_sampler: sampler;
 
 struct YuvColorTransform {
@@ -21,38 +28,41 @@ struct YuvColorTransform {
 
 fn to_linear_vec3(val: vec3<f32>) -> vec3<f32> {
     let x = clamp(val, vec3<f32>(0.0), vec3<f32>(1.0));
-#ifdef TRANSFER_LINEAR
+    @if(TRANSFER_LINEAR)
     return x;
-#else ifdef TRANSFER_SRGB
-    let lo = x / 12.92;
-    let hi = pow((x + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
-    return select(hi, lo, x <= vec3<f32>(0.04045));
-#else ifdef TRANSFER_GAMMA_22
+
+    @elif(TRANSFER_SRGB) {
+        let lo = x / 12.92;
+        let hi = pow((x + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+        return select(hi, lo, x <= vec3<f32>(0.04045));
+    }
+    
+    @elif(TRANSFER_GAMMA_22)
     return pow(x, vec3<f32>(2.2));
-#else ifdef TRANSFER_GAMMA_28
+
+    @elif(TRANSFER_GAMMA_28)
     return pow(x, vec3<f32>(2.8));
-#else
+
     // Conventional BT.709/BT.601/BT.2020 SDR is displayed using BT.1886.
     // For an ideal black level its EOTF is a pure 2.4 power function. The
     // piecewise 4.5 curve belongs to the BT.709 camera OETF and is not the
     // display transfer function.
+    @else
     return pow(x, vec3<f32>(2.4));
-#endif
 }
 
 fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
-#ifdef FORMAT_I420
+    @if(FORMAT_I420)
     return vec3<f32>(
         textureSample(y_texture, main_sampler, uv).r,
         textureSample(u_texture, main_sampler, uv).r,
         textureSample(v_texture, main_sampler, uv).r,
     );
-#else ifdef FORMAT_NV12
+    @elif(FORMAT_NV12)
     let y = textureSample(y_texture, main_sampler, uv).r;
     let chroma = textureSample(uv_texture, main_sampler, uv).rg;
 
     return vec3<f32>(y, chroma.r, chroma.g);
-#endif
 }
 
 @group(1) @binding(5) var<uniform> opacity: f32;

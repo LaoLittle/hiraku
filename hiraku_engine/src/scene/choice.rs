@@ -1,3 +1,5 @@
+use bevy::ui_widgets::Button;
+
 use super::*;
 
 #[derive(Resource, Default)]
@@ -18,7 +20,7 @@ pub fn handle_choice_buttons(
     mut commands: Commands,
     mut choice_state: ResMut<ChoiceState>,
     ui_style: Res<UiStyle>,
-    mut clicks: MessageReader<Pointer<Click>>,
+    mut clicks: MessageReader<PointerClick>,
     mut interaction_query: Query<
         (&PickingInteraction, &mut BackgroundColor, &ChoiceButton),
         Changed<PickingInteraction>,

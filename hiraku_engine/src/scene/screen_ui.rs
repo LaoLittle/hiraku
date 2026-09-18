@@ -2,8 +2,8 @@ use super::*;
 use crate::ui::UiEffect;
 use bevy::{
     input::mouse::MouseScrollUnit,
-    picking::events::Scroll,
     ui::{VisualBox, widget::NodeImageMode},
+    ui_widgets::Button,
 };
 
 #[derive(Clone, Debug, Message)]
@@ -1660,7 +1660,7 @@ fn align_items_from_option(value: &Option<String>) -> AlignItems {
 pub fn handle_screen_buttons(
     mut screen_state: ResMut<ScreenUiState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
-    mut clicks: MessageReader<Pointer<Click>>,
+    mut clicks: MessageReader<PointerClick>,
     mut interaction_query: Query<
         (
             &PickingInteraction,
@@ -1795,7 +1795,7 @@ fn apply_screen_button_image(
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
-    mut clicks: MessageReader<Pointer<Click>>,
+    mut clicks: MessageReader<PointerClick>,
     mut interaction_query: Query<
         (
             &PickingInteraction,
@@ -1930,7 +1930,7 @@ pub(crate) fn initialize_scroll_anchors(
 }
 
 pub fn handle_screen_scroll(
-    mut scrolls: MessageReader<Pointer<Scroll>>,
+    mut scrolls: MessageReader<PointerScroll>,
     mut scrollables: Query<(
         &ScreenUiScrollable,
         &ComputedNode,
@@ -1989,7 +1989,7 @@ fn scroll_limit(computed: &ComputedNode, node: &Node) -> Vec2 {
 }
 
 pub fn handle_screen_toggles(
-    mut clicks: MessageReader<Pointer<Click>>,
+    mut clicks: MessageReader<PointerClick>,
     toggles: Query<&ScreenUiToggle>,
     parents: Query<&ChildOf>,
     callbacks: Query<&super::widgets::ToggleCallback>,
@@ -3586,7 +3586,7 @@ mod tests {
     #[test]
     fn scroll_targets_the_nearest_scrollable_ancestor() {
         let mut app = App::new();
-        app.add_message::<Pointer<Scroll>>()
+        app.add_message::<PointerScroll>()
             .add_systems(Update, handle_screen_scroll);
         let outer = app
             .world_mut()
@@ -3632,30 +3632,30 @@ mod tests {
             (MouseScrollUnit::Line, 20.0, 0.0),
             (MouseScrollUnit::Pixel, -1.0, 1.0),
         ] {
-            app.world_mut().write_message(Pointer::new(
-                PointerId::Custom(uuid::Uuid::from_u128(1)),
-                Location {
-                    target: NormalizedRenderTarget::None {
-                        width: 800,
-                        height: 600,
+            app.world_mut().write_message(PointerScroll {
+                entity: child,
+                pointer: Pointer::new(
+                    PointerId::Custom(uuid::Uuid::from_u128(1)),
+                    Location {
+                        target: NormalizedRenderTarget::None {
+                            width: 800,
+                            height: 600,
+                        },
+                        position: Vec2::ZERO,
                     },
-                    position: Vec2::ZERO,
+                ),
+                unit,
+                x: 0.0,
+                y: delta,
+                hit: HitData {
+                    camera: outer,
+                    depth: 0.0,
+                    position: None,
+                    normal: None,
+                    extra: None,
                 },
-                Scroll {
-                    unit,
-                    x: 0.0,
-                    y: delta,
-                    hit: HitData {
-                        camera: outer,
-                        depth: 0.0,
-                        position: None,
-                        normal: None,
-                        extra: None,
-                    },
-                    phase: bevy::input::touch::TouchPhase::Moved,
-                },
-                child,
-            ));
+                phase: bevy::input::touch::TouchPhase::Moved,
+            });
             app.update();
             assert_eq!(
                 app.world()
@@ -3710,7 +3710,7 @@ mod tests {
     fn screen_button_activates_on_click_not_press() {
         let mut app = App::new();
         app.init_resource::<ScreenUiState>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_message::<UiEffectMessage>()
             .add_systems(Update, handle_screen_buttons);
@@ -3760,29 +3760,29 @@ mod tests {
             "pressing must not activate a button",
         );
 
-        app.world_mut().write_message(Pointer::new(
-            PointerId::Mouse,
-            Location {
-                target: NormalizedRenderTarget::None {
-                    width: 1,
-                    height: 1,
+        app.world_mut().write_message(PointerClick {
+            entity: button,
+            pointer: Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
                 },
-                position: Vec2::ZERO,
+            ),
+            button: PointerButton::Primary,
+            hit: HitData {
+                camera: root,
+                depth: 0.0,
+                position: None,
+                normal: None,
+                extra: None,
             },
-            Click {
-                button: PointerButton::Primary,
-                hit: HitData {
-                    camera: root,
-                    depth: 0.0,
-                    position: None,
-                    normal: None,
-                    extra: None,
-                },
-                duration: Duration::ZERO,
-                count: 1,
-            },
-            button,
-        ));
+            duration: Duration::ZERO,
+            count: 1,
+        });
         app.update();
 
         assert_eq!(app.world().resource::<ScreenUiState>().waiting, None);
@@ -3825,7 +3825,7 @@ mod tests {
     fn image_button_restores_artwork_after_press_and_cancel() {
         let mut app = App::new();
         app.init_resource::<ScreenUiState>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, handle_screen_image_buttons);
         let root = app.world_mut().spawn_empty().id();
@@ -3918,7 +3918,7 @@ mod tests {
                 .init_resource::<ScreenUiState>()
                 .init_resource::<DialogueHistoryState>()
                 .add_message::<crate::input::HirakuActionInput>()
-                .add_message::<Pointer<Click>>()
+                .add_message::<PointerClick>()
                 .add_message::<ScriptResponseMessage>()
                 .add_systems(Update, advance_dialogue_on_input);
             app.world_mut().resource_mut::<DialogueState>().waiting =
@@ -3936,29 +3936,29 @@ mod tests {
                     .entity_mut(target)
                     .insert(DialogueAdvanceSurface);
             }
-            app.world_mut().write_message(Pointer::new(
-                PointerId::Custom(uuid::Uuid::from_u128(19)),
-                Location {
-                    target: NormalizedRenderTarget::None {
-                        width: 1,
-                        height: 1,
+            app.world_mut().write_message(PointerClick {
+                entity: target,
+                pointer: Pointer::new(
+                    PointerId::Custom(uuid::Uuid::from_u128(19)),
+                    Location {
+                        target: NormalizedRenderTarget::None {
+                            width: 1,
+                            height: 1,
+                        },
+                        position: Vec2::ZERO,
                     },
-                    position: Vec2::ZERO,
+                ),
+                button,
+                hit: HitData {
+                    camera: target,
+                    depth: 0.0,
+                    position: None,
+                    normal: None,
+                    extra: None,
                 },
-                Click {
-                    button,
-                    hit: HitData {
-                        camera: target,
-                        depth: 0.0,
-                        position: None,
-                        normal: None,
-                        extra: None,
-                    },
-                    duration: Duration::ZERO,
-                    count: 1,
-                },
-                target,
-            ));
+                duration: Duration::ZERO,
+                count: 1,
+            });
             app.update();
             assert_eq!(
                 app.world().resource::<DialogueState>().waiting.is_none(),
@@ -3979,7 +3979,7 @@ mod tests {
             .init_resource::<ScreenUiState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, advance_dialogue_on_input);
         app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
@@ -3989,29 +3989,29 @@ mod tests {
         let modal = app.world_mut().spawn(PauseMenuRoot).id();
         let label = app.world_mut().spawn_empty().id();
         app.world_mut().entity_mut(modal).add_child(label);
-        app.world_mut().write_message(Pointer::new(
-            PointerId::Custom(uuid::Uuid::from_u128(1)),
-            Location {
-                target: NormalizedRenderTarget::None {
-                    width: 1,
-                    height: 1,
+        app.world_mut().write_message(PointerClick {
+            entity: label,
+            pointer: Pointer::new(
+                PointerId::Custom(uuid::Uuid::from_u128(1)),
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
                 },
-                position: Vec2::ZERO,
+            ),
+            button: PointerButton::Primary,
+            hit: HitData {
+                camera: modal,
+                depth: 0.0,
+                position: None,
+                normal: None,
+                extra: None,
             },
-            Click {
-                button: PointerButton::Primary,
-                hit: HitData {
-                    camera: modal,
-                    depth: 0.0,
-                    position: None,
-                    normal: None,
-                    extra: None,
-                },
-                duration: Duration::ZERO,
-                count: 1,
-            },
-            label,
-        ));
+            duration: Duration::ZERO,
+            count: 1,
+        });
 
         app.update();
 
@@ -4030,7 +4030,7 @@ mod tests {
             .init_resource::<ScreenUiState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, advance_dialogue_on_input);
         app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
@@ -4040,29 +4040,29 @@ mod tests {
         let screen = app.world_mut().spawn(ScreenUiRoot).id();
         app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(screen);
         let dialogue_surface = app.world_mut().spawn(DialogueAdvanceSurface).id();
-        app.world_mut().write_message(Pointer::new(
-            PointerId::Custom(uuid::Uuid::from_u128(3)),
-            Location {
-                target: NormalizedRenderTarget::None {
-                    width: 1,
-                    height: 1,
+        app.world_mut().write_message(PointerClick {
+            entity: dialogue_surface,
+            pointer: Pointer::new(
+                PointerId::Custom(uuid::Uuid::from_u128(3)),
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
                 },
-                position: Vec2::ZERO,
+            ),
+            button: PointerButton::Primary,
+            hit: HitData {
+                camera: screen,
+                depth: 0.0,
+                position: None,
+                normal: None,
+                extra: None,
             },
-            Click {
-                button: PointerButton::Primary,
-                hit: HitData {
-                    camera: screen,
-                    depth: 0.0,
-                    position: None,
-                    normal: None,
-                    extra: None,
-                },
-                duration: Duration::ZERO,
-                count: 1,
-            },
-            dialogue_surface,
-        ));
+            duration: Duration::ZERO,
+            count: 1,
+        });
 
         app.update();
 
@@ -4085,7 +4085,7 @@ mod tests {
             .init_resource::<ScreenUiState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, (handle_screen_toggles, advance_dialogue_on_input));
         app.add_message::<super::widgets::UiCallbackRequest>();
@@ -4119,29 +4119,29 @@ mod tests {
                 unchecked_node,
             ))
             .id();
-        app.world_mut().write_message(Pointer::new(
-            PointerId::Custom(uuid::Uuid::from_u128(4)),
-            Location {
-                target: NormalizedRenderTarget::None {
-                    width: 1,
-                    height: 1,
+        app.world_mut().write_message(PointerClick {
+            entity: toggle,
+            pointer: Pointer::new(
+                PointerId::Custom(uuid::Uuid::from_u128(4)),
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
                 },
-                position: Vec2::ZERO,
+            ),
+            button: PointerButton::Primary,
+            hit: HitData {
+                camera: toggle,
+                depth: 0.0,
+                position: None,
+                normal: None,
+                extra: None,
             },
-            Click {
-                button: PointerButton::Primary,
-                hit: HitData {
-                    camera: toggle,
-                    depth: 0.0,
-                    position: None,
-                    normal: None,
-                    extra: None,
-                },
-                duration: Duration::ZERO,
-                count: 1,
-            },
-            toggle,
-        ));
+            duration: Duration::ZERO,
+            count: 1,
+        });
 
         app.update();
 
@@ -4232,7 +4232,7 @@ mod tests {
             .init_resource::<ScreenUiState>()
             .init_resource::<DialogueHistoryState>()
             .add_message::<crate::input::HirakuActionInput>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, advance_dialogue_on_input);
         app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
@@ -4242,29 +4242,29 @@ mod tests {
         let pointer = PointerId::Custom(uuid::Uuid::from_u128(2));
         let former_button = app.world_mut().spawn_empty().id();
         for _ in 0..2 {
-            app.world_mut().write_message(Pointer::new(
-                pointer,
-                Location {
-                    target: NormalizedRenderTarget::None {
-                        width: 1,
-                        height: 1,
+            app.world_mut().write_message(PointerClick {
+                entity: former_button,
+                pointer: Pointer::new(
+                    pointer,
+                    Location {
+                        target: NormalizedRenderTarget::None {
+                            width: 1,
+                            height: 1,
+                        },
+                        position: Vec2::ZERO,
                     },
-                    position: Vec2::ZERO,
+                ),
+                button: PointerButton::Primary,
+                hit: HitData {
+                    camera: former_button,
+                    depth: 0.0,
+                    position: None,
+                    normal: None,
+                    extra: None,
                 },
-                Click {
-                    button: PointerButton::Primary,
-                    hit: HitData {
-                        camera: former_button,
-                        depth: 0.0,
-                        position: None,
-                        normal: None,
-                        extra: None,
-                    },
-                    duration: Duration::ZERO,
-                    count: 1,
-                },
-                former_button,
-            ));
+                duration: Duration::ZERO,
+                count: 1,
+            });
         }
 
         app.world_mut().entity_mut(former_button).despawn();

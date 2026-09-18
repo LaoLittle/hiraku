@@ -46,7 +46,7 @@ pub struct RuntimeMenuContext<'w, 's> {
         Query<'w, 's, &'static mut Visibility, (With<DialogueRoot>, Without<HintText>)>,
     pub speaker_text: Query<'w, 's, &'static mut Text, (With<SpeakerText>, Without<LineText>)>,
     pub line_text: Query<'w, 's, &'static mut Text, (With<LineText>, Without<SpeakerText>)>,
-    pub clicks: MessageReader<'w, 's, Pointer<Click>>,
+    pub clicks: MessageReader<'w, 's, PointerClick>,
     pub widget_callbacks: MessageReader<'w, 's, super::widgets::UiCallbackRequest>,
     pub entities: Query<'w, 's, Entity>,
     pub action_query: Query<

@@ -100,7 +100,7 @@ impl Sprite3d {
             ..default()
         }
     }
-    
+
     pub fn from_atlas(image: Handle<Image>, atlas: TextureAtlas) -> Self {
         Self {
             image: Some(image),
@@ -108,7 +108,7 @@ impl Sprite3d {
             ..default()
         }
     }
-    
+
     pub fn from_color(color: Color, size: Vec2) -> Self {
         Self {
             color,
@@ -116,7 +116,7 @@ impl Sprite3d {
             ..default()
         }
     }
-    
+
     pub fn validate(&self) -> Result<(), Sprite3dError> {
         if self.layers.len() > MAX_LAYERS {
             return Err(Sprite3dError::TooManyLayers(self.layers.len()));
@@ -152,7 +152,7 @@ impl Sprite3d {
         }
         Ok(())
     }
-    
+
     pub(crate) fn resolve_rects(
         &self,
         atlases: &Assets<TextureAtlasLayout>,

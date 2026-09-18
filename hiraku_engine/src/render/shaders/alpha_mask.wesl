@@ -1,4 +1,4 @@
-#import bevy_pbr::forward_io::VertexOutput
+import bevy_pbr::render::forward_io::VertexOutput;
 
 struct AlphaMaskMaterial {
     tint: vec4<f32>,
@@ -10,11 +10,11 @@ struct AlphaMaskMaterial {
     _padding: vec2<f32>,
 };
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: AlphaMaskMaterial;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var color_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var color_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var mask_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var mask_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> material: AlphaMaskMaterial;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var color_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var color_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var mask_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var mask_sampler: sampler;
 
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
@@ -49,9 +49,8 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-#ifdef MASK_MULTIPLY
+    @if(MASK_MULTIPLY)
     return vec4(color.rgb * color.a, color.a);
-#else
+    @else
     return color;
-#endif
 }

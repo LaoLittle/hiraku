@@ -3,10 +3,8 @@
 use super::*;
 use crate::input::{HirakuTextFocus, HirakuTextInput};
 use crate::ui::{InputKind, InputNode, UiCallback};
-use bevy::picking::{
-    events::{Drag, DragEnd, Press, Release},
-    pointer::PointerId,
-};
+use bevy::picking::pointer::PointerId;
+use bevy::ui_widgets::Button;
 use hiraku_script::Value;
 
 /// Transient state belonging to one mounted UI, never to the story snapshot.
@@ -363,11 +361,11 @@ fn request(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn input_events(
-    mut presses: MessageReader<Pointer<Press>>,
-    mut clicks: MessageReader<Pointer<Click>>,
-    mut drags: MessageReader<Pointer<Drag>>,
-    mut ends: MessageReader<Pointer<DragEnd>>,
-    mut releases: MessageReader<Pointer<Release>>,
+    mut presses: MessageReader<PointerPress>,
+    mut clicks: MessageReader<PointerClick>,
+    mut drags: MessageReader<PointerDrag>,
+    mut ends: MessageReader<PointerDragEnd>,
+    mut releases: MessageReader<PointerRelease>,
     mut edits: MessageReader<HirakuTextInput>,
     mut focus: ResMut<HirakuTextFocus>,
     screen: Res<ScreenUiState>,
@@ -402,12 +400,12 @@ pub(crate) fn input_events(
                 control.edit.cursor = control.edit.text.len();
             }
             InputKind::Slider { .. } => {
-                control.drag = Some(event.pointer_id);
+                control.drag = Some(event.pointer.id);
                 propose_slider(
                     &mut control,
                     computed,
                     transform,
-                    event.pointer_location.position,
+                    event.pointer.location().position,
                     entity,
                     &mut output,
                 );
@@ -443,7 +441,7 @@ pub(crate) fn input_events(
         let Ok((mut control, computed, transform)) = controls.get_mut(entity) else {
             continue;
         };
-        if control.drag == Some(event.pointer_id)
+        if control.drag == Some(event.pointer.id)
             && control.spec.enabled
             && is_active(control.root, &screen, &overlays)
         {
@@ -451,7 +449,7 @@ pub(crate) fn input_events(
                 &mut control,
                 computed,
                 transform,
-                event.pointer_location.position,
+                event.pointer.location().position,
                 entity,
                 &mut output,
             );
@@ -467,7 +465,7 @@ pub(crate) fn input_events(
         let Ok((mut control, _, _)) = controls.get_mut(entity) else {
             continue;
         };
-        if control.drag == Some(event.pointer_id) {
+        if control.drag == Some(event.pointer.id) {
             control.drag = None;
             if control.spec.enabled
                 && is_active(control.root, &screen, &overlays)
@@ -484,7 +482,7 @@ pub(crate) fn input_events(
         // Release can land outside the original track, or without a DragEnd
         // when a user simply clicks. Complete the captured pointer exactly once.
         for (mut control, _, _) in &mut controls {
-            if control.drag == Some(event.pointer_id) {
+            if control.drag == Some(event.pointer.id) {
                 control.drag = None;
                 if control.spec.enabled
                     && is_active(control.root, &screen, &overlays)
@@ -685,11 +683,11 @@ mod tests {
             .init_resource::<HirakuTextFocus>()
             .init_resource::<ScriptRuntimeState>()
             .init_resource::<UiModels>()
-            .add_message::<Pointer<Press>>()
-            .add_message::<Pointer<Click>>()
-            .add_message::<Pointer<Drag>>()
-            .add_message::<Pointer<DragEnd>>()
-            .add_message::<Pointer<Release>>()
+            .add_message::<PointerPress>()
+            .add_message::<PointerClick>()
+            .add_message::<PointerDrag>()
+            .add_message::<PointerDragEnd>()
+            .add_message::<PointerRelease>()
             .add_message::<HirakuTextInput>()
             .add_message::<UiCallbackRequest>()
             .add_systems(Update, (input_events, sync_inputs).chain());
@@ -839,25 +837,19 @@ mod tests {
             extra: None,
         };
         let pointer = PointerId::Custom(uuid::Uuid::from_u128(5));
-        app.world_mut().write_message(Pointer::new(
-            pointer,
-            location.clone(),
-            Press {
-                button: PointerButton::Primary,
-                hit: hit.clone(),
-                count: 1,
-            },
+        app.world_mut().write_message(PointerPress {
             entity,
-        ));
-        app.world_mut().write_message(Pointer::new(
-            pointer,
-            location,
-            Release {
-                button: PointerButton::Primary,
-                hit,
-            },
+            pointer: Pointer::new(pointer, location.clone()),
+            button: PointerButton::Primary,
+            hit: hit.clone(),
+            count: 1,
+        });
+        app.world_mut().write_message(PointerRelease {
             entity,
-        ));
+            pointer: Pointer::new(pointer, location),
+            button: PointerButton::Primary,
+            hit,
+        });
         app.update();
         let requests = app
             .world_mut()

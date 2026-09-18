@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn late_host_input_wakes_the_bridge_then_returns_to_idle() {
-        use bevy::{ecs::message::MessageCursor, picking::events::Scroll, window::RequestRedraw};
+        use bevy::{ecs::message::MessageCursor, window::RequestRedraw};
         for pointer in [HirakuPointerId::Pointer(0), HirakuPointerId::Touch(7)] {
             let mut app = App::new();
             app.insert_resource(HirakuCanvas {
@@ -164,7 +164,7 @@ mod tests {
             .add_message::<HirakuActionInput>()
             .add_message::<HirakuTextInput>()
             .add_message::<PointerInput>()
-            .add_message::<Pointer<Scroll>>()
+            .add_message::<PointerScroll>()
             .add_message::<RequestRedraw>()
             .add_systems(First, bridge_virtual_pointers)
             // Host picking happens after First; no animation or subsequent
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn touch_scroll_cancels_click_and_keeps_fingers_independent() {
-        use bevy::picking::{backend::HitData, events::Scroll, hover::HoverMap};
+        use bevy::picking::{backend::HitData, hover::HoverMap};
         let mut app = App::new();
         app.insert_resource(HirakuCanvas {
             image: Handle::default(),
@@ -273,7 +273,7 @@ mod tests {
         .add_message::<HirakuPointerInput>()
         .add_message::<HirakuScrollInput>()
         .add_message::<PointerInput>()
-        .add_message::<Pointer<Scroll>>()
+        .add_message::<PointerScroll>()
         .add_systems(Update, bridge_virtual_pointers)
         .add_systems(Last, cleanup_touch_pointers);
         let scrollable = app
@@ -337,13 +337,13 @@ mod tests {
         app.update();
         let scrolls = app
             .world_mut()
-            .resource_mut::<Messages<Pointer<Scroll>>>()
+            .resource_mut::<Messages<PointerScroll>>()
             .drain()
             .collect::<Vec<_>>();
         assert_eq!(scrolls.len(), 2);
         for event in scrolls {
             assert_eq!(event.entity, scrollable);
-            assert_eq!(event.pointer_id, finger.picking_id());
+            assert_eq!(event.pointer.id, finger.picking_id());
             assert!((event.y + 60.0).abs() < 0.001);
             assert_eq!(event.unit, bevy::input::mouse::MouseScrollUnit::Pixel);
         }
@@ -390,7 +390,7 @@ mod tests {
         .add_message::<HirakuPointerInput>()
         .add_message::<HirakuScrollInput>()
         .add_message::<PointerInput>()
-        .add_message::<Pointer<bevy::picking::events::Scroll>>()
+        .add_message::<PointerScroll>()
         .add_systems(Update, bridge_virtual_pointers);
         for unit in [HirakuScrollUnit::Line, HirakuScrollUnit::Pixel] {
             app.world_mut().write_message(HirakuScrollInput {
@@ -441,7 +441,7 @@ pub(crate) fn bridge_virtual_pointers(
     parents: Query<&ChildOf>,
     scroll_nodes: Query<&Node, With<ScrollPosition>>,
     mut gestures: Local<HashMap<HirakuPointerId, TouchScrollGesture>>,
-    mut drag_scrolls: MessageWriter<Pointer<bevy::picking::events::Scroll>>,
+    mut drag_scrolls: MessageWriter<PointerScroll>,
 ) {
     let (Some(canvas), Some(target)) = (canvas, target) else {
         return;
@@ -536,18 +536,15 @@ pub(crate) fn bridge_virtual_pointers(
                         }
                         if gesture.dragging {
                             let delta = position - gesture.last;
-                            drag_scrolls.write(Pointer::new(
-                                id,
-                                location.clone(),
-                                bevy::picking::events::Scroll {
-                                    unit: bevy::input::mouse::MouseScrollUnit::Pixel,
-                                    x: delta.x,
-                                    y: delta.y,
-                                    hit: hit.clone(),
-                                    phase: bevy::input::touch::TouchPhase::Moved,
-                                },
-                                *entity,
-                            ));
+                            drag_scrolls.write(PointerScroll {
+                                entity: *entity,
+                                pointer: Pointer::new(id, location.clone()),
+                                unit: bevy::input::mouse::MouseScrollUnit::Pixel,
+                                x: delta.x,
+                                y: delta.y,
+                                hit: hit.clone(),
+                                phase: bevy::input::touch::TouchPhase::Moved,
+                            });
                             gesture.last = position;
                             continue;
                         }

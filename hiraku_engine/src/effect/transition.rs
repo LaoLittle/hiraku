@@ -8,7 +8,7 @@ use bevy::{
 };
 
 pub fn load_internal_shaders(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "shaders/rule_transition_2d.wgsl");
+    bevy::asset::embedded_asset!(app, "shaders/rule_transition_2d.wesl");
 }
 
 #[derive(Resource, Clone)]
@@ -49,7 +49,7 @@ impl From<&RuleTransitionMaterial> for RuleTransitionUniform {
 
 impl Material for RuleTransitionMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_engine/effect/shaders/rule_transition_2d.wgsl".into()
+        "embedded://hiraku_engine/effect/shaders/rule_transition_2d.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {

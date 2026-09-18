@@ -14,6 +14,7 @@ use bevy::{
 };
 
 #[derive(Clone, Default, Resource, ExtractResource)]
+#[extract_app(RenderApp)]
 pub(crate) struct VideoUpload {
     generation: u64,
     // Extraction clones only handles and the Arc, never the decoded pixels.

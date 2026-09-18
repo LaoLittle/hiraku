@@ -20,7 +20,7 @@ pub struct BlurEffectPlugin;
 
 impl Plugin for BlurEffectPlugin {
     fn build(&self, app: &mut App) {
-        bevy::asset::embedded_asset!(app, "shaders/blur_effect.wgsl");
+        bevy::asset::embedded_asset!(app, "shaders/blur_effect.wesl");
         app.add_plugins((
             ExtractComponentPlugin::<BlurSettings>::default(),
             UniformComponentPlugin::<BlurSettings>::default(),
@@ -46,6 +46,7 @@ impl Plugin for BlurEffectPlugin {
 }
 
 #[derive(Component, Clone, Copy, PartialEq, ExtractComponent, ShaderType)]
+#[extract_app(RenderApp)]
 pub struct BlurSettings {
     intensity: f32,
     include_ui: u32,
@@ -239,7 +240,7 @@ fn init_blur_pipeline(
         layout: vec![layout.clone()],
         vertex: fullscreen_shader.to_vertex_state(),
         fragment: Some(FragmentState {
-            shader: bevy::asset::load_embedded_asset!(&*asset_server, "shaders/blur_effect.wgsl"),
+            shader: bevy::asset::load_embedded_asset!(&*asset_server, "shaders/blur_effect.wesl"),
             targets: vec![Some(ColorTargetState {
                 format: TextureFormat::Rgba8UnormSrgb,
                 blend: None,

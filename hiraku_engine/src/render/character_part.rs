@@ -12,8 +12,8 @@ use bevy::{
 };
 
 pub fn load_internal_shaders(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "shaders/alpha_mask.wgsl");
-    bevy::asset::embedded_asset!(app, "shaders/multiply.wgsl");
+    bevy::asset::embedded_asset!(app, "shaders/alpha_mask.wesl");
+    bevy::asset::embedded_asset!(app, "shaders/multiply.wesl");
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
@@ -77,7 +77,7 @@ impl From<&AlphaMaskMaterial> for AlphaMaskUniform {
 
 impl Material for AlphaMaskMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_engine/render/shaders/alpha_mask.wgsl".into()
+        "embedded://hiraku_engine/render/shaders/alpha_mask.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -139,7 +139,7 @@ impl From<&MultiplyMaterial> for MultiplyUniform {
 
 impl Material for MultiplyMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_engine/render/shaders/multiply.wgsl".into()
+        "embedded://hiraku_engine/render/shaders/multiply.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {

@@ -4,8 +4,8 @@
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Ruby {
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
     pub reading: String,
 }
 
@@ -74,8 +74,8 @@ pub(crate) fn parse(source: &str) -> Result<RichText, String> {
                 return Err(format!("ruby base must not be empty at byte {offset}"));
             }
             result.ruby.push(Ruby {
-                start,
-                end: count,
+                start: start as u32,
+                end: count as u32,
                 reading,
             });
             offset += 7;

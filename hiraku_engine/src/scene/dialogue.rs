@@ -195,7 +195,7 @@ pub fn advance_dialogue_on_input(
     mut redraw: crate::redraw::Redraw,
     dependencies: Option<Res<crate::dependencies::ScriptDependencies>>,
     mut actions: MessageReader<crate::input::HirakuActionInput>,
-    mut clicks: MessageReader<Pointer<Click>>,
+    mut clicks: MessageReader<PointerClick>,
     mut dialogue_state: ResMut<DialogueState>,
     mut animations: ResMut<AnimationState>,
     mut dialogue_chars: Query<&mut DialogueCharSpan>,
@@ -215,7 +215,7 @@ pub fn advance_dialogue_on_input(
     for click in clicks.read() {
         // Bevy UI picking decides which surface owns the click. Never infer
         // dialogue intent from an unrecognized widget or a despawned target.
-        pointer_advance |= click.pointer_id.is_custom()
+        pointer_advance |= click.pointer.id.is_custom()
             && click.button == PointerButton::Primary
             && advance_surfaces.contains(click.entity);
     }
@@ -618,7 +618,7 @@ mod preference_tests {
             .init_resource::<VoiceState>()
             .init_resource::<UserSettings>()
             .add_message::<crate::input::HirakuActionInput>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, advance_dialogue_on_input);
         {
@@ -675,7 +675,7 @@ mod preference_tests {
             .init_resource::<VoiceState>()
             .init_resource::<UserSettings>()
             .add_message::<crate::input::HirakuActionInput>()
-            .add_message::<Pointer<Click>>()
+            .add_message::<PointerClick>()
             .add_message::<ScriptResponseMessage>()
             .add_systems(Update, advance_dialogue_on_input);
         app.world_mut().resource_mut::<UserSettings>().auto_delay = 0.25;

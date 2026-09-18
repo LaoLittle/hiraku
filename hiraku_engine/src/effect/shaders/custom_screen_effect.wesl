@@ -1,4 +1,4 @@
-#import bevy_pbr::forward_io::VertexOutput
+import bevy_pbr::render::forward_io::VertexOutput;
 
 struct CustomScreenEffectMaterial {
     progress: f32,
@@ -11,17 +11,17 @@ struct CustomScreenEffectMaterial {
     p3: vec4<f32>,
 };
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: CustomScreenEffectMaterial;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var source_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var source_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var target_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var target_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(5) var rule_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(6) var rule_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(7) var aux0_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(8) var aux0_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(9) var aux1_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(10) var aux1_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> material: CustomScreenEffectMaterial;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var source_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var source_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var target_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var target_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var rule_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(6) var rule_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(7) var aux0_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(8) var aux0_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(9) var aux1_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(10) var aux1_sampler: sampler;
 
 fn mode_crossfade(uv: vec2<f32>) -> vec4<f32> {
     let source = textureSample(source_texture, source_sampler, uv);

@@ -131,7 +131,7 @@ impl From<&WorldSpriteMaterial> for WorldSpriteUniform {
 
 impl Material for WorldSpriteMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_engine/render/shaders/world_sprite.wgsl".into()
+        "embedded://hiraku_engine/render/shaders/world_sprite.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -379,7 +379,7 @@ mod tests {
 }
 
 pub fn install(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "shaders/world_sprite.wgsl");
+    bevy::asset::embedded_asset!(app, "shaders/world_sprite.wesl");
     app.add_plugins(MaterialPlugin::<WorldSpriteMaterial>::default())
         // Story systems mutate authoring state in `Update`; mirror it once,
         // immediately before render extraction, to avoid displaying stale

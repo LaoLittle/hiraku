@@ -10,7 +10,7 @@ use bevy::{
 };
 
 pub(crate) fn register(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "shaders/ui_quad.wgsl");
+    bevy::asset::embedded_asset!(app, "shaders/ui_quad.wesl");
     app.add_plugins(UiMaterialPlugin::<UiQuadMaterial>::default());
 }
 
@@ -49,7 +49,7 @@ impl From<&UiQuadMaterial> for UiQuadKey {
 }
 impl UiMaterial for UiQuadMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_engine/render/shaders/ui_quad.wgsl".into()
+        "embedded://hiraku_engine/render/shaders/ui_quad.wesl".into()
     }
     fn specialize(descriptor: &mut RenderPipelineDescriptor, key: UiMaterialKey<Self>) {
         if key.bind_group_data.1 == crate::ui::UiShaderBlend::Additive {

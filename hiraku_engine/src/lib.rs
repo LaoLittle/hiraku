@@ -282,6 +282,9 @@ impl Plugin for HirakuPlugin {
         scene::screen_ui::configure_screen_ui_phases(app);
         app.add_plugins(stage::StagePlugin);
         render::ui_quad::register(app);
+        effect::custom::load_internal_shaders(app);
+        effect::transition::load_internal_shaders(app);
+        render::character_part::load_internal_shaders(app);
         app.add_plugins((
             hiraku_uastc::UastcPlugin,
             hiraku_video::HirakuVideoPlugin,
@@ -291,9 +294,6 @@ impl Plugin for HirakuPlugin {
             MaterialPlugin::<MultiplyMaterial>::default(),
             BlurEffectPlugin,
         ));
-        effect::custom::load_internal_shaders(app);
-        effect::transition::load_internal_shaders(app);
-        render::character_part::load_internal_shaders(app);
         render::world_sprite::install(app);
         scene::character_composite::install(app);
 
@@ -519,23 +519,20 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 PostUpdate,
-                scene::fit_screen_text
-                    .after(bevy::ui::widget::text_system)
-                    .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
-            )
-            .add_systems(
-                PostUpdate,
                 scene::expire_overlays.in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 PostUpdate,
                 (
+                    scene::fit_screen_text,
                     scene::rich_text::reveal_glyphs,
                     scene::rich_text::position_ruby,
+                    scene::text_visibility::sync
                 )
                     .chain()
+                    .after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate)
                     .after(bevy::ui::widget::text_system)
-                    .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+                    .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility),
             )
             .add_systems(
                 Update,

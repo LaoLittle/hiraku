@@ -1,3 +1,4 @@
+use bevy::input::mouse::MouseScrollUnit;
 use bevy::{
     asset::{AssetMetaCheck, AssetPlugin},
     camera::{ScalingMode, visibility::RenderLayers},
@@ -7,7 +8,6 @@ use bevy::{
     window::WindowPlugin,
     winit::WinitSettings,
 };
-use bevy::{input::mouse::MouseScrollUnit, picking::events::Scroll};
 use hiraku_engine::input::{HirakuPointerId, HirakuScrollInput, HirakuScrollUnit};
 use hiraku_engine::{
     HirakuCanvas, HirakuPluginGroup, RuntimeLaunchConfig, configure_runtime_app,
@@ -179,13 +179,13 @@ fn forward_pointer(
 }
 
 fn forward_canvas_move(
-    mut event: On<Pointer<Move>>,
+    mut event: On<PointerMove>,
     targets: Query<&GlobalTransform, With<CanvasPresentation>>,
     canvas: Option<Res<HirakuCanvas>>,
     mut output: MessageWriter<HirakuPointerInput>,
 ) {
     if forward_pointer(
-        event.pointer_id,
+        event.pointer.id,
         event.event_target(),
         &event.hit,
         HirakuPointerPhase::Move,
@@ -198,14 +198,14 @@ fn forward_canvas_move(
 }
 
 fn forward_canvas_press(
-    mut event: On<Pointer<Press>>,
+    mut event: On<PointerPress>,
     targets: Query<&GlobalTransform, With<CanvasPresentation>>,
     canvas: Option<Res<HirakuCanvas>>,
     mut output: MessageWriter<HirakuPointerInput>,
 ) {
     if event.button == PointerButton::Primary
         && forward_pointer(
-            event.pointer_id,
+            event.pointer.id,
             event.event_target(),
             &event.hit,
             HirakuPointerPhase::Press,
@@ -219,14 +219,14 @@ fn forward_canvas_press(
 }
 
 fn forward_canvas_release(
-    mut event: On<Pointer<Release>>,
+    mut event: On<PointerRelease>,
     targets: Query<&GlobalTransform, With<CanvasPresentation>>,
     canvas: Option<Res<HirakuCanvas>>,
     mut output: MessageWriter<HirakuPointerInput>,
 ) {
     if event.button == PointerButton::Primary
         && forward_pointer(
-            event.pointer_id,
+            event.pointer.id,
             event.event_target(),
             &event.hit,
             HirakuPointerPhase::Release,
@@ -240,13 +240,13 @@ fn forward_canvas_release(
 }
 
 fn forward_canvas_scroll(
-    mut event: On<Pointer<Scroll>>,
+    mut event: On<PointerScroll>,
     targets: Query<&GlobalTransform, With<CanvasPresentation>>,
     canvas: Option<Res<HirakuCanvas>>,
     mut output: MessageWriter<HirakuScrollInput>,
 ) {
     let (Some(pointer), Some(canvas), Ok(transform)) = (
-        host_pointer_id(event.pointer_id),
+        host_pointer_id(event.pointer.id),
         canvas.as_ref(),
         targets.get(event.event_target()),
     ) else {
@@ -268,13 +268,13 @@ fn forward_canvas_scroll(
 }
 
 fn forward_canvas_cancel(
-    mut event: On<Pointer<Cancel>>,
+    mut event: On<PointerCancel>,
     targets: Query<&GlobalTransform, With<CanvasPresentation>>,
     canvas: Option<Res<HirakuCanvas>>,
     mut output: MessageWriter<HirakuPointerInput>,
 ) {
     if forward_pointer(
-        event.pointer_id,
+        event.pointer.id,
         event.event_target(),
         &event.hit,
         HirakuPointerPhase::Cancel,
@@ -287,14 +287,14 @@ fn forward_canvas_cancel(
 }
 
 fn forward_canvas_out(
-    mut event: On<Pointer<Out>>,
+    mut event: On<PointerOut>,
     targets: Query<&GlobalTransform, With<CanvasPresentation>>,
     canvas: Option<Res<HirakuCanvas>>,
     mut output: MessageWriter<HirakuPointerInput>,
 ) {
-    if matches!(event.pointer_id, PointerId::Touch(_))
+    if matches!(event.pointer.id, PointerId::Touch(_))
         && forward_pointer(
-            event.pointer_id,
+            event.pointer.id,
             event.event_target(),
             &event.hit,
             HirakuPointerPhase::Cancel,
@@ -389,21 +389,17 @@ mod tests {
             extra: None,
         };
         for id in [0, u64::MAX] {
-            app.world_mut().trigger(Pointer::new(
-                PointerId::Touch(id),
-                location.clone(),
-                Move {
-                    hit: hit.clone(),
-                    delta: Vec2::new(1.0, 2.0),
-                },
-                surface,
-            ));
-            app.world_mut().trigger(Pointer::new(
-                PointerId::Touch(id),
-                location.clone(),
-                Cancel { hit: hit.clone() },
-                surface,
-            ));
+            app.world_mut().trigger(PointerMove {
+                entity: surface,
+                pointer: Pointer::new(PointerId::Touch(id), location.clone()),
+                hit: hit.clone(),
+                delta: Vec2::new(1.0, 2.0),
+            });
+            app.world_mut().trigger(PointerCancel {
+                entity: surface,
+                pointer: Pointer::new(PointerId::Touch(id), location.clone()),
+                hit: hit.clone(),
+            });
         }
         let events = app
             .world_mut()
@@ -434,30 +430,30 @@ mod tests {
             .observe(forward_canvas_scroll)
             .id();
         for pointer in [PointerId::Mouse, PointerId::Touch(3)] {
-            app.world_mut().trigger(Pointer::new(
-                pointer,
-                Location {
-                    target: NormalizedRenderTarget::None {
-                        width: 800,
-                        height: 600,
+            app.world_mut().trigger(PointerScroll {
+                entity: surface,
+                pointer: Pointer::new(
+                    pointer,
+                    Location {
+                        target: NormalizedRenderTarget::None {
+                            width: 800,
+                            height: 600,
+                        },
+                        position: Vec2::ZERO,
                     },
-                    position: Vec2::ZERO,
+                ),
+                unit: MouseScrollUnit::Line,
+                x: 0.0,
+                y: -2.0,
+                hit: HitData {
+                    camera: surface,
+                    depth: 0.0,
+                    position: Some(Vec3::ZERO),
+                    normal: None,
+                    extra: None,
                 },
-                Scroll {
-                    unit: MouseScrollUnit::Line,
-                    x: 0.0,
-                    y: -2.0,
-                    hit: HitData {
-                        camera: surface,
-                        depth: 0.0,
-                        position: Some(Vec3::ZERO),
-                        normal: None,
-                        extra: None,
-                    },
-                    phase: bevy::input::touch::TouchPhase::Moved,
-                },
-                surface,
-            ));
+                phase: bevy::input::touch::TouchPhase::Moved,
+            });
         }
         let forwarded = app
             .world_mut()

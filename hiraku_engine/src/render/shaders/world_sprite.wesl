@@ -1,4 +1,4 @@
-#import bevy_pbr::forward_io::VertexOutput
+import bevy_pbr::render::forward_io::VertexOutput;
 
 struct WorldSpriteMaterial {
     clip_plane: vec4<f32>,
@@ -13,11 +13,11 @@ struct WorldSpriteMaterial {
     rect: vec4<f32>,
 };
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: WorldSpriteMaterial;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var color_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var color_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var dissolve_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var dissolve_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> material: WorldSpriteMaterial;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var color_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var color_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var dissolve_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var dissolve_sampler: sampler;
 
 // Keep corners at source-pixel size, shrinking proportionally when the target
 // is smaller than both borders combined. Only the center strip stretches.
@@ -53,7 +53,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     var sampled = textureSample(color_texture, color_sampler, uv);
     if material.effects.y > 0.0 {
         let cell = vec2<u32>(floor(clamp(local_uv, vec2<f32>(0.0), vec2<f32>(0.999999)) * material.effects.zw));
-        var hash = cell.x * 1597334677u ^ cell.y * 3812015801u ^ u32(material.effects.y) * 2798796415u;
+        var hash = (cell.x * 1597334677u) ^ (cell.y * 3812015801u) ^ (u32(material.effects.y) * 2798796415u);
         hash = (hash ^ (hash >> 16u)) * 2246822519u;
         hash = (hash ^ (hash >> 13u)) * 3266489917u;
         hash = hash ^ (hash >> 16u);

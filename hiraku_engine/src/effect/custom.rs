@@ -8,7 +8,7 @@ use bevy::{
 };
 
 pub fn load_internal_shaders(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "shaders/custom_screen_effect.wgsl");
+    bevy::asset::embedded_asset!(app, "shaders/custom_screen_effect.wesl");
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +84,7 @@ impl From<&CustomScreenEffectMaterial> for CustomScreenEffectUniform {
 
 impl Material for CustomScreenEffectMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_engine/effect/shaders/custom_screen_effect.wgsl".into()
+        "embedded://hiraku_engine/effect/shaders/custom_screen_effect.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
