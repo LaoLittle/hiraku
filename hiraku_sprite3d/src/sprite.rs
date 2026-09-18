@@ -100,6 +100,7 @@ impl Sprite3d {
             ..default()
         }
     }
+    
     pub fn from_atlas(image: Handle<Image>, atlas: TextureAtlas) -> Self {
         Self {
             image: Some(image),
@@ -107,6 +108,7 @@ impl Sprite3d {
             ..default()
         }
     }
+    
     pub fn from_color(color: Color, size: Vec2) -> Self {
         Self {
             color,
@@ -114,6 +116,7 @@ impl Sprite3d {
             ..default()
         }
     }
+    
     pub fn validate(&self) -> Result<(), Sprite3dError> {
         if self.layers.len() > MAX_LAYERS {
             return Err(Sprite3dError::TooManyLayers(self.layers.len()));
@@ -149,6 +152,7 @@ impl Sprite3d {
         }
         Ok(())
     }
+    
     pub(crate) fn resolve_rects(
         &self,
         atlases: &Assets<TextureAtlasLayout>,
@@ -190,12 +194,15 @@ impl Sprite3d {
         Ok(rects)
     }
 }
+
 fn valid_size(v: Vec2) -> bool {
     v.is_finite() && v.min_element() > 0.0
 }
+
 fn valid_rect(r: Rect) -> bool {
     r.min.is_finite() && r.max.is_finite() && valid_size(r.size())
 }
+
 fn valid_color(color: Color) -> bool {
     let rgba = color.to_linear().to_f32_array();
     rgba.iter().all(|v| v.is_finite()) && (0.0..=1.0).contains(&rgba[3])

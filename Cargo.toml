@@ -81,7 +81,7 @@ path = "hiraku_uastc"
 version = "0.1.0"
 
 [workspace.dependencies.bevy]
-version = "0.19.1"
+version = "0.20.0-rc.1"
 default-features = false
 features = ["3d", "audio", "ui"]
 

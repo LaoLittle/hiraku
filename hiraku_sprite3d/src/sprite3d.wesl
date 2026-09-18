@@ -1,11 +1,14 @@
-#import bevy_pbr::forward_io::VertexOutput
+import bevy_pbr::render::forward_io::VertexOutput;
+
 struct Layer {
     rect: vec4<f32>, bounds: vec4<f32>, tint: vec4<f32>, modes: vec4<f32>, flip: vec4<f32>,
 };
+
 struct Sprite { clip_bounds: vec4<f32>, clip_axes: vec4<f32>, tint: vec4<f32>, backface_tint: vec4<f32>, count: vec4<u32>, layers: array<Layer, 32>, };
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> sprite: Sprite;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var atlas: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var atlas_sampler: sampler;
+
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> sprite: Sprite;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var atlas: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var atlas_sampler: sampler;
 
 // Premultiplied operands, including genuinely translucent layers.
 fn compose(dst: vec4<f32>, src: vec4<f32>, multiply: bool) -> vec4<f32> {
@@ -15,6 +18,7 @@ fn compose(dst: vec4<f32>, src: vec4<f32>, multiply: bool) -> vec4<f32> {
     }
     return vec4<f32>(src.rgb + dst.rgb * (1.0 - src.a), alpha);
 }
+
 @fragment
 fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let delta = mesh.world_position.xy - sprite.clip_bounds.xy;

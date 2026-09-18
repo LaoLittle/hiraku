@@ -13,12 +13,13 @@ pub use sprite::{
 };
 
 pub struct Sprite3dPlugin;
+
 /// Embeddings producing Sprite3d components can order their projection before this set.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sprite3dSync;
 impl Plugin for Sprite3dPlugin {
     fn build(&self, app: &mut App) {
-        bevy::asset::embedded_asset!(app, "sprite3d.wgsl");
+        bevy::asset::embedded_asset!(app, "sprite3d.wesl");
         if !app
             .world()
             .contains_resource::<Assets<TextureAtlasLayout>>()

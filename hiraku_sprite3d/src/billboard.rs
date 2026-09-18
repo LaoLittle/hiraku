@@ -23,6 +23,7 @@ pub struct Billboard {
     /// Local Z rotation in radians.
     pub roll: f32,
 }
+
 impl Billboard {
     pub fn new(camera: Entity) -> Self {
         Self {
@@ -32,6 +33,7 @@ impl Billboard {
         }
     }
 }
+
 pub struct BillboardPlugin;
 impl Plugin for BillboardPlugin {
     fn build(&self, app: &mut App) {
@@ -43,6 +45,7 @@ impl Plugin for BillboardPlugin {
             );
     }
 }
+
 fn facing(mode: BillboardMode, position: Vec3, camera: &GlobalTransform) -> Option<Quat> {
     if mode == BillboardMode::ScreenAligned {
         return Some(camera.rotation());
@@ -64,6 +67,7 @@ fn facing(mode: BillboardMode, position: Vec3, camera: &GlobalTransform) -> Opti
         forward,
     )))
 }
+
 fn orient_billboards(
     billboards: Query<(Entity, &Billboard, Option<&ChildOf>)>,
     cameras: Query<(), With<Camera>>,
@@ -108,6 +112,7 @@ fn orient_billboards(
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

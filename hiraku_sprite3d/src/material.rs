@@ -18,6 +18,7 @@ pub struct LayerUniform {
     modes: Vec4,
     flip: Vec4,
 }
+
 #[derive(Clone, Debug, ShaderType)]
 pub struct SpriteUniform {
     clip_bounds: Vec4,
@@ -27,6 +28,7 @@ pub struct SpriteUniform {
     count: UVec4,
     layers: [LayerUniform; MAX_LAYERS],
 }
+
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
 pub struct Sprite3dMaterial {
     #[uniform(0)]
@@ -35,6 +37,7 @@ pub struct Sprite3dMaterial {
     #[sampler(2)]
     pub image: Option<Handle<Image>>,
 }
+
 impl Sprite3dMaterial {
     /// Resolve layout assets without altering the authoring component.
     pub fn from_sprite(
@@ -110,15 +113,17 @@ impl Sprite3dMaterial {
         }
     }
 }
+
 impl TryFrom<&Sprite3d> for Sprite3dMaterial {
     type Error = crate::Sprite3dError;
     fn try_from(sprite: &Sprite3d) -> Result<Self, Self::Error> {
         Self::from_sprite(sprite, &Assets::default())
     }
 }
+
 impl Material for Sprite3dMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_sprite3d/sprite3d.wgsl".into()
+        "embedded://hiraku_sprite3d/sprite3d.wesl".into()
     }
     fn alpha_mode(&self) -> AlphaMode {
         AlphaMode::Premultiplied
