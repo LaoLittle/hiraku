@@ -473,3 +473,15 @@ mod tests {
         assert_eq!(host_pointer_id(PointerId::Custom(Default::default())), None);
     }
 }
+
+#[cfg(target_os = "android")]
+#[bevy_main]
+pub fn main() {
+    let config = RuntimeLaunchConfig::default();
+
+    let mut app = build_app(config);
+
+    app.insert_resource(bevy::winit::WinitSettings::mobile());
+
+    app.run();
+}

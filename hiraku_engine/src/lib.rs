@@ -527,7 +527,7 @@ impl Plugin for HirakuPlugin {
                     scene::fit_screen_text,
                     scene::rich_text::reveal_glyphs,
                     scene::rich_text::position_ruby,
-                    scene::text_visibility::sync
+                    scene::text_visibility::sync,
                 )
                     .chain()
                     .after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate)

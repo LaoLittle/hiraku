@@ -1,9 +1,6 @@
 use bevy::prelude::*;
 
-use super::{
-    rich_text::RubyLabel,
-    screen_ui::FitText,
-};
+use super::{rich_text::RubyLabel, screen_ui::FitText};
 
 pub(crate) fn sync(
     managed_text: Query<
@@ -27,9 +24,7 @@ pub(crate) fn sync(
         pending.push((root, parent_visible));
 
         while let Some((entity, parent_visible)) = pending.pop() {
-            let Ok((explicit, mut inherited)) =
-                visibility.get_mut(entity)
-            else {
+            let Ok((explicit, mut inherited)) = visibility.get_mut(entity) else {
                 continue;
             };
 

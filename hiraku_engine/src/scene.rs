@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 pub mod clock;
+pub(crate) mod text_visibility;
 pub(crate) mod ui_keyframes;
 pub(crate) mod ui_visuals;
-pub(crate) mod text_visibility;
 
 use crate::audio::EngineAudioSource as AudioSource;
 use bevy::{

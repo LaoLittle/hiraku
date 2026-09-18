@@ -52,17 +52,19 @@ fn to_linear_vec3(val: vec3<f32>) -> vec3<f32> {
 }
 
 fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
-    @if(FORMAT_I420)
-    return vec3<f32>(
-        textureSample(y_texture, main_sampler, uv).r,
-        textureSample(u_texture, main_sampler, uv).r,
-        textureSample(v_texture, main_sampler, uv).r,
-    );
-    @elif(FORMAT_NV12)
-    let y = textureSample(y_texture, main_sampler, uv).r;
-    let chroma = textureSample(uv_texture, main_sampler, uv).rg;
-
-    return vec3<f32>(y, chroma.r, chroma.g);
+    @if(FORMAT_I420) {
+        return vec3<f32>(
+            textureSample(y_texture, main_sampler, uv).r,
+            textureSample(u_texture, main_sampler, uv).r,
+            textureSample(v_texture, main_sampler, uv).r,
+        );
+    }
+    @elif(FORMAT_NV12) {
+        let y = textureSample(y_texture, main_sampler, uv).r;
+        let chroma = textureSample(uv_texture, main_sampler, uv).rg;
+    
+        return vec3<f32>(y, chroma.r, chroma.g);
+    }
 }
 
 @group(1) @binding(5) var<uniform> opacity: f32;

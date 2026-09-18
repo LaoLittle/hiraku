@@ -27,8 +27,8 @@ mod slots;
 mod user_settings;
 pub(crate) use runtime::{initialize_runtime_storage, poll_runtime_storage, storage_ready};
 pub use slots::{
-    load_save_data, load_save_data_from_root, load_save_metadata, load_save_thumbnail,
-    save_slot_exists, write_save_data_to_root,
+    load_save_data, load_save_metadata, load_save_thumbnail, save_slot_exists,
+    write_save_data_to_root,
 };
 pub use user_settings::{PreferenceChange, UserSettings, read_user_settings, write_user_settings};
 

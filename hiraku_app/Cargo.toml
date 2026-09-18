@@ -6,9 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[dependencies]
-bevy.workspace = true
-hiraku-engine.workspace = true
+[lib]
+name = "hiraku_app"
+crate-type = ["lib", "cdylib"]
 
-[dev-dependencies]
-hiraku-script.workspace = true
+[dependencies]
+bevy = { workspace = true, features = ["android-game-activity"] }
+hiraku-engine.workspace = true

@@ -262,15 +262,19 @@ fn copy_output(
             .get(offset..)
             .ok_or_else(|| error("plane outside output buffer"))
     };
+
+    // TODO: handle unspecified (0) here.
     let (kr, kb) = match format.i32("color-standard").unwrap_or(1) {
-        1 => (0.2126, 0.0722),
+        0 | 1 => (0.2126, 0.0722),
         2 | 4 => (0.299, 0.114),
         6 => (0.2627, 0.0593),
         _ => return Err(error("unsupported color standard")),
     };
+
+    // TODO: handle unspecified (0) here.
     let transfer = match format.i32("color-transfer").unwrap_or(3) {
         1 => TransferFunction::Linear,
-        3 => TransferFunction::Bt1886,
+        0 | 3 => TransferFunction::Bt1886,
         _ => {
             return Err(error(
                 "unsupported transfer function (HDR is not supported)",
