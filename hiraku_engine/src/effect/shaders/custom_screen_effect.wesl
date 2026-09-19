@@ -1,4 +1,5 @@
 import bevy_pbr::render::forward_io::VertexOutput;
+import hiraku_sprite3d::sampling::decode_color;
 
 struct CustomScreenEffectMaterial {
     progress: f32,
@@ -24,18 +25,18 @@ struct CustomScreenEffectMaterial {
 @group(constants::MATERIAL_BIND_GROUP) @binding(10) var aux1_sampler: sampler;
 
 fn mode_crossfade(uv: vec2<f32>) -> vec4<f32> {
-    let source = textureSample(source_texture, source_sampler, uv);
-    let target = textureSample(target_texture, target_sampler, uv);
-    return mix(source, target, clamp(material.progress, 0.0, 1.0));
+    let source = decode_color(textureSample(source_texture, source_sampler, uv), sampling.x);
+    let target_color = decode_color(textureSample(target_texture, target_sampler, uv), sampling.y);
+    return mix(source, target_color, clamp(material.progress, 0.0, 1.0));
 }
 
 fn mode_rule(uv: vec2<f32>) -> vec4<f32> {
-    let source = textureSample(source_texture, source_sampler, uv);
-    let target = textureSample(target_texture, target_sampler, uv);
+    let source = decode_color(textureSample(source_texture, source_sampler, uv), sampling.x);
+    let target_color = decode_color(textureSample(target_texture, target_sampler, uv), sampling.y);
     let rule = textureSample(rule_texture, rule_sampler, uv).r;
     let vague = max(material.p0.x, 0.0001);
     let edge = clamp((material.progress - rule) / vague + 0.5, 0.0, 1.0);
-    return mix(source, target, edge);
+    return mix(source, target_color, edge);
 }
 
 fn mode_wave(uv: vec2<f32>) -> vec4<f32> {
@@ -45,9 +46,9 @@ fn mode_wave(uv: vec2<f32>) -> vec4<f32> {
     let mix_target = clamp(material.p0.w, 0.0, 1.0);
     let wave = sin((uv.y + material.time * speed) * frequency) * amplitude;
     let warped_uv = vec2(uv.x + wave, uv.y);
-    let source = textureSample(source_texture, source_sampler, warped_uv);
-    let target = textureSample(target_texture, target_sampler, uv);
-    return mix(source, target, mix_target * clamp(material.progress, 0.0, 1.0));
+    let source = decode_color(textureSample(source_texture, source_sampler, warped_uv), sampling.x);
+    let target_color = decode_color(textureSample(target_texture, target_sampler, uv), sampling.y);
+    return mix(source, target_color, mix_target * clamp(material.progress, 0.0, 1.0));
 }
 
 @fragment
@@ -64,3 +65,4 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 
     return mode_crossfade(uv);
 }
+@group(constants::MATERIAL_BIND_GROUP) @binding(15) var<uniform> sampling: vec4<u32>;

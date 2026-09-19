@@ -304,6 +304,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<UiQuadMaterial>>()
             .add(UiQuadMaterial {
+                sampling: UVec4::ZERO,
                 color: LinearRgba::WHITE,
                 uv_u: Vec4::X,
                 uv_v: Vec4::Y,

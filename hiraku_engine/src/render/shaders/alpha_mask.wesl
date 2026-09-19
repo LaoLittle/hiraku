@@ -1,4 +1,5 @@
 import bevy_pbr::render::forward_io::VertexOutput;
+import hiraku_sprite3d::sampling::decode_color;
 
 struct AlphaMaskMaterial {
     tint: vec4<f32>,
@@ -20,7 +21,7 @@ struct AlphaMaskMaterial {
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let color_size = vec2<f32>(textureDimensions(color_texture));
     let color_uv = (material.main_rect.xy + mesh.uv * material.main_rect.zw) / color_size;
-    var color = textureSample(color_texture, color_sampler, color_uv) * material.tint;
+    var color = decode_color(textureSample(color_texture, color_sampler, color_uv), sampling.x) * material.tint;
 
     let main_local = vec2(
         (mesh.uv.x - 0.5) * material.main_rect.z,
@@ -38,7 +39,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 
     let mask_size = vec2<f32>(textureDimensions(mask_texture));
     let mask_uv = (material.mask_rect.xy + clamped_local * material.mask_rect.zw) / mask_size;
-    let raw_mask_alpha = textureSample(mask_texture, mask_sampler, mask_uv).a;
+    let raw_mask_alpha = decode_color(textureSample(mask_texture, mask_sampler, mask_uv), sampling.y).a;
 
     let mask_pass = select(0.0, 1.0, (raw_mask_alpha * is_in_bounds) > (1.0 / 255.0));
 
@@ -54,3 +55,4 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     @else
     return color;
 }
+@group(constants::MATERIAL_BIND_GROUP) @binding(15) var<uniform> sampling: vec4<u32>;

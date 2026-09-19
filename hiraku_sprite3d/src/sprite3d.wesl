@@ -1,4 +1,6 @@
 import bevy_pbr::render::forward_io::VertexOutput;
+import hiraku_sprite3d::sampling::decode_color;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var<uniform> sampling: vec4<u32>;
 
 struct Layer {
     rect: vec4<f32>, bounds: vec4<f32>, tint: vec4<f32>, modes: vec4<f32>, flip: vec4<f32>,
@@ -36,7 +38,7 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
         let size = select(layer.rect.zw, dimensions, layer.rect.z <= 0.0);
         // Clamp to source texel centers, avoiding adjacent atlas entries.
         let sample_uv = (origin + clamp(uv * size, vec2<f32>(0.5), max(size - 0.5, vec2<f32>(0.5)))) / dimensions;
-        let texel = textureSampleLevel(atlas, atlas_sampler, sample_uv, 0.0);
+        let texel = decode_color(textureSampleLevel(atlas, atlas_sampler, sample_uv, 0.0), sampling.x);
         let sample_color = texel * layer.tint;
         var alpha = sample_color.a;
         let mode = u32(layer.modes.y);

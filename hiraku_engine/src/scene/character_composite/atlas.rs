@@ -161,7 +161,7 @@ fn pack(
         .initial_size(UVec2::splat(256.min(limit)))
         .max_size(UVec2::splat(limit))
         .format(TextureFormat::Rgba8UnormSrgb)
-        .auto_format_conversion(false);
+        .auto_format_conversion(true);
     for tile in &tiles {
         builder.add_texture(None, tile);
     }
@@ -258,6 +258,41 @@ mod tests {
     }
 
     #[test]
+    fn atlas_builder_converts_gray_alpha_only_when_packing() {
+        let mut images = Assets::<Image>::default();
+        let alice = images.add(Image::from_dynamic(
+            image::DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_pixel(
+                2,
+                2,
+                image::LumaA([128, 96]),
+            )),
+            true,
+            default(),
+        ));
+        let bob = images.add(image([10, 20, 30, 255]));
+        let regions = [
+            Region {
+                image: alice.id().into(),
+                rect: URect::new(0, 0, 2, 2),
+            },
+            Region {
+                image: bob.id().into(),
+                rect: URect::new(0, 0, 2, 2),
+            },
+        ];
+        let (atlas, rects) = PackedAtlas::default()
+            .resolve(&regions, &mut images, 256)
+            .expect("pack mixed formats");
+        assert_eq!(
+            pixel(images.get(&atlas).expect("atlas"), rects[0].min),
+            &[128, 128, 128, 96]
+        );
+        let original = images.get(&alice).expect("source unchanged");
+        assert_eq!(original.texture_descriptor.format, TextureFormat::Rg8Unorm);
+        assert_eq!(original.data.as_ref().expect("source pixels").len(), 8);
+    }
+
+    #[test]
     fn new_expression_grows_once_and_hot_reload_invalidates() {
         let mut images = Assets::<Image>::default();
         let alice = images.add(image([10; 4]));
@@ -348,12 +383,17 @@ mod tests {
 fn crop_with_gutter(region: Region, image: &Image) -> Result<Image, String> {
     // PNG color parts use this format. Existing single-image atlases (including
     // GPU-compressed images) bypass packing entirely.
-    if image.texture_descriptor.format != TextureFormat::Rgba8UnormSrgb {
-        return Err(format!(
-            "loose character parts require RGBA8 sRGB, got {:?}",
-            image.texture_descriptor.format
-        ));
-    }
+    let bytes_per_pixel = match image.texture_descriptor.format {
+        TextureFormat::R8Unorm => 1,
+        TextureFormat::Rg8Unorm => 2,
+        TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm => 4,
+        _ => {
+            return Err(format!(
+                "unsupported loose character part format {:?}",
+                image.texture_descriptor.format
+            ));
+        }
+    };
     let data = image
         .data
         .as_ref()
@@ -370,21 +410,23 @@ fn crop_with_gutter(region: Region, image: &Image) -> Result<Image, String> {
     let height = rect.height() + 2;
     let length = (width as usize)
         .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_mul(bytes_per_pixel))
         .ok_or("character atlas tile size overflow")?;
     let mut pixels = vec![0; length];
     for y in 0..height {
         let source_y = rect.min.y + y.saturating_sub(1).min(rect.height() - 1);
-        let start = (source_y as usize * image.width() as usize + rect.min.x as usize) * 4;
-        let end = start + rect.width() as usize * 4;
+        let start =
+            (source_y as usize * image.width() as usize + rect.min.x as usize) * bytes_per_pixel;
+        let end = start + rect.width() as usize * bytes_per_pixel;
         let source = data
             .get(start..end)
             .ok_or("truncated character pixel data")?;
-        let row =
-            &mut pixels[y as usize * width as usize * 4..(y as usize + 1) * width as usize * 4];
-        row[..4].copy_from_slice(&source[..4]);
-        row[4..4 + source.len()].copy_from_slice(source);
-        row[4 + source.len()..].copy_from_slice(&source[source.len() - 4..]);
+        let row = &mut pixels[y as usize * width as usize * bytes_per_pixel
+            ..(y as usize + 1) * width as usize * bytes_per_pixel];
+        row[..bytes_per_pixel].copy_from_slice(&source[..bytes_per_pixel]);
+        row[bytes_per_pixel..bytes_per_pixel + source.len()].copy_from_slice(source);
+        row[bytes_per_pixel + source.len()..]
+            .copy_from_slice(&source[source.len() - bytes_per_pixel..]);
     }
     Ok(Image::new(
         Extent3d {
@@ -394,7 +436,7 @@ fn crop_with_gutter(region: Region, image: &Image) -> Result<Image, String> {
         },
         TextureDimension::D2,
         pixels,
-        TextureFormat::Rgba8UnormSrgb,
+        image.texture_descriptor.format,
         RenderAssetUsages::default(),
     ))
 }

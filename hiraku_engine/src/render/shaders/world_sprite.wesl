@@ -1,4 +1,5 @@
 import bevy_pbr::render::forward_io::VertexOutput;
+import hiraku_sprite3d::sampling::decode_color;
 
 struct WorldSpriteMaterial {
     clip_plane: vec4<f32>,
@@ -50,7 +51,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         local_uv,
         full_image,
     );
-    var sampled = textureSample(color_texture, color_sampler, uv);
+    var sampled = decode_color(textureSample(color_texture, color_sampler, uv), sampling.x);
     if material.effects.y > 0.0 {
         let cell = vec2<u32>(floor(clamp(local_uv, vec2<f32>(0.0), vec2<f32>(0.999999)) * material.effects.zw));
         var hash = (cell.x * 1597334677u) ^ (cell.y * 3812015801u) ^ (u32(material.effects.y) * 2798796415u);
@@ -72,7 +73,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         for (var y = 0u; y < 5u; y += 1u) {
             for (var x = 0u; x < 5u; x += 1u) {
                 let offset = (vec2<f32>(f32(x), f32(y)) - vec2<f32>(2.0)) * material.effects.x * 0.5 / texture_size;
-                let tap = textureSampleLevel(color_texture, color_sampler, clamp(uv + offset, low, high), 0.0);
+                let tap = decode_color(textureSampleLevel(color_texture, color_sampler, clamp(uv + offset, low, high), 0.0), sampling.x);
                 // Filter premultiplied color to avoid dark fringes at transparent edges.
                 sum += vec4<f32>(tap.rgb * tap.a, tap.a) * weights[x] * weights[y];
             }
@@ -106,3 +107,4 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     }
     return color;
 }
+@group(constants::MATERIAL_BIND_GROUP) @binding(15) var<uniform> sampling: vec4<u32>;

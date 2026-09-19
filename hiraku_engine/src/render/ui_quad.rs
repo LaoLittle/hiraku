@@ -17,6 +17,8 @@ pub(crate) fn register(app: &mut App) {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[bind_group_data(UiQuadKey)]
 pub(crate) struct UiQuadMaterial {
+    #[uniform(15)]
+    pub sampling: UVec4,
     #[uniform(0)]
     pub color: LinearRgba,
     /// Rows of the mapping from bounding-box UV to image UV.

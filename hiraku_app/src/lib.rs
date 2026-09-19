@@ -55,6 +55,8 @@ impl Plugin for HirakuPresentationPlugin {
             Update,
             display::apply_preferences.run_if(resource_exists::<hiraku_engine::UserSettings>),
         );
+
+        app.add_systems(Last, android_exit);
     }
 }
 
@@ -352,6 +354,28 @@ fn present_hiraku_canvas(
     ));
 }
 
+fn android_exit(exit_reader: MessageReader<AppExit>) {
+    if !exit_reader.is_empty() {
+        #[cfg(target_os = "android")]
+        {
+            std::process::exit(0);
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[bevy_main]
+pub fn main() {
+    let config = RuntimeLaunchConfig::default();
+
+    let mut app = build_app(config);
+
+    app.insert_resource(bevy::winit::WinitSettings::mobile());
+
+    app.run();
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,16 +496,4 @@ mod tests {
         // reflected back into the host-to-engine bridge.
         assert_eq!(host_pointer_id(PointerId::Custom(Default::default())), None);
     }
-}
-
-#[cfg(target_os = "android")]
-#[bevy_main]
-pub fn main() {
-    let config = RuntimeLaunchConfig::default();
-
-    let mut app = build_app(config);
-
-    app.insert_resource(bevy::winit::WinitSettings::mobile());
-
-    app.run();
 }

@@ -1,4 +1,5 @@
 import bevy_pbr::render::forward_io::VertexOutput;
+import hiraku_sprite3d::sampling::decode_color;
 
 struct MultiplyMaterial {
     tint: vec4<f32>,
@@ -15,10 +16,11 @@ struct MultiplyMaterial {
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let texture_size = vec2<f32>(textureDimensions(color_texture));
     let uv = (material.rect.xy + mesh.uv * material.rect.zw) / texture_size;
-    var color = textureSample(color_texture, color_sampler, uv) * material.tint;
+    var color = decode_color(textureSample(color_texture, color_sampler, uv), sampling.x) * material.tint;
     color.a *= material.opacity;
     if color.a <= 0.0001 {
         discard;
     }
     return vec4(color.rgb * color.a, color.a);
 }
+@group(constants::MATERIAL_BIND_GROUP) @binding(15) var<uniform> sampling: vec4<u32>;

@@ -30,6 +30,8 @@ pub struct CustomEffectOptions {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, CustomScreenEffectUniform)]
 pub struct CustomScreenEffectMaterial {
+    #[uniform(15)]
+    pub sampling: UVec4,
     #[texture(1)]
     #[sampler(2)]
     pub source_texture: Handle<Image>,

@@ -104,6 +104,7 @@ pub(crate) fn tick(
                             .unwrap_or_else(|| image.image.clone())
                     };
                     let handle = materials.add(UiQuadMaterial {
+                        sampling: UVec4::ZERO,
                         color: image.color.to_linear(),
                         uv_u: u,
                         uv_v: v,

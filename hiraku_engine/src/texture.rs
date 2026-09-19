@@ -7,6 +7,9 @@ use thiserror::Error;
 
 use crate::vfs::{HdpVfs, VfsError};
 
+pub(crate) mod artwork;
+pub(crate) use artwork::ArtworkPlugin;
+
 /// Immutable artwork keeps its metadata, but transfers pixel ownership to the
 /// renderer. Use the same settings for speculative and demand loads.
 pub(crate) fn load_static_image(server: &AssetServer, path: impl Into<String>) -> Handle<Image> {
@@ -21,6 +24,7 @@ pub(crate) fn load_static_image(server: &AssetServer, path: impl Into<String>) -
 #[derive(Clone, Debug, Default, Resource)]
 pub struct TextureCatalog {
     textures: BTreeMap<String, TextureDefinition>,
+    metadata: BTreeMap<String, artwork::TextureMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +67,8 @@ pub enum TextureCatalogError {
 
 #[derive(Debug, Deserialize)]
 struct TextureFile {
+    #[serde(flatten)]
+    metadata: artwork::TextureMetadata,
     #[serde(default)]
     name: Option<String>,
     image: String,
@@ -88,6 +94,7 @@ pub fn load_texture_catalog(vfs: &HdpVfs) -> Result<TextureCatalog, TextureCatal
     descriptor_paths.sort();
 
     let mut textures = BTreeMap::new();
+    let mut metadata = BTreeMap::new();
     for descriptor_path in descriptor_paths {
         let source = vfs.read_text(&descriptor_path)?;
         let texture: TextureFile =
@@ -100,6 +107,14 @@ pub fn load_texture_catalog(vfs: &HdpVfs) -> Result<TextureCatalog, TextureCatal
                 ),
             })?;
         let path = vfs.resolve_path(Some(&descriptor_path), &texture.image);
+        if let Some(previous) = metadata.insert(path.clone(), texture.metadata.canonical()) {
+            if previous != texture.metadata.canonical() {
+                return Err(TextureCatalogError::Data {
+                    path: descriptor_path,
+                    message: format!("conflicting texture metadata for `{path}`"),
+                });
+            }
+        }
 
         if let Some(name) = texture.name {
             insert_texture(
@@ -128,7 +143,7 @@ pub fn load_texture_catalog(vfs: &HdpVfs) -> Result<TextureCatalog, TextureCatal
             )?;
         }
     }
-    Ok(TextureCatalog { textures })
+    Ok(TextureCatalog { textures, metadata })
 }
 
 fn insert_texture(
@@ -223,6 +238,7 @@ mod tests {
     #[test]
     fn slider_skin_resolves_catalog_regions_without_image_loading() {
         let textures = TextureCatalog {
+            metadata: Default::default(),
             textures: ["track", "fill", "thumb"]
                 .into_iter()
                 .map(|name| {
@@ -255,6 +271,7 @@ mod tests {
     #[test]
     fn story_background_effects_resolve_catalog_names() {
         let catalog = TextureCatalog {
+            metadata: Default::default(),
             textures: BTreeMap::from([(
                 "bg/016/001".to_string(),
                 TextureDefinition {

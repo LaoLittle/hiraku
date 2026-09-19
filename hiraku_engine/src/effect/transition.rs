@@ -17,6 +17,8 @@ pub struct RuleTransitionMesh(pub Handle<Mesh>);
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, RuleTransitionUniform)]
 pub struct RuleTransitionMaterial {
+    #[uniform(15)]
+    pub sampling: UVec4,
     #[texture(1)]
     #[sampler(2)]
     pub from_texture: Handle<Image>,

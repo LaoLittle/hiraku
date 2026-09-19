@@ -31,6 +31,8 @@ pub struct SpriteUniform {
 
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
 pub struct Sprite3dMaterial {
+    #[uniform(3)]
+    pub sampling: UVec4,
     #[uniform(0)]
     pub(crate) uniform: SpriteUniform,
     #[texture(1)]
@@ -98,6 +100,7 @@ impl Sprite3dMaterial {
         }
         Self {
             image: sprite.image.clone(),
+            sampling: UVec4::ZERO,
             uniform: SpriteUniform {
                 clip_bounds: sprite
                     .clip

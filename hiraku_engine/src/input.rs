@@ -154,6 +154,7 @@ mod tests {
         use bevy::{ecs::message::MessageCursor, window::RequestRedraw};
         for pointer in [HirakuPointerId::Pointer(0), HirakuPointerId::Touch(7)] {
             let mut app = App::new();
+            app.init_resource::<bevy::picking::pointer::PointerMap>();
             app.insert_resource(HirakuCanvas {
                 image: Handle::default(),
                 size: UVec2::new(800, 600),
@@ -264,6 +265,7 @@ mod tests {
     fn touch_scroll_cancels_click_and_keeps_fingers_independent() {
         use bevy::picking::{backend::HitData, hover::HoverMap};
         let mut app = App::new();
+        app.init_resource::<bevy::picking::pointer::PointerMap>();
         app.insert_resource(HirakuCanvas {
             image: Handle::default(),
             size: UVec2::new(800, 600),
@@ -382,6 +384,7 @@ mod tests {
     #[test]
     fn scroll_sets_virtual_pointer_location_and_preserves_delta_units() {
         let mut app = App::new();
+        app.init_resource::<bevy::picking::pointer::PointerMap>();
         app.insert_resource(HirakuCanvas {
             image: Handle::default(),
             size: UVec2::new(800, 600),

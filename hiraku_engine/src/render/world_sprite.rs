@@ -83,6 +83,8 @@ impl WorldSprite {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, WorldSpriteUniform)]
 pub struct WorldSpriteMaterial {
+    #[uniform(15)]
+    pub sampling: UVec4,
     pub clip_plane: Vec4,
     pub slice_borders: Vec4,
     pub slice_size: Vec4,
@@ -156,6 +158,7 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
+        sampling: UVec4::ZERO,
         clip_plane: sprite
             .clip_plane
             .map_or(Vec4::ZERO, |plane| plane.extend(1.0)),

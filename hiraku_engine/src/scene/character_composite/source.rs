@@ -50,10 +50,10 @@ impl AssetLoader for AtlasSourceLoader {
     ) -> Result<Self::Asset, Self::Error> {
         let mut settings = settings.clone();
         settings.asset_usage = RenderAssetUsages::MAIN_WORLD;
-        ImageLoader::new(CompressedImageFormats::NONE)
+        let image = ImageLoader::new(CompressedImageFormats::NONE)
             .load(reader, &settings, context)
-            .await
-            .map(AtlasSource)
+            .await?;
+        Ok(AtlasSource(image))
     }
 
     // Select by requested asset type only; never replace the normal PNG loader.

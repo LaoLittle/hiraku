@@ -20,6 +20,8 @@ pub fn load_internal_shaders(app: &mut App) {
 #[uniform(0, AlphaMaskUniform)]
 #[bind_group_data(AlphaMaskKey)]
 pub struct AlphaMaskMaterial {
+    #[uniform(15)]
+    pub sampling: UVec4,
     #[texture(1)]
     #[sampler(2)]
     pub texture: Handle<Image>,
@@ -110,6 +112,8 @@ impl Material for AlphaMaskMaterial {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, MultiplyUniform)]
 pub struct MultiplyMaterial {
+    #[uniform(15)]
+    pub sampling: UVec4,
     #[texture(1)]
     #[sampler(2)]
     pub texture: Handle<Image>,
@@ -205,6 +209,7 @@ mod tests {
     #[test]
     fn mask_blend_mode_is_part_of_pipeline_key_not_uniform_layout() {
         let mut material = AlphaMaskMaterial {
+            sampling: UVec4::ZERO,
             texture: Handle::default(),
             mask_texture: Handle::default(),
             tint: Vec4::ONE,
