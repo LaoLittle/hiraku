@@ -21,6 +21,7 @@ pub struct ProjectInterface {
     pub(crate) type_parameters: BTreeMap<SymbolId, Vec<SymbolId>>,
     pub(crate) symbols: SymbolManifest,
     pub(crate) functions: BTreeMap<SymbolId, FunctionSignature>,
+    pub(crate) globals: BTreeMap<String, (crate::ScriptType, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +166,7 @@ fn compile_project_impl(
         type_parameters: BTreeMap::new(),
         symbols: natives.symbols().clone(),
         functions: BTreeMap::new(),
+        globals: BTreeMap::new(),
     };
     let mut type_owners = BTreeMap::new();
     for (source, program) in sources.iter().zip(&parsed) {
@@ -325,6 +327,51 @@ mod tests {
             source: source.into(),
             namespace: None,
         }
+    }
+
+    #[test]
+    fn typed_project_globals_preserve_binding_rules_across_modules() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        let common = "global var score: Int = 0\nglobal fn initialize() { score = 1 }\nglobal fn increase() { score += 1 }";
+        let project = compile_project(
+            vec![
+                source("common.hks", common),
+                source(
+                    "story.hks",
+                    "initialize()\nincrease()\nscore += 3\nglobal let result = score",
+                ),
+            ],
+            &manifest,
+        )
+        .expect("shared globals compile");
+        let mut vm =
+            crate::LinkedVm::new(project.program.clone(), project.paths["story.hks"]).expect("VM");
+        for _ in 0..1000 {
+            let event = vm.step_with_budget(&mut 1).expect("run shared state");
+            vm = crate::LinkedVm::restore(vm.snapshot(), project.program.clone())
+                .expect("restore shared state");
+            if matches!(event, Some(crate::LinkedVmEvent::Completed(_))) {
+                break;
+            }
+        }
+        assert_eq!(
+            vm.current_globals().expect("globals")["result"],
+            crate::Value::Int(5)
+        );
+        let errors = compile_project(
+            vec![
+                source("common.hks", "global let name: String = \"Alice\""),
+                source("story.hks", "name = \"Bob\""),
+            ],
+            &manifest,
+        )
+        .expect_err("shared let is immutable");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.error.message.contains("immutable")),
+            "{errors:?}"
+        );
     }
 
     #[test]

@@ -152,6 +152,65 @@ mod tests {
     }
 
     #[test]
+    fn shared_actor_initializer_retains_state_across_entry_and_restore() {
+        use crate::script::story_runtime::{StoryRuntime, StoryRuntimeEvent};
+        let sources = vec![
+            source(
+                "common/char.hks",
+                "global let alice: Actor = char(\"alice\")",
+            ),
+            source("chapter.hks", "alice.e(\"happy\")\nalice: \"Hello\""),
+        ];
+        let initializer =
+            compile_sources(sources.clone(), "common/char.hks").expect("shared actor compiles");
+        let mut runtime = StoryRuntime::new(initializer.clone()).expect("initializer");
+        for _ in 0..200 {
+            if matches!(
+                runtime.step().expect("initialize actors"),
+                Some(StoryRuntimeEvent::Completed(_))
+            ) {
+                break;
+            }
+        }
+        let initial = runtime.globals().clone();
+        let previous = runtime;
+        let chapter = compile_sources(sources, "chapter.hks")
+            .expect("consumer sees typed actor without redeclaration");
+        let mut runtime = StoryRuntime::new(chapter).expect("chapter");
+        runtime.inherit_native_state(&previous, false);
+        runtime.set_globals(initial);
+        let mut said = false;
+        for _ in 0..300 {
+            if let Some(StoryRuntimeEvent::Effect(super::super::capabilities::StoryEffect::Say {
+                speaker,
+                ..
+            })) = runtime.step().expect("shared actor works")
+            {
+                assert_eq!(speaker, "alice");
+                said = true;
+                break;
+            }
+        }
+        assert!(said);
+        let retained = runtime.globals().clone();
+        let mut repeated = StoryRuntime::new(initializer.clone()).expect("re-enter initializer");
+        repeated.inherit_native_state(&runtime, false);
+        repeated.set_globals(retained.clone());
+        for _ in 0..200 {
+            if matches!(
+                repeated.step().expect("retain initialized actors"),
+                Some(StoryRuntimeEvent::Completed(_))
+            ) {
+                break;
+            }
+        }
+        assert_eq!(repeated.globals()["alice"], retained["alice"]);
+        let restored = StoryRuntime::restore(initializer, repeated.snapshot().expect("snapshot"))
+            .expect("restore shared actors");
+        assert_eq!(restored.globals()["alice"], retained["alice"]);
+    }
+
+    #[test]
     fn script_colon_wrappers_preserve_speaker_and_template_scope() {
         for receiver in ["char(\"alice\")", "\"alice\""] {
             let code = compile_sources(

@@ -14,6 +14,37 @@ pub enum LinkedVmEvent {
     Completed(Value),
 }
 
+/// Project globals have one session value even when their slots differ between
+/// modules. Values here stay inside the linked execution's shared object heap.
+fn copy_shared_globals(source: &Vm, destination: &mut Vm) -> Result<(), VmError> {
+    let values = source
+        .bytecode()
+        .globals
+        .iter()
+        .zip(source.globals())
+        .filter(|(_, value)| !matches!(value, Value::Uninitialized))
+        .filter_map(|(symbol, value)| {
+            source
+                .bytecode()
+                .symbols
+                .resolve(*symbol)
+                .map(|name| (name, value))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut globals = destination.globals();
+    for (symbol, value) in destination.bytecode().globals.iter().zip(&mut globals) {
+        if let Some(shared) = destination
+            .bytecode()
+            .symbols
+            .resolve(*symbol)
+            .and_then(|name| values.get(name))
+        {
+            *value = shared.clone();
+        }
+    }
+    destination.set_global_values(globals)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedVmFrameSnapshot {
     pub module: ModuleId,
@@ -315,6 +346,10 @@ impl LinkedVm {
                             if let Some(globals) = self.module_globals.get(&module.0) {
                                 vm.set_compact_globals(globals)?;
                             }
+                            copy_shared_globals(
+                                &self.frames.last().ok_or(LinkedVmError::NoFrame)?.1,
+                                &mut vm,
+                            )?;
                             self.frames.push((module, vm));
                         }
                         PreparedInvocation::Native(mut call) => {
@@ -338,11 +373,12 @@ impl LinkedVm {
                     if is_root {
                         return Ok(Some(LinkedVmEvent::Completed(self.objects.export(&value)?)));
                     }
-                    self.frames.pop();
+                    let (_, completed) = self.frames.pop().ok_or(LinkedVmError::NoFrame)?;
                     if let Some((caller_module, caller)) = self.frames.last_mut() {
                         if let Some(globals) = self.module_globals.get(&caller_module.0) {
                             caller.set_compact_globals(globals)?;
                         }
+                        copy_shared_globals(&completed, caller)?;
                         caller.resume(value)?;
                         continue;
                     }
@@ -402,6 +438,7 @@ impl LinkedVm {
                             if let Some(globals) = self.module_globals.get(&module.0) {
                                 callee.set_compact_globals(globals)?;
                             }
+                            copy_shared_globals(vm, &mut callee)?;
                             self.frames.push((module, callee));
                         }
                         None => return Err(LinkedVmError::UnlinkedCall(call.function)),

@@ -293,6 +293,30 @@ pub(crate) fn collect_project_exports(
     .expect("project symbols are unique");
     lowerer.declare_types(&program);
     lowerer.declare_functions(&program);
+    for declaration in &program.statements {
+        if let Stmt::Global {
+            name,
+            mutable,
+            type_annotation: Some(annotation),
+            span,
+            ..
+        } = declaration
+        {
+            if let Some(ty) = lowerer.type_from_ast(annotation) {
+                if let Some(previous) = interface
+                    .globals
+                    .insert(name.clone(), (ty.clone(), *mutable))
+                {
+                    if previous != (ty, *mutable) {
+                        lowerer.error(
+                            format!("global `{name}` has conflicting project declarations"),
+                            *span,
+                        );
+                    }
+                }
+            }
+        }
+    }
     for (index, function) in lowerer.functions.iter().enumerate() {
         if !function.exported {
             continue;
@@ -353,6 +377,7 @@ pub(crate) fn lower_with_project_interface<'hir>(
     lowerer.external_receiver_functions = interface.receiver_functions.clone();
     lowerer.external_types = interface.types.clone();
     lowerer.external_statement_hooks = interface.statement_hooks.clone();
+    lowerer.external_globals = interface.globals.clone();
     lowerer.external_type_parameters = interface.type_parameters.clone();
     lowerer.lower(&program)
 }
@@ -394,6 +419,7 @@ struct Lowerer<'hir, 'manifest> {
     external_functions: BTreeMap<SymbolId, crate::FunctionSignature>,
     external_receiver_functions: BTreeSet<SymbolId>,
     external_types: Vec<Stmt>,
+    external_globals: BTreeMap<String, (ScriptType, bool)>,
     external_statement_hooks: BTreeSet<SymbolId>,
     external_type_parameters: BTreeMap<SymbolId, Vec<SymbolId>>,
     lowered_functions: Vec<HirFunction<'hir>>,
@@ -482,6 +508,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             external_functions: BTreeMap::new(),
             external_receiver_functions: BTreeSet::new(),
             external_types: Vec::new(),
+            external_globals: BTreeMap::new(),
             external_statement_hooks: BTreeSet::new(),
             external_type_parameters: BTreeMap::new(),
             lowered_functions: Vec::new(),
@@ -579,6 +606,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             resolved.external_functions = self.external_functions;
             resolved.external_receiver_functions = self.external_receiver_functions;
             resolved.external_types = self.external_types;
+            resolved.external_globals = self.external_globals;
             resolved.external_statement_hooks = self.external_statement_hooks;
             resolved.external_type_parameters = self.external_type_parameters;
             resolved.numeric_hints = hints;
@@ -758,6 +786,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .and_then(|ty| self.type_from_ast(ty))
                 .unwrap_or(ScriptType::Any);
             self.push_global(name, ty, *mutable, false, Some(*span));
+        }
+        for (name, (ty, mutable)) in self.external_globals.clone() {
+            let symbol = self.symbol(&name);
+            if !self.global_names.contains_key(&symbol) {
+                self.push_global(&name, ty, mutable, false, None);
+            }
         }
     }
 
