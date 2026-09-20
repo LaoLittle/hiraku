@@ -75,6 +75,7 @@ pub use string_pool::SharedStrings;
 pub use fingerprint::ProgramFingerprint;
 pub mod debug;
 pub mod project;
+pub mod contract;
 pub use project::{
     CompiledProject, ProjectError, ProjectLinkPolicy, ScriptSource, compile_project,
     compile_project_with_policy,

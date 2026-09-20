@@ -28,6 +28,175 @@ fn document(source: &str) -> UiDocument {
 }
 
 #[test]
+fn entry_contract_uses_declaration_provenance_not_native_symbol_numbers() {
+    use hiraku_script::{BuiltinManifest, SymbolInterner};
+    let compile = |origin: &str, field: &str, prefix: bool| {
+        let mut symbols = SymbolInterner::new();
+        if prefix {
+            symbols.intern("unrelatedHostSymbol");
+            symbols.intern("anotherHostSymbol");
+        }
+        let manifest = BuiltinManifest::new(Vec::<(String, hiraku_script::BuiltinId)>::new())
+            .with_type_metadata(symbols.manifest(), Default::default(), Vec::new());
+        UiDocument::compile(
+            "form.ui.hks",
+            vec![
+                ScriptSource {
+                    path: origin.into(),
+                    namespace: None,
+                    source: format!("global struct FormInput {{ name: {field} }}"),
+                },
+                ScriptSource {
+                    path: "form.ui.hks".into(),
+                    namespace: None,
+                    source: "@ui\nglobal fn main(input: FormInput, reply: (FormInput) -> Unit) {}"
+                        .into(),
+                },
+            ],
+            &manifest,
+            RenderOptions::plain(),
+        )
+        .expect("compile entry contract")
+    };
+    let story_side = compile("contracts.hks", "String", false);
+    let ui_side = compile("contracts.hks", "String", true);
+    assert_ne!(
+        story_side.entry_signature(),
+        ui_side.entry_signature(),
+        "local symbol IDs differ"
+    );
+    assert_eq!(
+        story_side.entry_contract().expect("contract"),
+        ui_side.entry_contract().expect("contract")
+    );
+    let story = hiraku_script::compile_project(
+        vec![
+            ScriptSource {
+                path: "contracts.hks".into(),
+                namespace: None,
+                source: "global struct FormInput { name: String }".into(),
+            },
+            ScriptSource {
+                path: "story.hks".into(),
+                namespace: None,
+                source: "global fn form(input: FormInput, reply: (FormInput) -> Unit) {}".into(),
+            },
+        ],
+        &NativeRegistry::<()>::new().manifest(),
+    )
+    .expect("compile independent story contract");
+    let module = story.paths["story.hks"];
+    let symbol = story.program.modules[module.0 as usize]
+        .bytecode
+        .symbols
+        .find("form")
+        .expect("function symbol");
+    assert_eq!(
+        Some(
+            story
+                .function_contract(module, symbol)
+                .expect("story contract")
+        ),
+        ui_side.entry_contract().expect("UI contract")
+    );
+    assert!(
+        story
+            .function_contract(hiraku_script::ModuleId(u32::MAX), symbol)
+            .is_err()
+    );
+    assert!(
+        story
+            .function_contract(module, hiraku_script::SymbolId(u32::MAX))
+            .is_err()
+    );
+    for different in [
+        compile("other.hks", "String", false),
+        compile("contracts.hks", "Int", false),
+    ] {
+        assert_ne!(
+            story_side.entry_contract().expect("contract"),
+            different.entry_contract().expect("contract"),
+            "same type name is insufficient when provenance or schema differs"
+        );
+    }
+}
+
+#[test]
+fn modal_contract_infers_result_from_reply_not_render_return() {
+    let shared = ScriptSource {
+        path: "shared/profile.hks".into(), namespace: None,
+        source: "global type DisplayName = String\nglobal struct ProfileInput { name: DisplayName }\nglobal enum ProfileResult { saved(DisplayName), cancelled }".into(),
+    };
+    let manifest = NativeRegistry::<()>::new().manifest();
+    let ui = UiDocument::compile("profile.ui.hks", vec![shared.clone(), ScriptSource {
+        path: "profile.ui.hks".into(), namespace: None,
+        source: "@ui\nglobal fn editProfile(input: ProfileInput, reply: (ProfileResult) -> Unit) { reply(.saved(input.name)) }".into(),
+    }], &manifest, RenderOptions::plain()).expect("typed UI authoring");
+    let story = hiraku_script::compile_project(
+        vec![
+            shared,
+            ScriptSource {
+                path: "story.hks".into(),
+                namespace: None,
+                source:
+                    "global fn expectedOpen(input: ProfileInput) -> ProfileResult { .cancelled }"
+                        .into(),
+            },
+        ],
+        &manifest,
+    )
+    .expect("caller signature");
+    let module = story.paths["story.hks"];
+    let symbol = story.program.modules[module.0 as usize]
+        .bytecode
+        .symbols
+        .find("expectedOpen")
+        .expect("function");
+    assert_eq!(
+        ui.modal_contract().expect("derive input/result"),
+        story
+            .function_contract(module, symbol)
+            .expect("caller contract")
+    );
+    assert_ne!(
+        ui.entry_contract().expect("render contract"),
+        Some(ui.modal_contract().expect("modal contract"))
+    );
+
+    let invalid_reply = UiDocument::compile(
+        "profile.ui.hks",
+        vec![ScriptSource {
+            path: "profile.ui.hks".into(),
+            namespace: None,
+            source: "@ui\nglobal fn editProfile(reply: (String) -> Unit) { reply(123) }".into(),
+        }],
+        &manifest,
+        RenderOptions::plain(),
+    )
+    .expect_err("wrong reply type must fail during compilation");
+    assert!(invalid_reply.to_string().contains("String"));
+}
+
+#[test]
+fn modal_contract_explains_invalid_entry_shapes() {
+    for source in [
+        "let name = \"Alice\"",
+        "@ui\nglobal fn main() {}",
+        "@ui\nglobal fn main(reply: () -> Unit) {}",
+        "@ui\nglobal fn main(reply: (String, Int) -> Unit) {}",
+        "@ui\nglobal fn main(reply: (String) -> Int) {}",
+        "@ui\nglobal fn main(reply: (String) -> Unit) -> Int { 1 }",
+    ] {
+        assert!(document(source).modal_contract().is_err(), "{source}");
+    }
+    assert!(
+        document("@ui\nglobal fn main(reply: (Unit) -> Unit) {}")
+            .modal_contract()
+            .is_ok()
+    );
+}
+
+#[test]
 fn shared_nominal_input_contract_is_checked_before_ui_execution() {
     use hiraku_script::{ScriptType, SymbolId};
     let document = UiDocument::compile(

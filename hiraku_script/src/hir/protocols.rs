@@ -236,6 +236,7 @@ pub(super) fn resolve(source: &Program, core: &Program) -> Result<Program, Vec<L
                 type_parameters,
                 ty,
                 span,
+                ..
             } = member
             {
                 if !associated_types.contains(member)

@@ -16,7 +16,7 @@ pub struct ScriptSource {
 #[derive(Clone, Debug, Default)]
 pub struct ProjectInterface {
     pub(crate) receiver_functions: std::collections::BTreeSet<SymbolId>,
-    pub(crate) structs: Vec<crate::Stmt>,
+    pub(crate) types: Vec<crate::Stmt>,
     pub(crate) statement_hooks: std::collections::BTreeSet<SymbolId>,
     pub(crate) type_parameters: BTreeMap<SymbolId, Vec<SymbolId>>,
     pub(crate) symbols: SymbolManifest,
@@ -27,6 +27,38 @@ pub struct ProjectInterface {
 pub struct CompiledProject {
     pub paths: BTreeMap<String, ModuleId>,
     pub program: LinkedProgram,
+    /// Nominal declaration provenance, scoped to each compiled module.
+    /// These paths are compiler inputs, not runtime symbol or heap identities.
+    pub type_origins: BTreeMap<ModuleId, BTreeMap<String, String>>,
+}
+
+impl CompiledProject {
+    /// Resolve a script definition's contract without exporting native
+    /// capabilities or assuming another program uses the same SymbolIds.
+    pub fn function_contract(
+        &self,
+        module: ModuleId,
+        symbol: SymbolId,
+    ) -> Result<crate::contract::FunctionContract, crate::contract::ContractError> {
+        use crate::contract::{ContractError, FunctionContract};
+        let bytecode = &self
+            .program
+            .modules
+            .get(module.0 as usize)
+            .ok_or(ContractError::MissingModule(module))?
+            .bytecode;
+        let signature = &bytecode
+            .functions
+            .iter()
+            .find(|function| function.name == symbol)
+            .ok_or(ContractError::MissingFunction { module, symbol })?
+            .signature;
+        let origins = self
+            .type_origins
+            .get(&module)
+            .ok_or(ContractError::MissingModule(module))?;
+        FunctionContract::new(signature, &bytecode.symbols, origins)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +160,7 @@ fn compile_project_impl(
     }
     let mut interface = ProjectInterface {
         receiver_functions: Default::default(),
-        structs: Vec::new(),
+        types: Vec::new(),
         statement_hooks: Default::default(),
         type_parameters: BTreeMap::new(),
         symbols: natives.symbols().clone(),
@@ -137,12 +169,24 @@ fn compile_project_impl(
     let mut type_owners = BTreeMap::new();
     for (source, program) in sources.iter().zip(&parsed) {
         for declaration in &program.statements {
-            let crate::Stmt::Struct {
+            let (crate::Stmt::Struct {
                 exported: true,
                 name,
                 span,
                 ..
-            } = declaration
+            }
+            | crate::Stmt::Enum {
+                exported: true,
+                name,
+                span,
+                ..
+            }
+            | crate::Stmt::TypeAlias {
+                exported: true,
+                name,
+                span,
+                ..
+            }) = declaration
             else {
                 continue;
             };
@@ -157,7 +201,7 @@ fn compile_project_impl(
                     },
                 });
             } else {
-                interface.structs.push(declaration.clone());
+                interface.types.push(declaration.clone());
             }
         }
     }
@@ -252,7 +296,24 @@ fn compile_project_impl(
                 .collect::<Vec<_>>()
         },
     )?;
-    Ok(CompiledProject { paths, program })
+    let mut type_origins = BTreeMap::new();
+    for (source, parsed) in sources.iter().zip(&parsed) {
+        let mut origins = type_owners.clone();
+        for declaration in &parsed.statements {
+            match declaration {
+                crate::Stmt::Struct { name, .. } | crate::Stmt::Enum { name, .. } => {
+                    origins.insert(name.clone(), source.path.clone());
+                }
+                _ => {}
+            }
+        }
+        type_origins.insert(paths[&source.path], origins);
+    }
+    Ok(CompiledProject {
+        paths,
+        program,
+        type_origins,
+    })
 }
 
 #[cfg(test)]
@@ -263,6 +324,65 @@ mod tests {
             path: path.into(),
             source: source.into(),
             namespace: None,
+        }
+    }
+
+    #[test]
+    fn shared_enums_and_aliases_link_without_copying_declarations() {
+        let project = compile_project(vec![
+            source("contracts.hks", "global enum Reply<T> { accepted(T), cancelled }\nglobal type Name = String\nglobal struct Input { name: Name }"),
+            source("form.hks", "global fn accept(input: Input) -> Reply<Name> { .accepted(input.name) }"),
+            source("story.hks", "global let answer = when accept(Input.{ name: \"Alice\" }) { .accepted(name) -> name, .cancelled -> \"Bob\" }"),
+        ], &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new())).expect("shared data types compile");
+        let mut vm =
+            crate::LinkedVm::new(project.program.clone(), project.paths["story.hks"]).expect("VM");
+        for _ in 0..1000 {
+            if matches!(
+                vm.step().expect("execute shared enum"),
+                Some(crate::LinkedVmEvent::Completed(_))
+            ) {
+                break;
+            }
+        }
+        assert_eq!(
+            vm.current_globals().expect("globals").get("answer"),
+            Some(&crate::Value::String("Alice".into()))
+        );
+        let module = project.paths["form.hks"];
+        let symbol = project.program.modules[module.0 as usize]
+            .bytecode
+            .symbols
+            .find("accept")
+            .expect("export");
+        project
+            .function_contract(module, symbol)
+            .expect("enum provenance is available");
+    }
+
+    #[test]
+    fn exported_types_have_one_owner_across_all_declaration_kinds() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for conflicting in [
+            "global enum Input { cancelled }",
+            "global type Input = String",
+            "struct Input {}",
+            "enum Input { cancelled }",
+            "type Input = String",
+        ] {
+            let errors = compile_project(
+                vec![
+                    source("contracts.hks", "global struct Input {}"),
+                    source("form.hks", conflicting),
+                ],
+                &manifest,
+            )
+            .expect_err("shared type cannot be redefined or shadowed");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains("type `Input`")),
+                "{errors:?}"
+            );
         }
     }
 

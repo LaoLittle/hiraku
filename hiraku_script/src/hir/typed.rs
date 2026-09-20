@@ -285,7 +285,7 @@ pub(crate) fn collect_project_exports(
     let program = super::prepare::prepare(program)?;
     let arena = HirArena::new();
     let mut lowerer = Lowerer::new(&arena, &program, Some(manifest));
-    lowerer.external_structs = interface.structs.clone();
+    lowerer.external_types = interface.types.clone();
     lowerer.symbols = SymbolInterner::from_manifest(super::normalize_program_symbols(
         &program,
         Some(&interface.symbols),
@@ -351,7 +351,7 @@ pub(crate) fn lower_with_project_interface<'hir>(
     .expect("project symbols are unique");
     lowerer.external_functions = interface.functions.clone();
     lowerer.external_receiver_functions = interface.receiver_functions.clone();
-    lowerer.external_structs = interface.structs.clone();
+    lowerer.external_types = interface.types.clone();
     lowerer.external_statement_hooks = interface.statement_hooks.clone();
     lowerer.external_type_parameters = interface.type_parameters.clone();
     lowerer.lower(&program)
@@ -393,7 +393,7 @@ struct Lowerer<'hir, 'manifest> {
     functions: Vec<FunctionDeclaration>,
     external_functions: BTreeMap<SymbolId, crate::FunctionSignature>,
     external_receiver_functions: BTreeSet<SymbolId>,
-    external_structs: Vec<Stmt>,
+    external_types: Vec<Stmt>,
     external_statement_hooks: BTreeSet<SymbolId>,
     external_type_parameters: BTreeMap<SymbolId, Vec<SymbolId>>,
     lowered_functions: Vec<HirFunction<'hir>>,
@@ -481,7 +481,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             functions: Vec::new(),
             external_functions: BTreeMap::new(),
             external_receiver_functions: BTreeSet::new(),
-            external_structs: Vec::new(),
+            external_types: Vec::new(),
             external_statement_hooks: BTreeSet::new(),
             external_type_parameters: BTreeMap::new(),
             lowered_functions: Vec::new(),
@@ -578,7 +578,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 .expect("the existing project symbol table is valid");
             resolved.external_functions = self.external_functions;
             resolved.external_receiver_functions = self.external_receiver_functions;
-            resolved.external_structs = self.external_structs;
+            resolved.external_types = self.external_types;
             resolved.external_statement_hooks = self.external_statement_hooks;
             resolved.external_type_parameters = self.external_type_parameters;
             resolved.numeric_hints = hints;
@@ -592,11 +592,16 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         let globals = self.arena.alloc_slice_copy(&self.globals);
         let functions = self.arena.alloc_slice_copy(&self.lowered_functions);
         let global_names = self
-            .external_structs
+            .external_types
             .iter()
             .chain(&source.statements)
             .filter_map(|statement| match statement {
                 Stmt::Struct {
+                    exported: true,
+                    name,
+                    ..
+                }
+                | Stmt::Enum {
                     exported: true,
                     name,
                     ..
@@ -621,36 +626,59 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     }
 
     fn declare_types(&mut self, program: &Program) {
-        for declaration in self.external_structs.clone() {
-            let Stmt::Struct {
-                name,
-                type_parameters,
-                ty,
-                ..
-            } = declaration
-            else {
-                continue;
+        for declaration in self.external_types.clone() {
+            let name = match &declaration {
+                Stmt::Struct { name, .. }
+                | Stmt::Enum { name, .. }
+                | Stmt::TypeAlias { name, .. } => name,
+                _ => continue,
             };
             if let Some(local) = program.statements.iter().find(
-                |statement| matches!(statement, Stmt::Struct { name: local, .. } if local == &name),
+                |statement| matches!(statement,
+                    Stmt::Struct { name: local, .. } | Stmt::Enum { name: local, .. } | Stmt::TypeAlias { name: local, .. }
+                    if local == name),
             ) {
                 if let Stmt::Struct {
                     exported: false,
                     span,
                     ..
-                } = local
+                } | Stmt::Enum { exported: false, span, .. } | Stmt::TypeAlias { exported: false, span, .. } = local
                 {
                     self.error(format!("private type `{name}` conflicts with an exported type; use a distinct name"), *span);
                 }
                 continue;
             }
-            self.aliases.insert(
-                name,
-                TypeAliasDeclaration {
-                    parameters: type_parameters,
-                    body: ty,
-                },
-            );
+            match declaration {
+                Stmt::Enum {
+                    name,
+                    type_parameters,
+                    variants,
+                    ..
+                } => {
+                    self.enums.insert(name, (type_parameters, variants));
+                }
+                Stmt::Struct {
+                    name,
+                    type_parameters,
+                    ty,
+                    ..
+                }
+                | Stmt::TypeAlias {
+                    name,
+                    type_parameters,
+                    ty,
+                    ..
+                } => {
+                    self.aliases.insert(
+                        name,
+                        TypeAliasDeclaration {
+                            parameters: type_parameters,
+                            body: ty,
+                        },
+                    );
+                }
+                _ => {}
+            }
         }
         for statement in &program.statements {
             if let Stmt::Enum {
@@ -658,6 +686,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 type_parameters,
                 variants,
                 span,
+                ..
             } = statement
             {
                 if self
@@ -675,6 +704,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 type_parameters,
                 ty,
                 span,
+                ..
             }
             | Stmt::Struct {
                 name,

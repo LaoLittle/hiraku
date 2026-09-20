@@ -72,6 +72,7 @@ pub enum Stmt {
     /// A nominal record declaration; unlike a transparent type alias its
     /// identity is the declaring module and name.
     Enum {
+        exported: bool,
         name: String,
         type_parameters: Vec<String>,
         variants: Vec<EnumVariant>,
@@ -85,6 +86,7 @@ pub enum Stmt {
         span: Span,
     },
     TypeAlias {
+        exported: bool,
         name: String,
         type_parameters: Vec<String>,
         ty: TypeExpr,

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hiraku_script::{
     BuiltinManifest, LinkedProgram, LinkedVm, LinkedVmError, ModuleId, RenderOptions, ScriptSource,
@@ -16,6 +16,7 @@ pub struct UiDocument {
     pub entry_symbol: Option<SymbolId>,
     pub owned_globals: BTreeSet<String>,
     pub plan: CompositionPlan,
+    entry_type_origins: BTreeMap<String, String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +24,64 @@ pub struct UiDocument {
 pub struct UiCompileError(pub String);
 
 impl UiDocument {
+    /// Derive the caller-facing `(inputs...) -> Reply` contract from an entry
+    /// ending in `reply: (Reply) -> Unit`. Rendering itself returns Unit.
+    /// This checks metadata only; the embedding must install a scoped reply
+    /// capability and validate transported values before using this contract.
+    pub fn modal_contract(
+        &self,
+    ) -> Result<hiraku_script::contract::FunctionContract, UiCompileError> {
+        use hiraku_script::ScriptType;
+        let entry = self.entry_signature().ok_or_else(|| {
+            UiCompileError("a typed modal UI requires an `@ui global fn` entrypoint".into())
+        })?;
+        if entry.receiver.is_some() || entry.variadic.is_some() || entry.result != ScriptType::Unit
+        {
+            return Err(UiCompileError("a typed modal UI entry must be a non-variadic function returning Unit; send the result through its reply callback".into()));
+        }
+        let Some((ScriptType::Callable { parameters, result }, inputs)) =
+            entry.parameters.split_last()
+        else {
+            return Err(UiCompileError(
+                "a typed modal UI entry must end with `reply: (ResultType) -> Unit`".into(),
+            ));
+        };
+        if parameters.len() != 1 || result.as_ref() != &ScriptType::Unit {
+            return Err(UiCompileError(
+                "the modal reply callback must accept exactly one result and return Unit".into(),
+            ));
+        }
+        hiraku_script::contract::FunctionContract::new(
+            &hiraku_script::FunctionSignature {
+                receiver: None,
+                parameters: inputs.to_vec(),
+                variadic: None,
+                result: parameters[0].clone(),
+            },
+            &self.program.modules[self.entry.0 as usize].bytecode.symbols,
+            &self.entry_type_origins,
+        )
+        .map_err(|error| UiCompileError(format!("invalid modal UI contract: {error}")))
+    }
+
+    /// Compare rendering entries across independently compiled programs without
+    /// comparing their local SymbolIds. This is not a modal reply contract.
+    pub fn entry_contract(
+        &self,
+    ) -> Result<
+        Option<hiraku_script::contract::FunctionContract>,
+        hiraku_script::contract::ContractError,
+    > {
+        self.entry_signature()
+            .map(|signature| {
+                hiraku_script::contract::FunctionContract::new(
+                    signature,
+                    &self.program.modules[self.entry.0 as usize].bytecode.symbols,
+                    &self.entry_type_origins,
+                )
+            })
+            .transpose()
+    }
     /// The compiled rendering-entry contract. Its result is the rendering
     /// function's result, not the eventual value returned by a modal UI.
     /// Nominal symbols belong to `program`; unrelated programs must not reuse them.
@@ -140,6 +199,9 @@ impl UiDocument {
                 .extend(dependency.structural_paths.iter().cloned());
         }
         Ok(Self {
+            entry_type_origins: project.type_origins.get(&entry).cloned().ok_or_else(|| {
+                UiCompileError("compiled UI entry is missing its type provenance".into())
+            })?,
             program: project.program,
             entry,
             entry_symbol,

@@ -1068,6 +1068,7 @@ impl Parser {
             self.error_here("enum requires at least one variant");
         }
         Stmt::Enum {
+            exported: false,
             name,
             type_parameters,
             variants,
@@ -1146,6 +1147,7 @@ impl Parser {
         let ty = self.parse_type();
         let span = Span::join(&start.span, &ty.span);
         Stmt::TypeAlias {
+            exported: false,
             name,
             type_parameters,
             ty,
@@ -1274,6 +1276,20 @@ impl Parser {
 
     fn parse_global(&mut self) -> Stmt {
         let start = self.advance();
+        if matches!(&self.current().kind, TokenKind::Ident(name) if name == "enum" || name == "type")
+        {
+            let mut declaration = if matches!(&self.current().kind, TokenKind::Ident(name) if name == "enum")
+            {
+                self.parse_enum()
+            } else {
+                self.parse_type_alias()
+            };
+            match &mut declaration {
+                Stmt::Enum { exported, .. } | Stmt::TypeAlias { exported, .. } => *exported = true,
+                _ => unreachable!("type declaration parser returned a different statement"),
+            }
+            return declaration;
+        }
         if matches!(&self.current().kind, TokenKind::Ident(name) if name == "struct") {
             let mut declaration = self.parse_struct();
             if let Stmt::Struct { exported, .. } = &mut declaration {
@@ -1291,7 +1307,7 @@ impl Parser {
                 mutable
             }
             _ => {
-                self.error_here("expected `let`, `var`, `fn`, or `struct` after `global`; use `global let` for a fixed binding or `global var` for a reassignable binding");
+                self.error_here("expected `let`, `var`, `fn`, `struct`, `enum`, or `type` after `global`; use `global let` for a fixed binding or `global var` for a reassignable binding");
                 false
             }
         };
