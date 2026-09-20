@@ -390,12 +390,10 @@ impl StoryRuntime {
         let Some(ChoiceState::AwaitingSelection { options, .. }) = &self.choice else {
             return true;
         };
-        let Value::Number(index) = value else {
+        let Value::Int(index) = value else {
             return false;
         };
-        index.is_finite()
-            && *index >= 0.0
-            && index.fract() == 0.0
+        *index >= 0
             && options
                 .get(*index as usize)
                 .is_some_and(|option| option.enabled)
@@ -412,7 +410,7 @@ impl StoryRuntime {
             return Ok(());
         }
         if let Some(ChoiceState::AwaitingSelection { options, .. }) = &self.choice {
-            let Value::Number(selected) = value else {
+            let Value::Int(selected) = value else {
                 return Err(StoryRuntimeError::InvalidChoice);
             };
             let selected = selected as usize;
@@ -842,7 +840,7 @@ impl StoryRuntime {
                 {
                     self.choice = None;
                     self.execution
-                        .resume(ExecutionId::MAIN, Value::Number(selected as f64))?;
+                        .resume(ExecutionId::MAIN, Value::Int(selected as i64))?;
                     return Ok(None);
                 }
                 if self.waiting_task == Some(task) {
@@ -987,7 +985,7 @@ mod tests {
         else {
             panic!("first delay");
         };
-        assert_eq!(runtime.globals().get("built"), Some(&Value::Number(2.0)));
+        assert_eq!(runtime.globals().get("built"), Some(&Value::Int(2)));
         assert!(
             runtime.execution.mode(task).is_none(),
             "finished closure is not retained during playback"
@@ -1016,7 +1014,7 @@ mod tests {
         ));
         assert_eq!(
             runtime.globals().get("built"),
-            Some(&Value::Number(2.0)),
+            Some(&Value::Int(2)),
             "restoring playback must not repeat build-time assignments"
         );
     }
@@ -1054,7 +1052,7 @@ mod tests {
             }
         };
         assert_eq!(event, StoryRuntimeEvent::RandomInt { min: 2, max: 4 });
-        runtime.resume(Value::Number(3.0)).expect("host response");
+        runtime.resume(Value::Int(3)).expect("host response");
         for _ in 0..20 {
             if let Some(event) = runtime.step().expect("continue") {
                 assert!(!matches!(event, StoryRuntimeEvent::RandomInt { .. }));
@@ -1199,7 +1197,7 @@ mod tests {
                     )
                     .expect("restore map");
                     runtime
-                        .resume(Value::Number(room as f64))
+                        .resume(Value::Int(room as i64))
                         .expect("choose room");
                     visited[room] = true;
                     let mut waiting = false;
@@ -1626,7 +1624,7 @@ mod tests {
             first.step().expect("complete"),
             Some(StoryRuntimeEvent::Completed(_))
         ));
-        assert_eq!(first.globals().get("score"), Some(&Value::Number(2.0)));
+        assert_eq!(first.globals().get("score"), Some(&Value::Int(2)));
         let mut next = StoryRuntime::new(bytecode.clone()).expect("next entry");
         next.inherit_native_state(&first, false);
         next.set_globals(first.globals().clone());
@@ -1634,7 +1632,7 @@ mod tests {
             next.step().expect("skip initializer"),
             Some(StoryRuntimeEvent::Completed(_))
         ));
-        assert_eq!(next.globals().get("score"), Some(&Value::Number(3.0)));
+        assert_eq!(next.globals().get("score"), Some(&Value::Int(3)));
         let mut reset = StoryRuntime::new(bytecode).expect("new session");
         assert!(matches!(
             reset.step().expect("initialize again"),
@@ -1729,14 +1727,14 @@ mod tests {
         assert!(
             matches!(runtime.restored_boundary_event(), Some(StoryRuntimeEvent::Choice { enabled, .. }) if enabled == [false, true])
         );
-        assert!(!runtime.accepts_choice_response(&Value::Number(0.0)));
+        assert!(!runtime.accepts_choice_response(&Value::Int(0)));
         assert!(!runtime.accepts_choice_response(&Value::Number(0.5)));
         runtime
-            .resume(Value::Number(0.0))
+            .resume(Value::Int(0))
             .expect("disabled selection is ignored");
         assert!(runtime.step().expect("still waiting").is_none());
         runtime
-            .resume(Value::Number(1.0))
+            .resume(Value::Int(1))
             .expect("enabled branch starts");
         assert!(
             matches!(runtime.step().expect("branch executes"), Some(StoryRuntimeEvent::Effect(StoryEffect::Log(message))) if message == "bob")
@@ -1782,7 +1780,7 @@ mod tests {
     #[test]
     fn raw_ui_result_requires_and_obeys_a_concrete_cast() {
         let source = "global var answer: Int = 0\nlet result = ui.open_any(\"form\") as! .{ a: Int }\nanswer = result.a";
-        for value in [Value::Number(1.0), Value::String("alice".into())] {
+        for value in [Value::Int(1), Value::String("alice".into())] {
             let code =
                 compile_story_bytecode("memory://result.hks", source).expect("raw API compiles");
             let mut runtime = StoryRuntime::new(code).expect("runtime");
@@ -1800,7 +1798,7 @@ mod tests {
                 );
             } else {
                 while runtime.step().expect("valid result").is_some() {}
-                assert_eq!(runtime.globals().get("answer"), Some(&Value::Number(1.0)));
+                assert_eq!(runtime.globals().get("answer"), Some(&Value::Int(1)));
             }
         }
     }
@@ -1843,7 +1841,7 @@ mod tests {
             runtime.step().expect("ui.open must run"),
             Some(StoryRuntimeEvent::OpenUi {
                 path: "dialogue".to_string(),
-                arguments: vec![Value::String("Alice".to_string()), Value::Number(3.0)],
+                arguments: vec![Value::String("Alice".to_string()), Value::Int(3)],
             })
         );
     }
@@ -2154,9 +2152,7 @@ mod tests {
         }
         assert!(reached_choice);
         assert_eq!(runtime.step().expect("blocked choice can collect"), None);
-        runtime
-            .resume(Value::Number(0.0))
-            .expect("selection resumes");
+        runtime.resume(Value::Int(0)).expect("selection resumes");
         assert!(
             matches!(runtime.step().expect("captured object survives collection"), Some(StoryRuntimeEvent::Effect(StoryEffect::Say { text, .. })) if text == "alice")
         );
@@ -2186,7 +2182,7 @@ mod tests {
         );
         assert_eq!(runtime.step().expect("choice remains blocked"), None);
         runtime
-            .resume(Value::Number(1.0))
+            .resume(Value::Int(1))
             .expect("choice response resumes the VM");
         assert!(matches!(
             runtime.step().expect("selected branch runs"),
@@ -2228,7 +2224,7 @@ mod tests {
             Some(StoryRuntimeEvent::Choice { .. })
         ));
         runtime
-            .resume(Value::Number(0.0))
+            .resume(Value::Int(0))
             .expect("choice response must start the selected branch");
         assert_eq!(
             runtime.step().expect("movie must suspend its branch"),
@@ -2287,7 +2283,7 @@ mod tests {
             })
         );
         restored
-            .resume(Value::Number(1.0))
+            .resume(Value::Int(1))
             .expect("restored selection must start its branch");
         assert!(matches!(
             restored.step().expect("captured branch must run"),

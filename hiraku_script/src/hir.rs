@@ -389,7 +389,8 @@ fn intern_expression(expression: &Expr, symbols: &mut SymbolInterner) {
         | ExprKind::Null
         | ExprKind::Ellipsis
         | ExprKind::Bool(_)
-        | ExprKind::Number { .. } => {}
+        | ExprKind::Number { .. }
+        | ExprKind::Integer(_) => {}
     }
 }
 

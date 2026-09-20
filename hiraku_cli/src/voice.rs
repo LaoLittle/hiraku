@@ -274,6 +274,7 @@ impl Collector<'_> {
             | ExprKind::Symbol(_)
             | ExprKind::Bool(_)
             | ExprKind::Number { .. }
+            | ExprKind::Integer(_)
             | ExprKind::String(_) => {}
         }
     }

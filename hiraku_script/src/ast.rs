@@ -228,6 +228,7 @@ pub enum ExprKind {
     Ident(String),
     Symbol(String),
     Bool(bool),
+    Integer(u64),
     Number {
         value: f64,
         unit: NumberUnit,

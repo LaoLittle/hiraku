@@ -117,8 +117,12 @@ pub(crate) fn update(
                     match evaluator
                         .evaluate(&expression, &models)
                         .map_err(|e| e.to_string())
-                        .and_then(|value| u32::from_hks_value(&value).map_err(|e| e.to_string()))
-                    {
+                        .and_then(|value| i64::from_hks_value(&value).map_err(|e| e.to_string()))
+                        .and_then(|value| {
+                            u32::try_from(value).map_err(|_| {
+                                "reveal count must fit a nonnegative 32-bit integer".to_string()
+                            })
+                        }) {
                         Ok(count) => rich.count = Some(count),
                         Err(error) => crate::script::emit_script_diagnostic(
                             "rich text reveal failed",

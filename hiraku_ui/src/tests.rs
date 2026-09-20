@@ -28,6 +28,63 @@ fn document(source: &str) -> UiDocument {
 }
 
 #[test]
+fn shared_nominal_input_contract_is_checked_before_ui_execution() {
+    use hiraku_script::{ScriptType, SymbolId};
+    let document = UiDocument::compile(
+        "form.ui.hks",
+        vec![
+            ScriptSource { path: "contracts.hks".into(), namespace: None,
+                source: "global struct FormInput { name: String }".into() },
+            ScriptSource { path: "form.ui.hks".into(), namespace: None,
+                source: "global var label = \"\"\n@ui\nglobal fn main(input: FormInput) { label = input.name }".into() },
+        ], &NativeRegistry::<()>::new().manifest(), RenderOptions::plain(),
+    ).expect("shared declaration compiles with UI");
+    let signature = document.entry_signature().expect("entry contract");
+    let ScriptType::Struct { name, .. } = signature.parameters[0] else {
+        panic!("nominal input");
+    };
+    let input = |type_id, value| Value::Typed {
+        type_id,
+        value: Box::new(Value::Map([("name".into(), value)].into_iter().collect())),
+    };
+    for invalid in [
+        input(name, Value::Int(1)),
+        input(SymbolId(name.0 + 1), Value::String("alice".into())),
+        Value::Map(
+            [("name".into(), Value::String("alice".into()))]
+                .into_iter()
+                .collect(),
+        ),
+    ] {
+        assert!(
+            document.invocation(vec![invalid]).is_err(),
+            "invalid input must fail before rendering"
+        );
+    }
+    let globals = compose(
+        document
+            .invocation(vec![input(name, Value::String("alice".into()))])
+            .expect("typed input"),
+        &NativeRegistry::<()>::new(),
+        &mut (),
+        &Default::default(),
+        &document.owned_globals,
+        1000,
+        |_| {},
+    )
+    .expect("render valid input");
+    assert_eq!(globals["label"], Value::String("alice".into()));
+}
+
+#[test]
+fn parameterized_ui_rejects_wrong_arity_and_scalar_type_at_invocation() {
+    let document = document("@ui\nglobal fn main(value: Float) {}");
+    assert!(document.invocation(vec![]).is_err());
+    assert!(document.invocation(vec![Value::Int(1)]).is_err());
+    assert!(document.invocation(vec![Value::Number(1.0)]).is_ok());
+}
+
+#[test]
 fn document_entry_receives_arguments_and_commits_state() {
     let document = document(
         "global var label = \"alice\"\n@ui\nglobal fn main(name: String) { label = name }",
@@ -82,7 +139,7 @@ fn file_entry_and_invocation_failures_are_explicit() {
         |_| {},
     )
     .expect("execute file entry");
-    assert_eq!(globals["count"], Value::Number(2.0));
+    assert_eq!(globals["count"], Value::Int(2));
     let endless = self::document("while true {}");
     assert!(matches!(
         compose(

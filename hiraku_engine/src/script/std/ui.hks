@@ -2,26 +2,26 @@
 // are embedding primitives; projects build and replace components using these
 // public wrappers without depending on Bevy or Rust UI types.
 
-global fn screen(content: Function) -> UiNode {
+global fn screen(content: () -> Unit) -> UiNode {
     __uiScreen(content)
 }
 
 // A transparent, unpanelled full-root layout suitable for HUDs and overlays.
-global fn canvas(content: Function) -> UiNode {
+global fn canvas(content: () -> Unit) -> UiNode {
     __uiScreen(content)
         .panel(false)
         .overlay(0.0, 0.0, 0.0, 0.0)
 }
 
-global fn column(content: Function) -> UiNode {
+global fn column(content: () -> Unit) -> UiNode {
     __uiColumn(content)
 }
 
-global fn row(content: Function) -> UiNode {
+global fn row(content: () -> Unit) -> UiNode {
     __uiRow(content)
 }
 
-global fn scrollable(content: Function) -> UiNode {
+global fn scrollable(content: () -> Unit) -> UiNode {
     __uiScrollable(content)
 }
 

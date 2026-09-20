@@ -431,6 +431,7 @@ impl StoredValue {
         match self {
             Self::Bool(value) => value.to_string(),
             Self::Int(value) => value.to_string(),
+            Self::UInt(value) => value.to_string(),
             Self::Float(value) => value.to_string(),
             Self::String(value) => value.clone(),
             Self::Array(_) | Self::Map(_) => "<object>".to_string(),

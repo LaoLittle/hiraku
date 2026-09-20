@@ -148,6 +148,8 @@ pub struct HirWhenArm<'hir> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HirLiteral<'hir> {
+    Int(i64),
+    UInt(u64),
     Unit,
     Null,
     Ellipsis,
@@ -1547,6 +1549,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 HirExprKind::Literal(HirLiteral::Bool(*value)),
                 ScriptType::Bool,
             ),
+            ExprKind::Integer(value) => match i64::try_from(*value) {
+                Ok(value) => (
+                    HirExprKind::Literal(HirLiteral::Int(value)),
+                    ScriptType::Int,
+                ),
+                Err(_) => {
+                    self.error(
+                        "integer literal exceeds Int; provide a UInt type annotation",
+                        expression.span,
+                    );
+                    (
+                        HirExprKind::Literal(HirLiteral::UInt(*value)),
+                        ScriptType::UInt,
+                    )
+                }
+            },
             ExprKind::Number { value, unit } => (
                 HirExprKind::Literal(HirLiteral::Number {
                     value: *value,
@@ -1554,7 +1572,6 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 }),
                 match unit {
                     NumberUnit::Percent => ScriptType::Percent,
-                    NumberUnit::Scalar if value.fract() == 0.0 => ScriptType::Int,
                     NumberUnit::Scalar => ScriptType::Float,
                 },
             ),
@@ -1648,12 +1665,23 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 )
             }
             ExprKind::UnaryMinus(value) => {
+                if matches!(value.kind, ExprKind::Integer(9_223_372_036_854_775_808)) {
+                    return self.alloc_expression(
+                        HirExprKind::Literal(HirLiteral::Int(i64::MIN)),
+                        ScriptType::Int,
+                        expression.span,
+                    );
+                }
                 let value = self.lower_expression(value);
                 let method = self.symbol("protocol#Negate#negate");
                 // Preserve signed-literal provenance for contextual Float
                 // inference and cross-module argument checks.
-                if !matches!(value.kind, HirExprKind::Literal(HirLiteral::Number { .. }))
-                    && let Some(function) = self.methods.get(&(value.ty, method)).copied()
+                if !matches!(
+                    value.kind,
+                    HirExprKind::Literal(
+                        HirLiteral::Number { .. } | HirLiteral::Int(_) | HirLiteral::UInt(_)
+                    )
+                ) && let Some(function) = self.methods.get(&(value.ty, method)).copied()
                 {
                     return self.accessor_call(function, &[value], expression.span);
                 }
@@ -2157,14 +2185,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     );
                 }
                 if let Some(block) = trailing_block {
-                    self.return_context.push(None);
-                    let block = self.lower_block(block, true);
-                    self.return_context.pop();
-                    let closure = self.alloc_expression(
-                        HirExprKind::Block(block),
-                        ScriptType::Function,
-                        block.span,
-                    );
+                    let expected = expected_parameters
+                        .as_ref()
+                        .and_then(|parameters| parameters.get(arguments.len()));
+                    let closure = self.lower_trailing_closure(block, expected);
                     arguments.push(HirArgument {
                         label: None,
                         value: closure,
@@ -2491,6 +2515,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         let primitive = matches!(
                             self.expression_type(left),
                             ScriptType::Int
+                                | ScriptType::UInt
                                 | ScriptType::Float
                                 | ScriptType::String
                                 | ScriptType::Bool
@@ -2530,6 +2555,30 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         }
                     }
                 }
+                if self.expression_type(left) == &ScriptType::UInt
+                    && matches!(right_syntax.kind, ExprKind::Integer(_))
+                {
+                    right = self.lower_expression_expected(right_syntax, Some(&ScriptType::UInt));
+                } else if self.expression_type(right) == &ScriptType::UInt
+                    && matches!(left_syntax.kind, ExprKind::Integer(_))
+                {
+                    left = self.lower_expression_expected(left_syntax, Some(&ScriptType::UInt));
+                }
+                if self.expression_type(left) != self.expression_type(right)
+                    && matches!(
+                        self.expression_type(left),
+                        ScriptType::Int | ScriptType::UInt
+                    )
+                    && matches!(
+                        self.expression_type(right),
+                        ScriptType::Int | ScriptType::UInt
+                    )
+                {
+                    self.error(
+                        "Int and UInt require an explicit conversion before use together",
+                        expression.span,
+                    );
+                }
                 if self.expression_type(left) == &ScriptType::Float
                     && self.expression_type(right) == &ScriptType::Int
                 {
@@ -2564,6 +2613,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         matches!(
                             ty,
                             ScriptType::Int
+                                | ScriptType::UInt
                                 | ScriptType::Float
                                 | ScriptType::Never
                                 | ScriptType::Any
@@ -2586,7 +2636,10 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     for operand in [left, right] {
                         if !matches!(
                             self.expression_type(operand),
-                            ScriptType::Int | ScriptType::Float | ScriptType::Never
+                            ScriptType::Int
+                                | ScriptType::UInt
+                                | ScriptType::Float
+                                | ScriptType::Never
                         ) {
                             self.error(
                                 format!(
@@ -2674,6 +2727,26 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     /// `UiPosition`, `.rel(50, 50)` is resolved as `UiPosition.rel(50, 50)`.
     /// This keeps selector syntax concise without making static member names
     /// globally unique.
+    fn lower_trailing_closure(
+        &mut self,
+        block: &crate::Block,
+        expected: Option<&ScriptType>,
+    ) -> &'hir HirExpr<'hir> {
+        if matches!(expected, Some(ScriptType::Callable { .. })) {
+            return self.lower_expression_expected(
+                &crate::Expr {
+                    kind: ExprKind::Block(block.clone()),
+                    span: block.span,
+                },
+                expected,
+            );
+        }
+        self.return_context.push(None);
+        let block = self.lower_block(block, true);
+        self.return_context.pop();
+        self.alloc_expression(HirExprKind::Block(block), ScriptType::Function, block.span)
+    }
+
     fn lower_expression_expected(
         &mut self,
         expression: &Expr,
@@ -2688,6 +2761,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 ScriptType::Symbol,
                 expression.span,
             );
+        }
+        if let ExprKind::Integer(value) = expression.kind {
+            let literal = match expected {
+                Some(ScriptType::UInt) => Some((HirLiteral::UInt(value), ScriptType::UInt)),
+                Some(ScriptType::Float) => Some((
+                    HirLiteral::Number {
+                        value: value as f64,
+                        unit: NumberUnit::Scalar,
+                    },
+                    ScriptType::Float,
+                )),
+                _ => None,
+            };
+            if let Some((literal, ty)) = literal {
+                return self.alloc_expression(HirExprKind::Literal(literal), ty, expression.span);
+            }
         }
         if let ExprKind::Elvis { value, fallback } = &expression.kind {
             return self.lower_elvis(value, fallback, expected, expression.span);
@@ -2822,10 +2911,47 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             && !types.contains(&ScriptType::Int)
             && matches!(
                 expression.kind,
-                ExprKind::Number { .. } | ExprKind::UnaryMinus(_)
+                ExprKind::Integer(_) | ExprKind::Number { .. } | ExprKind::UnaryMinus(_)
             )
         {
             return self.lower_expression_expected(expression, Some(&ScriptType::Float));
+        }
+        if let Some(ScriptType::Union(types)) = expected
+            && types.contains(&ScriptType::UInt)
+            && !types.contains(&ScriptType::Int)
+            && !types.contains(&ScriptType::Float)
+            && matches!(expression.kind, ExprKind::Integer(_))
+        {
+            return self.lower_expression_expected(expression, Some(&ScriptType::UInt));
+        }
+        if expected == Some(&ScriptType::UInt)
+            && let ExprKind::Binary { left, op, right } = &expression.kind
+            && matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+            )
+        {
+            let left = self.lower_expression_expected(left, expected);
+            let right = self.lower_expression_expected(right, expected);
+            self.check_assignment(
+                &ScriptType::UInt,
+                &self.expression_type(left).clone(),
+                left.span,
+            );
+            self.check_assignment(
+                &ScriptType::UInt,
+                &self.expression_type(right).clone(),
+                right.span,
+            );
+            return self.alloc_expression(
+                HirExprKind::Binary {
+                    left,
+                    op: *op,
+                    right,
+                },
+                ScriptType::UInt,
+                expression.span,
+            );
         }
         if expected == Some(&ScriptType::Float) {
             if let ExprKind::UnaryMinus(inner) = &expression.kind {
@@ -3097,16 +3223,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             })
             .collect::<Vec<_>>();
         if let Some(block) = trailing_block {
-            self.return_context.push(None);
-            let block = self.lower_block(block, true);
-            self.return_context.pop();
+            let closure = self
+                .lower_trailing_closure(block, expected_parameters.get(lowered_arguments.len()));
             lowered_arguments.push(HirArgument {
                 label: None,
-                value: self.alloc_expression(
-                    HirExprKind::Block(block),
-                    ScriptType::Function,
-                    block.span,
-                ),
+                value: closure,
                 span: block.span,
             });
         }
@@ -4060,6 +4181,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             "Never" => Some(ScriptType::Never),
             "Bool" => Some(ScriptType::Bool),
             "Int" => Some(ScriptType::Int),
+            "UInt" => Some(ScriptType::UInt),
             "Float" => Some(ScriptType::Float),
             "String" => Some(ScriptType::String),
             "TextTemplate" => Some(ScriptType::TextTemplate),
@@ -4330,13 +4452,14 @@ fn binary_type(op: BinaryOp, left: &ScriptType, right: &ScriptType) -> ScriptTyp
         | BinaryOp::LessEqual
         | BinaryOp::Greater
         | BinaryOp::GreaterEqual => ScriptType::Bool,
-        BinaryOp::Divide => ScriptType::Float,
-        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply
-            if left == &ScriptType::Int && right == &ScriptType::Int =>
+        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+            if left == right && matches!(left, ScriptType::Int | ScriptType::UInt) =>
         {
-            ScriptType::Int
+            left.clone()
         }
-        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => ScriptType::Float,
+        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+            ScriptType::Float
+        }
         BinaryOp::Colon => ScriptType::Any,
     }
 }
@@ -4375,6 +4498,7 @@ fn stable_cast_evidence(ty: &ScriptType) -> bool {
         ScriptType::Unit
             | ScriptType::Bool
             | ScriptType::Int
+            | ScriptType::UInt
             | ScriptType::Float
             | ScriptType::Percent
             | ScriptType::String
@@ -4396,9 +4520,8 @@ fn cast_certainty(source: &ScriptType, target: &ScriptType) -> CastCertainty {
         return Runtime;
     }
     match (source, target) {
-        // Numeric storage is normalized to f64. `as Int` supplies the explicit
-        // Both directions are explicitly requested by the author here.
-        (Float, Int) | (Int, Float) => Always,
+        (Int | UInt, Float) => Always,
+        (Float, Int | UInt) | (Int, UInt) | (UInt, Int) => Runtime,
         (Optional(source), Optional(target)) => cast_certainty(source, target),
         (Optional(source), target) => match cast_certainty(source, target) {
             Impossible => Impossible,
@@ -4662,6 +4785,25 @@ fn statement_span(statement: &Stmt) -> Span {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trailing_closures_obey_declared_parameter_and_return_types() {
+        for source in [
+            "fn run(body: () -> Unit) { body() }\nrun { 7 }",
+            "fn run(body: () -> Int) -> Int { body() }\nlet value: Int = run { 7 }",
+        ] {
+            let syntax = crate::parse_program(source).expect("parse");
+            let arena = crate::HirArena::new();
+            crate::lower_to_hir(&arena, &syntax, None).expect("typed trailing closure");
+        }
+        for source in [
+            "fn run(body: () -> Int) -> Int { body() }\nrun { \"alice\" }",
+            "fn run(body: (Int) -> Unit) { body(1) }\nrun {}",
+        ] {
+            let syntax = crate::parse_program(source).expect("parse");
+            let arena = crate::HirArena::new();
+            assert!(crate::lower_to_hir(&arena, &syntax, None).is_err());
+        }
+    }
     use super::*;
     use crate::parse_program;
 
@@ -4900,7 +5042,7 @@ mod tests {
 
     #[test]
     fn normalized_inference_promotes_int_to_float_but_requires_an_explicit_downcast() {
-        let accepted = parse_program("let a = 1\nlet b: Float = a\nlet c: Int = b as Int")
+        let accepted = parse_program("let a = 1\nlet b: Float = a\nlet c: Int = b as! Int")
             .expect("source parses");
         let arena = HirArena::new();
         lower_to_hir(&arena, &accepted, None).expect("numeric conversions must lower");

@@ -103,6 +103,7 @@ fn display_value(value: &StoredValue) -> Result<String, UiContextError> {
     match value {
         StoredValue::Bool(value) => Ok(value.to_string()),
         StoredValue::Int(value) => Ok(value.to_string()),
+        StoredValue::UInt(value) => Ok(value.to_string()),
         StoredValue::Float(value) => Ok(value.to_string()),
         StoredValue::String(value) => Ok(value.clone()),
         StoredValue::Array(_) | StoredValue::Map(_) => Err(UiContextError::Template(

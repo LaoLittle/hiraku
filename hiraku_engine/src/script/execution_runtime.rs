@@ -421,6 +421,7 @@ impl ExecutionRuntime {
                 if state.paused {
                     return Ok(None);
                 }
+                state.vm.set_module(state.module);
                 state.vm.set_global_values(values_from_globals(
                     state.vm.bytecode(),
                     &self.module_globals,
@@ -439,11 +440,65 @@ impl ExecutionRuntime {
             };
 
             return match event {
+                VmEvent::Invoke {
+                    callable,
+                    arguments,
+                } => {
+                    self.capture_globals(execution)?;
+                    let state = self
+                        .executions
+                        .get_mut(&execution)
+                        .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|mut argument| {
+                            argument.value = hiraku_script::linked_vm::bind_value_module(
+                                argument.value,
+                                state.module,
+                            );
+                            argument
+                        })
+                        .collect();
+                    state.vm.swap_objects(&mut self.objects);
+                    let prepared = hiraku_script::linked_vm::prepare_invocation(
+                        &self.program,
+                        callable,
+                        arguments,
+                        &mut self.objects,
+                    );
+                    state.vm.swap_objects(&mut self.objects);
+                    match prepared? {
+                        hiraku_script::linked_vm::PreparedInvocation::Script {
+                            module,
+                            vm: mut callee,
+                        } => {
+                            callee.set_read_only_globals(state.vm.read_only_globals().clone());
+                            callee.set_global_values(values_from_globals(
+                                callee.bytecode(),
+                                &self.module_globals,
+                            ))?;
+                            state.vm.swap_objects(&mut self.objects);
+                            callee.swap_objects(&mut self.objects);
+                            let caller = std::mem::replace(&mut state.vm, callee);
+                            state.callers.push((state.module, caller));
+                            state.module = module;
+                            continue;
+                        }
+                        hiraku_script::linked_vm::PreparedInvocation::Native(mut call) => {
+                            evaluate_call_templates(&mut call, |text| {
+                                state
+                                    .vm
+                                    .eval_template_value_with(text, |source| Ok(source.to_owned()))
+                            })?;
+                            Ok(Some(ExecutionEvent::Call { execution, call }))
+                        }
+                    }
+                }
                 VmEvent::BudgetExhausted => {
                     self.capture_globals(execution)?;
                     Ok(None)
                 }
-                VmEvent::Call(call) => {
+                VmEvent::Call(mut call) => {
                     self.capture_globals(execution)?;
                     let state = self
                         .executions
@@ -476,6 +531,9 @@ impl ExecutionRuntime {
                                 .into());
                             }
                             let code = self.program.modules[module.0 as usize].bytecode.clone();
+                            call.resolve_literal_arguments(
+                                &code.functions[function as usize].signature,
+                            );
                             let mut callee = Vm::from_function(
                                 code.clone(),
                                 function,
@@ -634,15 +692,19 @@ impl ExecutionRuntime {
         host_roots: &[&Value],
     ) -> Result<(), ExecutionRuntimeError> {
         if self.objects.collection_due() {
+            let roots: Vec<_> = self
+                .executions
+                .values()
+                .flat_map(|state| {
+                    state
+                        .vm
+                        .object_roots()
+                        .chain(state.callers.iter().flat_map(|(_, vm)| vm.object_roots()))
+                })
+                .collect();
             self.objects.collect(
-                self.executions
-                    .values()
-                    .flat_map(|state| {
-                        state
-                            .vm
-                            .object_roots()
-                            .chain(state.callers.iter().flat_map(|(_, vm)| vm.object_roots()))
-                    })
+                roots
+                    .iter()
                     .chain(self.module_globals.values())
                     .chain(host_roots.iter().copied()),
             )?;
@@ -657,7 +719,7 @@ impl ExecutionRuntime {
             .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?
             .vm;
         self.module_globals
-            .extend(globals_from_values(vm.bytecode(), vm.globals()));
+            .extend(globals_from_values(vm.bytecode(), &vm.globals()));
         Ok(())
     }
 
@@ -673,6 +735,8 @@ impl ExecutionRuntime {
 
 #[derive(Debug, Error)]
 pub enum ExecutionRuntimeError {
+    #[error("HKS callable dispatch failed: {0}")]
+    Callable(#[from] hiraku_script::linked_vm::LinkedVmError),
     #[error("HKS VM failed: {0}")]
     Vm(VmError),
     #[error("unknown story execution {0}")]
@@ -753,6 +817,49 @@ fn globals_from_values(bytecode: &Bytecode, values: &[Value]) -> BTreeMap<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_callback_executes_in_its_owner_and_restores_host_wait() {
+        let mut natives = hiraku_script::native::NativeRegistry::<Vec<i64>>::new();
+        natives
+            .register_fn("record", |output: &mut Vec<i64>, value: i64| {
+                output.push(value);
+                Ok(())
+            })
+            .expect("native");
+        let project = hiraku_script::compile_project([
+            ("library.hks", "let decoy: () -> Int = { 99 }\nglobal fn apply(callback: () -> Int) -> Int { callback() }"),
+            ("main.hks", "let unused = 0\nlet callback: () -> Int = { record(5); 7 }\nrecord(apply(callback))"),
+        ].into_iter().map(|(path, source)| hiraku_script::ScriptSource {
+            path: path.into(), source: source.into(), namespace: None,
+        }).collect(), &natives.manifest()).expect("project");
+        let program = crate::script::StoryProgram::Project {
+            entry: project.paths["main.hks"],
+            program: project.program,
+        };
+        let mut runtime = ExecutionRuntime::new(program.clone()).expect("runtime");
+        let mut output = Vec::new();
+        for _ in 0..100 {
+            match runtime.step().expect("execute callback") {
+                Some(ExecutionEvent::Call { execution, call }) => {
+                    let bytes = hiraku_script::hson::to_vec(&runtime.snapshot()).expect("snapshot");
+                    runtime = ExecutionRuntime::restore(
+                        program.clone(),
+                        hiraku_script::hson::from_slice(&bytes).expect("decode"),
+                    )
+                    .expect("restore");
+                    let value = natives.call(&mut output, &call).expect("native");
+                    runtime.resume(execution, value).expect("resume");
+                }
+                Some(ExecutionEvent::Completed { .. }) => {
+                    assert_eq!(output, [5, 7]);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("expected completion");
+    }
 
     #[test]
     fn extension_static_identity_survives_serialized_restore() {
@@ -852,7 +959,7 @@ mod tests {
             let Value::Map(fields) = value.as_mut() else {
                 panic!("expected fields")
             };
-            fields.insert("score".into(), Value::Number(10.0));
+            fields.insert("score".into(), Value::Int(10));
             runtime.set_globals(globals);
         }
         let encoded =
@@ -873,7 +980,7 @@ mod tests {
         };
         assert_eq!(
             fields["score"],
-            Value::Number(if update_from_host { 12.0 } else { 3.0 })
+            Value::Int(if update_from_host { 12 } else { 3 })
         );
     }
 }

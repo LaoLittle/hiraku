@@ -712,14 +712,7 @@ impl StoryNativeHost {
                 .arguments
                 .iter()
                 .map(|a| match a.value {
-                    Value::Number(n)
-                        if n.is_finite()
-                            && n.fract() == 0.0
-                            && n >= i32::MIN as f64
-                            && n <= i32::MAX as f64 =>
-                    {
-                        Some(n as i64)
-                    }
+                    Value::Int(n) if n >= i32::MIN as i64 && n <= i32::MAX as i64 => Some(n as i64),
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()

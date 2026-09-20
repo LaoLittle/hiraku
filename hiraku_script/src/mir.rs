@@ -239,6 +239,8 @@ impl MirInstruction {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirConstant {
+    Int(i64),
+    UInt(u64),
     Uninitialized,
     Null,
     Ellipsis,
@@ -741,6 +743,8 @@ impl<'types> MirBuilder<'types> {
                 result
             }
             HirExprKind::Literal(literal) => Some(self.constant(match literal {
+                HirLiteral::Int(value) => MirConstant::Int(value),
+                HirLiteral::UInt(value) => MirConstant::UInt(value),
                 HirLiteral::Unit => MirConstant::Unit,
                 HirLiteral::Null => MirConstant::Null,
                 HirLiteral::Ellipsis => MirConstant::Ellipsis,
@@ -850,10 +854,18 @@ impl<'types> MirBuilder<'types> {
                             .expect("argument type exists")
                             .clone(),
                         numeric_literal: match argument.value.kind {
-                            HirExprKind::Literal(HirLiteral::Number { .. }) => true,
+                            HirExprKind::Literal(
+                                HirLiteral::Number { .. }
+                                | HirLiteral::Int(_)
+                                | HirLiteral::UInt(_),
+                            ) => true,
                             HirExprKind::UnaryMinus(value) => matches!(
                                 value.kind,
-                                HirExprKind::Literal(HirLiteral::Number { .. })
+                                HirExprKind::Literal(
+                                    HirLiteral::Number { .. }
+                                        | HirLiteral::Int(_)
+                                        | HirLiteral::UInt(_)
+                                )
                             ),
                             _ => false,
                         },

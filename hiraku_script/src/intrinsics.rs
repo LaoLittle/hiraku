@@ -26,6 +26,7 @@ pub fn binary(name: &str) -> Option<(crate::BinaryOp, ScriptType, ScriptType)> {
     let (owner, operation) = suffix.split_once('.')?;
     let ty = match owner {
         "int" => ScriptType::Int,
+        "uint" => ScriptType::UInt,
         "float" => ScriptType::Float,
         "string" => ScriptType::String,
         "bool" => ScriptType::Bool,

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 25;
+pub const CURRENT_SAVE_VERSION: u32 = 26;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
@@ -17,6 +17,7 @@ pub struct ScriptCallFrameSnapshot {
 pub enum StoredValue {
     Bool(bool),
     Int(i64),
+    UInt(u64),
     Float(f64),
     String(String),
     Array(Vec<StoredValue>),

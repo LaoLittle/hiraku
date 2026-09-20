@@ -1,5 +1,73 @@
 type Unit = ()
 
+extend UInt {
+    fn toUInt(self) -> UInt { self }
+    @inline
+    fn toString(self) -> String { intrinsics.toString(self) }
+    fn toFloat(self) -> Float { self as Float }
+    fn toInt(self) -> Int { self as! Int }
+}
+
+extend UInt: Add<UInt> {
+    type Output = UInt
+    @inline
+    fn add(self, rhs: UInt) -> Output { intrinsics.uint.add(self, rhs) }
+}
+
+extend UInt: Subtract<UInt> {
+    type Output = UInt
+    @inline
+    fn subtract(self, rhs: UInt) -> Output { intrinsics.uint.subtract(self, rhs) }
+}
+
+extend UInt: Multiply<UInt> {
+    type Output = UInt
+    @inline
+    fn multiply(self, rhs: UInt) -> Output { intrinsics.uint.multiply(self, rhs) }
+}
+
+extend UInt: Divide<UInt> {
+    type Output = UInt
+    @inline
+    fn divide(self, rhs: UInt) -> Output { intrinsics.uint.divide(self, rhs) }
+}
+
+extend UInt: Equal<UInt> {
+    type Output = Bool
+    @inline
+    fn equal(self, rhs: UInt) -> Output { intrinsics.uint.equal(self, rhs) }
+}
+
+extend UInt: NotEqual<UInt> {
+    type Output = Bool
+    @inline
+    fn notEqual(self, rhs: UInt) -> Output { intrinsics.uint.notEqual(self, rhs) }
+}
+
+extend UInt: Less<UInt> {
+    type Output = Bool
+    @inline
+    fn less(self, rhs: UInt) -> Output { intrinsics.uint.less(self, rhs) }
+}
+
+extend UInt: LessEqual<UInt> {
+    type Output = Bool
+    @inline
+    fn lessEqual(self, rhs: UInt) -> Output { intrinsics.uint.lessEqual(self, rhs) }
+}
+
+extend UInt: Greater<UInt> {
+    type Output = Bool
+    @inline
+    fn greater(self, rhs: UInt) -> Output { intrinsics.uint.greater(self, rhs) }
+}
+
+extend UInt: GreaterEqual<UInt> {
+    type Output = Bool
+    @inline
+    fn greaterEqual(self, rhs: UInt) -> Output { intrinsics.uint.greaterEqual(self, rhs) }
+}
+
 protocol Colon<Rhs> {
     type Output
     fn colon(self, rhs: Rhs) -> Self.Output
@@ -51,6 +119,7 @@ fn unreachable() -> Never { panic("entered unreachable code") }
 fn todo() -> Never { panic("not yet implemented") }
 
 extend Float {
+    fn toUInt(self) -> UInt { self as! UInt }
     @inline
     fn toString(self) -> String { intrinsics.toString(self) }
     fn toFloat(self) -> Float { self }
@@ -59,6 +128,7 @@ extend Float {
 }
 
 extend Int {
+    fn toUInt(self) -> UInt { self as! UInt }
     @inline
     fn toString(self) -> String { intrinsics.toString(self) }
     @inline

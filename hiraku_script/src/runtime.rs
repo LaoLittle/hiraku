@@ -304,6 +304,8 @@ pub enum Value {
     Uninitialized,
     Ellipsis,
     Bool(bool),
+    Int(i64),
+    UInt(u64),
     Number(f64),
     Percent(f64),
     String(String),

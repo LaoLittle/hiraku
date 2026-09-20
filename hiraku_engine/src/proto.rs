@@ -102,7 +102,7 @@ pub struct StoredMap {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct StoredValue {
-    #[prost(oneof = "stored_value::Kind", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "stored_value::Kind", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub kind: Option<stored_value::Kind>,
 }
 
@@ -125,6 +125,8 @@ pub mod stored_value {
         Array(StoredArray),
         #[prost(message, tag = "6")]
         Map(StoredMap),
+        #[prost(uint64, tag = "7")]
+        UInt(u64),
     }
 }
 

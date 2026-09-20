@@ -354,6 +354,7 @@ fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError
         ExprKind::String(value) | ExprKind::Symbol(value) => Ok(HsonValue::String(value.clone())),
         ExprKind::Bool(value) => Ok(HsonValue::Bool(*value)),
         ExprKind::Null => Ok(HsonValue::Null),
+        ExprKind::Integer(_) => parse_number(expression, source),
         ExprKind::Number { value, unit } => match unit {
             NumberUnit::Scalar | NumberUnit::Percent if value.is_finite() => {
                 parse_number(expression, source)
@@ -361,6 +362,9 @@ fn literal_value(expression: &Expr, source: &str) -> Result<HsonValue, HsonError
             _ => Err(invalid("HSON numbers must be finite")),
         },
         ExprKind::UnaryMinus(value) => {
+            if matches!(value.kind, ExprKind::Integer(_)) {
+                return parse_number(expression, source);
+            }
             let ExprKind::Number { value, .. } = value.kind else {
                 return Err(invalid("unary minus is only valid for numbers"));
             };

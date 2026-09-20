@@ -756,13 +756,16 @@ mod tests {
     fn late_float_context_accepts_literals_but_not_int_bindings() {
         let natives = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let provider = compile("global fn scale(value: Float) -> Float { value }");
-        assert!(
-            link_register_modules(
-                vec![compile("scale(1)\nscale(-2)"), provider.clone()],
-                &natives
-            )
-            .is_ok()
-        );
+        let program = link_register_modules(
+            vec![compile("scale(1)\nscale(-2)"), provider.clone()],
+            &natives,
+        )
+        .expect("literal adopts provider signature");
+        let mut vm = crate::LinkedVm::new(program, ModuleId(0)).expect("linked VM");
+        while !matches!(
+            vm.step().expect("late Float context executes"),
+            Some(crate::LinkedVmEvent::Completed(_))
+        ) {}
         let errors = link_register_modules(
             vec![compile("let count: Int = 1\nscale(count)"), provider],
             &natives,

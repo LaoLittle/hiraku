@@ -69,6 +69,9 @@ pub mod objects;
 pub mod source_text;
 pub use objects::{ObjectHeap, ObjectId};
 mod fingerprint;
+mod nanbox;
+mod value_heap;
+pub use string_pool::SharedStrings;
 pub use fingerprint::ProgramFingerprint;
 pub mod debug;
 pub mod project;
@@ -84,6 +87,7 @@ pub mod string_pool;
 pub mod symbol;
 pub mod template;
 pub mod vm;
+mod snapshot_validation;
 
 pub use ast::{
     Argument, BinaryOp, Block, CastMode, Expr, ExprKind, FunctionParameter, MapField, NumberUnit,

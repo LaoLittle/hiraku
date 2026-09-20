@@ -395,6 +395,6 @@ mod tests {
             }
         }
         assert!(logged);
-        assert_eq!(runtime.globals()["score"], Value::Number(2.0));
+        assert_eq!(runtime.globals()["score"], Value::Int(2));
     }
 }

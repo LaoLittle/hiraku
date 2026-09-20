@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 21;
+pub const BYTECODE_VERSION: u16 = 22;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -203,6 +203,8 @@ pub enum Instruction {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Constant {
+    Int(i64),
+    UInt(u64),
     Uninitialized,
     Null,
     Ellipsis,
@@ -881,6 +883,8 @@ fn constant(value: MirConstant, strings: &mut StringPoolBuilder) -> Constant {
         MirConstant::Ellipsis => Constant::Ellipsis,
         MirConstant::Bool(value) => Constant::Bool(value),
         MirConstant::Number(value) => Constant::Number(value),
+        MirConstant::Int(value) => Constant::Int(value),
+        MirConstant::UInt(value) => Constant::UInt(value),
         MirConstant::Percent(value) => Constant::Percent(value),
         MirConstant::String(value) => Constant::String(strings.intern(value)),
         MirConstant::TextTemplate(value) => Constant::TextTemplate(strings.intern(value)),
@@ -906,6 +910,11 @@ pub enum CodeLocation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmEvent {
+    /// A module-owned callable must be dispatched by the linked execution owner.
+    Invoke {
+        callable: Value,
+        arguments: Vec<CallArgument>,
+    },
     /// Cooperative yield, not a statement commit or a host wait.
     BudgetExhausted,
     Call(SymbolCall),
@@ -915,10 +924,31 @@ pub enum VmEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SymbolCall {
+    pub argument_types: Vec<crate::runtime::ArgumentType>,
     pub type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
     pub function: SymbolId,
     pub receiver: Option<Value>,
     pub arguments: Vec<CallArgument>,
+}
+
+impl SymbolCall {
+    /// Apply the contextual literal conversion accepted by the static linker.
+    /// Already-bound integers are never coerced by this operation.
+    pub fn resolve_literal_arguments(&mut self, signature: &crate::runtime::FunctionSignature) {
+        for ((argument, evidence), expected) in self
+            .arguments
+            .iter_mut()
+            .zip(&self.argument_types)
+            .zip(&signature.parameters)
+        {
+            if evidence.numeric_literal
+                && expected == &crate::ScriptType::Float
+                && let Value::Int(value) = argument.value
+            {
+                argument.value = Value::Number(value as f64);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -952,19 +982,53 @@ pub struct CallFrameSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct CallFrame {
+    type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
+    location: CodeLocation,
+    pc: usize,
+    registers: RegisterFrame,
+    locals: RegisterFrame,
+    destination: Register,
+}
+impl CallFrame {
+    fn snapshot(&self) -> CallFrameSnapshot {
+        CallFrameSnapshot {
+            type_bindings: self.type_bindings.clone(),
+            location: self.location,
+            pc: self.pc,
+            registers: self.registers.values().collect(),
+            locals: self.locals.values().collect(),
+            destination: self.destination,
+        }
+    }
+    fn restore(frame: CallFrameSnapshot) -> Self {
+        Self {
+            type_bindings: frame.type_bindings,
+            location: frame.location,
+            pc: frame.pc,
+            registers: RegisterFrame::from_values(frame.registers, Default::default()),
+            locals: RegisterFrame::from_values(frame.locals, Default::default()),
+            destination: frame.destination,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Vm {
+    // Supplied by the linked executor, never inferred from a serialized value.
+    module: Option<u32>,
     type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
     read_only_globals: std::collections::BTreeSet<String>,
     objects: crate::ObjectHeap,
     bytecode: Arc<Bytecode>,
     pc: usize,
     registers: RegisterFrame,
-    locals: Box<[Value]>,
-    globals: Box<[Value]>,
+    locals: RegisterFrame,
+    globals: RegisterFrame,
     waiting_destination: Option<Register>,
     status: VmStatus,
     location: CodeLocation,
-    call_stack: Vec<CallFrameSnapshot>,
+    call_stack: Vec<CallFrame>,
 }
 
 mod type_binding_table {
@@ -990,23 +1054,33 @@ mod type_binding_table {
 
 impl Vm {
     pub fn new(bytecode: impl Into<Arc<Bytecode>>) -> Result<Self, VmError> {
+        Self::with_strings(bytecode, Default::default())
+    }
+
+    /// Use a session-owned pool instead of the bounded process-wide default.
+    pub fn with_strings(
+        bytecode: impl Into<Arc<Bytecode>>,
+        strings: crate::SharedStrings,
+    ) -> Result<Self, VmError> {
         let bytecode = bytecode.into();
         if bytecode.version != BYTECODE_VERSION {
             return Err(VmError::UnsupportedBytecode(bytecode.version));
         }
+        strings.prepare(&bytecode.strings, &bytecode.symbols);
         Ok(Self {
-            registers: RegisterFrame::new(bytecode.register_count),
+            module: None,
+            registers: RegisterFrame::with_len(bytecode.register_count as usize, strings.clone()),
             read_only_globals: Default::default(),
             type_bindings: Default::default(),
-            locals: vec![Value::Uninitialized; bytecode.local_count as usize].into_boxed_slice(),
-            globals: vec![Value::Uninitialized; bytecode.globals.len()].into_boxed_slice(),
+            locals: RegisterFrame::with_len(bytecode.local_count as usize, strings.clone()),
+            globals: RegisterFrame::with_len(bytecode.globals.len(), strings.clone()),
             bytecode,
             pc: 0,
             waiting_destination: None,
             status: VmStatus::Ready,
             location: CodeLocation::Entry,
             call_stack: Vec::new(),
-            objects: crate::ObjectHeap::default(),
+            objects: crate::ObjectHeap::with_strings(strings),
         })
     }
 
@@ -1015,6 +1089,7 @@ impl Vm {
         closure: &Value,
     ) -> Result<Self, VmError> {
         let bytecode = bytecode.into();
+        crate::SharedStrings::default().prepare(&bytecode.strings, &bytecode.symbols);
         let mut objects = crate::ObjectHeap::default();
         let closure = objects.import(closure.clone());
         let Value::Closure {
@@ -1037,11 +1112,12 @@ impl Vm {
             return Err(VmError::FrameShapeMismatch);
         }
         Ok(Self {
+            module: None,
             registers: RegisterFrame::new(code.register_count),
-            locals: captures.clone().into_boxed_slice(),
+            locals: RegisterFrame::from_values(captures.clone(), Default::default()),
             read_only_globals: Default::default(),
             type_bindings: type_bindings.iter().cloned().collect(),
-            globals: vec![Value::Uninitialized; bytecode.globals.len()].into_boxed_slice(),
+            globals: RegisterFrame::with_len(bytecode.globals.len(), Default::default()),
             bytecode,
             pc: 0,
             waiting_destination: None,
@@ -1074,7 +1150,8 @@ impl Vm {
                 let parameters = metadata.parameters.clone();
                 let mut vm = Self::from_closure(bytecode, callable)?;
                 for (local, value) in parameters.into_iter().zip(arguments) {
-                    *vm.local_mut(local)? = vm.objects.import(value);
+                    let value = vm.objects.import(value);
+                    vm.set_local(local, value)?;
                 }
                 Ok(vm)
             }
@@ -1096,6 +1173,7 @@ impl Vm {
         arguments: Vec<Value>,
     ) -> Result<Self, VmError> {
         let bytecode = bytecode.into();
+        crate::SharedStrings::default().prepare(&bytecode.strings, &bytecode.symbols);
         let metadata = bytecode
             .functions
             .get(function as usize)
@@ -1112,11 +1190,12 @@ impl Vm {
         let register_count = metadata.register_count;
         let parameters = metadata.parameters.clone();
         let mut vm = Self {
+            module: None,
             read_only_globals: Default::default(),
             type_bindings: Default::default(),
             registers: RegisterFrame::new(register_count),
-            locals: vec![Value::Uninitialized; bytecode.local_count as usize].into_boxed_slice(),
-            globals: vec![Value::Uninitialized; bytecode.globals.len()].into_boxed_slice(),
+            locals: RegisterFrame::with_len(bytecode.local_count as usize, Default::default()),
+            globals: RegisterFrame::with_len(bytecode.globals.len(), Default::default()),
             bytecode,
             pc: 0,
             waiting_destination: None,
@@ -1126,7 +1205,8 @@ impl Vm {
             objects: crate::ObjectHeap::default(),
         };
         for (local, value) in parameters.into_iter().zip(arguments) {
-            *vm.local_mut(local)? = vm.objects.import(value);
+            let value = vm.objects.import(value);
+            vm.set_local(local, value)?;
         }
         Ok(vm)
     }
@@ -1176,8 +1256,9 @@ impl Vm {
                     self.write(dst, value)?;
                 }
                 Instruction::Move { dst, src } => {
-                    let value = self.read(src)?.clone();
-                    self.write(dst, value)?;
+                    self.registers
+                        .copy(dst, src)
+                        .map_err(|error| VmError::InvalidRegister(error.0))?;
                 }
                 Instruction::MakeClosure { dst, region } => {
                     if self.bytecode.regions.get(region as usize).is_none() {
@@ -1192,42 +1273,79 @@ impl Vm {
                                 .map(|(name, ty)| (*name, ty.clone()))
                                 .collect(),
                             objects: None,
-                            module: None,
+                            module: self.module,
                             region,
-                            captures: self.locals.to_vec(),
+                            captures: self.locals.values().collect(),
                         },
                     )?;
                 }
                 Instruction::LoadLocal { dst, local } => {
-                    let value = self.local(local)?.clone();
-                    if value == Value::Uninitialized {
+                    if !self
+                        .locals
+                        .is_initialized(local as usize)
+                        .ok_or(VmError::InvalidLocal(local))?
+                    {
                         return Err(VmError::UninitializedLocal(local));
                     }
-                    self.write(dst, value)?;
+                    self.registers
+                        .copy_from(dst.0 as usize, &self.locals, local as usize)
+                        .map_err(|error| match error {
+                            crate::register::SlotCopyError::Source => VmError::InvalidLocal(local),
+                            crate::register::SlotCopyError::Destination => {
+                                VmError::InvalidRegister(dst)
+                            }
+                        })?;
                 }
                 Instruction::StoreLocal { local, src } => {
-                    let value = self.read(src)?.clone();
-                    *self.local_mut(local)? = value;
+                    self.locals
+                        .copy_from(local as usize, &self.registers, src.0 as usize)
+                        .map_err(|error| match error {
+                            crate::register::SlotCopyError::Source => VmError::InvalidRegister(src),
+                            crate::register::SlotCopyError::Destination => {
+                                VmError::InvalidLocal(local)
+                            }
+                        })?;
                 }
                 Instruction::LoadGlobal { dst, global } => {
-                    let value = self.global_slot(global)?.clone();
                     if self.global_is_read_only(global) {
-                        self.objects.freeze(&value)?;
+                        self.objects.freeze(&self.global_slot(global)?)?;
                     }
-                    if value == Value::Uninitialized {
+                    if !self
+                        .globals
+                        .is_initialized(global as usize)
+                        .ok_or(VmError::InvalidGlobal(global))?
+                    {
                         return Err(VmError::UninitializedGlobal(global));
                     }
-                    self.write(dst, value)?;
+                    self.registers
+                        .copy_from(dst.0 as usize, &self.globals, global as usize)
+                        .map_err(|error| match error {
+                            crate::register::SlotCopyError::Source => {
+                                VmError::InvalidGlobal(global)
+                            }
+                            crate::register::SlotCopyError::Destination => {
+                                VmError::InvalidRegister(dst)
+                            }
+                        })?;
                 }
                 Instruction::StoreGlobal { global, src } => {
                     if self.global_is_read_only(global) {
                         return Err(VmError::ReadOnlyValue);
                     }
-                    let value = self.read(src)?.clone();
-                    *self.global_mut(global)? = value;
+                    self.globals
+                        .copy_from(global as usize, &self.registers, src.0 as usize)
+                        .map_err(|error| match error {
+                            crate::register::SlotCopyError::Source => VmError::InvalidRegister(src),
+                            crate::register::SlotCopyError::Destination => {
+                                VmError::InvalidGlobal(global)
+                            }
+                        })?;
                 }
                 Instruction::GlobalInitialized { dst, global } => {
-                    let initialized = *self.global_slot(global)? != Value::Uninitialized;
+                    let initialized = self
+                        .globals
+                        .is_initialized(global as usize)
+                        .ok_or(VmError::InvalidGlobal(global))?;
                     self.write(dst, Value::Bool(initialized))?;
                 }
                 Instruction::GetMember {
@@ -1237,7 +1355,7 @@ impl Vm {
                     safe,
                 } => {
                     let name = self.symbol(member)?.to_string();
-                    let value = get_member(self.read(object)?, &name, safe, &self.objects)?;
+                    let value = get_member(&self.read(object)?, &name, safe, &self.objects)?;
                     self.write(dst, value)?;
                 }
                 Instruction::SetMember {
@@ -1247,24 +1365,30 @@ impl Vm {
                     value,
                 } => {
                     let name = self.symbol(member)?.to_string();
-                    let mut object = self.read(object)?.clone();
-                    let value = self.read(value)?.clone();
+                    let mut object = self.read(object)?;
+                    let value = self.read(value)?;
                     if let Value::Object(id) = object {
-                        set_member(self.objects.get_mut(id)?, &name, value)?;
+                        self.objects.set_member(id, &name, value)?;
                     } else {
                         set_member(&mut object, &name, value)?;
                     }
                     self.write(dst, object)?;
                 }
                 Instruction::UnaryMinus { dst, value } => {
-                    let Value::Number(value) = self.read(value)? else {
-                        return Err(VmError::TypeMismatch("unary minus expects Number"));
+                    let value = match self.read(value)? {
+                        Value::Int(value) => {
+                            Value::Int(value.checked_neg().ok_or(VmError::IntegerOverflow)?)
+                        }
+                        Value::Number(value) => Value::Number(-value),
+                        _ => return Err(VmError::TypeMismatch("unary minus expects Int or Float")),
                     };
-                    self.write(dst, Value::Number(-value))?;
+                    self.write(dst, value)?;
                 }
                 Instruction::ToString { dst, value } => {
                     let text = match self.read(value)? {
                         Value::Number(number) => number.to_string(),
+                        Value::Int(number) => number.to_string(),
+                        Value::UInt(number) => number.to_string(),
                         Value::Bool(value) => value.to_string(),
                         Value::String(value) => value.clone(),
                         _ => {
@@ -1282,7 +1406,7 @@ impl Vm {
                     mode,
                 } => {
                     let target = crate::hir::substitute_type(&target, &self.type_bindings);
-                    let source = self.read(value)?.clone();
+                    let source = self.read(value)?;
                     let value = cast_value_with_heap(&source, &target, &self.objects);
                     let value = match (mode, value) {
                         (crate::CastMode::Optional, Ok(value)) => {
@@ -1295,7 +1419,7 @@ impl Vm {
                     self.write(dst, value)?;
                 }
                 Instruction::MakeOptional { dst, value } => {
-                    let value = self.read(value)?.clone();
+                    let value = self.read(value)?;
                     self.write(dst, Value::Optional(Some(Box::new(value))))?;
                 }
                 Instruction::Binary {
@@ -1304,8 +1428,7 @@ impl Vm {
                     left,
                     right,
                 } => {
-                    let value = binary(op, self.read(left)?, self.read(right)?)?;
-                    self.write(dst, value)?;
+                    self.registers.binary(dst, op, left, right)?;
                 }
                 Instruction::MakeTuple { dst, values } => {
                     let values = self.read_slice(values)?;
@@ -1332,7 +1455,7 @@ impl Vm {
                         }
                         Value::Null if self.symbol(type_name)? == "Optional" => tag == "none",
                         Value::Typed { type_id, value } => {
-                            *type_id == type_name
+                            type_id == type_name
                                 && matches!(value.as_ref(), Value::Tuple(fields) if matches!(fields.first(), Some(Value::Symbol(name)) if name == tag))
                         }
                         _ => false,
@@ -1403,7 +1526,7 @@ impl Vm {
                     receiver,
                     labels,
                     arguments,
-                    ..
+                    argument_types,
                 } => {
                     let type_bindings = type_bindings
                         .into_iter()
@@ -1411,9 +1534,7 @@ impl Vm {
                             (name, crate::hir::substitute_type(&ty, &self.type_bindings))
                         })
                         .collect::<BTreeMap<_, _>>();
-                    let receiver = receiver
-                        .map(|receiver| self.read(receiver).cloned())
-                        .transpose()?;
+                    let receiver = receiver.map(|receiver| self.read(receiver)).transpose()?;
                     let values = self.read_slice(arguments)?;
                     let arguments = labels
                         .into_iter()
@@ -1445,6 +1566,7 @@ impl Vm {
                     self.status = VmStatus::WaitingForHost;
                     self.waiting_destination = Some(dst);
                     return Ok(Some(VmEvent::Call(SymbolCall {
+                        argument_types,
                         type_bindings,
                         function,
                         receiver,
@@ -1457,7 +1579,7 @@ impl Vm {
                     labels,
                     arguments,
                 } => {
-                    let callee = self.read(callee)?.clone();
+                    let callee = self.read(callee)?;
                     let values = self.read_slice(arguments)?;
                     let arguments = labels
                         .into_iter()
@@ -1471,6 +1593,15 @@ impl Vm {
                             })
                         })
                         .collect::<Result<Vec<_>, VmError>>()?;
+                    if matches!(&callee, Value::Function { module: Some(owner), .. } | Value::Closure { module: Some(owner), .. } if Some(*owner) != self.module)
+                    {
+                        self.status = VmStatus::WaitingForHost;
+                        self.waiting_destination = Some(dst);
+                        return Ok(Some(VmEvent::Invoke {
+                            callable: callee,
+                            arguments,
+                        }));
+                    }
                     match callee {
                         Value::Function {
                             module: _,
@@ -1495,6 +1626,7 @@ impl Vm {
                             self.status = VmStatus::WaitingForHost;
                             self.waiting_destination = Some(dst);
                             return Ok(Some(VmEvent::Call(SymbolCall {
+                                argument_types: Vec::new(),
                                 type_bindings: Default::default(),
                                 function,
                                 receiver: None,
@@ -1537,7 +1669,7 @@ impl Vm {
                     }
                 }
                 Instruction::AssertNonNull { dst, value } => {
-                    let value = self.read(value)?.clone();
+                    let value = self.read(value)?;
                     match value {
                         Value::Optional(Some(value)) => self.write(dst, *value)?,
                         Value::Optional(None) | Value::Null => {
@@ -1559,7 +1691,7 @@ impl Vm {
                             StatementValue::TextTemplate(value.clone())
                         }
                         (_, true, Value::Unit) | (_, false, _) => StatementValue::Commit,
-                        (_, true, _) => StatementValue::Value(value.clone()),
+                        (_, true, value) => StatementValue::Value(value),
                     };
                     return Ok(Some(VmEvent::Statement(statement)));
                 }
@@ -1572,11 +1704,11 @@ impl Vm {
                     let Value::Bool(condition) = self.read(condition)? else {
                         return Err(VmError::TypeMismatch("branch expects Bool"));
                     };
-                    self.pc = if *condition { then_target } else { else_target };
+                    self.pc = if condition { then_target } else { else_target };
                 }
                 Instruction::Return(value) => {
                     let value = value
-                        .map(|register| self.read(register).cloned())
+                        .map(|register| self.read(register))
                         .transpose()?
                         .unwrap_or(Value::Unit);
                     if self.call_stack.is_empty() {
@@ -1615,13 +1747,13 @@ impl Vm {
             source_hash: self.bytecode.source_hash,
             builtin_manifest_hash: self.bytecode.builtin_manifest_hash,
             pc: self.pc,
-            registers: self.registers.values().to_vec(),
-            locals: self.locals.to_vec(),
-            globals: self.globals.to_vec(),
+            registers: self.registers.values().collect(),
+            locals: self.locals.values().collect(),
+            globals: self.globals.values().collect(),
             waiting_destination: self.waiting_destination,
             status: self.status,
             location: self.location,
-            call_stack: self.call_stack.clone(),
+            call_stack: self.call_stack.iter().map(CallFrame::snapshot).collect(),
         }
     }
 
@@ -1630,6 +1762,7 @@ impl Vm {
         snapshot: VmSnapshot,
     ) -> Result<Self, VmError> {
         let bytecode = bytecode.into();
+        crate::SharedStrings::default().prepare(&bytecode.strings, &bytecode.symbols);
         if bytecode.version != BYTECODE_VERSION {
             return Err(VmError::UnsupportedBytecode(bytecode.version));
         }
@@ -1639,49 +1772,37 @@ impl Vm {
         if bytecode.builtin_manifest_hash != snapshot.builtin_manifest_hash {
             return Err(VmError::BuiltinManifestMismatch);
         }
-        let register_count = match snapshot.location {
-            CodeLocation::Entry => bytecode.register_count,
-            CodeLocation::Function(function) => bytecode
-                .functions
-                .get(function as usize)
-                .map(|function| function.register_count)
-                .ok_or(VmError::UnknownFunction(function))?,
-            CodeLocation::Region(region) => bytecode
-                .regions
-                .get(region as usize)
-                .map(|region| region.register_count)
-                .ok_or(VmError::UnknownRegion(region))?,
-        };
-        if snapshot.registers.len() != usize::from(register_count)
-            || snapshot.locals.len() != bytecode.local_count as usize
-            || snapshot.globals.len() != bytecode.globals.len()
-        {
-            return Err(VmError::FrameShapeMismatch);
-        }
-        let mut registers = RegisterFrame::new(register_count);
-        for (index, value) in snapshot.registers.into_iter().enumerate() {
-            registers
-                .write(Register(index as u16), value)
-                .map_err(|_| VmError::InvalidRegister(Register(index as u16)))?;
-        }
+        crate::snapshot_validation::validate(&bytecode, &snapshot)?;
+        let registers = RegisterFrame::from_values(snapshot.registers, Default::default());
         Ok(Self {
+            module: None,
             bytecode,
             read_only_globals: snapshot.read_only_globals,
             type_bindings: snapshot.type_bindings,
             pc: snapshot.pc,
             registers,
-            locals: snapshot.locals.into_boxed_slice(),
-            globals: snapshot.globals.into_boxed_slice(),
+            locals: RegisterFrame::from_values(snapshot.locals, Default::default()),
+            globals: RegisterFrame::from_values(snapshot.globals, Default::default()),
             waiting_destination: snapshot.waiting_destination,
             status: snapshot.status,
             location: snapshot.location,
-            call_stack: snapshot.call_stack,
+            call_stack: snapshot
+                .call_stack
+                .into_iter()
+                .map(CallFrame::restore)
+                .collect(),
             objects: snapshot.objects,
         })
     }
 
     pub fn status(&self) -> VmStatus {
         self.status
+    }
+
+    /// Assign the bytecode's linked identity before execution. This controls
+    /// callable ownership, not capability grants or access to native intrinsics.
+    pub fn set_module(&mut self, module: crate::ModuleId) {
+        self.module = Some(module.0);
     }
 
     pub fn bytecode(&self) -> &Bytecode {
@@ -1695,42 +1816,30 @@ impl Vm {
     /// Freeze objects supplied to a fresh invocation (parameters and captures).
     /// Call before stepping when an embedding exposes borrowed, read-only inputs.
     pub fn freeze_invocation_inputs(&mut self) -> Result<(), VmError> {
-        for value in &self.locals {
-            self.objects.freeze(value)?;
+        for value in self.locals.values() {
+            self.objects.freeze(&value)?;
         }
         Ok(())
     }
 
     /// Roots for a collector owned by an embedding that shares this VM's heap.
-    pub fn object_roots(&self) -> impl Iterator<Item = &Value> {
+    pub fn object_roots(&self) -> impl Iterator<Item = Value> + '_ {
         self.registers
             .values()
-            .iter()
-            .chain(self.locals.iter())
-            .chain(self.globals.iter())
+            .chain(self.locals.values())
+            .chain(self.globals.values())
             .chain(
                 self.call_stack
                     .iter()
-                    .flat_map(|frame| frame.registers.iter().chain(frame.locals.iter())),
+                    .flat_map(|frame| frame.registers.values().chain(frame.locals.values())),
             )
     }
 
     /// Collect this VM's private heap. Host-retained values must be included.
     /// For shared heaps, enumerate every execution with `object_roots` instead.
     pub fn collect_objects(&mut self, host_roots: &[Value]) -> Result<usize, VmError> {
-        let roots = self
-            .registers
-            .values()
-            .iter()
-            .chain(self.locals.iter())
-            .chain(self.globals.iter())
-            .chain(
-                self.call_stack
-                    .iter()
-                    .flat_map(|frame| frame.registers.iter().chain(frame.locals.iter())),
-            )
-            .chain(host_roots);
-        self.objects.collect(roots)
+        let roots: Vec<_> = self.object_roots().collect();
+        self.objects.collect(roots.iter().chain(host_roots))
     }
 
     /// An embedding that schedules multiple VMs owns one heap and lends it to
@@ -1743,7 +1852,7 @@ impl Vm {
         self.objects.export(value)
     }
 
-    pub fn global(&self, name: &str) -> Option<&Value> {
+    pub fn global(&self, name: &str) -> Option<Value> {
         self.bytecode
             .globals
             .iter()
@@ -1751,8 +1860,8 @@ impl Vm {
             .and_then(|index| self.globals.get(index))
     }
 
-    pub fn globals(&self) -> &[Value] {
-        &self.globals
+    pub fn globals(&self) -> Vec<Value> {
+        self.globals.values().collect()
     }
 
     pub fn set_read_only_globals(&mut self, names: std::collections::BTreeSet<String>) {
@@ -1763,7 +1872,7 @@ impl Vm {
         self.type_bindings = bindings;
     }
 
-    pub(crate) fn read_only_globals(&self) -> &std::collections::BTreeSet<String> {
+    pub fn read_only_globals(&self) -> &std::collections::BTreeSet<String> {
         &self.read_only_globals
     }
 
@@ -1779,10 +1888,23 @@ impl Vm {
         if values.len() != self.bytecode.globals.len() {
             return Err(VmError::FrameShapeMismatch);
         }
-        self.globals = values
+        let values = values
             .into_iter()
             .map(|value| self.objects.import(value))
             .collect();
+        self.globals = RegisterFrame::from_values(values, self.globals.strings());
+        Ok(())
+    }
+
+    pub(crate) fn compact_globals(&self) -> RegisterFrame {
+        self.globals.clone()
+    }
+
+    pub(crate) fn set_compact_globals(&mut self, globals: &RegisterFrame) -> Result<(), VmError> {
+        if globals.len() != self.globals.len() {
+            return Err(VmError::FrameShapeMismatch);
+        }
+        self.globals = globals.clone();
         Ok(())
     }
 
@@ -1834,15 +1956,15 @@ impl Vm {
 
     fn template_captures(&self) -> BTreeMap<String, Value> {
         let mut context = BTreeMap::new();
-        for (symbol, value) in self.bytecode.globals.iter().zip(self.globals.iter()) {
-            if value != &Value::Uninitialized
+        for (symbol, value) in self.bytecode.globals.iter().zip(self.globals.values()) {
+            if value != Value::Uninitialized
                 && let Some(name) = self.bytecode.symbols.resolve(*symbol)
             {
                 context.insert(name.to_string(), value.clone());
             }
         }
-        for (symbol, value) in self.bytecode.locals.iter().zip(self.locals.iter()) {
-            if value != &Value::Uninitialized
+        for (symbol, value) in self.bytecode.locals.iter().zip(self.locals.values()) {
+            if value != Value::Uninitialized
                 && let Some(name) = self.bytecode.symbols.resolve(*symbol)
             {
                 context.insert(name.to_string(), value.clone());
@@ -1859,6 +1981,8 @@ impl Vm {
             Constant::Ellipsis => Value::Ellipsis,
             Constant::Bool(value) => Value::Bool(value),
             Constant::Number(value) => Value::Number(value),
+            Constant::Int(value) => Value::Int(value),
+            Constant::UInt(value) => Value::UInt(value),
             Constant::Percent(value) => Value::Percent(value),
             Constant::String(id) => Value::String(self.string(id)?.to_owned()),
             Constant::TextTemplate(id) => Value::TextTemplate(crate::runtime::TemplateValue {
@@ -1868,7 +1992,7 @@ impl Vm {
             Constant::Symbol(symbol) => Value::Symbol(self.symbol(symbol)?.to_string()),
             Constant::Selector(symbol) => Value::Selector(self.symbol(symbol)?.to_string()),
             Constant::Function(symbol) => Value::Function {
-                module: None,
+                module: self.module,
                 symbol,
             },
         })
@@ -1982,7 +2106,9 @@ impl Vm {
             })
     }
 
-    fn validate_function_arguments(&self) -> Result<(), VmError> {
+    /// Validate the current invocation against its compiled signature. Embeddings
+    /// must install the invocation's object heap before calling this method.
+    pub fn validate_function_arguments(&self) -> Result<(), VmError> {
         let (parameters, signature) = match self.location {
             CodeLocation::Entry => return Ok(()),
             CodeLocation::Function(index) => {
@@ -1997,7 +2123,7 @@ impl Vm {
         let types = signature.receiver.iter().chain(&signature.parameters);
         for (index, (local, ty)) in parameters.iter().zip(types).enumerate() {
             let ty = crate::hir::substitute_type(ty, &self.type_bindings);
-            if !argument_matches(self.local(*local)?, &ty, &self.objects)? {
+            if !argument_matches(&self.local(*local)?, &ty, &self.objects)? {
                 return Err(VmError::ArgumentTypeMismatch {
                     argument: index + 1,
                     expected: format!("{ty:?}"),
@@ -2024,23 +2150,26 @@ impl Vm {
                 actual: arguments.len(),
             });
         }
-        self.call_stack.push(CallFrameSnapshot {
+        let strings = self.registers.strings();
+        self.call_stack.push(CallFrame {
             type_bindings: self.type_bindings.clone(),
             location: self.location,
             pc: self.pc,
-            registers: self.registers.values().to_vec(),
-            locals: self.locals.to_vec(),
+            registers: std::mem::replace(
+                &mut self.registers,
+                RegisterFrame::with_len(function.register_count as usize, strings.clone()),
+            ),
+            locals: std::mem::replace(
+                &mut self.locals,
+                RegisterFrame::with_len(self.bytecode.local_count as usize, strings),
+            ),
             destination,
         });
-        let register_count = function.register_count;
         let parameters = function.parameters.clone();
         self.location = CodeLocation::Function(function_index as u32);
         self.pc = 0;
-        self.registers = RegisterFrame::new(register_count);
-        self.locals =
-            vec![Value::Uninitialized; self.bytecode.local_count as usize].into_boxed_slice();
         for (local, value) in parameters.into_iter().zip(arguments) {
-            *self.local_mut(local)? = value;
+            self.set_local(local, value)?;
         }
         Ok(())
     }
@@ -2061,21 +2190,25 @@ impl Vm {
         if captures.len() != self.bytecode.local_count as usize {
             return Err(VmError::FrameShapeMismatch);
         }
-        self.call_stack.push(CallFrameSnapshot {
+        let strings = self.registers.strings();
+        self.call_stack.push(CallFrame {
             type_bindings: self.type_bindings.clone(),
             location: self.location,
             pc: self.pc,
-            registers: self.registers.values().to_vec(),
-            locals: self.locals.to_vec(),
+            registers: std::mem::replace(
+                &mut self.registers,
+                RegisterFrame::with_len(code.register_count as usize, strings.clone()),
+            ),
+            locals: std::mem::replace(
+                &mut self.locals,
+                RegisterFrame::from_values(captures, strings),
+            ),
             destination,
         });
-        let register_count = code.register_count;
         self.location = CodeLocation::Region(region);
         self.pc = 0;
-        self.registers = RegisterFrame::new(register_count);
-        self.locals = captures.into_boxed_slice();
         for (local, value) in parameters.into_iter().zip(arguments) {
-            *self.local_mut(local)? = value;
+            self.set_local(local, value)?;
         }
         Ok(())
     }
@@ -2088,18 +2221,12 @@ impl Vm {
         self.location = frame.location;
         self.type_bindings = frame.type_bindings;
         self.pc = frame.pc;
-        let mut registers = RegisterFrame::new(frame.registers.len() as u16);
-        for (index, value) in frame.registers.into_iter().enumerate() {
-            registers
-                .write(Register(index as u16), value)
-                .map_err(|_| VmError::InvalidRegister(Register(index as u16)))?;
-        }
-        self.registers = registers;
-        self.locals = frame.locals.into_boxed_slice();
+        self.registers = frame.registers;
+        self.locals = frame.locals;
         self.write(frame.destination, value)
     }
 
-    fn read(&self, register: Register) -> Result<&Value, VmError> {
+    fn read(&self, register: Register) -> Result<Value, VmError> {
         self.registers
             .read(register)
             .ok_or(VmError::InvalidRegister(register))
@@ -2118,32 +2245,26 @@ impl Vm {
                     .checked_add(offset)
                     .and_then(|index| u16::try_from(index).ok())
                     .ok_or(VmError::InvalidRegister(registers.start))?;
-                self.read(Register(index)).cloned()
+                self.read(Register(index))
             })
             .collect()
     }
 
-    fn local(&self, local: u32) -> Result<&Value, VmError> {
+    fn local(&self, local: u32) -> Result<Value, VmError> {
         self.locals
             .get(local as usize)
             .ok_or(VmError::InvalidLocal(local))
     }
 
-    fn local_mut(&mut self, local: u32) -> Result<&mut Value, VmError> {
+    fn set_local(&mut self, local: u32, value: Value) -> Result<(), VmError> {
         self.locals
-            .get_mut(local as usize)
-            .ok_or(VmError::InvalidLocal(local))
+            .set(local as usize, value)
+            .map_err(|_| VmError::InvalidLocal(local))
     }
 
-    fn global_slot(&self, global: u32) -> Result<&Value, VmError> {
+    fn global_slot(&self, global: u32) -> Result<Value, VmError> {
         self.globals
             .get(global as usize)
-            .ok_or(VmError::InvalidGlobal(global))
-    }
-
-    fn global_mut(&mut self, global: u32) -> Result<&mut Value, VmError> {
-        self.globals
-            .get_mut(global as usize)
             .ok_or(VmError::InvalidGlobal(global))
     }
 }
@@ -2155,7 +2276,7 @@ fn get_member(
     objects: &crate::ObjectHeap,
 ) -> Result<Value, VmError> {
     match value {
-        Value::Object(id) => get_member(objects.get(*id)?, name, safe, objects),
+        Value::Object(id) => objects.member(*id, name),
         Value::Optional(None) if safe => Ok(Value::Optional(None)),
         Value::Optional(None) => Err(VmError::NullMemberAccess(name.to_string())),
         Value::Optional(Some(value)) if safe => get_member(value, name, false, objects)
@@ -2192,7 +2313,7 @@ fn set_member(value: &mut Value, name: &str, new_value: Value) -> Result<(), VmE
     Ok(())
 }
 
-fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmError> {
+pub(crate) fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmError> {
     use crate::BinaryOp;
     if op == BinaryOp::Add
         && let (Value::String(left), Value::String(right)) = (left, right)
@@ -2201,6 +2322,38 @@ fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result<Value, VmE
         result.push_str(left);
         result.push_str(right);
         return Ok(Value::String(result));
+    }
+    macro_rules! integer {
+        ($left:expr, $right:expr, $kind:ident) => {{
+            let (a, b) = (*$left, *$right);
+            return Ok(match op {
+                BinaryOp::Equal => Value::Bool(a == b),
+                BinaryOp::NotEqual => Value::Bool(a != b),
+                BinaryOp::Less => Value::Bool(a < b),
+                BinaryOp::LessEqual => Value::Bool(a <= b),
+                BinaryOp::Greater => Value::Bool(a > b),
+                BinaryOp::GreaterEqual => Value::Bool(a >= b),
+                BinaryOp::Add => Value::$kind(a.checked_add(b).ok_or(VmError::IntegerOverflow)?),
+                BinaryOp::Subtract => {
+                    Value::$kind(a.checked_sub(b).ok_or(VmError::IntegerOverflow)?)
+                }
+                BinaryOp::Multiply => {
+                    Value::$kind(a.checked_mul(b).ok_or(VmError::IntegerOverflow)?)
+                }
+                BinaryOp::Divide => {
+                    if b == 0 {
+                        return Err(VmError::DivisionByZero);
+                    }
+                    Value::$kind(a.checked_div(b).ok_or(VmError::IntegerOverflow)?)
+                }
+                _ => return Err(VmError::TypeMismatch("invalid integer operator")),
+            });
+        }};
+    }
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => integer!(a, b, Int),
+        (Value::UInt(a), Value::UInt(b)) => integer!(a, b, UInt),
+        _ => {}
     }
     match op {
         BinaryOp::And | BinaryOp::Or => Err(VmError::TypeMismatch(
@@ -2254,7 +2407,7 @@ fn argument_matches(
         return Ok(!matches!(value, Value::Uninitialized));
     }
     if let Value::Object(id) = value {
-        return argument_matches(heap.get(*id)?, ty, heap);
+        return argument_matches(&heap.get(*id)?, ty, heap);
     }
     Ok(match (ty, value) {
         (T::Unit, Value::Unit)
@@ -2268,9 +2421,7 @@ fn argument_matches(
         | (T::Selector, Value::Selector(_))
         | (T::Task, Value::Task(_))
         | (T::Tuple, Value::Tuple(_)) => true,
-        (T::Int, Value::Number(n)) => {
-            n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
-        }
+        (T::Int, Value::Int(_)) | (T::UInt, Value::UInt(_)) => true,
         (T::Optional(_), Value::Optional(None) | Value::Null) => true,
         (T::Optional(inner), Value::Optional(Some(value))) => argument_matches(value, inner, heap)?,
         (T::Optional(inner), value) => argument_matches(value, inner, heap)?,
@@ -2343,7 +2494,7 @@ fn argument_matches(
             }
             true
         }
-        (T::Struct { fields, .. }, Value::Typed { value, .. }) => {
+        (T::Struct { name, fields, .. }, Value::Typed { type_id, value }) if name == type_id => {
             argument_matches(value, &T::Record(fields.clone()), heap)?
         }
         _ => false,
@@ -2394,18 +2545,38 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
         ScriptType::Ellipsis if matches!(value, Value::Ellipsis) => Ok(value.clone()),
         ScriptType::Bool if matches!(value, Value::Bool(_)) => Ok(value.clone()),
         ScriptType::Int => match value {
+            Value::Int(_) => Ok(value.clone()),
+            Value::UInt(number) => i64::try_from(*number)
+                .map(Value::Int)
+                .map_err(|_| mismatch()),
             Value::Number(number) if number.is_finite() => {
-                // Until integers have a dedicated runtime representation, do not
-                // silently round/clamp values outside the exact integer range.
-                const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-                if number.trunc().abs() > MAX_SAFE_INTEGER {
+                if *number < i64::MIN as f64 || *number >= 9_223_372_036_854_775_808.0 {
                     return Err(mismatch());
                 }
-                Ok(Value::Number(number.trunc()))
+                Ok(Value::Int(number.trunc() as i64))
             }
             _ => Err(mismatch()),
         },
-        ScriptType::Float if matches!(value, Value::Number(_)) => Ok(value.clone()),
+        ScriptType::UInt => match value {
+            Value::UInt(_) => Ok(value.clone()),
+            Value::Int(number) => u64::try_from(*number)
+                .map(Value::UInt)
+                .map_err(|_| mismatch()),
+            Value::Number(number)
+                if number.is_finite()
+                    && *number >= 0.0
+                    && *number < 18_446_744_073_709_551_616.0 =>
+            {
+                Ok(Value::UInt(number.trunc() as u64))
+            }
+            _ => Err(mismatch()),
+        },
+        ScriptType::Float => match value {
+            Value::Number(_) => Ok(value.clone()),
+            Value::Int(number) => Ok(Value::Number(*number as f64)),
+            Value::UInt(number) => Ok(Value::Number(*number as f64)),
+            _ => Err(mismatch()),
+        },
         ScriptType::Percent if matches!(value, Value::Percent(_)) => Ok(value.clone()),
         ScriptType::String if matches!(value, Value::String(_)) => Ok(value.clone()),
         ScriptType::TextTemplate if matches!(value, Value::TextTemplate(_)) => Ok(value.clone()),
@@ -2529,6 +2700,7 @@ fn cast_value(value: &Value, target: &crate::ScriptType) -> Result<Value, VmErro
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmError {
+    IntegerOverflow,
     ReadOnlyValue,
     ProgramFingerprintMismatch,
     InvalidObject(crate::ObjectId),
@@ -2557,6 +2729,7 @@ pub enum VmError {
     SourceHashMismatch,
     BuiltinManifestMismatch,
     FrameShapeMismatch,
+    InvalidSnapshot(String),
     UnknownFunction(u32),
     UnknownRegion(u32),
     FunctionArity {
@@ -2613,6 +2786,7 @@ impl std::fmt::Display for VmError {
             return formatter.write_str(&rendered);
         }
         match self {
+            Self::InvalidSnapshot(message) => write!(formatter, "invalid VM snapshot: {message}"),
             Self::ProgramFingerprintMismatch => formatter.write_str("compiled program fingerprint does not match the saved program; restoring its program counter is unsafe"),
             Self::ReadOnlyValue => formatter.write_str("cannot modify a read-only value; request changes through an explicitly provided callback"),
             Self::Panic { message, span, .. } => write!(
@@ -2628,6 +2802,74 @@ impl std::fmt::Display for VmError {
 #[cfg(test)]
 mod tests {
     use crate::{BuiltinId, parse_program};
+
+    #[test]
+    fn exact_signed_and_unsigned_arithmetic_survives_snapshots() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile(
+            r#"
+            global let signed: Int = 9007199254740993
+            global let next = signed + 1
+            global let lowest: Int = -9223372036854775808
+            global let largest: UInt = 18446744073709551615
+            global let previous: UInt = largest - 1
+            global let exact = previous.toString()
+            global let absent: Int? = largest as? Int
+            global let arithmetic: UInt = 2 + 3 * 4
+            global let converted: UInt = 12.toUInt()
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        loop {
+            let event = vm.step().expect("integers execute");
+            let encoded = crate::hson::to_vec(&vm.snapshot()).expect("snapshot serializes");
+            let snapshot = crate::hson::from_slice(&encoded).expect("snapshot decodes");
+            vm = Vm::restore(code.clone(), snapshot).expect("restore");
+            if matches!(event, Some(VmEvent::Completed(_))) {
+                break;
+            }
+        }
+        assert_eq!(
+            vm.global("next").as_ref(),
+            Some(&Value::Int(9007199254740994))
+        );
+        assert_eq!(vm.global("lowest").as_ref(), Some(&Value::Int(i64::MIN)));
+        assert_eq!(vm.global("largest").as_ref(), Some(&Value::UInt(u64::MAX)));
+        assert_eq!(
+            vm.global("exact").as_ref(),
+            Some(&Value::String("18446744073709551614".into()))
+        );
+        assert_eq!(vm.global("absent").as_ref(), Some(&Value::Optional(None)));
+        assert_eq!(vm.global("arithmetic").as_ref(), Some(&Value::UInt(14)));
+        assert_eq!(vm.global("converted").as_ref(), Some(&Value::UInt(12)));
+    }
+
+    #[test]
+    fn integer_arithmetic_checks_overflow_and_rejects_mixed_types() {
+        assert_eq!(
+            binary(
+                crate::BinaryOp::Add,
+                &Value::UInt(u64::MAX),
+                &Value::UInt(1)
+            ),
+            Err(VmError::IntegerOverflow)
+        );
+        assert_eq!(
+            binary(
+                crate::BinaryOp::Divide,
+                &Value::Int(i64::MIN),
+                &Value::Int(-1)
+            ),
+            Err(VmError::IntegerOverflow)
+        );
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let source = parse_program(
+            "let signed: Int = 1\nlet unsigned: UInt = 2\nlet invalid = signed + unsigned",
+        )
+        .expect("parse");
+        assert!(compile_with_manifest(&source, 0, &manifest).is_err());
+    }
 
     use super::*;
 
@@ -2687,7 +2929,7 @@ mod tests {
                 match vm.step() {
                     Ok(Some(VmEvent::Completed(_))) => {
                         assert_eq!(
-                            vm.global("result"),
+                            vm.global("result").as_ref(),
                             expected.map(|s| Value::String(s.into())).as_ref(),
                             "{expression}"
                         );
@@ -2709,8 +2951,8 @@ mod tests {
             }
             assert!(finished, "{expression}");
             assert_eq!(
-                vm.global("calls"),
-                Some(&Value::Number(expected_calls)),
+                vm.global("calls").as_ref(),
+                Some(&Value::Int(expected_calls as i64)),
                 "{expression}"
             );
         }
@@ -2739,7 +2981,10 @@ mod tests {
                 }
                 Some(VmEvent::Completed(_)) => {
                     assert!(restored);
-                    assert_eq!(vm.global("result"), Some(&Value::String("Bob".into())));
+                    assert_eq!(
+                        vm.global("result").as_ref(),
+                        Some(&Value::String("Bob".into()))
+                    );
                     return;
                 }
                 _ => {}
@@ -2842,10 +3087,13 @@ mod tests {
             ("method", "Method: 3"),
             ("captured", "Captured: 3"),
         ] {
-            assert_eq!(vm.global(name), Some(&Value::String(expected.into())));
+            assert_eq!(
+                vm.global(name).as_ref(),
+                Some(&Value::String(expected.into()))
+            );
         }
         assert!(
-            matches!(vm.global("savedTemplate"), Some(Value::TextTemplate(template))
+            matches!(vm.global("savedTemplate").as_ref(), Some(Value::TextTemplate(template))
             if template.source == "${undefinedName}")
         );
     }
@@ -2897,13 +3145,16 @@ mod tests {
             ("chained", "abc"),
             ("explicit", "value: 42"),
         ] {
-            assert_eq!(vm.global(name), Some(&Value::String(expected.into())));
+            assert_eq!(
+                vm.global(name).as_ref(),
+                Some(&Value::String(expected.into()))
+            );
         }
         assert!(
             binary(
                 crate::BinaryOp::Add,
                 &Value::String("a".into()),
-                &Value::Number(1.0)
+                &Value::Int(1)
             )
             .is_err()
         );
@@ -2946,8 +3197,11 @@ mod tests {
             }
         }
         assert!(restored);
-        assert_eq!(vm.global("answer"), Some(&Value::Number(42.0)));
-        assert_eq!(vm.global("label"), Some(&Value::String("alice".into())));
+        assert_eq!(vm.global("answer").as_ref(), Some(&Value::Int(42)));
+        assert_eq!(
+            vm.global("label").as_ref(),
+            Some(&Value::String("alice".into()))
+        );
     }
 
     #[test]
@@ -2989,12 +3243,12 @@ mod tests {
             }
         }
         assert!(completed);
-        assert_eq!(vm.global("calls"), Some(&Value::Number(2.0)));
-        assert_eq!(vm.global("lazy"), Some(&Value::Number(42.0)));
-        assert_eq!(vm.global("absentValue"), Some(&Value::Number(7.0)));
-        assert_eq!(vm.global("result"), Some(&Value::Number(7.0)));
-        assert_eq!(vm.global("preserved"), Some(&Value::Number(42.0)));
-        assert_eq!(vm.global("second"), Some(&Value::Number(2.0)));
+        assert_eq!(vm.global("calls").as_ref(), Some(&Value::Int(2)));
+        assert_eq!(vm.global("lazy").as_ref(), Some(&Value::Int(42)));
+        assert_eq!(vm.global("absentValue").as_ref(), Some(&Value::Int(7)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(7)));
+        assert_eq!(vm.global("preserved").as_ref(), Some(&Value::Int(42)));
+        assert_eq!(vm.global("second").as_ref(), Some(&Value::Number(2.0)));
     }
 
     #[test]
@@ -3030,7 +3284,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(vm.global("calls"), Some(&Value::Number(1.0)));
+        assert_eq!(vm.global("calls").as_ref(), Some(&Value::Int(1)));
         let snapshot = crate::hson::to_string(&vm.snapshot()).expect("snapshot");
         let mut vm =
             Vm::restore(code, crate::hson::from_str(&snapshot).expect("decode")).expect("restore");
@@ -3043,9 +3297,9 @@ mod tests {
             }
         }
         assert!(completed);
-        assert_eq!(vm.global("result"), Some(&Value::Number(42.0)));
-        assert_eq!(vm.global("fallback"), Some(&Value::Number(7.0)));
-        assert_eq!(vm.global("calls"), Some(&Value::Number(1.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(42)));
+        assert_eq!(vm.global("fallback").as_ref(), Some(&Value::Int(7)));
+        assert_eq!(vm.global("calls").as_ref(), Some(&Value::Int(1)));
     }
 
     #[test]
@@ -3082,7 +3336,7 @@ mod tests {
                 vm.step_with_budget(&mut 1).expect("boolean program runs"),
                 Some(VmEvent::Completed(_))
             ) {
-                assert_eq!(vm.globals()[0], Value::Number(2.0));
+                assert_eq!(vm.globals()[0], Value::Int(2));
                 assert_eq!(
                     vm.globals()[1],
                     Value::List(
@@ -3095,7 +3349,7 @@ mod tests {
                         .collect()
                     )
                 );
-                assert_eq!(vm.globals()[2], Value::Number(3.0));
+                assert_eq!(vm.globals()[2], Value::Int(3));
                 return;
             }
         }
@@ -3223,7 +3477,7 @@ mod tests {
                 vm.step().expect("constant program runs"),
                 Some(VmEvent::Completed(_))
             ) {
-                assert_eq!(vm.global("result"), Some(&Value::Bool(true)));
+                assert_eq!(vm.global("result").as_ref(), Some(&Value::Bool(true)));
                 return;
             }
         }
@@ -3273,7 +3527,7 @@ mod tests {
             }
         }
         let encoded = crate::hson::to_string(&vm.snapshot()).expect("waiting state serializes");
-        for value in [Value::Number(1.0), Value::String("bob".into())] {
+        for value in [Value::Int(1), Value::String("bob".into())] {
             let mut restored = Vm::restore(
                 code.clone(),
                 crate::hson::from_str(&encoded).expect("snapshot"),
@@ -3381,8 +3635,7 @@ mod tests {
                 "invalid arguments must not execute the body"
             );
         }
-        let mut vm =
-            Vm::from_function(bytecode, 0, vec![Value::Number(2.0)]).expect("arity is valid");
+        let mut vm = Vm::from_function(bytecode, 0, vec![Value::Int(2)]).expect("arity is valid");
         assert!(vm.step().is_ok());
     }
 
@@ -3404,10 +3657,7 @@ mod tests {
             let vm = Vm::from_function(
                 bytecode.clone(),
                 0,
-                vec![Value::List(vec![Value::Tuple(vec![
-                    Value::Number(1.0),
-                    value,
-                ])])],
+                vec![Value::List(vec![Value::Tuple(vec![Value::Int(1), value])])],
             )
             .expect("arity is valid");
             let mut restored =
@@ -3440,7 +3690,7 @@ mod tests {
     fn proven_any_cast_preserves_the_value() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
-            "let a: Int = 1\nlet b: Any = a\nlet c: Int = b as Int",
+            "let a: Int = 1\nlet b: Any = a\nlet c: Int = b as! Int",
             &manifest,
         );
         let result = bytecode
@@ -3450,7 +3700,7 @@ mod tests {
             .expect("result local exists");
         let mut vm = Vm::new(bytecode).expect("program initializes");
         while vm.step().expect("proven cast executes").is_some() {}
-        assert_eq!(vm.locals[result], Value::Number(1.0));
+        assert_eq!(vm.locals.get(result), Some(Value::Int(1)));
     }
 
     #[test]
@@ -3491,7 +3741,7 @@ mod tests {
         while vm.step().expect("closure initializes").is_some() {}
         let closure = vm
             .locals
-            .iter()
+            .values()
             .find(|value| matches!(value, Value::Closure { .. }))
             .expect("closure is stored")
             .clone();
@@ -3660,7 +3910,7 @@ mod tests {
             }
         }
         let Value::Map(player) = vm
-            .export_value(vm.global("player").expect("player global exists"))
+            .export_value(vm.global("player").as_ref().expect("player global exists"))
             .expect("record exports")
         else {
             panic!("player is a record")
@@ -3668,7 +3918,7 @@ mod tests {
         let Value::Map(stats) = &player["stats"] else {
             panic!("stats is a record")
         };
-        assert_eq!(stats["health"], Value::Number(4.0));
+        assert_eq!(stats["health"], Value::Int(4));
     }
 
     #[test]
@@ -3690,7 +3940,7 @@ mod tests {
         let snapshot = vm.snapshot();
         let mut restored = Vm::restore(bytecode, snapshot).expect("waiting VM snapshot restores");
         restored
-            .resume(Value::Number(4.0))
+            .resume(Value::Int(4))
             .expect("host value resumes VM");
         assert_eq!(
             restored.step().expect("statement executes"),
@@ -3741,13 +3991,13 @@ mod tests {
             panic!("expected native call")
         };
         assert_eq!(bytecode.symbols.resolve(call.function), Some("nativeValue"));
-        assert_eq!(call.arguments[0].value, Value::Number(4.0));
+        assert_eq!(call.arguments[0].value, Value::Int(4));
         let snapshot = vm.snapshot();
         assert_eq!(snapshot.call_stack.len(), 1);
 
         let mut restored = Vm::restore(bytecode, snapshot).expect("call stack restores");
         restored
-            .resume(Value::Number(4.0))
+            .resume(Value::Int(4))
             .expect("native result resumes function");
         while !matches!(
             restored.step().expect("execution succeeds"),
@@ -3789,7 +4039,7 @@ mod tests {
                 ref captures,
                 ..
             }
-                if captures.contains(&Value::Number(4.0))
+                if captures.contains(&Value::Int(4))
         ));
     }
 
@@ -3807,7 +4057,7 @@ mod tests {
             vm.step().expect("typed lambda executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert!(vm.snapshot().locals.contains(&Value::Number(5.0)));
+        assert!(vm.snapshot().locals.contains(&Value::Int(5)));
     }
 
     #[test]
@@ -3903,11 +4153,17 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(vm.global("result"), Some(&Value::Number(2.0)));
-        assert_eq!(vm.global("label"), Some(&Value::String(String::new())));
-        assert_eq!(vm.global("inferredResult"), Some(&Value::Number(7.0)));
-        assert_eq!(vm.global("branch"), Some(&Value::Number(4.0)));
-        assert_eq!(vm.global("flexible"), Some(&Value::String("alice".into())));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(2)));
+        assert_eq!(
+            vm.global("label").as_ref(),
+            Some(&Value::String(String::new()))
+        );
+        assert_eq!(vm.global("inferredResult").as_ref(), Some(&Value::Int(7)));
+        assert_eq!(vm.global("branch").as_ref(), Some(&Value::Int(4)));
+        assert_eq!(
+            vm.global("flexible").as_ref(),
+            Some(&Value::String("alice".into()))
+        );
     }
 
     #[test]
@@ -3941,7 +4197,7 @@ mod tests {
             vm.step().expect("function value executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(3.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(3)));
     }
 
     #[test]
@@ -3979,7 +4235,7 @@ mod tests {
     fn cast_modes_execute_with_checked_runtime_semantics() {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let bytecode = compile(
-            "global var rounded: Int = 3.75 as Int\nglobal var absent: String? = 4 as? String",
+            "global var rounded: Int = 3.75 as! Int\nglobal var absent: String? = 4 as? String",
             &manifest,
         );
         let mut vm = Vm::new(bytecode).expect("VM initializes");
@@ -3987,8 +4243,8 @@ mod tests {
             vm.step().expect("casts execute"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("rounded"), Some(&Value::Number(3.0)));
-        assert_eq!(vm.global("absent"), Some(&Value::Optional(None)));
+        assert_eq!(vm.global("rounded").as_ref(), Some(&Value::Int(3)));
+        assert_eq!(vm.global("absent").as_ref(), Some(&Value::Optional(None)));
     }
 
     #[test]
@@ -4004,20 +4260,20 @@ mod tests {
             Some(VmEvent::Completed(_))
         ) {}
         assert_eq!(
-            vm.global("present"),
+            vm.global("present").as_ref(),
             Some(&Value::Optional(Some(Box::new(Value::String(
                 "alice".into()
             )))))
         );
         assert_eq!(
-            vm.global("nested"),
+            vm.global("nested").as_ref(),
             Some(&Value::Optional(Some(Box::new(Value::Optional(None)))))
         );
-        assert_eq!(vm.global("empty"), Some(&Value::Optional(None)));
+        assert_eq!(vm.global("empty").as_ref(), Some(&Value::Optional(None)));
 
         let restored = Vm::restore(bytecode, vm.snapshot()).expect("snapshot restores");
         assert_eq!(
-            restored.global("nested"),
+            restored.global("nested").as_ref(),
             Some(&Value::Optional(Some(Box::new(Value::Optional(None)))))
         );
     }
@@ -4036,7 +4292,7 @@ mod tests {
             value
         );
         let bad = heap.import(Value::List(vec![Value::List(vec![Value::Map(
-            BTreeMap::from([("name".into(), Value::Number(1.0))]),
+            BTreeMap::from([("name".into(), Value::Int(1))]),
         )])]));
         assert!(cast_value_with_heap(&bad, &target, &heap).is_err());
     }
@@ -4090,9 +4346,18 @@ mod tests {
             vm.step().expect("string conversion succeeds"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::String("0.5".into())));
-        assert_eq!(vm.global("integer"), Some(&Value::String("12".into())));
-        assert_eq!(vm.global("flag"), Some(&Value::String("true".into())));
+        assert_eq!(
+            vm.global("result").as_ref(),
+            Some(&Value::String("0.5".into()))
+        );
+        assert_eq!(
+            vm.global("integer").as_ref(),
+            Some(&Value::String("12".into()))
+        );
+        assert_eq!(
+            vm.global("flag").as_ref(),
+            Some(&Value::String("true".into()))
+        );
     }
 
     #[test]
@@ -4107,7 +4372,7 @@ mod tests {
             vm.step().expect("conversion succeeds"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(-3.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(-3)));
         assert!(cast_value(&Value::Number(f64::INFINITY), &crate::ScriptType::Int).is_err());
         assert!(cast_value(&Value::Number(1e30), &crate::ScriptType::Int).is_err());
     }
@@ -4147,8 +4412,8 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(calls, vec![Value::Number(3.0), Value::Number(4.0)]);
-        assert_eq!(vm.global("result"), Some(&Value::Number(6.0)));
+        assert_eq!(calls, vec![Value::Int(3), Value::Int(4)]);
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(6)));
     }
 
     #[test]
@@ -4208,7 +4473,7 @@ mod tests {
             vm.step().expect("conversion executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Number(7.0)));
     }
 
     #[test]
@@ -4326,13 +4591,13 @@ mod tests {
             vm.step().expect("named primitive method executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("sum"), Some(&Value::Number(7.0)));
-        assert_eq!(vm.global("product"), Some(&Value::Number(6.0)));
+        assert_eq!(vm.global("sum").as_ref(), Some(&Value::Int(7)));
+        assert_eq!(vm.global("product").as_ref(), Some(&Value::Number(6.0)));
         assert_eq!(
-            vm.global("greeting"),
+            vm.global("greeting").as_ref(),
             Some(&Value::String("alicebob".into()))
         );
-        assert_eq!(vm.global("same"), Some(&Value::Bool(true)));
+        assert_eq!(vm.global("same").as_ref(), Some(&Value::Bool(true)));
     }
 
     #[test]
@@ -4381,7 +4646,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(vm.global("result"), Some(&Value::String("alice".into())));
+        assert_eq!(
+            vm.global("result").as_ref(),
+            Some(&Value::String("alice".into()))
+        );
     }
 
     #[test]
@@ -4412,11 +4680,11 @@ mod tests {
             Some(VmEvent::Completed(_))
         ) {}
         assert_eq!(
-            vm.global("result"),
+            vm.global("result").as_ref(),
             Some(&Value::String("alicealice2".into()))
         );
         assert_eq!(
-            vm.global("methodResult"),
+            vm.global("methodResult").as_ref(),
             Some(&Value::String("bob".into()))
         );
     }
@@ -4463,8 +4731,11 @@ mod tests {
             vm.step().expect("protocol call executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::String("5".into())));
-        assert_eq!(vm.global("negative"), Some(&Value::Number(-2.0)));
+        assert_eq!(
+            vm.global("result").as_ref(),
+            Some(&Value::String("5".into()))
+        );
+        assert_eq!(vm.global("negative").as_ref(), Some(&Value::Int(-2)));
         assert!(
             crate::parse_program("extend String { operator fn colon(self, rhs: String) {} }")
                 .is_err()
@@ -4523,7 +4794,7 @@ mod tests {
             vm.step().expect("method executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(15.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(15)));
     }
 
     #[test]
@@ -4567,7 +4838,7 @@ mod tests {
             Some(VmEvent::Completed(_))
         ) {}
         assert_eq!(
-            vm.global("pair"),
+            vm.global("pair").as_ref(),
             Some(&Value::Tuple(vec![
                 Value::Number(1.0),
                 Value::String("alice".into())
@@ -4611,7 +4882,7 @@ mod tests {
             vm.step().expect("properties execute"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(27.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(27)));
     }
 
     #[test]
@@ -4634,7 +4905,7 @@ mod tests {
             vm.step().expect("typed closures execute"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(5.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(5)));
     }
 
     #[test]
@@ -4674,7 +4945,7 @@ mod tests {
             vm.step().expect("aliases execute"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(7.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(7)));
     }
 
     #[test]
@@ -4702,10 +4973,16 @@ mod tests {
             vm.step().expect("static and instance calls execute"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("label"), Some(&Value::String("Player".into())));
-        assert_eq!(vm.global("total"), Some(&Value::Number(5.0)));
-        assert_eq!(vm.global("instance"), Some(&Value::Number(7.0)));
-        assert_eq!(vm.global("indirect"), Some(&Value::String("Player".into())));
+        assert_eq!(
+            vm.global("label").as_ref(),
+            Some(&Value::String("Player".into()))
+        );
+        assert_eq!(vm.global("total").as_ref(), Some(&Value::Int(5)));
+        assert_eq!(vm.global("instance").as_ref(), Some(&Value::Int(7)));
+        assert_eq!(
+            vm.global("indirect").as_ref(),
+            Some(&Value::String("Player".into()))
+        );
     }
 
     #[test]
@@ -4727,7 +5004,7 @@ mod tests {
             vm.step().expect("restored method executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(5.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(5)));
     }
 
     #[test]
@@ -4746,7 +5023,7 @@ mod tests {
             vm.step().expect("method executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::Number(6.0)));
+        assert_eq!(vm.global("result").as_ref(), Some(&Value::Int(6)));
     }
 
     #[test]
@@ -4913,7 +5190,10 @@ mod tests {
                 inherited.step().expect("initializer is skipped"),
                 Some(VmEvent::Completed(_))
             ));
-            assert_eq!(inherited.global("name"), Some(&Value::Optional(None)));
+            assert_eq!(
+                inherited.global("name").as_ref(),
+                Some(&Value::Optional(None))
+            );
             let mut fresh = Vm::new(code).expect("fresh session");
             assert!(matches!(
                 fresh.step().expect("initializer executes in fresh session"),
@@ -4927,10 +5207,10 @@ mod tests {
         let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
         let code = compile("global var score = 1\nscore += 1", &manifest);
         let mut vm = Vm::new(code).expect("VM initializes");
-        vm.set_global_values(vec![Value::Number(40.0)])
+        vm.set_global_values(vec![Value::Int(40)])
             .expect("inherit score");
         while !matches!(vm.step().expect("execute"), Some(VmEvent::Completed(_))) {}
-        assert_eq!(vm.global("score"), Some(&Value::Number(41.0)));
+        assert_eq!(vm.global("score").as_ref(), Some(&Value::Int(41)));
     }
 
     #[test]
@@ -4955,7 +5235,10 @@ mod tests {
             vm.step().expect("generic call executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::String("alice".into())));
+        assert_eq!(
+            vm.global("result").as_ref(),
+            Some(&Value::String("alice".into()))
+        );
     }
 
     #[test]
@@ -4969,7 +5252,10 @@ mod tests {
             vm.step().expect("generic call executes"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("result"), Some(&Value::String("alice".into())));
+        assert_eq!(
+            vm.global("result").as_ref(),
+            Some(&Value::String("alice".into()))
+        );
     }
 
     #[test]
@@ -5055,7 +5341,7 @@ mod tests {
             vm.step().expect("template function runs"),
             Some(VmEvent::Completed(_))
         ) {}
-        let bytes = crate::hson::to_vec(vm.global("text").expect("returned template"))
+        let bytes = crate::hson::to_vec(vm.global("text").as_ref().expect("returned template"))
             .expect("template serializes");
         let Value::TextTemplate(template) =
             crate::hson::from_slice::<Value>(&bytes).expect("template restores")
@@ -5105,7 +5391,7 @@ mod tests {
                     assert_eq!(call.arguments[0].value, Value::String("alice".into()));
                     assert_eq!(
                         call.arguments[1].value,
-                        Value::Number(if emotions.is_empty() { 0.0 } else { 4.0 })
+                        Value::Int(if emotions.is_empty() { 0 } else { 4 })
                     );
                     emotions.push(call.arguments[2].value.clone());
                     vm = Vm::restore(code.clone(), vm.snapshot())
@@ -5124,7 +5410,7 @@ mod tests {
                 Value::String("sad".into())
             ]
         );
-        assert_eq!(vm.global("commits"), Some(&Value::Number(3.0)));
+        assert_eq!(vm.global("commits").as_ref(), Some(&Value::Int(3)));
     }
 
     #[test]
@@ -5144,8 +5430,14 @@ mod tests {
             vm.step().expect("optional arguments"),
             Some(VmEvent::Completed(_))
         ) {}
-        assert_eq!(vm.global("first"), Some(&Value::String("alice!".into())));
-        assert_eq!(vm.global("second"), Some(&Value::String("bob!".into())));
+        assert_eq!(
+            vm.global("first").as_ref(),
+            Some(&Value::String("alice!".into()))
+        );
+        assert_eq!(
+            vm.global("second").as_ref(),
+            Some(&Value::String("bob!".into()))
+        );
         let program = crate::parse_program("fn label(name: String, suffix: String?) {}\nlabel()")
             .expect("parse");
         assert!(compile_with_manifest(&program, 0, &manifest).is_err());
@@ -5225,7 +5517,7 @@ mod tests {
             panic!("template")
         };
         assert_eq!(
-            vm.eval_template_value_with(template, |source| Ok(source.to_owned()))
+            vm.eval_template_value_with(&template, |source| Ok(source.to_owned()))
                 .expect("captured record remains alive"),
             "Hello bob"
         );
@@ -5246,7 +5538,7 @@ mod tests {
         let mut vm = Vm::new(code).expect("VM");
         while !matches!(vm.step().expect("string hook"), Some(VmEvent::Completed(_))) {}
         assert_eq!(
-            vm.global("output"),
+            vm.global("output").as_ref(),
             Some(&Value::String("Hello alice".into()))
         );
     }

@@ -67,6 +67,7 @@ struct Token {
 #[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
     Ident(String),
+    Integer(u64),
     Number(f64, NumberUnit),
     String(String),
     Ellipsis,
@@ -239,6 +240,18 @@ impl<'a> TokenAdapter<'a> {
                 }
                 RawToken::Percent => {
                     if let Some(Token {
+                        kind: TokenKind::Integer(value),
+                        span: number_span,
+                    }) = tokens.last_mut()
+                        && number_span.end == start
+                    {
+                        let value = *value as f64;
+                        number_span.end = span.end;
+                        tokens.last_mut().expect("numeric token exists").kind =
+                            TokenKind::Number(value, NumberUnit::Percent);
+                        continue;
+                    }
+                    if let Some(Token {
                         kind: TokenKind::Number(_, unit),
                         span: number_span,
                     }) = tokens.last_mut()
@@ -257,8 +270,11 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Literal {
                     kind: LiteralKind::Int { empty_int, .. },
                     suffix_start,
-                } if !empty_int => match lexeme[..suffix_start as usize].parse::<f64>() {
-                    Ok(value) => TokenKind::Number(value, NumberUnit::Scalar),
+                } if !empty_int => match lexeme[..suffix_start as usize]
+                    .replace('_', "")
+                    .parse::<u64>()
+                {
+                    Ok(value) => TokenKind::Integer(value),
                     Err(_) => {
                         errors.push(ParseError {
                             message: "invalid numeric literal".to_string(),
@@ -1811,6 +1827,10 @@ impl Parser {
             },
             TokenKind::Ident(name) => Expr {
                 kind: ExprKind::Ident(name),
+                span: token.span,
+            },
+            TokenKind::Integer(value) => Expr {
+                kind: ExprKind::Integer(value),
                 span: token.span,
             },
             TokenKind::Number(value, unit) => Expr {

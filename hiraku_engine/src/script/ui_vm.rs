@@ -114,7 +114,7 @@ struct UiDraft {
     hovered_when_disabled: bool,
     hover_scale: f32,
     hover_active: Option<HksBinding<bool>>,
-    text_reveal: Option<HksBinding<u32>>,
+    text_reveal: Option<HksBinding<i64>>,
     press_scale: f32,
     scroll_speed: f32,
     default_scroll_anchor: crate::ui::ScrollAnchor,
@@ -610,9 +610,11 @@ mod native_ui {
     fn string_prefix(
         _context: &mut UiVmContext,
         value: String,
-        characters: u32,
+        characters: i64,
     ) -> Result<String, NativeError> {
-        Ok(value.chars().take(characters as usize).collect())
+        let count = usize::try_from(characters)
+            .map_err(|_| NativeError::message("prefix count must be nonnegative"))?;
+        Ok(value.chars().take(count).collect())
     }
 
     #[hks(name = "richText")]
@@ -629,7 +631,7 @@ mod native_ui {
     fn text_reveal(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        count: HksBindable<u32>,
+        count: HksBindable<i64>,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !draft.layout.rich_text {
@@ -637,7 +639,9 @@ mod native_ui {
         }
         match count {
             HksBindable::Value(value) => {
-                draft.layout.text_reveal = Some(value);
+                draft.layout.text_reveal = Some(u32::try_from(value).map_err(|_| {
+                    NativeError::message("reveal count must fit a nonnegative 32-bit integer")
+                })?);
                 draft.text_reveal = None;
             }
             HksBindable::Binding(binding) => draft.text_reveal = Some(binding),
@@ -1404,6 +1408,8 @@ pub(crate) fn ui_argument_to_stored(value: &Value) -> Result<StoredValue, Native
     match value {
         Value::Bool(value) => Ok(StoredValue::Bool(*value)),
         Value::Number(value) => Ok(StoredValue::Float(*value)),
+        Value::Int(value) => Ok(StoredValue::Int(*value)),
+        Value::UInt(value) => Ok(StoredValue::UInt(*value)),
         Value::String(value) => Ok(StoredValue::String(value.clone())),
         Value::List(values) => values
             .iter()
@@ -1463,6 +1469,8 @@ fn validate_ui_result(value: &Value) -> Result<(), NativeError> {
         | Value::Null
         | Value::Bool(_)
         | Value::Number(_)
+        | Value::Int(_)
+        | Value::UInt(_)
         | Value::Percent(_)
         | Value::String(_)
         | Value::Optional(None) => Ok(()),
@@ -1911,7 +1919,9 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
 fn stored_value_type(value: &StoredValue) -> ScriptType {
     match value {
         StoredValue::Bool(_) => ScriptType::Bool,
-        StoredValue::Int(_) | StoredValue::Float(_) => ScriptType::Float,
+        StoredValue::Int(_) => ScriptType::Int,
+        StoredValue::UInt(_) => ScriptType::UInt,
+        StoredValue::Float(_) => ScriptType::Float,
         StoredValue::String(_) => ScriptType::String,
         StoredValue::Array(values) => {
             let mut types = values.iter().map(stored_value_type);
@@ -2196,7 +2206,11 @@ pub(crate) fn evaluate_ui_callback_with_args(
                         .map_err(|error| UiVmError::Runtime(error.to_string()))?
                         .with_origin(context.navigation_origin.clone());
                     effects.push(UiEffect::Navigate(request));
-                    return Ok((effects, vm.current_globals()));
+                    return Ok((
+                        effects,
+                        vm.current_globals()
+                            .map_err(|error| UiVmError::Runtime(error.to_string()))?,
+                    ));
                 }
                 let value = registry
                     .call(&mut context, &call)
@@ -2227,7 +2241,11 @@ pub(crate) fn evaluate_ui_callback_with_args(
                         .range((committed_effect + 1)..)
                         .map(|(_, effect)| effect.clone()),
                 );
-                return Ok((effects, vm.current_globals()));
+                return Ok((
+                    effects,
+                    vm.current_globals()
+                        .map_err(|error| UiVmError::Runtime(error.to_string()))?,
+                ));
             }
             None => {
                 return Err(UiVmError::Runtime(
@@ -2248,8 +2266,8 @@ fn context_globals(context: &UiVmContext) -> BTreeMap<String, Value> {
     globals.insert(
         "time".to_string(),
         Value::Map(BTreeMap::from([
-            ("elapsedSeconds".to_string(), Value::Number(0.0)),
-            ("unixSeconds".to_string(), Value::Number(0.0)),
+            ("elapsedSeconds".to_string(), Value::Int(0)),
+            ("unixSeconds".to_string(), Value::Int(0)),
         ])),
     );
     globals.extend(context.local_globals.clone());
@@ -2259,7 +2277,8 @@ fn context_globals(context: &UiVmContext) -> BTreeMap<String, Value> {
 fn stored_to_hks(value: &StoredValue) -> Value {
     match value {
         StoredValue::Bool(value) => Value::Bool(*value),
-        StoredValue::Int(value) => Value::Number(*value as f64),
+        StoredValue::Int(value) => Value::Int(*value),
+        StoredValue::UInt(value) => Value::UInt(*value),
         StoredValue::Float(value) => Value::Number(*value),
         StoredValue::String(value) => Value::String(value.clone()),
         StoredValue::Array(values) => Value::List(values.iter().map(stored_to_hks).collect()),
@@ -2594,7 +2613,13 @@ fn materialize_node(
         let reactive = reactive_binding(binding, program, context);
         let value = evaluate_binding_value(&reactive, registry, context)?;
         draft.layout.text_reveal = Some(
-            u32::from_hks_value(&value).map_err(|error| UiVmError::Invalid(error.to_string()))?,
+            u32::try_from(
+                i64::from_hks_value(&value)
+                    .map_err(|error| UiVmError::Invalid(error.to_string()))?,
+            )
+            .map_err(|_| {
+                UiVmError::Invalid("reveal count must fit a nonnegative 32-bit integer".into())
+            })?,
         );
         draft.layout.reactive_text_reveal = Some(reactive);
     }
@@ -2873,7 +2898,7 @@ fn materialize_node(
                 };
                 let rendered = closure_children_with_args(
                     renderer.clone(),
-                    vec![Value::Number(index as f64), Value::String(label)],
+                    vec![Value::Int(index as i64), Value::String(label)],
                     program,
                     registry,
                     context,
@@ -3111,7 +3136,8 @@ fn image_button_layout(mut image: ScreenLayout, button: &ScreenLayout) -> Screen
 fn stored_value(value: Value) -> Result<StoredValue, UiVmError> {
     match value {
         Value::Bool(value) => Ok(StoredValue::Bool(value)),
-        Value::Number(value) if value.fract() == 0.0 => Ok(StoredValue::Int(value as i64)),
+        Value::Int(value) => Ok(StoredValue::Int(value)),
+        Value::UInt(value) => Ok(StoredValue::UInt(value)),
         Value::Number(value) => Ok(StoredValue::Float(value)),
         Value::String(value) | Value::Symbol(value) => Ok(StoredValue::String(value)),
         Value::List(values) | Value::Tuple(values) => values
@@ -3613,7 +3639,7 @@ mod tests {
             ("ui.close(null)", Value::Optional(None)),
             (
                 "ui.close(.{ a: 1 })",
-                Value::Map(BTreeMap::from([("a".into(), Value::Number(1.0))])),
+                Value::Map(BTreeMap::from([("a".into(), Value::Int(1))])),
             ),
         ] {
             let source = format!(
@@ -5326,7 +5352,7 @@ canvas {
             .reactive_text
             .clone()
             .expect("compiler extracted property");
-        property.globals.insert("count".into(), Value::Number(2.0));
+        property.globals.insert("count".into(), Value::Int(2));
         assert_eq!(
             evaluate_ui_reactive_binding(&property, &crate::ui::UiModels::default())
                 .expect("recompute"),

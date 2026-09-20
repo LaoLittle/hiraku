@@ -20,9 +20,11 @@ fn evaluate_scalar(
         LoweringError { message: "extension let initializer must be a constant expression; use var with get() for runtime computation".into(), span: expr.span }
     };
     let kind = match &expr.kind {
-        ExprKind::Unit | ExprKind::Null | ExprKind::Bool(_) | ExprKind::Number { .. } => {
-            expr.kind.clone()
-        }
+        ExprKind::Unit
+        | ExprKind::Null
+        | ExprKind::Bool(_)
+        | ExprKind::Number { .. }
+        | ExprKind::Integer(_) => expr.kind.clone(),
         ExprKind::Tuple(values) | ExprKind::List(values) => {
             let values = values
                 .iter()
@@ -54,6 +56,12 @@ fn evaluate_scalar(
             _ => return Err(fail()),
         },
         ExprKind::UnaryMinus(value) => match evaluate_scalar(value, constants, execute)?.kind {
+            ExprKind::Integer(value) if value <= 1u64 << 63 => {
+                ExprKind::UnaryMinus(Box::new(Expr {
+                    kind: ExprKind::Integer(value),
+                    span: expr.span,
+                }))
+            }
             ExprKind::Number { value, unit } => ExprKind::Number {
                 value: -value,
                 unit,
@@ -67,6 +75,56 @@ fn evaluate_scalar(
                 (ExprKind::Bool(false), BinaryOp::And) | (ExprKind::Bool(true), BinaryOp::Or)
             );
             let right = evaluate_scalar(right, constants, execute && !skipped)?.kind;
+            let integer = |kind: &ExprKind| match kind {
+                ExprKind::Integer(n) => Some(i128::from(*n)),
+                ExprKind::UnaryMinus(value) => match value.kind {
+                    ExprKind::Integer(n) => Some(-i128::from(n)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let (Some(a), Some(b)) = (integer(&left), integer(&right)) {
+                let boolean = match op {
+                    BinaryOp::Equal => Some(a == b),
+                    BinaryOp::NotEqual => Some(a != b),
+                    BinaryOp::Less => Some(a < b),
+                    BinaryOp::LessEqual => Some(a <= b),
+                    BinaryOp::Greater => Some(a > b),
+                    BinaryOp::GreaterEqual => Some(a >= b),
+                    _ => None,
+                };
+                let kind = if let Some(value) = boolean {
+                    ExprKind::Bool(value)
+                } else {
+                    let n = if !execute {
+                        0
+                    } else {
+                        match op {
+                            BinaryOp::Add => a.checked_add(b),
+                            BinaryOp::Subtract => a.checked_sub(b),
+                            BinaryOp::Multiply => a.checked_mul(b),
+                            BinaryOp::Divide => a.checked_div(b),
+                            _ => None,
+                        }
+                        .ok_or_else(fail)?
+                    };
+                    if n < i64::MIN as i128 || n > u64::MAX as i128 {
+                        return Err(fail());
+                    }
+                    if n < 0 {
+                        ExprKind::UnaryMinus(Box::new(Expr {
+                            kind: ExprKind::Integer((-n) as u64),
+                            span: expr.span,
+                        }))
+                    } else {
+                        ExprKind::Integer(n as u64)
+                    }
+                };
+                return Ok(Expr {
+                    kind,
+                    span: expr.span,
+                });
+            }
             match (left, right) {
                 (ExprKind::Bool(a), ExprKind::Bool(b)) => ExprKind::Bool(match op {
                     BinaryOp::And => a && b,

@@ -886,42 +886,37 @@ impl HksScriptType for f32 {
 }
 
 macro_rules! impl_integer_value {
-    ($( $type:ty ),* $(,)?) => {
+    ($variant:ident; $( $type:ty ),* $(,)?) => {
         $(
             impl FromHksValue for $type {
                 fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
-                    let Value::Number(value) = value else {
+                    let Value::$variant(value) = value else {
                         return Err(NativeError::TypeMismatch("integer"));
                     };
-                    if !value.is_finite() || value.fract() != 0.0
-                        || *value < <$type>::MIN as f64
-                        || *value > <$type>::MAX as f64
-                    {
-                        return Err(NativeError::message(format!(
+                    <$type>::try_from(*value).map_err(|_| NativeError::message(format!(
                             "number {value} is outside the range of {}",
                             stringify!($type),
-                        )));
-                    }
-                    Ok(*value as $type)
+                        )))
                 }
             }
 
             impl IntoHksValue for $type {
                 fn into_hks_value(self) -> Value {
-                    Value::Number(self as f64)
+                    Value::$variant(self.into())
                 }
             }
 
             impl HksScriptType for $type {
                 fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> crate::ScriptType {
-                    crate::ScriptType::Int
+                    crate::ScriptType::$variant
                 }
             }
         )*
     };
 }
 
-impl_integer_value!(u8, u16, u32, i8, i16, i32);
+impl_integer_value!(Int; i8, i16, i32, i64);
+impl_integer_value!(UInt; u8, u16, u32, u64);
 
 impl IntoHksValue for () {
     fn into_hks_value(self) -> Value {
@@ -1109,3 +1104,26 @@ impl fmt::Display for RegistrationError {
 }
 
 impl Error for RegistrationError {}
+
+#[cfg(test)]
+mod integer_tests {
+    use super::*;
+
+    #[test]
+    fn native_integers_are_exact_and_signedness_is_checked() {
+        let mut registry = NativeRegistry::<()>::new();
+        assert_eq!(u64::hks_script_type(&mut registry), crate::ScriptType::UInt);
+        assert_eq!(i64::hks_script_type(&mut registry), crate::ScriptType::Int);
+        assert_eq!(
+            u64::from_hks_value(&u64::MAX.into_hks_value()).expect("UInt"),
+            u64::MAX
+        );
+        assert_eq!(
+            i64::from_hks_value(&i64::MIN.into_hks_value()).expect("Int"),
+            i64::MIN
+        );
+        assert!(u32::from_hks_value(&Value::UInt(u64::MAX)).is_err());
+        assert!(u64::from_hks_value(&Value::Int(-1)).is_err());
+        assert!(i64::from_hks_value(&Value::Number(1.0)).is_err());
+    }
+}

@@ -1074,7 +1074,7 @@ mod tests {
         loop {
             match vm.step().expect("hook runs") {
                 Some(crate::LinkedVmEvent::Call(call)) => {
-                    assert_eq!(call.arguments[0].value, crate::Value::Number(4.0));
+                    assert_eq!(call.arguments[0].value, crate::Value::Int(4));
                     calls += 1;
                     vm.resume(crate::Value::Unit).expect("host resumes");
                 }

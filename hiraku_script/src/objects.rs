@@ -7,42 +7,85 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectId(pub u32);
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct ObjectHeap {
-    #[serde(with = "object_table")]
-    objects: BTreeMap<ObjectId, Value>,
+    objects: BTreeMap<ObjectId, crate::nanbox::Slot>,
+    storage: crate::value_heap::ValueHeap,
     // IDs are never reused, including after collection or snapshot restore.
     next_id: u32,
-    #[serde(skip)]
     last_collection: u32,
-    #[serde(default)]
     read_only: BTreeSet<ObjectId>,
 }
 
-mod object_table {
-    use super::*;
-    pub fn serialize<S: serde::Serializer>(
-        objects: &BTreeMap<ObjectId, Value>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        objects.iter().collect::<Vec<_>>().serialize(serializer)
+#[derive(Serialize, Deserialize)]
+struct HeapSnapshot {
+    objects: Vec<(ObjectId, Value)>,
+    next_id: u32,
+    read_only: BTreeSet<ObjectId>,
+}
+
+impl PartialEq for ObjectHeap {
+    fn eq(&self, other: &Self) -> bool {
+        self.next_id == other.next_id
+            && self.read_only == other.read_only
+            && self.objects.len() == other.objects.len()
+            && self
+                .objects
+                .keys()
+                .all(|id| self.get(*id) == other.get(*id))
     }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<BTreeMap<ObjectId, Value>, D::Error> {
-        let entries = Vec::<(ObjectId, Value)>::deserialize(deserializer)?;
-        let count = entries.len();
-        let objects: BTreeMap<_, _> = entries.into_iter().collect();
-        if objects.len() != count {
+}
+impl Serialize for ObjectHeap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        HeapSnapshot {
+            objects: self
+                .objects
+                .iter()
+                .map(|(id, slot)| (*id, self.storage.unpack(*slot)))
+                .collect(),
+            next_id: self.next_id,
+            read_only: self.read_only.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for ObjectHeap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let saved = HeapSnapshot::deserialize(deserializer)?;
+        let mut heap = Self {
+            next_id: saved.next_id,
+            read_only: saved.read_only,
+            ..Self::default()
+        };
+        for (id, value) in saved.objects {
+            if id.0 >= heap.next_id || heap.objects.contains_key(&id) {
+                return Err(serde::de::Error::custom(
+                    "duplicate or out-of-range object ID in heap snapshot",
+                ));
+            }
+            let value = heap.storage.pack(value);
+            heap.objects.insert(id, value);
+        }
+        if heap
+            .read_only
+            .iter()
+            .any(|id| !heap.objects.contains_key(id))
+        {
             return Err(serde::de::Error::custom(
-                "duplicate object ID in heap snapshot",
+                "read-only set refers to a missing object",
             ));
         }
-        Ok(objects)
+        Ok(heap)
     }
 }
 
 impl ObjectHeap {
+    pub fn with_strings(strings: crate::SharedStrings) -> Self {
+        Self {
+            storage: crate::value_heap::ValueHeap::with_strings(strings),
+            ..Self::default()
+        }
+    }
     /// Apply an owned host update without breaking aliases to an existing record.
     pub fn update(&mut self, old: &Value, new: Value) -> Result<Value, crate::VmError> {
         let Value::Object(id) = old else {
@@ -51,7 +94,7 @@ impl ObjectHeap {
         if matches!(new, Value::Object(_)) {
             return Ok(new);
         }
-        let previous = self.get(*id)?.clone();
+        let previous = self.get(*id)?;
         let merge =
             |heap: &mut Self, old: BTreeMap<String, Value>, new: BTreeMap<String, Value>| {
                 new.into_iter()
@@ -89,7 +132,7 @@ impl ObjectHeap {
             },
             (_, new) => return Ok(self.import(new)),
         };
-        *self.get_mut(*id)? = replacement;
+        self.replace(*id, replacement)?;
         Ok(Value::Object(*id))
     }
     pub fn allocate(&mut self, value: Value) -> Value {
@@ -98,23 +141,53 @@ impl ObjectHeap {
             .next_id
             .checked_add(1)
             .expect("object identifier space exhausted");
+        let value = self.storage.pack(value);
         self.objects.insert(id, value);
         Value::Object(id)
     }
 
-    pub fn get(&self, id: ObjectId) -> Result<&Value, crate::VmError> {
+    pub fn get(&self, id: ObjectId) -> Result<Value, crate::VmError> {
         self.objects
             .get(&id)
+            .map(|slot| self.storage.unpack(*slot))
             .ok_or(crate::VmError::InvalidObject(id))
     }
 
-    pub fn get_mut(&mut self, id: ObjectId) -> Result<&mut Value, crate::VmError> {
+    pub(crate) fn member(&self, id: ObjectId, name: &str) -> Result<Value, crate::VmError> {
+        let slot = self
+            .objects
+            .get(&id)
+            .ok_or(crate::VmError::InvalidObject(id))?;
+        self.storage.member(*slot, name)
+    }
+
+    pub(crate) fn set_member(
+        &mut self,
+        id: ObjectId,
+        name: &str,
+        value: Value,
+    ) -> Result<(), crate::VmError> {
         if self.read_only.contains(&id) {
             return Err(crate::VmError::ReadOnlyValue);
         }
-        self.objects
+        let slot = *self
+            .objects
+            .get(&id)
+            .ok_or(crate::VmError::InvalidObject(id))?;
+        self.storage.set_member(slot, name, value)
+    }
+
+    pub fn replace(&mut self, id: ObjectId, value: Value) -> Result<(), crate::VmError> {
+        if self.read_only.contains(&id) {
+            return Err(crate::VmError::ReadOnlyValue);
+        }
+        let slot = self
+            .objects
             .get_mut(&id)
-            .ok_or(crate::VmError::InvalidObject(id))
+            .ok_or(crate::VmError::InvalidObject(id))?;
+        self.storage.release(*slot);
+        *slot = self.storage.pack(value);
+        Ok(())
     }
 
     /// Freeze a reachable graph, including aliases, nested records and cycles.
@@ -125,7 +198,7 @@ impl ObjectHeap {
             match value {
                 Value::Object(id) => {
                     if self.read_only.insert(id) {
-                        pending.push(self.get(id)?.clone());
+                        pending.push(self.get(id)?);
                     }
                 }
                 Value::Map(fields) => pending.extend(fields.into_values()),
@@ -197,16 +270,17 @@ impl ObjectHeap {
                     self.next_id = base
                         .checked_add(objects.next_id)
                         .expect("object identifier space exhausted");
-                    self.objects
-                        .extend(objects.objects.into_iter().map(|(id, value)| {
-                            (
-                                ObjectId(
-                                    id.0.checked_add(base)
-                                        .expect("object identifier space exhausted"),
-                                ),
-                                relocate(value, base),
-                            )
-                        }));
+                    for (id, slot) in objects.objects {
+                        let value = relocate(objects.storage.unpack(slot), base);
+                        let slot = self.storage.pack(value);
+                        self.objects.insert(
+                            ObjectId(
+                                id.0.checked_add(base)
+                                    .expect("object identifier space exhausted"),
+                            ),
+                            slot,
+                        );
+                    }
                     captures
                         .into_iter()
                         .map(|value| relocate(value, base))
@@ -252,17 +326,24 @@ impl ObjectHeap {
         roots: impl IntoIterator<Item = &'a Value>,
     ) -> Result<usize, crate::VmError> {
         let mut marked = BTreeSet::new();
-        let mut pending = roots.into_iter().collect::<Vec<_>>();
+        let mut pending = roots.into_iter().cloned().collect::<Vec<_>>();
         while let Some(value) = pending.pop() {
             match value {
                 Value::Object(id) => {
-                    if marked.insert(*id) {
-                        pending.push(self.get(*id)?);
+                    if marked.insert(id) {
+                        let slot = *self
+                            .objects
+                            .get(&id)
+                            .ok_or(crate::VmError::InvalidObject(id))?;
+                        self.storage
+                            .visit_objects(slot, &mut |id| pending.push(Value::Object(id)));
                     }
                 }
-                Value::Map(fields) => pending.extend(fields.values()),
-                Value::TextTemplate(template) => pending.extend(template.captures.values()),
-                Value::Typed { value, .. } | Value::Optional(Some(value)) => pending.push(value),
+                Value::Map(fields) => pending.extend(fields.into_values()),
+                Value::TextTemplate(template) => {
+                    pending.extend(template.captures.values().cloned())
+                }
+                Value::Typed { value, .. } | Value::Optional(Some(value)) => pending.push(*value),
                 Value::Tuple(values) | Value::List(values) => pending.extend(values),
                 Value::Closure {
                     captures,
@@ -273,7 +354,14 @@ impl ObjectHeap {
             }
         }
         let previous = self.objects.len();
-        self.objects.retain(|id, _| marked.contains(id));
+        self.objects.retain(|id, slot| {
+            if marked.contains(id) {
+                true
+            } else {
+                self.storage.release(*slot);
+                false
+            }
+        });
         self.read_only.retain(|id| marked.contains(id));
         self.last_collection = self.next_id;
         Ok(previous - self.objects.len())
@@ -306,7 +394,7 @@ impl ObjectHeap {
                 if !visiting.insert(*id) {
                     return Err(crate::VmError::CyclicHostValue);
                 }
-                let value = self.export_inner(self.get(*id)?, visiting)?;
+                let value = self.export_inner(&self.get(*id)?, visiting)?;
                 visiting.remove(id);
                 value
             }
@@ -387,11 +475,11 @@ impl ObjectHeap {
                 let source = self.get(*id)?;
                 let reference = target.allocate(Value::Unit);
                 ids.insert(*id, reference.clone());
-                let record = self.copy_reachable(source, target, ids)?;
+                let record = self.copy_reachable(&source, target, ids)?;
                 let Value::Object(target_id) = reference else {
                     unreachable!("allocation returns an object reference")
                 };
-                *target.get_mut(target_id)? = record;
+                target.replace(target_id, record)?;
                 if self.read_only.contains(id) {
                     target.read_only.insert(target_id);
                 }
@@ -505,6 +593,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_restores_logical_values_not_pool_indices() {
+        let strings = crate::SharedStrings::with_budget(4096);
+        strings.intern("bob");
+        strings.intern("alice");
+        let mut heap = ObjectHeap::with_strings(strings);
+        let value = Value::Map(BTreeMap::from([
+            ("name".into(), Value::String("alice".into())),
+            ("score".into(), Value::UInt(u64::MAX)),
+        ]));
+        let reference = heap.import(value.clone());
+        let bytes = crate::hson::to_vec(&heap).expect("snapshot serializes");
+        let restored: ObjectHeap = crate::hson::from_slice(&bytes).expect("snapshot restores");
+        assert_eq!(restored.export(&reference).expect("object exports"), value);
+        assert_eq!(heap, restored);
+        heap.collect(std::iter::empty())
+            .expect("collect unreachable payloads");
+        assert_eq!(heap.storage.usage(), (0, 0));
+    }
+
+    #[test]
     fn collection_reclaims_cycles_and_never_reuses_stale_ids() {
         let mut heap = ObjectHeap::default();
         let live = heap.import(Value::Map(BTreeMap::from([(
@@ -515,8 +623,8 @@ mod tests {
         let Value::Object(dead_id) = dead else {
             panic!("expected reference")
         };
-        *heap.get_mut(dead_id).expect("allocated object") =
-            Value::Map(BTreeMap::from([("self".into(), dead)]));
+        heap.replace(dead_id, Value::Map(BTreeMap::from([("self".into(), dead)])))
+            .expect("allocated object");
         let callback = Value::Closure {
             type_bindings: Vec::new(),
             module: None,
@@ -554,10 +662,14 @@ mod tests {
         let Value::Object(id) = object else {
             panic!("expected object reference")
         };
-        *heap.get_mut(id).expect("allocated record") = Value::Map(BTreeMap::from([
-            ("self".into(), object.clone()),
-            ("name".into(), Value::String("alice".into())),
-        ]));
+        heap.replace(
+            id,
+            Value::Map(BTreeMap::from([
+                ("self".into(), object.clone()),
+                ("name".into(), Value::String("alice".into())),
+            ])),
+        )
+        .expect("allocated record");
         let closure = Value::Closure {
             type_bindings: Vec::new(),
             module: None,
@@ -631,13 +743,19 @@ mod tests {
         let Value::Object(child) = fields["child"] else {
             panic!("child");
         };
-        assert_eq!(target.get_mut(root), Err(crate::VmError::ReadOnlyValue));
-        assert_eq!(target.get_mut(child), Err(crate::VmError::ReadOnlyValue));
+        assert_eq!(
+            target.replace(root, Value::Unit),
+            Err(crate::VmError::ReadOnlyValue)
+        );
+        assert_eq!(
+            target.replace(child, Value::Unit),
+            Err(crate::VmError::ReadOnlyValue)
+        );
         let Value::Object(local) = target.allocate(Value::Unit) else {
             panic!("object");
         };
         assert!(
-            target.get_mut(local).is_ok(),
+            target.replace(local, Value::Unit).is_ok(),
             "new local allocations remain mutable"
         );
     }

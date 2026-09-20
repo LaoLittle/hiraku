@@ -448,7 +448,8 @@ pub fn save_runtime_slot(
 fn stored_value_to_hks(value: StoredValue) -> hiraku_script::Value {
     match value {
         StoredValue::Bool(value) => hiraku_script::Value::Bool(value),
-        StoredValue::Int(value) => hiraku_script::Value::Number(value as f64),
+        StoredValue::Int(value) => hiraku_script::Value::Int(value),
+        StoredValue::UInt(value) => hiraku_script::Value::UInt(value),
         StoredValue::Float(value) => hiraku_script::Value::Number(value),
         StoredValue::String(value) => hiraku_script::Value::String(value),
         StoredValue::Array(values) => {
@@ -476,6 +477,8 @@ fn hks_value_to_stored(value: &hiraku_script::Value) -> Option<StoredValue> {
     match value {
         hiraku_script::Value::Bool(value) => Some(StoredValue::Bool(*value)),
         hiraku_script::Value::Number(value) => Some(StoredValue::Float(*value)),
+        hiraku_script::Value::Int(value) => Some(StoredValue::Int(*value)),
+        hiraku_script::Value::UInt(value) => Some(StoredValue::UInt(*value)),
         hiraku_script::Value::String(value) | hiraku_script::Value::Symbol(value) => {
             Some(StoredValue::String(value.clone()))
         }

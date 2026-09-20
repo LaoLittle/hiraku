@@ -276,6 +276,7 @@ impl From<&StoredValue> for proto::StoredValue {
         let kind = match value {
             StoredValue::Bool(value) => Kind::Bool(*value),
             StoredValue::Int(value) => Kind::Int(*value),
+            StoredValue::UInt(value) => Kind::UInt(*value),
             StoredValue::Float(value) => Kind::Float(*value),
             StoredValue::String(value) => Kind::String(value.clone()),
             StoredValue::Array(values) => Kind::Array(proto::StoredArray {
@@ -301,6 +302,7 @@ impl TryFrom<proto::StoredValue> for StoredValue {
         {
             Kind::Bool(value) => Ok(StoredValue::Bool(value)),
             Kind::Int(value) => Ok(StoredValue::Int(value)),
+            Kind::UInt(value) => Ok(StoredValue::UInt(value)),
             Kind::Float(value) => Ok(StoredValue::Float(value)),
             Kind::String(value) => Ok(StoredValue::String(value)),
             Kind::Array(values) => values
@@ -608,6 +610,14 @@ fn sanitize_slot_name(slot: &str) -> Result<&str, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_storage_roundtrips_without_float_conversion() {
+        let value = StoredValue::UInt(u64::MAX);
+        let encoded = proto::StoredValue::from(&value).encode_to_vec();
+        let decoded = proto::StoredValue::decode(encoded.as_slice()).expect("protobuf");
+        assert_eq!(StoredValue::try_from(decoded).expect("stored UInt"), value);
+    }
 
     #[test]
     fn dialogue_history_round_trips_in_save_payload_in_order() {

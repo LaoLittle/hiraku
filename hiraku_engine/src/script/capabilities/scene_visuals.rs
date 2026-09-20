@@ -712,6 +712,22 @@ mod api {
         handle: SceneTransitionHandle,
         seconds: f64,
     ) -> Result<SceneTransitionHandle, NativeError> {
+        let duration = milliseconds(seconds)?;
+        if let Some((target, fade)) = context.scene_visuals.pending.get_mut(&handle.0) {
+            if matches!(
+                target,
+                SceneVisualTarget::Picture(
+                    PictureCommand::Show { .. }
+                        | PictureCommand::Hide { .. }
+                        | PictureCommand::Tint { .. }
+                        | PictureCommand::Blur { .. }
+                ) | SceneVisualTarget::HideCharacters { .. }
+                    | SceneVisualTarget::Curtain { .. }
+            ) {
+                *fade = Some(duration);
+                return Ok(handle);
+            }
+        }
         let spec = transition_spec(context, handle)?.with_time(seconds)?;
         set_transition_spec(context, handle, spec)
     }
@@ -919,7 +935,21 @@ mod api {
                 "scene transition has already been committed; start a new presentation statement",
             )
         })?;
-        pending.1 = (duration > 0).then_some(duration);
+        if !matches!(
+            &pending.0,
+            SceneVisualTarget::Picture(
+                PictureCommand::Show { .. }
+                    | PictureCommand::Hide { .. }
+                    | PictureCommand::Tint { .. }
+                    | PictureCommand::Blur { .. }
+            ) | SceneVisualTarget::HideCharacters { .. }
+                | SceneVisualTarget::Curtain { .. }
+        ) {
+            return Err(NativeError::message(
+                "fade is not supported by this operation; use time(seconds) for movement or camera transitions",
+            ));
+        }
+        pending.1 = Some(duration);
         Ok(SceneTransitionHandle(id))
     }
 
@@ -937,6 +967,45 @@ mod api {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_applies_to_picture_visibility_and_preserves_modifier_order() {
+        for source in [
+            "bg(\"alice/background\").time(0.3).scale(1.2)",
+            "bg(\"alice/background\").scale(1.2).time(0.3)",
+        ] {
+            let mut runtime = runtime(source);
+            let StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                seconds,
+                scale,
+                ..
+            })) = event(&mut runtime)
+            else {
+                panic!("picture show");
+            };
+            assert!((seconds - 0.3).abs() < 0.00001);
+            assert!((scale - 1.2).abs() < 0.00001);
+        }
+        for suffix in ["time(0)", "fade(0)"] {
+            let mut runtime = runtime(&format!("scene.hideCharacters(300).{suffix}"));
+            assert!(matches!(
+                event(&mut runtime),
+                StoryRuntimeEvent::Effect(StoryEffect::HideCharacter { fade_ms: 0, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn unsupported_fade_is_an_error_not_a_silent_noop() {
+        let mut runtime = runtime("scene.transformPicture(\"alice\").fade(300)");
+        for _ in 0..32 {
+            if let Err(error) = runtime.step() {
+                assert!(error.to_string().contains("fade is not supported"));
+                return;
+            }
+        }
+        panic!("unsupported modifier must fail");
+    }
 
     #[test]
     fn actor_and_camera_use_typed_bezier_and_invalid_controls_report_errors() {
@@ -1984,7 +2053,7 @@ mod tests {
             event(&mut runtime),
             StoryRuntimeEvent::Choice { .. }
         ));
-        runtime.resume(Value::Number(0.0)).expect("select option");
+        runtime.resume(Value::Int(0)).expect("select option");
         assert_eq!(
             event(&mut runtime),
             StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms: 100 })

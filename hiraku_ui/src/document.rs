@@ -23,6 +23,18 @@ pub struct UiDocument {
 pub struct UiCompileError(pub String);
 
 impl UiDocument {
+    /// The compiled rendering-entry contract. Its result is the rendering
+    /// function's result, not the eventual value returned by a modal UI.
+    /// Nominal symbols belong to `program`; unrelated programs must not reuse them.
+    pub fn entry_signature(&self) -> Option<&hiraku_script::FunctionSignature> {
+        let name = self.entry_symbol?;
+        self.program.modules[self.entry.0 as usize]
+            .bytecode
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .map(|function| &function.signature)
+    }
     pub fn compile(
         path: &str,
         sources: Vec<ScriptSource>,
@@ -158,6 +170,7 @@ impl UiDocument {
             return Err(UiInvocationError::MissingEntry);
         }
         .map_err(UiInvocationError::Vm)?;
+        vm.validate_invocation().map_err(UiInvocationError::Vm)?;
         vm.freeze_invocation_inputs()
             .map_err(UiInvocationError::Vm)?;
         Ok(vm)

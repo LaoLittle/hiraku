@@ -320,6 +320,7 @@ fn value_set(value: &Expr) -> ValueSet {
         ExprKind::Cast { value, .. } | ExprKind::NonNull(value) => set.merge(&value_set(value)),
         ExprKind::Bool(_)
         | ExprKind::Number { .. }
+        | ExprKind::Integer(_)
         | ExprKind::Null
         | ExprKind::Unit
         | ExprKind::Symbol(_) => (),

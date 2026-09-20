@@ -76,6 +76,7 @@ pub fn compose<C>(
                 commit(context);
                 return Ok(vm
                     .current_globals()
+                    .map_err(|error| CompositionError::Vm(error.to_string()))?
                     .into_iter()
                     .filter(|(name, value)| {
                         owned_globals.contains(name) && *value != Value::Uninitialized

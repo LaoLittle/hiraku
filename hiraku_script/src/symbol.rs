@@ -1,7 +1,14 @@
 //! Deterministic symbols shared by API manifests, bytecode metadata and snapshots.
 
+use crate::SharedStrings;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum InternedSymbol {
+    Shared(lasso::Spur),
+    Owned(String),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId(pub u32);
@@ -31,7 +38,8 @@ impl SymbolManifest {
 
 #[derive(Clone, Debug, Default)]
 pub struct SymbolInterner {
-    symbols: IndexMap<String, SymbolId>,
+    symbols: IndexMap<InternedSymbol, SymbolId>,
+    strings: SharedStrings,
 }
 
 impl SymbolInterner {
@@ -41,6 +49,13 @@ impl SymbolInterner {
 
     pub fn intern(&mut self, symbol: impl Into<String>) -> SymbolId {
         let symbol = symbol.into();
+        if let Some(id) = self.get(&symbol) {
+            return id;
+        }
+        let symbol = match self.strings.intern(&symbol) {
+            Some(key) => InternedSymbol::Shared(key),
+            None => InternedSymbol::Owned(symbol),
+        };
         if let Some(id) = self.symbols.get(&symbol) {
             return *id;
         }
@@ -52,18 +67,35 @@ impl SymbolInterner {
     }
 
     pub fn get(&self, symbol: &str) -> Option<SymbolId> {
-        self.symbols.get(symbol).copied()
+        let key = match self.strings.get(symbol) {
+            Some(key) => InternedSymbol::Shared(key),
+            None => InternedSymbol::Owned(symbol.to_owned()),
+        };
+        self.symbols.get(&key).copied().or_else(|| {
+            self.symbols
+                .get(&InternedSymbol::Owned(symbol.to_owned()))
+                .copied()
+        })
     }
 
     pub fn resolve(&self, id: SymbolId) -> Option<&str> {
         self.symbols
             .get_index(id.0 as usize)
-            .map(|(symbol, _)| symbol.as_str())
+            .map(|(symbol, _)| match symbol {
+                InternedSymbol::Shared(key) => self.strings.resolve(*key),
+                InternedSymbol::Owned(value) => value.as_str(),
+            })
     }
 
     pub fn manifest(&self) -> SymbolManifest {
         SymbolManifest {
-            symbols: self.symbols.keys().cloned().collect(),
+            symbols: (0..self.symbols.len())
+                .map(|i| {
+                    self.resolve(SymbolId(i as u32))
+                        .expect("manifest index exists")
+                        .to_owned()
+                })
+                .collect(),
         }
     }
 
@@ -97,6 +129,38 @@ impl std::error::Error for SymbolManifestError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_pool_order_never_changes_manifest_ids() {
+        let first_pool = SharedStrings::with_budget(4096);
+        let second_pool = SharedStrings::with_budget(4096);
+        first_pool.intern("bob");
+        second_pool.intern("alice");
+        let mut first = SymbolInterner {
+            strings: first_pool,
+            ..Default::default()
+        };
+        let mut second = SymbolInterner {
+            strings: second_pool,
+            ..Default::default()
+        };
+        for name in ["alice", "bob", "Position", "relative"] {
+            assert_eq!(first.intern(name), second.intern(name));
+        }
+        assert_eq!(first.manifest(), second.manifest());
+    }
+
+    #[test]
+    fn full_pool_falls_back_without_losing_symbols() {
+        let mut symbols = SymbolInterner {
+            strings: SharedStrings::with_budget(1),
+            ..Default::default()
+        };
+        let id = symbols.intern("alice");
+        assert_eq!(symbols.get("alice"), Some(id));
+        assert_eq!(symbols.intern("alice"), id);
+        assert_eq!(symbols.resolve(id), Some("alice"));
+    }
 
     #[test]
     fn manifest_preserves_ids_across_restore() {

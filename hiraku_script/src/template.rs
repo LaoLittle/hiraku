@@ -125,6 +125,9 @@ fn evaluate_ast(
     match &expression.kind {
         ExprKind::Null => Ok(Value::Optional(None)),
         ExprKind::Bool(value) => Ok(Value::Bool(*value)),
+        ExprKind::Integer(value) => i64::try_from(*value).map(Value::Int).map_err(|_| {
+            TemplateError::UnsupportedExpression("integer literal exceeds Int".into())
+        }),
         ExprKind::Number { value, .. } => Ok(Value::Number(*value)),
         ExprKind::String(value) => Ok(Value::String(eval_template(value, context)?)),
         ExprKind::Ident(name) => context.resolve_template_path(&[name]),
@@ -158,6 +161,10 @@ fn evaluate_ast(
         },
         ExprKind::UnaryMinus(value) => match evaluate_ast(value, context)? {
             Value::Number(value) => Ok(Value::Number(-value)),
+            Value::Int(value) => value
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or_else(|| TemplateError::UnsupportedExpression("integer overflow".into())),
             _ => Err(TemplateError::UnsupportedExpression(
                 "unary minus requires a number".to_string(),
             )),
@@ -181,6 +188,13 @@ fn evaluate_ast(
                 };
             }
             let right = evaluate_ast(right, context)?;
+            if matches!(
+                (&left, &right),
+                (Value::Int(_), Value::Int(_)) | (Value::UInt(_), Value::UInt(_))
+            ) {
+                return crate::vm::binary(*op, &left, &right)
+                    .map_err(|error| TemplateError::UnsupportedExpression(error.to_string()));
+            }
             match op {
                 BinaryOp::And | BinaryOp::Or => {
                     unreachable!("logical operators short circuit above")
@@ -299,6 +313,8 @@ fn display_value(value: Value) -> Result<String, TemplateError> {
     match value {
         Value::String(value) | Value::Symbol(value) => Ok(value),
         Value::Number(value) => Ok(value.to_string()),
+        Value::Int(value) => Ok(value.to_string()),
+        Value::UInt(value) => Ok(value.to_string()),
         Value::Bool(value) => Ok(value.to_string()),
         Value::Null => Ok("null".to_string()),
         Value::Optional(None) => Ok("null".to_string()),

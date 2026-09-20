@@ -14,6 +14,7 @@ pub enum ScriptType {
     Ellipsis,
     Bool,
     Int,
+    UInt,
     Float,
     Percent,
     String,
