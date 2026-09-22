@@ -15,6 +15,25 @@ pub(crate) struct VideoPicture {
     playback: VideoPlaybackId,
 }
 
+impl VideoPicture {
+    pub(super) fn state<'a>(
+        &self,
+        id: &str,
+        picture: &PictureState,
+        player: &'a VideoPlayer,
+    ) -> Option<&'a VideoPlaybackState> {
+        if self.id == id
+            && self.previous.is_none()
+            && self.path == picture.path
+            && picture.video.as_ref() == Some(&self.source)
+        {
+            player.state(self.playback)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(SystemParam)]
 pub(crate) struct VideoPictures<'w, 's> {
     player: ResMut<'w, VideoPlayer>,

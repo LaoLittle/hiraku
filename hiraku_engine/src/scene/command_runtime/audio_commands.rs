@@ -40,6 +40,39 @@ fn stop_sfx_channel(world: &mut World, channel: &str, duration: Duration) {
     }
 }
 
+fn set_sfx_channel_volume(world: &mut World, channel: &str, volume: f32, duration: Duration) {
+    let entities: Vec<_> = world
+        .query::<(Entity, &NamedSfxChannel)>()
+        .iter(world)
+        .filter_map(|(entity, name)| (name.0 == channel).then_some(entity))
+        .collect();
+    for entity in entities {
+        let from = world
+            .get::<AudioFade>(entity)
+            .map(|fade| fade.from + (fade.to - fade.from) * tween_fraction(&fade.timer))
+            .unwrap_or_else(|| {
+                world
+                    .get::<SfxChannel>(entity)
+                    .map_or(1.0, |sound| sound.volume)
+            });
+        if let Some(mut sound) = world.get_mut::<SfxChannel>(entity) {
+            sound.volume = volume;
+        }
+        if let Some(id) = world
+            .get::<AudioFade>(entity)
+            .and_then(|fade| fade.animation_id.clone())
+        {
+            world.resource_mut::<AnimationState>().completed.insert(id);
+        }
+        world.entity_mut(entity).insert(AudioFade {
+            from,
+            to: volume,
+            timer: Timer::new(duration, TimerMode::Once),
+            animation_id: None,
+        });
+    }
+}
+
 fn retire_bgm(commands: &mut Commands, entity: Entity) {
     commands.queue(move |world: &mut World| {
         let completion = world
@@ -95,6 +128,48 @@ fn stop_music(world: &mut World, entity: Option<Entity>, duration: Duration, don
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn channel_gain_retargets_current_fade_without_replacing_playback() {
+        let mut world = World::new();
+        world.init_resource::<AnimationState>();
+        let mut timer = Timer::from_seconds(2.0, TimerMode::Once);
+        timer.tick(Duration::from_secs(1));
+        let entity = world
+            .spawn((
+                NamedSfxChannel("ambient".into()),
+                SfxChannel { volume: 1.0 },
+                AudioFade {
+                    from: 0.0,
+                    to: 1.0,
+                    timer,
+                    animation_id: Some("entrance".into()),
+                },
+            ))
+            .id();
+        let other = world
+            .spawn((NamedSfxChannel("other".into()), SfxChannel { volume: 0.2 }))
+            .id();
+        set_sfx_channel_volume(&mut world, "ambient", 0.75, Duration::from_secs(1));
+        let fade = world
+            .get::<AudioFade>(entity)
+            .expect("same playback receives new fade");
+        assert_eq!(fade.from, 0.5);
+        assert_eq!(fade.to, 0.75);
+        assert_eq!(
+            world
+                .get::<SfxChannel>(entity)
+                .expect("channel survives")
+                .volume,
+            0.75
+        );
+        assert!(world.get::<AudioFade>(other).is_none());
+        assert!(
+            world
+                .resource::<AnimationState>()
+                .completed
+                .contains("entrance")
+        );
+    }
     #[test]
     fn stopping_loading_music_settles_old_and_new_waiters() {
         let mut world = World::new();
@@ -204,6 +279,15 @@ pub(super) fn dispatch_audio_command(
     voice_state: &mut VoiceState,
 ) {
     match command {
+        AudioCommand::SetSfxChannelVolume {
+            channel,
+            volume,
+            duration,
+        } => {
+            commands.queue(move |world: &mut World| {
+                set_sfx_channel_volume(world, &channel, volume, duration)
+            });
+        }
         AudioCommand::StopSfxChannel { channel, fade } => {
             commands.queue(move |world: &mut World| stop_sfx_channel(world, &channel, fade));
         }

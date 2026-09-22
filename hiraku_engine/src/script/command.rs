@@ -173,6 +173,11 @@ pub enum AnimationCommand {
 
 #[derive(Debug)]
 pub enum AudioCommand {
+    SetSfxChannelVolume {
+        channel: String,
+        volume: f32,
+        duration: Duration,
+    },
     StopSfxChannel {
         channel: String,
         fade: Duration,

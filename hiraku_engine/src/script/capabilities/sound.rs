@@ -122,6 +122,28 @@ pub(super) fn register(registry: &mut NativeRegistry<CharacterContext>) {
 #[hiraku_script::hks_module("audio")]
 mod channel_api {
     use super::*;
+    #[hks(name = "volume")]
+    fn volume(
+        context: &mut CharacterContext,
+        channel: String,
+        volume: f64,
+        seconds: f64,
+    ) -> Result<(), NativeError> {
+        if channel.trim().is_empty()
+            || !(0.0..=1.0).contains(&volume)
+            || Duration::try_from_secs_f64(seconds).is_err()
+        {
+            return Err(NativeError::message(
+                "audio.volume requires a channel, volume in 0..1 and non-negative finite seconds",
+            ));
+        }
+        context.commands.push(StoryEffect::SetSfxChannelVolume {
+            channel,
+            volume: volume as f32,
+            seconds,
+        });
+        Ok(())
+    }
     #[hks(name = "stop")]
     fn stop(
         context: &mut CharacterContext,

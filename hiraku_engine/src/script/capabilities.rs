@@ -63,6 +63,11 @@ pub enum StoryEffect {
         channel: String,
         fade_ms: u64,
     },
+    SetSfxChannelVolume {
+        channel: String,
+        volume: f32,
+        seconds: f64,
+    },
     PlaySfxChannel {
         channel: String,
         path: String,

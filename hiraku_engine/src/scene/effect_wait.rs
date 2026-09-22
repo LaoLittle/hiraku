@@ -1,6 +1,40 @@
 //! ECS-owned completion predicates for scene effects without a dedicated token.
 use super::*;
 
+fn video_show_busy(looping: bool, state: Option<&hiraku_video::VideoPlaybackState>) -> bool {
+    use hiraku_video::VideoPlaybackState as V;
+    match state {
+        Some(V::Finished | V::Skipped | V::Failed(_)) => false,
+        Some(V::Playing | V::Paused) => !looping,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod video_wait_tests {
+    use super::video_show_busy;
+    use hiraku_video::VideoPlaybackState as V;
+
+    #[test]
+    fn looping_video_joins_entrance_not_endless_playback() {
+        assert!(video_show_busy(true, None));
+        assert!(video_show_busy(true, Some(&V::Loading)));
+        assert!(!video_show_busy(true, Some(&V::Playing)));
+        assert!(!video_show_busy(true, Some(&V::Paused)));
+    }
+
+    #[test]
+    fn one_shot_waits_for_completion_or_cancellation() {
+        assert!(video_show_busy(false, Some(&V::Playing)));
+        assert!(!video_show_busy(false, Some(&V::Finished)));
+        assert!(!video_show_busy(false, Some(&V::Skipped)));
+        assert!(!video_show_busy(
+            false,
+            Some(&V::Failed("decode failed".into()))
+        ));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SceneEffect {
     Spatial(crate::stage::runtime::StageCommand),
@@ -27,6 +61,8 @@ pub fn complete(
     tweens: Query<&VisualTween>,
     pending: Res<PendingCharacterShows>,
     waits: Query<(Entity, &SceneEffectWait)>,
+    videos: Query<&super::video_pictures::VideoPicture>,
+    player: Res<hiraku_video::VideoPlayer>,
     mut responses: MessageWriter<ScriptResponseMessage>,
 ) {
     use super::pictures::PictureCommand as P;
@@ -100,25 +136,29 @@ pub fn complete(
                     unreachable!()
                 };
                 if let Some(picture) = shared.0.pictures.get(id) {
-                    let handle = if let Some(video) = &picture.video {
-                        let layout = video.layout;
-                        assets
-                            .load_builder()
-                            .with_settings(
-                                move |settings: &mut hiraku_video::VideoLoaderSettings| {
-                                    settings.layout = layout
-                                },
-                            )
-                            .load::<hiraku_video::VideoAsset>(picture.path.clone())
-                            .untyped()
+                    let video_state = videos
+                        .iter()
+                        .find_map(|video| video.state(id, picture, &player));
+                    let handle = if picture.video.is_some() {
+                        // The decoder owns the media after startup; AssetServer
+                        // may have released its handle. Never reload it to poll.
+                        None
                     } else {
-                        crate::texture::load_static_image(&assets, picture.path.clone()).untyped()
+                        Some(
+                            crate::texture::load_static_image(&assets, picture.path.clone())
+                                .untyped(),
+                        )
                     };
                     if !matches!(command, P::Hide { .. } | P::Exit { .. })
-                        && matches!(
-                            assets.load_state(handle.id()),
-                            bevy::asset::LoadState::Failed(_)
-                        )
+                        && (handle.as_ref().is_some_and(|handle| {
+                            matches!(
+                                assets.load_state(handle.id()),
+                                bevy::asset::LoadState::Failed(_)
+                            )
+                        }) || matches!(
+                            video_state,
+                            Some(hiraku_video::VideoPlaybackState::Failed(_))
+                        ))
                     {
                         crate::script::emit_script_diagnostic(
                             "picture animation failed",
@@ -130,8 +170,15 @@ pub fn complete(
                     }
                     match command {
                         P::Show { .. } => {
-                            !assets.is_loaded_with_dependencies(handle.id())
-                                || picture.fade.is_some()
+                            picture.fade.is_some()
+                                || if let Some(video) = &picture.video {
+                                    picture.alpha > 0.0
+                                        && video_show_busy(video.looping, video_state)
+                                } else {
+                                    handle.as_ref().is_some_and(|handle| {
+                                        !assets.is_loaded_with_dependencies(handle.id())
+                                    })
+                                }
                         }
                         P::Hide { .. } | P::Exit { .. } => picture.fade.is_some(),
                         P::Blur { .. } => picture.blur_tween.is_some(),

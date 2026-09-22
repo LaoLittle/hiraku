@@ -243,6 +243,15 @@ pub(crate) fn script_command_from_effect(
                 fade: Duration::from_millis(fade_ms),
             })
         }
+        StoryEffect::SetSfxChannelVolume {
+            channel,
+            volume,
+            seconds,
+        } => ScriptCommand::Audio(AudioCommand::SetSfxChannelVolume {
+            channel,
+            volume,
+            duration: Duration::from_secs_f64(seconds),
+        }),
         StoryEffect::SetUiRole { .. }
         | StoryEffect::MountUiOverlay { .. }
         | StoryEffect::UnmountUiOverlay { .. }
