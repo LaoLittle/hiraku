@@ -460,6 +460,7 @@ impl Plugin for HirakuPlugin {
                     .chain()
                     .after(process_script_commands)
                     .in_set(scene::screen_ui::ScreenUiPhase::Content)
+                    .after(scene::recompose_screen_ui)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(

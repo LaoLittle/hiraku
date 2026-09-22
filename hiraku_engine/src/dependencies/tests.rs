@@ -137,6 +137,33 @@ fn innermost_source_span_selects_the_branch_not_its_parent() {
 }
 
 #[test]
+fn navigation_does_not_wait_for_retained_background_prefetch() {
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+        .init_asset::<Image>();
+    let assets = app.world().resource::<AssetServer>();
+    let mut manifest = manifest();
+    manifest
+        .windows
+        .insert("common.hks".into(), ResourceGraph::default());
+    let mut state = ScriptDependencies::default();
+    state.manifests.insert(String::new(), Some(manifest));
+    state.move_window(BTreeSet::from([("scene.hks".into(), 0)]), assets);
+    assert!(!state.handles.is_empty());
+    let vfs = HdpVfs::new("unused-fixture-root");
+    assert!(
+        state
+            .prepare(&vfs, assets, &["common.hks".into()])
+            .expect("helper entry")
+    );
+    assert!(!state.loading);
+    assert!(
+        !state.handles.is_empty(),
+        "retain earlier speculative loads without waiting on them"
+    );
+}
+
+#[test]
 fn navigation_preloads_only_entry_and_loose_content_remains_lazy() {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))

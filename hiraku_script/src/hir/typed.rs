@@ -3147,7 +3147,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 _ => None,
             };
             let mut actual_fields = BTreeMap::new();
-            let fields = fields
+            let mut fields = fields
                 .iter()
                 .map(|field| {
                     let name = self.symbol(&field.name);
@@ -3157,6 +3157,20 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     (name, value)
                 })
                 .collect::<Vec<_>>();
+            // A contextually typed record may omit optional fields. Materialize
+            // them as none so its runtime shape still matches the full schema.
+            for (name, ty) in expected_fields {
+                if !actual_fields.contains_key(name) && matches!(ty, ScriptType::Optional(_)) {
+                    let symbol = self.symbol(name);
+                    let value = self.alloc_expression(
+                        HirExprKind::Literal(HirLiteral::Null),
+                        ty.clone(),
+                        expression.span,
+                    );
+                    fields.push((symbol, value));
+                    actual_fields.insert(name.clone(), ty.clone());
+                }
+            }
             self.check_assignment(
                 &ScriptType::Record(expected_fields.clone()),
                 &ScriptType::Record(actual_fields),
@@ -5231,6 +5245,20 @@ mod tests {
             let syntax = parse_program(source).expect("parses");
             let arena = HirArena::new();
             assert!(lower_to_hir(&arena, &syntax, None).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn typed_records_default_only_missing_optional_fields() {
+        for (source, valid) in [
+            ("let x: .{ name: String, enabled: Bool? } = .{ name: \"Alice\" }", true),
+            ("let x: .{ name: String, enabled: Bool? } = .{ enabled: true }", false),
+            ("let x: .{ enabled: Bool? } = .{ enabled: 1 }", false),
+            ("let x: .{ enabled: Bool? } = .{ other: true }", false),
+        ] {
+            let syntax = parse_program(source).expect("source parses");
+            let arena = HirArena::new();
+            assert_eq!(lower_to_hir(&arena, &syntax, None).is_ok(), valid, "{source}");
         }
     }
 

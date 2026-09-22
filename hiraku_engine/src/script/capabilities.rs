@@ -2269,6 +2269,7 @@ not_actor.at(.left)"#,
                     path: "ending.hks".into(),
                     kind: crate::script::navigation::NavigationKind::Goto,
                     reset: crate::script::navigation::NavigationReset::Presentation,
+                    preload: None,
                     origin: None,
                 })
             ))

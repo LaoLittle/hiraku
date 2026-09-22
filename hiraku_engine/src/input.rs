@@ -124,14 +124,28 @@ pub(crate) struct TouchScrollGesture {
 }
 
 #[derive(Component)]
-pub(crate) struct RetiredTouchPointer;
+pub(crate) struct RetiredTouchPointer(bool);
 
 pub(crate) fn cleanup_touch_pointers(
     mut commands: Commands,
-    retired: Query<Entity, With<RetiredTouchPointer>>,
+    mut redraw: crate::redraw::Redraw,
+    mut retired: Query<(
+        Entity,
+        &mut RetiredTouchPointer,
+        &mut bevy::picking::pointer::PointerLocation,
+    )>,
 ) {
-    for entity in &retired {
-        commands.entity(entity).despawn();
+    for (entity, mut retired, mut location) in &mut retired {
+        if retired.0 {
+            commands.entity(entity).try_despawn();
+        } else {
+            // Picking clears previous hovered entities by iterating live pointer
+            // entities. Keep the finger for one location-less picking pass;
+            // removing it immediately can leave widgets permanently Pressed.
+            location.location = None;
+            retired.0 = true;
+            redraw.request();
+        }
     }
 }
 
@@ -141,7 +155,7 @@ fn retire_touch_pointer(
     commands: &mut Commands,
 ) {
     if let Some((_, entity)) = pointers.remove(&pointer) {
-        commands.entity(entity).insert(RetiredTouchPointer);
+        commands.entity(entity).insert(RetiredTouchPointer(false));
     }
 }
 
@@ -262,6 +276,59 @@ mod tests {
     }
 
     #[test]
+    fn retiring_touch_allows_picking_to_clear_previous_widget_state() {
+        use bevy::picking::{
+            backend::HitData,
+            hover::{HoverMap, PickingInteraction, PreviousHoverMap, update_interactions},
+        };
+        let mut app = App::new();
+        app.init_resource::<bevy::picking::pointer::PointerMap>()
+            .init_resource::<HoverMap>()
+            .init_resource::<PreviousHoverMap>()
+            .add_systems(Update, update_interactions)
+            .add_systems(Last, cleanup_touch_pointers);
+        let id = HirakuPointerId::Touch(3).picking_id();
+        let pointer = app.world_mut().spawn((id, RetiredTouchPointer(false))).id();
+        let widget = app.world_mut().spawn(PickingInteraction::None).id();
+        let hits = [(widget, HitData::new(widget, 0.0, None, None))]
+            .into_iter()
+            .collect();
+        app.world_mut()
+            .resource_mut::<HoverMap>()
+            .0
+            .insert(id, hits);
+        app.update();
+        assert!(
+            app.world().get_entity(pointer).is_ok(),
+            "picking needs the retired pointer for cleanup"
+        );
+        assert_eq!(
+            *app.world()
+                .get::<PickingInteraction>(widget)
+                .expect("widget"),
+            PickingInteraction::Hovered
+        );
+        let hits = app
+            .world_mut()
+            .resource_mut::<HoverMap>()
+            .0
+            .remove(&id)
+            .expect("hover hits");
+        app.world_mut()
+            .resource_mut::<PreviousHoverMap>()
+            .0
+            .insert(id, hits);
+        app.update();
+        assert_eq!(
+            *app.world()
+                .get::<PickingInteraction>(widget)
+                .expect("widget"),
+            PickingInteraction::None
+        );
+        assert!(app.world().get_entity(pointer).is_err());
+    }
+
+    #[test]
     fn touch_scroll_cancels_click_and_keeps_fingers_independent() {
         use bevy::picking::{backend::HitData, hover::HoverMap};
         let mut app = App::new();
@@ -371,6 +438,7 @@ mod tests {
         assert!(events.iter().any(|event| event.pointer_id
             == HirakuPointerId::Touch(1).picking_id()
             && matches!(event.action, PointerAction::Release(_))));
+        app.update();
         assert_eq!(
             app.world_mut()
                 .query::<&PointerId>()
@@ -440,6 +508,7 @@ pub(crate) fn bridge_virtual_pointers(
     mut scrolls: MessageReader<HirakuScrollInput>,
     mut output: MessageWriter<PointerInput>,
     mut pointers: Local<HashMap<HirakuPointerId, (Vec2, Entity)>>,
+    retired: Query<(Entity, &PointerId), With<RetiredTouchPointer>>,
     hover: Option<Res<bevy::picking::hover::HoverMap>>,
     parents: Query<&ChildOf>,
     scroll_nodes: Query<&Node, With<ScrollPosition>>,
@@ -570,7 +639,19 @@ pub(crate) fn bridge_virtual_pointers(
         let is_new = !pointers.contains_key(&sample.pointer);
         let last = pointers
             .entry(sample.pointer)
-            .or_insert_with(|| (position, commands.spawn(id).id()))
+            .or_insert_with(|| {
+                let entity = retired
+                    .iter()
+                    .find(|(_, pointer)| **pointer == id)
+                    .map(|(entity, _)| entity);
+                let entity = if let Some(entity) = entity {
+                    commands.entity(entity).remove::<RetiredTouchPointer>();
+                    entity
+                } else {
+                    commands.spawn(id).id()
+                };
+                (position, entity)
+            })
             .0;
         if sample.phase != HirakuPointerPhase::Move && (is_new || last != position) {
             output.write(PointerInput::new(

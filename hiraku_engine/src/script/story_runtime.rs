@@ -21,6 +21,7 @@ use crate::script::capabilities::{
 /// Engine-facing whole-story driver. It translates generic VM boundaries into
 /// story effects without introducing a second executable representation.
 pub struct StoryRuntime {
+    pub(crate) preload_calls: bool,
     plans: BTreeMap<ExecutionId, AnimationPlan>,
     execution: ExecutionRuntime,
     host: StoryNativeHost,
@@ -87,6 +88,7 @@ pub enum StoryRuntimeEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryRuntimeSnapshot {
+    preload_calls: bool,
     plans: BTreeMap<ExecutionId, AnimationPlan>,
     awaiting_effects: std::collections::BTreeSet<ExecutionId>,
     execution: ExecutionRuntimeSnapshot,
@@ -232,6 +234,7 @@ impl StoryRuntime {
 
     pub fn new(bytecode: impl Into<super::StoryProgram>) -> Result<Self, StoryRuntimeError> {
         Ok(Self {
+            preload_calls: true,
             plans: BTreeMap::new(),
             execution: ExecutionRuntime::new(bytecode)?,
             host: StoryNativeHost::new(),
@@ -254,6 +257,7 @@ impl StoryRuntime {
             return Err(StoryRuntimeError::NotAtSnapshotBoundary);
         }
         Ok(StoryRuntimeSnapshot {
+            preload_calls: self.preload_calls,
             plans: self.plans.clone(),
             awaiting_effects: self.awaiting_effects.clone(),
             execution: self.execution.snapshot(),
@@ -314,6 +318,7 @@ impl StoryRuntime {
             })
             .collect();
         let mut runtime = Self {
+            preload_calls: snapshot.preload_calls,
             plans: snapshot.plans,
             awaiting_effects: snapshot.awaiting_effects,
             execution: ExecutionRuntime::restore(bytecode, snapshot.execution)?,
@@ -730,7 +735,11 @@ impl StoryRuntime {
                 execution: task,
                 call,
             } => match self.host.call(&call)? {
-                StoryCallOutcome::Control(StoryControl::Navigate(request)) => {
+                StoryCallOutcome::Control(StoryControl::Navigate(mut request)) => {
+                    if matches!(self.choice, Some(ChoiceState::RunningBranch { task: branch, .. }) if branch == task)
+                    {
+                        request.preload.get_or_insert(false);
+                    }
                     self.terminated = true;
                     return Ok(Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(
                         request,
@@ -2201,6 +2210,105 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
                 if text == "after choice"
         ));
+    }
+
+    #[test]
+    fn choice_navigation_defaults_to_no_preload_and_allows_override() {
+        for (options, expected) in [
+            ("", false),
+            (", .{ preload: true }", true),
+            (", .{ preload: false }", false),
+        ] {
+            let source = format!(
+                r#"
+                fn route() -> Never {{ story.goto("next.hks"{options}) }}
+                choice {{ option("Alice") {{ route() }} }}
+            "#
+            );
+            let code = compile_story_bytecode("entry.hks", &source).expect("navigation compiles");
+            let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+            assert!(matches!(
+                runtime.step().expect("choice"),
+                Some(StoryRuntimeEvent::Choice { .. })
+            ));
+            // The default is execution-local and survives saving at the choice.
+            runtime = StoryRuntime::restore(code, runtime.snapshot().expect("snapshot"))
+                .expect("restore choice");
+            runtime.resume(Value::Int(0)).expect("select option");
+            let Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(request))) =
+                runtime.step().expect("navigate")
+            else {
+                panic!("expected navigation");
+            };
+            assert_eq!(request.preload, Some(expected));
+        }
+    }
+
+    #[test]
+    fn no_preload_destination_passes_policy_through_calls_and_restore() {
+        use crate::script::navigation::NavigationRequest;
+        let code = compile_story_bytecode("branch.hks", "story.call(\"common.hks\")")
+            .expect("compile call");
+        let mut branch = StoryRuntime::new(code.clone()).expect("branch");
+        branch.preload_calls = false;
+        let mut branch =
+            StoryRuntime::restore(code, branch.snapshot().expect("snapshot")).expect("restore");
+        let Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(call))) =
+            branch.step().expect("call")
+        else {
+            panic!("expected call");
+        };
+        assert!(!call.should_preload(Some(&branch)));
+        let helper_code = compile_story_bytecode("common.hks", "story.call(\"nested.hks\")")
+            .expect("compile helper");
+        let mut helper = StoryRuntime::new(helper_code).expect("helper");
+        helper.preload_calls = call.should_preload(Some(&branch));
+        assert!(
+            !NavigationRequest::call("nested.hks".into())
+                .expect("call")
+                .should_preload(Some(&helper))
+        );
+        let mut jump = NavigationRequest::goto("next.hks".into()).expect("goto");
+        assert!(
+            jump.should_preload(Some(&branch)),
+            "later ordinary goto starts a new policy"
+        );
+        jump.preload = Some(false);
+        assert!(!jump.should_preload(Some(&branch)));
+        let regular =
+            StoryRuntime::new(compile_story_bytecode("regular.hks", "").expect("compile"))
+                .expect("regular");
+        assert!(
+            call.should_preload(Some(&regular)),
+            "ordinary calls retain preloading"
+        );
+    }
+
+    #[test]
+    fn navigation_after_choice_keeps_normal_preload_default() {
+        let code = compile_story_bytecode(
+            "entry.hks",
+            r#"
+            choice { option("Alice") {} }
+            story.goto("next.hks")
+        "#,
+        )
+        .expect("compile");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        assert!(matches!(
+            runtime.step().expect("choice"),
+            Some(StoryRuntimeEvent::Choice { .. })
+        ));
+        runtime.resume(Value::Int(0)).expect("select");
+        for _ in 0..10 {
+            if let Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(request))) =
+                runtime.step().expect("advance")
+            {
+                assert_eq!(request.preload, None);
+                return;
+            }
+        }
+        panic!("expected navigation after choice");
     }
 
     #[test]

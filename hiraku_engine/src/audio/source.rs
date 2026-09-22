@@ -5,7 +5,7 @@ use bevy::{
     audio::{Decodable, Source},
     prelude::{Asset, TypePath},
 };
-use hiraku_opus::OpusDecoder;
+use hiraku_media::{AudioDecoderConfig, AudioPacketDecoder};
 use std::{
     io::{self, Cursor},
     sync::Arc,
@@ -67,8 +67,10 @@ impl EngineAudioSource {
                 if tags.stream_serial() != serial || !valid_tags(&tags.data) {
                     return Err(invalid("missing OpusTags or multiplexed stream"));
                 }
-                let mut decoder = OpusDecoder::new(48000, channels as usize).map_err(invalid)?;
-                let mut scratch = vec![0.0; 5760 * channels as usize];
+                let mut decoder =
+                    AudioPacketDecoder::new(&AudioDecoderConfig::new("opus", 48000, channels))
+                        .map_err(invalid)?;
+                let mut scratch = vec![0.0; decoder.output_capacity()];
                 let mut decoded = 0u64;
                 let mut end = None;
                 let mut packets = Vec::new();
@@ -82,7 +84,7 @@ impl EngineAudioSource {
                         return Err(invalid("empty Opus audio packet"));
                     }
                     let count = decoder
-                        .decode(&packet.data, 5760, &mut scratch)
+                        .decode_into(&packet.data, &mut scratch)
                         .map_err(invalid)?;
                     if scratch[..count * channels as usize]
                         .iter()
@@ -190,7 +192,7 @@ impl Decodable for EngineAudioSource {
 
 struct OpusPlayback {
     data: Arc<OpusData>,
-    decoder: OpusDecoder,
+    decoder: AudioPacketDecoder,
     buffer: Vec<f32>,
     packet: usize,
     cursor: usize,
@@ -201,9 +203,11 @@ struct OpusPlayback {
 
 impl OpusPlayback {
     fn new(data: Arc<OpusData>) -> Result<Self, String> {
-        let decoder = OpusDecoder::new(48000, data.channels as usize).map_err(|e| e.to_string())?;
+        let decoder =
+            AudioPacketDecoder::new(&AudioDecoderConfig::new("opus", 48000, data.channels))
+                .map_err(|e| e.to_string())?;
         Ok(Self {
-            buffer: vec![0.0; 5760 * data.channels as usize],
+            buffer: vec![0.0; decoder.output_capacity()],
             data,
             decoder,
             packet: 0,
@@ -225,7 +229,7 @@ impl Iterator for OpusPlayback {
         while self.cursor >= self.length {
             let packet = self.data.packets.get(self.packet)?;
             self.packet += 1;
-            let count = match self.decoder.decode(packet, 5760, &mut self.buffer) {
+            let count = match self.decoder.decode_into(packet, &mut self.buffer) {
                 Ok(count) => count,
                 Err(error) => {
                     bevy::log::error!("Opus playback decode failed: {error}");

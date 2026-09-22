@@ -1804,7 +1804,7 @@ pub fn handle_screen_image_buttons(
             &mut UiTransform,
             &ScreenUiImageButton,
         ),
-        Changed<PickingInteraction>,
+        Or<(Changed<PickingInteraction>, Changed<ScreenUiImageButton>)>,
     >,
     button_query: Query<&ScreenUiImageButton>,
 ) {
@@ -3899,6 +3899,12 @@ mod tests {
                 Vec2::ONE
             );
         }
+        // Touch has no continuing hover motion. A script-side style update
+        // must apply even when PickingInteraction remains None.
+        app.world_mut().get_mut::<ScreenUiImageButton>(button).expect("button")
+            .normal_rect = hover_rect;
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(button).expect("image").rect, hover_rect);
     }
 
     #[test]

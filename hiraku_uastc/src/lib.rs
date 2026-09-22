@@ -43,12 +43,21 @@ impl AssetLoader for UastcLoader {
     ) -> Result<Image, UastcError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        let image = decode(&bytes, self.formats)?;
-        apply_settings(image, settings)
+        decode_with_settings(&bytes, self.formats, settings)
     }
     fn extensions(&self) -> &[&str] {
         &["uastc.ktx2"]
     }
+}
+
+/// Shared decoding path for GPU images and CPU-only atlas sources. Pass
+/// `CompressedImageFormats::NONE` when consumers require unpacked RGBA pixels.
+pub fn decode_with_settings(
+    bytes: &[u8],
+    formats: CompressedImageFormats,
+    settings: &ImageLoaderSettings,
+) -> Result<Image, UastcError> {
+    apply_settings(decode(bytes, formats)?, settings)
 }
 
 fn apply_settings(mut image: Image, settings: &ImageLoaderSettings) -> Result<Image, UastcError> {

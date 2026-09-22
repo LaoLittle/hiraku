@@ -12,6 +12,7 @@ hiraku_script::hks_define! {
 pub enum UiKeyframe {
     Rect(f64, f64, f64, f64, f64, f64),
     Quad(f64, f64, f64, f64, f64, f64, f64, f64),
+    QuadStepAlpha(f64, f64, f64, f64, f64, f64, f64, f64),
 }
 impl UiKeyframe {
     fn rect(seconds: f64, x: f64, y: f64, width: f64, height: f64, alpha: f64) -> UiKeyframe {
@@ -20,6 +21,11 @@ impl UiKeyframe {
     /// Origin and two full edge vectors after orthographic projection.
     fn quad(seconds: f64, x: f64, y: f64, ux: f64, uy: f64, vx: f64, vy: f64, alpha: f64) -> UiKeyframe {
         Self::Quad(seconds, x, y, ux, uy, vx, vy, alpha)
+    }
+    /// Interpolate geometry, but hold alpha until the next key's timestamp.
+    #[allow(non_snake_case)]
+    fn quadStepAlpha(seconds: f64, x: f64, y: f64, ux: f64, uy: f64, vx: f64, vy: f64, alpha: f64) -> UiKeyframe {
+        Self::QuadStepAlpha(seconds, x, y, ux, uy, vx, vy, alpha)
     }
 }
 }

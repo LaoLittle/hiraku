@@ -8,14 +8,18 @@ use serde::{Deserialize, Serialize};
 /// Complete configuration for a terminal jump; there is no deferred builder.
 pub(crate) struct NavigationOptions {
     reset: NavigationResetValue,
+    preload: Option<bool>,
 }
 
 impl HksScriptType for NavigationOptions {
     fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> ScriptType {
-        ScriptType::Record(std::collections::BTreeMap::from([(
-            "reset".into(),
-            NavigationResetValue::hks_script_type(registry),
-        )]))
+        ScriptType::Record(std::collections::BTreeMap::from([
+            (
+                "reset".into(),
+                Option::<NavigationResetValue>::hks_script_type(registry),
+            ),
+            ("preload".into(), Option::<bool>::hks_script_type(registry)),
+        ]))
     }
 }
 
@@ -24,16 +28,23 @@ impl FromHksValue for NavigationOptions {
         let Value::Map(fields) = value else {
             return Err(NativeError::message("goto options must be a record"));
         };
-        if fields.len() != 1 {
+        if fields.keys().any(|key| key != "reset" && key != "preload") {
             return Err(NativeError::message(
-                "goto options require exactly the `reset` field",
+                "goto options accept only `reset` and `preload`",
             ));
         }
-        let reset = fields
-            .get("reset")
-            .ok_or_else(|| NativeError::message("goto options require `reset`"))?;
         Ok(Self {
-            reset: NavigationResetValue::from_hks_value(reset)?,
+            reset: fields
+                .get("reset")
+                .map(Option::<NavigationResetValue>::from_hks_value)
+                .transpose()?
+                .flatten()
+                .unwrap_or(NavigationResetValue::None),
+            preload: fields
+                .get("preload")
+                .map(Option::<bool>::from_hks_value)
+                .transpose()?
+                .flatten(),
         })
     }
 }
@@ -57,11 +68,20 @@ pub struct NavigationRequest {
     pub path: String,
     pub kind: NavigationKind,
     pub reset: NavigationReset,
+    /// None inherits the execution context; ordinary navigation preloads.
+    #[serde(default)]
+    pub preload: Option<bool>,
     #[serde(default)]
     pub origin: Option<String>,
 }
 
 impl NavigationRequest {
+    pub(crate) fn should_preload(&self, caller: Option<&super::StoryRuntime>) -> bool {
+        self.preload.unwrap_or_else(|| {
+            self.kind != NavigationKind::Call || caller.is_none_or(|story| story.preload_calls)
+        })
+    }
+
     pub(crate) fn from_goto_call(call: &BuiltinCall) -> Result<Self, NativeError> {
         if !(1..=2).contains(&call.arguments.len()) {
             return Err(NativeError::message(
@@ -78,6 +98,7 @@ impl NavigationRequest {
         let mut request = Self::goto(path)?;
         if let Some(options) = options {
             request.reset = options.reset.into();
+            request.preload = options.preload;
         }
         Ok(request)
     }
@@ -88,6 +109,7 @@ impl NavigationRequest {
             path,
             kind: NavigationKind::Goto,
             reset: NavigationReset::None,
+            preload: None,
             origin: None,
         })
     }
@@ -98,6 +120,7 @@ impl NavigationRequest {
             path,
             kind: NavigationKind::Call,
             reset: NavigationReset::None,
+            preload: None,
             origin: None,
         })
     }

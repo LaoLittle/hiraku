@@ -7,7 +7,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-hiraku-opus = { git = "https://github.com/Hiraku-Project/opus-rs.git", version = "0.1.32" }
+hiraku-media.workspace = true
 ogg = "0.9"
 rodio = { version = "0.22", default-features = false }
 hiraku-uastc.workspace = true

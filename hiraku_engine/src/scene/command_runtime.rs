@@ -164,6 +164,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
             command: ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation)),
             ..
         }) = pending_script_commands.items.front()
+            && navigation.should_preload(script_runtime.story.as_ref())
         {
             let target = vfs.0.resolve_path(
                 navigation
@@ -666,6 +667,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         continue;
                     }
                 };
+                next_story.preload_calls = navigation.should_preload(script_runtime.story.as_ref());
 
                 let mut globals = if navigation.reset == NavigationReset::Session {
                     BTreeMap::new()

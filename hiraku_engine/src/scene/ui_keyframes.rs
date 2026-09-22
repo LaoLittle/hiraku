@@ -7,7 +7,8 @@ impl UiKeyframe {
     fn values(self) -> [f64; 8] {
         match self {
             Self::Rect(t, x, y, w, h, a) => [t, x, y, w, 0., 0., h, a],
-            Self::Quad(t, x, y, ux, uy, vx, vy, a) => [t, x, y, ux, uy, vx, vy, a],
+            Self::Quad(t, x, y, ux, uy, vx, vy, a)
+            | Self::QuadStepAlpha(t, x, y, ux, uy, vx, vy, a) => [t, x, y, ux, uy, vx, vy, a],
         }
     }
 }
@@ -35,7 +36,11 @@ fn sample(frames: &[UiKeyframe], elapsed: f64) -> [f64; 8] {
     }
     let b = frames[index].values();
     let fraction = ((elapsed - a[0]) / (b[0] - a[0])).clamp(0.0, 1.0);
-    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * fraction)
+    let mut result = std::array::from_fn(|i| a[i] + (b[i] - a[i]) * fraction);
+    if matches!(frames[index - 1], UiKeyframe::QuadStepAlpha(..)) {
+        result[7] = a[7];
+    }
+    result
 }
 #[derive(Component)]
 pub(crate) struct UiKeyframes {
@@ -52,7 +57,7 @@ impl UiKeyframes {
             elapsed: 0.0,
             projected: frames
                 .iter()
-                .any(|frame| matches!(frame, UiKeyframe::Quad(..))),
+                .any(|frame| matches!(frame, UiKeyframe::Quad(..) | UiKeyframe::QuadStepAlpha(..))),
         }
     }
 }
@@ -143,6 +148,23 @@ pub(crate) fn tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discrete_layer_handoff_never_exposes_the_background() {
+        use UiKeyframe::QuadStepAlpha as Key;
+        let outgoing = [Key(0., 0., 0., 10., 0., 0., 10., 1.), Key(1., 20., 0., 10., 0., 0., 10., 0.)];
+        let incoming = [Key(0., 0., 0., 10., 0., 0., 10., 0.), Key(1., 20., 0., 10., 0., 0., 10., 1.)];
+        assert!(validate(&outgoing));
+        assert!(UiKeyframes::new(&outgoing).projected);
+        for t in [0., 0.25, 0.5, 0.999999, 1., 1.000001, 2.] {
+            let a = sample(&outgoing, t);
+            let b = sample(&incoming, t);
+            assert_eq!(a[7] + b[7] * (1. - a[7]), 1., "coverage at {t}");
+        }
+        assert_eq!(sample(&outgoing, 0.5)[1], 10., "geometry still interpolates");
+        assert_eq!(sample(&outgoing, 1.)[7], 0.);
+        assert_eq!(sample(&incoming, 1.)[7], 1.);
+    }
+
     #[test]
     fn validates_and_clamps_track_samples() {
         let frames = [

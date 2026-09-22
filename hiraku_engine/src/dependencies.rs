@@ -27,6 +27,8 @@ pub struct ScriptDependencies {
     positions: Vec<(String, usize)>,
     history: std::collections::VecDeque<Vec<String>>,
     desired: BTreeSet<String>,
+    /// The current forward window, excluding retained historical windows.
+    ahead: BTreeSet<String>,
     pub(crate) revision: u64,
     pub(crate) closed: bool,
     pub loading: bool,
@@ -47,6 +49,7 @@ impl Default for ScriptDependencies {
             positions: Vec::new(),
             history: Default::default(),
             desired: BTreeSet::new(),
+            ahead: BTreeSet::new(),
             revision: 0,
             closed: false,
             loading: false,
@@ -123,6 +126,7 @@ impl ScriptDependencies {
         self.handles.clear();
         self.history.clear();
         self.desired.clear();
+        self.ahead.clear();
         self.frontier.clear();
         self.positions.clear();
         self.requested = None;
@@ -197,6 +201,7 @@ impl ScriptDependencies {
             );
         }
         // Near future wins the budget; recently traversed windows are lower priority.
+        self.ahead = ahead.iter().cloned().collect();
         self.history.push_front(ahead.clone());
         self.history.truncate(self.retain_steps.saturating_add(1));
         let candidates: Vec<_> = self.history.iter().flatten().cloned().collect();
@@ -258,6 +263,9 @@ impl ScriptDependencies {
         }
         self.loading = false;
         for (path, handle) in &self.handles {
+            if !self.ahead.contains(path) {
+                continue;
+            }
             match assets.get_load_state(handle.id()) {
                 Some(LoadState::Loaded) => (),
                 Some(LoadState::Failed(error)) => {

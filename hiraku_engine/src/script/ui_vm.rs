@@ -2713,7 +2713,7 @@ fn materialize_node(
                 || layout
                     .keyframes
                     .iter()
-                    .any(|key| matches!(key, crate::ui::UiKeyframe::Quad(..))))
+                    .any(|key| matches!(key, crate::ui::UiKeyframe::Quad(..) | crate::ui::UiKeyframe::QuadStepAlpha(..))))
                 && (texture.rect.is_some() || layout.flip_x)
             {
                 return Err(UiVmError::Invalid("projected shader tracks require whole, unflipped images; encode reflection in quad axes".into()));
@@ -4939,6 +4939,7 @@ screen {
                 path: "../title.hks".into(),
                 kind: super::super::navigation::NavigationKind::Goto,
                 reset: super::super::navigation::NavigationReset::Session,
+                preload: None,
                 origin: Some("memory://ui/menu.ui.hks".into()),
             })]
         );
