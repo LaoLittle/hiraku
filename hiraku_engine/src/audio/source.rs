@@ -72,6 +72,7 @@ impl EngineAudioSource {
                         .map_err(invalid)?;
                 let mut scratch = vec![0.0; decoder.output_capacity()];
                 let mut decoded = 0u64;
+                let mut previous_page_end = 0u64;
                 let mut end = None;
                 let mut packets = Vec::new();
                 while let Some(packet) = reader.read_packet().map_err(invalid)? {
@@ -97,11 +98,15 @@ impl EngineAudioSource {
                         let position = packet.absgp_page();
                         if position < skip as u64
                             || position > decoded
-                            || position < decoded - count as u64
+                            || position < previous_page_end
                         {
                             return Err(invalid("unsupported or invalid Opus end granule"));
                         }
                         end = Some(position);
+                    } else if packet.last_in_page() {
+                        // RFC 7845 section 4.4 permits trimming the final page,
+                        // not just the last packet (the latter is only SHOULD).
+                        previous_page_end = packet.absgp_page();
                     }
                     packets.push(packet.data);
                 }
@@ -122,6 +127,54 @@ impl EngineAudioSource {
         // Bevy's AudioSource::decoder unwraps; validate at the fallible loader boundary.
         standard_decoder(audio.clone()).map_err(invalid)?;
         Ok(Self(AudioData::Standard(audio)))
+    }
+}
+
+#[cfg(test)]
+mod end_trimming_tests {
+    use super::*;
+    use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+
+    fn silence_with_trim(end: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = PacketWriter::new(&mut bytes);
+            let mut head = b"OpusHead".to_vec();
+            head.extend_from_slice(&[1, 1, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
+            writer
+                .write_packet(head, 1, PacketWriteEndInfo::EndPage, 0)
+                .expect("write identification header");
+            let mut tags = b"OpusTags".to_vec();
+            tags.extend_from_slice(&[0; 8]);
+            writer
+                .write_packet(tags, 1, PacketWriteEndInfo::EndPage, 0)
+                .expect("write comment header");
+            // Three 20 ms silence packets, with the final two on one page.
+            for (kind, granule) in [
+                (PacketWriteEndInfo::EndPage, 960),
+                (PacketWriteEndInfo::NormalPacket, 1920),
+                (PacketWriteEndInfo::EndStream, end),
+            ] {
+                writer
+                    .write_packet(vec![0xf8, 0xff, 0xfe], 1, kind, granule)
+                    .expect("write silent packet");
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn last_page_can_discard_more_than_one_packet() {
+        let audio = EngineAudioSource::from_bytes(silence_with_trim(1200))
+            .expect("valid page-level trimming");
+        assert_eq!(audio.decoder().count(), 1200);
+    }
+
+    #[test]
+    fn end_cannot_rewind_an_earlier_page_or_exceed_decoded_audio() {
+        for end in [959, 2881] {
+            assert!(EngineAudioSource::from_bytes(silence_with_trim(end)).is_err());
+        }
     }
 }
 
