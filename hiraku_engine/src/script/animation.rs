@@ -1,6 +1,13 @@
 use hiraku_script::native::{NativeError, NativeRegistry, RegistrationError};
 use serde::{Deserialize, Serialize};
 
+/// Common `.time(seconds)` boundary for effects whose host representation is
+/// milliseconds. Keep validation and rounding independent of builder family.
+pub(crate) fn duration_millis(seconds: f64) -> Result<u64, NativeError> {
+    AnimationSpec::Linear(0.0, false).with_time(seconds)?;
+    Ok((seconds * 1000.0).round() as u64)
+}
+
 hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Easing {
@@ -457,6 +464,24 @@ pub fn register_animation_api<C: 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn millisecond_effects_share_seconds_validation_and_rounding() {
+        for (seconds, expected) in [
+            (0.0, 0),
+            (0.0004, 0),
+            (0.0006, 1),
+            (0.4, 400),
+            (3600.0, 3_600_000),
+        ] {
+            assert_eq!(
+                super::duration_millis(seconds).expect("valid duration"),
+                expected
+            );
+        }
+        for seconds in [-0.1, 3600.001, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(super::duration_millis(seconds).is_err(), "{seconds}");
+        }
+    }
     use super::*;
 
     const PRESETS: &[(&str, Easing)] = &[

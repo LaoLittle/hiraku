@@ -983,7 +983,13 @@ impl CharacterContext {
         ActorIdentity(handle): ActorIdentity,
         position: Position,
     ) -> Result<ActorIdentity, CharacterCapabilityError> {
-        self.actor_mut(handle)?.position = position.resolve();
+        let position = position.resolve();
+        if !position.into_iter().all(f32::is_finite) {
+            return Err(CharacterCapabilityError::InvalidArguments(
+                "position must be finite and representable in canvas coordinates",
+            ));
+        }
+        self.actor_mut(handle)?.position = position;
         self.actor_mut(handle)?.dirty = true;
         Ok(ActorIdentity(handle))
     }
@@ -993,12 +999,13 @@ impl CharacterContext {
         ActorIdentity(handle): ActorIdentity,
         scale: f64,
     ) -> Result<ActorIdentity, CharacterCapabilityError> {
-        if scale <= 0.0 {
+        let scale = scale as f32;
+        if !scale.is_finite() || scale <= 0.0 {
             return Err(CharacterCapabilityError::InvalidArguments(
-                "scale must be positive",
+                "scale must be finite, positive and representable",
             ));
         }
-        self.actor_mut(handle)?.scale = scale as f32;
+        self.actor_mut(handle)?.scale = scale;
         self.actor_mut(handle)?.dirty = true;
         Ok(ActorIdentity(handle))
     }
@@ -1185,8 +1192,13 @@ enum Position {
 }
 
 impl Position {
-    fn pos(x: f64, y: f64) -> Position {
-        Self::Absolute(x, y)
+    fn pos(x: f64, y: f64) -> Result<Position, NativeError> {
+        if ![x, y].into_iter().all(is_finite_f32) {
+            return Err(NativeError::message(
+                "absolute position components must be finite and representable in canvas coordinates",
+            ));
+        }
+        Ok(Self::Absolute(x, y))
     }
 
     fn rel(x: f64, y: f64) -> Result<Position, NativeError> {
@@ -1263,6 +1275,10 @@ impl Position {
             ],
         }
     }
+}
+
+fn is_finite_f32(value: f64) -> bool {
+    value.is_finite() && (value as f32).is_finite()
 }
 
 fn hide_duration(value: Option<f64>) -> Result<u64, NativeError> {
@@ -1428,6 +1444,14 @@ mod native_api {
         fade_ms: Option<f64>,
     ) -> Result<ActorIdentity, NativeError> {
         let fade_ms = hide_duration(fade_ms)?;
+        native_hide_with_duration(context, actor, fade_ms)
+    }
+
+    pub(super) fn native_hide_with_duration(
+        context: &mut CharacterContext,
+        actor: ActorIdentity,
+        fade_ms: u64,
+    ) -> Result<ActorIdentity, NativeError> {
         let pending = context
             .actor_mut(actor.0)
             .map_err(|error| NativeError::message(error.to_string()))?;
@@ -1442,6 +1466,7 @@ mod native_api {
         {
             pending.visible = false;
             pending.pending_offset = None;
+            pending.placement_animation = None;
         }
         context.commands.push(StoryEffect::HideCharacter {
             actor_id: Some(actor_id),
@@ -1454,7 +1479,7 @@ mod native_api {
     fn native_hide_characters(
         context: &mut CharacterContext,
         fade_ms: Option<f64>,
-    ) -> Result<scene_visuals::SceneTransitionHandle, NativeError> {
+    ) -> Result<scene_visuals::FadeTransitionHandle, NativeError> {
         let fade_ms = hide_duration(fade_ms)?;
         context.invalidate_actor_motions(None)?;
         for actor in context.actors.values_mut() {
@@ -1774,9 +1799,9 @@ mod native_api {
         CameraHandle(handle): CameraHandle,
         intensity: f64,
     ) -> Result<CameraHandle, NativeError> {
-        if !intensity.is_finite() || intensity < 0.0 {
+        if !is_finite_f32(intensity) || intensity < 0.0 {
             return Err(NativeError::message(
-                "camera blur intensity must be non-negative",
+                "camera blur intensity must be finite, non-negative and representable",
             ));
         }
         context.camera_mut(handle)?.blur = Some(intensity as f32);
@@ -1789,10 +1814,13 @@ mod native_api {
         CameraHandle(handle): CameraHandle,
         zoom: f64,
     ) -> Result<CameraHandle, NativeError> {
+        let zoom = zoom as f32;
         if !zoom.is_finite() || zoom <= 0.0 {
-            return Err(NativeError::message("camera zoom must be positive"));
+            return Err(NativeError::message(
+                "camera zoom must be finite, positive and representable",
+            ));
         }
-        context.camera_mut(handle)?.zoom = Some(zoom as f32);
+        context.camera_mut(handle)?.zoom = Some(zoom);
         context.camera_mut(handle)?.zoom_view_space = false;
         Ok(CameraHandle(handle))
     }
@@ -1824,8 +1852,10 @@ mod native_api {
         y: f64,
         z: f64,
     ) -> Result<CameraHandle, NativeError> {
-        if ![x, y, z].into_iter().all(f64::is_finite) {
-            return Err(NativeError::message("camera offset must be finite"));
+        if ![x, y, z].into_iter().all(is_finite_f32) {
+            return Err(NativeError::message(
+                "camera offset must be finite and representable",
+            ));
         }
         context.camera_mut(handle)?.offset = Some([x as f32, y as f32, z as f32]);
         Ok(CameraHandle(handle))
@@ -1839,8 +1869,10 @@ mod native_api {
         y: f64,
         z: f64,
     ) -> Result<CameraHandle, NativeError> {
-        if ![x, y, z].into_iter().all(f64::is_finite) {
-            return Err(NativeError::message("camera rotation must be finite"));
+        if ![x, y, z].into_iter().all(is_finite_f32) {
+            return Err(NativeError::message(
+                "camera rotation must be finite and representable",
+            ));
         }
         context.camera_mut(handle)?.rotation = Some([x as f32, y as f32, z as f32]);
         Ok(CameraHandle(handle))
@@ -1852,8 +1884,10 @@ mod native_api {
         CameraHandle(handle): CameraHandle,
         degrees: f64,
     ) -> Result<CameraHandle, NativeError> {
-        if !degrees.is_finite() {
-            return Err(NativeError::message("camera roll must be finite"));
+        if !is_finite_f32(degrees) {
+            return Err(NativeError::message(
+                "camera roll must be finite and representable",
+            ));
         }
         let pending = context.camera_mut(handle)?;
         let mut rotation = pending.rotation.unwrap_or([0.0; 3]);
@@ -1881,8 +1915,8 @@ mod native_api {
         CameraHandle(handle): CameraHandle,
         seconds: f64,
     ) -> Result<CameraHandle, NativeError> {
-        AnimationSpec::Linear(0.0, false).with_time(seconds)?;
-        context.camera_mut(handle)?.duration_ms = (seconds * 1000.0).round() as u64;
+        let duration = crate::script::animation::duration_millis(seconds)?;
+        context.camera_mut(handle)?.duration_ms = duration;
         Ok(CameraHandle(handle))
     }
 
@@ -1965,6 +1999,54 @@ mod native_api {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    #[test]
+    fn camera_numeric_validation_preserves_pending_state_on_failure() {
+        let mut host = StoryNativeHost::new();
+        let camera = native_camera(&mut host.context, None).expect("camera");
+        native_camera_blur(&mut host.context, camera, 2.0).expect("blur");
+        native_camera_view_scale(&mut host.context, camera, 0.5).expect("view scale");
+        native_camera_offset(&mut host.context, camera, -10.0, 20.0, 3.0).expect("offset");
+        native_camera_rotation(&mut host.context, camera, -5.0, 10.0, 15.0).expect("rotation");
+        let initial = host.snapshot();
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            assert!(native_camera_blur(&mut host.context, camera, invalid).is_err());
+            assert_eq!(host.snapshot(), initial);
+            assert!(native_camera_zoom(&mut host.context, camera, invalid).is_err());
+            assert_eq!(host.snapshot(), initial);
+            assert!(native_camera_roll(&mut host.context, camera, invalid).is_err());
+            assert_eq!(host.snapshot(), initial);
+            for [x, y, z] in [
+                [invalid, 0.0, 0.0],
+                [0.0, invalid, 0.0],
+                [0.0, 0.0, invalid],
+            ] {
+                assert!(native_camera_offset(&mut host.context, camera, x, y, z).is_err());
+                assert_eq!(host.snapshot(), initial);
+                assert!(native_camera_rotation(&mut host.context, camera, x, y, z).is_err());
+                assert_eq!(host.snapshot(), initial);
+            }
+        }
+        for invalid in [0.0, -1.0, f64::MIN_POSITIVE] {
+            assert!(native_camera_zoom(&mut host.context, camera, invalid).is_err());
+            assert_eq!(host.snapshot(), initial);
+        }
+        assert!(native_camera_blur(&mut host.context, camera, -1.0).is_err());
+        assert_eq!(host.snapshot(), initial);
+        native_camera_blur(&mut host.context, camera, 0.0).expect("zero blur");
+        native_camera_roll(&mut host.context, camera, -90.0).expect("negative roll");
+        native_camera_zoom(&mut host.context, camera, f32::MIN_POSITIVE as f64)
+            .expect("positive representable zoom");
+        native_camera_zoom(&mut host.context, camera, f32::MAX as f64)
+            .expect("largest finite zoom");
+    }
 }
 
 #[hiraku_script::hks_module("story")]
@@ -2023,6 +2105,111 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_positions_require_finite_canvas_coordinates() {
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            assert!(Position::pos(invalid, 0.0).is_err());
+            assert!(Position::pos(0.0, invalid).is_err());
+        }
+        assert_eq!(
+            Position::pos(f32::MAX as f64, -(f32::MAX as f64)).expect("finite f32 limits"),
+            Position::Absolute(f32::MAX as f64, -(f32::MAX as f64)),
+        );
+        compile_story_bytecode(
+            "position.hks",
+            "char(\"alice\").at(.pos(10, -20)).scale(0.5).show()",
+        )
+        .expect("checked absolute constructor retains its script signature");
+    }
+
+    #[test]
+    fn actor_numeric_validation_preserves_pending_state_on_failure() {
+        let mut host = StoryNativeHost::new();
+        let alice = host.context.char("alice".into()).expect("actor");
+        host.context
+            .at(alice, Position::Absolute(10.0, -20.0))
+            .expect("position");
+        host.context.scale(alice, 0.5).expect("scale");
+        let initial = host.snapshot();
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            // Host-built or restored enum values must not bypass the constructor.
+            for position in [
+                Position::Absolute(invalid, 0.0),
+                Position::Absolute(0.0, invalid),
+                Position::Relative(invalid, 0.0),
+                Position::Relative(0.0, invalid),
+            ] {
+                assert!(host.context.at(alice, position).is_err());
+                assert_eq!(host.snapshot(), initial);
+            }
+            assert!(host.context.scale(alice, invalid).is_err());
+            assert_eq!(host.snapshot(), initial);
+        }
+        for invalid in [0.0, -1.0, f64::MIN_POSITIVE] {
+            assert!(host.context.scale(alice, invalid).is_err());
+            assert_eq!(host.snapshot(), initial);
+        }
+        host.context
+            .scale(alice, f32::MIN_POSITIVE as f64)
+            .expect("positive representable scale");
+        host.context
+            .scale(alice, f32::MAX as f64)
+            .expect("largest finite scale");
+    }
+
+    #[test]
+    fn actor_hide_clears_discarded_animation_for_every_alias() {
+        let mut host = StoryNativeHost::new();
+        let alice = host.context.char("alice".into()).expect("actor");
+        let alias =
+            native_api::native_alias(&mut host.context, alice, "alternate".into()).expect("alias");
+        for actor in [alice, alias] {
+            native_api::native_at(&mut host.context, actor, Position::Right).expect("position");
+            native_api::actor_time(&mut host.context, actor, 0.4).expect("placement timing");
+            native_api::native_actor_offset(&mut host.context, actor, Position::Absolute(5.0, 0.0))
+                .expect("offset");
+        }
+        let initial = host.snapshot();
+        assert!(native_api::native_hide(&mut host.context, alice, Some(60_001.0)).is_err());
+        assert_eq!(host.snapshot(), initial);
+        native_api::native_hide_with_duration(&mut host.context, alice, 70_000)
+            .expect("prevalidated duration");
+        for actor in [alice, alias] {
+            let state = &host.context.actors[&actor.0];
+            assert!(state.pending_offset.is_none());
+            assert!(state.placement_animation.is_none());
+            assert!(!state.visible);
+        }
+        assert!(matches!(
+            host.drain_effects().as_slice(),
+            [StoryEffect::HideCharacter {
+                fade_ms: 70_000,
+                ..
+            }]
+        ));
+        native_api::native_show(&mut host.context, alias).expect("show alias");
+        host.context.commit_actor(alias.0).expect("commit show");
+        assert!(matches!(
+            host.drain_effects().as_slice(),
+            [StoryEffect::ShowCharacter {
+                placement_animation: None,
+                ..
+            }]
+        ));
+    }
 
     #[test]
     fn actor_depth_uses_display_identity_without_showing_the_actor() {

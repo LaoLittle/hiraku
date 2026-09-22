@@ -967,6 +967,209 @@ mod tests {
     }
 
     #[test]
+    fn call_contract_rejects_non_callable_values() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for script in [
+            "let value: Int = 7\nvalue()",
+            "let value = \"alice\"\nvalue()",
+            "let value = .{ name: \"alice\" }\nvalue()",
+            "let value = .{ run: 7 }\nvalue.run()",
+            "let value: (() -> Int)? = null\nvalue()",
+            "fn invoke<T>(value: T) { value() }",
+            "global let value: Int = 7\nvalue()",
+            "fn value() -> Int { 7 }\nlet value = \"alice\"\nvalue()",
+        ] {
+            let errors = compile_project(vec![source("main.hks", script)], &manifest)
+                .expect_err("only callable values can be called");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains("cannot call")),
+                "{script}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_contract_rejects_type_arguments_on_non_generic_values() {
+        let manifest = BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new());
+        for script in [
+            "value<String>()",
+            "let callback = value\ncallback<String>()",
+            "let callback: () -> Int = { 7 }\ncallback<String>()",
+        ] {
+            let errors = compile_project(
+                vec![
+                    source("main.hks", script),
+                    source("library.hks", "global fn value() -> Int { 7 }"),
+                ],
+                &manifest,
+            )
+            .expect_err("non-generic call targets must not ignore type arguments");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.error.message.contains("type arguments")),
+                "{script}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_contract_respects_callable_binding_shadowing_and_globals() {
+        let project = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+                fn value() -> Int { 99 }
+                let value: () -> Int = { 7 }
+                global let callback: () -> Int = { 11 }
+                global let result: Int = value() + callback()
+            "#,
+            )],
+            &BuiltinManifest::new(Vec::<(String, crate::BuiltinId)>::new()),
+        )
+        .expect("callable bindings compile");
+        let program = project.program;
+        let mut vm =
+            crate::LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+        for _ in 0..1_000 {
+            let event = vm
+                .step_with_budget(&mut 1)
+                .expect("invoke the lexical binding");
+            vm = crate::LinkedVm::restore(vm.snapshot(), program.clone())
+                .expect("restore callable bindings");
+            if matches!(event, Some(crate::LinkedVmEvent::Completed(_))) {
+                assert_eq!(
+                    vm.current_globals().expect("globals")["result"],
+                    crate::Value::Int(18)
+                );
+                return;
+            }
+        }
+        panic!("execution did not complete");
+    }
+
+    #[test]
+    fn call_contract_lexical_binding_shadows_native_signature() {
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        registry
+            .register_fn("value", |_: &mut (), _: String| Ok(99_i64))
+            .expect("native function");
+        let project = compile_project(
+            vec![source(
+                "main.hks",
+                r#"
+                let value: (Int) -> Int = { input -> input }
+                global let result: Int = value(7)
+            "#,
+            )],
+            &registry.manifest(),
+        )
+        .expect("the lexical callable supplies the signature");
+        let mut vm =
+            crate::LinkedVm::new(project.program, project.paths["main.hks"]).expect("entry");
+        for _ in 0..100 {
+            match vm.step().expect("execute lexical callable") {
+                Some(crate::LinkedVmEvent::Call(_)) => panic!("shadowed native was called"),
+                Some(crate::LinkedVmEvent::Completed(_)) => {
+                    assert_eq!(
+                        vm.current_globals().expect("globals")["result"],
+                        crate::Value::Int(7)
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("execution did not complete");
+    }
+
+    #[test]
+    fn call_contract_shared_global_callback_retains_generic_owner_after_restore() {
+        let manifest = BuiltinManifest::new([("checkpoint", crate::BuiltinId(1))]);
+        for (literal, should_fail) in [("7", false), ("\"alice\"", true)] {
+            let project = compile_project(
+                vec![
+                    source(
+                        "factory.hks",
+                        r#"
+                    global fn converter<T>() -> (Any) -> T {
+                        { value: Any -> checkpoint(); value as! T }
+                    }
+                "#,
+                    ),
+                    source(
+                        "callbacks.hks",
+                        r#"
+                    let decoy: () -> Int = { 99 }
+                    global var callback: (Any) -> Int
+                    global fn initialize(value: (Any) -> Int) { callback = value }
+                    global fn apply<T>(ignored: T, value: Any) -> Int { callback(value) }
+                "#,
+                    ),
+                    source(
+                        "main.hks",
+                        &format!(
+                            r#"
+                    initialize(converter<Int>())
+                    let direct = callback(7)
+                    global let result: Int = apply<String>("bob", {literal})
+                "#
+                        ),
+                    ),
+                ],
+                &manifest,
+            )
+            .expect("shared generic callback compiles");
+            let program = project.program;
+            let mut vm =
+                crate::LinkedVm::new(program.clone(), project.paths["main.hks"]).expect("entry");
+            let mut host_waits = 0;
+            let mut finished = false;
+            for _ in 0..1_000 {
+                let event = vm.step_with_budget(&mut 1);
+                let bytes = crate::hson::to_vec(&vm.snapshot()).expect("encode checkpoint");
+                vm = crate::LinkedVm::restore(
+                    crate::hson::from_slice(&bytes).expect("decode checkpoint"),
+                    program.clone(),
+                )
+                .expect("restore generic callback state");
+                match event {
+                    Ok(Some(crate::LinkedVmEvent::Call(_))) => {
+                        host_waits += 1;
+                        vm.resume(crate::Value::Unit).expect("resume host wait");
+                    }
+                    Ok(Some(crate::LinkedVmEvent::Completed(_))) => {
+                        assert!(
+                            !should_fail,
+                            "an Int callback must reject String after restore"
+                        );
+                        assert_eq!(
+                            vm.current_globals().expect("globals")["result"],
+                            crate::Value::Int(7)
+                        );
+                        finished = true;
+                        break;
+                    }
+                    Err(crate::LinkedVmError::Vm(crate::VmError::CastFailed(_))) => {
+                        assert!(
+                            should_fail,
+                            "captured Int must not become the caller's String"
+                        );
+                        finished = true;
+                        break;
+                    }
+                    Err(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert!(finished, "execution did not complete");
+            assert_eq!(host_waits, 2);
+        }
+    }
+
+    #[test]
     fn missing_enum_method_is_not_reported_as_an_any_call() {
         let errors = compile_project(
             vec![source(

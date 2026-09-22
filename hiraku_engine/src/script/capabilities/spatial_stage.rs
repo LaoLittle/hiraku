@@ -1,4 +1,6 @@
-use super::scene_visuals::{SceneTransitionHandle, SceneVisualTarget};
+use super::scene_visuals::{
+    SceneVisualTarget, StageCameraTransitionHandle, StageViewTransitionHandle,
+};
 use super::*;
 use crate::stage::runtime::StageCommand;
 
@@ -105,10 +107,10 @@ mod api {
         context: &mut CharacterContext,
         stage: Stage,
         name: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<StageCameraTransitionHandle, NativeError> {
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Spatial(StageCommand::Camera {
+            .begin_as(SceneVisualTarget::Spatial(StageCommand::Camera {
                 id: stage.0,
                 view: "main".into(),
                 name,
@@ -116,12 +118,12 @@ mod api {
             }))
     }
 
-    #[hks(name = "track", selector = "SceneTransition", receiver)]
+    #[hks(name = "track", selector = "StageCameraTransition", receiver)]
     fn track(
         context: &mut CharacterContext,
-        handle: SceneTransitionHandle,
+        handle: StageCameraTransitionHandle,
         name: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<StageCameraTransitionHandle, NativeError> {
         if name.trim().is_empty() {
             return Err(NativeError::message("stage view name must not be empty"));
         }
@@ -141,10 +143,10 @@ mod api {
         context: &mut CharacterContext,
         stage: Stage,
         name: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<StageViewTransitionHandle, NativeError> {
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Spatial(StageCommand::View {
+            .begin_as(SceneVisualTarget::Spatial(StageCommand::View {
                 id: stage.0,
                 view: name,
                 visible: true,
@@ -157,10 +159,10 @@ mod api {
         context: &mut CharacterContext,
         stage: Stage,
         name: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<StageViewTransitionHandle, NativeError> {
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Spatial(StageCommand::View {
+            .begin_as(SceneVisualTarget::Spatial(StageCommand::View {
                 id: stage.0,
                 view: name,
                 visible: false,

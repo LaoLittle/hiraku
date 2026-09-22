@@ -8,12 +8,16 @@ use super::{CharacterContext, Position, StoryEffect};
 use crate::scene::clipping::{ClipCommand, ClipRegion};
 use crate::scene::pictures::PictureCommand;
 
+mod builders;
+pub(super) use builders::*;
+
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "SceneClip", handle_type = 5)]
 pub(super) struct SceneClipHandle(u64);
 
-#[derive(Clone, Copy, hiraku_script::HksHandle)]
-#[hks(name = "SceneTransition", handle_type = 4)]
+// Internal identity only: public handles expose the modifiers supported by
+// their operation, rather than one universal scene-builder method table.
+#[derive(Clone, Copy)]
 pub(super) struct SceneTransitionHandle(pub(super) u64);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -49,8 +53,14 @@ impl SceneVisualState {
     pub(super) fn hide_characters(
         &mut self,
         duration_ms: u64,
-    ) -> Result<SceneTransitionHandle, NativeError> {
-        self.begin(SceneVisualTarget::HideCharacters { duration_ms })
+    ) -> Result<FadeTransitionHandle, NativeError> {
+        self.begin_as(SceneVisualTarget::HideCharacters { duration_ms })
+    }
+    pub(super) fn begin_as<T: From<SceneTransitionHandle>>(
+        &mut self,
+        target: SceneVisualTarget,
+    ) -> Result<T, NativeError> {
+        self.begin(target).map(Into::into)
     }
     pub(super) fn begin(
         &mut self,
@@ -125,6 +135,8 @@ impl SceneVisualState {
 pub(super) fn register(registry: &mut NativeRegistry<CharacterContext>) {
     api::register_hks(registry)
         .expect("scene presentation API registration must be internally consistent");
+    builders::register(registry)
+        .expect("scene builder API registration must be internally consistent");
 }
 
 fn milliseconds(seconds: f64) -> Result<u64, NativeError> {
@@ -147,7 +159,7 @@ mod api {
         x: f64,
         y: f64,
         interval: f64,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<TimedSceneTransitionHandle, NativeError> {
         if ![x, y, interval].into_iter().all(f64::is_finite)
             || x < 0.0
             || y < 0.0
@@ -160,7 +172,7 @@ mod api {
                 "shake requires nonnegative finite amplitudes and an interval in 0.001..60 seconds",
             ));
         }
-        context.scene_visuals.begin(SceneVisualTarget::Shake {
+        context.scene_visuals.begin_as(SceneVisualTarget::Shake {
             amplitude: [x as f32, y as f32],
             interval: interval as f32,
         })
@@ -256,7 +268,7 @@ mod api {
         context: &mut CharacterContext,
         id: String,
         texture: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<PictureShowHandle, NativeError> {
         if id.trim().is_empty() || texture.trim().is_empty() {
             return Err(NativeError::message(
                 "picture identity and texture must not be empty",
@@ -264,7 +276,7 @@ mod api {
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Show {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::Show {
                 screen_space: false,
                 size: None,
                 slice: None,
@@ -280,8 +292,7 @@ mod api {
             }))
     }
 
-    #[hks(name = "at", selector = "SceneTransition", receiver)]
-    fn picture_at(
+    pub(super) fn picture_at(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         position: Position,
@@ -314,8 +325,7 @@ mod api {
         Ok(handle)
     }
 
-    #[hks(name = "screenSpace", receiver)]
-    fn screen_space(
+    pub(super) fn screen_space(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
     ) -> Result<SceneTransitionHandle, NativeError> {
@@ -330,8 +340,7 @@ mod api {
         Ok(handle)
     }
 
-    #[hks(name = "frame", receiver)]
-    fn frame(
+    pub(super) fn frame(
         context: &mut CharacterContext,
         SceneTransitionHandle(id): SceneTransitionHandle,
         x: f64,
@@ -371,8 +380,7 @@ mod api {
     }
 
     /// Presentation order independent of position, size and rotation.
-    #[hks(name = "layer", selector = "SceneTransition", receiver)]
-    fn picture_layer(
+    pub(super) fn picture_layer(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         value: f64,
@@ -393,8 +401,7 @@ mod api {
         Ok(handle)
     }
 
-    #[hks(name = "size", selector = "SceneTransition", receiver)]
-    fn picture_size(
+    pub(super) fn picture_size(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         width: f64,
@@ -417,8 +424,7 @@ mod api {
         Ok(handle)
     }
 
-    #[hks(name = "slice", selector = "SceneTransition", receiver)]
-    fn picture_slice(
+    pub(super) fn picture_slice(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         left: f64,
@@ -446,8 +452,7 @@ mod api {
         Ok(handle)
     }
 
-    #[hks(name = "tint", selector = "SceneTransition", receiver)]
-    fn picture_tint(
+    pub(super) fn picture_tint(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         red: i32,
@@ -477,7 +482,7 @@ mod api {
         g: i32,
         b: i32,
         a: i32,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<FadeTransitionHandle, NativeError> {
         let bytes = [r, g, b, a];
         if id.trim().is_empty() || !bytes.iter().all(|v| (0..=255).contains(v)) {
             return Err(NativeError::message(
@@ -486,7 +491,7 @@ mod api {
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Tint {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::Tint {
                 id,
                 color: bytes.map(|v| v as f32 / 255.0),
                 seconds: 0.0,
@@ -529,7 +534,7 @@ mod api {
         context: &mut CharacterContext,
         id: String,
         radius: f64,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<FadeTransitionHandle, NativeError> {
         if id.trim().is_empty() || !radius.is_finite() || !(0.0..=128.0).contains(&radius) {
             return Err(NativeError::message(
                 "blurPicture requires an identity and radius in 0..=128 pixels",
@@ -537,7 +542,7 @@ mod api {
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Blur {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::Blur {
                 id,
                 radius: radius as f32,
                 seconds: 0.0,
@@ -548,10 +553,10 @@ mod api {
     fn hide_picture(
         context: &mut CharacterContext,
         id: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<PictureHideHandle, NativeError> {
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Hide {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::Hide {
                 id,
                 seconds: 0.0,
             }))
@@ -565,7 +570,7 @@ mod api {
         y: f64,
         seconds: f64,
         ease: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<PictureTransformHandle, NativeError> {
         milliseconds(seconds)?;
         if ![x, y].iter().all(|n| n.is_finite() && n.abs() <= 100000.0)
             || !["linear", "smoothStep", "easeOutQuad", "easeOutBack"].contains(&ease.as_str())
@@ -574,7 +579,7 @@ mod api {
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Transform {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::Transform {
                 id,
                 position: [Some(x as f32), Some(y as f32)],
                 scale: None,
@@ -590,13 +595,13 @@ mod api {
     fn transform_picture(
         context: &mut CharacterContext,
         id: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<PictureTransformHandle, NativeError> {
         if id.trim().is_empty() {
             return Err(NativeError::message("picture identity must not be empty"));
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Transform {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::Transform {
                 id,
                 position: [None; 2],
                 scale: None,
@@ -657,8 +662,7 @@ mod api {
     }
 
     /// Virtual-canvas percentages; offscreen and fractional positions allowed.
-    #[hks(name = "x", selector = "SceneTransition", receiver)]
-    fn transform_x(
+    pub(super) fn transform_x(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         value: f64,
@@ -666,8 +670,7 @@ mod api {
         transform_field(context, handle, 0, value)
     }
 
-    #[hks(name = "y", selector = "SceneTransition", receiver)]
-    fn transform_y(
+    pub(super) fn transform_y(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         value: f64,
@@ -675,8 +678,7 @@ mod api {
         transform_field(context, handle, 1, value)
     }
 
-    #[hks(name = "scale", selector = "SceneTransition", receiver)]
-    fn transform_scale(
+    pub(super) fn transform_scale(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         value: f64,
@@ -684,8 +686,7 @@ mod api {
         transform_field(context, handle, 2, value)
     }
 
-    #[hks(name = "rotation", selector = "SceneTransition", receiver)]
-    fn transform_rotation(
+    pub(super) fn transform_rotation(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         value: f64,
@@ -748,13 +749,12 @@ mod api {
         }
         Ok(handle)
     }
-    #[hks(name = "time", selector = "SceneTransition", receiver)]
-    fn transition_time(
+    pub(super) fn transition_time(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         seconds: f64,
     ) -> Result<SceneTransitionHandle, NativeError> {
-        let duration = milliseconds(seconds)?;
+        let duration = crate::script::animation::duration_millis(seconds)?;
         if let Some((target, fade)) = context.scene_visuals.pending.get_mut(&handle.0) {
             if matches!(
                 target,
@@ -775,8 +775,7 @@ mod api {
         let spec = transition_spec(context, handle)?.with_time(seconds)?;
         set_transition_spec(context, handle, spec)
     }
-    #[hks(name = "easing", selector = "SceneTransition", receiver)]
-    fn transition_easing(
+    pub(super) fn transition_easing(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         easing: crate::script::animation::Easing,
@@ -786,8 +785,7 @@ mod api {
     }
 
     /// One owned exit: final position and alpha finish before removal.
-    #[hks(name = "to", selector = "SceneTransition", receiver)]
-    fn exit_to(
+    pub(super) fn exit_to(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
         x: f64,
@@ -796,7 +794,7 @@ mod api {
         if !x.is_finite() || !y.is_finite() || x.abs() > 100000.0 || y.abs() > 100000.0 {
             return Err(NativeError::message("invalid picture exit position"));
         }
-        let Some((SceneVisualTarget::Picture(command), _)) =
+        let Some((SceneVisualTarget::Picture(command), duration_override)) =
             context.scene_visuals.pending.get_mut(&handle.0)
         else {
             return Err(NativeError::message(
@@ -806,10 +804,17 @@ mod api {
         let PictureCommand::Hide { id, seconds } = command else {
             return Err(NativeError::message("to requires hidePicture"));
         };
+        // Hide stores visibility timing as an override; Exit owns one motion
+        // and fade timeline. Transfer that value once rather than leaving a
+        // stale override that can hide or replace a later `.time(...)`.
+        let seconds = duration_override
+            .take()
+            .map(|ms| ms as f32 / 1000.0)
+            .unwrap_or(*seconds);
         *command = PictureCommand::Exit {
             id: id.clone(),
             position: [x as f32, y as f32],
-            seconds: *seconds,
+            seconds,
             ease: "linear".into(),
         };
         Ok(handle)
@@ -841,7 +846,7 @@ mod api {
         y: f64,
         period_x: f64,
         period_y: f64,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<TimedSceneTransitionHandle, NativeError> {
         if ![x, y].iter().all(|v| v.is_finite() && v.abs() < 100000.0)
             || ![period_x, period_y]
                 .iter()
@@ -853,7 +858,7 @@ mod api {
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::Oscillate {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::Oscillate {
                 id,
                 amplitude: [x as f32, y as f32],
                 period: [period_x as f32, period_y as f32],
@@ -867,7 +872,7 @@ mod api {
         id: String,
         offsets: Vec<f64>,
         step_seconds: f64,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<SceneEffectHandle, NativeError> {
         if offsets.is_empty()
             || offsets.len() > 4096
             || !offsets.iter().all(|n| n.is_finite() && n.abs() < 100000.0)
@@ -877,7 +882,7 @@ mod api {
         }
         context
             .scene_visuals
-            .begin(SceneVisualTarget::Picture(PictureCommand::AnimateX {
+            .begin_as(SceneVisualTarget::Picture(PictureCommand::AnimateX {
                 id,
                 offsets: offsets.into_iter().map(|n| n as f32).collect(),
                 step_seconds: step_seconds as f32,
@@ -888,7 +893,7 @@ mod api {
     fn background(
         context: &mut CharacterContext,
         texture: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<PictureShowHandle, NativeError> {
         picture(context, "Backgrounds".into(), texture)
     }
 
@@ -896,7 +901,7 @@ mod api {
     fn cg(
         context: &mut CharacterContext,
         texture: String,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<PictureShowHandle, NativeError> {
         picture(context, "Stills".into(), texture)
     }
 
@@ -906,13 +911,13 @@ mod api {
     fn curtain(
         context: &mut CharacterContext,
         opacity: f64,
-    ) -> Result<SceneTransitionHandle, NativeError> {
+    ) -> Result<CurtainTransitionHandle, NativeError> {
         if !(0.0..=1.0).contains(&opacity) {
             return Err(NativeError::message(
                 "curtain opacity must be between 0 and 1",
             ));
         }
-        context.scene_visuals.begin(SceneVisualTarget::Curtain {
+        context.scene_visuals.begin_as(SceneVisualTarget::Curtain {
             color: [0; 3],
             opacity: opacity as f32,
             mask: None,
@@ -921,8 +926,7 @@ mod api {
     }
 
     /// Select the curtain pigment; fade controls its opacity independently.
-    #[hks(name = "color", receiver)]
-    fn color(
+    pub(super) fn color(
         context: &mut CharacterContext,
         SceneTransitionHandle(id): SceneTransitionHandle,
         red: i32,
@@ -949,8 +953,7 @@ mod api {
     }
 
     /// A red-channel threshold mask, sampled as linear data across the canvas.
-    #[hks(name = "dissolve", receiver)]
-    fn dissolve(
+    pub(super) fn dissolve(
         context: &mut CharacterContext,
         SceneTransitionHandle(id): SceneTransitionHandle,
         texture: String,
@@ -981,8 +984,7 @@ mod api {
     }
 
     /// Join this statement's scene transition through the shared effect protocol.
-    #[hks(name = "await", selector = "SceneTransition", receiver)]
-    fn await_transition(
+    pub(super) fn await_transition(
         context: &mut CharacterContext,
         SceneTransitionHandle(id): SceneTransitionHandle,
     ) -> Result<(), NativeError> {
@@ -996,8 +998,7 @@ mod api {
     }
 
     /// Milliseconds, matching Bgm.fadeIn. The builder commits at statement end.
-    #[hks(name = "fade", receiver)]
-    fn fade_in(
+    pub(super) fn fade_in(
         context: &mut CharacterContext,
         SceneTransitionHandle(id): SceneTransitionHandle,
         duration_ms: f64,
@@ -1013,6 +1014,7 @@ mod api {
             SceneVisualTarget::Picture(
                 PictureCommand::Show { .. }
                     | PictureCommand::Hide { .. }
+                    | PictureCommand::Exit { .. }
                     | PictureCommand::Tint { .. }
                     | PictureCommand::Blur { .. }
             ) | SceneVisualTarget::HideCharacters { .. }
@@ -1022,7 +1024,11 @@ mod api {
                 "fade is not supported by this operation; use time(seconds) for movement or camera transitions",
             ));
         }
-        pending.1 = Some(duration);
+        if let SceneVisualTarget::Picture(PictureCommand::Exit { seconds, .. }) = &mut pending.0 {
+            *seconds = duration as f32 / 1000.0;
+        } else {
+            pending.1 = Some(duration);
+        }
         Ok(SceneTransitionHandle(id))
     }
 
@@ -1040,6 +1046,32 @@ mod api {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_time_uses_the_common_duration_contract() {
+        let mut picture = runtime("bg(\"room\").time(0.0006)");
+        let StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+            seconds, ..
+        })) = event(&mut picture)
+        else {
+            panic!("picture show");
+        };
+        assert!((seconds - 0.001).abs() < 0.000001);
+        for builder in [
+            "bg(\"room\")",
+            "scene.hidePicture(\"panel\")",
+            "scene.curtain(1)",
+            "scene.hideCharacters()",
+            "scene.shake(1, 1, 0.05)",
+        ] {
+            let mut invalid = runtime(&format!("{builder}.time(3600.1)"));
+            let error = invalid.step().expect_err("out-of-range duration");
+            assert!(
+                error.to_string().contains("0..=3600 seconds"),
+                "{builder}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn stepped_shake_uses_the_normal_animation_wait_path() {
@@ -1110,15 +1142,45 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_fade_is_an_error_not_a_silent_noop() {
-        let mut runtime = runtime("scene.transformPicture(\"alice\").fade(300)");
-        for _ in 0..32 {
-            if let Err(error) = runtime.step() {
-                assert!(error.to_string().contains("fade is not supported"));
-                return;
-            }
+    fn unsupported_modifiers_fail_before_execution() {
+        for (source, method) in [
+            ("scene.transformPicture(\"alice\").fade(300)", "fade"),
+            ("scene.transformPicture(\"alice\").size(40, 50)", "size"),
+            ("scene.hidePicture(\"panel\").at(.center)", "at"),
+            ("scene.hidePicture(\"panel\").easing(.easeOut)", "easing"),
+            ("bg(\"room\").easing(.easeOut)", "easing"),
+            ("bg(\"room\").color(255, 255, 255)", "color"),
+            ("bg(\"room\").to(50, 50)", "to"),
+            ("scene.curtain(1).size(40, 50)", "size"),
+            ("scene.hideCharacters().at(.center)", "at"),
+            ("scene.shake(1, 1, 0.05).fade(300)", "fade"),
+            (
+                "scene.animatePictureX(\"panel\", [0.0, 2.0], 0.1).time(1)",
+                "time",
+            ),
+            (
+                "stage.open(\"room.stage.hson\").camera(\"front\").size(40, 50)",
+                "size",
+            ),
+            (
+                "stage.open(\"room.stage.hson\").showView(\"side\").track(\"front\")",
+                "track",
+            ),
+        ] {
+            let error = compile_story_bytecode("builder.hks", source)
+                .expect_err("unsupported modifiers must be compile errors");
+            assert!(error.to_string().contains(method), "{source}: {error}");
         }
-        panic!("unsupported modifier must fail");
+    }
+
+    #[test]
+    fn scene_builder_handles_are_distinct_in_native_values() {
+        use hiraku_script::native::{FromHksValue, IntoHksValue};
+        let show = PictureShowHandle::from(SceneTransitionHandle(1)).into_hks_value();
+        let exit = PictureExitHandle::from(SceneTransitionHandle(1)).into_hks_value();
+        assert!(PictureShowHandle::from_hks_value(&show).is_ok());
+        assert!(PictureExitHandle::from_hks_value(&show).is_err());
+        assert!(PictureShowHandle::from_hks_value(&exit).is_err());
     }
 
     #[test]
@@ -1214,6 +1276,38 @@ mod tests {
         assert!(exit.step().expect("wait for owned exit").is_none());
         exit.complete_task_effect(task, &effect)
             .expect("complete exit");
+    }
+
+    #[test]
+    fn picture_exit_duration_is_independent_of_modifier_order() {
+        for (modifiers, expected) in [
+            (".time(0.4).to(20, 30)", 0.4),
+            (".to(20, 30).time(0.4)", 0.4),
+            (".fade(400).to(20, 30)", 0.4),
+            (".to(20, 30).fade(400)", 0.4),
+            (".time(0.4).to(20, 30).time(0.8)", 0.8),
+            (".time(0.4).to(20, 30).time(0)", 0.0),
+            (".time(0).to(20, 30)", 0.0),
+        ] {
+            let mut script = runtime(&format!(
+                "scene.hidePicture(\"panel\"){modifiers}.easing(.easeIn).await()"
+            ));
+            let StoryRuntimeEvent::TaskEffect { task, effect } = event(&mut script) else {
+                panic!("exit must be awaitable: {modifiers}");
+            };
+            let StoryEffect::Picture(PictureCommand::Exit { seconds, ease, .. }) = &effect else {
+                panic!("expected picture exit: {modifiers}");
+            };
+            assert!(
+                (*seconds - expected).abs() < 0.0001,
+                "{modifiers}: {seconds}"
+            );
+            assert_eq!(*ease, crate::script::animation::Easing::EaseIn);
+            assert!(script.step().expect("waiting").is_none());
+            script
+                .complete_task_effect(task, &effect)
+                .expect("complete exit");
+        }
     }
     use crate::script::capabilities::{StoryWait, compile_story_bytecode};
     use crate::script::{StoryRuntime, StoryRuntimeEvent};

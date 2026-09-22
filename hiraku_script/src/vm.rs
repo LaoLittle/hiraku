@@ -970,6 +970,21 @@ pub struct VmSnapshot {
     pub call_stack: Vec<CallFrameSnapshot>,
 }
 
+impl VmSnapshot {
+    /// Values owned by execution frames, excluding the separately stored heap.
+    pub fn object_roots(&self) -> impl Iterator<Item = &Value> {
+        self.registers
+            .iter()
+            .chain(&self.locals)
+            .chain(&self.globals)
+            .chain(
+                self.call_stack
+                    .iter()
+                    .flat_map(|frame| frame.registers.iter().chain(&frame.locals)),
+            )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CallFrameSnapshot {
     #[serde(with = "type_binding_table")]
@@ -1761,7 +1776,30 @@ impl Vm {
         bytecode: impl Into<Arc<Bytecode>>,
         snapshot: VmSnapshot,
     ) -> Result<Self, VmError> {
-        let bytecode = bytecode.into();
+        Self::restore_inner(bytecode.into(), snapshot, None)
+    }
+
+    /// Restore a frame whose object IDs belong to an embedding-owned heap.
+    /// The embedding must lend this same heap before executing the VM. A saved
+    /// private heap is rejected: its IDs cannot be merged with the shared scope.
+    pub fn restore_with_shared_heap(
+        bytecode: impl Into<Arc<Bytecode>>,
+        snapshot: VmSnapshot,
+        objects: &crate::ObjectHeap,
+    ) -> Result<Self, VmError> {
+        if snapshot.objects.live_objects() != 0 {
+            return Err(VmError::InvalidSnapshot(
+                "shared-heap frame contains a private object heap".into(),
+            ));
+        }
+        Self::restore_inner(bytecode.into(), snapshot, Some(objects))
+    }
+
+    fn restore_inner(
+        bytecode: Arc<Bytecode>,
+        snapshot: VmSnapshot,
+        shared_objects: Option<&crate::ObjectHeap>,
+    ) -> Result<Self, VmError> {
         crate::SharedStrings::default().prepare(&bytecode.strings, &bytecode.symbols);
         if bytecode.version != BYTECODE_VERSION {
             return Err(VmError::UnsupportedBytecode(bytecode.version));
@@ -1773,6 +1811,9 @@ impl Vm {
             return Err(VmError::BuiltinManifestMismatch);
         }
         crate::snapshot_validation::validate(&bytecode, &snapshot)?;
+        shared_objects
+            .unwrap_or(&snapshot.objects)
+            .validate_roots(snapshot.object_roots())?;
         let registers = RegisterFrame::from_values(snapshot.registers, Default::default());
         Ok(Self {
             module: None,

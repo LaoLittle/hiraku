@@ -544,6 +544,9 @@ impl LinkedVm {
         {
             return Err(VmError::ProgramFingerprintMismatch.into());
         }
+        snapshot
+            .objects
+            .validate_roots(snapshot.module_globals.values().flatten())?;
         let frames = snapshot
             .frames
             .into_iter()
@@ -554,7 +557,10 @@ impl LinkedVm {
                     .ok_or(LinkedVmError::UnknownModule(frame.module))?
                     .bytecode
                     .clone();
-                Ok((frame.module, Vm::restore(bytecode, frame.vm)?))
+                Ok((
+                    frame.module,
+                    Vm::restore_with_shared_heap(bytecode, frame.vm, &snapshot.objects)?,
+                ))
             })
             .collect::<Result<_, LinkedVmError>>()?;
         Ok(Self {
@@ -845,6 +851,20 @@ mod tests {
         let mut invalid = saved.clone();
         invalid.module_globals.insert(u32::MAX, vec![]);
         assert!(LinkedVm::restore(invalid, program.clone()).is_err());
+        let mut invalid = saved.clone();
+        invalid
+            .module_globals
+            .insert(0, vec![Value::Object(crate::ObjectId(42))]);
+        assert!(matches!(
+            LinkedVm::restore(invalid, program.clone()),
+            Err(LinkedVmError::Vm(VmError::InvalidObject(_)))
+        ));
+        let mut invalid = saved.clone();
+        invalid.frames[0].vm.globals[0] = Value::Object(crate::ObjectId(42));
+        assert!(matches!(
+            LinkedVm::restore(invalid, program.clone()),
+            Err(LinkedVmError::Vm(VmError::InvalidObject(_)))
+        ));
         let mut invalid = saved;
         invalid.module_globals.insert(0, vec![]);
         assert!(LinkedVm::restore(invalid, program).is_err());

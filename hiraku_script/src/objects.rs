@@ -52,34 +52,50 @@ impl Serialize for ObjectHeap {
 impl<'de> Deserialize<'de> for ObjectHeap {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let saved = HeapSnapshot::deserialize(deserializer)?;
+        // Validate logical values before packing them into the runtime heap.
+        // Object references can form cycles, but may not refer outside this
+        // heap (portable closures have a distinct, explicitly owned scope).
+        let ids: BTreeSet<_> = saved.objects.iter().map(|(id, _)| *id).collect();
+        if ids.len() != saved.objects.len() {
+            return Err(serde::de::Error::custom(
+                "duplicate object ID in heap snapshot",
+            ));
+        }
+        let mut validator = GraphValidator::default();
+        validator
+            .scope(&ids, saved.next_id, &saved.read_only)
+            .map_err(serde::de::Error::custom)?;
+        for (_, value) in &saved.objects {
+            validator
+                .value(value, &ids, 0)
+                .map_err(serde::de::Error::custom)?;
+        }
         let mut heap = Self {
             next_id: saved.next_id,
             read_only: saved.read_only,
             ..Self::default()
         };
         for (id, value) in saved.objects {
-            if id.0 >= heap.next_id || heap.objects.contains_key(&id) {
-                return Err(serde::de::Error::custom(
-                    "duplicate or out-of-range object ID in heap snapshot",
-                ));
-            }
             let value = heap.storage.pack(value);
             heap.objects.insert(id, value);
-        }
-        if heap
-            .read_only
-            .iter()
-            .any(|id| !heap.objects.contains_key(id))
-        {
-            return Err(serde::de::Error::custom(
-                "read-only set refers to a missing object",
-            ));
         }
         Ok(heap)
     }
 }
 
 impl ObjectHeap {
+    /// Validate an entire execution-owned graph and its external roots before
+    /// activation. Aliases and cycles are valid; dangling IDs are not. Every
+    /// stored object is checked, including unreachable objects retained until
+    /// the next collection. This does not grant host capabilities or validate
+    /// module/function identities, which belong to the embedding/linker.
+    pub fn validate_roots<'a>(
+        &self,
+        roots: impl IntoIterator<Item = &'a Value>,
+    ) -> Result<(), crate::VmError> {
+        GraphValidator::default().heap(self, roots, 0)
+    }
+
     pub fn with_strings(strings: crate::SharedStrings) -> Self {
         Self {
             storage: crate::value_heap::ValueHeap::with_strings(strings),
@@ -531,6 +547,119 @@ impl ObjectHeap {
     }
 }
 
+// A graph is validated one stored value at a time, not by recursive traversal
+// of ObjectIds. Consequently both cycles and arbitrarily long reference chains
+// cost linear work and do not consume the Rust call stack. Inline containers
+// and portable heap nesting are bounded separately.
+const MAX_GRAPH_VALUES: usize = 1_048_576;
+const MAX_VALUE_DEPTH: usize = 128;
+
+struct GraphValidator {
+    remaining: usize,
+}
+
+impl Default for GraphValidator {
+    fn default() -> Self {
+        Self {
+            remaining: MAX_GRAPH_VALUES,
+        }
+    }
+}
+
+impl GraphValidator {
+    fn scope(
+        &self,
+        ids: &BTreeSet<ObjectId>,
+        next_id: u32,
+        read_only: &BTreeSet<ObjectId>,
+    ) -> Result<(), crate::VmError> {
+        if ids.len() > self.remaining {
+            return Err(crate::VmError::InvalidSnapshot(
+                "object graph exceeds the value budget".into(),
+            ));
+        }
+        if ids.iter().any(|id| id.0 >= next_id) {
+            return Err(crate::VmError::InvalidSnapshot(
+                "object ID exceeds the heap allocation boundary".into(),
+            ));
+        }
+        if let Some(id) = read_only.iter().find(|id| !ids.contains(id)) {
+            return Err(crate::VmError::InvalidObject(*id));
+        }
+        Ok(())
+    }
+
+    fn heap<'a>(
+        &mut self,
+        heap: &ObjectHeap,
+        roots: impl IntoIterator<Item = &'a Value>,
+        depth: usize,
+    ) -> Result<(), crate::VmError> {
+        let ids = heap.objects.keys().copied().collect();
+        self.scope(&ids, heap.next_id, &heap.read_only)?;
+        for slot in heap.objects.values() {
+            self.value(&heap.storage.unpack(*slot), &ids, depth)?;
+        }
+        for root in roots {
+            self.value(root, &ids, depth)?;
+        }
+        Ok(())
+    }
+
+    fn value(
+        &mut self,
+        value: &Value,
+        ids: &BTreeSet<ObjectId>,
+        depth: usize,
+    ) -> Result<(), crate::VmError> {
+        if depth > MAX_VALUE_DEPTH || self.remaining == 0 {
+            return Err(crate::VmError::InvalidSnapshot(
+                "object graph exceeds the nesting or value budget".into(),
+            ));
+        }
+        self.remaining -= 1;
+        match value {
+            Value::Object(id) if !ids.contains(id) => {
+                return Err(crate::VmError::InvalidObject(*id));
+            }
+            Value::Map(fields) => {
+                for value in fields.values() {
+                    self.value(value, ids, depth + 1)?;
+                }
+            }
+            Value::List(values) | Value::Tuple(values) => {
+                for value in values {
+                    self.value(value, ids, depth + 1)?;
+                }
+            }
+            Value::Typed { value, .. } | Value::Optional(Some(value)) => {
+                self.value(value, ids, depth + 1)?
+            }
+            Value::TextTemplate(template) => {
+                for value in template.captures.values() {
+                    self.value(value, ids, depth + 1)?;
+                }
+            }
+            Value::Closure {
+                captures,
+                objects: Some(heap),
+                ..
+            } => self.heap(heap, captures, depth + 1)?,
+            Value::Closure {
+                captures,
+                objects: None,
+                ..
+            } => {
+                for value in captures {
+                    self.value(value, ids, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 fn relocate(value: Value, base: u32) -> Value {
     match value {
         Value::TextTemplate(mut template) => {
@@ -591,6 +720,141 @@ fn relocate(value: Value, base: u32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn closure(captures: Vec<Value>, objects: Option<ObjectHeap>) -> Value {
+        Value::Closure {
+            type_bindings: vec![],
+            module: None,
+            region: 0,
+            captures,
+            objects: objects.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn graph_validation_checks_all_containers_and_unreachable_objects() {
+        let missing = Value::Object(ObjectId(42));
+        let invalid_values = [
+            missing.clone(),
+            Value::Map(BTreeMap::from([("alice".into(), missing.clone())])),
+            Value::List(vec![missing.clone()]),
+            Value::Tuple(vec![missing.clone()]),
+            Value::Optional(Some(Box::new(missing.clone()))),
+            Value::Typed {
+                type_id: crate::SymbolId(0),
+                value: Box::new(missing.clone()),
+            },
+            closure(vec![missing.clone()], None),
+            Value::TextTemplate(crate::runtime::TemplateValue {
+                source: "${alice}".into(),
+                captures: BTreeMap::from([("alice".into(), missing)]).into(),
+            }),
+        ];
+        for invalid in invalid_values {
+            let mut heap = ObjectHeap::default();
+            assert_eq!(
+                heap.validate_roots([&invalid]),
+                Err(crate::VmError::InvalidObject(ObjectId(42)))
+            );
+            heap.allocate(invalid);
+            assert_eq!(
+                heap.validate_roots([]),
+                Err(crate::VmError::InvalidObject(ObjectId(42)))
+            );
+            let saved = crate::hson::to_string(&heap).expect("encode malformed fixture");
+            assert!(
+                crate::hson::from_str::<ObjectHeap>(&saved).is_err(),
+                "dangling edge rejected before heap packing"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_closure_references_are_validated_in_their_own_heap() {
+        let mut outer = ObjectHeap::default();
+        let outer_ref = outer.allocate(Value::String("Alice".into()));
+        let invalid = closure(vec![outer_ref.clone()], Some(ObjectHeap::default()));
+        assert!(
+            outer.validate_roots([&invalid]).is_err(),
+            "matching outer ID must not authorize a portable capture"
+        );
+        let mut inner = ObjectHeap::default();
+        let inner_ref = inner.allocate(Value::String("Bob".into()));
+        let portable = closure(vec![inner_ref.clone(), inner_ref], Some(inner));
+        ObjectHeap::default()
+            .validate_roots([&portable])
+            .expect("portable captures need no outer objects");
+        outer
+            .validate_roots([&portable, &outer_ref])
+            .expect("same numeric IDs remain independent");
+    }
+
+    #[test]
+    fn valid_cycles_aliases_and_long_reference_chains_do_not_recurse() {
+        let mut heap = ObjectHeap::default();
+        let first = heap.allocate(Value::Unit);
+        let mut previous = first.clone();
+        for _ in 0..4096 {
+            previous = heap.allocate(Value::Map(BTreeMap::from([("next".into(), previous)])));
+        }
+        let Value::Object(first_id) = first else {
+            panic!("object")
+        };
+        heap.replace(first_id, previous.clone())
+            .expect("close cycle");
+        heap.freeze(&first).expect("freeze cycle");
+        heap.validate_roots([&first, &previous, &first])
+            .expect("cyclic graph with aliases");
+        let saved = crate::hson::to_string(&heap).expect("serialize graph");
+        let restored: ObjectHeap = crate::hson::from_str(&saved).expect("restore graph");
+        restored.validate_roots([&first]).expect("restored graph");
+        assert_eq!(restored, heap);
+    }
+
+    #[test]
+    fn graph_validation_bounds_inline_depth_and_total_work() {
+        let mut deep = Value::Unit;
+        for _ in 0..=MAX_VALUE_DEPTH {
+            deep = Value::Optional(Some(Box::new(deep)));
+        }
+        assert!(matches!(
+            ObjectHeap::default().validate_roots([&deep]),
+            Err(crate::VmError::InvalidSnapshot(_))
+        ));
+        let mut validator = GraphValidator { remaining: 2 };
+        assert!(matches!(
+            validator.value(
+                &Value::List(vec![Value::Unit, Value::Unit]),
+                &BTreeSet::new(),
+                0
+            ),
+            Err(crate::VmError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn heap_snapshot_checks_allocator_and_readonly_ids() {
+        for saved in [
+            HeapSnapshot {
+                objects: vec![(ObjectId(0), Value::Unit)],
+                next_id: 0,
+                read_only: BTreeSet::new(),
+            },
+            HeapSnapshot {
+                objects: vec![(ObjectId(0), Value::Unit), (ObjectId(0), Value::Unit)],
+                next_id: 1,
+                read_only: BTreeSet::new(),
+            },
+            HeapSnapshot {
+                objects: vec![],
+                next_id: 1,
+                read_only: BTreeSet::from([ObjectId(0)]),
+            },
+        ] {
+            let saved = crate::hson::to_string(&saved).expect("encode malformed metadata");
+            assert!(crate::hson::from_str::<ObjectHeap>(&saved).is_err());
+        }
+    }
 
     #[test]
     fn snapshot_restores_logical_values_not_pool_indices() {

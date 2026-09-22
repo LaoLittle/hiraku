@@ -190,6 +190,39 @@ impl ExecutionRuntime {
         {
             return Err(VmError::ProgramFingerprintMismatch.into());
         }
+        if snapshot.next_execution == 0
+            || snapshot
+                .executions
+                .keys()
+                .any(|id| id.0 >= snapshot.next_execution)
+        {
+            return Err(VmError::InvalidSnapshot(
+                "execution IDs exceed the allocation boundary".into(),
+            )
+            .into());
+        }
+        for (id, state) in &snapshot.executions {
+            if id.is_main() != (state.mode == ExecutionMode::Main) {
+                return Err(VmError::InvalidSnapshot(
+                    "execution mode does not match its identity".into(),
+                )
+                .into());
+            }
+            if state.callers.len() > 1024
+                || state
+                    .callers
+                    .iter()
+                    .any(|(_, caller)| caller.status != VmStatus::WaitingForHost)
+            {
+                return Err(VmError::InvalidSnapshot(
+                    "saved callers must be bounded and suspended awaiting a callee".into(),
+                )
+                .into());
+            }
+        }
+        snapshot
+            .objects
+            .validate_roots(snapshot.module_globals.values())?;
         let executions = snapshot
             .executions
             .into_iter()
@@ -203,17 +236,20 @@ impl ExecutionRuntime {
                 let callers = state
                     .callers
                     .into_iter()
-                    .map(|(module, snapshot)| {
+                    .map(|(module, saved)| {
                         let code = program
                             .modules
                             .get(module.0 as usize)
                             .ok_or(VmError::ProgramFingerprintMismatch)?
                             .bytecode
                             .clone();
-                        Ok((module, Vm::restore(code, snapshot)?))
+                        Ok((
+                            module,
+                            Vm::restore_with_shared_heap(code, saved, &snapshot.objects)?,
+                        ))
                     })
                     .collect::<Result<Vec<_>, VmError>>()?;
-                Vm::restore(code, state.vm).map(|vm| {
+                Vm::restore_with_shared_heap(code, state.vm, &snapshot.objects).map(|vm| {
                     (
                         id,
                         ExecutionState {
@@ -297,7 +333,7 @@ impl ExecutionRuntime {
         self.next_execution = self
             .next_execution
             .checked_add(1)
-            .expect("story execution identifier space must not be exhausted");
+            .ok_or(ExecutionRuntimeError::ExecutionIdsExhausted)?;
         // Import portable captures into the execution-owned heap before creating
         // the child. All story executions must address the same object table.
         let closure = self.objects.import(closure.clone());
@@ -743,6 +779,8 @@ pub enum ExecutionRuntimeError {
     UnknownExecution(ExecutionId),
     #[error("the root execution mode cannot be used for a closure")]
     InvalidChildMode,
+    #[error("story execution identifiers are exhausted")]
+    ExecutionIdsExhausted,
     #[error("HKS bytecode link failed: {0:?}")]
     Link(Vec<hiraku_script::LinkError>),
     #[error("HKS call references an unlinked symbol {0:?}")]
@@ -927,6 +965,57 @@ mod tests {
             ExecutionRuntime::restore(changed_layout, snapshot).is_err(),
             "matching source hash alone is insufficient"
         );
+    }
+
+    #[test]
+    fn restore_rejects_dangling_shared_graphs_and_invalid_execution_metadata() {
+        let code =
+            crate::script::compile_story_bytecode("entry.hks", "log(\"Alice\")").expect("compile");
+        let runtime = ExecutionRuntime::new(code.clone()).expect("runtime");
+        let saved = runtime.snapshot();
+        let mutations: &[fn(&mut ExecutionRuntimeSnapshot)] = &[
+            |s| {
+                s.next_execution = 0;
+            },
+            |s| {
+                s.executions.get_mut(&ExecutionId::MAIN).expect("main").mode =
+                    ExecutionMode::Interactive;
+            },
+            |s| {
+                s.module_globals
+                    .insert("alice".into(), Value::Object(hiraku_script::ObjectId(42)));
+            },
+            |s| {
+                s.executions
+                    .get_mut(&ExecutionId::MAIN)
+                    .expect("main")
+                    .vm
+                    .registers[0] = Value::Object(hiraku_script::ObjectId(42));
+            },
+            |s| {
+                s.objects
+                    .allocate(Value::Object(hiraku_script::ObjectId(42)));
+            },
+        ];
+        for mutate in mutations {
+            let mut invalid = saved.clone();
+            mutate(&mut invalid);
+            assert!(ExecutionRuntime::restore(code.clone(), invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn exhausted_execution_identifiers_return_an_error_without_overwriting_state() {
+        let code =
+            crate::script::compile_story_bytecode("entry.hks", "log(\"Alice\")").expect("compile");
+        let mut runtime = ExecutionRuntime::new(code).expect("runtime");
+        runtime.next_execution = u64::MAX;
+        let before = runtime.snapshot();
+        assert!(matches!(
+            runtime.spawn(&Value::Unit, ExecutionMode::Interactive),
+            Err(ExecutionRuntimeError::ExecutionIdsExhausted)
+        ));
+        assert_eq!(runtime.snapshot(), before);
     }
 
     fn check_child_record_identity(update_from_host: bool) {

@@ -1833,6 +1833,16 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     );
                 }
                 let object = self.lower_expression(object);
+                // A failed or diverging receiver cannot yield a member value.
+                // Preserve bottom instead of widening recovery to Any and
+                // producing a new call/cast diagnostic at every fluent step.
+                if self.expression_type(object) == &ScriptType::Never {
+                    return self.alloc_expression(
+                        object.kind,
+                        ScriptType::Never,
+                        expression.span,
+                    );
+                }
                 let member = self.symbol(name);
                 if !self.direct_callee && self.protocol_methods.contains_key(&(object.ty, member)) {
                     self.error("taking a bound protocol method as a value is not supported; use a closure that calls the method", expression.span);
@@ -2174,6 +2184,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         format!("unknown method `{name}` for `{owner}`"),
                         syntax_callee.span,
                     );
+                    return self.alloc_expression(
+                        HirExprKind::Literal(HirLiteral::Unit),
+                        ScriptType::Never,
+                        expression.span,
+                    );
                 }
                 if explicit_types.is_empty()
                     && let Some(expected) = expected_result.filter(|ty| **ty != ScriptType::Any)
@@ -2289,10 +2304,18 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     &explicit_types,
                     expression.span,
                 );
-                let ty = if function == ResolvedFunction::Dynamic {
+                let ty = if self.expression_type(callee) == &ScriptType::Never {
+                    ScriptType::Never
+                } else if function == ResolvedFunction::Dynamic {
                     match self.expression_type(callee) {
                         ScriptType::Callable { result, .. } => (**result).clone(),
-                        _ => self.call_result(function, arguments, &explicit_types),
+                        ScriptType::Function => {
+                            self.call_result(function, arguments, &explicit_types)
+                        }
+                        // check_call has already rejected Any and non-callable
+                        // values. Do not advertise a usable Any result for an
+                        // expression that cannot execute.
+                        _ => ScriptType::Never,
                     }
                 } else {
                     self.call_result(function, arguments, &explicit_types)
@@ -3332,6 +3355,15 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         explicit_types: &[ScriptType],
         span: Span,
     ) {
+        if !explicit_types.is_empty()
+            && (function == ResolvedFunction::Dynamic
+                || matches!(function, ResolvedFunction::External(_))
+                    && self
+                        .generic_signature(function)
+                        .is_none_or(|(parameters, _, _)| parameters.is_empty()))
+        {
+            self.error("non-generic callable does not accept type arguments", span);
+        }
         if let ResolvedFunction::External(_) = function
             && let Some((type_parameters, parameters, _)) = self.generic_signature(function)
             && !type_parameters.is_empty()
@@ -3367,13 +3399,24 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             return;
         }
-        if function == ResolvedFunction::Dynamic && self.expression_type(callee) == &ScriptType::Any
-        {
-            self.error(
-                "cannot call Any; explicitly cast to a function type such as `(Int) -> Int` using `as`, `as?`, or `as!` before calling",
-                callee.span,
-            );
-            return;
+        if function == ResolvedFunction::Dynamic {
+            match self.expression_type(callee) {
+                ScriptType::Any => {
+                    self.error(
+                        "cannot call Any; explicitly cast to a function type such as `(Int) -> Int` using `as`, `as?`, or `as!` before calling",
+                        callee.span,
+                    );
+                    return;
+                }
+                ScriptType::Callable { .. } | ScriptType::Function | ScriptType::Never => {}
+                ty => {
+                    self.error(
+                        format!("cannot call {ty:?}; expected a function value"),
+                        callee.span,
+                    );
+                    return;
+                }
+            }
         }
         if matches!(
             function,
@@ -3940,16 +3983,20 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         }
         if let ExprKind::Ident(name) = &callee.kind {
             let symbol = self.symbol(name);
+            // Resolve calls in the same lexical order as ordinary identifiers.
+            // A callable binding is a value invocation, even when it shadows a
+            // function/native name or occupies a project-global slot.
+            if self.resolve_local(symbol).is_some() || self.global_names.contains_key(&symbol) {
+                return ResolvedFunction::Dynamic;
+            }
             if let Some(function) = self.function_names.get(&symbol).copied() {
                 return ResolvedFunction::User(function);
             }
             if let Some(builtin) = self.manifest.and_then(|manifest| manifest.resolve(name)) {
                 return ResolvedFunction::Builtin(builtin);
             }
-            if self.resolve_local(symbol).is_none() {
-                let imported = self.imported_name(name);
-                return ResolvedFunction::External(self.symbol(&imported));
-            }
+            let imported = self.imported_name(name);
+            return ResolvedFunction::External(self.symbol(&imported));
         }
         if let ExprKind::Symbol(name) = &callee.kind
             && let Some(member) = self
@@ -4884,6 +4931,59 @@ mod tests {
     }
     use super::*;
     use crate::parse_program;
+
+    #[test]
+    fn unknown_native_methods_do_not_cascade_through_fluent_calls() {
+        let mut registry = crate::native::NativeRegistry::<()>::new();
+        let builder = registry.define_type("Builder");
+        registry
+            .define_global("builder", ScriptType::Named(builder))
+            .expect("synthetic global registers");
+        let manifest = registry.manifest();
+        for source in [
+            "builder.missing()",
+            "builder.missing().next().finish()",
+            "builder.missing()?.next().finish()",
+            "let value: Int = builder.missing().next()",
+        ] {
+            let syntax = parse_program(source).expect("source parses");
+            let arena = HirArena::new();
+            let errors = lower_to_hir(&arena, &syntax, Some(&manifest))
+                .expect_err("unknown method must fail statically");
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            assert!(
+                errors[0].message.contains("unknown method `missing` for `Builder`"),
+                "{source}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_callees_report_the_root_error_without_any_cascades() {
+        for (source, message) in [
+            ("missing().next().finish()", "unknown identifier `missing`"),
+            ("let value = 1\nvalue().next()", "cannot call Int"),
+            (
+                "let value: (() -> Int)? = null\nvalue().next()",
+                "cannot call Optional",
+            ),
+            (
+                "struct Builder {}\nlet value = Builder.{}\nvalue.missing().next()",
+                "unknown method `missing` for `Builder`",
+            ),
+            (
+                "let value: Any = { 1 }\nvalue().next()",
+                "cannot call Any; explicitly cast to a function type",
+            ),
+        ] {
+            let syntax = parse_program(source).expect("source parses");
+            let arena = HirArena::new();
+            let errors = lower_to_hir(&arena, &syntax, None)
+                .expect_err("invalid callee must fail statically");
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            assert!(errors[0].message.contains(message), "{source}: {errors:?}");
+        }
+    }
 
     #[test]
     fn unknown_names_and_contextless_members_have_specific_diagnostics() {

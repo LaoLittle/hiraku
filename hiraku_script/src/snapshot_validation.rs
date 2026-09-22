@@ -1,5 +1,6 @@
 //! Validate saved execution frames before allocating a live VM.
-//! Heap graphs and host authority have separate owners; this validates frame metadata.
+//! Frame metadata validation; VM restore also validates the execution-owned heap.
+//! Host authority and linked callable identities remain the embedding's responsibility.
 use crate::Register;
 use crate::vm::{Bytecode, CodeLocation, Instruction, VmError, VmSnapshot, VmStatus};
 
@@ -218,6 +219,48 @@ mod tests {
         saved.waiting_destination = Some(Register(1));
         assert!(matches!(
             Vm::restore(code, saved),
+            Err(VmError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_dangling_values_in_active_and_saved_frames() {
+        let code = program();
+        let saved = suspended(&code);
+        let mutations: &[fn(&mut VmSnapshot)] = &[
+            |s| s.registers[0] = crate::Value::Object(crate::ObjectId(42)),
+            |s| s.globals[0] = crate::Value::Object(crate::ObjectId(42)),
+            |s| s.call_stack[0].registers[0] = crate::Value::Object(crate::ObjectId(42)),
+        ];
+        for mutate in mutations {
+            let mut invalid = saved.clone();
+            mutate(&mut invalid);
+            assert!(matches!(
+                Vm::restore(code.clone(), invalid),
+                Err(VmError::InvalidObject(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_frame_restore_requires_the_explicit_correct_heap() {
+        let code = program();
+        let mut saved = suspended(&code);
+        let mut heap = crate::ObjectHeap::default();
+        saved.globals[0] = heap.import(crate::Value::Map(std::collections::BTreeMap::from([(
+            "name".into(),
+            crate::Value::String("Alice".into()),
+        )])));
+        assert!(matches!(
+            Vm::restore(code.clone(), saved.clone()),
+            Err(VmError::InvalidObject(_))
+        ));
+        Vm::restore_with_shared_heap(code.clone(), saved.clone(), &heap)
+            .expect("explicit shared ownership");
+        saved.objects = heap.clone();
+        Vm::restore(code.clone(), saved.clone()).expect("private ownership");
+        assert!(matches!(
+            Vm::restore_with_shared_heap(code, saved, &heap),
             Err(VmError::InvalidSnapshot(_))
         ));
     }
