@@ -112,6 +112,7 @@ impl Drop for VideoToolboxDecoder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputPixelFormat {
     Nv12,
+    Nv12Full,
     I420,
 }
 
@@ -119,6 +120,7 @@ impl OutputPixelFormat {
     const fn ostype(self) -> OSType {
         match self {
             Self::Nv12 => K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE,
+            Self::Nv12Full => K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE,
             Self::I420 => K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR,
         }
     }
@@ -126,6 +128,7 @@ impl OutputPixelFormat {
     const fn name(self) -> &'static str {
         match self {
             Self::Nv12 => "NV12 / 420v",
+            Self::Nv12Full => "NV12 / 420f",
             Self::I420 => "I420 / y420",
         }
     }
@@ -205,6 +208,7 @@ unsafe fn copy_pixel_buffer(
     let timestamp = cm_time_to_timestamp(presentation_time_stamp)?;
 
     let limited_range = match pixel_format {
+        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE => false,
         K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE
         | K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR => true,
         _ => {
@@ -225,7 +229,8 @@ unsafe fn copy_pixel_buffer(
     )?;
 
     let result = match pixel_format {
-        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE => unsafe {
+        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE
+        | K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE => unsafe {
             copy_nv12(
                 pixel_buffer,
                 timestamp,
@@ -501,10 +506,15 @@ fn create_decoder(
     }
 
     // The performance list is optional. In its absence there is no API-provided speed ordering.
-    // Probe the conventional Apple fast path first, then planar I420. Keep the first successful
+    // Prefer full-range NV12 to avoid reducing coverage precision in packed-alpha
+    // videos, then try video-range NV12 and planar I420. Keep the first successful
     // session rather than destroying it and creating a third session.
     let mut errors = Vec::new();
-    for candidate in [OutputPixelFormat::Nv12, OutputPixelFormat::I420] {
+    for candidate in [
+        OutputPixelFormat::Nv12Full,
+        OutputPixelFormat::Nv12,
+        OutputPixelFormat::I420,
+    ] {
         match create_hardware_decoder_session(format_description, Some(candidate), callback_ref_con)
         {
             Ok(session) => return Ok(session),
@@ -520,9 +530,31 @@ fn create_decoder(
 
 fn hiraku_pixel_format(format: OSType) -> Option<OutputPixelFormat> {
     match format {
+        K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE => Some(OutputPixelFormat::Nv12Full),
         K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE => Some(OutputPixelFormat::Nv12),
         K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR => Some(OutputPixelFormat::I420),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod output_format_tests {
+    use super::*;
+
+    #[test]
+    fn full_range_nv12_is_a_supported_hardware_output() {
+        for format in [
+            OutputPixelFormat::Nv12Full,
+            OutputPixelFormat::Nv12,
+            OutputPixelFormat::I420,
+        ] {
+            assert_eq!(hiraku_pixel_format(format.ostype()), Some(format));
+        }
+        assert_eq!(
+            hiraku_pixel_format(u32::from_be_bytes(*b"420f")),
+            Some(OutputPixelFormat::Nv12Full)
+        );
+        assert_eq!(hiraku_pixel_format(0), None);
     }
 }
 
@@ -910,6 +942,7 @@ const K_CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
 
 const K_CM_VIDEO_CODEC_TYPE_AV1: OSType = u32::from_be_bytes(*b"av01");
 const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE: OSType = u32::from_be_bytes(*b"420v");
+const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE: OSType = u32::from_be_bytes(*b"420f");
 const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR: OSType = u32::from_be_bytes(*b"y420");
 
 #[repr(C)]

@@ -1,5 +1,6 @@
 //! Direct VA-API AV1 decode, confined to the existing codec worker.
 mod stream;
+pub(super) use VaapiDecoder as VideoDecoder;
 use super::frame::{Plane, planar_frame};
 use crate::{
     CodecError, EncodedChunk, TransferFunction, VideoDecoderConfig, VideoFrame, YuvColorTransform,
@@ -354,6 +355,9 @@ mod tests {
         assert_eq!(transfer, TransferFunction::Bt1886);
         config.color_range = true;
         let (full, _) = color(&config).expect("full range");
+        assert_eq!(full.luma, [1.0, 0.0]);
+        assert!((16.0 / 255.0 * limited.luma[0] + limited.luma[1]).abs() < 1e-6);
+        assert!((235.0 / 255.0 * limited.luma[0] + limited.luma[1] - 1.0).abs() < 1e-6);
         assert_ne!(limited.row_r[0], full.row_r[0]);
         config.transfer_characteristics = TransferCharacteristics::Smpte2084;
         assert!(color(&config).is_err());

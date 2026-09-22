@@ -22,6 +22,7 @@ struct YuvColorTransform {
     row_r: vec4<f32>,
     row_g: vec4<f32>,
     row_b: vec4<f32>,
+    luma: vec2<f32>,
 };
 
 @group(1) @binding(4) var<uniform> color_transform: YuvColorTransform;
@@ -71,8 +72,35 @@ fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
 
 @fragment
 fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
+    var color_uv = in.uv;
+    var alpha = 1.0;
+    // Reserve a chroma texel at the split to prevent bilinear sampling from
+    // blending the color half with the grayscale matte half.
+    let margin = vec2<f32>(1.0) / vec2<f32>(textureDimensions(y_texture));
+    @if(ALPHA_VERTICAL) {
+        color_uv = clamp(in.uv * vec2<f32>(1.0, 0.5), margin, vec2<f32>(1.0, 0.5) - margin);
+        let alpha_uv = clamp(in.uv * vec2<f32>(1.0, 0.5) + vec2<f32>(0.0, 0.5), vec2<f32>(0.0, 0.5) + margin, vec2<f32>(1.0) - margin);
+        alpha = textureSample(y_texture, main_sampler, alpha_uv).r;
+    }
+    @elif(ALPHA_HORIZONTAL) {
+        color_uv = clamp(in.uv * vec2<f32>(0.5, 1.0), margin, vec2<f32>(0.5, 1.0) - margin);
+        let alpha_uv = clamp(in.uv * vec2<f32>(0.5, 1.0) + vec2<f32>(0.5, 0.0), vec2<f32>(0.5, 0.0) + margin, vec2<f32>(1.0) - margin);
+        alpha = textureSample(y_texture, main_sampler, alpha_uv).r;
+    }
+    // Hardware may convert full-range encoded Y to limited-range output.
+    // Undo that range conversion, but never apply a color EOTF to coverage.
+    @if(!FORMAT_RGBA) {
+        @if(ALPHA_VERTICAL || ALPHA_HORIZONTAL) {
+            alpha = alpha * color_transform.luma.x + color_transform.luma.y;
+        }
+    }
+    @if(FORMAT_RGBA) {
+        let rgb = textureSample(y_texture, main_sampler, color_uv).rgb;
+        return vec4<f32>(to_linear_vec3(rgb), clamp(alpha, 0.0, 1.0) * opacity);
+    }
+    @else {
     let yuv = vec4<f32>(
-        sample_yuv(in.uv),
+        sample_yuv(color_uv),
         1.0,
     );
 
@@ -84,5 +112,6 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
 
     let linear_rgb = to_linear_vec3(encoded_rgb);
 
-    return vec4<f32>(linear_rgb, opacity);
+    return vec4<f32>(linear_rgb, clamp(alpha, 0.0, 1.0) * opacity);
+    }
 }

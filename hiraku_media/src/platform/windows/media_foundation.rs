@@ -603,6 +603,7 @@ mod tests {
             assert_eq!(frame.timestamp, 1_000_000);
             assert_eq!(frame.transfer, TransferFunction::Srgb);
             assert_eq!(frame.color_transform.row_r[0], 1.0);
+            assert_eq!(frame.color_transform.luma, [1.0, 0.0]);
             let VideoPixels::Nv12Strided {
                 planes,
                 uv_offset,
@@ -614,6 +615,10 @@ mod tests {
             };
             assert_eq!(&*planes, &bytes);
             assert_eq!((uv_offset, y_stride, uv_stride), (8, 4, 4));
+            media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 2)?;
+            let limited = copy_nv12(&sample(&bytes)?, &media_type, 2, 2)?.color_transform;
+            assert!((16.0 / 255.0 * limited.luma[0] + limited.luma[1]).abs() < 1e-6);
+            assert!((235.0 / 255.0 * limited.luma[0] + limited.luma[1] - 1.0).abs() < 1e-6);
             assert!(copy_nv12(&sample(&bytes[..8])?, &media_type, 2, 2).is_err());
             media_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, (-4_i32) as u32)?;
             assert!(copy_nv12(&sample(&bytes)?, &media_type, 2, 2).is_err());

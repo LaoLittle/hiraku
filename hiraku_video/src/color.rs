@@ -1,4 +1,7 @@
-use bevy::{math::Vec4, render::render_resource::ShaderType};
+use bevy::{
+    math::{Vec2, Vec4},
+    render::render_resource::ShaderType,
+};
 
 /// A precombined YUV-range and YUV-to-RGB affine transform.
 ///
@@ -9,6 +12,7 @@ pub(crate) struct YuvColorTransform {
     pub row_r: Vec4,
     pub row_g: Vec4,
     pub row_b: Vec4,
+    pub luma: Vec2,
 }
 
 // GPU layout adapter only; color conversion math belongs to hiraku-media.
@@ -18,6 +22,7 @@ impl From<hiraku_media::YuvColorTransform> for YuvColorTransform {
             row_r: Vec4::from_array(value.row_r),
             row_g: Vec4::from_array(value.row_g),
             row_b: Vec4::from_array(value.row_b),
+            luma: Vec2::from_array(value.luma),
         }
     }
 }
@@ -25,6 +30,26 @@ impl From<hiraku_media::YuvColorTransform> for YuvColorTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_alpha_survives_decoder_range_conversion_without_gamma() {
+        for limited in [false, true] {
+            for (kr, kb) in [(0.2126, 0.0722), (0.299, 0.114)] {
+                let transform = YuvColorTransform::from(
+                    hiraku_media::YuvColorTransform::from_luma_coefficients(kr, kb, limited),
+                );
+                for coverage in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let decoded_y = if limited {
+                        (16.0 + 219.0 * coverage) / 255.0
+                    } else {
+                        coverage
+                    };
+                    let alpha = decoded_y * transform.luma.x + transform.luma.y;
+                    assert!((alpha - coverage).abs() < 1.0e-6);
+                }
+            }
+        }
+    }
 
     #[test]
     fn limited_range_black_and_white_map_to_display_endpoints() {

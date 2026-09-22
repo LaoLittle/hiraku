@@ -290,7 +290,7 @@ async fn decode_frame(frame: &web_sys::VideoFrame, state: &FrameCopyState) -> Re
         Some(VideoMatrixCoefficients::Bt2020Ncl) => (0.2627, 0.0593),
         _ => (0.2126, 0.0722),
     };
-    let transfer = match color_space.transfer() {
+    let mut transfer = match color_space.transfer() {
         Some(VideoTransferCharacteristics::Linear) => TransferFunction::Linear,
         Some(VideoTransferCharacteristics::Iec6196621) => TransferFunction::Srgb,
         Some(VideoTransferCharacteristics::Pq | VideoTransferCharacteristics::Hlg) => {
@@ -303,9 +303,18 @@ async fn decode_frame(frame: &web_sys::VideoFrame, state: &FrameCopyState) -> Re
             Ok((y, u, v)) => crate::VideoPixels::I420Planar { y, u, v },
             Err(_) => crate::VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?),
         }
+    } else if frame.format() == Some(VideoPixelFormat::Nv12) {
+        match copy_nv12(frame, state, width, height).await {
+            Ok(pixels) => pixels,
+            Err(_) => crate::VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?),
+        }
     } else {
         crate::VideoPixels::Rgba(copy_rgba(frame, state, width, height).await?)
     };
+    // RGBA copy/canvas output is sRGB, not the source YUV transfer function.
+    if matches!(pixels, crate::VideoPixels::Rgba(_)) {
+        transfer = TransferFunction::Srgb;
+    }
     Ok(VideoFrame {
         timestamp: timestamp as i64,
         width,
@@ -345,6 +354,29 @@ async fn copy_i420(
         uint8_array_to_vec(&storage.subarray(y_len, v_offset)),
         uint8_array_to_vec(&storage.subarray(v_offset, byte_len)),
     ))
+}
+
+async fn copy_nv12(
+    frame: &web_sys::VideoFrame,
+    state: &FrameCopyState,
+    width: u32,
+    height: u32,
+) -> Result<crate::VideoPixels, String> {
+    let uv_stride = width.div_ceil(2).checked_mul(2).ok_or("NV12 stride overflow")?;
+    let uv_offset = width.checked_mul(height).ok_or("NV12 offset overflow")?;
+    let options = VideoFrameCopyToOptions::new();
+    options.set_layout(&[PlaneLayout::new(0, width), PlaneLayout::new(uv_offset, uv_stride)]);
+    let byte_len = frame.allocation_size_with_options(&options)
+        .map_err(|error| format!("WebCodecs NV12 allocation failed: {}", js_error(&error)))?;
+    let storage = state.storage(byte_len);
+    JsFuture::from(frame.copy_to_with_u8_array_and_options(&storage, &options)).await
+        .map_err(|error| format!("WebCodecs NV12 copy failed: {}", js_error(&error)))?;
+    Ok(crate::VideoPixels::Nv12Strided {
+        planes: Arc::from(uint8_array_to_vec(&storage)),
+        uv_offset: uv_offset as usize,
+        y_stride: width,
+        uv_stride,
+    })
 }
 
 async fn copy_rgba(frame: &web_sys::VideoFrame, state: &FrameCopyState, width: u32, height: u32) -> Result<Vec<u8>, String> {

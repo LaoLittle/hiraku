@@ -192,6 +192,7 @@ impl VideoPlayer {
 struct ActiveVideo(Option<ActivePlayback>);
 
 struct ActivePlayback {
+    alpha_layout: Option<crate::AlphaLayout>,
     id: VideoPlaybackId,
     receiver: crossbeam_channel::Receiver<DecodeEvent>,
     frames: VecDeque<DecodedFrame>,
@@ -226,6 +227,16 @@ enum VideoSurface {
         image: Handle<Image>,
         image_entity: Entity,
     },
+}
+
+impl ActivePlayback {
+    fn display_aspect(&self, width: u32, height: u32) -> f32 {
+        let (width, height) = self
+            .alpha_layout
+            .and_then(|layout| layout.display_size(width, height))
+            .unwrap_or((width, height));
+        width as f32 / height as f32
+    }
 }
 
 pub struct HirakuVideoPlugin;
@@ -318,7 +329,7 @@ fn start_pending_video(
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(if pending.z_index == 0 {
+            BackgroundColor(if pending.z_index == 0 || asset.alpha_layout.is_some() {
                 Color::NONE
             } else {
                 Color::BLACK
@@ -334,6 +345,7 @@ fn start_pending_video(
     };
     player.active = Some(pending.id);
     active.0 = Some(ActivePlayback {
+        alpha_layout: asset.alpha_layout,
         id: pending.id,
         receiver: stream.video.clone(),
         frames: VecDeque::new(),
@@ -603,7 +615,7 @@ fn present_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
-    let aspect_ratio = frame.width as f32 / frame.height as f32;
+    let aspect_ratio = playback.display_aspect(frame.width, frame.height);
     let (y, u, v) = match frame.pixels {
         DecodedPixels::I420Planar { y, u, v } => {
             upload.clear();
@@ -616,14 +628,26 @@ fn present_frame(
                 image_entity,
             }) = playback.surface.as_ref()
             {
-                replace_rgba(images, image, frame.width, frame.height, rgba);
+                replace_rgba(
+                    images,
+                    image,
+                    frame.width,
+                    frame.height,
+                    rgba,
+                    playback.alpha_layout.is_some(),
+                );
                 if let Ok(mut node) = nodes.get_mut(*image_entity) {
                     node.aspect_ratio = Some(aspect_ratio);
                 }
                 return;
             }
             replace_surface(commands, playback);
-            let image = images.add(rgba_image(frame.width, frame.height, rgba));
+            let image = images.add(rgba_image(
+                frame.width,
+                frame.height,
+                rgba,
+                playback.alpha_layout.is_some(),
+            ));
             let image_entity = commands
                 .spawn((
                     ImageNode::new(image.clone()),
@@ -636,6 +660,23 @@ fn present_frame(
                     Pickable::IGNORE,
                 ))
                 .id();
+            if playback.alpha_layout.is_some() {
+                let material = materials.add(Yuv420Material {
+                    opacity: 1.0,
+                    alpha_layout: playback.alpha_layout,
+                    rgba: true,
+                    y: image.clone(),
+                    chroma0: image.clone(),
+                    chroma1: image.clone(),
+                    color_transform: frame.color_transform.into(),
+                    transfer: frame.transfer,
+                    format: YuvPixelFormat::I420,
+                });
+                commands
+                    .entity(image_entity)
+                    .remove::<ImageNode>()
+                    .insert(MaterialNode(material));
+            }
             commands.entity(playback.root).add_child(image_entity);
             playback.surface = Some(VideoSurface::Rgba {
                 image,
@@ -691,6 +732,8 @@ fn present_frame(
     let v_image = images.add(plane_image(frame.chroma_width, frame.chroma_height, v));
     let material = materials.add(Yuv420Material {
         opacity: 1.0,
+        alpha_layout: playback.alpha_layout,
+        rgba: false,
         y: y_image.clone(),
         chroma0: u_image.clone(),
         chroma1: v_image.clone(),
@@ -728,7 +771,7 @@ fn present_strided_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
-    let aspect_ratio = frame.width as f32 / frame.height as f32;
+    let aspect_ratio = playback.display_aspect(frame.width, frame.height);
     let (y_image, u_image, v_image, image_entity) = if let Some(VideoSurface::YuvI420 {
         y_image,
         u_image,
@@ -749,6 +792,8 @@ fn present_strided_frame(
         let v_image = images.add(empty_plane_image(frame.chroma_width, frame.chroma_height));
         let material = materials.add(Yuv420Material {
             opacity: 1.0,
+            alpha_layout: playback.alpha_layout,
+            rgba: false,
             y: y_image.clone(),
             chroma0: u_image.clone(),
             chroma1: v_image.clone(),
@@ -794,7 +839,7 @@ fn present_nv12_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
-    let aspect_ratio = frame.width as f32 / frame.height as f32;
+    let aspect_ratio = playback.display_aspect(frame.width, frame.height);
 
     let (y_image, uv_image, image_entity) = if let Some(VideoSurface::YuvNv12 {
         y_image,
@@ -817,6 +862,8 @@ fn present_nv12_frame(
 
         let material = materials.add(Yuv420Material {
             opacity: 1.0,
+            alpha_layout: playback.alpha_layout,
+            rgba: false,
             y: y_image.clone(),
             chroma0: uv_image.clone(),
             chroma1: dummy_image.clone(),
@@ -984,21 +1031,27 @@ fn replace_rgba(
     width: u32,
     height: u32,
     data: Vec<u8>,
+    packed_alpha: bool,
 ) {
     if let Some(mut image) = images.get_mut(handle) {
         let size = image.texture_descriptor.size;
         if size.width == width
             && size.height == height
-            && image.texture_descriptor.format == TextureFormat::Rgba8UnormSrgb
+            && image.texture_descriptor.format
+                == if packed_alpha {
+                    TextureFormat::Rgba8Unorm
+                } else {
+                    TextureFormat::Rgba8UnormSrgb
+                }
         {
             image.data = Some(data);
         } else {
-            *image = rgba_image(width, height, data);
+            *image = rgba_image(width, height, data, packed_alpha);
         }
     }
 }
 
-fn rgba_image(width: u32, height: u32, data: Vec<u8>) -> Image {
+fn rgba_image(width: u32, height: u32, data: Vec<u8>, packed_alpha: bool) -> Image {
     Image::new(
         Extent3d {
             width,
@@ -1007,7 +1060,11 @@ fn rgba_image(width: u32, height: u32, data: Vec<u8>) -> Image {
         },
         TextureDimension::D2,
         data,
-        TextureFormat::Rgba8UnormSrgb,
+        if packed_alpha {
+            TextureFormat::Rgba8Unorm
+        } else {
+            TextureFormat::Rgba8UnormSrgb
+        },
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     )
 }

@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 bevy.workspace = true
 thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
 hiraku-media.workspace = true
 crossbeam-channel.workspace = true
 

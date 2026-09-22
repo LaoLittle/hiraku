@@ -25,10 +25,16 @@ pub(super) fn dispatch_video_command(
     match command {
         VideoCommand::Play {
             path,
+            layout,
             done,
             fade_out,
         } => {
-            let asset: Handle<VideoAsset> = asset_server.load(path);
+            let asset: Handle<VideoAsset> = asset_server
+                .load_builder()
+                .with_settings(move |settings: &mut hiraku_video::VideoLoaderSettings| {
+                    settings.layout = layout
+                })
+                .load(path);
             let playback = if done.is_some() {
                 player.play(asset)
             } else {

@@ -2,6 +2,7 @@
 //! worker thread after copying; neither JNI nor a rendering surface is needed.
 use super::frame::{Plane, planar_frame};
 mod color;
+pub(super) use MediaCodecDecoder as VideoDecoder;
 use crate::*;
 use ndk::media::{
     media_codec::{

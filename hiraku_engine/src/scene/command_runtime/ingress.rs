@@ -646,14 +646,14 @@ pub fn drive_story_runtime(
                     let target = movies
                         .as_deref()
                         .and_then(|catalog| catalog.resolve(&path))
-                        .map(|definition| definition.path.clone())
+                        .map(|definition| (definition.path.clone(), definition.layout))
                         .or_else(|| {
                             let lower = path.to_ascii_lowercase();
-                            (lower.ends_with(".mkv") || lower.ends_with(".webm")).then(|| {
-                                vfs.0.resolve_path(runtime.current_script.as_deref(), &path)
+                            [".mkv", ".webm", ".mkva", ".webma"].iter().any(|ext| lower.ends_with(ext)).then(|| {
+                                (vfs.0.resolve_path(runtime.current_script.as_deref(), &path), hiraku_video::AlphaLayout::default())
                             })
                         });
-                    let Some(target) = target else {
+                    let Some((target, layout)) = target else {
                         warn!("movie `{path}` is not defined");
                         runtime.story = None;
                         return;
@@ -667,6 +667,7 @@ pub fn drive_story_runtime(
                     };
                     pending_script_commands.enqueue(ScriptCommand::Video(VideoCommand::Play {
                         path: target,
+                        layout,
                         fade_out: Duration::from_millis(fade_out_ms),
                         done,
                     }));

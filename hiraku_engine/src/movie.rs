@@ -15,6 +15,7 @@ pub struct MovieCatalog {
 #[derive(Clone, Debug)]
 pub struct MovieDefinition {
     pub path: String,
+    pub layout: hiraku_video::AlphaLayout,
 }
 
 impl MovieCatalog {
@@ -27,6 +28,8 @@ impl MovieCatalog {
 struct MovieFile {
     name: String,
     video: String,
+    #[serde(default)]
+    layout: hiraku_video::AlphaLayout,
 }
 
 #[derive(Debug, Error)]
@@ -65,14 +68,18 @@ pub fn load_movie_catalog(vfs: &HdpVfs) -> Result<MovieCatalog, MovieCatalogErro
             });
         }
         let lower = file.video.to_ascii_lowercase();
-        if !lower.ends_with(".mkv") && !lower.ends_with(".webm") {
+        if ![".mkv", ".webm", ".mkva", ".webma"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+        {
             return Err(MovieCatalogError::Data {
                 path: descriptor_path,
-                message: "movie video must be a `.mkv` or `.webm` AV1 + Opus asset".into(),
+                message: "movie video must be a `.mkv`, `.webm`, `.mkva` or `.webma` AV1 + optional Opus asset".into(),
             });
         }
         let definition = MovieDefinition {
             path: vfs.resolve_path(Some(&descriptor_path), &file.video),
+            layout: file.layout,
         };
         if movies.insert(file.name.clone(), definition).is_some() {
             return Err(MovieCatalogError::Data {
@@ -87,6 +94,23 @@ pub fn load_movie_catalog(vfs: &HdpVfs) -> Result<MovieCatalog, MovieCatalogErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_movie_layout_is_typed_and_defaults_to_vertical() {
+        let default: MovieFile =
+            hson::from_str(".{ name: \"intro\", video: \"intro.webma\" }").expect("descriptor");
+        assert_eq!(default.layout, hiraku_video::AlphaLayout::Vertical);
+        let horizontal: MovieFile =
+            hson::from_str(".{ name: \"intro\", video: \"intro.mkva\", layout: \"horizontal\" }")
+                .expect("descriptor");
+        assert_eq!(horizontal.layout, hiraku_video::AlphaLayout::Horizontal);
+        assert!(
+            hson::from_str::<MovieFile>(
+                ".{ name: \"intro\", video: \"intro.webma\", layout: \"unknown\" }"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn loads_named_movie_descriptors() {

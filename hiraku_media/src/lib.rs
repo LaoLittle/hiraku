@@ -34,6 +34,9 @@ pub enum YuvPixelFormat {
 
 #[derive(Clone, Copy, Debug)]
 pub struct YuvColorTransform {
+    /// Decoded luma to normalized coverage: `y * scale + offset`.
+    /// Describes the output pixels, which a hardware decoder may range-convert.
+    pub luma: [f32; 2],
     pub row_r: [f32; 4],
     pub row_g: [f32; 4],
     pub row_b: [f32; 4],
@@ -53,6 +56,7 @@ impl YuvColorTransform {
         };
         let offset = |u: f32, v: f32| -ys * yo - cs * co * (u + v);
         Self {
+            luma: [ys, -ys * yo],
             row_r: [ys, 0.0, red_v * cs, offset(0.0, red_v)],
             row_g: [ys, green_u * cs, green_v * cs, offset(green_u, green_v)],
             row_b: [ys, blue_u * cs, 0.0, offset(blue_u, 0.0)],

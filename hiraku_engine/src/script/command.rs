@@ -202,6 +202,7 @@ pub enum AudioCommand {
 pub enum VideoCommand {
     Play {
         path: String,
+        layout: hiraku_video::AlphaLayout,
         done: Option<ScriptRequestId>,
         fade_out: Duration,
     },

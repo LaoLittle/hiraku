@@ -14,7 +14,10 @@ mod player;
 mod render;
 mod upload;
 
-pub use asset::{VideoAsset, VideoAssetLoader, VideoAssetLoaderError, VideoMetadata};
+pub use asset::{
+    AlphaLayout, VideoAsset, VideoAssetLoader, VideoAssetLoaderError, VideoLoaderSettings,
+    VideoMetadata,
+};
 pub use player::{
     HirakuVideoPlugin, VideoDecodeSettings, VideoEvent, VideoPlaybackId, VideoPlaybackState,
     VideoPlayer,

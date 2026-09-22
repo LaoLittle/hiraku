@@ -73,6 +73,16 @@ pub(super) fn resolve(
 mod tests {
     use super::*;
     #[test]
+    fn decoded_full_range_overrides_limited_stream_metadata() {
+        let codec = "av01.0.04M.08.0.110.01.13.01.0";
+        let (full, _) = resolve(Some(1), None, Some(1), codec).expect("full output");
+        assert_eq!(full.luma, [1.0, 0.0]);
+        let (limited, _) = resolve(Some(1), None, Some(2), codec).expect("limited output");
+        for (sample, expected) in [(16.0 / 255.0, 0.0), (235.0 / 255.0, 1.0)] {
+            assert!((sample * limited.luma[0] + limited.luma[1] - expected).abs() < 1e-6);
+        }
+    }
+    #[test]
     fn unspecified_uses_stream_metadata_and_explicit_values_override_it() {
         let codec = "av01.0.04M.08.0.110.01.13.06.1";
         let (matrix, transfer) =
