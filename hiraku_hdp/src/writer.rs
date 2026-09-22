@@ -680,7 +680,12 @@ pub fn write_package(path: impl AsRef<Path>, package: &PackageOutput) -> Result<
 }
 
 fn remove_stale_volumes(path: &Path, volume_count: usize) -> Result<(), HdpError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // A bare filename has Some("") as its parent, not None. Reading that
+    // empty directory fails after all volumes have already been written.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return Ok(());
     };

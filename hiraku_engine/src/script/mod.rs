@@ -78,6 +78,16 @@ pub(crate) fn script_command_from_effect(
     use capabilities::StoryEffect;
 
     Ok(match effect {
+        StoryEffect::ShakeCamera {
+            amplitude,
+            interval,
+            duration_ms,
+        } => ScriptCommand::Camera(CameraCommand::Shake {
+            amplitude: Vec2::from_array(amplitude),
+            interval,
+            duration: Duration::from_millis(duration_ms),
+            animation_id: None,
+        }),
         StoryEffect::Spatial(command) => ScriptCommand::Stage(StageCommand::Spatial(command)),
         StoryEffect::Log(message) => ScriptCommand::Runtime(RuntimeCommand::Log(message)),
         StoryEffect::ClearDialogue => ScriptCommand::Dialogue(DialogueCommand::Clear),

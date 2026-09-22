@@ -93,6 +93,7 @@ pub fn complete(
                 | P::Exit { id, .. }
                 | P::Transform { id, .. }
                 | P::AnimateX { id, .. }
+                | P::Oscillate { id, .. }
                 | P::Tint { id, .. }
                 | P::Blur { id, .. }) = command
                 else {
@@ -123,7 +124,9 @@ pub fn complete(
                         P::Hide { .. } | P::Exit { .. } => picture.fade.is_some(),
                         P::Blur { .. } => picture.blur_tween.is_some(),
                         P::Tint { .. } => picture.tint_tween.is_some(),
-                        P::Transform { .. } | P::AnimateX { .. } => picture.motion.is_some(),
+                        P::Transform { .. } | P::AnimateX { .. } | P::Oscillate { .. } => {
+                            picture.motion.is_some()
+                        }
                         P::Clear | P::StopMotion { .. } | P::Noise { .. } => false,
                     }
                 } else {

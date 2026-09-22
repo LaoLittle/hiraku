@@ -26,6 +26,11 @@ mod spatial_stage;
 /// Engine code dispatches these effects directly to ECS-facing systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
+    ShakeCamera {
+        amplitude: [f32; 2],
+        interval: f32,
+        duration_ms: u64,
+    },
     MovieBackground {
         path: String,
         fade_out_ms: u64,

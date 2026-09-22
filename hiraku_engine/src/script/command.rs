@@ -80,6 +80,12 @@ pub enum DialogueCommand {
 
 #[derive(Debug)]
 pub enum CameraCommand {
+    Shake {
+        amplitude: Vec2,
+        interval: f32,
+        duration: Duration,
+        animation_id: Option<String>,
+    },
     Set {
         blur_intensity: Option<f32>,
         zoom: Option<f32>,

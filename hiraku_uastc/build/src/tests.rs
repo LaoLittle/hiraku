@@ -156,6 +156,27 @@ fn manifests_share_one_encoded_texture_and_unreferenced_images_are_excluded() {
             max_volume_size: Some(4096),
             ..Default::default()
         },
+        hiraku_hdp::dependencies::DependencyManifest {
+            version: hiraku_hdp::dependencies::DEPENDENCY_VERSION,
+            scripts: BTreeMap::from([("startup.hks".into(), ["textures/alice.png".into()].into())]),
+            windows: BTreeMap::from([(
+                "startup.hks".into(),
+                hiraku_hdp::dependencies::ResourceGraph {
+                    entry: Some(0),
+                    functions: BTreeMap::new(),
+                    nodes: vec![hiraku_hdp::dependencies::ResourceNode {
+                        span: [0, 11],
+                        images: ["textures/alice.png".into()].into(),
+                        next: vec![],
+                        calls: Default::default(),
+                    }],
+                },
+            )]),
+            exports: BTreeMap::new(),
+            image_bytes: BTreeMap::from([("textures/alice.png".into(), 256)]),
+            resident: Default::default(),
+            conservative: BTreeMap::new(),
+        },
         |event| events.push(event),
     )
     .expect("pack generated inputs");

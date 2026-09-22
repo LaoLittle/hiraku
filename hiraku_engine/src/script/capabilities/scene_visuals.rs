@@ -18,6 +18,10 @@ pub(super) struct SceneTransitionHandle(pub(super) u64);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) enum SceneVisualTarget {
+    Shake {
+        amplitude: [f32; 2],
+        interval: f32,
+    },
     Spatial(crate::stage::runtime::StageCommand),
     Clip {
         name: String,
@@ -63,6 +67,14 @@ impl SceneVisualState {
     pub(super) fn commit(&mut self, effects: &mut Vec<StoryEffect>) {
         for (_, (target, fade_ms)) in std::mem::take(&mut self.pending) {
             effects.push(match target {
+                SceneVisualTarget::Shake {
+                    amplitude,
+                    interval,
+                } => StoryEffect::ShakeCamera {
+                    amplitude,
+                    interval,
+                    duration_ms: fade_ms.unwrap_or(0),
+                },
                 SceneVisualTarget::Spatial(command) => StoryEffect::Spatial(command),
                 SceneVisualTarget::Clip { name, region } => {
                     StoryEffect::Clip(ClipCommand::Define { name, region })
@@ -84,6 +96,9 @@ impl SceneVisualState {
                             seconds: duration, ..
                         }
                         | PictureCommand::Tint {
+                            seconds: duration, ..
+                        }
+                        | PictureCommand::Oscillate {
                             seconds: duration, ..
                         } => *duration = seconds,
                         _ => {}
@@ -123,6 +138,33 @@ fn milliseconds(seconds: f64) -> Result<u64, NativeError> {
 #[hiraku_script::hks_module]
 mod api {
     use super::*;
+
+    /// Additive, frame-stepped camera displacement in canvas units. No decay
+    /// is imposed; the camera returns to its base transform at completion.
+    #[hks(name = "shake", selector = "scene")]
+    fn shake(
+        context: &mut CharacterContext,
+        x: f64,
+        y: f64,
+        interval: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if ![x, y, interval].into_iter().all(f64::is_finite)
+            || x < 0.0
+            || y < 0.0
+            || x > f32::MAX as f64
+            || y > f32::MAX as f64
+            || interval < 0.001
+            || interval > 60.0
+        {
+            return Err(NativeError::message(
+                "shake requires nonnegative finite amplitudes and an interval in 0.001..60 seconds",
+            ));
+        }
+        context.scene_visuals.begin(SceneVisualTarget::Shake {
+            amplitude: [x as f32, y as f32],
+            interval: interval as f32,
+        })
+    }
 
     /// Dimensions and position are world-space canvas units, not percentages.
     #[hks(name = "clipRect", selector = "scene")]
@@ -721,7 +763,9 @@ mod api {
                         | PictureCommand::Hide { .. }
                         | PictureCommand::Tint { .. }
                         | PictureCommand::Blur { .. }
+                        | PictureCommand::Oscillate { .. }
                 ) | SceneVisualTarget::HideCharacters { .. }
+                    | SceneVisualTarget::Shake { .. }
                     | SceneVisualTarget::Curtain { .. }
             ) {
                 *fade = Some(duration);
@@ -786,6 +830,35 @@ mod api {
             .commands
             .push(StoryEffect::Picture(PictureCommand::StopMotion { id }));
         Ok(())
+    }
+
+    /// Amplitudes are canvas percentages, periods and duration are seconds.
+    #[hks(name = "oscillatePicture", selector = "scene")]
+    fn oscillate_picture(
+        context: &mut CharacterContext,
+        id: String,
+        x: f64,
+        y: f64,
+        period_x: f64,
+        period_y: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if ![x, y].iter().all(|v| v.is_finite() && v.abs() < 100000.0)
+            || ![period_x, period_y]
+                .iter()
+                .all(|v| (0.001..=3600.0).contains(v))
+        {
+            return Err(NativeError::message(
+                "invalid picture oscillation amplitude or period",
+            ));
+        }
+        context
+            .scene_visuals
+            .begin(SceneVisualTarget::Picture(PictureCommand::Oscillate {
+                id,
+                amplitude: [x as f32, y as f32],
+                period: [period_x as f32, period_y as f32],
+                seconds: 0.0,
+            }))
     }
 
     #[hks(name = "animatePictureX", selector = "scene")]
@@ -967,6 +1040,47 @@ mod api {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stepped_shake_uses_the_normal_animation_wait_path() {
+        let mut script = runtime("scene.shake(15, 15, 0.05).time(0.4)");
+        assert!(matches!(
+            event(&mut script),
+            StoryRuntimeEvent::Effect(StoryEffect::ShakeCamera {
+                amplitude: [15.0, 15.0],
+                duration_ms: 400,
+                ..
+            })
+        ));
+        let mut script = runtime("scene.shake(15, 15, 0.05).time(0.4).await()");
+        assert!(matches!(
+            event(&mut script),
+            StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::ShakeCamera {
+                    duration_ms: 400,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn picture_oscillation_is_timed_and_awaitable() {
+        let mut script =
+            runtime("scene.oscillatePicture(\"panel\", 1, 2, 0.1, 0.2).time(0.25).await()");
+        assert!(matches!(
+            event(&mut script),
+            StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::Picture(PictureCommand::Oscillate {
+                    amplitude: [1.0, 2.0],
+                    seconds: 0.25,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn time_applies_to_picture_visibility_and_preserves_modifier_order() {

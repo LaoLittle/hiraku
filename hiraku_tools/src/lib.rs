@@ -1,5 +1,6 @@
 //! Build-only asset tooling. Never depend on this crate from a runtime.
 mod analysis;
+pub mod pack;
 pub use analysis::analyze;
 use hiraku_hdp::dependencies::DEPENDENCY_MANIFEST;
 use hiraku_hdp::{FileOptions, PackOptions, StreamPackageBuilder, WrittenPackage};

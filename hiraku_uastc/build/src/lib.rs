@@ -50,8 +50,9 @@ pub fn pack_directory(
     root: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: PackOptions,
+    dependencies: hiraku_hdp::dependencies::DependencyManifest,
 ) -> Result<WrittenPackage> {
-    pack_directory_with_progress(root, output, options, |_| {})
+    pack_directory_with_progress(root, output, options, dependencies, |_| {})
 }
 
 /// Report phase/file progress without choosing a terminal or logging framework.
@@ -59,6 +60,7 @@ pub fn pack_directory_with_progress(
     root: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: PackOptions,
+    mut dependencies: hiraku_hdp::dependencies::DependencyManifest,
     mut report: impl FnMut(progress::PackProgress),
 ) -> Result<WrittenPackage> {
     use progress::PackProgress;
@@ -67,7 +69,6 @@ pub fn pack_directory_with_progress(
     let mut paths = Vec::new();
     collect(&root, &root, &mut paths)?;
     paths.sort();
-    let mut dependencies = hiraku_tools::analyze_directory(&root)?;
     let dependency_name = hiraku_hdp::dependencies::DEPENDENCY_MANIFEST;
     if paths.iter().any(|path| path == Path::new(dependency_name)) {
         return Err(format!("{dependency_name} is generated; remove the source copy").into());

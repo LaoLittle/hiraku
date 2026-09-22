@@ -918,6 +918,7 @@ fn animation_effect(effect: &StoryEffect) -> bool {
     matches!(
         effect,
         StoryEffect::Spatial(_)
+            | StoryEffect::ShakeCamera { .. }
             | StoryEffect::SetCamera { .. }
             | StoryEffect::SetBackground { .. }
             | StoryEffect::ShowCharacter { .. }

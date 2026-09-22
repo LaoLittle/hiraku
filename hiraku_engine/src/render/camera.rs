@@ -133,8 +133,33 @@ pub struct CameraVectorTween {
 
 pub struct CameraShake {
     pub timer: Timer,
-    pub amplitude: f32,
+    pub amplitude: Vec2,
+    pub interval: f32,
+    pub seed: u64,
     pub animation_id: Option<String>,
+}
+
+impl CameraShake {
+    fn displacement(&self) -> Vec2 {
+        let elapsed = self.timer.elapsed_secs();
+        if self.timer.is_finished() || elapsed < self.interval {
+            return Vec2::ZERO;
+        }
+        let step = (elapsed / self.interval).floor() as u64;
+        // Counter-based noise: independent of frame rate and never consumes the
+        // story's random stream. Sampling is stable throughout one interval.
+        let sample = |axis: u64| {
+            let mut bits = self
+                .seed
+                .wrapping_add(step.wrapping_mul(0x9e3779b97f4a7c15))
+                .wrapping_add(axis);
+            bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d049bb133111eb);
+            bits ^= bits >> 31;
+            (bits >> 40) as f32 / 16777216.0 * 2.0 - 1.0
+        };
+        Vec2::new(sample(0), sample(1)) * self.amplitude
+    }
 }
 
 pub fn setup_stage_cameras(
@@ -252,12 +277,10 @@ pub fn animate_camera_shake(
 
     redraw.request();
     shake.timer.tick(time.delta());
-    let decay = 1.0 - tween_fraction(&shake.timer);
-    let elapsed = shake.timer.elapsed_secs();
-    let amplitude = shake.amplitude * decay;
+    let displacement = shake.displacement();
     for mut camera in &mut cameras {
-        camera.translation.x = camera_state.offset.x + (elapsed * 43.0).sin() * amplitude;
-        camera.translation.y = camera_state.offset.y + (elapsed * 31.0).cos() * amplitude;
+        camera.translation.x = camera_state.offset.x + displacement.x;
+        camera.translation.y = camera_state.offset.y + displacement.y;
     }
 
     if shake.timer.is_finished() {
@@ -594,6 +617,26 @@ pub fn animate_camera_transition(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stepped_shake_is_frame_rate_independent_and_returns_to_origin() {
+        let mut shake = super::CameraShake {
+            timer: Timer::from_seconds(0.4, TimerMode::Once),
+            amplitude: Vec2::new(15.0, 15.0),
+            interval: 0.05,
+            seed: 42,
+            animation_id: None,
+        };
+        assert_eq!(shake.displacement(), Vec2::ZERO);
+        shake.timer.tick(std::time::Duration::from_millis(60));
+        let a = shake.displacement();
+        shake.timer.tick(std::time::Duration::from_millis(20));
+        assert_eq!(a, shake.displacement());
+        assert!(a.abs().cmple(shake.amplitude).all());
+        shake.timer.tick(std::time::Duration::from_millis(30));
+        assert_ne!(a, shake.displacement());
+        shake.timer.tick(std::time::Duration::from_secs(1));
+        assert_eq!(shake.displacement(), Vec2::ZERO);
+    }
     #[test]
     fn view_scale_interpolates_visible_extent_not_magnification() {
         assert!((super::interpolate_zoom(1.0, 2.5, 0.5, true) - 1.0 / 0.7).abs() < 0.00001);

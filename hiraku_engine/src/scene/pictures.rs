@@ -80,6 +80,8 @@ pub struct PictureFade {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PictureMotion {
+    #[serde(default)]
+    pub oscillation: Option<PictureOscillation>,
     pub from: [f32; 5],
     pub to: [f32; 5],
     pub elapsed: f32,
@@ -91,7 +93,19 @@ pub struct PictureMotion {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PictureOscillation {
+    pub amplitude: [f32; 2],
+    pub period: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PictureCommand {
+    Oscillate {
+        id: String,
+        amplitude: [f32; 2],
+        period: [f32; 2],
+        seconds: f32,
+    },
     Noise {
         id: String,
         grid: [u32; 2],
@@ -291,6 +305,7 @@ pub(super) fn apply_picture_command(
             let target = [position[0], position[1], scale, rotation, 1.0];
             let start = old.unwrap_or([position[0], position[1], scale, rotation, 0.0]);
             let motion = (seconds > 0.0).then_some(PictureMotion {
+                oscillation: None,
                 from: start,
                 to: target,
                 elapsed: 0.0,
@@ -358,6 +373,7 @@ pub(super) fn apply_picture_command(
                 picture.motion = None;
             } else {
                 picture.motion = Some(PictureMotion {
+                    oscillation: None,
                     from,
                     to,
                     elapsed: 0.0,
@@ -382,6 +398,7 @@ pub(super) fn apply_picture_command(
                 to[0] = position[0];
                 to[1] = position[1];
                 picture.motion = Some(PictureMotion {
+                    oscillation: None,
                     from,
                     to,
                     elapsed: 0.0,
@@ -415,6 +432,27 @@ pub(super) fn apply_picture_command(
                 });
             }
         }
+        PictureCommand::Oscillate {
+            id,
+            amplitude,
+            period,
+            seconds,
+        } => {
+            let picture = pictures
+                .get_mut(&id)
+                .ok_or_else(|| format!("picture `{id}` is not visible"))?;
+            let from = values(picture);
+            picture.motion = (seconds > 0.0).then_some(PictureMotion {
+                oscillation: Some(PictureOscillation { amplitude, period }),
+                from,
+                to: from,
+                elapsed: 0.0,
+                seconds,
+                ease: "linear".into(),
+                remove: false,
+                offsets_x: Vec::new(),
+            });
+        }
         PictureCommand::AnimateX {
             id,
             offsets,
@@ -427,6 +465,7 @@ pub(super) fn apply_picture_command(
             let mut to = from;
             to[0] += offsets.last().copied().unwrap_or(0.0);
             picture.motion = Some(PictureMotion {
+                oscillation: None,
                 from,
                 to,
                 elapsed: 0.0,
@@ -722,6 +761,16 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
             picture.position[0] = motion.from[0]
                 + previous
                 + (motion.offsets_x[index] - previous) * (progress - index as f32).min(1.0);
+        }
+        if let Some(wave) = &motion.oscillation {
+            // Additive displacement never changes the base pose. Completion
+            // restores that pose even when the duration is not a whole period.
+            if p < 1.0 {
+                for axis in 0..2 {
+                    picture.position[axis] += wave.amplitude[axis]
+                        * (std::f32::consts::TAU * motion.elapsed / wave.period[axis]).sin();
+                }
+            }
         }
         if p == 1.0 {
             if motion.remove {
@@ -1493,6 +1542,32 @@ mod tests {
         assert_eq!(picture.position, position);
         assert_eq!(picture.alpha, alpha * 0.5);
         assert!(!tick_picture(picture, 0.5));
+    }
+
+    #[test]
+    fn oscillation_restores_base_and_survives_snapshot_serialization() {
+        let mut pictures = shown();
+        let base = pictures["room"].position;
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Oscillate {
+                id: "room".into(),
+                amplitude: [2.0, 4.0],
+                period: [1.0, 2.0],
+                seconds: 0.75,
+            },
+        )
+        .expect("oscillation starts");
+        tick_picture(pictures.get_mut("room").expect("picture"), 0.25);
+        assert!((pictures["room"].position[0] - base[0] - 2.0).abs() < 0.0001);
+        let bytes = hiraku_script::hson::to_vec(&pictures).expect("serialize picture state");
+        let mut restored: std::collections::BTreeMap<String, PictureState> =
+            hiraku_script::hson::from_slice(&bytes).expect("restore picture state");
+        // Use the same saved phase, not a new wave starting at zero.
+        let picture = restored.get_mut("room").expect("restored picture");
+        tick_picture(picture, 0.5);
+        assert_eq!(picture.position, base);
+        assert!(picture.motion.is_none());
     }
 
     #[test]

@@ -649,9 +649,16 @@ pub fn drive_story_runtime(
                         .map(|definition| (definition.path.clone(), definition.layout))
                         .or_else(|| {
                             let lower = path.to_ascii_lowercase();
-                            [".mkv", ".webm", ".mkva", ".webma"].iter().any(|ext| lower.ends_with(ext)).then(|| {
-                                (vfs.0.resolve_path(runtime.current_script.as_deref(), &path), hiraku_video::AlphaLayout::default())
-                            })
+                            [".mkv", ".webm", ".mkva", ".webma"]
+                                .iter()
+                                .any(|ext| lower.ends_with(ext))
+                                .then(|| {
+                                    (
+                                        vfs.0
+                                            .resolve_path(runtime.current_script.as_deref(), &path),
+                                        hiraku_video::AlphaLayout::default(),
+                                    )
+                                })
                         });
                     let Some((target, layout)) = target else {
                         warn!("movie `{path}` is not defined");
@@ -1005,6 +1012,7 @@ pub fn drive_story_runtime(
                     let id = format!("hks-effect-{}", request.0);
                     let wait = match &mut command {
                         ScriptCommand::Camera(CameraCommand::Set { animation_id, .. })
+                        | ScriptCommand::Camera(CameraCommand::Shake { animation_id, .. })
                         | ScriptCommand::Audio(AudioCommand::StopBgm { animation_id, .. })
                         | ScriptCommand::Stage(StageCommand::SetBackground {
                             animation_id, ..

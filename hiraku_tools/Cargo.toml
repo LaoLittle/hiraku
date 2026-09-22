@@ -6,8 +6,12 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+hiraku-uastc-build = { path = "../hiraku_uastc/build", optional = true }
 hiraku-script.workspace = true
 hiraku-hdp.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[features]
+uastc = ["dep:hiraku-uastc-build"]

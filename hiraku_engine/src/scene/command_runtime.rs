@@ -110,6 +110,7 @@ pub struct SceneCommandContext<'w, 's> {
     pub execution: ScriptExecutionCommandContext<'w>,
     pub camera_state: ResMut<'w, CameraState>,
     pub camera_tweens: ResMut<'w, CameraTweenState>,
+    pub camera_shake: ResMut<'w, CameraShakeState>,
     pub voice_state: ResMut<'w, VoiceState>,
     pub pending_characters: ResMut<'w, PendingCharacterShows>,
     pub waits: ResMut<'w, PendingWaits>,
@@ -134,6 +135,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
     let mut stage = ctx.stage;
     let mut camera_state = ctx.camera_state;
     let mut camera_tweens = ctx.camera_tweens;
+    let mut camera_shake = ctx.camera_shake;
     let mut pending_script_commands = execution.pending_commands;
     let mut script_runtime = execution.runtime;
     let mut dialogue_state = ui.dialogue_state;
@@ -350,6 +352,27 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 &ui_fonts,
                 &ui_style,
             ),
+            ScriptCommand::Camera(CameraCommand::Shake {
+                amplitude,
+                interval,
+                duration,
+                animation_id,
+            }) => {
+                if let Some(previous) = camera_shake.active.take() {
+                    complete_missing_animation(&mut animations, previous.animation_id);
+                }
+                if duration.is_zero() {
+                    complete_missing_animation(&mut animations, animation_id);
+                } else {
+                    camera_shake.active = Some(crate::render::camera::CameraShake {
+                        amplitude,
+                        interval,
+                        timer: Timer::new(duration, TimerMode::Once),
+                        seed: queued.sequence,
+                        animation_id,
+                    });
+                }
+            }
             ScriptCommand::Camera(CameraCommand::Set {
                 blur_intensity,
                 zoom,
@@ -713,6 +736,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     pending_characters.items.clear();
                     animations.completed.clear();
                     camera_tweens.active = None;
+                    camera_shake.active = None;
                     *camera_state = CameraState::default();
                     let empty_scene = SceneSnapshot::default();
                     shared_state.0 = empty_scene.clone();

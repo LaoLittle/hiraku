@@ -775,6 +775,7 @@ mod tests {
                 layer: 5.0,
                 alpha: 0.5,
                 motion: Some(PictureMotion {
+                    oscillation: None,
                     from: [50.0, 50.0, 2.0, -10.0, 0.0],
                     to: [70.0, 30.0, 2.0, -10.0, 1.0],
                     elapsed: 0.2,
