@@ -33,6 +33,9 @@ pub(super) fn resolve(
     };
     let transfer = match transfer.filter(|value| *value != 0) {
         Some(1) => TransferFunction::Linear,
+        // Android's native ColorAspects / Media3 use 2 for sRGB. It is not
+        // the CICP value 2 (unspecified), and is not an HDR transfer.
+        Some(2) => TransferFunction::Srgb,
         Some(3) => TransferFunction::Bt1886,
         None => match if extended { fields[7] } else { "01" } {
             "01" | "02" | "06" | "14" | "15" => TransferFunction::Bt1886,
@@ -46,9 +49,14 @@ pub(super) fn resolve(
                 )));
             }
         },
-        Some(value) => {
+        Some(value @ (6 | 7)) => {
             return Err(CodecError::Unsupported(format!(
                 "MediaCodec transfer {value}; HDR is not supported"
+            )));
+        }
+        Some(value) => {
+            return Err(CodecError::Unsupported(format!(
+                "unknown MediaCodec transfer {value}"
             )));
         }
     };
@@ -72,6 +80,27 @@ pub(super) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_srgb_output_preserves_full_range_and_overrides_stream_transfer() {
+        for codec in ["av01.0.04M.08", "av01.0.04M.08.0.110.01.01.01.0"] {
+            let (matrix, transfer) = resolve(Some(1), Some(2), Some(1), codec)
+                .expect("MediaCodec sRGB full-range output");
+            assert_eq!(transfer, TransferFunction::Srgb);
+            assert_eq!(matrix.luma, [1.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn hdr_and_unknown_transfers_are_reported_separately() {
+        for transfer in [6, 7] {
+            let error = resolve(None, Some(transfer), None, "av01.0.04M.08")
+                .expect_err("HDR remains unsupported");
+            assert!(error.to_string().contains("HDR is not supported"));
+        }
+        let error = resolve(None, Some(99), None, "av01.0.04M.08")
+            .expect_err("unknown transfer remains unsupported");
+        assert!(error.to_string().contains("unknown MediaCodec transfer 99"));
+    }
     #[test]
     fn decoded_full_range_overrides_limited_stream_metadata() {
         let codec = "av01.0.04M.08.0.110.01.13.01.0";
