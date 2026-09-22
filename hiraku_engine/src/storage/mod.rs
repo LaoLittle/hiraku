@@ -752,6 +752,8 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                video: None,
+                resolved_clip: None,
                 screen_space: false,
                 previous: Vec::new(),
                 size: Some([640.0, 320.0]),
@@ -807,6 +809,7 @@ mod tests {
             .apply(ClipCommand::Define {
                 name: "window".into(),
                 region: ClipRegion {
+                    mask: None,
                     center: [120.0, -20.0],
                     size: [400.0, 800.0],
                     rotation: -10.0,

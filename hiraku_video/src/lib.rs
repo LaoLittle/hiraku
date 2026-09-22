@@ -20,5 +20,5 @@ pub use asset::{
 };
 pub use player::{
     HirakuVideoPlugin, VideoDecodeSettings, VideoEvent, VideoPlaybackId, VideoPlaybackState,
-    VideoPlayer,
+    VideoPlaybackSystems, VideoPlayer,
 };

@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PictureState {
     #[serde(default)]
+    pub video: Option<PictureVideo>,
+    /// Last applied clip, retained with frozen backing layers during replacement.
+    pub resolved_clip: Option<super::clipping::ClipRegion>,
+    #[serde(default)]
     pub screen_space: bool,
     /// Frozen backing layers retained until the incoming image is ready and
     /// its entrance finishes. Owned by this replacement, never by callbacks.
@@ -34,6 +38,12 @@ pub struct PictureState {
     pub motion: Option<PictureMotion>,
     #[serde(default)]
     pub fade: Option<PictureFade>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PictureVideo {
+    pub layout: hiraku_video::AlphaLayout,
+    pub looping: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -122,6 +132,7 @@ pub enum PictureCommand {
         seconds: f32,
     },
     Show {
+        video: Option<PictureVideo>,
         screen_space: bool,
         size: Option<[f32; 2]>,
         slice: Option<[f32; 4]>,
@@ -178,6 +189,25 @@ pub(super) fn apply_picture_command(
     pictures: &mut BTreeMap<String, PictureState>,
     command: PictureCommand,
 ) -> Result<(), String> {
+    let unsupported = match &command {
+        PictureCommand::Show {
+            video: Some(_),
+            slice,
+            rect,
+            color,
+            ..
+        } => slice.is_some() || rect.is_some() || color.is_some_and(|c| c[..3] != [1.0; 3]),
+        PictureCommand::Blur { id, .. } | PictureCommand::Noise { id, .. } => {
+            pictures.get(id).is_some_and(|p| p.video.is_some())
+        }
+        PictureCommand::Tint { id, color, .. } => {
+            pictures.get(id).is_some_and(|p| p.video.is_some()) && color[..3] != [1.0; 3]
+        }
+        _ => false,
+    };
+    if unsupported {
+        return Err("video pictures currently support opacity, pose and transitions, but not RGB tint, blur, noise or atlas slicing".into());
+    }
     match command {
         PictureCommand::Noise { id, grid, interval } => {
             if grid.iter().any(|size| *size == 0 || *size > 16384)
@@ -253,6 +283,7 @@ pub(super) fn apply_picture_command(
         }
         PictureCommand::Clear => pictures.clear(),
         PictureCommand::Show {
+            video,
             screen_space,
             size,
             slice,
@@ -271,7 +302,9 @@ pub(super) fn apply_picture_command(
                 .get(&id)
                 .map(|old| {
                     let mut layers = old.previous.clone();
-                    if (old.path != path || old.rect != rect) && old.alpha > 0.0 {
+                    if (old.path != path || old.rect != rect || old.video != video)
+                        && old.alpha > 0.0
+                    {
                         let mut frozen = old.clone();
                         frozen.previous.clear();
                         frozen.motion = None;
@@ -298,6 +331,7 @@ pub(super) fn apply_picture_command(
                 .get(&id)
                 .filter(|picture| {
                     picture.path == path
+                        && picture.video == video
                         && picture.rect == rect
                         && !picture.fade.as_ref().is_some_and(|fade| fade.remove)
                 })
@@ -325,6 +359,8 @@ pub(super) fn apply_picture_command(
             pictures.insert(
                 id.clone(),
                 PictureState {
+                    video,
+                    resolved_clip: None,
                     screen_space,
                     previous,
                     size,
@@ -480,6 +516,7 @@ pub(super) fn apply_picture_command(
 }
 
 pub fn sync_pictures(
+    mut videos: super::video_pictures::VideoPictures,
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: crate::scene::playback::StoryTime,
@@ -491,6 +528,7 @@ pub fn sync_pictures(
         (
             With<crate::render::camera::WorldCamera3d>,
             Without<PictureEntity>,
+            Without<super::video_pictures::VideoPicture>,
         ),
     >,
     mut shared: ResMut<SceneSharedState>,
@@ -505,9 +543,12 @@ pub fn sync_pictures(
     let crate::state::SceneSnapshot {
         pictures, clips, ..
     } = &mut shared.0;
+    for (id, picture) in pictures.iter_mut() {
+        picture.resolved_clip = clips.picture_region(id).cloned();
+    }
     // Keep the first visible frame at the start of its animation: loading a
     // large picture must not consume the entire entrance before it is ready.
-    let ready: HashSet<_> = entities
+    let mut ready: HashSet<_> = entities
         .iter()
         .filter_map(|(_, marker, previous, sprite, _)| {
             if previous.is_some() {
@@ -516,6 +557,12 @@ pub fn sync_pictures(
             let image = sprite.image.as_ref()?;
             let picture = pictures.get(&marker.0)?;
             (images.contains(image.id())
+                && clips.picture_mask(&marker.0).is_none_or(|path| {
+                    sprite.clip_mask.as_ref().is_some_and(|mask| {
+                        images.contains(mask.id())
+                            && mask.path().is_some_and(|p| p.to_string() == path)
+                    })
+                })
                 && sprite.rect == picture.rect
                 && image
                     .path()
@@ -523,6 +570,7 @@ pub fn sync_pictures(
             .then(|| marker.0.clone())
         })
         .collect();
+    ready.extend(videos.ready(pictures));
     // A scene's pending entrances must start on the same renderable frame.
     // Otherwise a small backing image fades in before its large foreground
     // image has loaded, briefly exposing the wrong composition. Already
@@ -589,7 +637,10 @@ pub fn sync_pictures(
             commands.entity(entity).insert(PreviousPicture(index));
         }
         let key = (marker.0.clone(), backing);
-        let Some(picture) = render_pictures.get(&key) else {
+        let Some(picture) = render_pictures
+            .get(&key)
+            .filter(|picture| picture.video.is_none())
+        else {
             commands.entity(entity).try_despawn();
             continue;
         };
@@ -601,9 +652,26 @@ pub fn sync_pictures(
         if sprite.slice != picture.slice {
             sprite.slice = picture.slice;
         }
-        let clip = clips.picture(&marker.0);
+        let clip = picture
+            .resolved_clip
+            .as_ref()
+            .and_then(|region| region.rect().ok());
         if sprite.clip != clip {
             sprite.clip = clip;
+        }
+        let mask = picture
+            .resolved_clip
+            .as_ref()
+            .and_then(|region| region.mask.as_deref());
+        if sprite
+            .clip_mask
+            .as_ref()
+            .and_then(|h| h.path())
+            .map(ToString::to_string)
+            .as_deref()
+            != mask
+        {
+            sprite.clip_mask = mask.map(|path| crate::texture::load_static_image(&assets, path));
         }
         if !sprite
             .image
@@ -649,7 +717,7 @@ pub fn sync_pictures(
     }
     for ((id, previous), picture) in render_pictures
         .iter()
-        .filter(|(key, _)| !existing.contains(*key))
+        .filter(|(key, picture)| !existing.contains(*key) && picture.video.is_none())
     {
         let mut sprite = WorldSprite::from_image(crate::texture::load_static_image(
             &assets,
@@ -657,7 +725,15 @@ pub fn sync_pictures(
         ));
         sprite.custom_size = picture.size.map(Vec2::from_array);
         sprite.slice = picture.slice;
-        sprite.clip = clips.picture(id);
+        sprite.clip = picture
+            .resolved_clip
+            .as_ref()
+            .and_then(|region| region.rect().ok());
+        sprite.clip_mask = picture
+            .resolved_clip
+            .as_ref()
+            .and_then(|region| region.mask.as_deref())
+            .map(|path| crate::texture::load_static_image(&assets, path));
         sprite.rect = picture.rect;
         sprite.blur_radius = picture.blur_radius;
         sprite.noise = picture
@@ -688,6 +764,14 @@ pub fn sync_pictures(
             entity.insert(PreviousPicture(*index));
         }
     }
+    videos.sync(
+        &mut commands,
+        &assets,
+        pictures,
+        &render_pictures,
+        canvas.size.as_vec2(),
+        cameras.single().ok(),
+    );
 }
 
 fn picture_color(picture: &PictureState) -> Color {
@@ -796,7 +880,7 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
     true
 }
 
-fn picture_transform(p: &PictureState, canvas: Vec2) -> Transform {
+pub(super) fn picture_transform(p: &PictureState, canvas: Vec2) -> Transform {
     Transform::from_xyz(
         (p.position[0] / 100.0 - 0.5) * canvas.x,
         (p.position[1] / 100.0 - 0.5) * canvas.y,
@@ -806,7 +890,7 @@ fn picture_transform(p: &PictureState, canvas: Vec2) -> Transform {
     .with_rotation(Quat::from_rotation_z(p.rotation.to_radians()))
 }
 
-fn screen_picture_transform(
+pub(super) fn screen_picture_transform(
     mut local: Transform,
     canvas: Vec2,
     camera: &Transform,
@@ -866,6 +950,8 @@ mod tests {
                 bevy::image::CompressedImageFormats::NONE,
             ))
             .init_resource::<SceneSharedState>()
+            .init_resource::<hiraku_video::VideoPlayer>()
+            .init_resource::<Time<super::super::clock::SceneClock>>()
             .insert_resource(crate::HirakuCanvas {
                 image: Handle::default(),
                 size: UVec2::new(1920, 1080),
@@ -886,10 +972,18 @@ mod tests {
         let mut pictures = shown();
         let old = pictures.get_mut("room").expect("old picture");
         old.path = "alice.png".into();
+        let old_clip = super::super::clipping::ClipRegion {
+            mask: Some("alice.png".into()),
+            center: [20.0, 10.0],
+            size: [100.0, 200.0],
+            rotation: 0.0,
+        };
+        old.resolved_clip = Some(old_clip.clone());
         tick_picture(old, 1.0);
         apply_picture_command(
             &mut pictures,
             PictureCommand::Show {
+                video: None,
                 screen_space: false,
                 size: None,
                 slice: None,
@@ -924,6 +1018,9 @@ mod tests {
                 .image,
             Some(image)
         );
+        let backing = app.world().get::<WorldSprite>(outgoing).expect("backing");
+        assert_eq!(backing.clip, Some(old_clip.rect().expect("bounds")));
+        assert!(backing.clip_mask.is_some());
         let mut current = app
             .world_mut()
             .query_filtered::<Entity, (With<PictureEntity>, Without<PreviousPicture>)>();
@@ -931,6 +1028,14 @@ mod tests {
         assert_ne!(
             current.single(app.world()).expect("incoming entity"),
             outgoing
+        );
+        let incoming = current.single(app.world()).expect("incoming");
+        assert!(
+            app.world()
+                .get::<WorldSprite>(incoming)
+                .expect("sprite")
+                .clip
+                .is_none()
         );
     }
 
@@ -1329,6 +1434,8 @@ mod tests {
         app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
             .init_resource::<Assets<Image>>()
             .init_resource::<SceneSharedState>()
+            .init_resource::<hiraku_video::VideoPlayer>()
+            .init_resource::<Time<super::super::clock::SceneClock>>()
             .insert_resource(crate::HirakuCanvas {
                 image: Handle::default(),
                 size: UVec2::new(1920, 1080),
@@ -1377,6 +1484,7 @@ mod tests {
             &mut pictures,
             PictureCommand::Show {
                 id: "room".into(),
+                video: None,
                 screen_space: false,
                 path: "background/room".into(),
                 size: None,
@@ -1586,6 +1694,7 @@ mod tests {
         apply_picture_command(
             &mut pictures,
             PictureCommand::Show {
+                video: None,
                 screen_space: false,
                 id: "room".into(),
                 path: "background/room".into(),
@@ -1618,6 +1727,7 @@ mod tests {
             &mut pictures,
             PictureCommand::Show {
                 id: "room".into(),
+                video: None,
                 path: "pictures/bob.png".into(),
                 screen_space: false,
                 size: None,

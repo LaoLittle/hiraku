@@ -19,6 +19,8 @@ struct WorldSpriteMaterial {
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var color_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var dissolve_texture: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var dissolve_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var clip_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(6) var clip_sampler: sampler;
 
 // Keep corners at source-pixel size, shrinking proportionally when the target
 // is smaller than both borders combined. Only the center strip stretches.
@@ -85,7 +87,8 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     if material.dissolve.x != 0.0 {
         // Screen coordinates keep a full-canvas mask independent of the large
         // scene-covering quad and of camera zoom/projection.
-        let threshold = textureSample(dissolve_texture, dissolve_sampler, mesh.position.xy / material.dissolve.zw).r;
+        let mask = textureSample(dissolve_texture, dissolve_sampler, mesh.position.xy / material.dissolve.zw);
+        let threshold = mask.r;
         // Both entering and leaving traverse the mask from low to high.
         let reversed = material.dissolve.x < 0.0;
         let progress = select(material.tint.a, 1.0 - material.tint.a, reversed);
@@ -97,11 +100,18 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // Ensure exact endpoints even when the mask contains black or white.
         coverage = select(coverage, 0.0, progress <= 0.0);
         coverage = select(coverage, 1.0, progress >= 1.0);
-        color.a = select(coverage, 1.0 - coverage, reversed);
+        // Alpha defines the affected region; RGB defines transition timing.
+        // Opaque rule images retain the full-canvas behavior.
+        color.a = select(coverage, 1.0 - coverage, reversed) * mask.a;
     }
     let delta = mesh.world_position.xy - material.clip_bounds.xy;
     let local = vec2<f32>(dot(delta, material.clip_axes.xy), dot(delta, vec2<f32>(-material.clip_axes.y, material.clip_axes.x)));
     let outside = material.clip_axes.z > 0.0 && any(abs(local) > material.clip_bounds.zw);
+    if material.clip_axes.w > 0.0 {
+        // World-space mask: picture translation/scale does not move the window.
+        let uv = vec2<f32>(local.x, -local.y) / (2.0 * material.clip_bounds.zw) + 0.5;
+        color.a *= textureSample(clip_texture, clip_sampler, uv).a;
+    }
     if outside || color.a <= 0.0001 {
         discard;
     }

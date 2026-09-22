@@ -18,6 +18,7 @@ pub struct WorldSprite {
     /// Nine-slice borders in source pixels: left, top, right, bottom.
     pub slice: Option<[f32; 4]>,
     pub clip: Option<hiraku_sprite3d::ClipRect>,
+    pub clip_mask: Option<Handle<Image>>,
     /// Sampling radius in source-image pixels; independent of camera effects.
     pub blur_radius: f32,
     /// Noise frame (zero disables), grid width, grid height.
@@ -46,6 +47,7 @@ impl WorldSprite {
             clip_plane: None,
             slice: None,
             clip: None,
+            clip_mask: None,
             blur_radius: 0.0,
             noise: Vec3::ZERO,
             dissolve: None,
@@ -62,6 +64,7 @@ impl WorldSprite {
             clip_plane: None,
             slice: None,
             clip: None,
+            clip_mask: None,
             blur_radius: 0.0,
             noise: Vec3::ZERO,
             dissolve: None,
@@ -83,6 +86,9 @@ impl WorldSprite {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[uniform(0, WorldSpriteUniform)]
 pub struct WorldSpriteMaterial {
+    #[texture(5)]
+    #[sampler(6)]
+    pub clip_mask: Option<Handle<Image>>,
     #[uniform(15)]
     pub sampling: UVec4,
     pub clip_plane: Vec4,
@@ -158,6 +164,7 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
+        clip_mask: sprite.clip_mask.clone(),
         sampling: UVec4::ZERO,
         clip_plane: sprite
             .clip_plane
@@ -173,9 +180,11 @@ fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
         clip_bounds: sprite
             .clip
             .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[0]),
-        clip_axes: sprite
-            .clip
-            .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[1]),
+        clip_axes: sprite.clip.map_or(Vec4::ZERO, |clip| {
+            let mut axes = clip.shader_parameters()[1];
+            axes.w = if sprite.clip_mask.is_some() { 1.0 } else { 0.0 };
+            axes
+        }),
         effects: Vec4::new(
             sprite.blur_radius,
             sprite.noise.x,

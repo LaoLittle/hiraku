@@ -1,19 +1,21 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::Duration,
 };
 
 use bevy::{
     asset::{AssetApp, LoadState, RenderAssetUsages},
     audio::{AddAudioSource, AudioPlayer, AudioSink, AudioSinkPlayback, PlaybackSettings},
+    camera::visibility::RenderLayers,
     image::Image,
+    pbr::MaterialPlugin,
     picking::Pickable,
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 
 use crate::decode::{MediaDecoder, VideoEvent as DecodeEvent};
-use crate::upload::{VideoUpload, install_video_upload};
+use crate::upload::{VideoUpload, VideoUploads, install_video_upload};
 use crate::{
     VideoAsset, VideoAssetLoader,
     audio::VideoAudio,
@@ -77,6 +79,9 @@ impl VideoDecodeSettings {
 }
 
 struct PendingPlayback {
+    looping: bool,
+    parent: Option<Entity>,
+    world_size: Option<Vec2>,
     id: VideoPlaybackId,
     asset: Handle<VideoAsset>,
     z_index: i32,
@@ -101,9 +106,46 @@ pub struct VideoPlayer {
     controls: VecDeque<PlaybackControl>,
     states: BTreeMap<VideoPlaybackId, VideoPlaybackState>,
     active: Option<VideoPlaybackId>,
+    suspended: BTreeSet<VideoPlaybackId>,
+    opacity: BTreeMap<VideoPlaybackId, f32>,
 }
 
 impl VideoPlayer {
+    /// Host animation opacity, multiplied with the video's natural exit fade.
+    pub fn set_opacity(&mut self, id: VideoPlaybackId, opacity: f32) -> bool {
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) || !self.states.contains_key(&id)
+        {
+            return false;
+        }
+        self.opacity.insert(id, opacity);
+        true
+    }
+    pub fn is_suspended(&self, id: VideoPlaybackId) -> bool {
+        self.suspended.contains(&id)
+    }
+
+    /// Suspend a host-owned playback clock without changing its manual pause
+    /// state. This also applies while loading and across loop boundaries.
+    /// Releasing suspension never resumes an explicitly paused playback.
+    pub fn set_suspended(&mut self, id: VideoPlaybackId, suspended: bool) -> bool {
+        if !matches!(
+            self.states.get(&id),
+            Some(
+                VideoPlaybackState::Loading
+                    | VideoPlaybackState::Playing
+                    | VideoPlaybackState::Paused
+            )
+        ) {
+            return false;
+        }
+        if suspended {
+            self.suspended.insert(id);
+        } else {
+            self.suspended.remove(&id);
+        }
+        true
+    }
+
     pub fn play(&mut self, asset: Handle<VideoAsset>) -> VideoPlaybackId {
         self.play_at_layer(asset, VIDEO_Z_INDEX)
     }
@@ -113,11 +155,50 @@ impl VideoPlayer {
         self.play_at_layer(asset, 0)
     }
 
+    /// Independent playback contained by a host-owned UI node. It does not
+    /// replace or queue behind fullscreen movies; controls address its own ID.
+    /// Despawning the parent cancels playback and releases its decoder/surfaces.
+    pub fn play_in(&mut self, asset: Handle<VideoAsset>, parent: Entity) -> VideoPlaybackId {
+        let id = self.play_at_layer(asset, 0);
+        self.pending
+            .back_mut()
+            .expect("new playback is queued")
+            .parent = Some(parent);
+        id
+    }
+
+    /// Render an unlit video quad in the host's world hierarchy. Size is in
+    /// world units; position, rotation and scale belong to the parent's Transform.
+    pub fn play_world(
+        &mut self,
+        asset: Handle<VideoAsset>,
+        parent: Entity,
+        size: Vec2,
+    ) -> Result<VideoPlaybackId, &'static str> {
+        if !size.is_finite() || size.min_element() <= 0.0 {
+            return Err("video quad size must be finite and positive");
+        }
+        let id = self.play_in(asset, parent);
+        self.pending.back_mut().expect("new playback").world_size = Some(size);
+        Ok(id)
+    }
+
     /// Configure natural completion before playback starts. The last frame
     /// remains alive until its exit fade completes; skip still cancels at once.
     pub fn set_fade_out(&mut self, id: VideoPlaybackId, duration: Duration) -> bool {
         if let Some(pending) = self.pending.iter_mut().find(|pending| pending.id == id) {
             pending.fade_out = duration;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Configure repetition before startup. A looping instance finishes only
+    /// when explicitly stopped or when its host is removed.
+    pub fn set_looping(&mut self, id: VideoPlaybackId, looping: bool) -> bool {
+        if let Some(pending) = self.pending.iter_mut().find(|pending| pending.id == id) {
+            pending.looping = looping;
             true
         } else {
             false
@@ -132,6 +213,9 @@ impl VideoPlayer {
         let id = VideoPlaybackId(self.next_id);
         self.states.insert(id, VideoPlaybackState::Loading);
         self.pending.push_back(PendingPlayback {
+            looping: false,
+            parent: None,
+            world_size: None,
             id,
             asset,
             z_index,
@@ -172,13 +256,25 @@ impl VideoPlayer {
 
     /// Cancel loading requests as well as active playback through normal terminal events.
     pub fn stop_all(&mut self) {
-        let pending: Vec<_> = self.pending.iter().map(|request| request.id).collect();
-        for id in pending {
+        let live: Vec<_> = self
+            .states
+            .iter()
+            .filter_map(|(id, state)| {
+                matches!(
+                    state,
+                    VideoPlaybackState::Loading
+                        | VideoPlaybackState::Playing
+                        | VideoPlaybackState::Paused
+                )
+                .then_some(*id)
+            })
+            .collect();
+        for id in live {
             self.skip(id);
         }
-        self.skip_active();
     }
 
+    /// Active fullscreen playback, excluding independently hosted surfaces.
     pub fn active(&self) -> Option<VideoPlaybackId> {
         self.active
     }
@@ -189,9 +285,13 @@ impl VideoPlayer {
 }
 
 #[derive(Default)]
-struct ActiveVideo(Option<ActivePlayback>);
+struct ActiveVideo(BTreeMap<VideoPlaybackId, ActivePlayback>);
 
 struct ActivePlayback {
+    repeat: Option<(VideoAsset, DecodeSettings)>,
+    awaiting_restart: bool,
+    frame_step: Duration,
+    world: Option<(Handle<Mesh>, RenderLayers)>,
     alpha_layout: Option<crate::AlphaLayout>,
     id: VideoPlaybackId,
     receiver: crossbeam_channel::Receiver<DecodeEvent>,
@@ -241,6 +341,10 @@ impl ActivePlayback {
 
 pub struct HirakuVideoPlugin;
 
+/// Hosts update clock policy before this set; completion consumers run after it.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VideoPlaybackSystems;
+
 impl Plugin for HirakuVideoPlugin {
     fn build(&self, app: &mut App) {
         load_internal_shader(app);
@@ -250,14 +354,69 @@ impl Plugin for HirakuVideoPlugin {
             .init_asset_loader::<VideoAssetLoader>()
             .add_audio_source::<VideoAudio>()
             .add_plugins(UiMaterialPlugin::<Yuv420Material>::default())
+            .add_plugins(MaterialPlugin::<Yuv420Material>::default())
             .init_resource::<VideoDecodeSettings>()
             .init_resource::<VideoPlayer>()
             .add_message::<VideoEvent>()
+            .add_systems(PostUpdate, sync_video_opacity)
             .add_systems(
                 Update,
-                (start_pending_video, apply_video_controls, update_video).chain(),
+                (start_pending_video, apply_video_controls, update_video)
+                    .chain()
+                    .in_set(VideoPlaybackSystems),
             );
     }
+}
+
+fn sync_video_opacity(
+    active: NonSend<ActiveVideo>,
+    mut player: ResMut<VideoPlayer>,
+    mut materials: ResMut<Assets<Yuv420Material>>,
+    surfaces: Query<(
+        Option<&MaterialNode<Yuv420Material>>,
+        Option<&MeshMaterial3d<Yuv420Material>>,
+    )>,
+    mut images: Query<&mut ImageNode>,
+) {
+    for (&id, playback) in &active.0 {
+        let Some(surface) = &playback.surface else {
+            continue;
+        };
+        let entity = match surface {
+            VideoSurface::YuvI420 { image_entity, .. }
+            | VideoSurface::YuvNv12 { image_entity, .. }
+            | VideoSurface::Rgba { image_entity, .. } => *image_entity,
+        };
+        let opacity = player.opacity.get(&id).copied().unwrap_or(1.0)
+            * playback
+                .exit_elapsed
+                .map_or(1.0, |elapsed| exit_opacity(elapsed, playback.fade_out));
+        if let Ok((ui, world)) = surfaces.get(entity)
+            && let Some(handle) = ui.map(|n| &n.0).or_else(|| world.map(|m| &m.0))
+            && let Some(mut material) = materials.get_mut(handle)
+            && material.opacity != opacity
+        {
+            material.opacity = opacity;
+        }
+        if let Ok(mut image) = images.get_mut(entity)
+            && image.color.alpha() != opacity
+        {
+            image.color.set_alpha(opacity);
+        }
+    }
+    let VideoPlayer {
+        opacity, states, ..
+    } = &mut *player;
+    opacity.retain(|id, _| {
+        matches!(
+            states.get(id),
+            Some(
+                VideoPlaybackState::Loading
+                    | VideoPlaybackState::Playing
+                    | VideoPlaybackState::Paused
+            )
+        )
+    });
 }
 
 fn start_pending_video(
@@ -270,99 +429,179 @@ fn start_pending_video(
     mut active: NonSendMut<ActiveVideo>,
     decode_settings: Res<VideoDecodeSettings>,
     mut events: MessageWriter<VideoEvent>,
+    parents: Query<(Option<&Node>, Option<&Transform>, Option<&RenderLayers>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    if active.0.is_some() {
-        return;
-    }
-    let Some(pending) = player.pending.front() else {
-        return;
-    };
-    if redraw.is_some() {
-        commands.write_message(bevy::window::RequestRedraw);
-    }
-    let Some(asset) = videos.get(&pending.asset) else {
-        if let LoadState::Failed(error) = asset_server.load_state(&pending.asset) {
-            let pending = player
-                .pending
-                .pop_front()
-                .expect("the inspected video request must remain queued");
-            fail_playback(
-                pending.id,
-                format!("video asset failed to load: {error}"),
-                &mut player,
-                &mut events,
-            );
+    let mut index = 0;
+    let mut fullscreen_claimed = player.active.is_some();
+    while index < player.pending.len() {
+        let pending = &player.pending[index];
+        if pending.parent.is_none() {
+            if fullscreen_claimed {
+                index += 1;
+                continue;
+            }
+            // Loading fullscreen requests keep their order; independent
+            // surfaces later in the queue may still proceed.
+            fullscreen_claimed = true;
         }
-        return;
-    };
-    let pending = player
-        .pending
-        .pop_front()
-        .expect("the loaded video request must remain queued");
-    let start_paused = matches!(
-        player.states.get(&pending.id),
-        Some(VideoPlaybackState::Paused)
-    );
-    let stream = match MediaDecoder::new(
-        &asset.media,
-        DecodeSettings {
-            decoder_threads: decode_settings.decoder_threads,
-            max_frame_delay: decode_settings.max_frame_delay,
-        },
-    ) {
-        Ok(stream) => stream,
-        Err(error) => {
-            fail_playback(pending.id, error.to_string(), &mut player, &mut events);
-            return;
+        if pending
+            .parent
+            .is_some_and(|parent| parents.get(parent).is_err())
+        {
+            let pending = player.pending.remove(index).expect("pending index");
+            player
+                .states
+                .insert(pending.id, VideoPlaybackState::Skipped);
+            events.write(VideoEvent::Skipped { id: pending.id });
+            continue;
         }
-    };
-    let audio = VideoAudio::new(stream.audio.clone(), asset.metadata);
-    let root = commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(0),
-                right: px(0),
-                top: px(0),
-                bottom: px(0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(if pending.z_index == 0 || asset.alpha_layout.is_some() {
-                Color::NONE
+        if let Some(parent) = pending.parent {
+            let (node, transform, _) = parents.get(parent).expect("parent exists");
+            if (pending.world_size.is_some() && transform.is_none())
+                || (pending.world_size.is_none() && node.is_none())
+            {
+                let pending = player.pending.remove(index).expect("pending index");
+                fail_playback(
+                    pending.id,
+                    "video parent requires a Transform for world playback or Node for UI playback"
+                        .into(),
+                    &mut player,
+                    &mut events,
+                );
+                continue;
+            }
+        }
+        if redraw.is_some() {
+            commands.write_message(bevy::window::RequestRedraw);
+        }
+        let Some(asset) = videos.get(&pending.asset) else {
+            if let LoadState::Failed(error) = asset_server.load_state(&pending.asset) {
+                let pending = player
+                    .pending
+                    .remove(index)
+                    .expect("the inspected video request must remain queued");
+                fail_playback(
+                    pending.id,
+                    format!("video asset failed to load: {error}"),
+                    &mut player,
+                    &mut events,
+                );
             } else {
-                Color::BLACK
-            }),
-            GlobalZIndex(pending.z_index),
-            Pickable::IGNORE,
-        ))
-        .id();
-    let audio_entity = if asset.metadata.channels == 0 {
-        None
-    } else {
-        spawn_movie_audio(&mut commands, &mut audio_assets, audio.clone())
-    };
-    player.active = Some(pending.id);
-    active.0 = Some(ActivePlayback {
-        alpha_layout: asset.alpha_layout,
-        id: pending.id,
-        receiver: stream.video.clone(),
-        frames: VecDeque::new(),
-        surface: None,
-        root,
-        audio_entity,
-        position: Duration::ZERO,
-        paused: start_paused,
-        started: false,
-        decoder_ended: false,
-        last_timestamp: Duration::ZERO,
-        audio_clock: audio,
-        age: Duration::ZERO,
-        decoder: stream,
-        fade_out: pending.fade_out,
-        exit_elapsed: None,
-    });
+                index += 1;
+            }
+            continue;
+        };
+        let pending = player
+            .pending
+            .remove(index)
+            .expect("the loaded video request must remain queued");
+        let start_paused = matches!(
+            player.states.get(&pending.id),
+            Some(VideoPlaybackState::Paused)
+        );
+        let stream = match MediaDecoder::new(
+            &asset.media,
+            DecodeSettings {
+                decoder_threads: decode_settings.decoder_threads,
+                max_frame_delay: decode_settings.max_frame_delay,
+            },
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                fail_playback(pending.id, error.to_string(), &mut player, &mut events);
+                continue;
+            }
+        };
+        let audio = VideoAudio::new(stream.audio.clone(), asset.metadata);
+        let world = pending.world_size.map(|size| {
+            (
+                meshes.add(Rectangle::from_size(size)),
+                pending
+                    .parent
+                    .and_then(|parent| parents.get(parent).ok())
+                    .and_then(|(_, _, layers)| layers.cloned())
+                    .unwrap_or_default(),
+            )
+        });
+        let root = if world.is_some() {
+            commands
+                .spawn((
+                    Transform::default(),
+                    Visibility::Inherited,
+                    Pickable::IGNORE,
+                ))
+                .id()
+        } else {
+            commands
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0),
+                        right: px(0),
+                        top: px(0),
+                        bottom: px(0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(if pending.z_index == 0 || asset.alpha_layout.is_some() {
+                        Color::NONE
+                    } else {
+                        Color::BLACK
+                    }),
+                    Pickable::IGNORE,
+                ))
+                .id()
+        };
+        if let Some(parent) = pending.parent {
+            commands.entity(root).insert(ChildOf(parent));
+        } else {
+            commands.entity(root).insert(GlobalZIndex(pending.z_index));
+        }
+        let audio_entity = if asset.metadata.channels == 0 {
+            None
+        } else {
+            spawn_movie_audio(&mut commands, &mut audio_assets, audio.clone())
+        };
+        if pending.parent.is_none() {
+            player.active = Some(pending.id);
+        }
+        active.0.insert(
+            pending.id,
+            ActivePlayback {
+                repeat: pending.looping.then(|| {
+                    (
+                        asset.clone(),
+                        DecodeSettings {
+                            decoder_threads: decode_settings.decoder_threads,
+                            max_frame_delay: decode_settings.max_frame_delay,
+                        },
+                    )
+                }),
+                awaiting_restart: false,
+                frame_step: LAST_FRAME_HOLD,
+                world,
+                alpha_layout: asset.alpha_layout,
+                id: pending.id,
+                receiver: stream.video.clone(),
+                frames: VecDeque::new(),
+                surface: None,
+                root,
+                audio_entity,
+                position: Duration::ZERO,
+                paused: start_paused,
+                started: false,
+                decoder_ended: false,
+                last_timestamp: Duration::ZERO,
+                audio_clock: audio,
+                age: Duration::ZERO,
+                decoder: stream,
+                fade_out: pending.fade_out,
+                exit_elapsed: None,
+            },
+        );
+    }
 }
 
 fn apply_video_controls(
@@ -372,6 +611,7 @@ fn apply_video_controls(
     mut active: NonSendMut<ActiveVideo>,
     sinks: Query<&AudioSink>,
     mut events: MessageWriter<VideoEvent>,
+    mut uploads: ResMut<VideoUploads>,
 ) {
     if !player.controls.is_empty() && redraw.is_some() {
         commands.write_message(bevy::window::RequestRedraw);
@@ -379,7 +619,7 @@ fn apply_video_controls(
     while let Some(control) = player.controls.pop_front() {
         match control {
             PlaybackControl::Pause(id) => {
-                if let Some(playback) = active.0.as_mut().filter(|playback| playback.id == id) {
+                if let Some(playback) = active.0.get_mut(&id) {
                     playback.paused = true;
                     if let Some(audio_entity) = playback.audio_entity
                         && let Ok(sink) = sinks.get(audio_entity)
@@ -392,12 +632,14 @@ fn apply_video_controls(
                 }
             }
             PlaybackControl::Resume(id) => {
-                if let Some(playback) = active.0.as_mut().filter(|playback| playback.id == id) {
+                if let Some(playback) = active.0.get_mut(&id) {
                     playback.paused = false;
                     if let Some(audio_entity) = playback.audio_entity
                         && let Ok(sink) = sinks.get(audio_entity)
                     {
-                        sink.play();
+                        if playback.started && !player.suspended.contains(&id) {
+                            sink.play();
+                        }
                     }
                     player.states.insert(id, VideoPlaybackState::Playing);
                 } else if player.pending.iter().any(|pending| pending.id == id) {
@@ -405,16 +647,18 @@ fn apply_video_controls(
                 }
             }
             PlaybackControl::Skip(id) => {
-                if let Some(playback) = active.0.as_ref().filter(|playback| playback.id == id) {
+                if let Some(playback) = active.0.remove(&id) {
                     if let Some(audio_entity) = playback.audio_entity
                         && let Ok(sink) = sinks.get(audio_entity)
                     {
                         sink.stop();
                     }
-                    cleanup_playback(&mut commands, playback);
+                    cleanup_playback(&mut commands, &playback);
                     player.states.insert(id, VideoPlaybackState::Skipped);
-                    player.active = None;
-                    active.0 = None;
+                    if player.active == Some(id) {
+                        player.active = None;
+                    }
+                    uploads.0.remove(&id);
                     events.write(VideoEvent::Skipped { id });
                 } else if let Some(index) =
                     player.pending.iter().position(|pending| pending.id == id)
@@ -439,159 +683,253 @@ fn update_video(
     mut player: ResMut<VideoPlayer>,
     mut active: NonSendMut<ActiveVideo>,
     mut events: MessageWriter<VideoEvent>,
-    mut video_upload: ResMut<VideoUpload>,
-    material_nodes: Query<&MaterialNode<Yuv420Material>>,
+    mut uploads: ResMut<VideoUploads>,
+    material_nodes: Query<(
+        Option<&MaterialNode<Yuv420Material>>,
+        Option<&MeshMaterial3d<Yuv420Material>>,
+    )>,
     mut image_nodes: Query<&mut ImageNode>,
     mut backgrounds: Query<&mut BackgroundColor>,
+    roots: Query<Entity>,
+    mut audio_assets: ResMut<Assets<VideoAudio>>,
 ) {
-    let Some(playback) = active.0.as_mut() else {
-        video_upload.clear();
-        return;
-    };
-    playback.age += time.delta();
-    if (!playback.paused || !playback.started) && redraw.is_some() {
-        commands.write_message(bevy::window::RequestRedraw);
-    }
-    playback.decoder.poll();
-    if playback
-        .audio_entity
-        .is_some_and(|audio_entity| sinks.get(audio_entity).is_err())
-        && playback.age >= AUDIO_SINK_TIMEOUT
-    {
-        let id = playback.id;
-        cleanup_playback(&mut commands, playback);
-        active.0 = None;
-        player.active = None;
-        fail_playback(
-            id,
-            "Bevy did not create an audio sink for the movie".into(),
-            &mut player,
-            &mut events,
-        );
-        return;
-    }
-    if let Some(result) = drain_ready_frames(&playback.receiver, &mut playback.frames) {
-        match result {
-            Ok(()) => playback.decoder_ended = true,
-            Err(error) => {
-                let id = playback.id;
-                cleanup_playback(&mut commands, playback);
-                active.0 = None;
-                player.active = None;
-                fail_playback(id, error, &mut player, &mut events);
-                return;
-            }
-        }
-    }
-    if !playback.started && !playback.frames.is_empty() {
-        playback.started = true;
-        player.states.insert(
-            playback.id,
-            if playback.paused {
-                VideoPlaybackState::Paused
-            } else {
-                VideoPlaybackState::Playing
-            },
-        );
-        events.write(VideoEvent::Started { id: playback.id });
-    }
-    if playback.started && !playback.paused {
-        if let Some(audio_entity) = playback.audio_entity
-            && let Ok(sink) = sinks.get(audio_entity)
-            && sink.is_paused()
-        {
-            sink.play();
-        }
-        playback.position = playback
-            .audio_entity
-            .and_then(|audio_entity| sinks.get(audio_entity).ok())
-            .map(|sink| {
-                if sink.empty() {
-                    playback.position + time.delta()
-                } else {
-                    playback.audio_clock.position()
-                }
-            })
-            .unwrap_or_else(|| playback.position + time.delta());
-    }
-    // Only the newest due frame can be visible this render tick. Do not create/update
-    // surfaces or publish GPU uploads for frames that have already been superseded.
-    let mut due_frame = None;
-    while playback.frames.front().is_some_and(|frame| {
-        Duration::from_micros(frame.timestamp.max(0) as u64) <= playback.position
-    }) {
-        let frame = playback
-            .frames
-            .pop_front()
-            .expect("the checked frame queue must not be empty");
-        due_frame = Some(frame);
-    }
-    if let Some(frame) = due_frame {
-        playback.last_timestamp = Duration::from_micros(frame.timestamp.max(0) as u64);
-        present_frame(
-            &mut commands,
-            &mut images,
-            &mut materials,
-            &mut nodes,
-            &mut video_upload,
-            playback,
-            frame,
-        );
-    }
-    if playback.paused
-        && let Some(audio_entity) = playback.audio_entity
-        && let Ok(sink) = sinks.get(audio_entity)
-        && !sink.is_paused()
-    {
-        sink.pause();
-    }
-    let audio_finished = audio_completed(
-        playback.audio_entity.is_some(),
-        playback
-            .audio_entity
-            .and_then(|entity| sinks.get(entity).ok())
-            .is_some_and(AudioSinkPlayback::empty),
-    );
-    if playback.decoder_ended
-        && playback.frames.is_empty()
-        && playback.position >= playback.last_timestamp + LAST_FRAME_HOLD
-        && audio_finished
-    {
-        let elapsed = playback.exit_elapsed.get_or_insert(Duration::ZERO);
-        if !playback.paused {
-            *elapsed += time.delta();
-        }
-        let opacity = exit_opacity(*elapsed, playback.fade_out);
-        if let Ok(mut background) = backgrounds.get_mut(playback.root) {
-            if background.0.alpha() > 0.0 {
-                background.0.set_alpha(opacity);
-            }
-        }
-        if let Some(surface) = &playback.surface {
-            let image_entity = match surface {
-                VideoSurface::YuvI420 { image_entity, .. }
-                | VideoSurface::YuvNv12 { image_entity, .. }
-                | VideoSurface::Rgba { image_entity, .. } => *image_entity,
-            };
-            if let Ok(node) = material_nodes.get(image_entity)
-                && let Some(mut material) = materials.get_mut(&node.0)
+    active.0.retain(|id, playback| {
+        let paused = playback.paused || player.suspended.contains(id);
+        if !roots.contains(playback.root) {
+            if let Some(audio_entity) = playback.audio_entity
+                && let Ok(sink) = sinks.get(audio_entity)
             {
-                material.opacity = opacity;
+                sink.stop();
             }
-            if let Ok(mut image) = image_nodes.get_mut(image_entity) {
-                image.color.set_alpha(opacity);
+            cleanup_playback(&mut commands, playback);
+            if player.active == Some(*id) {
+                player.active = None;
+            }
+            player.states.insert(*id, VideoPlaybackState::Skipped);
+            events.write(VideoEvent::Skipped { id: *id });
+            return false;
+        }
+        let mut video_upload = uploads.0.entry(*id).or_default();
+        playback.age += time.delta();
+        if (!paused || !playback.started) && redraw.is_some() {
+            commands.write_message(bevy::window::RequestRedraw);
+        }
+        playback.decoder.poll();
+        if playback
+            .audio_entity
+            .is_some_and(|audio_entity| sinks.get(audio_entity).is_err())
+            && playback.age >= AUDIO_SINK_TIMEOUT
+        {
+            let id = playback.id;
+            cleanup_playback(&mut commands, playback);
+            if player.active == Some(id) {
+                player.active = None;
+            }
+            fail_playback(
+                id,
+                "Bevy did not create an audio sink for the movie".into(),
+                &mut player,
+                &mut events,
+            );
+            return false;
+        }
+        if let Some(result) = drain_ready_frames(&playback.receiver, &mut playback.frames) {
+            match result {
+                Ok(()) => playback.decoder_ended = true,
+                Err(error) => {
+                    let id = playback.id;
+                    cleanup_playback(&mut commands, playback);
+                    if player.active == Some(id) {
+                        player.active = None;
+                    }
+                    fail_playback(id, error, &mut player, &mut events);
+                    return false;
+                }
             }
         }
-        if opacity > 0.0 {
-            return;
+        if !playback.frames.is_empty() {
+            playback.awaiting_restart = false;
         }
-        let id = playback.id;
-        cleanup_playback(&mut commands, playback);
-        active.0 = None;
-        player.active = None;
-        player.states.insert(id, VideoPlaybackState::Finished);
-        events.write(VideoEvent::Finished { id });
-    }
+        if !playback.started && !playback.frames.is_empty() {
+            playback.started = true;
+            events.write(VideoEvent::Started { id: playback.id });
+        }
+        if playback.started {
+            player.states.insert(
+                playback.id,
+                if paused {
+                    VideoPlaybackState::Paused
+                } else {
+                    VideoPlaybackState::Playing
+                },
+            );
+        }
+        if playback.started && !paused && !playback.awaiting_restart {
+            if let Some(audio_entity) = playback.audio_entity
+                && let Ok(sink) = sinks.get(audio_entity)
+                && sink.is_paused()
+            {
+                sink.play();
+            }
+            playback.position = playback
+                .audio_entity
+                .and_then(|audio_entity| sinks.get(audio_entity).ok())
+                .map(|sink| {
+                    if sink.empty() {
+                        playback.position + time.delta()
+                    } else {
+                        playback.audio_clock.position()
+                    }
+                })
+                .unwrap_or_else(|| playback.position + time.delta());
+        }
+        // Only the newest due frame can be visible this render tick. Do not create/update
+        // surfaces or publish GPU uploads for frames that have already been superseded.
+        let mut due_frame = None;
+        while playback.frames.front().is_some_and(|frame| {
+            Duration::from_micros(frame.timestamp.max(0) as u64) <= playback.position
+        }) {
+            let frame = playback
+                .frames
+                .pop_front()
+                .expect("the checked frame queue must not be empty");
+            let timestamp = Duration::from_micros(frame.timestamp.max(0) as u64);
+            let step = timestamp.saturating_sub(playback.last_timestamp);
+            if !step.is_zero() {
+                playback.frame_step = step;
+            }
+            playback.last_timestamp = timestamp;
+            due_frame = Some(frame);
+        }
+        if let Some(frame) = due_frame {
+            present_frame(
+                &mut commands,
+                &mut images,
+                &mut materials,
+                &mut nodes,
+                &mut video_upload,
+                playback,
+                frame,
+            );
+        }
+        if paused
+            && let Some(audio_entity) = playback.audio_entity
+            && let Ok(sink) = sinks.get(audio_entity)
+            && !sink.is_paused()
+        {
+            sink.pause();
+        }
+        let audio_finished = audio_completed(
+            playback.audio_entity.is_some(),
+            playback
+                .audio_entity
+                .and_then(|entity| sinks.get(entity).ok())
+                .is_some_and(AudioSinkPlayback::empty),
+        );
+        if playback.decoder_ended
+            && playback.frames.is_empty()
+            && playback.position >= playback.last_timestamp + playback.frame_step
+            && audio_finished
+        {
+            if paused {
+                return true;
+            }
+            if let Some((asset, settings)) = &playback.repeat {
+                match MediaDecoder::new(&asset.media, settings.clone()) {
+                    Ok(stream) => {
+                        if let Some(entity) = playback.audio_entity {
+                            if let Ok(sink) = sinks.get(entity) {
+                                sink.stop();
+                            }
+                            commands.entity(entity).try_despawn();
+                        }
+                        playback.audio_clock =
+                            VideoAudio::new(stream.audio.clone(), asset.metadata);
+                        playback.audio_entity = if asset.metadata.channels == 0 {
+                            None
+                        } else {
+                            spawn_movie_audio(
+                                &mut commands,
+                                &mut audio_assets,
+                                playback.audio_clock.clone(),
+                            )
+                        };
+                        playback.receiver = stream.video.clone();
+                        playback.decoder = stream;
+                        playback.decoder_ended = false;
+                        playback.position = Duration::ZERO;
+                        playback.last_timestamp = Duration::ZERO;
+                        playback.age = Duration::ZERO;
+                        playback.awaiting_restart = true;
+                        // Keep the old surface and upload alive until frame zero
+                        // is decoded: repetition must not introduce a blank frame.
+                        return true;
+                    }
+                    Err(error) => {
+                        cleanup_playback(&mut commands, playback);
+                        if player.active == Some(*id) {
+                            player.active = None;
+                        }
+                        fail_playback(*id, error.to_string(), &mut player, &mut events);
+                        return false;
+                    }
+                }
+            }
+            let elapsed = playback.exit_elapsed.get_or_insert(Duration::ZERO);
+            if !paused {
+                *elapsed += time.delta();
+            }
+            let opacity = exit_opacity(*elapsed, playback.fade_out);
+            if let Ok(mut background) = backgrounds.get_mut(playback.root) {
+                if background.0.alpha() > 0.0 {
+                    background.0.set_alpha(opacity);
+                }
+            }
+            if let Some(surface) = &playback.surface {
+                let image_entity = match surface {
+                    VideoSurface::YuvI420 { image_entity, .. }
+                    | VideoSurface::YuvNv12 { image_entity, .. }
+                    | VideoSurface::Rgba { image_entity, .. } => *image_entity,
+                };
+                if let Ok((ui, world)) = material_nodes.get(image_entity)
+                    && let Some(handle) =
+                        ui.map(|node| &node.0).or_else(|| world.map(|mesh| &mesh.0))
+                    && let Some(mut material) = materials.get_mut(handle)
+                {
+                    material.opacity = opacity;
+                }
+                if let Ok(mut image) = image_nodes.get_mut(image_entity) {
+                    image.color.set_alpha(opacity);
+                }
+            }
+            if opacity > 0.0 {
+                return true;
+            }
+            let id = playback.id;
+            cleanup_playback(&mut commands, playback);
+            if player.active == Some(id) {
+                player.active = None;
+            }
+            player.states.insert(id, VideoPlaybackState::Finished);
+            events.write(VideoEvent::Finished { id });
+            return false;
+        }
+        true
+    });
+    uploads.0.retain(|id, _| active.0.contains_key(id));
+    let VideoPlayer {
+        suspended, states, ..
+    } = &mut *player;
+    suspended.retain(|id| {
+        matches!(
+            states.get(id),
+            Some(
+                VideoPlaybackState::Loading
+                    | VideoPlaybackState::Playing
+                    | VideoPlaybackState::Paused
+            )
+        )
+    });
 }
 
 fn exit_opacity(elapsed: Duration, duration: Duration) -> f32 {
@@ -634,7 +972,7 @@ fn present_frame(
                     frame.width,
                     frame.height,
                     rgba,
-                    playback.alpha_layout.is_some(),
+                    playback.alpha_layout.is_some() || playback.world.is_some(),
                 );
                 if let Ok(mut node) = nodes.get_mut(*image_entity) {
                     node.aspect_ratio = Some(aspect_ratio);
@@ -646,21 +984,42 @@ fn present_frame(
                 frame.width,
                 frame.height,
                 rgba,
-                playback.alpha_layout.is_some(),
+                playback.alpha_layout.is_some() || playback.world.is_some(),
             ));
-            let image_entity = commands
-                .spawn((
-                    ImageNode::new(image.clone()),
-                    Node {
-                        width: percent(100),
-                        max_height: percent(100),
-                        aspect_ratio: Some(aspect_ratio),
-                        ..default()
-                    },
-                    Pickable::IGNORE,
-                ))
-                .id();
-            if playback.alpha_layout.is_some() {
+            let image_entity = if playback.world.is_some() {
+                let material = materials.add(Yuv420Material {
+                    opacity: 1.0,
+                    alpha_layout: playback.alpha_layout,
+                    rgba: true,
+                    y: image.clone(),
+                    chroma0: image.clone(),
+                    chroma1: image.clone(),
+                    color_transform: frame.color_transform.into(),
+                    transfer: frame.transfer,
+                    format: YuvPixelFormat::I420,
+                });
+                spawn_video_surface(
+                    commands,
+                    playback.root,
+                    playback.world.as_ref(),
+                    material,
+                    aspect_ratio,
+                )
+            } else {
+                commands
+                    .spawn((
+                        ImageNode::new(image.clone()),
+                        Node {
+                            width: percent(100),
+                            max_height: percent(100),
+                            aspect_ratio: Some(aspect_ratio),
+                            ..default()
+                        },
+                        Pickable::IGNORE,
+                    ))
+                    .id()
+            };
+            if playback.alpha_layout.is_some() && playback.world.is_none() {
                 let material = materials.add(Yuv420Material {
                     opacity: 1.0,
                     alpha_layout: playback.alpha_layout,
@@ -677,7 +1036,9 @@ fn present_frame(
                     .remove::<ImageNode>()
                     .insert(MaterialNode(material));
             }
-            commands.entity(playback.root).add_child(image_entity);
+            if playback.world.is_none() {
+                commands.entity(playback.root).add_child(image_entity);
+            }
             playback.surface = Some(VideoSurface::Rgba {
                 image,
                 image_entity,
@@ -741,19 +1102,13 @@ fn present_frame(
         transfer: frame.transfer,
         format: YuvPixelFormat::I420,
     });
-    let image_entity = commands
-        .spawn((
-            MaterialNode(material),
-            Node {
-                width: percent(100),
-                max_height: percent(100),
-                aspect_ratio: Some(aspect_ratio),
-                ..default()
-            },
-            Pickable::IGNORE,
-        ))
-        .id();
-    commands.entity(playback.root).add_child(image_entity);
+    let image_entity = spawn_video_surface(
+        commands,
+        playback.root,
+        playback.world.as_ref(),
+        material,
+        aspect_ratio,
+    );
     playback.surface = Some(VideoSurface::YuvI420 {
         y_image,
         u_image,
@@ -801,19 +1156,13 @@ fn present_strided_frame(
             transfer: frame.transfer,
             format: YuvPixelFormat::I420,
         });
-        let image_entity = commands
-            .spawn((
-                MaterialNode(material),
-                Node {
-                    width: percent(100),
-                    max_height: percent(100),
-                    aspect_ratio: Some(aspect_ratio),
-                    ..default()
-                },
-                Pickable::IGNORE,
-            ))
-            .id();
-        commands.entity(playback.root).add_child(image_entity);
+        let image_entity = spawn_video_surface(
+            commands,
+            playback.root,
+            playback.world.as_ref(),
+            material,
+            aspect_ratio,
+        );
         playback.surface = Some(VideoSurface::YuvI420 {
             y_image: y_image.clone(),
             u_image: u_image.clone(),
@@ -872,20 +1221,13 @@ fn present_nv12_frame(
             format: YuvPixelFormat::Nv12,
         });
 
-        let image_entity = commands
-            .spawn((
-                MaterialNode(material),
-                Node {
-                    width: percent(100),
-                    max_height: percent(100),
-                    aspect_ratio: Some(aspect_ratio),
-                    ..default()
-                },
-                Pickable::IGNORE,
-            ))
-            .id();
-
-        commands.entity(playback.root).add_child(image_entity);
+        let image_entity = spawn_video_surface(
+            commands,
+            playback.root,
+            playback.world.as_ref(),
+            material,
+            aspect_ratio,
+        );
 
         playback.surface = Some(VideoSurface::YuvNv12 {
             y_image: y_image.clone(),
@@ -901,6 +1243,42 @@ fn present_nv12_frame(
     }
 
     upload.publish(frame, [y_image, uv_image, Handle::default()]);
+}
+
+fn spawn_video_surface(
+    commands: &mut Commands,
+    root: Entity,
+    world: Option<&(Handle<Mesh>, RenderLayers)>,
+    material: Handle<Yuv420Material>,
+    aspect_ratio: f32,
+) -> Entity {
+    let entity = if let Some((mesh, layers)) = world {
+        commands
+            .spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material),
+                layers.clone(),
+                Transform::default(),
+                Visibility::Inherited,
+                Pickable::IGNORE,
+            ))
+            .id()
+    } else {
+        commands
+            .spawn((
+                MaterialNode(material),
+                Node {
+                    width: percent(100),
+                    max_height: percent(100),
+                    aspect_ratio: Some(aspect_ratio),
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ))
+            .id()
+    };
+    commands.entity(root).add_child(entity);
+    entity
 }
 
 fn replace_surface(commands: &mut Commands, playback: &mut ActivePlayback) {
@@ -1031,14 +1409,14 @@ fn replace_rgba(
     width: u32,
     height: u32,
     data: Vec<u8>,
-    packed_alpha: bool,
+    shader_decodes_transfer: bool,
 ) {
     if let Some(mut image) = images.get_mut(handle) {
         let size = image.texture_descriptor.size;
         if size.width == width
             && size.height == height
             && image.texture_descriptor.format
-                == if packed_alpha {
+                == if shader_decodes_transfer {
                     TextureFormat::Rgba8Unorm
                 } else {
                     TextureFormat::Rgba8UnormSrgb
@@ -1046,12 +1424,12 @@ fn replace_rgba(
         {
             image.data = Some(data);
         } else {
-            *image = rgba_image(width, height, data, packed_alpha);
+            *image = rgba_image(width, height, data, shader_decodes_transfer);
         }
     }
 }
 
-fn rgba_image(width: u32, height: u32, data: Vec<u8>, packed_alpha: bool) -> Image {
+fn rgba_image(width: u32, height: u32, data: Vec<u8>, shader_decodes_transfer: bool) -> Image {
     Image::new(
         Extent3d {
             width,
@@ -1060,7 +1438,7 @@ fn rgba_image(width: u32, height: u32, data: Vec<u8>, packed_alpha: bool) -> Ima
         },
         TextureDimension::D2,
         data,
-        if packed_alpha {
+        if shader_decodes_transfer {
             TextureFormat::Rgba8Unorm
         } else {
             TextureFormat::Rgba8UnormSrgb
@@ -1072,6 +1450,181 @@ fn rgba_image(width: u32, height: u32, data: Vec<u8>, packed_alpha: bool) -> Ima
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspension_does_not_replace_manual_pause_or_affect_other_requests() {
+        let mut app = App::new();
+        app.init_resource::<VideoPlayer>()
+            .init_resource::<VideoUploads>()
+            .insert_non_send(ActiveVideo::default())
+            .add_message::<VideoEvent>()
+            .add_systems(Update, apply_video_controls);
+        let (first, second) = {
+            let mut player = app.world_mut().resource_mut::<VideoPlayer>();
+            let first = player.play(Handle::default());
+            let second = player.play(Handle::default());
+            assert!(player.set_suspended(first, true));
+            assert!(player.suspended.contains(&first));
+            assert!(!player.suspended.contains(&second));
+            player.pause(first);
+            (first, second)
+        };
+        app.update();
+        {
+            let mut player = app.world_mut().resource_mut::<VideoPlayer>();
+            assert!(player.set_suspended(first, false));
+            assert_eq!(player.state(first), Some(&VideoPlaybackState::Paused));
+            assert_eq!(player.state(second), Some(&VideoPlaybackState::Loading));
+            assert!(player.set_suspended(first, true));
+            player.resume(first);
+        }
+        app.update();
+        let mut player = app.world_mut().resource_mut::<VideoPlayer>();
+        assert!(
+            player.suspended.contains(&first),
+            "manual resume cannot release the host clock"
+        );
+        player.states.insert(first, VideoPlaybackState::Finished);
+        assert!(!player.set_suspended(first, true));
+        assert!(!player.set_suspended(VideoPlaybackId(u64::MAX), true));
+    }
+
+    #[test]
+    fn repetition_is_configured_per_request_without_changing_other_playbacks() {
+        let mut player = VideoPlayer::default();
+        let first = player.play(Handle::default());
+        let second = player.play(Handle::default());
+        assert!(player.set_looping(first, true));
+        assert!(player.pending[0].looping);
+        assert!(!player.pending[1].looping);
+        assert!(player.set_looping(first, false));
+        assert!(!player.pending[0].looping);
+        assert!(!player.set_looping(VideoPlaybackId(second.0 + 1), true));
+    }
+
+    #[test]
+    fn shader_decoded_rgba_uses_unorm_to_avoid_a_second_transfer_conversion() {
+        let world = rgba_image(2, 2, vec![128; 16], true);
+        assert_eq!(world.texture_descriptor.format, TextureFormat::Rgba8Unorm);
+        let ui = rgba_image(2, 2, vec![128; 16], false);
+        assert_eq!(ui.texture_descriptor.format, TextureFormat::Rgba8UnormSrgb);
+    }
+
+    #[test]
+    fn world_surface_is_a_mesh_not_a_ui_node_and_keeps_host_layers() {
+        let mut world = World::new();
+        let root = world
+            .spawn((Transform::default(), Visibility::Inherited))
+            .id();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mesh = (Handle::<Mesh>::default(), RenderLayers::layer(7));
+        let entity = {
+            let mut commands = Commands::new(&mut queue, &world);
+            spawn_video_surface(
+                &mut commands,
+                root,
+                Some(&mesh),
+                Handle::default(),
+                16.0 / 9.0,
+            )
+        };
+        queue.apply(&mut world);
+        assert!(world.get::<Mesh3d>(entity).is_some());
+        assert!(
+            world
+                .get::<MeshMaterial3d<Yuv420Material>>(entity)
+                .is_some()
+        );
+        assert!(world.get::<Node>(entity).is_none());
+        assert_eq!(world.get::<RenderLayers>(entity), Some(&mesh.1));
+        assert_eq!(world.get::<ChildOf>(entity).expect("parent").parent(), root);
+        world.despawn(root);
+        assert!(world.get_entity(entity).is_err());
+    }
+
+    #[test]
+    fn world_video_rejects_invalid_size_and_non_spatial_parent() {
+        let mut app = control_app();
+        app.add_systems(Update, start_pending_video);
+        let parent = app.world_mut().spawn_empty().id();
+        let id = {
+            let mut player = app.world_mut().resource_mut::<VideoPlayer>();
+            assert!(
+                player
+                    .play_world(Handle::default(), parent, Vec2::ZERO)
+                    .is_err()
+            );
+            assert!(player.pending.is_empty());
+            player
+                .play_world(Handle::default(), parent, Vec2::new(16.0, 9.0))
+                .expect("size")
+        };
+        app.update();
+        assert!(matches!(
+            app.world().resource::<VideoPlayer>().state(id),
+            Some(VideoPlaybackState::Failed(_))
+        ));
+    }
+
+    fn control_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<VideoAsset>()
+            .init_resource::<Assets<VideoAudio>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<VideoPlayer>()
+            .init_resource::<VideoUploads>()
+            .init_resource::<VideoDecodeSettings>()
+            .add_message::<VideoEvent>();
+        app.insert_non_send(ActiveVideo::default());
+        app
+    }
+
+    #[test]
+    fn independent_parent_lifetime_is_checked_even_behind_fullscreen_queue() {
+        let mut app = control_app();
+        app.add_systems(Update, start_pending_video);
+        let parent = app.world_mut().spawn(Node::default()).id();
+        let (full, child) = {
+            let mut player = app.world_mut().resource_mut::<VideoPlayer>();
+            let full = player.play(Handle::default());
+            player.active = Some(full);
+            let child = player.play_in(Handle::default(), parent);
+            (full, child)
+        };
+        app.world_mut().despawn(parent);
+        app.update();
+        let player = app.world().resource::<VideoPlayer>();
+        assert_eq!(player.state(child), Some(&VideoPlaybackState::Skipped));
+        assert_eq!(player.active(), Some(full));
+        assert_eq!(player.pending.len(), 1);
+    }
+
+    #[test]
+    fn cancelling_one_surface_preserves_other_requests_and_stop_all_cancels_everyone() {
+        let mut app = control_app();
+        app.add_systems(Update, apply_video_controls);
+        let parent = app.world_mut().spawn(Node::default()).id();
+        let (first, second, full) = {
+            let mut player = app.world_mut().resource_mut::<VideoPlayer>();
+            let first = player.play_in(Handle::default(), parent);
+            let second = player.play_in(Handle::default(), parent);
+            let full = player.play(Handle::default());
+            player.skip(first);
+            (first, second, full)
+        };
+        app.update();
+        let player = app.world().resource::<VideoPlayer>();
+        assert_eq!(player.state(first), Some(&VideoPlaybackState::Skipped));
+        assert_eq!(player.state(second), Some(&VideoPlaybackState::Loading));
+        assert_eq!(player.state(full), Some(&VideoPlaybackState::Loading));
+        app.world_mut().resource_mut::<VideoPlayer>().stop_all();
+        app.update();
+        let player = app.world().resource::<VideoPlayer>();
+        assert!(player.pending.is_empty());
+        assert_eq!(player.state(second), Some(&VideoPlaybackState::Skipped));
+        assert_eq!(player.state(full), Some(&VideoPlaybackState::Skipped));
+    }
 
     #[test]
     fn silent_video_can_finish_and_exit_fade_has_exact_endpoints() {

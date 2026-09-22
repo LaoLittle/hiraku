@@ -430,6 +430,14 @@ impl Plugin for HirakuPlugin {
             .add_systems(Update, drive_story_runtime.in_set(HirakuRuntimeSystems))
             .add_systems(
                 Update,
+                scene::sync_movie_clock
+                    .after(scene::clock::advance)
+                    .after(process_script_commands)
+                    .before(hiraku_video::VideoPlaybackSystems)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
                 complete_movie_waits
                     .before(drive_story_runtime)
                     .in_set(HirakuRuntimeSystems),
@@ -592,6 +600,7 @@ impl Plugin for HirakuPlugin {
                     scene::poll_sfx_playback.in_set(HirakuRuntimeSystems),
                     animate_custom_effects.in_set(HirakuRuntimeSystems),
                     scene::pictures::sync_pictures
+                        .before(hiraku_video::VideoPlaybackSystems)
                         .after(animate_camera_transition)
                         .after(animate_camera_shake)
                         .after(scene::process_script_commands)

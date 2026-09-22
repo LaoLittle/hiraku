@@ -190,6 +190,7 @@ mod api {
             return Err(NativeError::message("clip name must not be empty"));
         }
         let region = ClipRegion {
+            mask: None,
             center: [0.0; 2],
             size: [width as f32, height as f32],
             rotation: 0.0,
@@ -199,6 +200,25 @@ mod api {
             .scene_visuals
             .begin(SceneVisualTarget::Clip { name, region })?;
         Ok(SceneClipHandle(handle.0))
+    }
+
+    /// Use texture alpha inside the world-space clip rectangle (pictures only).
+    #[hks(name = "mask", selector = "SceneClip", receiver)]
+    fn clip_mask(
+        context: &mut CharacterContext,
+        handle: SceneClipHandle,
+        texture: String,
+    ) -> Result<SceneClipHandle, NativeError> {
+        if texture.trim().is_empty() {
+            return Err(NativeError::message("clip mask texture must not be empty"));
+        }
+        let Some((SceneVisualTarget::Clip { region, .. }, _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("clip handle is not pending"));
+        };
+        region.mask = Some(texture);
+        Ok(handle)
     }
 
     #[hks(name = "at", selector = "SceneClip", receiver)]
@@ -277,6 +297,7 @@ mod api {
         context
             .scene_visuals
             .begin_as(SceneVisualTarget::Picture(PictureCommand::Show {
+                video: None,
                 screen_space: false,
                 size: None,
                 slice: None,
@@ -290,6 +311,47 @@ mod api {
                 layer: 1.0,
                 seconds: 0.0,
             }))
+    }
+
+    /// A named animated picture; pose, transitions and hiding use Picture APIs.
+    #[hks(name = "video", selector = "scene")]
+    fn video(
+        context: &mut CharacterContext,
+        id: String,
+        movie: String,
+    ) -> Result<PictureShowHandle, NativeError> {
+        let handle = picture(context, id, movie)?;
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { video, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("missing video builder"));
+        };
+        *video = Some(crate::scene::pictures::PictureVideo {
+            layout: Default::default(),
+            looping: false,
+        });
+        Ok(handle)
+    }
+
+    #[hks(name = "looping", receiver)]
+    fn video_looping(
+        context: &mut CharacterContext,
+        handle: PictureShowHandle,
+        looping: bool,
+    ) -> Result<PictureShowHandle, NativeError> {
+        let Some((
+            SceneVisualTarget::Picture(PictureCommand::Show {
+                video: Some(video), ..
+            }),
+            _,
+        )) = context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "looping requires an uncommitted video picture",
+            ));
+        };
+        video.looping = looping;
+        Ok(handle)
     }
 
     pub(super) fn picture_at(
@@ -1045,6 +1107,34 @@ mod api {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_video_uses_picture_transitions_and_retains_loop_configuration() {
+        use super::*;
+        use crate::script::{StoryRuntime, StoryRuntimeEvent};
+        let code = compile_story_bytecode("video.hks", r#"
+            scene.video("water", "movies/water").looping(true).at(.center).size(640, 360).layer(2).time(0.5)
+            scene.hidePicture("water").time(0.25)
+        "#).expect("video builder compiles");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let Some(StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+            video: Some(video),
+            path,
+            seconds,
+            ..
+        }))) = runtime.step().expect("video show")
+        else {
+            panic!("expected video picture")
+        };
+        assert!(video.looping);
+        assert_eq!(path, "movies/water");
+        assert_eq!(seconds, 0.5);
+        assert!(matches!(
+            runtime.step().expect("hide"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Picture(
+                PictureCommand::Hide { seconds: 0.25, .. }
+            )))
+        ));
+    }
     use super::*;
 
     #[test]
@@ -1260,6 +1350,7 @@ mod tests {
         assert!(matches!(
             event(&mut show),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                video: None,
                 screen_space: true,
                 ..
             }))
@@ -1475,6 +1566,23 @@ mod tests {
             panic!("expected smoothstep motion");
         };
         assert_eq!(ease, crate::script::animation::Easing::SmoothStep);
+    }
+
+    #[test]
+    fn picture_alpha_clip_builder_commits_texture_and_world_bounds() {
+        let mut runtime = runtime(
+            r#"
+            scene.clipRect("split", 800, 600).mask("masks/split").at(.pos(20, -10))
+        "#,
+        );
+        let StoryRuntimeEvent::Effect(StoryEffect::Clip(ClipCommand::Define { region, .. })) =
+            event(&mut runtime)
+        else {
+            panic!("expected clip definition");
+        };
+        assert_eq!(region.mask.as_deref(), Some("masks/split"));
+        assert_eq!(region.center, [20.0, -10.0]);
+        assert_eq!(region.size, [800.0, 600.0]);
     }
 
     #[test]
@@ -2189,6 +2297,7 @@ mod tests {
         assert_eq!(
             event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                video: None,
                 screen_space: false,
                 id: "Backgrounds".into(),
                 size: None,

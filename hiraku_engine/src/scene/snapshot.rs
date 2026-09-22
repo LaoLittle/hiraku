@@ -154,6 +154,14 @@ pub(super) fn restore_scene_snapshot(
     snapshot: SceneSnapshot,
 ) {
     let text_effect = snapshot.text_effect.clone();
+    // Decoder instances are presentation state, never reusable across restores.
+    commands.queue(|world: &mut World| {
+        let mut query = world.query_filtered::<Entity, With<super::video_pictures::VideoPicture>>();
+        let entities: Vec<_> = query.iter(world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+    });
     // Playback controls are transient input, never restored story state.
     dialogue_state.fast_forward_enabled = false;
     dialogue_state.fast_forward_held = false;

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::prelude::*;
 use hiraku_video::{VideoAsset, VideoEvent, VideoPlaybackId, VideoPlayer};
@@ -8,11 +8,14 @@ use crate::script::{
 };
 
 #[derive(Resource, Default)]
-pub struct PendingMovieWaits(BTreeMap<VideoPlaybackId, ScriptRequestId>);
+pub struct PendingMovieWaits {
+    requests: BTreeMap<VideoPlaybackId, ScriptRequestId>,
+    playbacks: BTreeSet<VideoPlaybackId>,
+}
 
 impl PendingMovieWaits {
     pub(crate) fn is_waiting(&self) -> bool {
-        !self.0.is_empty()
+        !self.requests.is_empty()
     }
 }
 
@@ -41,15 +44,32 @@ pub(super) fn dispatch_video_command(
                 player.play_under_ui(asset)
             };
             let configured = player.set_fade_out(playback, fade_out);
+            waits.playbacks.insert(playback);
             debug_assert!(
                 configured,
                 "newly queued movie accepts playback configuration"
             );
             if let Some(done) = done {
-                waits.0.insert(playback, done);
+                waits.requests.insert(playback, done);
             }
         }
-        VideoCommand::Stop => player.stop_all(),
+        VideoCommand::Stop => {
+            for &id in &waits.playbacks {
+                player.skip(id);
+            }
+        }
+    }
+}
+
+/// Only engine-owned playback follows scene time. Videos hosted by the outer
+/// application keep their own clock and manual pause policy.
+pub(crate) fn sync_movie_clock(
+    clock: Res<Time<super::clock::SceneClock>>,
+    waits: Res<PendingMovieWaits>,
+    mut player: ResMut<VideoPlayer>,
+) {
+    for &id in &waits.playbacks {
+        player.set_suspended(id, clock.context().paused);
     }
 }
 
@@ -68,7 +88,8 @@ pub fn complete_movie_waits(
                 *id
             }
         };
-        if let Some(request) = waits.0.remove(&playback)
+        waits.playbacks.remove(&playback);
+        if let Some(request) = waits.requests.remove(&playback)
             && runtime.wait_request == Some(request)
         {
             responses.write(ScriptResponseMessage {
@@ -82,6 +103,62 @@ pub fn complete_movie_waits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_clock_suspends_only_engine_movies_and_terminal_events_release_ownership() {
+        let mut app = App::new();
+        app.init_resource::<PendingMovieWaits>()
+            .init_resource::<ScriptRuntimeState>()
+            .init_resource::<VideoPlayer>()
+            .init_resource::<Time<super::super::clock::SceneClock>>()
+            .add_message::<VideoEvent>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, (sync_movie_clock, complete_movie_waits).chain());
+        let id = app
+            .world_mut()
+            .resource_mut::<VideoPlayer>()
+            .play(Handle::default());
+        let external = app
+            .world_mut()
+            .resource_mut::<VideoPlayer>()
+            .play(Handle::default());
+        app.world_mut()
+            .resource_mut::<PendingMovieWaits>()
+            .playbacks
+            .insert(id);
+        app.world_mut()
+            .resource_mut::<Time<super::super::clock::SceneClock>>()
+            .context_mut()
+            .paused = true;
+        app.update();
+        assert!(app.world().resource::<VideoPlayer>().is_suspended(id));
+        assert!(!app.world().resource::<VideoPlayer>().is_suspended(external));
+        assert!(
+            app.world()
+                .resource::<PendingMovieWaits>()
+                .playbacks
+                .contains(&id)
+        );
+        app.world_mut()
+            .resource_mut::<Time<super::super::clock::SceneClock>>()
+            .context_mut()
+            .paused = false;
+        app.update();
+        assert!(!app.world().resource::<VideoPlayer>().is_suspended(id));
+        app.world_mut().write_message(VideoEvent::Skipped { id });
+        app.update();
+        assert!(
+            app.world()
+                .resource::<PendingMovieWaits>()
+                .playbacks
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<Messages<ScriptResponseMessage>>()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn background_video_completion_does_not_consume_a_dialogue_wait() {
@@ -121,7 +198,7 @@ mod tests {
         let playback = VideoPlaybackId(7);
         app.world_mut()
             .resource_mut::<PendingMovieWaits>()
-            .0
+            .requests
             .insert(playback, ScriptRequestId(11));
         app.world_mut()
             .resource_mut::<ScriptRuntimeState>()
@@ -149,7 +226,7 @@ mod tests {
         let playback = VideoPlaybackId(9);
         app.world_mut()
             .resource_mut::<PendingMovieWaits>()
-            .0
+            .requests
             .insert(playback, ScriptRequestId(12));
         app.world_mut()
             .write_message(VideoEvent::Finished { id: playback });
@@ -157,6 +234,11 @@ mod tests {
 
         let responses = app.world().resource::<Messages<ScriptResponseMessage>>();
         assert_eq!(responses.len(), 0);
-        assert!(app.world().resource::<PendingMovieWaits>().0.is_empty());
+        assert!(
+            app.world()
+                .resource::<PendingMovieWaits>()
+                .requests
+                .is_empty()
+        );
     }
 }

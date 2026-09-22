@@ -84,6 +84,8 @@ pub struct ScriptExecutionCommandContext<'w> {
 
 #[derive(SystemParam)]
 pub struct RenderAssetCommandContext<'w> {
+    pub movies: Option<Res<'w, crate::movie::MovieCatalog>>,
+    pub textures: Option<Res<'w, TextureCatalog>>,
     pub canvas: Res<'w, crate::HirakuCanvas>,
     pub preview: ResMut<'w, super::save_preview::SavePreview>,
     pub images: Res<'w, Assets<Image>>,
@@ -216,7 +218,43 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     warn!("failed to save slot `{slot}`: {error}");
                 }
             }
-            ScriptCommand::Stage(StageCommand::Clip(clip)) => {
+            ScriptCommand::Stage(StageCommand::Clip(mut clip)) => {
+                if let super::clipping::ClipCommand::Picture {
+                    id,
+                    region: Some(_),
+                } = &clip
+                    && shared_state
+                        .0
+                        .pictures
+                        .get(id)
+                        .is_some_and(|p| p.video.is_some())
+                {
+                    crate::script::emit_script_diagnostic(
+                        "video picture failed",
+                        "video picture clipping is not implemented",
+                    );
+                    script_runtime.story = None;
+                    return;
+                }
+                if let super::clipping::ClipCommand::Define { region, .. } = &mut clip {
+                    if let Some(name) = &region.mask {
+                        let Some(texture) = render_assets
+                            .textures
+                            .as_ref()
+                            .and_then(|catalog| catalog.resolve(name))
+                        else {
+                            warn!("clip mask texture `{name}` is not defined");
+                            continue;
+                        };
+                        if texture.rect.is_some() {
+                            warn!(
+                                "clip mask `{name}` must reference a whole image, not an atlas region"
+                            );
+                            continue;
+                        }
+                        region.mask = Some(texture.path.clone());
+                    }
+                }
                 if let Err(error) = shared_state.0.clips.apply(clip) {
                     warn!("{error}");
                 }
@@ -239,11 +277,51 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     return;
                 }
             }
-            ScriptCommand::Stage(StageCommand::Picture(picture)) => {
+            ScriptCommand::Stage(StageCommand::Picture(mut picture)) => {
+                if let pictures::PictureCommand::Show {
+                    id,
+                    path,
+                    video: Some(video),
+                    ..
+                } = &mut picture
+                {
+                    if shared_state.0.clips.picture_region(id).is_some() {
+                        crate::script::emit_script_diagnostic(
+                            "video picture failed",
+                            "remove the picture clip before showing a video; video clipping is not implemented",
+                        );
+                        script_runtime.story = None;
+                        return;
+                    }
+                    let Some(definition) = render_assets
+                        .movies
+                        .as_deref()
+                        .and_then(|c| c.resolve(path))
+                    else {
+                        crate::script::emit_script_diagnostic(
+                            "video picture failed",
+                            &format!("movie `{path}` is not defined"),
+                        );
+                        script_runtime.story = None;
+                        return;
+                    };
+                    *path = definition.path.clone();
+                    video.layout = definition.layout;
+                }
+                let shown = match &picture {
+                    pictures::PictureCommand::Show { id, .. } => Some(id.clone()),
+                    _ => None,
+                };
                 if let Err(error) =
                     pictures::apply_picture_command(&mut shared_state.0.pictures, picture)
                 {
                     warn!("{error}");
+                }
+                if let Some(id) = shown {
+                    let clip = shared_state.0.clips.picture_region(&id).cloned();
+                    if let Some(picture) = shared_state.0.pictures.get_mut(&id) {
+                        picture.resolved_clip = clip;
+                    }
                 }
             }
             ScriptCommand::Runtime(RuntimeCommand::Log(message)) => info!("[hks] {message}"),

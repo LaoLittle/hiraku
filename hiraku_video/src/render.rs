@@ -1,6 +1,10 @@
 use bevy::{
+    mesh::MeshVertexBufferLayoutRef,
+    pbr::{Material, MaterialPipeline, MaterialPipelineKey},
     prelude::*,
-    render::render_resource::{AsBindGroup, RenderPipelineDescriptor},
+    render::render_resource::{
+        AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    },
     shader::{ShaderDefVal, ShaderRef},
     ui_render::prelude::UiMaterialKey,
 };
@@ -61,46 +65,78 @@ impl UiMaterial for Yuv420Material {
     }
 
     fn specialize(descriptor: &mut RenderPipelineDescriptor, key: UiMaterialKey<Self>) {
-        let frag = descriptor
+        specialize_video(descriptor, key.bind_group_data);
+    }
+}
+
+impl Material for Yuv420Material {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://hiraku_video/shaders/yuv420.wesl".into()
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        specialize_video(descriptor, key.bind_group_data);
+        descriptor
             .fragment
             .as_mut()
-            .expect("YUV UI material must have a fragment shader");
-
-        let transfer_def = match key.bind_group_data.transfer {
-            TransferFunction::Linear => Some("TRANSFER_LINEAR"),
-            TransferFunction::Bt1886 => None,
-            TransferFunction::Srgb => Some("TRANSFER_SRGB"),
-            TransferFunction::Gamma22 => Some("TRANSFER_GAMMA_22"),
-            TransferFunction::Gamma28 => Some("TRANSFER_GAMMA_28"),
-        };
-
-        if let Some(transfer_def) = transfer_def {
-            frag.shader_defs
-                .push(ShaderDefVal::Bool(transfer_def.into(), true));
-        }
-
-        let format_def = match key.bind_group_data.format {
-            YuvPixelFormat::I420 => "FORMAT_I420",
-            YuvPixelFormat::Nv12 => "FORMAT_NV12",
-        };
-        if key.bind_group_data.rgba {
-            frag.shader_defs
-                .push(ShaderDefVal::Bool("FORMAT_RGBA".into(), true));
-        }
-        if let Some(layout) = key.bind_group_data.alpha_layout {
-            frag.shader_defs.push(ShaderDefVal::Bool(
-                match layout {
-                    crate::AlphaLayout::Vertical => "ALPHA_VERTICAL",
-                    crate::AlphaLayout::Horizontal => "ALPHA_HORIZONTAL",
-                }
-                .into(),
-                true,
-            ));
-        }
-
-        frag.shader_defs
-            .push(ShaderDefVal::Bool(format_def.into(), true));
+            .expect("video fragment")
+            .shader_defs
+            .push("WORLD_VIDEO".into());
+        descriptor.primitive.cull_mode = None;
+        Ok(())
     }
+}
+
+fn specialize_video(descriptor: &mut RenderPipelineDescriptor, key: Yuv420MaterialKey) {
+    let frag = descriptor
+        .fragment
+        .as_mut()
+        .expect("video material must have a fragment shader");
+
+    let transfer_def = match key.transfer {
+        TransferFunction::Linear => Some("TRANSFER_LINEAR"),
+        TransferFunction::Bt1886 => None,
+        TransferFunction::Srgb => Some("TRANSFER_SRGB"),
+        TransferFunction::Gamma22 => Some("TRANSFER_GAMMA_22"),
+        TransferFunction::Gamma28 => Some("TRANSFER_GAMMA_28"),
+    };
+
+    if let Some(transfer_def) = transfer_def {
+        frag.shader_defs
+            .push(ShaderDefVal::Bool(transfer_def.into(), true));
+    }
+
+    let format_def = match key.format {
+        YuvPixelFormat::I420 => "FORMAT_I420",
+        YuvPixelFormat::Nv12 => "FORMAT_NV12",
+    };
+    if key.rgba {
+        frag.shader_defs
+            .push(ShaderDefVal::Bool("FORMAT_RGBA".into(), true));
+    }
+    if let Some(layout) = key.alpha_layout {
+        frag.shader_defs.push(ShaderDefVal::Bool(
+            match layout {
+                crate::AlphaLayout::Vertical => "ALPHA_VERTICAL",
+                crate::AlphaLayout::Horizontal => "ALPHA_HORIZONTAL",
+            }
+            .into(),
+            true,
+        ));
+    }
+
+    frag.shader_defs
+        .push(ShaderDefVal::Bool(format_def.into(), true));
 }
 
 #[cfg(test)]
@@ -120,11 +156,14 @@ mod tests {
             include_str!("shaders/yuv420.wesl"),
             "embedded://hiraku_video/shaders/yuv420.wesl",
         ));
+        let world_vertex = assets.add(Shader::from_wesl(
+            "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };",
+            "embedded://bevy_pbr/render/forward_io.wesl"));
         let mut cache = ShaderCache::new((), |_, source, _| match source {
             ShaderCacheSource::Wgsl(source) => Ok(source),
             _ => panic!("expected WGSL"),
         });
-        for handle in [&vertex, &fragment] {
+        for handle in [&vertex, &world_vertex, &fragment] {
             cache.set_shader(
                 handle.id(),
                 assets.get(handle).expect("shader fixture").clone(),
@@ -148,6 +187,11 @@ mod tests {
                 cache
                     .get(index, fragment.id(), &defs)
                     .unwrap_or_else(|error| panic!("{format}/{layout:?}: {error}"));
+                defs.push(ShaderDefVal::Bool("WORLD_VIDEO".into(), true));
+                defs.push(ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 3));
+                cache
+                    .get(index + 10, fragment.id(), &defs)
+                    .unwrap_or_else(|error| panic!("world {format}/{layout:?}: {error}"));
             }
         }
     }

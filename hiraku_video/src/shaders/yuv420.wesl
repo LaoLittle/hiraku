@@ -1,22 +1,26 @@
-import bevy_ui_render::ui_vertex_output::UiVertexOutput;
+@if(WORLD_VIDEO) import bevy_pbr::render::forward_io::VertexOutput;
+@if(!WORLD_VIDEO) import bevy_ui_render::ui_vertex_output::UiVertexOutput;
+
+@if(WORLD_VIDEO) const VIDEO_GROUP: u32 = constants::MATERIAL_BIND_GROUP;
+@else const VIDEO_GROUP: u32 = 1u;
 
 @if(FORMAT_I420) {
 
-@group(1) @binding(0) var y_texture: texture_2d<f32>;
-@group(1) @binding(1) var u_texture: texture_2d<f32>;
-@group(1) @binding(2) var v_texture: texture_2d<f32>;
+@group(VIDEO_GROUP) @binding(0) var y_texture: texture_2d<f32>;
+@group(VIDEO_GROUP) @binding(1) var u_texture: texture_2d<f32>;
+@group(VIDEO_GROUP) @binding(2) var v_texture: texture_2d<f32>;
 
 }
 
 @elif(FORMAT_NV12) {
 
-@group(1) @binding(0) var y_texture: texture_2d<f32>;
-@group(1) @binding(1) var uv_texture: texture_2d<f32>;
-@group(1) @binding(2) var _dummy: texture_2d<f32>;
+@group(VIDEO_GROUP) @binding(0) var y_texture: texture_2d<f32>;
+@group(VIDEO_GROUP) @binding(1) var uv_texture: texture_2d<f32>;
+@group(VIDEO_GROUP) @binding(2) var _dummy: texture_2d<f32>;
 
 }
 
-@group(1) @binding(3) var main_sampler: sampler;
+@group(VIDEO_GROUP) @binding(3) var main_sampler: sampler;
 
 struct YuvColorTransform {
     row_r: vec4<f32>,
@@ -25,7 +29,7 @@ struct YuvColorTransform {
     luma: vec2<f32>,
 };
 
-@group(1) @binding(4) var<uniform> color_transform: YuvColorTransform;
+@group(VIDEO_GROUP) @binding(4) var<uniform> color_transform: YuvColorTransform;
 
 fn to_linear_vec3(val: vec3<f32>) -> vec3<f32> {
     let x = clamp(val, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -68,23 +72,22 @@ fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
     }
 }
 
-@group(1) @binding(5) var<uniform> opacity: f32;
+@group(VIDEO_GROUP) @binding(5) var<uniform> opacity: f32;
 
-@fragment
-fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
-    var color_uv = in.uv;
+fn video_color(uv: vec2<f32>) -> vec4<f32> {
+    var color_uv = uv;
     var alpha = 1.0;
     // Reserve a chroma texel at the split to prevent bilinear sampling from
     // blending the color half with the grayscale matte half.
     let margin = vec2<f32>(1.0) / vec2<f32>(textureDimensions(y_texture));
     @if(ALPHA_VERTICAL) {
-        color_uv = clamp(in.uv * vec2<f32>(1.0, 0.5), margin, vec2<f32>(1.0, 0.5) - margin);
-        let alpha_uv = clamp(in.uv * vec2<f32>(1.0, 0.5) + vec2<f32>(0.0, 0.5), vec2<f32>(0.0, 0.5) + margin, vec2<f32>(1.0) - margin);
+        color_uv = clamp(uv * vec2<f32>(1.0, 0.5), margin, vec2<f32>(1.0, 0.5) - margin);
+        let alpha_uv = clamp(uv * vec2<f32>(1.0, 0.5) + vec2<f32>(0.0, 0.5), vec2<f32>(0.0, 0.5) + margin, vec2<f32>(1.0) - margin);
         alpha = textureSample(y_texture, main_sampler, alpha_uv).r;
     }
     @elif(ALPHA_HORIZONTAL) {
-        color_uv = clamp(in.uv * vec2<f32>(0.5, 1.0), margin, vec2<f32>(0.5, 1.0) - margin);
-        let alpha_uv = clamp(in.uv * vec2<f32>(0.5, 1.0) + vec2<f32>(0.5, 0.0), vec2<f32>(0.5, 0.0) + margin, vec2<f32>(1.0) - margin);
+        color_uv = clamp(uv * vec2<f32>(0.5, 1.0), margin, vec2<f32>(0.5, 1.0) - margin);
+        let alpha_uv = clamp(uv * vec2<f32>(0.5, 1.0) + vec2<f32>(0.5, 0.0), vec2<f32>(0.5, 0.0) + margin, vec2<f32>(1.0) - margin);
         alpha = textureSample(y_texture, main_sampler, alpha_uv).r;
     }
     // Hardware may convert full-range encoded Y to limited-range output.
@@ -114,4 +117,15 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
 
     return vec4<f32>(linear_rgb, clamp(alpha, 0.0, 1.0) * opacity);
     }
+}
+
+@if(WORLD_VIDEO)
+@fragment
+fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    return video_color(in.uv);
+}
+@else
+@fragment
+fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
+    return video_color(in.uv);
 }

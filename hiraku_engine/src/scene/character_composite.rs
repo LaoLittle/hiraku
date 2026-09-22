@@ -901,6 +901,7 @@ mod tests {
                 actor_id: "bob".into(),
             });
         let region = super::super::clipping::ClipRegion {
+            mask: None,
             center: [10.0, 20.0],
             size: [40.0, 80.0],
             rotation: 30.0,

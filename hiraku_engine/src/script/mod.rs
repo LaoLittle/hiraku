@@ -183,7 +183,13 @@ pub(crate) fn script_command_from_effect(
             ScriptCommand::Stage(StageCommand::SetActorDepth { id, depth })
         }
         StoryEffect::Picture(mut picture) => {
-            if let crate::scene::pictures::PictureCommand::Show { path, rect, .. } = &mut picture {
+            if let crate::scene::pictures::PictureCommand::Show {
+                path,
+                rect,
+                video: None,
+                ..
+            } = &mut picture
+            {
                 let texture = textures
                     .and_then(|catalog| catalog.resolve(path))
                     .ok_or_else(|| format!("texture `{path}` is not defined"))?;

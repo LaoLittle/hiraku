@@ -100,8 +100,20 @@ pub fn complete(
                     unreachable!()
                 };
                 if let Some(picture) = shared.0.pictures.get(id) {
-                    let handle: Handle<Image> =
-                        crate::texture::load_static_image(&assets, picture.path.clone());
+                    let handle = if let Some(video) = &picture.video {
+                        let layout = video.layout;
+                        assets
+                            .load_builder()
+                            .with_settings(
+                                move |settings: &mut hiraku_video::VideoLoaderSettings| {
+                                    settings.layout = layout
+                                },
+                            )
+                            .load::<hiraku_video::VideoAsset>(picture.path.clone())
+                            .untyped()
+                    } else {
+                        crate::texture::load_static_image(&assets, picture.path.clone()).untyped()
+                    };
                     if !matches!(command, P::Hide { .. } | P::Exit { .. })
                         && matches!(
                             assets.load_state(handle.id()),

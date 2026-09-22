@@ -80,6 +80,7 @@ mod snapshot;
 pub(crate) mod ui_hover;
 pub(crate) mod ui_timers;
 mod video_runtime;
+mod video_pictures;
 pub(crate) mod widgets;
 
 pub use animation_runtime::{
@@ -139,6 +140,7 @@ use screen_ui::{
 use snapshot::restore_scene_snapshot;
 pub use snapshot::sync_scene_snapshot;
 use video_runtime::dispatch_video_command;
+pub(crate) use video_runtime::sync_movie_clock;
 pub use video_runtime::{PendingMovieWaits, complete_movie_waits};
 
 const STAGE_Z_BACKGROUND: f32 = 0.0;

@@ -1,5 +1,6 @@
+use crate::VideoPlaybackId;
 use hiraku_media::{VideoFrame, VideoPixels};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bevy::{
     prelude::*,
@@ -15,6 +16,9 @@ use bevy::{
 
 #[derive(Clone, Default, Resource, ExtractResource)]
 #[extract_app(RenderApp)]
+pub(crate) struct VideoUploads(pub BTreeMap<VideoPlaybackId, VideoUpload>);
+
+#[derive(Clone, Default)]
 pub(crate) struct VideoUpload {
     generation: u64,
     // Extraction clones only handles and the Arc, never the decoded pixels.
@@ -39,8 +43,8 @@ impl VideoUpload {
 }
 
 pub(crate) fn install_video_upload(app: &mut App) {
-    app.init_resource::<VideoUpload>()
-        .add_plugins(ExtractResourcePlugin::<VideoUpload>::default());
+    app.init_resource::<VideoUploads>()
+        .add_plugins(ExtractResourcePlugin::<VideoUploads>::default());
     if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
         render_app.add_systems(
             Render,
@@ -52,10 +56,27 @@ pub(crate) fn install_video_upload(app: &mut App) {
 }
 
 fn upload_video_frame(
-    upload: Res<VideoUpload>,
+    uploads: Res<VideoUploads>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     render_queue: Res<RenderQueue>,
-    mut uploaded_generation: Local<u64>,
+    mut generations: Local<BTreeMap<VideoPlaybackId, u64>>,
+) {
+    generations.retain(|id, _| uploads.0.contains_key(id));
+    for (id, upload) in &uploads.0 {
+        upload_frame(
+            upload,
+            &gpu_images,
+            &render_queue,
+            generations.entry(*id).or_default(),
+        );
+    }
+}
+
+fn upload_frame(
+    upload: &VideoUpload,
+    gpu_images: &RenderAssets<GpuImage>,
+    render_queue: &RenderQueue,
+    uploaded_generation: &mut u64,
 ) {
     if upload.generation == *uploaded_generation {
         return;
@@ -143,4 +164,79 @@ fn write_plane(
             depth_or_array_layers: 1,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(timestamp: i64) -> VideoFrame {
+        VideoFrame {
+            timestamp,
+            width: 2,
+            height: 2,
+            chroma_width: 1,
+            chroma_height: 1,
+            color_transform: hiraku_media::YuvColorTransform::from_luma_coefficients(
+                0.2126, 0.0722, false,
+            ),
+            transfer: hiraku_media::TransferFunction::Srgb,
+            pixels: VideoPixels::I420Strided {
+                planes: Arc::from([0u8; 6]),
+                u_offset: 4,
+                v_offset: 5,
+                y_stride: 2,
+                chroma_stride: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn per_playback_uploads_do_not_overwrite_sibling_frames_or_copy_pixels() {
+        let mut uploads = VideoUploads::default();
+        uploads
+            .0
+            .entry(VideoPlaybackId(1))
+            .or_default()
+            .publish(frame(10), Default::default());
+        uploads
+            .0
+            .entry(VideoPlaybackId(2))
+            .or_default()
+            .publish(frame(20), Default::default());
+        let extracted = uploads.clone();
+        assert!(Arc::ptr_eq(
+            uploads.0[&VideoPlaybackId(1)]
+                .frame
+                .as_ref()
+                .expect("first"),
+            extracted.0[&VideoPlaybackId(1)]
+                .frame
+                .as_ref()
+                .expect("extracted")
+        ));
+        uploads.0.remove(&VideoPlaybackId(1));
+        assert_eq!(
+            uploads.0[&VideoPlaybackId(2)]
+                .frame
+                .as_ref()
+                .expect("second")
+                .timestamp,
+            20
+        );
+        uploads
+            .0
+            .get_mut(&VideoPlaybackId(2))
+            .expect("slot")
+            .clear();
+        assert!(uploads.0[&VideoPlaybackId(2)].frame.is_none());
+        assert_eq!(
+            extracted.0[&VideoPlaybackId(2)]
+                .frame
+                .as_ref()
+                .expect("render snapshot")
+                .timestamp,
+            20
+        );
+    }
 }

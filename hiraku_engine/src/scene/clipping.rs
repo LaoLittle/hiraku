@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClipRegion {
+    /// Optional catalog texture whose alpha clips pictures within this region.
+    pub mask: Option<String>,
     pub center: [f32; 2],
     pub size: [f32; 2],
     pub rotation: f32,
@@ -45,6 +47,16 @@ impl ClipState {
                     return Err("clip name must not be empty".into());
                 }
                 region.rect().map_err(str::to_owned)?;
+                if region
+                    .mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.trim().is_empty())
+                {
+                    return Err("clip mask texture must not be empty".into());
+                }
+                if region.mask.is_some() && self.actors.values().any(|value| value == &name) {
+                    return Err("texture clips currently support pictures only".into());
+                }
                 self.regions.insert(name, region);
             }
             ClipCommand::Remove { name } => {
@@ -55,6 +67,13 @@ impl ClipState {
                 self.pictures.retain(|_, region| region != &name);
             }
             ClipCommand::Actor { id, region } => {
+                if region
+                    .as_ref()
+                    .and_then(|name| self.regions.get(name))
+                    .is_some_and(|r| r.mask.is_some())
+                {
+                    return Err("texture clips currently support pictures only".into());
+                }
                 Self::attach(&self.regions, &mut self.actors, id, region)?
             }
             ClipCommand::Picture { id, region } => {
@@ -93,11 +112,59 @@ impl ClipState {
     pub fn picture(&self, id: &str) -> Option<ClipRect> {
         self.resolve(self.pictures.get(id))
     }
+
+    pub fn picture_mask(&self, id: &str) -> Option<&str> {
+        self.regions.get(self.pictures.get(id)?)?.mask.as_deref()
+    }
+
+    pub fn picture_region(&self, id: &str) -> Option<&ClipRegion> {
+        self.regions.get(self.pictures.get(id)?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_clip_roundtrips_and_cannot_silently_be_used_as_actor_rectangle() {
+        let mut state = ClipState::default();
+        state
+            .apply(ClipCommand::Define {
+                name: "split".into(),
+                region: ClipRegion {
+                    mask: Some("textures/split.png".into()),
+                    center: [0.0; 2],
+                    size: [800.0, 600.0],
+                    rotation: 0.0,
+                },
+            })
+            .expect("define alpha clip");
+        state
+            .apply(ClipCommand::Picture {
+                id: "room".into(),
+                region: Some("split".into()),
+            })
+            .expect("attach picture");
+        let bytes = hiraku_script::hson::to_vec(&state).expect("serialize");
+        let restored: ClipState = hiraku_script::hson::from_slice(&bytes).expect("restore");
+        assert_eq!(restored.picture_mask("room"), Some("textures/split.png"));
+        assert_eq!(restored, state);
+        assert!(
+            state
+                .apply(ClipCommand::Actor {
+                    id: "alice".into(),
+                    region: Some("split".into())
+                })
+                .is_err()
+        );
+        state
+            .apply(ClipCommand::Remove {
+                name: "split".into(),
+            })
+            .expect("remove");
+        assert_eq!(state.picture_mask("room"), None);
+    }
 
     #[test]
     fn shared_region_survives_snapshot_and_detaches_on_remove() {
@@ -106,6 +173,7 @@ mod tests {
             .apply(ClipCommand::Define {
                 name: "window".into(),
                 region: ClipRegion {
+                    mask: None,
                     center: [10.0, 20.0],
                     size: [40.0, 80.0],
                     rotation: 30.0,
@@ -126,6 +194,7 @@ mod tests {
             .expect("picture");
         assert_eq!(state.actor("alice"), state.picture("room"));
         let updated = ClipRegion {
+            mask: None,
             center: [-30.0, 60.0],
             size: [50.0, 90.0],
             rotation: -15.0,

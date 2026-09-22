@@ -50,12 +50,11 @@ mod api {
     fn fade_out(
         context: &mut CharacterContext,
         MovieHandle(id): MovieHandle,
-        milliseconds: f64,
+        seconds: f64,
     ) -> Result<MovieHandle, NativeError> {
-        let duration =
-            std::time::Duration::try_from_secs_f64(milliseconds / 1000.0).map_err(|_| {
-                NativeError::message("movie fade duration must be finite and non-negative")
-            })?;
+        let duration = std::time::Duration::try_from_secs_f64(seconds).map_err(|_| {
+            NativeError::message("movie fade duration must be finite and non-negative")
+        })?;
         let millis = u64::try_from(duration.as_millis())
             .map_err(|_| NativeError::message("movie fade duration is too large"))?;
         context
@@ -148,7 +147,7 @@ mod tests {
 
     #[test]
     fn movie_exit_duration_reaches_the_host_and_survives_restore() {
-        let code = compile_story_bytecode("movie.hks", "movie(\"clip\").fadeOut(1000).await()")
+        let code = compile_story_bytecode("movie.hks", "movie(\"clip\").fadeOut(1.0).await()")
             .expect("movie with exit fade compiles");
         let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
         let expected = StoryRuntimeEvent::Wait(StoryWait::Movie {
