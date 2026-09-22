@@ -1,3 +1,10 @@
+mod audio_packet;
+pub(crate) use audio_packet::AudioPacketDecoder;
+// Pure metadata policy is testable without an Android NDK or decoder device.
+#[cfg(test)]
+#[path = "android/color.rs"]
+mod android_color_tests;
+
 cfg_select! {
     target_family = "wasm" => {
         mod wasm;

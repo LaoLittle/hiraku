@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use hiraku_opus::OpusDecoder;
+use crate::AudioPacketDecoder;
 use hiraku_rav1d::{Decoder as Av1Decoder, Picture as Av1Picture, PixelLayout, PlanarImageComponent, Rav1dError, Settings};
 use crate::{AudioData, AudioDecoderConfig, CodecError, DecodeSettings, EncodedChunk, TransferFunction, VideoDecoderConfig, VideoFrame, VideoPixels, YuvColorTransform};
 
@@ -72,17 +72,16 @@ impl Video {
         Ok(frames)
     }
 }
-pub(super) struct Audio { decoder: OpusDecoder, config: AudioDecoderConfig }
+pub(super) struct Audio { decoder: AudioPacketDecoder, config: AudioDecoderConfig }
 impl Audio {
     pub fn new(config: AudioDecoderConfig) -> Result<Self, CodecError> {
         if !supports_audio(&config) { return Err(CodecError::Unsupported(config.codec.0.clone())); }
-        let decoder = OpusDecoder::new(config.sample_rate as i32, config.number_of_channels.into()).map_err(operation)?;
+        let decoder = AudioPacketDecoder::new(&config)?;
         Ok(Self { decoder, config })
     }
     pub fn decode(&mut self, chunk: EncodedChunk) -> Result<Vec<AudioData>, CodecError> {
-        let frame_size = (self.config.sample_rate / 1000 * 120) as usize;
-        let mut samples = vec![0.0; frame_size * self.config.number_of_channels as usize];
-        let count = self.decoder.decode(&chunk.data, frame_size, &mut samples).map_err(operation)?;
+        let mut samples = vec![0.0; self.decoder.output_capacity()];
+        let count = self.decoder.decode_into(&chunk.data, &mut samples)?;
         samples.truncate(count * self.config.number_of_channels as usize);
         Ok(vec![AudioData { timestamp: chunk.timestamp, sample_rate: self.config.sample_rate,
             number_of_channels: self.config.number_of_channels, samples: samples.into() }])

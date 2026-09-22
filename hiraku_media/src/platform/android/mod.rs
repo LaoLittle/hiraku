@@ -1,6 +1,7 @@
 //! NDK MediaCodec byte-buffer decoding. Driver buffers are released on the
 //! worker thread after copying; neither JNI nor a rendering surface is needed.
 use super::frame::{Plane, planar_frame};
+mod color;
 use crate::*;
 use ndk::media::{
     media_codec::{
@@ -17,6 +18,7 @@ use std::{
 pub(super) struct MediaCodecDecoder {
     codec: MediaCodec,
     origin: Option<i64>,
+    codec_name: String,
 }
 fn error(value: impl std::fmt::Display) -> CodecError {
     CodecError::Operation(format!("MediaCodec: {value}"))
@@ -58,6 +60,7 @@ impl MediaCodecDecoder {
         Ok(Self {
             codec,
             origin: None,
+            codec_name: config.codec.0.clone(),
         })
     }
     pub fn decode(
@@ -162,7 +165,8 @@ impl MediaCodecDecoder {
                                 .presentation_time_us()
                                 .checked_add(self.origin.unwrap_or(0))
                                 .ok_or_else(|| error("timestamp overflow"))?;
-                            copy_output(bytes, &buffer.format(), timestamp).map(Some)
+                            copy_output(bytes, &buffer.format(), timestamp, &self.codec_name)
+                                .map(Some)
                         })()
                     } else {
                         Ok(None)
@@ -191,6 +195,7 @@ fn copy_output(
     bytes: &[u8],
     format: &MediaFormat,
     timestamp: i64,
+    codec: &str,
 ) -> Result<VideoFrame, CodecError> {
     let positive = |key: &str| -> Result<usize, CodecError> {
         format
@@ -263,24 +268,12 @@ fn copy_output(
             .ok_or_else(|| error("plane outside output buffer"))
     };
 
-    // TODO: handle unspecified (0) here.
-    let (kr, kb) = match format.i32("color-standard").unwrap_or(1) {
-        0 | 1 => (0.2126, 0.0722),
-        2 | 4 => (0.299, 0.114),
-        6 => (0.2627, 0.0593),
-        _ => return Err(error("unsupported color standard")),
-    };
-
-    // TODO: handle unspecified (0) here.
-    let transfer = match format.i32("color-transfer").unwrap_or(3) {
-        1 => TransferFunction::Linear,
-        0 | 3 => TransferFunction::Bt1886,
-        _ => {
-            return Err(error(
-                "unsupported transfer function (HDR is not supported)",
-            ));
-        }
-    };
+    let (transform, transfer) = color::resolve(
+        format.i32("color-standard"),
+        format.i32("color-transfer"),
+        format.i32("color-range"),
+        codec,
+    )?;
     planar_frame(
         timestamp,
         w as u32,
@@ -302,7 +295,7 @@ fn copy_output(
                 pixel_stride: if nv12 { 2 } else { 1 },
             },
         ],
-        YuvColorTransform::from_luma_coefficients(kr, kb, format.i32("color-range") != Some(1)),
+        transform,
         transfer,
     )
 }

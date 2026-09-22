@@ -6,6 +6,8 @@
 mod codec;
 mod platform;
 pub use codec::*;
+mod audio_packet;
+pub use audio_packet::AudioPacketDecoder;
 
 use std::sync::Arc;
 

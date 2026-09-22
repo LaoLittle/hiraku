@@ -10,7 +10,7 @@ license.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true
 
-[target.'cfg(not(target_family = "wasm"))'.dependencies.hiraku-opus]
+[dependencies.hiraku-opus]
 git = "https://github.com/Hiraku-Project/opus-rs.git"
 version = "0.1.32"
 
