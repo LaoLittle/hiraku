@@ -10,11 +10,11 @@ use hiraku_script::{
 hiraku_script::hks_define! {
 #[derive(Clone, Copy)]
 enum PostProcess {
-    Settings(f64, f64, f64),
+    Settings(f64, f64, f64, f64, f64, f64),
 }
 impl PostProcess {
     #[getter]
-    fn identity() -> PostProcess { Self::Settings(0.0, 0.0, 1.0) }
+    fn identity() -> PostProcess { Self::Settings(0.0, 0.0, 1.0, 0.0, 0.0, 0.0) }
 }
 }
 
@@ -37,8 +37,8 @@ mod modifiers {
                 "blur radius must be in 0..=128 texture pixels",
             ));
         }
-        modify(effect, |PostProcess::Settings(_, exposure, saturation)| {
-            PostProcess::Settings(radius, exposure, saturation)
+        modify(effect, |PostProcess::Settings(_, exposure, saturation, r, g, b)| {
+            PostProcess::Settings(radius, exposure, saturation, r, g, b)
         })
     }
 
@@ -56,8 +56,8 @@ mod modifiers {
         if !stops.is_finite() || !(-16.0..=16.0).contains(&stops) {
             return Err(NativeError::message("exposure must be in -16..=16 stops"));
         }
-        modify(effect, |PostProcess::Settings(blur, _, saturation)| {
-            PostProcess::Settings(blur, stops, saturation)
+        modify(effect, |PostProcess::Settings(blur, _, saturation, r, g, b)| {
+            PostProcess::Settings(blur, stops, saturation, r, g, b)
         })
     }
 
@@ -75,8 +75,30 @@ mod modifiers {
         if !value.is_finite() || !(0.0..=8.0).contains(&value) {
             return Err(NativeError::message("saturation must be in 0..=8"));
         }
-        modify(effect, |PostProcess::Settings(blur, exposure, _)| {
-            PostProcess::Settings(blur, exposure, value)
+        modify(effect, |PostProcess::Settings(blur, exposure, _, r, g, b)| {
+            PostProcess::Settings(blur, exposure, value, r, g, b)
+        })
+    }
+
+    #[hks(
+        name = "grayscaleGamma",
+        selector = "PostProcess",
+        receiver = "PostProcess",
+        result = "PostProcess"
+    )]
+    fn grayscale_gamma(
+        context: &mut CharacterContext,
+        effect: Value,
+        red: f64,
+        green: f64,
+        blue: f64,
+    ) -> Result<Value, NativeError> {
+        let _ = context;
+        if [red, green, blue].into_iter().any(|v| !v.is_finite() || v <= 0.0 || v > 16.0) {
+            return Err(NativeError::message("grayscale gamma must be in 0..=16"));
+        }
+        modify(effect, |PostProcess::Settings(blur, exposure, saturation, _, _, _)| {
+            PostProcess::Settings(blur, exposure, saturation, red, green, blue)
         })
     }
 }
@@ -141,11 +163,16 @@ mod api {
 
 impl PostProcess {
     fn parameters(self) -> EffectParameters {
-        let Self::Settings(blur, exposure, saturation) = self;
+        let Self::Settings(blur, exposure, saturation, red, green, blue) = self;
         EffectParameters {
             blur_radius: blur as f32,
             exposure: exposure as f32,
             saturation: saturation as f32,
+            grayscale_gamma: if red > 0.0 {
+                bevy::prelude::Vec4::new(red as f32, green as f32, blue as f32, 1.0)
+            } else {
+                bevy::prelude::Vec4::ZERO
+            },
             ..Default::default()
         }
     }

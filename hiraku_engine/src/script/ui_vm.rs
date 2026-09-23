@@ -855,8 +855,13 @@ mod native_ui {
         node: UiNodeHandle,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
-        if !matches!(draft.kind, UiDraftKind::Row | UiDraftKind::Column) {
-            return Err(NativeError::message("centered requires row or column"));
+        if !matches!(
+            draft.kind,
+            UiDraftKind::Row | UiDraftKind::Column | UiDraftKind::ChoiceOptions(_)
+        ) {
+            return Err(NativeError::message(
+                "centered requires row, column or choiceOptions",
+            ));
         }
         draft.centered = true;
         Ok(node)
@@ -2921,8 +2926,8 @@ fn materialize_node(
                 padding: draft.padding,
                 background: draft.surface,
                 border: None,
-                justify: Some("center".into()),
-                align_items: Some("stretch".into()),
+                justify: draft.centered.then(|| "center".into()),
+                align_items: Some(if draft.centered { "center" } else { "stretch" }.into()),
                 layout: draft.layout,
                 children,
             }))
@@ -5012,6 +5017,8 @@ canvas {
             panic!("choiceOptions should materialize a column");
         };
         assert_eq!(options.gap, 9.0);
+        assert_eq!(options.justify, None);
+        assert_eq!(options.align_items.as_deref(), Some("stretch"));
         assert!(matches!(
             &options.children[0],
             ScreenNode::Button(button)
@@ -5026,6 +5033,38 @@ canvas {
                     && button.enabled
                     && button.value == Some(StoredValue::Int(1))
         ));
+    }
+
+    #[test]
+    fn canvas_choice_options_can_center_fixed_size_buttons() {
+        let values = UiContext::new(BTreeMap::from([(
+            "choice".into(),
+            StoredValue::Map(BTreeMap::from([(
+                "options".into(),
+                StoredValue::Array(vec![StoredValue::String("Route A".into())]),
+            )])),
+        )]));
+        let screen = evaluate_ui_component_named(
+            "memory://choice.ui.hks",
+            r#"import ui.widgets.*
+canvas {
+    choiceOptions { index: Int, label: String ->
+        button(index) { text(label) }.size(.abs(600, 80))
+    }.gap(16).size(.rel(100, 100)).centered()
+}"#,
+            values,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("choice options should fill and center within a canvas");
+        let ScreenNode::Column(options) = &screen.children[0] else {
+            panic!("choiceOptions should materialize a column");
+        };
+        assert!(!screen.panel);
+        assert_eq!(options.justify.as_deref(), Some("center"));
+        assert_eq!(options.align_items.as_deref(), Some("center"));
+        assert_eq!(options.layout.width_percent, Some(100.0));
+        assert_eq!(options.layout.height_percent, Some(100.0));
     }
 
     #[test]

@@ -9,6 +9,7 @@ struct StandardUniform {
     exposure: f32,
     saturation: f32,
     tint: vec4<f32>,
+    grayscale_gamma: vec4<f32>,
     vignette: vec4<f32>,
 }
 @group(EFFECT_BINDING_GROUP) @binding(7) var<uniform> settings: StandardUniform;
@@ -21,5 +22,5 @@ fn fragment(input: VertexOutput) -> FragmentOutput {
     sample.uv += (local_uv - sample.local_uv) * (sample.high - sample.low);
     sample.local_uv = local_uv;
     return finish(input, grade(sampleColor(sample, sample.uv), local_uv,
-        settings.exposure, settings.saturation, settings.tint, settings.vignette));
+        settings.exposure, settings.saturation, settings.tint, settings.grayscale_gamma, settings.vignette));
 }

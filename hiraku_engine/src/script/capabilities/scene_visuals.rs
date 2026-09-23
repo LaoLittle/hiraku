@@ -522,6 +522,29 @@ mod api {
         Ok(handle)
     }
 
+    pub(super) fn picture_grayscale_gamma(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        red: f64,
+        green: f64,
+        blue: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if [red, green, blue]
+            .into_iter()
+            .any(|value| !value.is_finite() || !(0.0..=16.0).contains(&value) || value == 0.0)
+        {
+            return Err(NativeError::message("grayscale gamma must be in (0, 16]"));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { post_process, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("grayscaleGamma requires an uncommitted picture"));
+        };
+        post_process.get_or_insert_default().grayscale_gamma =
+            bevy::prelude::Vec4::new(red as f32, green as f32, blue as f32, 1.0);
+        Ok(handle)
+    }
+
     pub(super) fn picture_slice(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,

@@ -32,6 +32,9 @@ pub struct EffectParameters {
     pub exposure: f32,
     pub saturation: f32,
     pub tint: Vec4,
+    /// Source-image byte-domain grayscale followed by per-channel gamma.
+    /// A zero W disables this operation; RGB contain the gamma exponents.
+    pub grayscale_gamma: Vec4,
     /// Strength, inner radius, outer radius, unused.
     pub vignette: Vec4,
 }
@@ -44,6 +47,7 @@ impl Default for EffectParameters {
             exposure: 0.0,
             saturation: 1.0,
             tint: Vec4::ONE,
+            grayscale_gamma: Vec4::ZERO,
             vignette: Vec4::new(0.0, 0.25, 0.75, 0.0),
         }
     }
@@ -58,6 +62,7 @@ impl EffectParameters {
         let scalar = [self.blur_radius, self.zoom, self.exposure, self.saturation];
         if scalar.into_iter().any(|v| !v.is_finite())
             || !self.tint.is_finite()
+            || !self.grayscale_gamma.is_finite()
             || !self.vignette.is_finite()
             || !(0.0..=128.0).contains(&self.blur_radius)
             || self.zoom <= 0.0
@@ -65,6 +70,9 @@ impl EffectParameters {
             || !(0.0..=8.0).contains(&self.saturation)
             || self.tint.min_element() < 0.0
             || self.tint.max_element() > 1.0
+            || (self.grayscale_gamma.w != 0.0
+                && (self.grayscale_gamma.w != 1.0
+                    || self.grayscale_gamma.truncate().min_element() <= 0.0))
             || !(0.0..=1.0).contains(&self.vignette.x)
             || self.vignette.y < 0.0
             || self.vignette.z <= self.vignette.y
@@ -137,6 +145,18 @@ mod tests {
             );
         }
         assert!(!EffectParameters::default().is_enabled());
+        assert!(EffectParameters {
+            grayscale_gamma: Vec4::new(2.0, 1.1, 1.0, 1.0),
+            ..default()
+        }
+        .validate()
+        .is_ok());
+        assert!(EffectParameters {
+            grayscale_gamma: Vec4::new(2.0, 0.0, 1.0, 1.0),
+            ..default()
+        }
+        .validate()
+        .is_err());
     }
 }
 

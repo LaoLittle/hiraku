@@ -48,6 +48,8 @@ builder! {
     layer["layer"](value: f64) -> PictureShowHandle => picture_layer;
     replace["replace"]() -> PictureShowHandle => picture_replace;
     blur["blur"](radius: f64) -> PictureShowHandle => picture_blur;
+    grayscale_gamma["grayscaleGamma"](red: f64, green: f64, blue: f64)
+        -> PictureShowHandle => picture_grayscale_gamma;
     size["size"](width: f64, height: f64) -> PictureShowHandle => picture_size;
     slice["slice"](left: f64, top: f64, right: f64, bottom: f64)
         -> PictureShowHandle => picture_slice;

@@ -2828,7 +2828,7 @@ impl std::fmt::Display for VmError {
         }
         match self {
             Self::InvalidSnapshot(message) => write!(formatter, "invalid VM snapshot: {message}"),
-            Self::ProgramFingerprintMismatch => formatter.write_str("compiled program fingerprint does not match the saved program; restoring its program counter is unsafe"),
+            Self::ProgramFingerprintMismatch => formatter.write_str("compiled program fingerprint does not match the saved program; restoring its program counter is unspecified"),
             Self::ReadOnlyValue => formatter.write_str("cannot modify a read-only value; request changes through an explicitly provided callback"),
             Self::Panic { message, span, .. } => write!(
                 formatter,
