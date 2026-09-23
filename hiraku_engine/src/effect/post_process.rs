@@ -1,5 +1,6 @@
 //! Layer-local effects. UI isolation reuses Bevy's prepared UI phase and the
 //! existing camera, preserving its viewport, picking target and draw commands.
+use super::kawase::{BlurPipeline, BlurWorkspace};
 use super::program::{EFFECT_UNIFORM_BINDING, EffectUniform, LayerEffectShaders};
 use bevy::{asset::AssetId, shader::Shader};
 use bevy::{
@@ -149,6 +150,7 @@ impl Plugin for PostProcessPlugin {
         super::program::register_libraries(app);
         bevy::asset::embedded_asset!(app, "shaders/standard.wesl");
         bevy::asset::embedded_asset!(app, "shaders/blur.wesl");
+        super::kawase::install(app);
         app.add_plugins((
             ExtractComponentPlugin::<PostProcessSettings>::default(),
             ExtractComponentPlugin::<LayerEffectShaders>::default(),
@@ -333,6 +335,8 @@ fn scene_pass(
     pipeline: Option<Res<EffectPipeline>>,
     cache: Res<PipelineCache>,
     mut uniform: Local<Option<PreparedEffectUniform>>,
+    blur: Res<BlurPipeline>,
+    mut blur_work: Local<BlurWorkspace>,
     mut ctx: RenderContext,
 ) {
     let (target, settings, programs) = view.into_inner();
@@ -346,8 +350,12 @@ fn scene_pass(
             pipeline.as_deref(),
             &cache,
             &mut uniform,
+            &blur,
+            &mut blur_work,
             &mut ctx,
         );
+    } else {
+        *blur_work = BlurWorkspace::default();
     }
 }
 
@@ -360,6 +368,8 @@ fn canvas_pass(
     pipeline: Option<Res<EffectPipeline>>,
     cache: Res<PipelineCache>,
     mut uniform: Local<Option<PreparedEffectUniform>>,
+    blur: Res<BlurPipeline>,
+    mut blur_work: Local<BlurWorkspace>,
     mut ctx: RenderContext,
 ) {
     let (target, settings, programs) = view.into_inner();
@@ -373,8 +383,12 @@ fn canvas_pass(
             pipeline.as_deref(),
             &cache,
             &mut uniform,
+            &blur,
+            &mut blur_work,
             &mut ctx,
         );
+    } else {
+        *blur_work = BlurWorkspace::default();
     }
 }
 
@@ -392,9 +406,10 @@ fn isolate_ui(
     mut isolated: ResMut<IsolatedUiPhases>,
     pipeline: Option<Res<EffectPipeline>>,
     cache: Res<PipelineCache>,
+    blur: Res<BlurPipeline>,
 ) {
     let (ui, target, settings, programs) = view.into_inner();
-    if (!settings.ui.is_enabled() && !programs.is_some_and(|p| p.ui.is_some())) {
+    if !settings.ui.is_enabled() && !programs.is_some_and(|p| p.ui.is_some()) {
         return;
     }
     let Some(pipeline) = pipeline else {
@@ -403,7 +418,11 @@ fn isolate_ui(
     let Some(id) = pipeline.pipelines.get(&pipeline.key(target, 1, programs)) else {
         return;
     };
-    if cache.get_render_pipeline(*id).is_none() {
+    if cache.get_render_pipeline(*id).is_none()
+        || (programs.and_then(|p| p.ui.as_ref()).is_none()
+            && settings.ui.blur_radius > 0.001
+            && !blur.ready(&cache))
+    {
         return;
     }
     let Ok(extracted) = ui_views.get(ui.0) else {
@@ -438,12 +457,15 @@ fn draw_isolated_ui(
     pipeline: Res<EffectPipeline>,
     cache: Res<PipelineCache>,
     mut uniform: Local<Option<PreparedEffectUniform>>,
+    blur: Res<BlurPipeline>,
+    mut blur_work: Local<BlurWorkspace>,
     mut texture: Local<Option<UiTexture>>,
     mut ctx: RenderContext,
 ) {
     let (ui, target, settings, camera, programs) = view.into_inner();
     let Some(phase) = isolated.0.get(&ui.0) else {
         *texture = None;
+        *blur_work = BlurWorkspace::default();
         return;
     };
     let size = target.main_texture().size();
@@ -504,6 +526,8 @@ fn draw_isolated_ui(
         Some(&pipeline),
         &cache,
         &mut uniform,
+        &blur,
+        &mut blur_work,
         &mut ctx,
     );
 }
@@ -536,6 +560,8 @@ fn apply_effect(
     pipeline: Option<&EffectPipeline>,
     cache: &PipelineCache,
     uniform: &mut Option<PreparedEffectUniform>,
+    blur: &BlurPipeline,
+    blur_work: &mut BlurWorkspace,
     ctx: &mut RenderContext,
 ) {
     let Some(pipeline) = pipeline else {
@@ -570,14 +596,50 @@ fn apply_effect(
         });
     }
     let buffer = &uniform.as_ref().expect("effect uniform prepared").buffer;
+    let use_blur = programs.and_then(|p| p.get(stage)).is_none() && settings.blur_radius > 0.001;
+    if use_blur && !blur.ready(cache) {
+        return;
+    }
     let textures = target.post_process_write();
+    let blurred = if use_blur {
+        let device = ctx.render_device().clone();
+        let size = target.main_texture().size();
+        Some(
+            blur.render(
+                &device,
+                cache,
+                ctx.command_encoder(),
+                ui.unwrap_or(textures.source),
+                UVec2::new(size.width, size.height),
+                Vec4::new(0.0, 0.0, size.width as f32, size.height as f32),
+                0,
+                true,
+                settings.blur_radius,
+                blur_work,
+            )
+            .expect("blur pipelines ready"),
+        )
+    } else {
+        *blur_work = BlurWorkspace::default();
+        None
+    };
+    let scene_source = if stage == 1 {
+        textures.source
+    } else {
+        blurred.as_ref().unwrap_or(textures.source)
+    };
+    let ui_source = blurred
+        .as_ref()
+        .filter(|_| stage == 1)
+        .or(ui)
+        .unwrap_or(textures.source);
     let group = ctx.render_device().create_bind_group(
         "hiraku_effects",
         &cache.get_bind_group_layout(&pipeline.layout),
         &BindGroupEntries::with_indices((
-            (0, textures.source),
+            (0, scene_source),
             (1, &pipeline.sampler),
-            (3, ui.unwrap_or(textures.source)),
+            (3, ui_source),
             (EFFECT_UNIFORM_BINDING, buffer.as_entire_binding()),
         )),
     );

@@ -56,7 +56,7 @@ fn source(mesh: VertexOutput) -> EffectInput {
     let origin = select(material.rect.xy, vec2<f32>(0.0), full_image);
     let low = (origin + vec2<f32>(0.5)) / texture_size;
     let high = (origin + source_size - vec2<f32>(0.5)) / texture_size;
-    return EffectInput(uv, local_uv, low, high, sampling.x, false);
+    return EffectInput(uv, local_uv, low, high, sampling.x, material.effects.x > 0.0);
 }
 
 fn texture_size() -> vec2<f32> { return vec2<f32>(textureDimensions(color_texture)); }

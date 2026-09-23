@@ -116,6 +116,7 @@ fn embedded_wesl_modules_link_for_material_variants() {
     app.add_plugins((MinimalPlugins, AssetPlugin::default()))
         .init_asset::<Shader>()
         .init_asset_loader::<bevy::shader::ShaderLoader>()
+        .init_asset::<Image>()
         .add_plugins(crate::effect::post_process::PostProcessPlugin);
     let required = ["input", "material", "fullscreen"];
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

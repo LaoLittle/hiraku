@@ -56,7 +56,6 @@ pub(super) fn register_libraries(app: &mut App) {
     let mut shaders = app.world_mut().resource_mut::<Assets<Shader>>();
     let handles = [
         ("render", include_str!("shaders/render.wesl")),
-        ("effects/kawase", include_str!("shaders/kawase.wesl")),
         (
             "effects/color_grade",
             include_str!("shaders/color_grade.wesl"),

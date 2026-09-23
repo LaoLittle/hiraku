@@ -1,7 +1,6 @@
 // Engine default, implemented with exactly the same API as author shaders.
 import constants::EFFECT_BINDING_GROUP;
-import hiraku::render::{VertexOutput, FragmentOutput, source, finish};
-import hiraku::effects::kawase::blur;
+import hiraku::render::{VertexOutput, FragmentOutput, source, sampleColor, finish};
 import hiraku::effects::color_grade::grade;
 
 struct StandardUniform {
@@ -21,6 +20,6 @@ fn fragment(input: VertexOutput) -> FragmentOutput {
     let local_uv = (sample.local_uv - 0.5) / zoom + 0.5;
     sample.uv += (local_uv - sample.local_uv) * (sample.high - sample.low);
     sample.local_uv = local_uv;
-    return finish(input, grade(blur(sample, settings.blur_radius), local_uv,
+    return finish(input, grade(sampleColor(sample, sample.uv), local_uv,
         settings.exposure, settings.saturation, settings.tint, settings.vignette));
 }
