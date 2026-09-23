@@ -46,6 +46,8 @@ builder! {
     frame["frame"](x: f64, y: f64, scale: f64, rotation: f64, layer: f64)
         -> PictureShowHandle => frame;
     layer["layer"](value: f64) -> PictureShowHandle => picture_layer;
+    replace["replace"]() -> PictureShowHandle => picture_replace;
+    blur["blur"](radius: f64) -> PictureShowHandle => picture_blur;
     size["size"](width: f64, height: f64) -> PictureShowHandle => picture_size;
     slice["slice"](left: f64, top: f64, right: f64, bottom: f64)
         -> PictureShowHandle => picture_slice;

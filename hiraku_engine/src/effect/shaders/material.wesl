@@ -1,5 +1,6 @@
-import bevy_pbr::render::forward_io::VertexOutput;
-import hiraku_sprite3d::sampling::decode_color;
+import bevy_pbr::render::forward_io::VertexOutput as MeshVertexOutput;
+import hiraku_engine::effect::shaders::input::{EffectInput, sample_premultiplied};
+alias VertexOutput = MeshVertexOutput;
 
 struct WorldSpriteMaterial {
     clip_plane: vec4<f32>,
@@ -33,8 +34,7 @@ fn slice_axis(uv: f32, source: f32, destination: f32, before: f32, after: f32) -
     return (borders.x + (p - screen.x) / max(destination - screen.x - screen.y, 0.0001) * (source - borders.x - borders.y)) / source;
 }
 
-@fragment
-fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+fn source(mesh: VertexOutput) -> EffectInput {
     if material.clip_plane.w > 0.0 && dot(material.clip_plane.xy, mesh.world_position.xy) > material.clip_plane.z {
         discard;
     }
@@ -53,7 +53,20 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         local_uv,
         full_image,
     );
-    var sampled = decode_color(textureSample(color_texture, color_sampler, uv), sampling.x);
+    let origin = select(material.rect.xy, vec2<f32>(0.0), full_image);
+    let low = (origin + vec2<f32>(0.5)) / texture_size;
+    let high = (origin + source_size - vec2<f32>(0.5)) / texture_size;
+    return EffectInput(uv, local_uv, low, high, sampling.x, false);
+}
+
+fn texture_size() -> vec2<f32> { return vec2<f32>(textureDimensions(color_texture)); }
+fn sample_source(input: EffectInput, uv: vec2<f32>) -> vec4<f32> {
+    return sample_premultiplied(color_texture, color_sampler, input, uv);
+}
+
+fn finish(mesh: VertexOutput, value: vec4<f32>) -> vec4<f32> {
+    let local_uv = source(mesh).local_uv;
+    var sampled = value;
     if material.effects.y > 0.0 {
         let cell = vec2<u32>(floor(clamp(local_uv, vec2<f32>(0.0), vec2<f32>(0.999999)) * material.effects.zw));
         var hash = (cell.x * 1597334677u) ^ (cell.y * 3812015801u) ^ (u32(material.effects.y) * 2798796415u);
@@ -64,24 +77,6 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // The original noise raster is display-referred, like an sRGB texture.
         let linear = select(pow((gray + 0.055) / 1.055, 2.4), gray / 12.92, gray <= 0.04045);
         sampled = vec4<f32>(vec3<f32>(linear), 1.0);
-    }
-    if material.effects.x > 0.0 {
-        let origin = select(material.rect.xy, vec2<f32>(0.0), full_image);
-        let size = select(material.rect.zw, texture_size, full_image);
-        let low = (origin + vec2<f32>(0.5)) / texture_size;
-        let high = (origin + size - vec2<f32>(0.5)) / texture_size;
-        let weights = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
-        var sum = vec4<f32>(0.0);
-        for (var y = 0u; y < 5u; y += 1u) {
-            for (var x = 0u; x < 5u; x += 1u) {
-                let offset = (vec2<f32>(f32(x), f32(y)) - vec2<f32>(2.0)) * material.effects.x * 0.5 / texture_size;
-                let tap = decode_color(textureSampleLevel(color_texture, color_sampler, clamp(uv + offset, low, high), 0.0), sampling.x);
-                // Filter premultiplied color to avoid dark fringes at transparent edges.
-                sum += vec4<f32>(tap.rgb * tap.a, tap.a) * weights[x] * weights[y];
-            }
-        }
-        let alpha = sum.a / 256.0;
-        sampled = vec4<f32>(sum.rgb / max(sum.a, 0.000001), alpha);
     }
     var color = sampled * material.tint;
     if material.dissolve.x != 0.0 {

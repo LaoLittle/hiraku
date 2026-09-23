@@ -1,9 +1,13 @@
+use crate::effect::post_process::EffectParameters;
+use crate::effect::program::EffectInstance;
+mod bindings;
 use bevy::{
     asset::Handle,
-    pbr::{Material, MaterialPlugin},
+    mesh::MeshVertexBufferLayoutRef,
+    pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin},
     prelude::*,
     reflect::TypePath,
-    render::render_resource::{AsBindGroup, ShaderType},
+    render::render_resource::{RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError},
     shader::ShaderRef,
 };
 
@@ -19,8 +23,10 @@ pub struct WorldSprite {
     pub slice: Option<[f32; 4]>,
     pub clip: Option<hiraku_sprite3d::ClipRect>,
     pub clip_mask: Option<Handle<Image>>,
-    /// Sampling radius in source-image pixels; independent of camera effects.
-    pub blur_radius: f32,
+    /// Standard-library effect settings, independent of camera effects.
+    pub post_process: EffectParameters,
+    /// Optional program using the same effect ABI as fullscreen layers.
+    pub effect_shader: Option<EffectInstance>,
     /// Noise frame (zero disables), grid width, grid height.
     pub noise: Vec3,
     pub dissolve: Option<DissolveMask>,
@@ -48,7 +54,8 @@ impl WorldSprite {
             slice: None,
             clip: None,
             clip_mask: None,
-            blur_radius: 0.0,
+            post_process: EffectParameters::default(),
+            effect_shader: None,
             noise: Vec3::ZERO,
             dissolve: None,
             image: Some(image),
@@ -65,7 +72,8 @@ impl WorldSprite {
             slice: None,
             clip: None,
             clip_mask: None,
-            blur_radius: 0.0,
+            post_process: EffectParameters::default(),
+            effect_shader: None,
             noise: Vec3::ZERO,
             dissolve: None,
             image: None,
@@ -83,13 +91,10 @@ impl WorldSprite {
     }
 }
 
-#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-#[uniform(0, WorldSpriteUniform)]
+#[derive(Asset, TypePath, Debug, Clone)]
 pub struct WorldSpriteMaterial {
-    #[texture(5)]
-    #[sampler(6)]
+    pub effect_shader: Option<EffectInstance>,
     pub clip_mask: Option<Handle<Image>>,
-    #[uniform(15)]
     pub sampling: UVec4,
     pub clip_plane: Vec4,
     pub slice_borders: Vec4,
@@ -97,15 +102,28 @@ pub struct WorldSpriteMaterial {
     pub clip_bounds: Vec4,
     pub clip_axes: Vec4,
     pub effects: Vec4,
-    #[texture(3)]
-    #[sampler(4)]
+    pub post_process: EffectParameters,
     pub dissolve_mask: Option<Handle<Image>>,
     pub dissolve: Vec4,
-    #[texture(1)]
-    #[sampler(2)]
     pub image: Option<Handle<Image>>,
     pub tint: Vec4,
     pub rect: Vec4,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WorldSpriteKey {
+    shader: Option<Handle<bevy::shader::Shader>>,
+}
+
+impl From<&WorldSpriteMaterial> for WorldSpriteKey {
+    fn from(material: &WorldSpriteMaterial) -> Self {
+        Self {
+            shader: material
+                .effect_shader
+                .as_ref()
+                .map(|effect| effect.shader.shader.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, ShaderType)]
@@ -138,8 +156,29 @@ impl From<&WorldSpriteMaterial> for WorldSpriteUniform {
 }
 
 impl Material for WorldSpriteMaterial {
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if let Some(fragment) = &mut descriptor.fragment {
+            fragment.shader_defs.push(bevy::shader::ShaderDefVal::Bool(
+                "HIRAKU_MATERIAL".into(),
+                true,
+            ));
+            fragment.shader_defs.push(bevy::shader::ShaderDefVal::UInt(
+                "EFFECT_BINDING_GROUP".into(),
+                bevy::pbr::MATERIAL_BIND_GROUP_INDEX as u32,
+            ));
+            if let Some(shader) = key.bind_group_data.shader {
+                fragment.shader = shader;
+            }
+        }
+        Ok(())
+    }
     fn fragment_shader() -> ShaderRef {
-        "embedded://hiraku_engine/render/shaders/world_sprite.wesl".into()
+        "embedded://hiraku_engine/effect/shaders/standard.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -164,6 +203,7 @@ pub fn world_sprite_render_components(
 
 fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
     WorldSpriteMaterial {
+        effect_shader: sprite.effect_shader.clone(),
         clip_mask: sprite.clip_mask.clone(),
         sampling: UVec4::ZERO,
         clip_plane: sprite
@@ -185,12 +225,8 @@ fn material_from_sprite(sprite: &WorldSprite) -> WorldSpriteMaterial {
             axes.w = if sprite.clip_mask.is_some() { 1.0 } else { 0.0 };
             axes
         }),
-        effects: Vec4::new(
-            sprite.blur_radius,
-            sprite.noise.x,
-            sprite.noise.y,
-            sprite.noise.z,
-        ),
+        effects: Vec4::new(0.0, sprite.noise.x, sprite.noise.y, sprite.noise.z),
+        post_process: sprite.post_process,
         dissolve_mask: sprite.dissolve.as_ref().map(|mask| mask.image.clone()),
         dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| {
             Vec4::new(
@@ -292,6 +328,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_program_selects_material_pipeline_but_parameter_changes_do_not() {
+        let mut shaders = Assets::<bevy::shader::Shader>::default();
+        let program = crate::EffectShader::from_wesl(&mut shaders, "// fixture");
+        let mut sprite = WorldSprite::from_image(Handle::default());
+        let ordinary = WorldSpriteKey::from(&material_from_sprite(&sprite));
+        sprite.effect_shader = Some(program.instance(&Vec4::splat(2.0)).expect("uniform"));
+        let custom = material_from_sprite(&sprite);
+        let key = WorldSpriteKey::from(&custom);
+        assert_ne!(key, ordinary);
+        assert_eq!(key.shader, Some(program.shader.clone()));
+        assert_eq!(custom.post_process, sprite.post_process);
+        sprite
+            .effect_shader
+            .as_mut()
+            .expect("mounted effect")
+            .uniform = crate::EffectUniform::new(&Vec4::splat(9.0)).expect("uniform");
+        assert_eq!(key, WorldSpriteKey::from(&material_from_sprite(&sprite)));
+    }
+
+    #[test]
     fn background_fit_contains_image_without_distortion() {
         let viewport = Vec2::new(1920.0, 1080.0);
         assert_eq!(
@@ -391,7 +447,6 @@ mod tests {
 }
 
 pub fn install(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "shaders/world_sprite.wesl");
     app.add_plugins(MaterialPlugin::<WorldSpriteMaterial>::default())
         // Story systems mutate authoring state in `Update`; mirror it once,
         // immediately before render extraction, to avoid displaying stale

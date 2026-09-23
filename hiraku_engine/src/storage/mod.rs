@@ -319,6 +319,8 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            post_process_hson: hson::to_vec(&scene.post_process)
+                .expect("serializable layer effects"),
             spatial_stage_hson: hson::to_vec(&scene.spatial_stage)
                 .expect("serializable spatial stage"),
             actor_depths: scene.actor_depths.clone(),
@@ -361,6 +363,18 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
+            post_process: if scene.post_process_hson.is_empty() {
+                Default::default()
+            } else {
+                let settings: crate::effect::post_process::PostProcessSettings =
+                    hson::from_slice(&scene.post_process_hson).map_err(|error| {
+                        StorageError::InvalidSave(format!("invalid layer effects: {error}"))
+                    })?;
+                settings
+                    .validate()
+                    .map_err(|error| StorageError::InvalidSave(error.into()))?;
+                settings
+            },
             spatial_stage: if scene.spatial_stage_hson.is_empty() {
                 None
             } else {
@@ -760,7 +774,10 @@ mod tests {
                 slice: Some([20.0; 4]),
                 tint: [0.5, 0.75, 1.0, 1.0],
                 tint_tween: None,
-                blur_radius: 8.0,
+                post_process: crate::effect::post_process::EffectParameters {
+                    blur_radius: 8.0,
+                    ..Default::default()
+                },
                 noise: None,
                 blur_tween: Some(crate::scene::pictures::PictureBlur {
                     from: 0.0,

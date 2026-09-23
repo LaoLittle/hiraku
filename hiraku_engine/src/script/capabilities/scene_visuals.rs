@@ -297,7 +297,9 @@ mod api {
         context
             .scene_visuals
             .begin_as(SceneVisualTarget::Picture(PictureCommand::Show {
+                post_process: None,
                 video: None,
+                replace: false,
                 screen_space: false,
                 size: None,
                 slice: None,
@@ -463,6 +465,21 @@ mod api {
         Ok(handle)
     }
 
+    pub(super) fn picture_replace(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { replace, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "replace requires an uncommitted picture",
+            ));
+        };
+        *replace = true;
+        Ok(handle)
+    }
+
     pub(super) fn picture_size(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
@@ -483,6 +500,25 @@ mod api {
             return Err(NativeError::message("size requires an uncommitted picture"));
         };
         *size = Some([width as f32, height as f32]);
+        Ok(handle)
+    }
+
+    pub(super) fn picture_blur(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        radius: f64,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        if !radius.is_finite() || !(0.0..=128.0).contains(&radius) {
+            return Err(NativeError::message(
+                "blur radius must be in 0..=128 pixels",
+            ));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { post_process, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("blur requires an uncommitted picture"));
+        };
+        post_process.get_or_insert_default().blur_radius = radius as f32;
         Ok(handle)
     }
 
@@ -2050,6 +2086,47 @@ mod tests {
     }
 
     #[test]
+    fn post_process_settings_are_typed_values_with_independent_layer_targets() {
+        let mut runtime = runtime(
+            r#"
+            scene.postProcess(.scene, .identity.blur(8).exposure(-0.5))
+            scene.postProcess(.ui, .identity.saturation(0.25))
+            scene.postProcessPicture("room", .identity.blur(4))
+            scene.postProcess(.canvas, .identity)
+            camera(.ui).blur(3)
+        "#,
+        );
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::PostProcess {
+            scope: crate::script::CameraEffectScope::World, parameters
+        }) if parameters.blur_radius == 8.0 && parameters.exposure == -0.5)
+        );
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::PostProcess {
+            scope: crate::script::CameraEffectScope::Ui, parameters
+        }) if parameters.blur_radius == 0.0 && parameters.saturation == 0.25)
+        );
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::PostProcess {
+            id, parameters
+        })) if id == "room" && parameters.blur_radius == 4.0)
+        );
+        assert!(
+            matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::PostProcess {
+            scope: crate::script::CameraEffectScope::Canvas, parameters
+        }) if parameters == Default::default())
+        );
+        assert!(matches!(
+            event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::SetCamera {
+                scope: crate::script::CameraEffectScope::Ui,
+                blur: Some(3.0),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn picture_and_character_visibility_are_native_capabilities() {
         let mut runtime = runtime(
             "scene.picture(\"room\", \"alice/background\").frame(80, -35, 3, -10, 5).fade(300)\nchar(\"alice\").hide()\nscene.hideCharacters()",
@@ -2298,6 +2375,8 @@ mod tests {
             event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
                 video: None,
+                replace: false,
+                post_process: None,
                 screen_space: false,
                 id: "Backgrounds".into(),
                 size: None,
@@ -2323,6 +2402,16 @@ mod tests {
         assert!(
             matches!(event(&mut runtime), StoryRuntimeEvent::Effect(StoryEffect::Say { text, .. }) if text == "after")
         );
+    }
+
+    #[test]
+    fn picture_replace_marks_a_same_asset_crossfade_without_pose_interpolation() {
+        let mut runtime =
+            runtime("scene.picture(\"room\", \"alice/background\").replace().fade(500)");
+        assert!(matches!(event(&mut runtime),
+            StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                replace: true, seconds, ..
+            })) if (seconds - 0.5).abs() < 0.001));
     }
 
     #[test]

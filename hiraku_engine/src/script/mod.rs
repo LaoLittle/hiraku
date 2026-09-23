@@ -117,6 +117,9 @@ pub(crate) fn script_command_from_effect(
                 animation_id: None,
             })
         }
+        StoryEffect::PostProcess { scope, parameters } => {
+            ScriptCommand::Camera(CameraCommand::PostProcess { scope, parameters })
+        }
         StoryEffect::SetCamera {
             blur,
             zoom,

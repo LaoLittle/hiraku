@@ -125,6 +125,8 @@ impl Default for CameraSnapshot {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
     #[serde(default)]
+    pub post_process: crate::effect::post_process::PostProcessSettings,
+    #[serde(default)]
     pub spatial_stage: Option<crate::stage::runtime::StageSnapshot>,
     pub actor_depths: BTreeMap<String, f32>,
     pub clips: crate::scene::clipping::ClipState,

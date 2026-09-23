@@ -290,6 +290,7 @@ struct ActiveVideo(BTreeMap<VideoPlaybackId, ActivePlayback>);
 struct ActivePlayback {
     repeat: Option<(VideoAsset, DecodeSettings)>,
     awaiting_restart: bool,
+    skip_blank_lead: bool,
     frame_step: Duration,
     world: Option<(Handle<Mesh>, RenderLayers)>,
     alpha_layout: Option<crate::AlphaLayout>,
@@ -580,6 +581,7 @@ fn start_pending_video(
                     )
                 }),
                 awaiting_restart: false,
+                skip_blank_lead: pending.looping,
                 frame_step: LAST_FRAME_HOLD,
                 world,
                 alpha_layout: asset.alpha_layout,
@@ -802,15 +804,23 @@ fn update_video(
             due_frame = Some(frame);
         }
         if let Some(frame) = due_frame {
-            present_frame(
-                &mut commands,
-                &mut images,
-                &mut materials,
-                &mut nodes,
-                &mut video_upload,
-                playback,
-                frame,
-            );
+            // Packed-alpha AMV loops may contain a fully transparent encoder
+            // lead frame. Presenting it replaces the held final frame with a
+            // transparent surface and exposes the black backing each cycle.
+            if !playback.skip_blank_lead
+                || !packed_alpha_frame_is_blank(&frame, playback.alpha_layout)
+            {
+                playback.skip_blank_lead = false;
+                present_frame(
+                    &mut commands,
+                    &mut images,
+                    &mut materials,
+                    &mut nodes,
+                    &mut video_upload,
+                    playback,
+                    frame,
+                );
+            }
         }
         if paused
             && let Some(audio_entity) = playback.audio_entity
@@ -861,6 +871,7 @@ fn update_video(
                         playback.last_timestamp = Duration::ZERO;
                         playback.age = Duration::ZERO;
                         playback.awaiting_restart = true;
+                        playback.skip_blank_lead = true;
                         // Keep the old surface and upload alive until frame zero
                         // is decoded: repetition must not introduce a blank frame.
                         return true;
@@ -942,6 +953,36 @@ fn exit_opacity(elapsed: Duration, duration: Duration) -> f32 {
 
 fn audio_completed(has_audio: bool, sink_empty: bool) -> bool {
     !has_audio || sink_empty
+}
+
+fn packed_alpha_frame_is_blank(frame: &DecodedFrame, layout: Option<crate::AlphaLayout>) -> bool {
+    let Some(layout) = layout else { return false };
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    if layout.display_size(frame.width, frame.height).is_none() {
+        return false;
+    }
+    let (bytes, stride, channels): (&[u8], usize, usize) = match &frame.pixels {
+        DecodedPixels::I420Planar { y, .. } => (y, width, 1),
+        DecodedPixels::I420Strided {
+            planes, y_stride, ..
+        }
+        | DecodedPixels::Nv12Strided {
+            planes, y_stride, ..
+        } => (planes, *y_stride as usize, 1),
+        DecodedPixels::Rgba(rgba) => (rgba, width * 4, 4),
+    };
+    let (first_row, first_col, rows, cols) = match layout {
+        crate::AlphaLayout::Vertical => (height / 2, 0, height / 2, width),
+        crate::AlphaLayout::Horizontal => (0, width / 2, height, width / 2),
+    };
+    (first_row..first_row + rows).all(|row| {
+        let start = row * stride + first_col * channels;
+        let end = start + cols * channels;
+        bytes
+            .get(start..end)
+            .is_some_and(|line| line.chunks_exact(channels).all(|pixel| pixel[0] <= 2))
+    })
 }
 
 fn present_frame(
@@ -1450,6 +1491,35 @@ fn rgba_image(width: u32, height: u32, data: Vec<u8>, shader_decodes_transfer: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_packed_alpha_lead_is_skipped_but_visible_frame_is_kept() {
+        let frame = |alpha: u8| DecodedFrame {
+            timestamp: 0,
+            width: 4,
+            height: 4,
+            chroma_width: 2,
+            chroma_height: 2,
+            color_transform: hiraku_media::YuvColorTransform::from_luma_coefficients(
+                0.2126, 0.0722, false,
+            ),
+            transfer: hiraku_media::TransferFunction::Srgb,
+            pixels: DecodedPixels::I420Planar {
+                y: [vec![60; 8], vec![alpha; 8]].concat(),
+                u: vec![128; 4],
+                v: vec![128; 4],
+            },
+        };
+        assert!(packed_alpha_frame_is_blank(
+            &frame(0),
+            Some(crate::AlphaLayout::Vertical)
+        ));
+        assert!(!packed_alpha_frame_is_blank(
+            &frame(255),
+            Some(crate::AlphaLayout::Vertical)
+        ));
+        assert!(!packed_alpha_frame_is_blank(&frame(0), None));
+    }
 
     #[test]
     fn suspension_does_not_replace_manual_pause_or_affect_other_requests() {

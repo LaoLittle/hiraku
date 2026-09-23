@@ -4,6 +4,8 @@ mod character;
 mod data;
 pub mod dependencies;
 mod effect;
+pub use effect::post_process::{EffectParameters, PostProcessSettings};
+pub use effect::program::{EffectInstance, EffectShader, EffectUniform, LayerEffectShaders};
 mod glossary;
 pub mod input;
 pub mod memory;
@@ -156,7 +158,7 @@ use bevy::{
     prelude::*,
 };
 use effect::transition::RuleTransitionMaterial;
-use effect::{blur::BlurEffectPlugin, custom::CustomScreenEffectMaterial};
+use effect::{custom::CustomScreenEffectMaterial, post_process::PostProcessPlugin};
 use render::camera::{animate_camera_shake, animate_camera_transition, assign_render_layers};
 use render::character_part::{AlphaMaskMaterial, MultiplyMaterial};
 use scene::{
@@ -293,7 +295,7 @@ impl Plugin for HirakuPlugin {
             MaterialPlugin::<RuleTransitionMaterial>::default(),
             MaterialPlugin::<AlphaMaskMaterial>::default(),
             MaterialPlugin::<MultiplyMaterial>::default(),
-            BlurEffectPlugin,
+            PostProcessPlugin,
         ));
         render::world_sprite::install(app);
         scene::character_composite::install(app);

@@ -451,6 +451,9 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     });
                 }
             }
+            ScriptCommand::Camera(CameraCommand::PostProcess { scope, parameters }) => {
+                *shared_state.0.post_process.layer_mut(scope) = parameters;
+            }
             ScriptCommand::Camera(CameraCommand::Set {
                 blur_intensity,
                 zoom,
@@ -485,6 +488,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 shared_state.0.camera.scope = match scope {
                     crate::script::CameraEffectScope::World => "world",
                     crate::script::CameraEffectScope::Canvas => "canvas",
+                    crate::script::CameraEffectScope::Ui => "ui",
                 }
                 .to_string();
                 start_camera_tween(

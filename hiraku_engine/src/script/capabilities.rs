@@ -17,6 +17,7 @@ use crate::storage::UserSettings;
 
 mod actor_patch;
 mod movie;
+mod post_process;
 mod scene_visuals;
 mod sound;
 mod spatial_stage;
@@ -138,6 +139,10 @@ pub enum StoryEffect {
         scope: CameraEffectScope,
         duration_ms: u64,
         ease: Easing,
+    },
+    PostProcess {
+        scope: CameraEffectScope,
+        parameters: crate::effect::post_process::EffectParameters,
     },
     ShowCharacter {
         rotation: f32,
@@ -287,6 +292,7 @@ fn setting_number(fields: &BTreeMap<String, Value>, name: &str) -> Result<f32, S
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
     scene_visuals::register(&mut registry);
+    post_process::register(&mut registry);
     spatial_stage::register(&mut registry);
     sound::register(&mut registry);
     movie::register(&mut registry);
@@ -1040,6 +1046,7 @@ impl CharacterContext {
                 scope: match scope {
                     CameraScope::Scene => CameraEffectScope::World,
                     CameraScope::Canvas => CameraEffectScope::Canvas,
+                    CameraScope::Ui => CameraEffectScope::Ui,
                 },
                 duration_ms: 0,
                 ease: Easing::Linear,
@@ -1240,6 +1247,7 @@ hiraku_script::hks_define! {
 enum CameraScope {
     Scene,
     Canvas,
+    Ui,
 }
 
 impl CameraScope {
@@ -1248,6 +1256,9 @@ impl CameraScope {
 
     #[getter]
     fn canvas() -> CameraScope { Self::Canvas }
+
+    #[getter]
+    fn ui() -> CameraScope { Self::Ui }
 }
 }
 

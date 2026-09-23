@@ -21,7 +21,7 @@ pub struct PictureState {
     pub tint: [f32; 4],
     pub tint_tween: Option<PictureTint>,
     #[serde(default)]
-    pub blur_radius: f32,
+    pub post_process: crate::effect::post_process::EffectParameters,
     #[serde(default)]
     pub noise: Option<PictureNoise>,
     #[serde(default)]
@@ -110,6 +110,10 @@ pub struct PictureOscillation {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PictureCommand {
+    PostProcess {
+        id: String,
+        parameters: crate::effect::post_process::EffectParameters,
+    },
     Oscillate {
         id: String,
         amplitude: [f32; 2],
@@ -132,7 +136,9 @@ pub enum PictureCommand {
         seconds: f32,
     },
     Show {
+        post_process: Option<crate::effect::post_process::EffectParameters>,
         video: Option<PictureVideo>,
+        replace: bool,
         screen_space: bool,
         size: Option<[f32; 2]>,
         slice: Option<[f32; 4]>,
@@ -192,12 +198,20 @@ pub(super) fn apply_picture_command(
     let unsupported = match &command {
         PictureCommand::Show {
             video: Some(_),
+            post_process,
             slice,
             rect,
             color,
             ..
-        } => slice.is_some() || rect.is_some() || color.is_some_and(|c| c[..3] != [1.0; 3]),
-        PictureCommand::Blur { id, .. } | PictureCommand::Noise { id, .. } => {
+        } => {
+            slice.is_some()
+                || rect.is_some()
+                || post_process.is_some_and(|p| p.is_enabled())
+                || color.is_some_and(|c| c[..3] != [1.0; 3])
+        }
+        PictureCommand::Blur { id, .. }
+        | PictureCommand::Noise { id, .. }
+        | PictureCommand::PostProcess { id, .. } => {
             pictures.get(id).is_some_and(|p| p.video.is_some())
         }
         PictureCommand::Tint { id, color, .. } => {
@@ -256,6 +270,14 @@ pub(super) fn apply_picture_command(
                 picture.tint = color;
             }
         }
+        PictureCommand::PostProcess { id, parameters } => {
+            parameters.validate().map_err(str::to_owned)?;
+            let picture = pictures
+                .get_mut(&id)
+                .ok_or_else(|| format!("picture `{id}` is not shown"))?;
+            picture.post_process = parameters;
+            picture.blur_tween = None;
+        }
         PictureCommand::Blur {
             id,
             radius,
@@ -272,18 +294,20 @@ pub(super) fn apply_picture_command(
                 .get_mut(&id)
                 .ok_or_else(|| format!("picture `{id}` is not shown"))?;
             picture.blur_tween = (seconds > 0.0).then_some(PictureBlur {
-                from: picture.blur_radius,
+                from: picture.post_process.blur_radius,
                 to: radius,
                 elapsed: 0.0,
                 seconds,
             });
             if seconds == 0.0 {
-                picture.blur_radius = radius;
+                picture.post_process.blur_radius = radius;
             }
         }
         PictureCommand::Clear => pictures.clear(),
         PictureCommand::Show {
             video,
+            post_process,
+            replace,
             screen_space,
             size,
             slice,
@@ -302,7 +326,7 @@ pub(super) fn apply_picture_command(
                 .get(&id)
                 .map(|old| {
                     let mut layers = old.previous.clone();
-                    if (old.path != path || old.rect != rect || old.video != video)
+                    if (replace || old.path != path || old.rect != rect || old.video != video)
                         && old.alpha > 0.0
                     {
                         let mut frozen = old.clone();
@@ -316,10 +340,14 @@ pub(super) fn apply_picture_command(
                     layers
                 })
                 .unwrap_or_default();
-            let blur = pictures
+            let mut blur = pictures
                 .get(&id)
-                .map(|p| (p.blur_radius, p.blur_tween.clone()))
+                .map(|p| (p.post_process, p.blur_tween.clone()))
                 .unwrap_or_default();
+            if let Some(parameters) = post_process {
+                parameters.validate().map_err(str::to_owned)?;
+                blur = (parameters, None);
+            }
             let (tint, tint_tween) = color.map(|color| (color, None)).unwrap_or_else(|| {
                 pictures
                     .get(&id)
@@ -330,7 +358,8 @@ pub(super) fn apply_picture_command(
             let old = pictures
                 .get(&id)
                 .filter(|picture| {
-                    picture.path == path
+                    !replace
+                        && picture.path == path
                         && picture.video == video
                         && picture.rect == rect
                         && !picture.fade.as_ref().is_some_and(|fade| fade.remove)
@@ -367,7 +396,7 @@ pub(super) fn apply_picture_command(
                     slice,
                     tint,
                     tint_tween,
-                    blur_radius: blur.0,
+                    post_process: blur.0,
                     noise: None,
                     blur_tween: blur.1,
                     id,
@@ -687,8 +716,8 @@ pub fn sync_pictures(
         if sprite.rect != picture.rect {
             sprite.rect = picture.rect;
         }
-        if sprite.blur_radius != picture.blur_radius {
-            sprite.blur_radius = picture.blur_radius;
+        if sprite.post_process != picture.post_process {
+            sprite.post_process = picture.post_process;
         }
         let noise = picture
             .noise
@@ -735,7 +764,7 @@ pub fn sync_pictures(
             .and_then(|region| region.mask.as_deref())
             .map(|path| crate::texture::load_static_image(&assets, path));
         sprite.rect = picture.rect;
-        sprite.blur_radius = picture.blur_radius;
+        sprite.post_process = picture.post_process;
         sprite.noise = picture
             .noise
             .as_ref()
@@ -819,7 +848,8 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
     }
     if let Some(blur) = &mut picture.blur_tween {
         blur.elapsed = (blur.elapsed + delta).min(blur.seconds);
-        picture.blur_radius = blur.from + (blur.to - blur.from) * (blur.elapsed / blur.seconds);
+        picture.post_process.blur_radius =
+            blur.from + (blur.to - blur.from) * (blur.elapsed / blur.seconds);
         if blur.elapsed >= blur.seconds {
             picture.blur_tween = None;
         }
@@ -984,6 +1014,8 @@ mod tests {
             &mut pictures,
             PictureCommand::Show {
                 video: None,
+                post_process: None,
+                replace: false,
                 screen_space: false,
                 size: None,
                 slice: None,
@@ -1386,13 +1418,13 @@ mod tests {
         )
         .expect("blur");
         tick_picture(pictures.get_mut("room").expect("room"), 0.5);
-        assert_eq!(pictures["room"].blur_radius, 8.0);
-        assert_eq!(pictures["other"].blur_radius, 0.0);
+        assert_eq!(pictures["room"].post_process.blur_radius, 8.0);
+        assert_eq!(pictures["other"].post_process.blur_radius, 0.0);
         let saved = hiraku_script::hson::to_vec(&pictures).expect("snapshot");
         let mut restored: BTreeMap<String, PictureState> =
             hiraku_script::hson::from_slice(&saved).expect("restore");
         tick_picture(restored.get_mut("room").expect("room"), 0.5);
-        assert_eq!(restored["room"].blur_radius, 16.0);
+        assert_eq!(restored["room"].post_process.blur_radius, 16.0);
         apply_picture_command(
             &mut pictures,
             PictureCommand::Blur {
@@ -1403,7 +1435,7 @@ mod tests {
         )
         .expect("retarget");
         tick_picture(pictures.get_mut("room").expect("room"), 0.5);
-        assert_eq!(pictures["room"].blur_radius, 4.0);
+        assert_eq!(pictures["room"].post_process.blur_radius, 4.0);
         apply_picture_command(
             &mut pictures,
             PictureCommand::Blur {
@@ -1413,7 +1445,7 @@ mod tests {
             },
         )
         .expect("disable");
-        assert_eq!(pictures["room"].blur_radius, 0.0);
+        assert_eq!(pictures["room"].post_process.blur_radius, 0.0);
         assert!(pictures["room"].blur_tween.is_none());
         assert!(
             apply_picture_command(
@@ -1485,6 +1517,8 @@ mod tests {
             PictureCommand::Show {
                 id: "room".into(),
                 video: None,
+                post_process: None,
+                replace: false,
                 screen_space: false,
                 path: "background/room".into(),
                 size: None,
@@ -1695,6 +1729,8 @@ mod tests {
             &mut pictures,
             PictureCommand::Show {
                 video: None,
+                post_process: None,
+                replace: false,
                 screen_space: false,
                 id: "room".into(),
                 path: "background/room".into(),
@@ -1728,6 +1764,8 @@ mod tests {
             PictureCommand::Show {
                 id: "room".into(),
                 video: None,
+                post_process: None,
+                replace: false,
                 path: "pictures/bob.png".into(),
                 screen_space: false,
                 size: None,
@@ -1759,5 +1797,38 @@ mod tests {
         tick_picture(&mut restored, 0.5);
         assert!(restored.previous.is_empty());
         assert_eq!(restored.path, "pictures/bob.png");
+    }
+
+    #[test]
+    fn replacing_the_same_image_freezes_old_pose_during_crossfade() {
+        let mut pictures = shown();
+        tick_picture(pictures.get_mut("room").expect("old picture"), 0.3);
+        let path = pictures["room"].path.clone();
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Show {
+                id: "room".into(),
+                video: None,
+                post_process: None,
+                replace: true,
+                path,
+                screen_space: false,
+                size: None,
+                slice: None,
+                color: None,
+                rect: None,
+                position: [70.0, 30.0],
+                scale: 1.5,
+                rotation: 0.0,
+                layer: 5.0,
+                seconds: 1.0,
+            },
+        )
+        .expect("same-image replacement starts");
+        let picture = &pictures["room"];
+        assert_eq!(picture.position, [70.0, 30.0]);
+        assert_eq!(picture.alpha, 0.0);
+        assert_eq!(picture.previous.len(), 1);
+        assert_ne!(picture.previous[0].position, picture.position);
     }
 }

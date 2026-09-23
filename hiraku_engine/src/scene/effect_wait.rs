@@ -186,7 +186,10 @@ pub fn complete(
                         P::Transform { .. } | P::AnimateX { .. } | P::Oscillate { .. } => {
                             picture.motion.is_some()
                         }
-                        P::Clear | P::StopMotion { .. } | P::Noise { .. } => false,
+                        P::Clear
+                        | P::StopMotion { .. }
+                        | P::Noise { .. }
+                        | P::PostProcess { .. } => false,
                     }
                 } else {
                     false

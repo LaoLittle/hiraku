@@ -80,6 +80,10 @@ pub enum DialogueCommand {
 
 #[derive(Debug)]
 pub enum CameraCommand {
+    PostProcess {
+        scope: CameraEffectScope,
+        parameters: crate::effect::post_process::EffectParameters,
+    },
     Shake {
         amplitude: Vec2,
         interval: f32,

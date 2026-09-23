@@ -132,6 +132,8 @@ pub mod stored_value {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SceneSnapshot {
+    #[prost(bytes = "vec", tag = "16")]
+    pub post_process_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "15")]
     pub spatial_stage_hson: Vec<u8>,
     #[prost(btree_map = "string, float", tag = "14")]

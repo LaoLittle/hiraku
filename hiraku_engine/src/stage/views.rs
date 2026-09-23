@@ -214,7 +214,7 @@ fn view_camera(
     let mut pose = preset.pose.transform();
     let mut projection = preset.projection.projection();
     if let Some(state) = state {
-        let zoom = if matches!(state.effect_scope, crate::script::CameraEffectScope::Canvas) {
+        let zoom = if state.effect_scope != crate::script::CameraEffectScope::World {
             1.0
         } else {
             state.zoom.max(0.01)

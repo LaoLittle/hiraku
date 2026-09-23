@@ -1,9 +1,6 @@
 //! Exercise WESL linking without a window or a GPU. The vertex interfaces are
 //! fixtures; rendering integration remains the embedding application's test.
-use bevy::{
-    asset::AssetId,
-    shader::{Shader, ShaderCache, ShaderCacheSource, ShaderDefVal},
-};
+use bevy::shader::{ShaderCache, ShaderCacheSource, ShaderDefVal};
 
 #[test]
 fn native_ui_sampling_links_against_bevys_real_shader_interfaces() {
@@ -112,13 +109,52 @@ fn native_ui_sampling_links_against_bevys_real_shader_interfaces() {
 
 #[test]
 fn embedded_wesl_modules_link_for_material_variants() {
+    use bevy::prelude::*;
+    // Use the production plugin's asset registration. Do not manually inject
+    // these modules into the cache: that hid unloaded library dependencies.
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+        .init_asset::<Shader>()
+        .init_asset_loader::<bevy::shader::ShaderLoader>()
+        .add_plugins(crate::effect::post_process::PostProcessPlugin);
+    let required = ["input", "material", "fullscreen"];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        app.update();
+        let shaders = app.world().resource::<Assets<Shader>>();
+        if required.iter().all(|name| {
+            shaders.iter().any(|(_, shader)| {
+                shader.path == format!("embedded://hiraku_engine/effect/shaders/{name}.wesl")
+            })
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "effect plugin did not load its shader libraries"
+        );
+        std::thread::yield_now();
+    }
     let mut cache = ShaderCache::new((), |_, source, _| match source {
-        ShaderCacheSource::Wgsl(source) => Ok(source),
+        ShaderCacheSource::Wgsl(source) => {
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+            Ok(source)
+        }
         _ => panic!("expected linked WGSL"),
     });
     let id = |n| AssetId::Uuid {
         uuid: uuid::Uuid::from_u128(n),
     };
+    for (id, shader) in app.world().resource::<Assets<Shader>>().iter() {
+        cache.set_shader(id, shader.clone());
+    }
     cache.set_shader(
         id(3),
         Shader::from_wesl(
@@ -127,13 +163,13 @@ fn embedded_wesl_modules_link_for_material_variants() {
         ),
     );
     cache.set_shader(id(1), Shader::from_wesl(
-        "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) world_position: vec4<f32>, @location(1) uv: vec2<f32>, };",
+        "struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) world_position: vec4<f32>, @location(1) world_normal: vec3<f32>, @location(2) uv: vec2<f32>, };",
         "embedded://bevy_pbr/render/forward_io.wesl"));
     cache.set_shader(id(2), Shader::from_wesl(
         "struct UiVertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>, };",
         "embedded://bevy_ui_render/ui_vertex_output.wesl"));
     for (index, (name, source)) in [
-        ("world_sprite", include_str!("shaders/world_sprite.wesl")),
+        ("standard", include_str!("../effect/shaders/standard.wesl")),
         ("alpha_mask", include_str!("shaders/alpha_mask.wesl")),
         ("multiply", include_str!("shaders/multiply.wesl")),
         ("ui_quad", include_str!("shaders/ui_quad.wesl")),
@@ -145,7 +181,7 @@ fn embedded_wesl_modules_link_for_material_variants() {
             "custom_screen",
             include_str!("../effect/shaders/custom_screen_effect.wesl"),
         ),
-        ("blur", include_str!("../effect/shaders/blur_effect.wesl")),
+        ("blur", include_str!("../effect/shaders/blur.wesl")),
         (
             "sprite3d",
             include_str!("../../../hiraku_sprite3d/src/sprite3d.wesl"),
@@ -159,17 +195,91 @@ fn embedded_wesl_modules_link_for_material_variants() {
             shader,
             Shader::from_wesl(source, format!("embedded://fixture/{name}.wesl")),
         );
-        for multiply in [false, true] {
+        for (material, multiply, stage) in [
+            (false, false, 0),
+            (false, false, 1),
+            (false, false, 2),
+            (true, false, 0),
+            (true, true, 0),
+        ] {
             cache
                 .get(
                     index,
                     shader,
                     &[
                         ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 3),
+                        ShaderDefVal::UInt("EFFECT_STAGE".into(), stage),
                         ShaderDefVal::Bool("MASK_MULTIPLY".into(), multiply),
+                        ShaderDefVal::Bool("HIRAKU_MATERIAL".into(), material),
+                        ShaderDefVal::UInt(
+                            "EFFECT_BINDING_GROUP".into(),
+                            if material { 3 } else { 0 },
+                        ),
                     ],
                 )
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    // One unchanged third-party entry, no knowledge of blur, scopes or bindings.
+    // The same shader handle is specialized for every layer and material.
+    let source = r#"
+        import constants::EFFECT_BINDING_GROUP;
+        import hiraku::render::{VertexOutput, FragmentOutput, source, sampleColor, finish};
+        struct InvertUniform { strength: f32, }
+        @group(EFFECT_BINDING_GROUP) @binding(7) var<uniform> settings: InvertUniform;
+        @fragment
+        fn fragment(input: VertexOutput) -> FragmentOutput {
+            let surface = source(input);
+            let color = sampleColor(surface, surface.uv);
+            return finish(input, vec4<f32>(mix(color.rgb, vec3<f32>(1.0) - color.rgb, settings.strength), color.a));
+        }
+    "#;
+    let program = crate::EffectShader::from_wesl(
+        &mut app.world_mut().resource_mut::<Assets<Shader>>(),
+        source,
+    );
+    for (id, shader) in app.world().resource::<Assets<Shader>>().iter() {
+        cache.set_shader(id, shader.clone());
+    }
+    assert_eq!(
+        app.world()
+            .resource::<Assets<Shader>>()
+            .get(program.source())
+            .expect("author shader")
+            .source
+            .as_str(),
+        source
+    );
+    for material in [true, false] {
+        for stage in 0..3 {
+            let linked = cache
+                .get(
+                    100 + stage as usize,
+                    program.source().id(),
+                    &[
+                        ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 3),
+                        ShaderDefVal::UInt("EFFECT_STAGE".into(), stage),
+                        ShaderDefVal::Bool("HIRAKU_MATERIAL".into(), material),
+                        ShaderDefVal::UInt(
+                            "EFFECT_BINDING_GROUP".into(),
+                            if material { 3 } else { 0 },
+                        ),
+                    ],
+                )
+                .expect("author fragment must link and validate for every target");
+            let module = naga::front::wgsl::parse_str(&linked).expect("validated WGSL");
+            assert_eq!(module.entry_points.len(), 1, "no generated entry points");
+            assert_eq!(module.entry_points[0].stage, naga::ShaderStage::Fragment);
+            let expected_group = if material { 3 } else { 0 };
+            for (_, variable) in module.global_variables.iter() {
+                if let Some(binding) = &variable.binding {
+                    assert_eq!(
+                        binding.group, expected_group,
+                        "target bindings must not leak between specializations"
+                    );
+                }
+            }
         }
     }
 }

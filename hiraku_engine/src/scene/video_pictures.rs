@@ -198,10 +198,12 @@ mod tests {
         apply_picture_command(
             &mut shared.0.pictures,
             PictureCommand::Show {
+                post_process: None,
                 video: Some(PictureVideo {
                     looping: true,
                     layout: Default::default(),
                 }),
+                replace: false,
                 screen_space: false,
                 size: Some([320.0, 180.0]),
                 slice: None,

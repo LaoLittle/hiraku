@@ -16,6 +16,7 @@ pub enum CameraEffectScope {
     #[default]
     World,
     Canvas,
+    Ui,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

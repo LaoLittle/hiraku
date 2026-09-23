@@ -1,6 +1,6 @@
 use crate::{
     HirakuCanvas, RuntimeLaunchConfig,
-    effect::blur::BlurSettings,
+    effect::post_process::PostProcessSettings,
     scene::{AnimationState, apply_character_ease, complete_missing_animation, tween_fraction},
     script::{CameraEffectScope, CameraProjectionMode},
 };
@@ -191,7 +191,7 @@ pub fn setup_stage_cameras(
         IsDefaultUiCamera,
         Projection::Orthographic(projection),
         Transform::from_xyz(0.0, 0.0, 1000.0),
-        BlurSettings::default(),
+        PostProcessSettings::default(),
         Camera {
             order: config.camera_order,
             clear_color: config.camera_clear_color.clone(),
@@ -456,7 +456,7 @@ pub fn animate_camera_transition(
             &WorldCamera3d,
             &mut Projection,
             &mut Transform,
-            &mut BlurSettings,
+            &mut PostProcessSettings,
         ),
         With<WorldCamera>,
     >,
@@ -539,19 +539,16 @@ pub fn animate_camera_transition(
     // Stage owns spatial projections, but its composed output still passes
     // through the presentation camera's post-processing.
     for (_, _, _, mut blur) in &mut world_cameras {
-        let mut settings = *blur;
-        settings.set_radius(camera_state.blur_intensity);
-        settings.set_include_ui(matches!(
-            camera_state.effect_scope,
-            CameraEffectScope::Canvas
-        ));
-        settings.set_canvas_zoom(
-            if matches!(camera_state.effect_scope, CameraEffectScope::Canvas) {
-                camera_state.zoom
-            } else {
-                1.0
-            },
-        );
+        let mut settings = shared
+            .as_ref()
+            .map_or_else(PostProcessSettings::default, |s| s.0.post_process);
+        let layer = settings.layer_mut(camera_state.effect_scope);
+        // Preserve the camera API's artistic strength-to-radius scale. The
+        // standard Kawase kernel does not guarantee a Gaussian sigma.
+        layer.blur_radius += 2.0 * camera_state.blur_intensity.max(0.0);
+        if camera_state.effect_scope != CameraEffectScope::World {
+            layer.zoom *= camera_state.zoom.max(0.01);
+        }
         blur.set_if_neq(settings);
     }
     if shared
@@ -570,7 +567,7 @@ pub fn animate_camera_transition(
         // Bevy UI is a separate pass attached to this camera and does not use
         // its world projection. Camera transforms therefore always apply to the
         // 3D scene, including effects authored with canvas scope.
-        let zoom = if matches!(camera_state.effect_scope, CameraEffectScope::Canvas) {
+        let zoom = if camera_state.effect_scope != CameraEffectScope::World {
             1.0 // Applied once to the composed frame, after the Bevy UI pass.
         } else {
             camera_state.zoom.max(0.01)
