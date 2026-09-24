@@ -18,6 +18,19 @@ use bevy::{
     prelude::*,
     render::render_resource::TextureFormat,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+const CAMERA_SCOPES: [CameraEffectScope; 4] = [
+    CameraEffectScope::Background,
+    CameraEffectScope::World,
+    CameraEffectScope::Ui,
+    CameraEffectScope::Canvas,
+];
+
+#[cfg(test)]
+#[path = "camera_tests.rs"]
+mod virtual_camera_tests;
 
 /// Static background artwork and background-only effects such as rain or fog.
 pub const BACKGROUND_LAYER: usize = 0;
@@ -72,17 +85,16 @@ pub struct CameraShakeState {
     pub active: Option<CameraShake>,
 }
 
-#[derive(Resource, Clone, PartialEq)]
-pub struct CameraState {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CameraView {
     pub blur_intensity: f32,
     pub zoom: f32,
     pub offset: Vec3,
     pub rotation: Vec3,
     pub projection: CameraProjectionMode,
-    pub effect_scope: CameraEffectScope,
 }
 
-impl Default for CameraState {
+impl Default for CameraView {
     fn default() -> Self {
         Self {
             blur_intensity: 0.0,
@@ -90,16 +102,197 @@ impl Default for CameraState {
             offset: Vec3::ZERO,
             rotation: Vec3::ZERO,
             projection: CameraProjectionMode::Orthographic,
-            effect_scope: CameraEffectScope::World,
         }
     }
 }
 
-#[derive(Resource, Default)]
+impl CameraView {
+    pub(crate) fn transform_picture(&self, mut transform: Transform) -> Transform {
+        let depth = transform.translation.z;
+        let rotation = Quat::from_rotation_z(-self.rotation.z.to_radians());
+        transform.translation = rotation * (transform.translation - self.offset) * self.zoom;
+        transform.translation.z = depth;
+        transform.rotation = rotation * transform.rotation;
+        transform.scale.x *= self.zoom;
+        transform.scale.y *= self.zoom;
+        transform
+    }
+    /// Inverse presentation transform, shared with virtual-pointer picking.
+    fn source_uv(&self, uv: Vec2, size: Vec2) -> Vec2 {
+        let p = (uv - Vec2::splat(0.5)) * size / self.zoom.max(0.01);
+        let (s, c) = self.rotation.z.to_radians().sin_cos();
+        (Vec2::new(c * p.x + s * p.y, -s * p.x + c * p.y)
+            + Vec2::new(self.offset.x, -self.offset.y))
+            / size
+            + Vec2::splat(0.5)
+    }
+}
+
+/// Independent virtual views sharing one physical presentation camera.
+#[derive(Resource, Clone, Debug, Serialize, Deserialize)]
+pub struct CameraState {
+    #[serde(with = "view_entries")]
+    views: BTreeMap<CameraEffectScope, CameraView>,
+}
+
+impl Default for CameraState {
+    fn default() -> Self {
+        Self {
+            views: CAMERA_SCOPES
+                .into_iter()
+                .map(|scope| (scope, CameraView::default()))
+                .collect(),
+        }
+    }
+}
+
+impl CameraState {
+    pub(crate) fn ui_source_uv(&self, uv: Vec2, size: Vec2) -> Vec2 {
+        let scene_uv = self.view(CameraEffectScope::Canvas).source_uv(uv, size);
+        if scene_uv.min_element() < 0.0 || scene_uv.max_element() > 1.0 {
+            return Vec2::splat(-1.0);
+        }
+        self.view(CameraEffectScope::Ui).source_uv(scene_uv, size)
+    }
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if CAMERA_SCOPES
+            .iter()
+            .any(|scope| !self.views.contains_key(scope))
+        {
+            return Err("virtual camera snapshot is missing a view");
+        }
+        if self.views.values().any(|view| {
+            !view.zoom.is_finite()
+                || view.zoom <= 0.0
+                || !view.blur_intensity.is_finite()
+                || view.blur_intensity < 0.0
+                || !view.offset.is_finite()
+                || !view.rotation.is_finite()
+        }) {
+            return Err("invalid virtual camera pose");
+        }
+        Ok(())
+    }
+    pub fn view(&self, scope: CameraEffectScope) -> &CameraView {
+        self.views
+            .get(&scope)
+            .expect("every camera scope has a view")
+    }
+
+    fn view_mut(&mut self, scope: CameraEffectScope) -> &mut CameraView {
+        self.views
+            .get_mut(&scope)
+            .expect("every camera scope has a view")
+    }
+}
+
+mod camera_timer {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        timer: &Timer,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        (timer.duration(), timer.elapsed()).serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Timer, D::Error> {
+        let (duration, elapsed) =
+            <(std::time::Duration, std::time::Duration)>::deserialize(deserializer)?;
+        if elapsed > duration {
+            return Err(serde::de::Error::custom(
+                "camera elapsed time exceeds its duration",
+            ));
+        }
+        let mut timer = Timer::new(duration, TimerMode::Once);
+        timer.tick(elapsed);
+        Ok(timer)
+    }
+}
+
+#[derive(Resource, Default, Clone, Debug, Serialize, Deserialize)]
 pub struct CameraTweenState {
+    #[serde(with = "view_entries")]
+    pub views: BTreeMap<CameraEffectScope, CameraTimeline>,
+}
+
+impl CameraTweenState {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        for timeline in self.views.values() {
+            let Some(tween) = &timeline.active else {
+                continue;
+            };
+            for scalar in [tween.blur.as_ref(), tween.zoom.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if !scalar.from.is_finite() || !scalar.to.is_finite() || !valid_ease(scalar.ease) {
+                    return Err("invalid virtual camera scalar tween");
+                }
+            }
+            if tween
+                .zoom
+                .as_ref()
+                .is_some_and(|v| v.from <= 0.0 || v.to <= 0.0)
+                || tween
+                    .blur
+                    .as_ref()
+                    .is_some_and(|v| v.from < 0.0 || v.to < 0.0)
+            {
+                return Err("invalid virtual camera zoom or blur range");
+            }
+            for vector in [tween.offset.as_ref(), tween.rotation.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if !vector.from.is_finite() || !vector.to.is_finite() || !valid_ease(vector.ease) {
+                    return Err("invalid virtual camera vector tween");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_ease(ease: CharacterEase) -> bool {
+    match ease {
+        CharacterEase::CubicBezier(x1, y1, x2, y2) => {
+            [x1, y1, x2, y2].into_iter().all(f64::is_finite)
+                && (0.0..=1.0).contains(&x1)
+                && (0.0..=1.0).contains(&x2)
+        }
+        _ => true,
+    }
+}
+
+mod view_entries {
+    use super::*;
+    pub fn serialize<T: Serialize, S: serde::Serializer>(
+        values: &BTreeMap<CameraEffectScope, T>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        values.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+    pub fn deserialize<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<CameraEffectScope, T>, D::Error> {
+        let entries = Vec::<(CameraEffectScope, T)>::deserialize(deserializer)?;
+        let mut result = BTreeMap::new();
+        for (scope, value) in entries {
+            if result.insert(scope, value).is_some() {
+                return Err(serde::de::Error::custom("duplicate virtual camera scope"));
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+pub struct CameraTimeline {
     pub active: Option<CameraTween>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CameraTween {
     pub zoom_view_space: bool,
     pub blur: Option<CameraScalarTween>,
@@ -109,6 +302,7 @@ pub struct CameraTween {
     pub completions: Vec<CameraTweenCompletion>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CameraTweenCompletion {
     pub blur: bool,
     pub zoom: bool,
@@ -117,16 +311,20 @@ pub struct CameraTweenCompletion {
     pub animation_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CameraScalarTween {
     pub from: f32,
     pub to: f32,
+    #[serde(with = "camera_timer")]
     pub timer: Timer,
     pub ease: CharacterEase,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CameraVectorTween {
     pub from: Vec3,
     pub to: Vec3,
+    #[serde(with = "camera_timer")]
     pub timer: Timer,
     pub ease: CharacterEase,
 }
@@ -259,7 +457,7 @@ pub fn assign_render_layers(
     }
 }
 
-pub fn animate_camera_shake(
+pub(crate) fn animate_camera_shake(
     mut redraw: crate::redraw::Redraw,
     time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
@@ -267,6 +465,7 @@ pub fn animate_camera_shake(
     camera_state: Res<CameraState>,
     mut cameras: Query<&mut Transform, With<WorldCamera>>,
 ) {
+    let camera_state = camera_state.view(CameraEffectScope::World);
     let Some(shake) = shake_state.active.as_mut() else {
         for mut camera in &mut cameras {
             camera.translation.x = camera_state.offset.x;
@@ -311,7 +510,8 @@ pub(crate) fn start_camera_tween(
     animation_id: Option<String>,
     animations: &mut AnimationState,
 ) {
-    camera.effect_scope = scope;
+    let camera = camera.view_mut(scope);
+    let tweens = tweens.views.entry(scope).or_default();
     if let Some(projection) = projection {
         camera.projection = projection;
     }
@@ -443,14 +643,15 @@ fn interpolate_zoom(from: f32, to: f32, progress: f32, view_space: bool) -> f32 
     }
 }
 
-pub fn animate_camera_transition(
-    shared: Option<Res<crate::state::SceneSharedState>>,
+pub(crate) fn animate_camera_transition(
+    mut shared: Option<ResMut<crate::state::SceneSharedState>>,
+    canvas: Option<Res<HirakuCanvas>>,
     mut redraw: crate::redraw::Redraw,
     time: crate::scene::playback::StoryTime,
     mut animations: ResMut<AnimationState>,
     mut camera_state: ResMut<CameraState>,
     mut tweens: ResMut<CameraTweenState>,
-    mut applied_state: Local<Option<CameraState>>,
+    mut applied_state: Local<Option<CameraView>>,
     mut world_cameras: Query<
         (
             &WorldCamera3d,
@@ -461,18 +662,90 @@ pub fn animate_camera_transition(
         With<WorldCamera>,
     >,
 ) {
+    let mut changed = camera_state.is_changed() || tweens.is_changed();
+    for scope in CAMERA_SCOPES {
+        if !tweens
+            .views
+            .get(&scope)
+            .is_some_and(|timeline| timeline.active.is_some())
+        {
+            continue;
+        }
+        changed = true;
+        let timeline = tweens
+            .views
+            .get_mut(&scope)
+            .expect("active timeline exists");
+        redraw.request();
+        tick_camera_view(
+            camera_state.view_mut(scope),
+            timeline,
+            time.delta(),
+            &mut animations,
+        );
+    }
+
+    if changed && let Some(shared) = shared.as_mut() {
+        shared.0.camera = crate::state::CameraSnapshot {
+            views: camera_state.clone(),
+            timelines: tweens.clone(),
+        };
+    }
+
+    // Each view contributes only to its own composition boundary. Changing a
+    // UI/canvas view must never switch off an ongoing scene lens animation.
+    for (_, _, _, mut effects) in &mut world_cameras {
+        let mut settings = shared
+            .as_ref()
+            .map_or_else(PostProcessSettings::default, |s| s.0.post_process);
+        for scope in CAMERA_SCOPES {
+            let view = camera_state.view(scope);
+            let layer = settings.layer_mut(scope);
+            layer.blur_radius += 2.0 * view.blur_intensity.max(0.0);
+            if matches!(scope, CameraEffectScope::Ui | CameraEffectScope::Canvas) {
+                layer.zoom *= view.zoom.max(0.01);
+                let size = canvas
+                    .as_ref()
+                    .map_or(Vec2::new(1920.0, 1080.0), |c| c.size.as_vec2())
+                    .max(Vec2::ONE);
+                if view.offset != Vec3::ZERO || view.rotation != Vec3::ZERO || view.zoom != 1.0 {
+                    layer.view_transform = Vec4::new(
+                        view.offset.x / size.x,
+                        -view.offset.y / size.y,
+                        view.rotation.z.to_radians(),
+                        size.x / size.y,
+                    );
+                }
+            }
+        }
+        effects.set_if_neq(settings);
+    }
+    let camera_state = camera_state.view(CameraEffectScope::World);
+    apply_scene_camera(
+        camera_state,
+        shared.as_deref(),
+        &mut applied_state,
+        &mut world_cameras,
+    );
+}
+
+fn tick_camera_view(
+    camera_state: &mut CameraView,
+    tweens: &mut CameraTimeline,
+    delta: std::time::Duration,
+    animations: &mut AnimationState,
+) {
     let mut completed = Vec::new();
     if let Some(tween) = tweens.active.as_mut() {
-        redraw.request();
         if let Some(blur_tween) = tween.blur.as_mut() {
-            blur_tween.timer.tick(time.delta());
+            blur_tween.timer.tick(delta);
             camera_state.blur_intensity = blur_tween.from.lerp(
                 blur_tween.to,
                 apply_character_ease(blur_tween.ease, tween_fraction(&blur_tween.timer)),
             );
         }
         if let Some(zoom_tween) = tween.zoom.as_mut() {
-            zoom_tween.timer.tick(time.delta());
+            zoom_tween.timer.tick(delta);
             camera_state.zoom = interpolate_zoom(
                 zoom_tween.from,
                 zoom_tween.to,
@@ -481,14 +754,14 @@ pub fn animate_camera_transition(
             );
         }
         if let Some(offset_tween) = tween.offset.as_mut() {
-            offset_tween.timer.tick(time.delta());
+            offset_tween.timer.tick(delta);
             camera_state.offset = offset_tween.from.lerp(
                 offset_tween.to,
                 apply_character_ease(offset_tween.ease, tween_fraction(&offset_tween.timer)),
             );
         }
         if let Some(rotation_tween) = tween.rotation.as_mut() {
-            rotation_tween.timer.tick(time.delta());
+            rotation_tween.timer.tick(delta);
             camera_state.rotation = rotation_tween.from.lerp(
                 rotation_tween.to,
                 apply_character_ease(rotation_tween.ease, tween_fraction(&rotation_tween.timer)),
@@ -526,7 +799,7 @@ pub fn animate_camera_transition(
         tween.completions = pending;
     }
     for completion in completed {
-        complete_missing_animation(&mut animations, completion.animation_id);
+        complete_missing_animation(animations, completion.animation_id);
     }
     if tweens
         .active
@@ -535,22 +808,22 @@ pub fn animate_camera_transition(
     {
         tweens.active = None;
     }
+}
 
-    // Stage owns spatial projections, but its composed output still passes
-    // through the presentation camera's post-processing.
-    for (_, _, _, mut blur) in &mut world_cameras {
-        let mut settings = shared
-            .as_ref()
-            .map_or_else(PostProcessSettings::default, |s| s.0.post_process);
-        let layer = settings.layer_mut(camera_state.effect_scope);
-        // Preserve the camera API's artistic strength-to-radius scale. The
-        // standard Kawase kernel does not guarantee a Gaussian sigma.
-        layer.blur_radius += 2.0 * camera_state.blur_intensity.max(0.0);
-        if camera_state.effect_scope != CameraEffectScope::World {
-            layer.zoom *= camera_state.zoom.max(0.01);
-        }
-        blur.set_if_neq(settings);
-    }
+fn apply_scene_camera(
+    camera_state: &CameraView,
+    shared: Option<&crate::state::SceneSharedState>,
+    applied_state: &mut Option<CameraView>,
+    world_cameras: &mut Query<
+        (
+            &WorldCamera3d,
+            &mut Projection,
+            &mut Transform,
+            &mut PostProcessSettings,
+        ),
+        With<WorldCamera>,
+    >,
+) {
     if shared
         .as_ref()
         .is_some_and(|shared| shared.0.spatial_stage.is_some())
@@ -563,15 +836,10 @@ pub fn animate_camera_transition(
     }
     *applied_state = Some(camera_state.clone());
 
-    for (camera, mut projection, mut transform, _) in &mut world_cameras {
-        // Bevy UI is a separate pass attached to this camera and does not use
-        // its world projection. Camera transforms therefore always apply to the
-        // 3D scene, including effects authored with canvas scope.
-        let zoom = if camera_state.effect_scope != CameraEffectScope::World {
-            1.0 // Applied once to the composed frame, after the Bevy UI pass.
-        } else {
-            camera_state.zoom.max(0.01)
-        };
+    for (camera, mut projection, mut transform, _) in world_cameras.iter_mut() {
+        // Only the scene view drives the physical lens. UI/canvas views are
+        // composed later and never mutate its transform or projection.
+        let zoom = camera_state.zoom.max(0.01);
         match camera_state.projection {
             CameraProjectionMode::Orthographic => {
                 if !matches!(*projection, Projection::Orthographic(_)) {

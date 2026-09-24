@@ -42,6 +42,7 @@ macro_rules! builder {
 builder! {
     picture_show, PictureShowHandle, "PictureShow", 10;
     at["at"](position: Position) -> PictureShowHandle => picture_at;
+    view["view"](view: CameraScope) -> PictureShowHandle => picture_view;
     screen_space["screenSpace"]() -> PictureShowHandle => screen_space;
     frame["frame"](x: f64, y: f64, scale: f64, rotation: f64, layer: f64)
         -> PictureShowHandle => frame;

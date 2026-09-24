@@ -77,6 +77,7 @@ impl VideoPictures<'_, '_> {
         rendered: &BTreeMap<(String, Option<usize>), &PictureState>,
         canvas: Vec2,
         camera: Option<(&Transform, &Projection)>,
+        background_view: Option<&crate::render::camera::CameraView>,
     ) {
         let mut existing = HashSet::new();
         for (entity, mut marker, mut transform) in &mut self.entities {
@@ -100,7 +101,9 @@ impl VideoPictures<'_, '_> {
             };
             marker.previous = previous;
             existing.insert(key);
-            let next = video_transform(picture, previous, pictures, canvas, camera);
+            commands.entity(entity).try_insert(picture.view);
+            let next =
+                video_transform(picture, previous, pictures, canvas, camera, background_view);
             if *transform != next {
                 *transform = next;
             }
@@ -118,7 +121,15 @@ impl VideoPictures<'_, '_> {
             }
             let entity = commands
                 .spawn((
-                    video_transform(picture, *previous, pictures, canvas, camera),
+                    video_transform(
+                        picture,
+                        *previous,
+                        pictures,
+                        canvas,
+                        camera,
+                        background_view,
+                    ),
+                    picture.view,
                     Visibility::Inherited,
                     crate::render::camera::scene_layer(),
                 ))
@@ -156,8 +167,9 @@ fn video_transform(
     pictures: &BTreeMap<String, PictureState>,
     canvas: Vec2,
     camera: Option<(&Transform, &Projection)>,
+    background_view: Option<&crate::render::camera::CameraView>,
 ) -> Transform {
-    let mut transform = super::pictures::picture_transform(picture, canvas);
+    let mut transform = super::pictures::viewed_picture_transform(picture, canvas, background_view);
     if let Some(index) = previous {
         let incoming = &pictures[&picture.id];
         transform.translation.z = incoming.layer - (incoming.previous.len() - index) as f32 * 0.001;
@@ -206,6 +218,7 @@ mod tests {
                 }),
                 replace: false,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 size: Some([320.0, 180.0]),
                 slice: None,
                 color: None,

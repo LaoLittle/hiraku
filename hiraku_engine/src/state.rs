@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 29;
+pub const CURRENT_SAVE_VERSION: u32 = 31;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
@@ -99,27 +99,10 @@ pub struct TextEffectSnapshot {
     pub fade_seconds: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CameraSnapshot {
-    pub blur: f32,
-    pub zoom: f32,
-    pub offset: [f32; 3],
-    pub rotation: [f32; 3],
-    pub projection: String,
-    pub scope: String,
-}
-
-impl Default for CameraSnapshot {
-    fn default() -> Self {
-        Self {
-            blur: 0.0,
-            zoom: 1.0,
-            offset: [0.0; 3],
-            rotation: [0.0; 3],
-            projection: "orthographic".to_string(),
-            scope: "world".to_string(),
-        }
-    }
+    pub views: crate::render::camera::CameraState,
+    pub timelines: crate::render::camera::CameraTweenState,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

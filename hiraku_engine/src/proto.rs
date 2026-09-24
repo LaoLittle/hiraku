@@ -168,18 +168,8 @@ pub struct SceneSnapshot {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct CameraSnapshot {
-    #[prost(float, tag = "1")]
-    pub blur: f32,
-    #[prost(float, tag = "2")]
-    pub zoom: f32,
-    #[prost(float, repeated, tag = "3")]
-    pub offset: Vec<f32>,
-    #[prost(float, repeated, tag = "4")]
-    pub rotation: Vec<f32>,
-    #[prost(string, tag = "5")]
-    pub projection: String,
-    #[prost(string, tag = "6")]
-    pub scope: String,
+    #[prost(bytes = "vec", tag = "7")]
+    pub views_hson: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]

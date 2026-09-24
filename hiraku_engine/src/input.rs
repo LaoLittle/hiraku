@@ -504,6 +504,7 @@ pub(crate) fn bridge_virtual_pointers(
     mut commands: Commands,
     canvas: Option<Res<HirakuCanvas>>,
     target: Option<Res<HirakuInputTarget>>,
+    camera_views: Option<Res<crate::render::camera::CameraState>>,
     mut input: MessageReader<HirakuPointerInput>,
     mut scrolls: MessageReader<HirakuScrollInput>,
     mut output: MessageWriter<PointerInput>,
@@ -536,7 +537,11 @@ pub(crate) fn bridge_virtual_pointers(
             gestures.remove(&sample.pointer);
             continue;
         }
-        let position = sample.uv.clamp(Vec2::ZERO, Vec2::ONE) * canvas.size.as_vec2();
+        let uv = sample.uv.clamp(Vec2::ZERO, Vec2::ONE);
+        let position = camera_views
+            .as_ref()
+            .map_or(uv, |views| views.ui_source_uv(uv, canvas.size.as_vec2()))
+            * canvas.size.as_vec2();
         let location = Location {
             target: target.clone(),
             position,
@@ -692,7 +697,11 @@ pub(crate) fn bridge_virtual_pointers(
             continue;
         }
         redraw.request();
-        let position = scroll.uv.clamp(Vec2::ZERO, Vec2::ONE) * canvas.size.as_vec2();
+        let uv = scroll.uv.clamp(Vec2::ZERO, Vec2::ONE);
+        let position = camera_views
+            .as_ref()
+            .map_or(uv, |views| views.ui_source_uv(uv, canvas.size.as_vec2()))
+            * canvas.size.as_vec2();
         let location = Location {
             target: target.clone(),
             position,

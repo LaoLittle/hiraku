@@ -131,6 +131,7 @@ mod api {
         effect: PostProcess,
     ) -> Result<(), NativeError> {
         let scope = match scope {
+            CameraScope::Background => CameraEffectScope::Background,
             CameraScope::Scene => CameraEffectScope::World,
             CameraScope::Ui => CameraEffectScope::Ui,
             CameraScope::Canvas => CameraEffectScope::Canvas,

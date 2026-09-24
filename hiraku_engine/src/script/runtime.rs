@@ -11,8 +11,9 @@ pub struct ScriptCallFrame {
     pub story: StoryRuntime,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CameraEffectScope {
+    Background,
     #[default]
     World,
     Canvas,

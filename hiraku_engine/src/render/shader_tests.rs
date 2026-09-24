@@ -200,6 +200,7 @@ fn embedded_wesl_modules_link_for_material_variants() {
             (false, false, 0),
             (false, false, 1),
             (false, false, 2),
+            (false, false, 3),
             (true, false, 0),
             (true, true, 0),
         ] {

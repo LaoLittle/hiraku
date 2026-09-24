@@ -466,31 +466,6 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 ease,
                 animation_id,
             }) => {
-                if let Some(blur) = blur_intensity {
-                    shared_state.0.camera.blur = blur;
-                }
-                if let Some(zoom) = zoom {
-                    shared_state.0.camera.zoom = zoom;
-                }
-                if let Some(offset) = offset {
-                    shared_state.0.camera.offset = offset.to_array();
-                }
-                if let Some(rotation) = rotation {
-                    shared_state.0.camera.rotation = rotation.to_array();
-                }
-                if let Some(projection) = projection {
-                    shared_state.0.camera.projection = match projection {
-                        crate::script::CameraProjectionMode::Orthographic => "orthographic",
-                        crate::script::CameraProjectionMode::Perspective => "perspective",
-                    }
-                    .to_string();
-                }
-                shared_state.0.camera.scope = match scope {
-                    crate::script::CameraEffectScope::World => "world",
-                    crate::script::CameraEffectScope::Canvas => "canvas",
-                    crate::script::CameraEffectScope::Ui => "ui",
-                }
-                .to_string();
                 start_camera_tween(
                     &mut camera_state,
                     &mut camera_tweens,
@@ -506,6 +481,10 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     animation_id,
                     &mut animations,
                 );
+                shared_state.0.camera = crate::state::CameraSnapshot {
+                    views: camera_state.clone(),
+                    timelines: camera_tweens.clone(),
+                };
             }
             ScriptCommand::Settings(command) => {
                 match &command {
@@ -825,7 +804,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     script_runtime.mounted_ui_overlays.clear();
                     pending_characters.items.clear();
                     animations.completed.clear();
-                    camera_tweens.active = None;
+                    camera_tweens.views.clear();
                     camera_shake.active = None;
                     *camera_state = CameraState::default();
                     let empty_scene = SceneSnapshot::default();

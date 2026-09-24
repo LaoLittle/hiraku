@@ -1046,6 +1046,7 @@ impl CharacterContext {
                 rotation: None,
                 projection: None,
                 scope: match scope {
+                    CameraScope::Background => CameraEffectScope::Background,
                     CameraScope::Scene => CameraEffectScope::World,
                     CameraScope::Canvas => CameraEffectScope::Canvas,
                     CameraScope::Ui => CameraEffectScope::Ui,
@@ -1248,12 +1249,15 @@ impl Position {
 hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CameraScope {
+    Background,
     Scene,
     Canvas,
     Ui,
 }
 
 impl CameraScope {
+    #[getter]
+    fn background() -> CameraScope { Self::Background }
     #[getter]
     fn scene() -> CameraScope { Self::Scene }
 
@@ -1858,6 +1862,22 @@ mod native_api {
         Ok(context.camera(scope.unwrap_or(CameraScope::Scene)))
     }
 
+    /// Reset the selected view, retaining this builder's timing and easing.
+    #[hks(name = "reset", receiver)]
+    fn native_camera_reset(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+    ) -> Result<CameraHandle, NativeError> {
+        let camera = context.camera_mut(handle)?;
+        camera.blur = Some(0.0);
+        camera.zoom = Some(1.0);
+        camera.zoom_view_space = false;
+        camera.offset = Some([0.0; 3]);
+        camera.rotation = Some([0.0; 3]);
+        camera.projection = Some(CameraProjectionMode::Orthographic);
+        Ok(CameraHandle(handle))
+    }
+
     #[hks(name = "blur", receiver)]
     fn native_camera_blur(
         context: &mut CharacterContext,
@@ -1922,7 +1942,13 @@ mod native_api {
                 "camera offset must be finite and representable",
             ));
         }
-        context.camera_mut(handle)?.offset = Some([x as f32, y as f32, z as f32]);
+        let camera = context.camera_mut(handle)?;
+        if camera.scope != CameraEffectScope::World && z != 0.0 {
+            return Err(NativeError::message(
+                "background/UI/canvas cameras are planar; offset z must be zero",
+            ));
+        }
+        camera.offset = Some([x as f32, y as f32, z as f32]);
         Ok(CameraHandle(handle))
     }
 
@@ -1939,7 +1965,13 @@ mod native_api {
                 "camera rotation must be finite and representable",
             ));
         }
-        context.camera_mut(handle)?.rotation = Some([x as f32, y as f32, z as f32]);
+        let camera = context.camera_mut(handle)?;
+        if camera.scope != CameraEffectScope::World && (x != 0.0 || y != 0.0) {
+            return Err(NativeError::message(
+                "background/UI/canvas cameras are planar; use roll or rotation(0, 0, degrees)",
+            ));
+        }
+        camera.rotation = Some([x as f32, y as f32, z as f32]);
         Ok(CameraHandle(handle))
     }
 
@@ -1967,7 +1999,13 @@ mod native_api {
         CameraHandle(handle): CameraHandle,
         projection: CameraProjection,
     ) -> Result<CameraHandle, NativeError> {
-        context.camera_mut(handle)?.projection = Some(match projection {
+        let camera = context.camera_mut(handle)?;
+        if camera.scope != CameraEffectScope::World && projection == CameraProjection::Perspective {
+            return Err(NativeError::message(
+                "perspective projection requires the scene camera",
+            ));
+        }
+        camera.projection = Some(match projection {
             CameraProjection::Orthographic => CameraProjectionMode::Orthographic,
             CameraProjection::Perspective => CameraProjectionMode::Perspective,
         });
@@ -2063,6 +2101,37 @@ mod native_api {
             native_narrate(context, TextTemplate(text.clone()))?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn camera_reset_and_planar_validation_share_the_same_builder() {
+        let mut host = StoryNativeHost::new();
+        for scope in [CameraScope::Scene, CameraScope::Ui, CameraScope::Canvas] {
+            let camera = native_camera(&mut host.context, Some(scope)).expect("camera");
+            native_camera_zoom(&mut host.context, camera, 2.0).expect("zoom");
+            native_camera_roll(&mut host.context, camera, 30.0).expect("roll");
+            native_camera_offset(&mut host.context, camera, 20.0, -30.0, 0.0).expect("pan");
+            native_camera_time(&mut host.context, camera, 0.5).expect("duration");
+            native_camera_reset(&mut host.context, camera).expect("reset");
+            let before = host.context.pending_cameras[&camera.0].clone();
+            assert_eq!(before.zoom, Some(1.0));
+            assert_eq!(before.offset, Some([0.0; 3]));
+            assert_eq!(before.duration_ms, 500);
+            if scope != CameraScope::Scene {
+                assert!(native_camera_offset(&mut host.context, camera, 0.0, 0.0, 1.0).is_err());
+                assert!(native_camera_rotation(&mut host.context, camera, 1.0, 0.0, 0.0).is_err());
+                assert!(
+                    native_camera_projection(
+                        &mut host.context,
+                        camera,
+                        CameraProjection::Perspective
+                    )
+                    .is_err()
+                );
+                assert_eq!(host.context.pending_cameras[&camera.0], before);
+            }
+        }
     }
 
     #[cfg(test)]

@@ -2025,13 +2025,14 @@ mod tests {
                 char("alice").focus().show()
                 char("bob").focus(false).show()
                 camera().blur(2)
-                camera(.canvas)
+                camera(.scene)
                     .offset(10, 20, 30)
                     .rotation(1, 2, 3)
                     .zoom(1.25)
                     .projection(.perspective)
                     .time(0.5)
                     .easing(.easeOut)
+                camera(.canvas).offset(10, 20, 0).roll(3).zoom(1.25).time(0.5)
             "#,
         )
         .expect("fluent engine APIs must compile");
@@ -2089,9 +2090,18 @@ mod tests {
                 projection: Some(crate::script::CameraProjectionMode::Perspective),
                 duration_ms: 500,
                 ease,
-                scope: crate::script::CameraEffectScope::Canvas,
+                scope: crate::script::CameraEffectScope::World,
                 ..
             } if (*zoom - 1.25).abs() < f32::EPSILON && *ease == crate::script::animation::Easing::EaseOut
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::SetCamera {
+                offset: Some([10.0, 20.0, 0.0]),
+                rotation: Some([0.0, 0.0, 3.0]),
+                scope: crate::script::CameraEffectScope::Canvas,
+                ..
+            }
         )));
     }
 

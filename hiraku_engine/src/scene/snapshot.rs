@@ -154,6 +154,8 @@ pub(super) fn restore_scene_snapshot(
     snapshot: SceneSnapshot,
 ) {
     let text_effect = snapshot.text_effect.clone();
+    commands.insert_resource(snapshot.camera.views.clone());
+    commands.insert_resource(snapshot.camera.timelines.clone());
     // Decoder instances are presentation state, never reusable across restores.
     commands.queue(|world: &mut World| {
         let mut query = world.query_filtered::<Entity, With<super::video_pictures::VideoPicture>>();

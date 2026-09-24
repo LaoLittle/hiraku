@@ -37,6 +37,9 @@ pub struct EffectParameters {
     pub grayscale_gamma: Vec4,
     /// Strength, inner radius, outer radius, unused.
     pub vignette: Vec4,
+    /// UV offset, view roll in radians, canvas aspect ratio (zero = identity).
+    #[serde(default)]
+    pub view_transform: Vec4,
 }
 
 impl Default for EffectParameters {
@@ -49,6 +52,7 @@ impl Default for EffectParameters {
             tint: Vec4::ONE,
             grayscale_gamma: Vec4::ZERO,
             vignette: Vec4::new(0.0, 0.25, 0.75, 0.0),
+            view_transform: Vec4::ZERO,
         }
     }
 }
@@ -64,6 +68,7 @@ impl EffectParameters {
             || !self.tint.is_finite()
             || !self.grayscale_gamma.is_finite()
             || !self.vignette.is_finite()
+            || !self.view_transform.is_finite()
             || !(0.0..=128.0).contains(&self.blur_radius)
             || self.zoom <= 0.0
             || !(-16.0..=16.0).contains(&self.exposure)
@@ -97,6 +102,8 @@ impl EffectParameters {
 )]
 #[extract_app(RenderApp)]
 pub struct PostProcessSettings {
+    #[serde(default)]
+    pub background: EffectParameters,
     pub scene: EffectParameters,
     pub ui: EffectParameters,
     pub canvas: EffectParameters,
@@ -104,12 +111,14 @@ pub struct PostProcessSettings {
 
 impl PostProcessSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.background.validate()?;
         self.scene.validate()?;
         self.ui.validate()?;
         self.canvas.validate()
     }
     pub fn layer_mut(&mut self, layer: crate::script::CameraEffectScope) -> &mut EffectParameters {
         match layer {
+            crate::script::CameraEffectScope::Background => &mut self.background,
             crate::script::CameraEffectScope::World => &mut self.scene,
             crate::script::CameraEffectScope::Ui => &mut self.ui,
             crate::script::CameraEffectScope::Canvas => &mut self.canvas,
@@ -145,18 +154,22 @@ mod tests {
             );
         }
         assert!(!EffectParameters::default().is_enabled());
-        assert!(EffectParameters {
-            grayscale_gamma: Vec4::new(2.0, 1.1, 1.0, 1.0),
-            ..default()
-        }
-        .validate()
-        .is_ok());
-        assert!(EffectParameters {
-            grayscale_gamma: Vec4::new(2.0, 0.0, 1.0, 1.0),
-            ..default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            EffectParameters {
+                grayscale_gamma: Vec4::new(2.0, 1.1, 1.0, 1.0),
+                ..default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            EffectParameters {
+                grayscale_gamma: Vec4::new(2.0, 0.0, 1.0, 1.0),
+                ..default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 }
 
@@ -171,6 +184,7 @@ impl Plugin for PostProcessPlugin {
         bevy::asset::embedded_asset!(app, "shaders/standard.wesl");
         bevy::asset::embedded_asset!(app, "shaders/blur.wesl");
         super::kawase::install(app);
+        super::background::install(app);
         app.add_plugins((
             ExtractComponentPlugin::<PostProcessSettings>::default(),
             ExtractComponentPlugin::<LayerEffectShaders>::default(),
@@ -206,14 +220,14 @@ impl Plugin for PostProcessPlugin {
 struct IsolatedUiPhases(HashMap<Entity, SortedRenderPhase<TransparentUi>>);
 
 #[derive(Resource)]
-struct EffectPipeline {
+pub(super) struct EffectPipeline {
     layout: BindGroupLayoutDescriptor,
     sampler: Sampler,
     default_shader: Handle<Shader>,
     pipelines: HashMap<(TextureFormat, u32, AssetId<Shader>), CachedRenderPipelineId>,
 }
 
-struct PreparedEffectUniform {
+pub(super) struct PreparedEffectUniform {
     data: EffectUniform,
     buffer: Buffer,
 }
@@ -249,7 +263,7 @@ fn init_pipeline(
         TextureFormat::Bgra8Unorm,
         TextureFormat::Rgba16Float,
     ] {
-        for stage in 0..3 {
+        for stage in 0..4 {
             pipelines.insert(
                 (format, stage, default_shader.id()),
                 cache.queue_render_pipeline(RenderPipelineDescriptor {
@@ -294,7 +308,7 @@ fn prepare_custom_pipelines(
     fullscreen: Res<FullscreenShader>,
 ) {
     for (target, programs) in &views {
-        for stage in 0..3 {
+        for stage in 0..4 {
             let Some(effect) = programs.get(stage) else {
                 continue;
             };
@@ -571,7 +585,7 @@ fn restore_ui(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_effect(
+pub(super) fn apply_effect(
     target: &ViewTarget,
     settings: &EffectParameters,
     stage: u32,

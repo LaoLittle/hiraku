@@ -2,8 +2,18 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+/// Composition membership is independent of depth and resource identity.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PictureView {
+    #[default]
+    Scene,
+    Background,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PictureState {
+    #[serde(default)]
+    pub view: PictureView,
     #[serde(default)]
     pub video: Option<PictureVideo>,
     /// Last applied clip, retained with outgoing backing layers during replacement.
@@ -144,6 +154,7 @@ pub enum PictureCommand {
         seconds: f32,
     },
     Show {
+        view: PictureView,
         dissolve: Option<PictureDissolve>,
         post_process: Option<crate::effect::post_process::EffectParameters>,
         video: Option<PictureVideo>,
@@ -343,6 +354,7 @@ pub(super) fn apply_picture_command(
             video,
             post_process,
             replace,
+            view,
             screen_space,
             size,
             slice,
@@ -427,6 +439,7 @@ pub(super) fn apply_picture_command(
             pictures.insert(
                 id.clone(),
                 PictureState {
+                    view,
                     dissolve,
                     video,
                     resolved_clip: None,
@@ -597,6 +610,7 @@ pub fn sync_pictures(
     mut commands: Commands,
     time: crate::scene::playback::StoryTime,
     canvas: Res<crate::HirakuCanvas>,
+    views: Option<Res<crate::render::camera::CameraState>>,
     assets: Res<AssetServer>,
     images: Res<Assets<Image>>,
     cameras: Query<
@@ -616,6 +630,9 @@ pub fn sync_pictures(
         &mut Transform,
     )>,
 ) {
+    let background_view = views
+        .as_ref()
+        .map(|views| views.view(crate::script::CameraEffectScope::Background));
     let crate::state::SceneSnapshot {
         pictures, clips, ..
     } = &mut shared.0;
@@ -793,7 +810,8 @@ pub fn sync_pictures(
         if sprite.color != color {
             sprite.color = color;
         }
-        let mut next = picture_transform(picture, canvas.size.as_vec2());
+        commands.entity(entity).try_insert(picture.view);
+        let mut next = viewed_picture_transform(picture, canvas.size.as_vec2(), background_view);
         if let Some(index) = key.1 {
             let incoming = &pictures[&marker.0];
             next.translation.z = incoming.layer - (incoming.previous.len() - index) as f32 * 0.001;
@@ -834,7 +852,8 @@ pub fn sync_pictures(
             .as_ref()
             .map_or(Vec3::ZERO, PictureNoise::parameters);
         sprite.color = picture_color(picture);
-        let mut transform = picture_transform(picture, canvas.size.as_vec2());
+        let mut transform =
+            viewed_picture_transform(picture, canvas.size.as_vec2(), background_view);
         if let Some(index) = previous {
             transform.translation.z =
                 pictures[id].layer - (pictures[id].previous.len() - index) as f32 * 0.001;
@@ -847,6 +866,7 @@ pub fn sync_pictures(
         }
         let mut entity = commands.spawn((
             PictureEntity(id.clone()),
+            picture.view,
             BackgroundLayer {
                 path: picture.path.clone(),
             },
@@ -864,6 +884,7 @@ pub fn sync_pictures(
         &render_pictures,
         canvas.size.as_vec2(),
         cameras.single().ok(),
+        background_view,
     );
 }
 
@@ -989,6 +1010,21 @@ pub(super) fn picture_transform(p: &PictureState, canvas: Vec2) -> Transform {
     .with_rotation(Quat::from_rotation_z(p.rotation.to_radians()))
 }
 
+pub(super) fn viewed_picture_transform(
+    p: &PictureState,
+    canvas: Vec2,
+    view: Option<&crate::render::camera::CameraView>,
+) -> Transform {
+    let transform = picture_transform(p, canvas);
+    if p.view == PictureView::Background
+        && let Some(view) = view
+    {
+        view.transform_picture(transform)
+    } else {
+        transform
+    }
+}
+
 pub(super) fn screen_picture_transform(
     mut local: Transform,
     canvas: Vec2,
@@ -1037,6 +1073,7 @@ mod tests {
                 video: None,
                 replace: false,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 size: None,
                 slice: None,
                 color: None,
@@ -1127,6 +1164,7 @@ mod tests {
                 post_process: None,
                 replace: false,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 size: None,
                 slice: None,
                 color: None,
@@ -1631,6 +1669,7 @@ mod tests {
                 post_process: None,
                 replace: false,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 path: "background/room".into(),
                 size: None,
                 slice: None,
@@ -1844,6 +1883,7 @@ mod tests {
                 post_process: None,
                 replace: false,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 id: "room".into(),
                 path: "background/room".into(),
                 size: None,
@@ -1881,6 +1921,7 @@ mod tests {
                 replace: false,
                 path: "pictures/bob.png".into(),
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 size: None,
                 slice: None,
                 color: None,
@@ -1940,6 +1981,7 @@ mod tests {
                 replace: false,
                 path: "background/next".into(),
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 size: None,
                 slice: None,
                 color: None,
@@ -2029,6 +2071,7 @@ mod tests {
                 replace: true,
                 path,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 size: None,
                 slice: None,
                 color: None,

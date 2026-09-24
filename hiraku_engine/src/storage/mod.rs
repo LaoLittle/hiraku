@@ -425,7 +425,11 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
             bgm: scene.bgm.map(Into::into),
             dialogue: scene.dialogue.map(Into::into),
             text_effect: scene.text_effect.map(Into::into).unwrap_or_default(),
-            camera: scene.camera.map(Into::into).unwrap_or_default(),
+            camera: scene
+                .camera
+                .map(CameraSnapshot::try_from)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
 }
@@ -433,39 +437,27 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 impl From<&CameraSnapshot> for proto::CameraSnapshot {
     fn from(snapshot: &CameraSnapshot) -> Self {
         Self {
-            blur: snapshot.blur,
-            zoom: snapshot.zoom,
-            offset: snapshot.offset.to_vec(),
-            rotation: snapshot.rotation.to_vec(),
-            projection: snapshot.projection.clone(),
-            scope: snapshot.scope.clone(),
+            views_hson: hson::to_vec(snapshot).expect("serializable virtual camera state"),
         }
     }
 }
 
-impl From<proto::CameraSnapshot> for CameraSnapshot {
-    fn from(snapshot: proto::CameraSnapshot) -> Self {
-        let component = |values: &[f32], index| values.get(index).copied().unwrap_or(0.0);
-        Self {
-            blur: snapshot.blur,
-            zoom: if snapshot.zoom > 0.0 {
-                snapshot.zoom
-            } else {
-                1.0
-            },
-            offset: [
-                component(&snapshot.offset, 0),
-                component(&snapshot.offset, 1),
-                component(&snapshot.offset, 2),
-            ],
-            rotation: [
-                component(&snapshot.rotation, 0),
-                component(&snapshot.rotation, 1),
-                component(&snapshot.rotation, 2),
-            ],
-            projection: snapshot.projection,
-            scope: snapshot.scope,
-        }
+impl TryFrom<proto::CameraSnapshot> for CameraSnapshot {
+    type Error = StorageError;
+
+    fn try_from(snapshot: proto::CameraSnapshot) -> Result<Self, Self::Error> {
+        let value: Self = hson::from_slice(&snapshot.views_hson).map_err(|error| {
+            StorageError::InvalidSave(format!("invalid virtual cameras: {error}"))
+        })?;
+        value
+            .views
+            .validate()
+            .map_err(|error| StorageError::InvalidSave(error.into()))?;
+        value
+            .timelines
+            .validate()
+            .map_err(|error| StorageError::InvalidSave(error.into()))?;
+        Ok(value)
     }
 }
 
@@ -766,6 +758,7 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                view: crate::scene::pictures::PictureView::Scene,
                 dissolve: None,
                 video: None,
                 resolved_clip: None,

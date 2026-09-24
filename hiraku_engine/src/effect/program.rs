@@ -125,6 +125,7 @@ pub struct EffectInstance {
 #[extract_app(RenderApp)]
 #[require(super::post_process::PostProcessSettings)]
 pub struct LayerEffectShaders {
+    pub background: Option<EffectInstance>,
     pub scene: Option<EffectInstance>,
     pub ui: Option<EffectInstance>,
     pub canvas: Option<EffectInstance>,
@@ -133,6 +134,7 @@ pub struct LayerEffectShaders {
 impl LayerEffectShaders {
     pub(crate) fn get(&self, stage: u32) -> Option<&EffectInstance> {
         match stage {
+            3 => self.background.as_ref(),
             0 => self.scene.as_ref(),
             1 => self.ui.as_ref(),
             2 => self.canvas.as_ref(),

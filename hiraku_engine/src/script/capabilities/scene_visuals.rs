@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, time::Duration};
 use hiraku_script::native::{NativeError, NativeRegistry};
 use serde::{Deserialize, Serialize};
 
-use super::{CharacterContext, Position, StoryEffect};
+use super::{CameraScope, CharacterContext, Position, StoryEffect};
 use crate::scene::clipping::{ClipCommand, ClipRegion};
 use crate::scene::pictures::PictureCommand;
 
@@ -302,6 +302,7 @@ mod api {
                 video: None,
                 replace: false,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Scene,
                 size: None,
                 slice: None,
                 color: None,
@@ -394,13 +395,22 @@ mod api {
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
     ) -> Result<SceneTransitionHandle, NativeError> {
-        let Some((SceneVisualTarget::Picture(PictureCommand::Show { screen_space, .. }), _)) =
-            context.scene_visuals.pending.get_mut(&handle.0)
+        let Some((
+            SceneVisualTarget::Picture(PictureCommand::Show {
+                screen_space, view, ..
+            }),
+            _,
+        )) = context.scene_visuals.pending.get_mut(&handle.0)
         else {
             return Err(NativeError::message(
                 "screenSpace requires an uncommitted picture",
             ));
         };
+        if *view == crate::scene::pictures::PictureView::Background {
+            return Err(NativeError::message(
+                "background pictures cannot use screenSpace",
+            ));
+        }
         *screen_space = true;
         Ok(handle)
     }
@@ -1045,7 +1055,45 @@ mod api {
         context: &mut CharacterContext,
         texture: String,
     ) -> Result<PictureShowHandle, NativeError> {
-        picture(context, "Backgrounds".into(), texture)
+        let picture = picture(context, "Backgrounds".into(), texture)?;
+        picture_view(
+            context,
+            SceneTransitionHandle(picture.0),
+            CameraScope::Background,
+        )?;
+        Ok(picture)
+    }
+
+    pub(super) fn picture_view(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        scope: CameraScope,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let next = match scope {
+            CameraScope::Background => crate::scene::pictures::PictureView::Background,
+            CameraScope::Scene => crate::scene::pictures::PictureView::Scene,
+            _ => {
+                return Err(NativeError::message(
+                    "picture view must be background or scene; UI belongs to the UI tree",
+                ));
+            }
+        };
+        let Some((
+            SceneVisualTarget::Picture(PictureCommand::Show {
+                view, screen_space, ..
+            }),
+            _,
+        )) = context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message("view requires a picture show builder"));
+        };
+        if *screen_space && next == crate::scene::pictures::PictureView::Background {
+            return Err(NativeError::message(
+                "background pictures cannot use screenSpace",
+            ));
+        }
+        *view = next;
+        Ok(handle)
     }
 
     #[hks(name = "cg")]
@@ -2437,8 +2485,13 @@ mod tests {
         for (short, explicit) in [("bg", "Backgrounds"), ("cg", "Stills")] {
             let suffix = ".frame(50, 40, 1.2, 5, 2).fade(300)";
             let mut shorthand = runtime(&format!("{short}(\"alice/image\"){suffix}"));
+            let view = if short == "bg" {
+                ".view(.background)"
+            } else {
+                ""
+            };
             let mut original = runtime(&format!(
-                "scene.picture(\"{explicit}\", \"alice/image\"){suffix}"
+                "scene.picture(\"{explicit}\", \"alice/image\"){view}{suffix}"
             ));
             assert_eq!(event(&mut shorthand), event(&mut original));
             assert!(matches!(
@@ -2460,6 +2513,7 @@ mod tests {
                 replace: false,
                 post_process: None,
                 screen_space: false,
+                view: crate::scene::pictures::PictureView::Background,
                 id: "Backgrounds".into(),
                 size: None,
                 slice: None,
