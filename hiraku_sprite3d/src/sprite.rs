@@ -4,6 +4,15 @@ use bevy::prelude::*;
 pub const MAX_LAYERS: usize = 32;
 pub const MAX_MASKS: u8 = 8;
 
+/// Screen-space rule used to reveal an already-composited sprite.
+#[derive(Clone, Debug, PartialEq, Reflect)]
+pub struct SpriteDissolve {
+    pub image: Handle<Image>,
+    pub softness: f32,
+    pub canvas_size: Vec2,
+    pub progress: f32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
 pub enum BlendMode {
     #[default]
@@ -67,6 +76,7 @@ impl Default for SpriteLayer {
 pub struct Sprite3d {
     /// Optional world-space clipping, applied after the sprite's layer composition.
     pub clip: Option<crate::ClipRect>,
+    pub dissolve: Option<SpriteDissolve>,
     pub image: Option<Handle<Image>>,
     /// Bevy atlas cell selection, inherited by layers without their own atlas.
     pub texture_atlas: Option<TextureAtlas>,
@@ -84,6 +94,7 @@ impl Default for Sprite3d {
     fn default() -> Self {
         Self {
             clip: None,
+            dissolve: None,
             image: None,
             texture_atlas: None,
             color: Color::WHITE,
@@ -126,6 +137,15 @@ impl Sprite3d {
             || !valid_color(self.backface_color)
         {
             return Err(Sprite3dError::InvalidGeometry);
+        }
+        if self.dissolve.as_ref().is_some_and(|mask| {
+            !mask.softness.is_finite()
+                || !(0.0..=1.0).contains(&mask.softness)
+                || !valid_size(mask.canvas_size)
+                || !mask.progress.is_finite()
+                || !(0.0..=1.0).contains(&mask.progress)
+        }) {
+            return Err(Sprite3dError::InvalidDissolve);
         }
         for (index, layer) in self.layers.iter().enumerate() {
             if !valid_rect(layer.bounds) || !valid_color(layer.color) {
@@ -218,6 +238,8 @@ pub enum Sprite3dError {
     TooManyLayers(usize),
     #[error("invalid sprite size or tint: size must be positive and finite, alpha in 0..=1")]
     InvalidGeometry,
+    #[error("invalid sprite dissolve: softness/progress must be 0..=1 and canvas size positive")]
+    InvalidDissolve,
     #[error("sprite layer {0} has invalid geometry, tint or mask cutoff")]
     InvalidLayer(usize),
     #[error("mask reference {0} is outside 1..=8")]

@@ -625,12 +625,15 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 position,
                 scale,
                 focused,
+                dissolve,
                 fade,
                 animation_id,
+                placement_animation_id,
             }) => {
                 let Some(character) = characters.characters.get(&character_name).cloned() else {
                     warn!("character `{character_name}` not found in catalog");
                     complete_missing_animation(&mut animations, animation_id);
+                    complete_missing_animation(&mut animations, placement_animation_id);
                     continue;
                 };
                 let parts = match character.parts_for_expressions(&expressions) {
@@ -638,6 +641,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     Err(message) => {
                         warn!("{message}");
                         complete_missing_animation(&mut animations, animation_id);
+                        complete_missing_animation(&mut animations, placement_animation_id);
                         continue;
                     }
                 };
@@ -664,6 +668,10 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     fade,
                     animation_id,
                     placement_animation,
+                    placement_animation_id,
+                    dissolve.map(|(path, softness)| {
+                        (path, softness, render_assets.canvas.size.as_vec2())
+                    }),
                 );
             }
             ScriptCommand::Stage(StageCommand::SetCurtain {

@@ -154,6 +154,8 @@ pub fn reconcile_restored_characters(
             Some(std::time::Duration::ZERO),
             None,
             None,
+            None,
+            None,
         );
     }
 }
@@ -193,6 +195,7 @@ fn reconcile_group_reveal(world: &mut World, root: Entity, desired: &HashSet<Ent
 #[derive(Component, Clone)]
 pub(crate) struct CharacterPlacementTween {
     animation: Option<crate::script::AnimationSpec>,
+    animation_ids: Vec<String>,
     from: Transform,
     to: Transform,
     timer: Timer,
@@ -230,7 +233,9 @@ fn update_actor_placement(
                 .map_or(p.current.rotation, |t| t.to.rotation)
         })
         .unwrap_or(Quat::IDENTITY);
-    update_actor_placement_with_animation(world, root, reference, position, scale, rotation, None);
+    update_actor_placement_with_animation(
+        world, root, reference, position, scale, rotation, None, None,
+    );
 }
 
 fn update_actor_placement_with_animation(
@@ -241,6 +246,7 @@ fn update_actor_placement_with_animation(
     scale: f32,
     rotation: Quat,
     animation: Option<crate::script::AnimationSpec>,
+    animation_id: Option<String>,
 ) {
     use super::character_composite::LogicalCharacterPart;
     let anchor = |transform: Transform, offset: Vec2| Transform {
@@ -261,6 +267,7 @@ fn update_actor_placement_with_animation(
                 let tween = world.get::<CharacterPlacementTween>(entity).map(|tween| {
                     CharacterPlacementTween {
                         animation: tween.animation,
+                        animation_ids: tween.animation_ids.clone(),
                         from: anchor(tween.from, offset),
                         to: anchor(tween.to, offset),
                         timer: tween.timer.clone(),
@@ -269,28 +276,41 @@ fn update_actor_placement_with_animation(
                 Some((current, tween))
             })
         });
-    let (current, previous) = source.unwrap_or((target, None));
+    let (current, mut previous) = source.unwrap_or((target, None));
     let at_target = |value: Transform| {
         value.translation.abs_diff_eq(target.translation, 0.0001)
             && value.scale.abs_diff_eq(target.scale, 0.0001)
             && value.rotation.abs_diff_eq(target.rotation, 0.0001)
     };
-    let trajectory = if let Some(tween) = previous.filter(|tween| at_target(tween.to)) {
+    let trajectory = if previous.as_ref().is_some_and(|tween| at_target(tween.to)) {
+        let mut tween = previous.take().expect("matching trajectory exists");
+        if let Some(id) = animation_id {
+            tween.animation_ids.push(id);
+        }
         Some(tween)
-    } else if !at_target(current) {
-        Some(CharacterPlacementTween {
-            animation,
-            from: current,
-            to: target,
-            timer: Timer::new(
-                animation
-                    .map(|a| Duration::from_secs_f32(a.duration()))
-                    .unwrap_or(Duration::from_millis(300)),
-                TimerMode::Once,
-            ),
-        })
     } else {
-        None
+        if let Some(old) = previous {
+            for id in old.animation_ids {
+                complete_missing_animation(&mut world.resource_mut::<AnimationState>(), Some(id));
+            }
+        }
+        if !at_target(current) {
+            Some(CharacterPlacementTween {
+                animation,
+                animation_ids: animation_id.into_iter().collect(),
+                from: current,
+                to: target,
+                timer: Timer::new(
+                    animation
+                        .map(|a| Duration::from_secs_f32(a.duration()))
+                        .unwrap_or(Duration::from_millis(300)),
+                    TimerMode::Once,
+                ),
+            })
+        } else {
+            complete_missing_animation(&mut world.resource_mut::<AnimationState>(), animation_id);
+            None
+        }
     };
     world.entity_mut(root).insert(ActorPlacement {
         current,
@@ -319,6 +339,7 @@ fn update_actor_placement_with_animation(
                 project(current),
                 CharacterPlacementTween {
                     animation: tween.animation,
+                    animation_ids: Vec::new(),
                     from: project(tween.from),
                     to: project(tween.to),
                     timer: tween.timer.clone(),
@@ -378,7 +399,13 @@ pub fn animate_character_motion_effects(
             let finished = tween.timer.is_finished();
             placement.current = current;
             if finished {
-                placement.trajectory = None;
+                let completed = placement
+                    .trajectory
+                    .take()
+                    .expect("finished trajectory remains attached");
+                for id in completed.animation_ids {
+                    complete_missing_animation(&mut animations, Some(id));
+                }
             }
         }
     }
@@ -470,6 +497,7 @@ pub fn poll_pending_character_shows(
     mut stage: ResMut<StageState>,
     mut animations: ResMut<AnimationState>,
     mut pending: ResMut<PendingCharacterShows>,
+    part_definitions: Query<&super::character_composite::LogicalCharacterPart>,
     mut visual_queries: ParamSet<(
         Query<
             (
@@ -555,6 +583,10 @@ pub fn poll_pending_character_shows(
 
     let mut visuals = visual_queries.p1();
     for (actor_id, whole_actor, entities, outgoing, fade, animation_id) in completed {
+        let replacement_slots = entities
+            .iter()
+            .filter_map(|entity| part_definitions.get(*entity).ok()?.0.slot)
+            .collect::<HashSet<_>>();
         let mut pending_animation = animation_id;
         if whole_actor {
             if let Some(root) = stage.character_roots.get(&actor_id).copied() {
@@ -612,6 +644,22 @@ pub fn poll_pending_character_shows(
                         animation_id: (index == 0).then(|| pending_animation.take()).flatten(),
                         despawn_on_finish: false,
                     });
+                    if part_definitions
+                        .get(entity)
+                        .ok()
+                        .and_then(|part| part.0.slot)
+                        .is_some_and(|slot| {
+                            outgoing.iter().any(|(_, old)| {
+                                part_definitions
+                                    .get(*old)
+                                    .is_ok_and(|part| part.0.slot == Some(slot))
+                            })
+                        })
+                    {
+                        commands
+                            .entity(entity)
+                            .insert(super::character_composite::ReplacementFadeIn);
+                    }
                 }
             }
         }
@@ -626,11 +674,33 @@ pub fn poll_pending_character_shows(
                 continue;
             }
             if let Some(fade) = fade {
+                let replaced = part_definitions
+                    .get(entity)
+                    .ok()
+                    .and_then(|part| part.0.slot)
+                    .is_some_and(|slot| replacement_slots.contains(&slot));
+                if replaced
+                    && let Ok((visual, sprite, alpha_mask, multiply, mut visibility)) =
+                        visuals.get_mut(entity)
+                {
+                    *visibility = Visibility::Visible;
+                    set_character_part_alpha(
+                        visual,
+                        sprite,
+                        alpha_mask,
+                        multiply,
+                        &mut alpha_mask_materials,
+                        &mut multiply_materials,
+                        1.0,
+                    );
+                }
                 commands.entity(entity).try_insert((
                     HideAfterTween,
                     VisualTween {
-                        from_alpha: Some(1.0),
-                        to_alpha: Some(0.0),
+                        // Standard alpha-over would reveal the background if
+                        // both old and new parts faded simultaneously.
+                        from_alpha: (!replaced).then_some(1.0),
+                        to_alpha: (!replaced).then_some(0.0),
                         from_translation: None,
                         to_translation: None,
                         from_scale: None,
@@ -695,6 +765,8 @@ pub(super) fn queue_character_show(
     fade: Option<std::time::Duration>,
     animation_id: Option<String>,
     placement_animation: Option<crate::script::AnimationSpec>,
+    placement_animation_id: Option<String>,
+    dissolve: Option<(String, f32, Vec2)>,
 ) {
     const DEFAULT_CHARACTER_FADE: std::time::Duration = std::time::Duration::from_millis(120);
 
@@ -718,6 +790,25 @@ pub(super) fn queue_character_show(
             stage.character_roots.insert(actor_id.clone(), root);
             root
         });
+    let dissolve = dissolve.map(
+        |(path, softness, canvas_size)| hiraku_sprite3d::SpriteDissolve {
+            image: asset_server
+                .load_builder()
+                .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+                    settings.is_srgb = false;
+                    settings.asset_usage = bevy::asset::RenderAssetUsages::RENDER_WORLD;
+                })
+                .load(path),
+            softness,
+            canvas_size,
+            progress: 0.0,
+        },
+    );
+    commands.queue(move |world: &mut World| {
+        if let Some(mut group) = world.get_mut::<super::character_composite::CharacterGroup>(root) {
+            group.dissolve = dissolve;
+        }
+    });
     let desired_ids = parts
         .iter()
         .map(|part| character_part_id(&actor_id, part))
@@ -862,6 +953,7 @@ pub(super) fn queue_character_show(
                 continue;
             }
             entity_commands.try_remove::<HideAfterTween>();
+            entity_commands.try_remove::<super::character_composite::ReplacementFadeIn>();
             // Cancel an interrupted fade-out before reusing the cached part.
             // Removing only HideAfterTween would leave a tween driving alpha to 0.
             commands.queue(move |world: &mut World| {
@@ -954,6 +1046,7 @@ pub(super) fn queue_character_show(
             scale,
             rotation,
             placement_animation,
+            placement_animation_id,
         )
     });
     if entities.is_empty() {
@@ -1061,7 +1154,7 @@ pub(super) fn character_part_prefix(actor_id: &str) -> String {
     format!("character::{actor_id}::")
 }
 
-fn character_part_id(actor_id: &str, part: &CharacterPartDefinition) -> String {
+pub(crate) fn character_part_id(actor_id: &str, part: &CharacterPartDefinition) -> String {
     match part.slot {
         Some(slot) => format!(
             "{}slot-{slot:03}-{}",
@@ -1195,6 +1288,7 @@ mod tests {
             1.0,
             Quat::IDENTITY,
             Some(crate::script::AnimationSpec::Linear(0.0, false)),
+            None,
         );
         app.world_mut()
             .resource_mut::<Time>()
@@ -1215,6 +1309,7 @@ mod tests {
             Vec2::new(200.0, 0.0),
             1.0,
             Quat::IDENTITY,
+            None,
             None,
         );
         app.world_mut()
@@ -1250,6 +1345,7 @@ mod tests {
             2.0,
             Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
             Some(crate::script::AnimationSpec::Linear(1.2, false)),
+            None,
         );
         app.world_mut()
             .resource_mut::<Time>()
@@ -1274,6 +1370,65 @@ mod tests {
                 .get::<ActorPlacement>(root)
                 .expect("placement")
                 .is_animating()
+        );
+    }
+
+    #[test]
+    fn actor_placement_completion_does_not_join_an_earlier_entrance() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .init_resource::<AnimationState>()
+            .init_resource::<StageState>()
+            .add_systems(Update, animate_character_motion_effects);
+        let root = app.world_mut().spawn_empty().id();
+        let part = spawn_placement_part(app.world_mut(), root, "alice/body", Vec2::ZERO, 0.0);
+        // A newly shown actor has no prior pose to move from. Its separate
+        // one-second fade token remains owned by the reveal system.
+        update_actor_placement_with_animation(
+            app.world_mut(),
+            root,
+            Some(part),
+            Vec2::ZERO,
+            1.0,
+            Quat::IDENTITY,
+            Some(crate::script::AnimationSpec::Linear(1.0, false)),
+            Some("entrance-placement".into()),
+        );
+        update_actor_placement_with_animation(
+            app.world_mut(),
+            root,
+            Some(part),
+            Vec2::new(100.0, 0.0),
+            1.0,
+            Quat::IDENTITY,
+            Some(crate::script::AnimationSpec::Linear(40.0, false)),
+            Some("later-motion".into()),
+        );
+        assert!(
+            app.world()
+                .resource::<AnimationState>()
+                .completed
+                .contains("entrance-placement")
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<AnimationState>()
+                .completed
+                .contains("later-motion")
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(39));
+        app.update();
+        assert!(
+            app.world()
+                .resource::<AnimationState>()
+                .completed
+                .contains("later-motion")
         );
     }
 
@@ -1603,6 +1758,8 @@ mod tests {
                 Vec2::new(100.0, 0.0),
                 1.0,
                 false,
+                None,
+                None,
                 None,
                 None,
                 None,

@@ -33,10 +33,14 @@ pub(super) fn apply(
     let rotation: Option<f64> = field(&fields, "rotationValue")?;
     let depth: Option<f64> = field(&fields, "depthValue")?;
     let clip: Option<Option<String>> = field(&fields, "clipValue")?;
+    let dissolve_mask: Option<String> = field(&fields, "dissolveMask")?;
+    let dissolve_softness: Option<f64> = field(&fields, "dissolveSoftness")?;
     let showing: Option<bool> = field(&fields, "showing")?;
     let hiding: Option<f64> = field(&fields, "hiding")?;
     let offset: Option<Position> = field(&fields, "offsetValue")?;
     let oscillation: Option<Position> = field(&fields, "oscillation")?;
+    let jitter: Option<Position> = field(&fields, "jitterValue")?;
+    let jitter_interval: f64 = field(&fields, "jitterInterval")?;
     let period_x: f64 = field(&fields, "periodX")?;
     let period_y: f64 = field(&fields, "periodY")?;
     let stopping: bool = field(&fields, "stopping")?;
@@ -82,6 +86,17 @@ pub(super) fn apply(
     if let Some(clip) = clip {
         native_api::native_actor_clip(context, actor, clip)?;
     }
+    if let Some(mask) = dissolve_mask {
+        native_api::native_actor_dissolve(
+            context,
+            actor,
+            mask,
+            dissolve_softness
+                .ok_or_else(|| NativeError::message("Actor.dissolve requires softness"))?,
+        )?;
+    } else if dissolve_softness.is_some() {
+        return Err(NativeError::message("Actor.dissolve requires a mask"));
+    }
     if showing == Some(true) {
         native_api::native_show(context, actor)?;
     }
@@ -93,6 +108,9 @@ pub(super) fn apply(
     }
     if let Some(amplitude) = oscillation {
         native_api::native_actor_oscillate(context, actor, amplitude, period_x, period_y)?;
+    }
+    if let Some(amplitude) = jitter {
+        native_api::native_actor_jitter(context, actor, amplitude, jitter_interval)?;
     }
     if let Some(seconds) = seconds.filter(|_| hide_ms.is_none()) {
         native_api::actor_time(context, actor, seconds)?;
@@ -115,6 +133,62 @@ pub(super) fn apply(
 mod tests {
     use super::*;
     use crate::script::{StoryRuntime, StoryRuntimeEvent};
+
+    #[test]
+    fn actor_dissolve_is_a_one_shot_typed_show_modifier() {
+        let code = compile_story_bytecode(
+            "test.hks",
+            "char(\"alice\").dissolve(\"rule/door\", 0.25).show().time(0.5).await()",
+        )
+        .expect("compile actor dissolve");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        assert!(matches!(
+            runtime.step().expect("submit actor dissolve"),
+            Some(StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::ShowCharacter {
+                    dissolve: Some((ref path, softness)), ..
+                }, ..
+            }) if path == "rule/door" && (softness - 0.25).abs() < f32::EPSILON
+        ));
+    }
+
+    #[test]
+    fn actor_dissolve_does_not_leak_into_later_expression_changes() {
+        let code = compile_story_bytecode(
+            "test.hks",
+            "char(\"alice\").dissolve(\"rule/door\", 0.25).show().time(0.5)\nchar(\"alice\").e(\"happy\")",
+        )
+        .expect("compile actor sequence");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let first = runtime.step().expect("first show");
+        assert!(matches!(first, Some(StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
+            dissolve: Some(_), ..
+        }))));
+        let second = runtime.step().expect("second show");
+        assert!(matches!(second, Some(StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
+            dissolve: None, ..
+        }))));
+    }
+
+    #[test]
+    fn script_actor_jitter_submits_a_timed_local_motion() {
+        let code = compile_story_bytecode(
+            "test.hks",
+            "char(\"alice\").jitter(.pos(7.5, 7.5), 0.04).time(0.3)",
+        )
+        .expect("compile actor jitter");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        assert!(matches!(
+            runtime.step().expect("submit jitter"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::ActorMotion {
+                transition: crate::script::actor_motion::ActorOffset {
+                    oscillation: Some(crate::script::actor_motion::ActorOscillation::Jitter {
+                        interval, ..
+                    }), ..
+                }, ..
+            })) if (interval - 0.04).abs() < f32::EPSILON
+        ));
+    }
 
     #[test]
     fn hide_time_controls_visibility_in_either_modifier_order() {

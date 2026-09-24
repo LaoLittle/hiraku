@@ -766,6 +766,7 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                dissolve: None,
                 video: None,
                 resolved_clip: None,
                 screen_space: false,

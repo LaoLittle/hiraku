@@ -132,6 +132,7 @@ pub fn animate_visual_tweens(
         Option<&MeshMaterial3d<AlphaMaskMaterial>>,
         Option<&MeshMaterial3d<MultiplyMaterial>>,
         Option<&CharacterPartVisual>,
+        Has<super::character_composite::ReplacementFadeIn>,
         &mut Transform,
         &mut VisualTween,
         Option<&HideAfterTween>,
@@ -147,6 +148,7 @@ pub fn animate_visual_tweens(
         alpha_mask,
         multiply,
         part_visual,
+        replacement_fade,
         mut transform,
         mut tween,
         hide_after,
@@ -155,6 +157,13 @@ pub fn animate_visual_tweens(
     {
         tween.timer.tick(time.delta());
         let fraction = tween_fraction(&tween.timer);
+        // Ease the incoming image over an opaque predecessor. Fading both
+        // independently makes a pair of half-alpha parts only 75% opaque.
+        let alpha_fraction = if replacement_fade {
+            0.5 - 0.5 * (std::f32::consts::PI * fraction).cos()
+        } else {
+            fraction
+        };
         if let (Some(from), Some(to)) = (tween.from_alpha, tween.to_alpha) {
             set_visual_alpha(
                 sprite.as_deref_mut(),
@@ -163,7 +172,7 @@ pub fn animate_visual_tweens(
                 part_visual,
                 &mut alpha_mask_materials,
                 &mut multiply_materials,
-                from + (to - from) * fraction,
+                from + (to - from) * alpha_fraction,
             );
         }
         if let (Some(from), Some(to)) = (tween.from_translation, tween.to_translation) {
@@ -201,6 +210,11 @@ pub fn animate_visual_tweens(
                     commands.entity(entity).try_remove::<HideAfterTween>();
                 }
                 commands.entity(entity).try_remove::<VisualTween>();
+                if replacement_fade {
+                    commands
+                        .entity(entity)
+                        .try_remove::<super::character_composite::ReplacementFadeIn>();
+                }
             }
         }
     }

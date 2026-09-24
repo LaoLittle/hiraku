@@ -154,8 +154,10 @@ pub enum CharacterCommand {
         position: Vec2,
         scale: f32,
         focused: bool,
+        dissolve: Option<(String, f32)>,
         fade: Option<Duration>,
         animation_id: Option<String>,
+        placement_animation_id: Option<String>,
     },
 }
 

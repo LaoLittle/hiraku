@@ -47,6 +47,8 @@ builder! {
         -> PictureShowHandle => frame;
     layer["layer"](value: f64) -> PictureShowHandle => picture_layer;
     replace["replace"]() -> PictureShowHandle => picture_replace;
+    dissolve["dissolve"](texture: String, softness: Option<f64>)
+        -> PictureShowHandle => picture_dissolve;
     blur["blur"](radius: f64) -> PictureShowHandle => picture_blur;
     grayscale_gamma["grayscaleGamma"](red: f64, green: f64, blue: f64)
         -> PictureShowHandle => picture_grayscale_gamma;

@@ -11,9 +11,15 @@ pub struct ActorOffset {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ActorOscillation {
-    pub amplitude: [f32; 2],
-    pub period: [f32; 2],
+pub enum ActorOscillation {
+    Sine {
+        amplitude: [f32; 2],
+        period: [f32; 2],
+    },
+    Jitter {
+        amplitude: [f32; 2],
+        interval: f32,
+    },
 }
 
 impl ActorOffset {
@@ -34,13 +40,21 @@ impl ActorOffset {
             return Err("actor offset requires finite pixel coordinates and a non-repeating animation in 0..=3600 seconds".into());
         }
         if let Some(wave) = self.oscillation {
-            if wave
-                .amplitude
+            let (amplitude, timing) = match wave {
+                ActorOscillation::Sine { amplitude, period } => (amplitude, period),
+                ActorOscillation::Jitter {
+                    amplitude,
+                    interval,
+                } => (amplitude, [interval; 2]),
+            };
+            if amplitude
                 .iter()
                 .any(|x| !x.is_finite() || x.abs() > 100000.0)
-                || wave.period.iter().any(|x| !x.is_finite() || *x <= 0.0)
+                || timing.iter().any(|x| !x.is_finite() || *x <= 0.0)
             {
-                return Err("oscillation requires finite amplitudes and positive periods".into());
+                return Err(
+                    "actor wave requires finite amplitudes and positive periods or interval".into(),
+                );
             }
         }
         Ok(())
@@ -105,13 +119,35 @@ impl ActorMotion {
                 self.transition.animation.sample(self.elapsed / duration) * duration
             };
             for axis in 0..2 {
-                self.offset[axis] = self.origin[axis]
-                    + if self.finished {
-                        0.0
-                    } else {
-                        wave.amplitude[axis]
-                            * (std::f32::consts::TAU * phase_time / wave.period[axis]).sin()
-                    };
+                let displacement = if self.finished {
+                    0.0
+                } else {
+                    match wave {
+                        ActorOscillation::Sine { amplitude, period } => {
+                            amplitude[axis]
+                                * (std::f32::consts::TAU * phase_time / period[axis]).sin()
+                        }
+                        ActorOscillation::Jitter {
+                            amplitude,
+                            interval,
+                        } => {
+                            let step = (phase_time / interval).floor() as u64;
+                            if step == 0 {
+                                0.0
+                            } else {
+                                let mut bits = self
+                                    .revision
+                                    .wrapping_add(step.wrapping_mul(0x9e3779b97f4a7c15))
+                                    .wrapping_add(axis as u64);
+                                bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                                bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d049bb133111eb);
+                                bits ^= bits >> 31;
+                                ((bits >> 40) as f32 / 16777216.0 * 2.0 - 1.0) * amplitude[axis]
+                            }
+                        }
+                    }
+                };
+                self.offset[axis] = self.origin[axis] + displacement;
             }
             return;
         }
@@ -130,13 +166,40 @@ impl ActorMotion {
 mod tests {
     use super::*;
     #[test]
+    fn jitter_is_stepped_deterministic_and_restorable() {
+        let transition = ActorOffset {
+            target: [0.0; 2],
+            animation: AnimationSpec::Linear(0.3, false),
+            oscillation: Some(ActorOscillation::Jitter {
+                amplitude: [7.5, 7.5],
+                interval: 0.04,
+            }),
+        };
+        transition.validate().expect("valid jitter");
+        let mut motion = ActorMotion::new(4, transition, [10.0, 20.0]);
+        motion.advance(0.045);
+        let first = motion.offset;
+        assert_ne!(first, [10.0, 20.0]);
+        motion.advance(0.02);
+        assert_eq!(motion.offset, first);
+        let bytes = hiraku_script::hson::to_vec(&motion).expect("snapshot jitter");
+        let mut restored: ActorMotion =
+            hiraku_script::hson::from_slice(&bytes).expect("restore jitter");
+        motion.advance(0.04);
+        restored.advance(0.04);
+        assert_eq!(restored.offset, motion.offset);
+        motion.advance(1.0);
+        assert_eq!(motion.offset, [10.0, 20.0]);
+    }
+
+    #[test]
     fn oscillation_samples_axes_independently_and_restores_without_phase_reset() {
         let mut wave = ActorMotion::new(
             1,
             ActorOffset {
                 target: [0.0; 2],
                 animation: AnimationSpec::Linear(0.25, false),
-                oscillation: Some(ActorOscillation {
+                oscillation: Some(ActorOscillation::Sine {
                     amplitude: [5.0, 5.0],
                     period: [0.1, 0.02],
                 }),
@@ -166,7 +229,7 @@ mod tests {
             ActorOffset {
                 target: [0.0; 2],
                 animation: AnimationSpec::Linear(1.0, false),
-                oscillation: Some(ActorOscillation {
+                oscillation: Some(ActorOscillation::Sine {
                     amplitude: [5.0; 2],
                     period: [0.1; 2],
                 }),
@@ -177,7 +240,7 @@ mod tests {
         motion.stop();
         assert_eq!(motion.offset, [0.0; 2]);
         let mut invalid = motion.transition;
-        invalid.oscillation = Some(ActorOscillation {
+        invalid.oscillation = Some(ActorOscillation::Sine {
             amplitude: [5.0; 2],
             period: [0.0, 0.1],
         });

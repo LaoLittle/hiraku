@@ -9,10 +9,14 @@ global struct Actor {
     rotationValue: Float?
     depthValue: Float?
     clipValue: Optional<Optional<String>>
+    dissolveMask: String?
+    dissolveSoftness: Float?
     showing: Bool?
     hiding: Float?
     offsetValue: Position?
     oscillation: Position?
+    jitterValue: Position?
+    jitterInterval: Float
     periodX: Float
     periodY: Float
     stopping: Bool
@@ -23,8 +27,10 @@ global struct Actor {
 fn makeActor(identity: ActorIdentity, name: String) -> Actor {
     Actor.{ identity: identity, name: name, expressions: [], position: null,
         scaleValue: null, focused: null, rotationValue: null, depthValue: null,
-        clipValue: null, showing: null, hiding: null, offsetValue: null,
-        oscillation: null, periodX: 0.0, periodY: 0.0, stopping: false,
+        clipValue: null, dissolveMask: null, dissolveSoftness: null,
+        showing: null, hiding: null, offsetValue: null,
+        oscillation: null, jitterValue: null, jitterInterval: 0.0,
+        periodX: 0.0, periodY: 0.0, stopping: false,
         seconds: null, curve: null }
 }
 
@@ -40,10 +46,13 @@ fn clearActorPatch(actor: Actor) {
     actor.rotationValue = null
     actor.depthValue = null
     actor.clipValue = null
+    actor.dissolveMask = null
+    actor.dissolveSoftness = null
     actor.showing = null
     actor.hiding = null
     actor.offsetValue = null
     actor.oscillation = null
+    actor.jitterValue = null
     actor.stopping = false
     actor.seconds = null
     actor.curve = null
@@ -66,8 +75,11 @@ fn commitActor(actor: Actor, wait: Bool) {
         expressions: actor.expressions, position: actor.position,
         scaleValue: actor.scaleValue, focused: actor.focused,
         rotationValue: actor.rotationValue, depthValue: actor.depthValue,
-        clipValue: actor.clipValue, showing: actor.showing, hiding: actor.hiding,
+        clipValue: actor.clipValue, dissolveMask: actor.dissolveMask,
+        dissolveSoftness: actor.dissolveSoftness,
+        showing: actor.showing, hiding: actor.hiding,
         offsetValue: actor.offsetValue, oscillation: actor.oscillation,
+        jitterValue: actor.jitterValue, jitterInterval: actor.jitterInterval,
         periodX: actor.periodX, periodY: actor.periodY, stopping: actor.stopping,
         seconds: actor.seconds, curve: actor.curve }, wait)
 }
@@ -83,17 +95,26 @@ extend Actor {
     global fn rotation(self, degrees: Float) -> Actor { self.rotationValue = degrees; self }
     global fn depth(self, depth: Float) -> Actor { self.depthValue = depth; self }
     global fn clip(self, region: String?) -> Actor { self.clipValue = .some(region); self }
+    global fn dissolve(self, mask: String, softness: Float) -> Actor {
+        self.dissolveMask = mask; self.dissolveSoftness = softness; self
+    }
     global fn show(self) -> Actor { self.showing = true; self.hiding = null; self }
     global fn hide(self, fadeMs: Float?) -> Actor { self.hiding = fadeMs ?: 0.0; self.showing = false; self }
     global fn offset(self, position: Position) -> Actor {
-        self.offsetValue = position; self.oscillation = null; self.stopping = false; self
+        self.offsetValue = position; self.oscillation = null; self.jitterValue = null
+        self.stopping = false; self
     }
     global fn oscillate(self, amplitude: Position, periodX: Float, periodY: Float) -> Actor {
         self.oscillation = amplitude; self.periodX = periodX; self.periodY = periodY
-        self.offsetValue = null; self.stopping = false; self
+        self.offsetValue = null; self.jitterValue = null; self.stopping = false; self
+    }
+    global fn jitter(self, amplitude: Position, interval: Float) -> Actor {
+        self.jitterValue = amplitude; self.jitterInterval = interval
+        self.offsetValue = null; self.oscillation = null; self.stopping = false; self
     }
     global fn stopMotion(self) -> Actor {
-        self.offsetValue = null; self.oscillation = null; self.stopping = true; self
+        self.offsetValue = null; self.oscillation = null; self.jitterValue = null
+        self.stopping = true; self
     }
     global fn time(self, seconds: Float) -> Actor { self.seconds = seconds; self }
     global fn easing(self, easing: Easing) -> Actor { self.curve = easing; self }

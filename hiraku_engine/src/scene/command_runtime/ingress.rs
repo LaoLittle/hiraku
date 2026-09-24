@@ -1030,6 +1030,21 @@ pub fn drive_story_runtime(
                                 done: request,
                             })
                         }
+                        ScriptCommand::Character(CharacterCommand::Show {
+                            animation_id,
+                            placement_animation_id,
+                            placement_animation,
+                            ..
+                        }) => {
+                            *animation_id = Some(id.clone());
+                            let mut ids = vec![id.clone()];
+                            if placement_animation.is_some() {
+                                let placement_id = format!("{id}-placement");
+                                *placement_animation_id = Some(placement_id.clone());
+                                ids.push(placement_id);
+                            }
+                            ScriptCommand::Animation(AnimationCommand::Wait { ids, done: request })
+                        }
                         ScriptCommand::Stage(StageCommand::SetCurtain { .. }) => {
                             ScriptCommand::Stage(StageCommand::AwaitCurtain { done: request })
                         }
@@ -1052,14 +1067,6 @@ pub fn drive_story_runtime(
                         ScriptCommand::Character(CharacterCommand::Hide { actor_id, .. }) => {
                             ScriptCommand::Animation(AnimationCommand::Scene {
                                 effect: super::super::effect_wait::SceneEffect::HideCharacter(
-                                    actor_id.clone(),
-                                ),
-                                done: request,
-                            })
-                        }
-                        ScriptCommand::Character(CharacterCommand::Show { actor_id, .. }) => {
-                            ScriptCommand::Animation(AnimationCommand::Scene {
-                                effect: super::super::effect_wait::SceneEffect::ShowCharacter(
                                     actor_id.clone(),
                                 ),
                                 done: request,

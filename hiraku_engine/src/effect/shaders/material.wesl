@@ -97,7 +97,9 @@ fn finish(mesh: VertexOutput, value: vec4<f32>) -> vec4<f32> {
         coverage = select(coverage, 1.0, progress >= 1.0);
         // Alpha defines the affected region; RGB defines transition timing.
         // Opaque rule images retain the full-canvas behavior.
-        color.a = select(coverage, 1.0 - coverage, reversed) * mask.a;
+        // Tint alpha drives the threshold, not a second opacity fade. Keep
+        // the source image's own transparency intact at partially covered pixels.
+        color.a = sampled.a * select(coverage, 1.0 - coverage, reversed) * mask.a;
     }
     let delta = mesh.world_position.xy - material.clip_bounds.xy;
     let local = vec2<f32>(dot(delta, material.clip_axes.xy), dot(delta, vec2<f32>(-material.clip_axes.y, material.clip_axes.x)));

@@ -40,7 +40,6 @@ pub enum SceneEffect {
     Spatial(crate::stage::runtime::StageCommand),
     Picture(super::pictures::PictureCommand),
     HideCharacter(Option<String>),
-    ShowCharacter(String),
 }
 
 #[derive(Component)]
@@ -57,9 +56,6 @@ pub fn complete(
     stage: Res<StageState>,
     assets: Res<AssetServer>,
     groups: Query<&super::character_composite::CharacterGroup>,
-    placements: Query<(&super::character::ActorPlacement, &Children)>,
-    tweens: Query<&VisualTween>,
-    pending: Res<PendingCharacterShows>,
     waits: Query<(Entity, &SceneEffectWait)>,
     videos: Query<&super::video_pictures::VideoPicture>,
     player: Res<hiraku_video::VideoPlayer>,
@@ -103,18 +99,6 @@ pub fn complete(
                         }
                     }
                 })
-            }
-            SceneEffect::ShowCharacter(actor) => {
-                pending.items.iter().any(|show| &show.actor_id == actor)
-                    || stage.character_roots.get(actor).is_some_and(|root| {
-                        groups.get(*root).is_ok_and(|g| g.is_animating())
-                            || placements.get(*root).is_ok_and(|(placement, children)| {
-                                placement.is_animating()
-                                    || children.iter().any(|child| {
-                                        tweens.get(child).is_ok_and(|t| !t.timer.is_finished())
-                                    })
-                            })
-                    })
             }
             SceneEffect::HideCharacter(actor) => {
                 stage.character_roots.iter().any(|(name, root)| {

@@ -1,6 +1,8 @@
 //! Logical part children retain animation/save state; only the composite draws.
 use super::*;
-use hiraku_sprite3d::{BlendMode, MaskMode, Sprite3d, Sprite3dPlugin, Sprite3dSync, SpriteLayer};
+use hiraku_sprite3d::{
+    BlendMode, MaskMode, Sprite3d, Sprite3dPlugin, Sprite3dSync, SpriteDissolve, SpriteLayer,
+};
 use std::time::Duration;
 mod atlas;
 pub(crate) mod source;
@@ -10,11 +12,15 @@ pub(crate) struct LogicalCharacterPart(
     pub CharacterPartDefinition,
     pub Option<Handle<source::AtlasSource>>,
 );
+/// A replacement enters over its still-opaque predecessor in the same slot.
+#[derive(Component)]
+pub(crate) struct ReplacementFadeIn;
 #[derive(Component)]
 struct CompositeDisplay;
 #[derive(Component, Default)]
 pub(crate) struct CharacterGroup {
     alpha: f32,
+    pub(super) dissolve: Option<SpriteDissolve>,
     tween: Option<GroupTween>,
     display: Option<Entity>,
     atlas: Option<Handle<TextureAtlasLayout>>,
@@ -161,11 +167,20 @@ fn advance_group_fades(
     mut redraw: crate::redraw::Redraw,
     mut commands: Commands,
     time: crate::scene::playback::StoryTime,
+    images: Res<Assets<Image>>,
     mut animations: ResMut<AnimationState>,
     mut groups: Query<(&Children, &mut CharacterGroup)>,
     parts: Query<(), With<LogicalCharacterPart>>,
 ) {
     for (children, mut group) in &mut groups {
+        if group
+            .dissolve
+            .as_ref()
+            .is_some_and(|mask| !images.contains(&mask.image))
+        {
+            redraw.request();
+            continue;
+        }
         let Some(tween) = group.tween.as_mut() else {
             continue;
         };
@@ -177,6 +192,9 @@ fn advance_group_fades(
         if complete {
             let tween = group.tween.take().expect("active group tween");
             group.alpha = tween.to;
+            if tween.to == 1.0 {
+                group.dissolve = None;
+            }
             complete_missing_animation(&mut animations, tween.animation_id);
             if tween.to == 0.0 {
                 for child in children.iter() {
@@ -195,6 +213,7 @@ fn compose_groups(
     mut commands: Commands,
     mut redraw: crate::redraw::Redraw,
     shared: Res<super::SceneSharedState>,
+    stage: Res<StageState>,
     spatial: Option<Res<crate::stage::runtime::StageRuntime>>,
     mut images: ResMut<Assets<Image>>,
     mut cpu: source::AtlasSources,
@@ -236,18 +255,53 @@ fn compose_groups(
     for (root, children, mut group, identity, placement) in &mut roots {
         group.packed.invalidate(&changed);
         group.packed.invalidate_sources(&changed_sources);
-        let mut selected = children
+        let selected = children
             .iter()
             .filter_map(|e| parts.get(e).ok())
             .filter(|(_, _, _, v, _)| **v != Visibility::Hidden)
             .collect::<Vec<_>>();
-        selected.sort_by(|a, b| {
-            a.0.0
-                .layer
-                .total_cmp(&b.0.0.layer)
+        let active = stage.character_active_parts.get(&identity.actor_id);
+        let active_slots = selected
+            .iter()
+            .filter(|part| {
+                active.is_some_and(|ids| {
+                    ids.contains(&super::character::character_part_id(
+                        &identity.actor_id,
+                        &part.0.0,
+                    ))
+                })
+            })
+            .filter_map(|part| part.0.0.slot.map(|slot| (slot, part.0.0.layer)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut keyed = selected
+            .into_iter()
+            .map(|part| {
+                (
+                    replacement_order(&part.0.0, &identity.actor_id, active, &active_slots),
+                    part,
+                )
+            })
+            .collect::<Vec<_>>();
+        keyed.sort_by(|(a_key, a), (b_key, b)| {
+            a_key
+                .0
+                .total_cmp(&b_key.0)
+                .then_with(|| a_key.1.cmp(&b_key.1))
                 .then_with(|| a.0.0.id.cmp(&b.0.0.id))
         });
+        let selected = keyed.into_iter().map(|(_, part)| part).collect::<Vec<_>>();
         if selected.is_empty() || group.alpha == 0.0 {
+            if let Some(e) = group.display {
+                commands.entity(e).try_insert(Visibility::Hidden);
+            }
+            continue;
+        }
+        if group
+            .dissolve
+            .as_ref()
+            .is_some_and(|mask| !images.contains(&mask.image))
+        {
+            redraw.request();
             if let Some(e) = group.display {
                 commands.entity(e).try_insert(Visibility::Hidden);
             }
@@ -316,10 +370,23 @@ fn compose_groups(
         }
         let sprite = Sprite3d {
             clip: shared.0.clips.actor(&identity.actor_id),
+            dissolve: group.dissolve.as_ref().map(|mask| SpriteDissolve {
+                progress: group.alpha,
+                ..mask.clone()
+            }),
             image: Some(image),
             layers,
             custom_size: Some(size),
-            color: Color::linear_rgba(1.0, 1.0, 1.0, group.alpha),
+            color: Color::linear_rgba(
+                1.0,
+                1.0,
+                1.0,
+                if group.dissolve.is_some() {
+                    1.0
+                } else {
+                    group.alpha
+                },
+            ),
             ..default()
         };
         // Per-part layers order composition only. Actor ordering belongs to
@@ -393,6 +460,26 @@ fn compose_groups(
             );
         }
     }
+}
+
+fn replacement_order(
+    part: &CharacterPartDefinition,
+    actor_id: &str,
+    active: Option<&HashSet<String>>,
+    active_slots: &std::collections::HashMap<usize, f32>,
+) -> (f32, bool) {
+    let outgoing = part.slot.is_some_and(|slot| {
+        active_slots.contains_key(&slot)
+            && active.is_some_and(|ids| {
+                !ids.contains(&super::character::character_part_id(actor_id, part))
+            })
+    });
+    let layer = if outgoing {
+        active_slots[&part.slot.expect("outgoing replacement has a slot")]
+    } else {
+        part.layer
+    };
+    (layer, !outgoing)
 }
 
 type PartView<'a> = (
@@ -684,6 +771,27 @@ mod tests {
     }
 
     #[test]
+    fn replaced_slot_renders_opaque_predecessor_below_incoming_part() {
+        let mut old = part("alice/eyes_old", [0.0, 0.0, 4.0, 4.0]).0;
+        old.slot = Some(1);
+        old.layer = 30.0;
+        let mut new = part("alice/eyes_new", [0.0, 0.0, 4.0, 4.0]).0;
+        new.slot = Some(1);
+        new.layer = 20.0;
+        let active = HashSet::from([super::super::character::character_part_id("alice", &new)]);
+        let slots = std::collections::HashMap::from([(1, new.layer)]);
+        let old_key = replacement_order(&old, "alice", Some(&active), &slots);
+        let new_key = replacement_order(&new, "alice", Some(&active), &slots);
+        assert_eq!(old_key.0, new_key.0);
+        assert!(old_key.1 < new_key.1);
+        // Alpha-over an opaque predecessor stays opaque throughout the fade.
+        for incoming in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let composed = incoming + 1.0 * (1.0 - incoming);
+            assert_eq!(composed, 1.0);
+        }
+    }
+
+    #[test]
     fn cpu_only_part_builds_without_any_render_source_even_for_one_visible_part() {
         let mut images = Assets::<Image>::default();
         let mut sources = Assets::<source::AtlasSource>::default();
@@ -860,6 +968,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<super::super::SceneSharedState>()
+            .init_resource::<StageState>()
             .init_resource::<AnimationState>()
             .init_resource::<Assets<Image>>()
             .add_message::<AssetEvent<Image>>()

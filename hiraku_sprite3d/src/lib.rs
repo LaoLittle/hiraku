@@ -10,7 +10,8 @@ pub use billboard::{Billboard, BillboardMode, BillboardPlugin};
 pub use clip::ClipRect;
 pub use material::Sprite3dMaterial;
 pub use sprite::{
-    BlendMode, MAX_LAYERS, MAX_MASKS, MaskMode, Sprite3d, Sprite3dError, SpriteLayer,
+    BlendMode, MAX_LAYERS, MAX_MASKS, MaskMode, Sprite3d, Sprite3dError, SpriteDissolve,
+    SpriteLayer,
 };
 
 pub struct Sprite3dPlugin;

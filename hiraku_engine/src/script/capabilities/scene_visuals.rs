@@ -297,6 +297,7 @@ mod api {
         context
             .scene_visuals
             .begin_as(SceneVisualTarget::Picture(PictureCommand::Show {
+                dissolve: None,
                 post_process: None,
                 video: None,
                 replace: false,
@@ -538,7 +539,9 @@ mod api {
         let Some((SceneVisualTarget::Picture(PictureCommand::Show { post_process, .. }), _)) =
             context.scene_visuals.pending.get_mut(&handle.0)
         else {
-            return Err(NativeError::message("grayscaleGamma requires an uncommitted picture"));
+            return Err(NativeError::message(
+                "grayscaleGamma requires an uncommitted picture",
+            ));
         };
         post_process.get_or_insert_default().grayscale_gamma =
             bevy::prelude::Vec4::new(red as f32, green as f32, blue as f32, 1.0);
@@ -591,6 +594,33 @@ mod api {
             return Err(NativeError::message("tint requires an uncommitted picture"));
         };
         *color = Some(channels.map(|n| n as f32 / 255.0));
+        Ok(handle)
+    }
+
+    /// Reveal an incoming picture through a full-canvas rule texture.
+    pub(super) fn picture_dissolve(
+        context: &mut CharacterContext,
+        handle: SceneTransitionHandle,
+        texture: String,
+        softness: Option<f64>,
+    ) -> Result<SceneTransitionHandle, NativeError> {
+        let softness = softness.unwrap_or(0.0);
+        if texture.trim().is_empty() || !softness.is_finite() || !(0.0..=1.0).contains(&softness) {
+            return Err(NativeError::message(
+                "picture dissolve needs a texture and softness between 0 and 1",
+            ));
+        }
+        let Some((SceneVisualTarget::Picture(PictureCommand::Show { dissolve, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "dissolve requires an uncommitted scene.picture(...) or bg(...) builder",
+            ));
+        };
+        *dissolve = Some(crate::scene::pictures::PictureDissolve {
+            path: texture,
+            softness: softness as f32,
+        });
         Ok(handle)
     }
 
@@ -1167,6 +1197,33 @@ mod api {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn picture_dissolve_is_typed_and_retains_the_rule_in_its_effect() {
+        use super::*;
+        use crate::script::{StoryRuntime, StoryRuntimeEvent};
+        let code = compile_story_bytecode(
+            "test.hks",
+            "scene.picture(\"wipe\", \"image/room\").dissolve(\"rule/door\", 0.25).time(1).await()",
+        )
+        .expect("picture dissolve compiles");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let Some(StoryRuntimeEvent::TaskEffect {
+            effect:
+                StoryEffect::Picture(PictureCommand::Show {
+                    dissolve: Some(crate::scene::pictures::PictureDissolve { path, softness }),
+                    seconds,
+                    ..
+                }),
+            ..
+        }) = runtime.step().expect("submit masked picture")
+        else {
+            panic!("expected awaitable picture dissolve")
+        };
+        assert_eq!(path, "rule/door");
+        assert_eq!(softness, 0.25);
+        assert_eq!(seconds, 1.0);
+    }
+
+    #[test]
     fn named_video_uses_picture_transitions_and_retains_loop_configuration() {
         use super::*;
         use crate::script::{StoryRuntime, StoryRuntimeEvent};
@@ -1409,6 +1466,7 @@ mod tests {
         assert!(matches!(
             event(&mut show),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                dissolve: None,
                 video: None,
                 screen_space: true,
                 ..
@@ -2397,6 +2455,7 @@ mod tests {
         assert_eq!(
             event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                dissolve: None,
                 video: None,
                 replace: false,
                 post_process: None,

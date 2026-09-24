@@ -189,6 +189,7 @@ pub(crate) fn script_command_from_effect(
             if let crate::scene::pictures::PictureCommand::Show {
                 path,
                 rect,
+                dissolve,
                 video: None,
                 ..
             } = &mut picture
@@ -198,6 +199,17 @@ pub(crate) fn script_command_from_effect(
                     .ok_or_else(|| format!("texture `{path}` is not defined"))?;
                 *path = texture.path.clone();
                 *rect = texture.rect;
+                if let Some(dissolve) = dissolve {
+                    let definition = textures
+                        .and_then(|catalog| catalog.resolve(&dissolve.path))
+                        .ok_or_else(|| {
+                            format!("dissolve texture `{}` is not defined", dissolve.path)
+                        })?;
+                    if definition.rect.is_some() {
+                        return Err("dissolve masks must use a standalone texture".into());
+                    }
+                    dissolve.path = definition.path.clone();
+                }
             }
             ScriptCommand::Stage(StageCommand::Picture(picture))
         }
@@ -227,6 +239,7 @@ pub(crate) fn script_command_from_effect(
             position,
             scale,
             focused,
+            dissolve,
         } => ScriptCommand::Character(CharacterCommand::Show {
             rotation,
             placement_animation,
@@ -236,9 +249,21 @@ pub(crate) fn script_command_from_effect(
             position: Vec2::new(position[0], position[1]),
             scale,
             focused,
+            dissolve: dissolve
+                .map(|(name, softness)| {
+                    let definition = textures
+                        .and_then(|catalog| catalog.resolve(&name))
+                        .ok_or_else(|| format!("dissolve texture `{name}` is not defined"))?;
+                    if definition.rect.is_some() {
+                        return Err("dissolve masks must use a standalone texture".to_string());
+                    }
+                    Ok((definition.path.clone(), softness))
+                })
+                .transpose()?,
             fade: placement_animation
                 .map(|animation| std::time::Duration::from_secs_f32(animation.duration())),
             animation_id: None,
+            placement_animation_id: None,
         }),
         StoryEffect::StopSfxChannel { channel, fade_ms } => {
             ScriptCommand::Audio(AudioCommand::StopSfxChannel {

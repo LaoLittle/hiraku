@@ -25,6 +25,7 @@ pub struct SpriteUniform {
     clip_axes: Vec4,
     tint: Vec4,
     backface_tint: Vec4,
+    dissolve: Vec4,
     count: UVec4,
     layers: [LayerUniform; MAX_LAYERS],
 }
@@ -38,6 +39,9 @@ pub struct Sprite3dMaterial {
     #[texture(1)]
     #[sampler(2)]
     pub image: Option<Handle<Image>>,
+    #[texture(4)]
+    #[sampler(5)]
+    pub dissolve_image: Option<Handle<Image>>,
 }
 
 impl Sprite3dMaterial {
@@ -100,6 +104,7 @@ impl Sprite3dMaterial {
         }
         Self {
             image: sprite.image.clone(),
+            dissolve_image: sprite.dissolve.as_ref().map(|mask| mask.image.clone()),
             sampling: UVec4::ZERO,
             uniform: SpriteUniform {
                 clip_bounds: sprite
@@ -110,6 +115,14 @@ impl Sprite3dMaterial {
                     .map_or(Vec4::ZERO, |clip| clip.shader_parameters()[1]),
                 tint: sprite.color.to_linear().to_f32_array().into(),
                 backface_tint: sprite.backface_color.to_linear().to_f32_array().into(),
+                dissolve: sprite.dissolve.as_ref().map_or(Vec4::ZERO, |mask| {
+                    Vec4::new(
+                        mask.progress,
+                        mask.softness,
+                        mask.canvas_size.x,
+                        mask.canvas_size.y,
+                    )
+                }),
                 count: UVec4::new(source.len() as u32, 0, 0, 0),
                 layers,
             },
@@ -148,6 +161,26 @@ impl Material for Sprite3dMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_rule_applies_after_layer_composition() {
+        let mask = Handle::<Image>::default();
+        let sprite = Sprite3d {
+            dissolve: Some(crate::SpriteDissolve {
+                image: mask.clone(),
+                softness: 0.25,
+                canvas_size: Vec2::new(1920.0, 1080.0),
+                progress: 0.5,
+            }),
+            ..default()
+        };
+        let material = Sprite3dMaterial::try_from(&sprite).expect("valid rule");
+        assert_eq!(material.dissolve_image, Some(mask));
+        assert_eq!(
+            material.uniform.dissolve,
+            Vec4::new(0.5, 0.25, 1920.0, 1080.0)
+        );
+    }
 
     #[test]
     fn overall_opacity_does_not_modify_layer_or_mask_alpha() {

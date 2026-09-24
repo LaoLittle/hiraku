@@ -153,6 +153,7 @@ pub enum StoryEffect {
         position: [f32; 2],
         scale: f32,
         focused: bool,
+        dissolve: Option<(String, f32)>,
     },
     StopActorMotion {
         actor_id: String,
@@ -899,6 +900,7 @@ struct ActorPresentation {
     scale: f32,
     dirty: bool,
     focused: bool,
+    dissolve: Option<(String, f32)>,
     visible: bool,
 }
 
@@ -1106,6 +1108,7 @@ impl CharacterContext {
                 position: pending.position,
                 scale: pending.scale,
                 focused: pending.focused,
+                dissolve: pending.dissolve.take(),
             }
         };
         self.commands.push(command);
@@ -1559,9 +1562,36 @@ mod native_api {
         let transition = super::super::actor_motion::ActorOffset {
             target: [0.0; 2],
             animation: AnimationSpec::Linear(0.3, false),
-            oscillation: Some(super::super::actor_motion::ActorOscillation {
+            oscillation: Some(super::super::actor_motion::ActorOscillation::Sine {
                 amplitude: [x as f32, y as f32],
                 period: [period_x as f32, period_y as f32],
+            }),
+        };
+        transition.validate().map_err(NativeError::message)?;
+        context
+            .actor_mut(handle)
+            .map_err(|e| NativeError::message(e.to_string()))?
+            .pending_offset = Some(transition);
+        Ok(ActorIdentity(handle))
+    }
+
+    pub(super) fn native_actor_jitter(
+        context: &mut CharacterContext,
+        ActorIdentity(handle): ActorIdentity,
+        amplitude: Position,
+        interval: f64,
+    ) -> Result<ActorIdentity, NativeError> {
+        let Position::Absolute(x, y) = amplitude else {
+            return Err(NativeError::message(
+                "jitter amplitude uses .pos(x, y) canvas units",
+            ));
+        };
+        let transition = super::super::actor_motion::ActorOffset {
+            target: [0.0; 2],
+            animation: AnimationSpec::Linear(0.3, false),
+            oscillation: Some(super::super::actor_motion::ActorOscillation::Jitter {
+                amplitude: [x as f32, y as f32],
+                interval: interval as f32,
             }),
         };
         transition.validate().map_err(NativeError::message)?;
@@ -1755,6 +1785,25 @@ mod native_api {
         context.commands.push(StoryEffect::Clip(
             crate::scene::clipping::ClipCommand::Actor { id, region },
         ));
+        Ok(actor)
+    }
+
+    pub(super) fn native_actor_dissolve(
+        context: &mut CharacterContext,
+        actor: ActorIdentity,
+        mask: String,
+        softness: f64,
+    ) -> Result<ActorIdentity, NativeError> {
+        if mask.is_empty() || !softness.is_finite() || !(0.0..=1.0).contains(&softness) {
+            return Err(NativeError::message(
+                "actor dissolve needs a texture and softness between 0 and 1",
+            ));
+        }
+        let pending = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?;
+        pending.dissolve = Some((mask, softness as f32));
+        pending.dirty = true;
         Ok(actor)
     }
 
@@ -2104,6 +2153,7 @@ fn pending_actor(name: &str) -> ActorPresentation {
         scale: 1.0,
         dirty: false,
         focused: false,
+        dissolve: None,
         visible: false,
     }
 }

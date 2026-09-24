@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 pub struct PictureState {
     #[serde(default)]
     pub video: Option<PictureVideo>,
-    /// Last applied clip, retained with frozen backing layers during replacement.
+    /// Last applied clip, retained with outgoing backing layers during replacement.
     pub resolved_clip: Option<super::clipping::ClipRegion>,
     #[serde(default)]
     pub screen_space: bool,
-    /// Frozen backing layers retained until the incoming image is ready and
-    /// its entrance finishes. Owned by this replacement, never by callbacks.
+    /// Outgoing layers retain their own motion until the incoming image is
+    /// ready and its entrance finishes. Owned by this replacement.
     #[serde(default)]
     pub previous: Vec<PictureState>,
     #[serde(default)]
@@ -38,6 +38,14 @@ pub struct PictureState {
     pub motion: Option<PictureMotion>,
     #[serde(default)]
     pub fade: Option<PictureFade>,
+    #[serde(default)]
+    pub dissolve: Option<PictureDissolve>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PictureDissolve {
+    pub path: String,
+    pub softness: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -136,6 +144,7 @@ pub enum PictureCommand {
         seconds: f32,
     },
     Show {
+        dissolve: Option<PictureDissolve>,
         post_process: Option<crate::effect::post_process::EffectParameters>,
         video: Option<PictureVideo>,
         replace: bool,
@@ -191,6 +200,29 @@ fn values(p: &PictureState) -> [f32; 5] {
     [p.position[0], p.position[1], p.scale, p.rotation, p.alpha]
 }
 
+fn picture_dissolve_mask(
+    picture: &PictureState,
+    assets: &AssetServer,
+    canvas_size: Vec2,
+) -> Option<crate::render::world_sprite::DissolveMask> {
+    picture
+        .dissolve
+        .as_ref()
+        .map(|dissolve| crate::render::world_sprite::DissolveMask {
+            image: assets
+                .load_builder()
+                .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+                    settings.is_srgb = false;
+                    settings.asset_usage = bevy::asset::RenderAssetUsages::RENDER_WORLD;
+                })
+                .load(dissolve.path.clone()),
+            path: dissolve.path.clone(),
+            softness: dissolve.softness,
+            canvas_size,
+            reversed: false,
+        })
+}
+
 pub(super) fn apply_picture_command(
     pictures: &mut BTreeMap<String, PictureState>,
     command: PictureCommand,
@@ -198,6 +230,7 @@ pub(super) fn apply_picture_command(
     let unsupported = match &command {
         PictureCommand::Show {
             video: Some(_),
+            dissolve,
             post_process,
             slice,
             rect,
@@ -205,6 +238,7 @@ pub(super) fn apply_picture_command(
             ..
         } => {
             slice.is_some()
+                || dissolve.is_some()
                 || rect.is_some()
                 || post_process.is_some_and(|p| p.is_enabled())
                 || color.is_some_and(|c| c[..3] != [1.0; 3])
@@ -305,6 +339,7 @@ pub(super) fn apply_picture_command(
         }
         PictureCommand::Clear => pictures.clear(),
         PictureCommand::Show {
+            dissolve,
             video,
             post_process,
             replace,
@@ -329,13 +364,17 @@ pub(super) fn apply_picture_command(
                     if (replace || old.path != path || old.rect != rect || old.video != video)
                         && old.alpha > 0.0
                     {
-                        let mut frozen = old.clone();
-                        frozen.previous.clear();
-                        frozen.motion = None;
-                        frozen.fade = None;
-                        frozen.tint_tween = None;
-                        frozen.blur_tween = None;
-                        layers.push(frozen);
+                        let mut outgoing = old.clone();
+                        outgoing.previous.clear();
+                        if let Some(motion) = outgoing.motion.as_mut() {
+                            // The replacement owns retirement; an interrupted
+                            // exit must not remove its backing mid-crossfade.
+                            motion.remove = false;
+                        }
+                        outgoing.fade = None;
+                        outgoing.tint_tween = None;
+                        outgoing.blur_tween = None;
+                        layers.push(outgoing);
                     }
                     layers
                 })
@@ -388,6 +427,7 @@ pub(super) fn apply_picture_command(
             pictures.insert(
                 id.clone(),
                 PictureState {
+                    dissolve,
                     video,
                     resolved_clip: None,
                     screen_space,
@@ -485,9 +525,16 @@ pub(super) fn apply_picture_command(
             if seconds == 0.0 {
                 pictures.remove(&id);
             } else if let Some(picture) = pictures.get_mut(&id) {
-                // Freeze the currently displayed pose, including a partially
-                // completed shake. No previous motion may run behind the exit.
-                picture.motion = None;
+                // A fade-out is independent of placement: a moving background
+                // keeps moving until it is fully hidden. A finite shake is an
+                // effect, not a trajectory, and still stops at the cut.
+                if picture.motion.as_ref().is_some_and(|motion| {
+                    motion.oscillation.is_some() || !motion.offsets_x.is_empty()
+                }) {
+                    picture.motion = None;
+                } else if let Some(motion) = picture.motion.as_mut() {
+                    motion.remove = false;
+                }
                 picture.fade = Some(PictureFade {
                     from: picture.alpha,
                     to: 0.0,
@@ -586,6 +633,11 @@ pub fn sync_pictures(
             let image = sprite.image.as_ref()?;
             let picture = pictures.get(&marker.0)?;
             (images.contains(image.id())
+                && picture.dissolve.as_ref().is_none_or(|dissolve| {
+                    sprite.dissolve.as_ref().is_some_and(|mask| {
+                        mask.path == dissolve.path && images.contains(mask.image.id())
+                    })
+                })
                 && clips.picture_mask(&marker.0).is_none_or(|path| {
                     sprite.clip_mask.as_ref().is_some_and(|mask| {
                         images.contains(mask.id())
@@ -719,6 +771,17 @@ pub fn sync_pictures(
         if sprite.post_process != picture.post_process {
             sprite.post_process = picture.post_process;
         }
+        if sprite
+            .dissolve
+            .as_ref()
+            .map(|mask| (mask.path.as_str(), mask.softness, mask.canvas_size))
+            != picture
+                .dissolve
+                .as_ref()
+                .map(|mask| (mask.path.as_str(), mask.softness, canvas.size.as_vec2()))
+        {
+            sprite.dissolve = picture_dissolve_mask(picture, &assets, canvas.size.as_vec2());
+        }
         let noise = picture
             .noise
             .as_ref()
@@ -765,6 +828,7 @@ pub fn sync_pictures(
             .map(|path| crate::texture::load_static_image(&assets, path));
         sprite.rect = picture.rect;
         sprite.post_process = picture.post_process;
+        sprite.dissolve = picture_dissolve_mask(picture, &assets, canvas.size.as_vec2());
         sprite.noise = picture
             .noise
             .as_ref()
@@ -814,6 +878,11 @@ fn tick_ready_picture(
     entrances_pending: bool,
     delta: f32,
 ) -> bool {
+    // The outgoing image is already renderable, so its trajectory must keep
+    // advancing even while the incoming asset is still being prepared.
+    for outgoing in &mut picture.previous {
+        tick_picture(outgoing, delta);
+    }
     // Hiding an unloaded image must not retain it or await a failed download.
     let exiting = picture.fade.as_ref().is_some_and(|fade| fade.remove);
     if !exiting
@@ -827,7 +896,7 @@ fn tick_ready_picture(
         return true;
     }
     let keep = tick_picture(picture, delta);
-    if picture.fade.is_none() && picture.motion.is_none() {
+    if picture.fade.is_none() {
         picture.previous.clear();
     }
     keep
@@ -904,7 +973,7 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
             picture.fade = None;
         }
     }
-    if picture.fade.is_none() && picture.motion.is_none() {
+    if picture.fade.is_none() {
         picture.previous.clear();
     }
     true
@@ -953,6 +1022,46 @@ pub(super) fn screen_picture_transform(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn picture_dissolve_survives_state_roundtrip_and_preserves_fade_progress() {
+        use super::*;
+        let mut pictures = BTreeMap::new();
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Show {
+                dissolve: Some(PictureDissolve {
+                    path: "rule/door.png".into(),
+                    softness: 0.25,
+                }),
+                post_process: None,
+                video: None,
+                replace: false,
+                screen_space: false,
+                size: None,
+                slice: None,
+                color: None,
+                id: "wipe".into(),
+                path: "image/room.png".into(),
+                rect: None,
+                position: [50.0, 50.0],
+                scale: 1.0,
+                rotation: 0.0,
+                layer: 29.0,
+                seconds: 1.0,
+            },
+        )
+        .expect("show masked picture");
+        tick_picture(pictures.get_mut("wipe").expect("picture"), 0.4);
+        let saved = hiraku_script::hson::to_vec(&pictures).expect("save pictures");
+        let restored: BTreeMap<String, PictureState> =
+            hiraku_script::hson::from_slice(&saved).expect("restore pictures");
+        assert_eq!(
+            restored["wipe"].dissolve.as_ref().expect("mask").path,
+            "rule/door.png"
+        );
+        assert!((restored["wipe"].alpha - 0.4).abs() < 0.001);
+    }
+
     use super::*;
 
     #[test]
@@ -1013,6 +1122,7 @@ mod tests {
         apply_picture_command(
             &mut pictures,
             PictureCommand::Show {
+                dissolve: None,
                 video: None,
                 post_process: None,
                 replace: false,
@@ -1516,6 +1626,7 @@ mod tests {
             &mut pictures,
             PictureCommand::Show {
                 id: "room".into(),
+                dissolve: None,
                 video: None,
                 post_process: None,
                 replace: false,
@@ -1603,7 +1714,7 @@ mod tests {
         )
         .expect("fade out");
         let picture = pictures.get("room").expect("picture fades before removal");
-        assert!(picture.motion.is_none());
+        assert!(picture.motion.is_some(), "fade must not cancel placement");
         assert!(picture.fade.as_ref().expect("fade").remove);
         let data = hiraku_script::hson::to_vec(&pictures).expect("encode pictures");
         let restored: BTreeMap<String, PictureState> =
@@ -1728,6 +1839,7 @@ mod tests {
         apply_picture_command(
             &mut pictures,
             PictureCommand::Show {
+                dissolve: None,
                 video: None,
                 post_process: None,
                 replace: false,
@@ -1763,6 +1875,7 @@ mod tests {
             &mut pictures,
             PictureCommand::Show {
                 id: "room".into(),
+                dissolve: None,
                 video: None,
                 post_process: None,
                 replace: false,
@@ -1800,6 +1913,108 @@ mod tests {
     }
 
     #[test]
+    fn moving_background_keeps_moving_while_its_replacement_loads_and_fades() {
+        let mut pictures = shown();
+        tick_picture(pictures.get_mut("room").expect("old picture"), 0.3);
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [Some(100.0), None],
+                scale: None,
+                rotation: None,
+                seconds: 4.0,
+                ease: "linear".into(),
+            },
+        )
+        .expect("background moves");
+        tick_picture(pictures.get_mut("room").expect("old picture"), 1.0);
+        let before = pictures["room"].position[0];
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Show {
+                id: "room".into(),
+                dissolve: None,
+                video: None,
+                post_process: None,
+                replace: false,
+                path: "background/next".into(),
+                screen_space: false,
+                size: None,
+                slice: None,
+                color: None,
+                rect: None,
+                position: [50.0, 50.0],
+                scale: 1.0,
+                rotation: 0.0,
+                layer: 5.0,
+                seconds: 1.0,
+            },
+        )
+        .expect("replace background");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [Some(90.0), None],
+                scale: None,
+                rotation: None,
+                seconds: 40.0,
+                ease: "linear".into(),
+            },
+        )
+        .expect("incoming picture begins its own long motion");
+        let picture = pictures.get_mut("room").expect("replacement");
+        assert!(picture.previous[0].motion.is_some());
+        tick_ready_picture(picture, false, false, 0.5);
+        assert!(picture.previous[0].position[0] > before);
+        assert_eq!(picture.alpha, 0.0, "incoming image is not loaded yet");
+        tick_ready_picture(picture, true, false, 0.5);
+        assert!(picture.previous[0].position[0] > before);
+        assert_eq!(picture.alpha, 0.5);
+        tick_ready_picture(picture, true, false, 0.5);
+        assert!(
+            picture.previous.is_empty(),
+            "backing retires after the fade"
+        );
+        assert!(
+            picture.motion.is_some(),
+            "new motion continues independently"
+        );
+    }
+
+    #[test]
+    fn hiding_a_moving_background_does_not_freeze_its_pose() {
+        let mut pictures = shown();
+        tick_picture(pictures.get_mut("room").expect("background"), 0.3);
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Transform {
+                id: "room".into(),
+                position: [Some(100.0), None],
+                scale: None,
+                rotation: None,
+                seconds: 4.0,
+                ease: "linear".into(),
+            },
+        )
+        .expect("background moves");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Hide {
+                id: "room".into(),
+                seconds: 1.0,
+            },
+        )
+        .expect("background hides");
+        let picture = pictures.get_mut("room").expect("fading background");
+        assert!(picture.motion.is_some());
+        tick_picture(picture, 0.5);
+        assert!(picture.position[0] > 80.0);
+        assert_eq!(picture.alpha, 0.5);
+    }
+
+    #[test]
     fn replacing_the_same_image_freezes_old_pose_during_crossfade() {
         let mut pictures = shown();
         tick_picture(pictures.get_mut("room").expect("old picture"), 0.3);
@@ -1808,6 +2023,7 @@ mod tests {
             &mut pictures,
             PictureCommand::Show {
                 id: "room".into(),
+                dissolve: None,
                 video: None,
                 post_process: None,
                 replace: true,

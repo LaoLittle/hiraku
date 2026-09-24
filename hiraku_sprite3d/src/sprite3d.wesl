@@ -6,11 +6,13 @@ struct Layer {
     rect: vec4<f32>, bounds: vec4<f32>, tint: vec4<f32>, modes: vec4<f32>, flip: vec4<f32>,
 };
 
-struct Sprite { clip_bounds: vec4<f32>, clip_axes: vec4<f32>, tint: vec4<f32>, backface_tint: vec4<f32>, count: vec4<u32>, layers: array<Layer, 32>, };
+struct Sprite { clip_bounds: vec4<f32>, clip_axes: vec4<f32>, tint: vec4<f32>, backface_tint: vec4<f32>, dissolve: vec4<f32>, count: vec4<u32>, layers: array<Layer, 32>, };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> sprite: Sprite;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var atlas: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var atlas_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var dissolve_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var dissolve_sampler: sampler;
 
 // Premultiplied operands, including genuinely translucent layers.
 fn compose(dst: vec4<f32>, src: vec4<f32>, multiply: bool) -> vec4<f32> {
@@ -56,5 +58,19 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
     // Apply group opacity only after internal overlaps have been resolved.
     let tint = sprite.tint * select(sprite.backface_tint, vec4<f32>(1.0), front);
     if outside { discard; }
-    return vec4<f32>(result.rgb * tint.rgb * tint.a, result.a * tint.a);
+    var coverage = 1.0;
+    if sprite.dissolve.z > 0.0 {
+        let rule = textureSampleLevel(dissolve_texture, dissolve_sampler, mesh.position.xy / sprite.dissolve.zw, 0.0);
+        let threshold = rule.r;
+        let progress = sprite.dissolve.x;
+        let softness = sprite.dissolve.y;
+        coverage = step(threshold, progress);
+        if softness > 0.0 {
+            coverage = smoothstep(threshold, threshold + softness, progress * (1.0 + softness));
+        }
+        coverage = select(coverage, 0.0, progress <= 0.0);
+        coverage = select(coverage, 1.0, progress >= 1.0);
+        coverage *= rule.a;
+    }
+    return vec4<f32>(result.rgb * tint.rgb * tint.a * coverage, result.a * tint.a * coverage);
 }
