@@ -111,7 +111,7 @@ impl AudioDecoderConfig {
     }
 }
 
-fn validate_codec(codec: &Codec) -> Result<(), CodecError> {
+pub(crate) fn validate_codec(codec: &Codec) -> Result<(), CodecError> {
     if codec.0.is_empty() || codec.0.chars().any(char::is_whitespace) {
         Err(CodecError::Configuration(
             "codec must be a nonempty registry identifier".into(),

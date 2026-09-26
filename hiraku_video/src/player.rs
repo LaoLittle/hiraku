@@ -21,7 +21,7 @@ use crate::{
     audio::VideoAudio,
     render::{Yuv420Material, load_internal_shader},
 };
-use hiraku_media::{
+use hiraku_codec::{
     DecodeSettings, VideoFrame as DecodedFrame, VideoPixels as DecodedPixels, YuvPixelFormat,
 };
 
@@ -1527,10 +1527,10 @@ mod tests {
             height: 4,
             chroma_width: 2,
             chroma_height: 2,
-            color_transform: hiraku_media::YuvColorTransform::from_luma_coefficients(
+            color_transform: hiraku_codec::YuvColorTransform::from_luma_coefficients(
                 0.2126, 0.0722, false,
             ),
-            transfer: hiraku_media::TransferFunction::Srgb,
+            transfer: hiraku_codec::TransferFunction::Srgb,
             pixels: DecodedPixels::I420Planar {
                 y: [vec![60; 8], vec![alpha; 8]].concat(),
                 u: vec![128; 4],

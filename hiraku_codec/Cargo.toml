@@ -1,6 +1,6 @@
 [package]
-name = "hiraku-media"
-description = "Hiraku media processing library"
+name = "hiraku-codec"
+description = "Platform-independent WebCodecs-style codec interfaces and adapters"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

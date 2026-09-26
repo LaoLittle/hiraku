@@ -1,7 +1,7 @@
 //! Optional container-to-codec adapter, driven by the host's update loop.
 use crate::asset::EncodedMedia;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use hiraku_media::*;
+use hiraku_codec::*;
 
 #[derive(Debug)]
 pub(crate) enum VideoEvent {

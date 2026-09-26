@@ -9,13 +9,21 @@ use crate::{TransferFunction, VideoFrame, VideoPixels, YuvColorTransform};
 #[link(name = "VideoToolbox", kind = "framework")]
 unsafe extern "C" {
     fn VTIsHardwareDecodeSupported(codec_type: OSType) -> bool;
+    #[cfg(target_os = "macos")]
+    fn VTRegisterSupplementalVideoDecoderIfAvailable(codec_type: OSType);
 }
 
-pub(in crate::platform) fn av1_hardware_decode_supported() -> bool {
-    unsafe { VTIsHardwareDecodeSupported(K_CM_VIDEO_CODEC_TYPE_AV1) }
+pub(in crate::platform) fn hardware_decode_supported(codec_type: OSType) -> bool {
+    let supported = unsafe { VTIsHardwareDecodeSupported(codec_type) };
+    #[cfg(target_os = "macos")]
+    if supported && codec_type == u32::from_be_bytes(*b"vp09") {
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| unsafe { VTRegisterSupplementalVideoDecoderIfAvailable(codec_type) });
+    }
+    supported
 }
 
-/// Synchronous VideoToolbox AV1 decoder.
+/// Synchronous VideoToolbox video decoder.
 ///
 /// All CoreFoundation/CoreMedia/CoreVideo/VideoToolbox references are private to this module.
 /// `decode` and `finish` return owned `VideoFrame`s.
@@ -26,8 +34,8 @@ pub(in crate::platform) struct VideoToolboxDecoder {
 }
 
 impl VideoToolboxDecoder {
-    pub(in crate::platform) fn new(width: u32, height: u32, av1c: &[u8]) -> Result<Self, String> {
-        let format_description = create_av1_format_description(width, height, av1c)?;
+    pub(in crate::platform) fn new(width: u32, height: u32, codec_type: OSType, atom: &str, description: &[u8]) -> Result<Self, String> {
+        let format_description = create_format_description(width, height, codec_type, atom, description)?;
         let mut callback_context = Box::new(CallbackContext::default());
         let callback_ref_con = (&mut *callback_context as *mut CallbackContext).cast();
 
@@ -47,7 +55,7 @@ impl VideoToolboxDecoder {
         })
     }
 
-    /// Submit one compressed AV1 sample.
+    /// Submit one compressed video sample.
     ///
     /// A vector is returned rather than a single frame because VideoToolbox is allowed to emit more
     /// than one output callback while processing a sample. With the current synchronous/low-latency
@@ -501,7 +509,7 @@ fn create_decoder(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "VideoToolbox hardware AV1 decoder exposes no Hiraku-compatible output format; performance list: [{listed}]"
+            "VideoToolbox hardware video decoder exposes no Hiraku-compatible output format; performance list: [{listed}]"
         ));
     }
 
@@ -523,7 +531,7 @@ fn create_decoder(
     }
 
     Err(format!(
-        "failed to create VideoToolbox hardware AV1 decoder with NV12 or I420 output: {}",
+        "failed to create VideoToolbox hardware video decoder with NV12 or I420 output: {}",
         errors.join("; ")
     ))
 }
@@ -674,38 +682,40 @@ fn create_hardware_decoder_session(
     Ok(session)
 }
 
-fn create_av1_format_description(
+fn create_format_description(
     width: u32,
     height: u32,
-    av1c: &[u8],
+    codec_type: OSType,
+    atom: &str,
+    description: &[u8],
 ) -> Result<CMVideoFormatDescriptionRef, String> {
     // Validate before creating CF objects so conversion failures cannot leak those objects.
     let width = i32::try_from(width).map_err(|_| "video width exceeds i32".to_string())?;
     let height = i32::try_from(height).map_err(|_| "video height exceeds i32".to_string())?;
-    let av1c_data = unsafe {
+    let atom_data = unsafe {
         CFDataCreate(
             kCFAllocatorDefault,
-            av1c.as_ptr(),
-            isize::try_from(av1c.len()).map_err(|_| "av1C is too large".to_string())?,
+            description.as_ptr(),
+            isize::try_from(description.len()).map_err(|_| "codec description is too large".to_string())?,
         )
     };
-    if av1c_data.is_null() {
-        return Err("CFDataCreate(av1C) failed".into());
+    if atom_data.is_null() {
+        return Err("CFDataCreate(codec description) failed".into());
     }
 
-    let av1c_key = match cf_string("av1C") {
+    let atom_key = match cf_string(atom) {
         Ok(value) => value,
         Err(error) => {
-            unsafe { cf_release(av1c_data) };
+            unsafe { cf_release(atom_data) };
             return Err(error);
         }
     };
-    let atoms = match cf_dictionary(&[(av1c_key, av1c_data)]) {
+    let atoms = match cf_dictionary(&[(atom_key, atom_data)]) {
         Ok(value) => value,
         Err(error) => {
             unsafe {
-                cf_release(av1c_key);
-                cf_release(av1c_data);
+                cf_release(atom_key);
+                cf_release(atom_data);
             }
             return Err(error);
         }
@@ -718,8 +728,8 @@ fn create_av1_format_description(
         Err(error) => {
             unsafe {
                 cf_release(atoms);
-                cf_release(av1c_key);
-                cf_release(av1c_data);
+                cf_release(atom_key);
+                cf_release(atom_data);
             }
             return Err(error);
         }
@@ -729,7 +739,7 @@ fn create_av1_format_description(
     let status = unsafe {
         CMVideoFormatDescriptionCreate(
             kCFAllocatorDefault,
-            K_CM_VIDEO_CODEC_TYPE_AV1,
+            codec_type,
             width,
             height,
             extensions,
@@ -740,8 +750,8 @@ fn create_av1_format_description(
     unsafe {
         cf_release(extensions);
         cf_release(atoms);
-        cf_release(av1c_key);
-        cf_release(av1c_data);
+        cf_release(atom_key);
+        cf_release(atom_data);
     }
 
     check_status(status, "CMVideoFormatDescriptionCreate")?;
@@ -940,7 +950,6 @@ const K_CF_NUMBER_SINT32_TYPE: i32 = 3;
 const K_CM_TIME_FLAGS_VALID: u32 = 1;
 const K_CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
 
-const K_CM_VIDEO_CODEC_TYPE_AV1: OSType = u32::from_be_bytes(*b"av01");
 const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE: OSType = u32::from_be_bytes(*b"420v");
 const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE: OSType = u32::from_be_bytes(*b"420f");
 const K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR: OSType = u32::from_be_bytes(*b"y420");

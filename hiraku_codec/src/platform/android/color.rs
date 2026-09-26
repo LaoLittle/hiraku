@@ -9,8 +9,16 @@ pub(super) fn resolve(
     codec: &str,
 ) -> Result<(YuvColorTransform, TransferFunction), CodecError> {
     let fields: Vec<_> = codec.split('.').collect();
-    let extended = fields.len() == 10 && fields[0] == "av01";
-    let matrix = if extended { fields[8] } else { "01" };
+    let av1 = fields.len() == 10 && fields[0] == "av01";
+    let vp9 = fields.len() == 9 && fields[0] == "vp09";
+    let extended = av1 || vp9;
+    let matrix = if av1 {
+        fields[8]
+    } else if vp9 {
+        fields[7]
+    } else {
+        "01"
+    };
     let (kr, kb) = match standard.filter(|value| *value != 0) {
         Some(1) => (0.2126, 0.0722),
         Some(2 | 4) => (0.299, 0.114),
@@ -37,7 +45,13 @@ pub(super) fn resolve(
         // the CICP value 2 (unspecified), and is not an HDR transfer.
         Some(2) => TransferFunction::Srgb,
         Some(3) => TransferFunction::Bt1886,
-        None => match if extended { fields[7] } else { "01" } {
+        None => match if av1 {
+            fields[7]
+        } else if vp9 {
+            fields[6]
+        } else {
+            "01"
+        } {
             "01" | "02" | "06" | "14" | "15" => TransferFunction::Bt1886,
             "04" => TransferFunction::Gamma22,
             "05" => TransferFunction::Gamma28,
@@ -63,9 +77,9 @@ pub(super) fn resolve(
     let limited = match range.filter(|value| *value != 0) {
         Some(1) => false,
         Some(2) => true,
-        None if extended => match fields[9] {
-            "0" => true,
-            "1" => false,
+        None if extended => match if av1 { fields[9] } else { fields[8] } {
+            "0" | "00" => true,
+            "1" | "01" => false,
             value => return Err(CodecError::Unsupported(format!("AV1 range {value}"))),
         },
         None => true,

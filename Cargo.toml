@@ -11,7 +11,7 @@ members = [
     "hiraku_errors", 
     "hiraku_video", 
     "hiraku_storage", 
-    "hiraku_media",
+    "hiraku_codec",
     "hiraku",
     "hiraku_sprite3d",
     "hiraku_ui",
@@ -48,8 +48,8 @@ version = "0.1.0"
 path = "hiraku_hdp"
 version = "0.1.0"
 
-[workspace.dependencies.hiraku-media]
-path = "hiraku_media"
+[workspace.dependencies.hiraku-codec]
+path = "hiraku_codec"
 version = "0.1.0"
 
 [workspace.dependencies.hiraku-script]

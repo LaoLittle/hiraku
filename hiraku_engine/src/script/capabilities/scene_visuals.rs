@@ -11,6 +11,20 @@ use crate::scene::pictures::PictureCommand;
 mod builders;
 pub(super) use builders::*;
 
+hiraku_script::hks_define! {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PictureTransition {
+    Tween,
+    Crossfade,
+}
+impl PictureTransition {
+    #[getter]
+    fn tween() -> PictureTransition { Self::Tween }
+    #[getter]
+    fn crossfade() -> PictureTransition { Self::Crossfade }
+}
+}
+
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "SceneClip", handle_type = 5)]
 pub(super) struct SceneClipHandle(u64);
@@ -476,18 +490,19 @@ mod api {
         Ok(handle)
     }
 
-    pub(super) fn picture_replace(
+    pub(super) fn picture_transition(
         context: &mut CharacterContext,
         handle: SceneTransitionHandle,
+        transition: PictureTransition,
     ) -> Result<SceneTransitionHandle, NativeError> {
         let Some((SceneVisualTarget::Picture(PictureCommand::Show { replace, .. }), _)) =
             context.scene_visuals.pending.get_mut(&handle.0)
         else {
             return Err(NativeError::message(
-                "replace requires an uncommitted picture",
+                "transition requires an uncommitted picture",
             ));
         };
-        *replace = true;
+        *replace = transition == PictureTransition::Crossfade;
         Ok(handle)
     }
 
@@ -2584,13 +2599,16 @@ mod tests {
     }
 
     #[test]
-    fn picture_replace_marks_a_same_asset_crossfade_without_pose_interpolation() {
-        let mut runtime =
-            runtime("scene.picture(\"room\", \"alice/background\").replace().fade(500)");
-        assert!(matches!(event(&mut runtime),
+    fn picture_transition_selects_crossfade_or_tween_independently_of_duration() {
+        for (mode, expected) in [("crossfade", true), ("tween", false)] {
+            let mut runtime = runtime(&format!(
+                "scene.picture(\"room\", \"alice/background\").time(0.5).transition(.crossfade).transition(.{mode})"
+            ));
+            assert!(matches!(event(&mut runtime),
             StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
-                replace: true, seconds, ..
-            })) if (seconds - 0.5).abs() < 0.001));
+                replace, seconds, ..
+            })) if replace == expected && (seconds - 0.5).abs() < 0.001));
+        }
     }
 
     #[test]

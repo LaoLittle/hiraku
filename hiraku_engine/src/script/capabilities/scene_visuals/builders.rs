@@ -47,7 +47,7 @@ builder! {
     frame["frame"](x: f64, y: f64, scale: f64, rotation: f64, layer: f64)
         -> PictureShowHandle => frame;
     layer["layer"](value: f64) -> PictureShowHandle => picture_layer;
-    replace["replace"]() -> PictureShowHandle => picture_replace;
+    transition["transition"](mode: PictureTransition) -> PictureShowHandle => picture_transition;
     dissolve["dissolve"](texture: String, softness: Option<f64>)
         -> PictureShowHandle => picture_dissolve;
     blur["blur"](radius: f64) -> PictureShowHandle => picture_blur;
@@ -144,6 +144,7 @@ builder! {
 pub(super) fn register(
     registry: &mut NativeRegistry<CharacterContext>,
 ) -> Result<(), RegistrationError> {
+    PictureTransition::register_hks(registry)?;
     picture_show::register_hks(registry)?;
     picture_transform::register_hks(registry)?;
     picture_hide::register_hks(registry)?;

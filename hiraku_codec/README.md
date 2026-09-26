@@ -1,4 +1,4 @@
-# Hiraku Media
+# Hiraku Codec
 
 A Rust codec API following Web Codecs standard [WebCodecs working draft (27 August 2026)](https://www.w3.org/TR/2026/WD-webcodecs-20260827/).
 
@@ -29,7 +29,7 @@ and PCM use reference-counted storage. Callers own returned frames and release
 them through ordinary Rust ownership.
 
 ```rust
-use hiraku_media::{AudioDecoder, AudioDecoderConfig, DecoderEvent};
+use hiraku_codec::{AudioDecoder, AudioDecoderConfig, DecoderEvent};
 
 let mut decoder = AudioDecoder::new()?;
 decoder.configure(AudioDecoderConfig::new("opus", 48_000, 2))?;
@@ -49,8 +49,17 @@ while let Some(event) = decoder.poll() {
 
 This is a Rust adaptation of the decoder processing model, not an implementation
 of the entire W3C surface. Polling replaces JavaScript callbacks/promises, reset
-discards outstanding flush tokens, and `Drop` handles resource release. Encoders,
-image decoders and GPU-native frame handles are not implemented yet.
+discards outstanding flush tokens, and `Drop` handles resource release. Image
+decoders and GPU-native frame handles are not implemented yet.
+
+## Encoder contracts
+
+`VideoEncoder` / `AudioEncoder` provide configuration, support queries, `encode`,
+`encode_queue_size`, `poll`, `flush`, `reset` and `close`. Output events carry
+encoded chunks and decoder-configuration metadata. Video options include key
+frames, bitrate mode, latency mode and alpha preservation. No encoder adapter is
+implemented yet: support queries return false and configure returns Unsupported.
+This is an interface, not a promise that a platform's encoder is wired up.
 
 ## Backend support
 
@@ -60,8 +69,10 @@ be added in backend dispatch without changing the API.
 | Backend | Current support |
 | --- | --- |
 | Software | AV1 profile 0, 8-bit 4:2:0 via rav1d; mono/stereo Opus via hiraku-opus |
-| macOS | AV1 VideoToolbox with software fallback |
-| Windows | AV1 Media Foundation with software fallback |
+| macOS / iOS | AV1 and VP9 VideoToolbox, subject to device capability |
+| Windows | AV1, VP8 and VP9 hardware Media Foundation transforms |
+| Android | AV1, VP8 and VP9 MediaCodec byte-buffer output |
+| Linux | AV1 and VP9 VA-API through cros-codecs |
 | Web | Configuration and chunks forwarded to browser WebCodecs; support depends on the browser |
 
 Native work runs on dedicated workers with bounded output queues and cancellable
@@ -71,8 +82,21 @@ Raw-frame copy conversion currently supports SDR I420/NV12 or RGBA; HDR tone
 mapping and higher-bit-depth output are not implemented.
 
 The default `hardware` feature enables native platform backends.
-`PreferHardware` and `PreferSoftware` are hints. Disable default features to use
-native software decoding directly.
+Native default selection tries platform hardware, then the AV1 software adapter,
+then returns an error including both failures. PreferSoftware reverses that order.
+No codec is rejected just because the software adapter does not implement it.
+Support queries use the same adapter creation/negotiation as configure; native
+queries can allocate a temporary hardware session. No fallback occurs after input
+has been consumed. Use `--no-default-features --features software` for software only.
+With no features, codec creation reports unsupported instead of failing to compile.
+
+Native VP9 currently accepts profile 0, 8-bit 4:2:0 SDR registry strings, with no
+description (as required by the WebCodecs VP9 registration). Other profiles are
+rejected. Platform support also depends on CPU-readable I420/NV12 output.
+Web forwards open codec strings and acceleration preferences to WebCodecs; the
+browser does not expose the adapter identity or guarantee hardware execution.
+Android NDK codec selection rejects known Android/Google software implementations;
+vendor codec hardware classification is not exposed by the supported NDK API level.
 
 Windows uses synchronous/asynchronous MFTs with CPU-readable NV12 output.
 D3D-only transforms needing a device manager and GPU surface sharing are not

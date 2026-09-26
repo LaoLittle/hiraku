@@ -1,5 +1,5 @@
 use crate::VideoPlaybackId;
-use hiraku_media::{VideoFrame, VideoPixels};
+use hiraku_codec::{VideoFrame, VideoPixels};
 use std::{collections::BTreeMap, sync::Arc};
 
 use bevy::{
@@ -177,10 +177,10 @@ mod tests {
             height: 2,
             chroma_width: 1,
             chroma_height: 1,
-            color_transform: hiraku_media::YuvColorTransform::from_luma_coefficients(
+            color_transform: hiraku_codec::YuvColorTransform::from_luma_coefficients(
                 0.2126, 0.0722, false,
             ),
-            transfer: hiraku_media::TransferFunction::Srgb,
+            transfer: hiraku_codec::TransferFunction::Srgb,
             pixels: VideoPixels::I420Strided {
                 planes: Arc::from([0u8; 6]),
                 u_offset: 4,

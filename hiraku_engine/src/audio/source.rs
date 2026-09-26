@@ -5,7 +5,7 @@ use bevy::{
     audio::{Decodable, Source},
     prelude::{Asset, TypePath},
 };
-use hiraku_media::{AudioDecoderConfig, AudioPacketDecoder};
+use hiraku_codec::{AudioDecoderConfig, AudioPacketDecoder};
 use std::{
     io::{self, Cursor},
     sync::Arc,

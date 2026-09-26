@@ -200,7 +200,7 @@ mod tests {
                 row_b: Vec4::Z,
                 luma: Vec2::ONE,
             },
-            transfer: hiraku_media::TransferFunction::Srgb,
+            transfer: hiraku_codec::TransferFunction::Srgb,
             format: YuvPixelFormat::I420,
             alpha_layout: None,
             rgba: false,

@@ -1,4 +1,9 @@
+#[cfg(feature = "software")]
 mod audio_packet;
+#[cfg(not(feature = "software"))]
+#[path = "audio_packet_disabled.rs"]
+mod audio_packet;
+pub(crate) mod encoder;
 pub(crate) use audio_packet::AudioPacketDecoder;
 // Pure metadata policy is testable without an Android NDK or decoder device.
 #[cfg(test)]
@@ -11,6 +16,12 @@ cfg_select! {
         pub(crate) use wasm::{VideoDecoder, AudioDecoder, video_config_supported, audio_config_supported};
     },
     _ => {
+        #[cfg(any(test, feature = "video-toolbox", feature = "media-foundation", feature = "media-codec", feature = "vaapi"))]
+        mod vp9;
+        #[cfg(feature = "software")]
+        mod software;
+        #[cfg(not(feature = "software"))]
+        #[path = "software_disabled.rs"]
         mod software;
         mod native;
         cfg_select! {

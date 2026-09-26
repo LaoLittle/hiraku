@@ -2,8 +2,8 @@
 //! worker thread after copying; neither JNI nor a rendering surface is needed.
 use super::frame::{Plane, planar_frame};
 mod color;
-pub(super) use MediaCodecDecoder as VideoDecoder;
 use crate::*;
+pub(super) use MediaCodecDecoder as VideoDecoder;
 use ndk::media::{
     media_codec::{
         DequeuedInputBufferResult as Input, DequeuedOutputBufferInfoResult as Output, MediaCodec,
@@ -40,10 +40,29 @@ impl Drop for MediaCodecDecoder {
 }
 impl MediaCodecDecoder {
     pub fn new(config: &VideoDecoderConfig) -> Result<Self, CodecError> {
-        let codec = MediaCodec::from_decoder_type("video/av01")
-            .ok_or_else(|| error("no AV1 MediaCodec decoder"))?;
+        let mime = match config.codec.0.split('.').next() {
+            Some("av01") => "video/av01",
+            Some("vp09") => {
+                super::vp9::configuration(config)?;
+                "video/x-vnd.on2.vp9"
+            }
+            Some("vp8") if config.codec.0 == "vp8" && config.description.is_none() => {
+                "video/x-vnd.on2.vp8"
+            }
+            _ => return Err(CodecError::Unsupported(config.codec.0.clone())),
+        };
+        let codec = MediaCodec::from_decoder_type(mime)
+            .ok_or_else(|| error(format!("no MediaCodec decoder for {mime}")))?;
+        // Do not silently introduce Android's VP8/VP9 software decoders into
+        // the hardware adapter. Hiraku's software adapter remains AV1-only.
+        let name = codec.name().map_err(error)?;
+        if name.starts_with("c2.android.") || name.starts_with("OMX.google.") {
+            return Err(CodecError::Unsupported(format!(
+                "{name} is a software decoder"
+            )));
+        }
         let mut format = MediaFormat::new();
-        format.set_str("mime", "video/av01");
+        format.set_str("mime", mime);
         format.set_i32("width", i32::try_from(config.coded_width).map_err(error)?);
         format.set_i32("height", i32::try_from(config.coded_height).map_err(error)?);
         // Explicit linear I420. Never reinterpret flexible/tiled vendor formats.

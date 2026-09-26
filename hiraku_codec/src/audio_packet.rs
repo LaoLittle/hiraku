@@ -22,7 +22,7 @@ impl AudioPacketDecoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "software"))]
 mod tests {
     use super::*;
     #[test]

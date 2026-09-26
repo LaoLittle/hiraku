@@ -2,7 +2,7 @@
 //!
 //! Hiraku intentionally supports one deterministic media profile: an AV1 video
 //! track and an optional Opus audio track inside a Matroska (`.mkv`) or WebM (`.webm`)
-//! container. Decoding lives in hiraku-media; this crate owns Bevy playback and presentation;
+//! container. Decoding lives in hiraku-codec; this crate owns Bevy playback and presentation;
 //! story semantics belong to the embedding engine.
 
 mod asset;

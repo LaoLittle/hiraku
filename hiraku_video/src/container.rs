@@ -9,7 +9,7 @@ use symphonia::core::{
 use thiserror::Error;
 
 use crate::asset::VideoMetadata as MediaMetadata;
-use hiraku_media::{
+use hiraku_codec::{
     AudioDecoderConfig, ChunkType, EncodedAudioChunk, EncodedChunk, EncodedVideoChunk,
     VideoDecoderConfig,
 };

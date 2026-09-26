@@ -6,9 +6,24 @@ pub(super) struct VideoDecoder(media_foundation::MediaFoundationDecoder);
 
 impl VideoDecoder {
     pub fn new(config: &VideoDecoderConfig) -> Result<Self, CodecError> {
-        media_foundation::MediaFoundationDecoder::new(config.coded_width, config.coded_height)
-            .map(Self)
-            .map_err(CodecError::Operation)
+        let subtype = match config.codec.0.split('.').next() {
+            Some("av01") => windows::Win32::Media::MediaFoundation::MFVideoFormat_AV1,
+            Some("vp09") => {
+                super::vp9::configuration(config)?;
+                windows::Win32::Media::MediaFoundation::MFVideoFormat_VP90
+            }
+            Some("vp8") if config.codec.0 == "vp8" && config.description.is_none() => {
+                windows::Win32::Media::MediaFoundation::MFVideoFormat_VP80
+            }
+            _ => return Err(CodecError::Unsupported(config.codec.0.clone())),
+        };
+        media_foundation::MediaFoundationDecoder::new(
+            config.coded_width,
+            config.coded_height,
+            subtype,
+        )
+        .map(Self)
+        .map_err(CodecError::Operation)
     }
     pub fn decode(
         &mut self,

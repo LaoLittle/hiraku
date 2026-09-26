@@ -8,7 +8,7 @@ use bevy::{
     shader::{ShaderDefVal, ShaderRef},
     ui_render::prelude::UiMaterialKey,
 };
-use hiraku_media::{TransferFunction, YuvPixelFormat};
+use hiraku_codec::{TransferFunction, YuvPixelFormat};
 
 use crate::color::YuvColorTransform;
 

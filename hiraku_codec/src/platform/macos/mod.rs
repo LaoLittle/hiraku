@@ -6,18 +6,23 @@ pub(super) struct VideoDecoder(video_toolbox::VideoToolboxDecoder);
 
 impl VideoDecoder {
     pub fn new(config: &VideoDecoderConfig) -> Result<Self, CodecError> {
-        if !video_toolbox::av1_hardware_decode_supported() {
+        let (codec_type, atom, description) = match config.codec.0.split('.').next() {
+            Some("av01") => (u32::from_be_bytes(*b"av01"), "av1C", config.description.as_deref()
+                .ok_or_else(|| CodecError::Unsupported("VideoToolbox requires an AV1 codec description".into()))?.to_vec()),
+            Some("vp09") => (u32::from_be_bytes(*b"vp09"), "vpcC", super::vp9::configuration(config)?.to_vec()),
+            _ => return Err(CodecError::Unsupported(config.codec.0.clone())),
+        };
+        if !video_toolbox::hardware_decode_supported(codec_type) {
             return Err(CodecError::Unsupported(
-                "hardware AV1 decoding is unavailable".into(),
+                format!("hardware decoding is unavailable for {}", config.codec.0),
             ));
         }
-        let description = config.description.as_ref().ok_or_else(|| {
-            CodecError::Unsupported("VideoToolbox requires a codec description".into())
-        })?;
         video_toolbox::VideoToolboxDecoder::new(
             config.coded_width,
             config.coded_height,
-            description,
+            codec_type,
+            atom,
+            &description,
         )
         .map(Self)
         .map_err(CodecError::Operation)

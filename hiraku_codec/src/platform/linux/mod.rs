@@ -1,10 +1,10 @@
 //! Direct VA-API AV1 decode, confined to the existing codec worker.
 mod stream;
-pub(super) use VaapiDecoder as VideoDecoder;
 use super::frame::{Plane, planar_frame};
 use crate::{
     CodecError, EncodedChunk, TransferFunction, VideoDecoderConfig, VideoFrame, YuvColorTransform,
 };
+pub(super) use VaapiDecoder as VideoDecoder;
 use cros_codecs::{
     DecodedFormat, Fourcc,
     codec::av1::parser::{BitDepth, ColorConfig, ObuAction, ObuType, ParsedObu, Parser},
@@ -12,7 +12,7 @@ use cros_codecs::{
         BlockingMode, DecodedHandle, DecoderEvent, StreamInfo,
         stateless::{
             DecodeError, DynStatelessVideoDecoder, StatelessDecoder, StatelessVideoDecoder,
-            av1::Av1,
+            av1::Av1, vp9::Vp9,
         },
     },
     video_frame::{
@@ -39,6 +39,7 @@ pub(super) struct VaapiDecoder {
     configuration: Vec<u8>,
     color: Option<(YuvColorTransform, TransferFunction)>,
     pending_color: Option<(YuvColorTransform, TransferFunction)>,
+    vp9: bool,
 }
 fn error(value: impl std::fmt::Display) -> CodecError {
     CodecError::Operation(format!("VA-API: {value}"))
@@ -53,7 +54,19 @@ fn cancelled(flag: &AtomicBool) -> Result<(), CodecError> {
 
 impl VaapiDecoder {
     pub fn new(config: &VideoDecoderConfig) -> Result<Self, CodecError> {
-        let configuration = stream::configuration_obus(config.description.as_deref())?;
+        let configuration = match config.codec.0.split('.').next() {
+            Some("av01") => stream::configuration_obus(config.description.as_deref())?,
+            Some("vp09") => {
+                super::vp9::configuration(config)?;
+                Vec::new()
+            }
+            _ => {
+                return Err(CodecError::Unsupported(format!(
+                    "VA-API adapter: {}",
+                    config.codec.0
+                )));
+            }
+        };
         let mut paths = std::fs::read_dir("/dev/dri")
             .map_err(error)?
             .filter_map(Result::ok)
@@ -83,7 +96,12 @@ impl VaapiDecoder {
         config: &VideoDecoderConfig,
     ) -> Result<Self, CodecError> {
         let display = cros_libva::Display::open_drm_display(path).map_err(error)?;
-        let profile = cros_libva::VAProfile::VAProfileAV1Profile0;
+        let vp9 = config.codec.0.starts_with("vp09.");
+        let profile = if vp9 {
+            cros_libva::VAProfile::VAProfileVP9Profile0
+        } else {
+            cros_libva::VAProfile::VAProfileAV1Profile0
+        };
         if !display
             .query_config_profiles()
             .map_err(error)?
@@ -113,17 +131,45 @@ impl VaapiDecoder {
             )
             .map_err(error)?;
         let _surface = probe.to_native_handle(&display).map_err(error)?;
-        let decoder = StatelessDecoder::<Av1, _>::new_vaapi(display, BlockingMode::Blocking)
-            .map_err(error)?
-            .into_trait_object();
+        let decoder = if vp9 {
+            StatelessDecoder::<Vp9, _>::new_vaapi(display, BlockingMode::Blocking)
+                .map_err(error)?
+                .into_trait_object()
+        } else {
+            StatelessDecoder::<Av1, _>::new_vaapi(display, BlockingMode::Blocking)
+                .map_err(error)?
+                .into_trait_object()
+        };
+        let vp9_color = if vp9 {
+            let record = super::vp9::configuration(config)?;
+            let (kr, kb) = match record[9] {
+                5 | 6 => (0.299, 0.114),
+                9 => (0.2627, 0.0593),
+                _ => (0.2126, 0.0722),
+            };
+            let transfer = match record[8] {
+                4 => TransferFunction::Gamma22,
+                5 => TransferFunction::Gamma28,
+                8 => TransferFunction::Linear,
+                13 => TransferFunction::Srgb,
+                _ => TransferFunction::Bt1886,
+            };
+            Some((
+                YuvColorTransform::from_luma_coefficients(kr, kb, record[6] & 1 == 0),
+                transfer,
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             decoder,
             device,
             pool: None,
             parser: Parser::default(),
             configuration,
-            color: None,
+            color: vp9_color,
             pending_color: None,
+            vp9,
         })
     }
     pub fn decode(
@@ -148,26 +194,32 @@ impl VaapiDecoder {
     ) -> Result<(), CodecError> {
         while !input.is_empty() {
             cancelled(cancel)?;
-            let count = match self.parser.read_obu(input).map_err(error)? {
-                ObuAction::Drop(count) => count as usize,
-                ObuAction::Process(obu) => {
-                    let count = obu.bytes_used;
-                    if obu.header.obu_type == ObuType::SequenceHeader {
-                        self.events(cancel, frames)?;
-                        if let ParsedObu::SequenceHeader(sequence) =
-                            self.parser.parse_obu(obu).map_err(error)?
-                        {
-                            if sequence.bit_depth != BitDepth::Depth8
-                                || sequence.color_config.mono_chrome
-                                || !sequence.color_config.subsampling_x
-                                || !sequence.color_config.subsampling_y
+            // VP9 chunks already contain complete frames/superframes; its
+            // stateless decoder parses the headers instead of the AV1 parser.
+            let count = if self.vp9 {
+                input.len()
+            } else {
+                match self.parser.read_obu(input).map_err(error)? {
+                    ObuAction::Drop(count) => count as usize,
+                    ObuAction::Process(obu) => {
+                        let count = obu.bytes_used;
+                        if obu.header.obu_type == ObuType::SequenceHeader {
+                            self.events(cancel, frames)?;
+                            if let ParsedObu::SequenceHeader(sequence) =
+                                self.parser.parse_obu(obu).map_err(error)?
                             {
-                                return Err(error("only AV1 8-bit 4:2:0 output is supported"));
+                                if sequence.bit_depth != BitDepth::Depth8
+                                    || sequence.color_config.mono_chrome
+                                    || !sequence.color_config.subsampling_x
+                                    || !sequence.color_config.subsampling_y
+                                {
+                                    return Err(error("only AV1 8-bit 4:2:0 output is supported"));
+                                }
+                                self.pending_color = Some(color(&sequence.color_config)?);
                             }
-                            self.pending_color = Some(color(&sequence.color_config)?);
                         }
+                        count
                     }
-                    count
                 }
             };
             let rest = stream::consumed(input, count)?;

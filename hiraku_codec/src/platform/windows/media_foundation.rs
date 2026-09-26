@@ -1,4 +1,4 @@
-//! AV1 MFT adapter. COM objects never leave the decoder worker thread.
+//! video MFT adapter. COM objects never leave the decoder worker thread.
 use std::{
     mem::ManuallyDrop,
     ptr,
@@ -15,7 +15,7 @@ use windows::{
         Media::MediaFoundation::*,
         System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
     },
-    core::{Error, Interface, Result},
+    core::{Error, GUID, Interface, Result},
 };
 
 use crate::{TransferFunction, VideoFrame, VideoPixels, YuvColorTransform};
@@ -58,10 +58,10 @@ struct Activations {
 }
 
 impl Activations {
-    fn enumerate(flags: MFT_ENUM_FLAG) -> Result<Self> {
+    fn enumerate(flags: MFT_ENUM_FLAG, subtype: GUID) -> Result<Self> {
         let input = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_AV1,
+            guidSubtype: subtype,
         };
         let mut result = Self {
             pointer: ptr::null_mut(),
@@ -129,21 +129,22 @@ impl Drop for Transform {
 }
 
 impl MediaFoundationDecoder {
-    pub(in crate::platform) fn new(width: u32, height: u32) -> std::result::Result<Self, String> {
+    pub(in crate::platform) fn new(
+        width: u32,
+        height: u32,
+        subtype: GUID,
+    ) -> std::result::Result<Self, String> {
         let runtime =
             Runtime::new().map_err(|e| format!("Media Foundation startup failed: {e}"))?;
-        let mut last_error = String::from("no installed AV1 MFT");
-        // Prefer hardware MFTs accepting system-memory samples, then installed
-        // synchronous/asynchronous decoders. GPU-surface-only MFTs are rejected
+        let mut last_error = String::from("no installed video MFT");
+        // Only enumerate hardware MFTs accepting system-memory samples.
+        // GPU-surface-only MFTs are rejected
         // during negotiation; the caller can then use rav1d.
-        for flags in [
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-        ] {
-            let candidates = Activations::enumerate(flags)
-                .map_err(|e| format!("AV1 MFT enumeration failed: {e}"))?;
+        for flags in [MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER] {
+            let candidates = Activations::enumerate(flags, subtype)
+                .map_err(|e| format!("video MFT enumeration failed: {e}"))?;
             for activation in candidates.entries().iter().flatten() {
-                match Transform::new(activation, width, height) {
+                match Transform::new(activation, width, height, subtype) {
                     Ok(core) => {
                         return Ok(Self {
                             core,
@@ -160,7 +161,7 @@ impl MediaFoundationDecoder {
             }
         }
         Err(format!(
-            "no usable Media Foundation AV1 decoder: {last_error}"
+            "no usable Media Foundation video decoder: {last_error}"
         ))
     }
 
@@ -177,7 +178,7 @@ impl MediaFoundationDecoder {
         let duration = ticks(duration, numer, denom)?;
         self.core
             .submit(packet, pts, duration, cancellation)
-            .map_err(|e| format!("Media Foundation AV1 decode failed: {e}"))
+            .map_err(|e| format!("Media Foundation video decode failed: {e}"))
     }
 
     pub(in crate::platform) fn finish(
@@ -191,7 +192,7 @@ impl MediaFoundationDecoder {
 }
 
 impl Transform {
-    fn new(activation: &IMFActivate, width: u32, height: u32) -> Result<Self> {
+    fn new(activation: &IMFActivate, width: u32, height: u32, subtype: GUID) -> Result<Self> {
         unsafe {
             let transform: IMFTransform = activation.ActivateObject()?;
             let events = if let Ok(attributes) = transform.GetAttributes() {
@@ -208,7 +209,9 @@ impl Transform {
             let mut outputs = 0;
             transform.GetStreamCount(&mut inputs, &mut outputs)?;
             if inputs != 1 || outputs != 1 {
-                return Err(failure("AV1 decoder must expose one input and one output"));
+                return Err(failure(
+                    "video decoder must expose one input and one output",
+                ));
             }
             let mut input = [0];
             let mut output = [0];
@@ -219,7 +222,7 @@ impl Transform {
             }
             let media_type = MFCreateMediaType()?;
             media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_AV1)?;
+            media_type.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
             media_type.SetUINT64(
                 &MF_MT_FRAME_SIZE,
                 (u64::from(width) << 32) | u64::from(height),
@@ -277,7 +280,7 @@ impl Transform {
                 }
             }
         }
-        Err(failure("AV1 MFT has no supported 8-bit NV12 output"))
+        Err(failure("video MFT has no supported 8-bit NV12 output"))
     }
 
     fn submit(
@@ -291,7 +294,7 @@ impl Transform {
         let sample = unsafe {
             let sample = MFCreateSample()?;
             let len =
-                u32::try_from(packet.len()).map_err(|_| failure("AV1 packet is too large"))?;
+                u32::try_from(packet.len()).map_err(|_| failure("video packet is too large"))?;
             let buffer = MFCreateMemoryBuffer(len)?;
             let mut pointer = ptr::null_mut();
             buffer.Lock(&mut pointer, None, None)?;
@@ -342,7 +345,8 @@ impl Transform {
         self.drained = false;
         self.input_requests = 0;
         unsafe {
-            self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
         Ok(frames)
     }
@@ -363,7 +367,7 @@ impl Transform {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(failure("AV1 MFT event wait timed out"));
+                return Err(failure("video MFT event wait timed out"));
             }
             // Only the dedicated decoder worker sleeps, never an ECS system.
             std::thread::sleep(Duration::from_millis(2));
@@ -454,7 +458,7 @@ impl Transform {
             }
         }
         Err(failure(
-            "AV1 MFT repeatedly changed output format without producing a frame",
+            "video MFT repeatedly changed output format without producing a frame",
         ))
     }
 
@@ -501,7 +505,7 @@ fn copy_nv12(
             .checked_add(uv_offset / 2)
             .ok_or_else(|| failure("NV12 buffer size overflow"))?;
         if planes.len() < expected {
-            return Err(failure("AV1 MFT returned a truncated NV12 buffer"));
+            return Err(failure("video MFT returned a truncated NV12 buffer"));
         }
         let matrix = media_type.GetUINT32(&MF_MT_YUV_MATRIX).unwrap_or(1);
         let (kr, kb) = match matrix {
@@ -518,7 +522,7 @@ fn copy_nv12(
             8 => TransferFunction::Gamma28,
             _ => {
                 return Err(failure(
-                    "unsupported AV1 transfer function: HDR/log tone mapping is not implemented",
+                    "unsupported video transfer function: HDR/log tone mapping is not implemented",
                 ));
             }
         };
@@ -547,10 +551,10 @@ fn copy_nv12(
 
 fn ticks(value: i64, numer: u32, denom: u32) -> std::result::Result<i64, String> {
     if denom == 0 {
-        return Err("AV1 time base denominator is zero".into());
+        return Err("video time base denominator is zero".into());
     }
     i64::try_from(i128::from(value) * i128::from(numer) * 10_000_000 / i128::from(denom))
-        .map_err(|_| "AV1 timestamp exceeds Media Foundation's 100 ns clock range".into())
+        .map_err(|_| "video timestamp exceeds Media Foundation's 100 ns clock range".into())
 }
 
 fn failure(message: &str) -> Error {

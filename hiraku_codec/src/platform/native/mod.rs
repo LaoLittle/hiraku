@@ -1,19 +1,27 @@
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use crate::*;
 use super::software;
+use crate::*;
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "software"))]
 mod tests;
 
 trait Processor<F> {
-    fn decode(&mut self, chunk: EncodedChunk, cancelled: &AtomicBool) -> Result<Vec<F>, CodecError>;
+    fn decode(&mut self, chunk: EncodedChunk, cancelled: &AtomicBool)
+    -> Result<Vec<F>, CodecError>;
     fn flush(&mut self, cancelled: &AtomicBool) -> Result<Vec<F>, CodecError>;
 }
 trait Configuration<F>: Clone + Send + 'static {
     fn open(self) -> Result<Box<dyn Processor<F>>, CodecError>;
 }
-enum Command<C> { Configure(C), Decode(EncodedChunk), Flush(FlushId) }
+enum Command<C> {
+    Configure(C),
+    Decode(EncodedChunk),
+    Flush(FlushId),
+}
 
 struct Worker<C, F> {
     commands: Sender<Command<C>>,
@@ -73,24 +81,44 @@ impl<C: Configuration<F>, F: Send + 'static> Worker<C, F> {
                 if let Err(error) = result { let _ = send(DecoderEvent::Error(error)); break; }
             }
         }).map_err(|e| CodecError::Operation(format!("failed to spawn codec worker: {e}")))?;
-        Ok(Self { commands, events, cancel, cancelled, queued })
+        Ok(Self {
+            commands,
+            events,
+            cancel,
+            cancelled,
+            queued,
+        })
     }
     fn send(&self, command: Command<C>) -> Result<(), CodecError> {
-        self.commands.send(command).map_err(|_| CodecError::InvalidState("codec worker has exited"))
+        self.commands
+            .send(command)
+            .map_err(|_| CodecError::InvalidState("codec worker has exited"))
     }
 }
 
 macro_rules! decoder {
     ($name:ident, $config:ty, $frame:ty) => {
-        pub(crate) struct $name { worker: Option<Worker<$config, $frame>> }
+        pub(crate) struct $name {
+            worker: Option<Worker<$config, $frame>>,
+        }
         impl $name {
-            pub fn new() -> Result<Self, CodecError> { Ok(Self { worker: None }) }
+            pub fn new() -> Result<Self, CodecError> {
+                Ok(Self { worker: None })
+            }
             pub fn configure(&mut self, config: $config) -> Result<(), CodecError> {
-                if self.worker.is_none() { self.worker = Some(Worker::new()?); }
-                self.worker.as_ref().expect("worker was initialized").send(Command::Configure(config))
+                if self.worker.is_none() {
+                    self.worker = Some(Worker::new()?);
+                }
+                self.worker
+                    .as_ref()
+                    .expect("worker was initialized")
+                    .send(Command::Configure(config))
             }
             pub fn decode(&mut self, chunk: EncodedChunk) -> Result<(), CodecError> {
-                let worker = self.worker.as_ref().ok_or(CodecError::InvalidState("worker is absent"))?;
+                let worker = self
+                    .worker
+                    .as_ref()
+                    .ok_or(CodecError::InvalidState("worker is absent"))?;
                 worker.queued.fetch_add(1, Ordering::AcqRel);
                 if let Err(error) = worker.send(Command::Decode(chunk)) {
                     worker.queued.fetch_sub(1, Ordering::AcqRel);
@@ -99,16 +127,25 @@ macro_rules! decoder {
                 Ok(())
             }
             pub fn flush(&mut self, id: FlushId) -> Result<(), CodecError> {
-                self.worker.as_ref().ok_or(CodecError::InvalidState("worker is absent"))?.send(Command::Flush(id))
+                self.worker
+                    .as_ref()
+                    .ok_or(CodecError::InvalidState("worker is absent"))?
+                    .send(Command::Flush(id))
             }
             pub fn poll(&mut self) -> Option<DecoderEvent<$frame>> {
                 self.worker.as_ref()?.events.try_recv().ok()
             }
             pub fn decode_queue_size(&self) -> usize {
-                self.worker.as_ref().map_or(0, |w| w.queued.load(Ordering::Acquire))
+                self.worker
+                    .as_ref()
+                    .map_or(0, |w| w.queued.load(Ordering::Acquire))
             }
-            pub fn pending_output(&self) -> usize { self.worker.as_ref().map_or(0, |w| w.events.len()) }
-            pub fn close(&mut self) { self.worker = None; }
+            pub fn pending_output(&self) -> usize {
+                self.worker.as_ref().map_or(0, |w| w.events.len())
+            }
+            pub fn close(&mut self) {
+                self.worker = None;
+            }
         }
     };
 }
@@ -122,17 +159,20 @@ enum VideoCodec {
 
 impl Configuration<VideoFrame> for VideoDecoderConfig {
     fn open(self) -> Result<Box<dyn Processor<VideoFrame>>, CodecError> {
-        if !software::supports_video(&self) { return Err(CodecError::Unsupported(self.codec.0.clone())); }
-        if self.hardware_acceleration != HardwareAcceleration::PreferSoftware
-            && let Ok(decoder) = super::imp::VideoDecoder::new(&self)
-        {
-            return Ok(Box::new(VideoCodec::Platform(decoder)));
-        }
-        Ok(Box::new(VideoCodec::Software(software::Video::new(&self)?)))
+        select_video(
+            &self,
+            || super::imp::VideoDecoder::new(&self).map(VideoCodec::Platform),
+            || software::Video::new(&self).map(VideoCodec::Software),
+        )
+        .map(|decoder| Box::new(decoder) as Box<dyn Processor<VideoFrame>>)
     }
 }
 impl Processor<VideoFrame> for VideoCodec {
-    fn decode(&mut self, chunk: EncodedChunk, cancelled: &AtomicBool) -> Result<Vec<VideoFrame>, CodecError> {
+    fn decode(
+        &mut self,
+        chunk: EncodedChunk,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<VideoFrame>, CodecError> {
         match self {
             Self::Software(codec) => codec.decode(chunk),
             Self::Platform(codec) => codec.decode(chunk, cancelled),
@@ -146,15 +186,55 @@ impl Processor<VideoFrame> for VideoCodec {
     }
 }
 impl Configuration<AudioData> for AudioDecoderConfig {
-    fn open(self) -> Result<Box<dyn Processor<AudioData>>, CodecError> { Ok(Box::new(software::Audio::new(self)?)) }
+    fn open(self) -> Result<Box<dyn Processor<AudioData>>, CodecError> {
+        Ok(Box::new(software::Audio::new(self)?))
+    }
 }
 impl Processor<AudioData> for software::Audio {
-    fn decode(&mut self, chunk: EncodedChunk, _: &AtomicBool) -> Result<Vec<AudioData>, CodecError> { self.decode(chunk) }
-    fn flush(&mut self, _: &AtomicBool) -> Result<Vec<AudioData>, CodecError> { self.flush() }
+    fn decode(
+        &mut self,
+        chunk: EncodedChunk,
+        _: &AtomicBool,
+    ) -> Result<Vec<AudioData>, CodecError> {
+        self.decode(chunk)
+    }
+    fn flush(&mut self, _: &AtomicBool) -> Result<Vec<AudioData>, CodecError> {
+        self.flush()
+    }
 }
-pub(crate) async fn video_config_supported(config: &VideoDecoderConfig) -> Result<bool, CodecError> {
-    Ok(software::supports_video(config))
+pub(crate) async fn video_config_supported(
+    config: &VideoDecoderConfig,
+) -> Result<bool, CodecError> {
+    Ok(config.clone().open().is_ok())
 }
-pub(crate) async fn audio_config_supported(config: &AudioDecoderConfig) -> Result<bool, CodecError> {
+pub(crate) async fn audio_config_supported(
+    config: &AudioDecoderConfig,
+) -> Result<bool, CodecError> {
     Ok(software::supports_audio(config))
+}
+
+/// Selection happens before consuming input. Never retry another decoder after
+/// decode has started: doing so would lose reference frames and timestamps.
+fn select_video<T>(
+    config: &VideoDecoderConfig,
+    hardware: impl FnOnce() -> Result<T, CodecError>,
+    software: impl FnOnce() -> Result<T, CodecError>,
+) -> Result<T, CodecError> {
+    let (first, second) = if config.hardware_acceleration == HardwareAcceleration::PreferSoftware {
+        match software() {
+            Ok(value) => return Ok(value),
+            Err(error) => (error, hardware()),
+        }
+    } else {
+        match hardware() {
+            Ok(value) => return Ok(value),
+            Err(error) => (error, software()),
+        }
+    };
+    second.map_err(|error| {
+        CodecError::Unsupported(format!(
+            "no adapter accepts {}: {first}; {error}",
+            config.codec.0
+        ))
+    })
 }

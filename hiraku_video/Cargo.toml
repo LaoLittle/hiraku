@@ -10,7 +10,7 @@ license.workspace = true
 bevy.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
-hiraku-media.workspace = true
+hiraku-codec.workspace = true
 crossbeam-channel.workspace = true
 
 [dependencies.symphonia]

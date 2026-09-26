@@ -6,6 +6,8 @@
 mod codec;
 mod platform;
 pub use codec::*;
+mod encoder;
+pub use encoder::*;
 mod audio_packet;
 pub use audio_packet::AudioPacketDecoder;
 
@@ -52,7 +54,9 @@ impl YuvColorTransform {
         let (yo, ys, co, cs) = if limited_range {
             (16.0 / 255.0, 255.0 / 219.0, 128.0 / 255.0, 255.0 / 224.0)
         } else {
-            (0.0, 1.0, 0.5, 1.0)
+            // Eight-bit UNORM samples divide by 255, while neutral chroma is
+            // code 128, not 127.5. Using 0.5 tints neutral pixels blue/magenta.
+            (0.0, 1.0, 128.0 / 255.0, 1.0)
         };
         let offset = |u: f32, v: f32| -ys * yo - cs * co * (u + v);
         Self {
