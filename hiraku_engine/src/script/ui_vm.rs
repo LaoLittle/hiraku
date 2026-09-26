@@ -2543,7 +2543,23 @@ fn validate_input_handler(
     expected: &ScriptType,
     program: &hiraku_script::LinkedProgram,
 ) -> Result<(), UiVmError> {
-    let signature = match handler.value() {
+    let signature = callable_signature(handler, program);
+    if signature.is_some_and(|signature| {
+        signature.parameters == [expected.clone()]
+            && matches!(signature.result, ScriptType::Unit | ScriptType::Never)
+    }) {
+        return Ok(());
+    }
+    Err(UiVmError::Invalid(format!(
+        "input handler requires ({expected:?}) -> Unit; annotate the callback parameter, for example {{ value: {expected:?} -> ... }}"
+    )))
+}
+
+fn callable_signature<'a>(
+    handler: &HksCallable,
+    program: &'a hiraku_script::LinkedProgram,
+) -> Option<&'a hiraku_script::FunctionSignature> {
+    match handler.value() {
         Value::Closure {
             module: Some(module),
             region,
@@ -2568,16 +2584,7 @@ fn validate_input_handler(
             })
             .map(|function| &function.signature),
         _ => None,
-    };
-    if signature.is_some_and(|signature| {
-        signature.parameters == [expected.clone()]
-            && matches!(signature.result, ScriptType::Unit | ScriptType::Never)
-    }) {
-        return Ok(());
     }
-    Err(UiVmError::Invalid(format!(
-        "input handler requires ({expected:?}) -> Unit; annotate the callback parameter, for example {{ value: {expected:?} -> ... }}"
-    )))
 }
 
 fn materialize_node(
@@ -2715,10 +2722,12 @@ fn materialize_node(
             }
             let texture = resolve_texture(textures, &path)?;
             if (layout.shader.is_some()
-                || layout
-                    .keyframes
-                    .iter()
-                    .any(|key| matches!(key, crate::ui::UiKeyframe::Quad(..) | crate::ui::UiKeyframe::QuadStepAlpha(..))))
+                || layout.keyframes.iter().any(|key| {
+                    matches!(
+                        key,
+                        crate::ui::UiKeyframe::Quad(..) | crate::ui::UiKeyframe::QuadStepAlpha(..)
+                    )
+                }))
                 && (texture.rect.is_some() || layout.flip_x)
             {
                 return Err(UiVmError::Invalid("projected shader tracks require whole, unflipped images; encode reflection in quad axes".into()));
@@ -2865,6 +2874,23 @@ fn materialize_node(
             }))
         }
         UiDraftKind::ChoiceOptions(renderer) => {
+            let arity =
+                callable_signature(&renderer, program).map(|signature| signature.parameters.len());
+            if !matches!(arity, Some(2 | 3)) {
+                return Err(UiVmError::Invalid("choiceOptions requires (index: Int, label: String) or (index: Int, label: String, parameters: T)".into()));
+            }
+            let parameters = context
+                .values
+                .story_values()
+                .get("choice")
+                .and_then(|choice| match choice {
+                    StoredValue::Map(fields) => fields.get("parameters"),
+                    _ => None,
+                })
+                .and_then(|value| match value {
+                    StoredValue::Map(values) => Some(values.clone()),
+                    _ => None,
+                });
             let enabled = context
                 .values
                 .story_values()
@@ -2901,9 +2927,15 @@ fn materialize_node(
                         "choice.options entries must be strings".into(),
                     ));
                 };
+                let mut arguments = vec![Value::Int(index as i64), Value::String(label)];
+                if arity == Some(3) {
+                    let value = parameters.as_ref().and_then(|values| values.get(&index.to_string()))
+                        .ok_or_else(|| UiVmError::Invalid(format!("choice option {index} is missing .params(value), required by its three-parameter UI renderer")))?;
+                    arguments.push(stored_to_hks(value));
+                }
                 let rendered = closure_children_with_args(
                     renderer.clone(),
-                    vec![Value::Int(index as i64), Value::String(label)],
+                    arguments,
                     program,
                     registry,
                     context,
@@ -5033,6 +5065,89 @@ canvas {
                     && button.enabled
                     && button.value == Some(StoredValue::Int(1))
         ));
+    }
+
+    #[test]
+    fn choice_renderer_receives_typed_option_parameters() {
+        let values = UiContext::new(BTreeMap::from([(
+            "choice".into(),
+            StoredValue::Map(BTreeMap::from([
+                (
+                    "options".into(),
+                    StoredValue::Array(vec![StoredValue::String("Alice".into())]),
+                ),
+                (
+                    "parameters".into(),
+                    StoredValue::Map(BTreeMap::from([("0".into(), StoredValue::Bool(true))])),
+                ),
+            ])),
+        )]));
+        for renderer in [
+            "choiceOptions { index: Int, label: String, danger: Bool -> button(index) { if danger { text(label) } else { text(\"Bob\") } } }",
+            "choiceOptions(renderOption)",
+        ] {
+            let source = format!(
+                r#"
+                import ui.widgets.*
+                fn renderOption(index: Int, label: String, danger: Bool) -> UiNode {{
+                    button(index) {{ if danger {{ text(label) }} else {{ text("Bob") }} }}
+                }}
+                canvas {{ {renderer} }}
+            "#
+            );
+            let screen = evaluate_ui_component_named(
+                "memory://choice.ui.hks",
+                &source,
+                values.clone(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("typed choice renders");
+            let ScreenNode::Column(options) = &screen.children[0] else {
+                panic!("expected options column")
+            };
+            assert!(
+                matches!(&options.children[0], ScreenNode::Button(button) if button.text == "Alice")
+            );
+        }
+        let source = r#"import ui.widgets.*
+            canvas { choiceOptions { index: Int, label: String, data: String -> button(index) { text(data) } } }
+        "#;
+        let error = evaluate_ui_component_named(
+            "memory://choice.ui.hks",
+            source,
+            values,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect_err("Bool must not be accepted as String");
+        assert!(error.to_string().contains("String"), "{error}");
+    }
+
+    #[test]
+    fn choice_renderer_reports_missing_parameters() {
+        let values = UiContext::new(BTreeMap::from([(
+            "choice".into(),
+            StoredValue::Map(BTreeMap::from([(
+                "options".into(),
+                StoredValue::Array(vec![StoredValue::String("Alice".into())]),
+            )])),
+        )]));
+        let source = r#"import ui.widgets.*
+            canvas { choiceOptions { index: Int, label: String, data: Bool -> button(index) { text(label) } } }
+        "#;
+        let error = evaluate_ui_component_named(
+            "memory://choice.ui.hks",
+            source,
+            values,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect_err("missing parameters must be diagnosed");
+        assert!(
+            error.to_string().contains("missing .params(value)"),
+            "{error}"
+        );
     }
 
     #[test]

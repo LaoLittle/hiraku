@@ -42,6 +42,7 @@ pub struct StoryRuntime {
 struct ChoiceOption {
     label: String,
     enabled: bool,
+    parameters: Option<crate::state::StoredValue>,
     body: Value,
 }
 
@@ -78,6 +79,7 @@ pub enum StoryRuntimeEvent {
         prompt: String,
         options: Vec<String>,
         enabled: Vec<bool>,
+        parameters: Vec<Option<crate::state::StoredValue>>,
     },
     TaskEffect {
         task: ExecutionId,
@@ -381,6 +383,10 @@ impl StoryRuntime {
                     prompt: prompt.clone(),
                     options: options.iter().map(|option| option.label.clone()).collect(),
                     enabled: options.iter().map(|option| option.enabled).collect(),
+                    parameters: options
+                        .iter()
+                        .map(|option| option.parameters.clone())
+                        .collect(),
                 })
             }
             _ => Some(StoryRuntimeEvent::Wait(
@@ -639,6 +645,7 @@ impl StoryRuntime {
                         }
                         StoryCallOutcome::Control(
                             control @ (StoryControl::AddChoiceOption { .. }
+                            | StoryControl::SetChoiceParameters { .. }
                             | StoryControl::EnableChoiceOption { .. }),
                         ) => {
                             return Err(StoryRuntimeError::UnexpectedMainControl(control));
@@ -764,8 +771,33 @@ impl StoryRuntime {
                     options.push(ChoiceOption {
                         label,
                         enabled: true,
+                        parameters: None,
                         body: closure,
                     });
+                    self.execution.resume(
+                        task,
+                        Value::Handle {
+                            type_id: super::capabilities::CHOICE_OPTION_HANDLE_TYPE,
+                            id,
+                        },
+                    )?;
+                }
+                StoryCallOutcome::Control(StoryControl::SetChoiceParameters { id, value }) => {
+                    let Some(ChoiceState::Collecting {
+                        options,
+                        builder_task,
+                        ..
+                    }) = &mut self.choice
+                    else {
+                        return Err(StoryRuntimeError::InvalidChoice);
+                    };
+                    if *builder_task != task || id >> 32 != task.task_handle() {
+                        return Err(StoryRuntimeError::InvalidChoice);
+                    }
+                    options
+                        .get_mut((id & u32::MAX as u64) as usize)
+                        .ok_or(StoryRuntimeError::InvalidChoice)?
+                        .parameters = Some(value);
                     self.execution.resume(
                         task,
                         Value::Handle {
@@ -830,12 +862,17 @@ impl StoryRuntime {
                     let options = options.clone();
                     let labels = options.iter().map(|option| option.label.clone()).collect();
                     let enabled = options.iter().map(|option| option.enabled).collect();
+                    let parameters = options
+                        .iter()
+                        .map(|option| option.parameters.clone())
+                        .collect();
                     self.choice = Some(ChoiceState::AwaitingSelection {
                         prompt: prompt.clone(),
                         options,
                     });
                     self.blocked = true;
                     return Ok(Some(StoryRuntimeEvent::Choice {
+                        parameters,
                         enabled,
                         prompt,
                         options: labels,
@@ -1716,6 +1753,56 @@ mod tests {
     }
 
     #[test]
+    fn choice_parameters_are_captured_once_and_restored() {
+        let source = r#"
+            var danger = true
+            choice {
+                option("Alice") { log("alice") }.params(danger).enable(false)
+                option("Bob") { log("bob") }.enable(true).params(false)
+                danger = false
+            }
+        "#;
+        let bytecode = compile_story_bytecode("choice.hks", source).expect("choice compiles");
+        let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime starts");
+        let event = runtime.step().expect("choice suspends");
+        assert!(
+            matches!(&event, Some(StoryRuntimeEvent::Choice { parameters, enabled, .. })
+            if parameters == &vec![Some(crate::state::StoredValue::Bool(true)), Some(crate::state::StoredValue::Bool(false))]
+                && enabled == &[false, true])
+        );
+        let snapshot = runtime.snapshot().expect("snapshot captures choice data");
+        let bytes = hiraku_script::hson::to_vec(&snapshot).expect("choice snapshot serializes");
+        let snapshot = hiraku_script::hson::from_slice(&bytes).expect("choice snapshot decodes");
+        let mut restored = StoryRuntime::restore(bytecode, snapshot).expect("snapshot restores");
+        assert_eq!(restored.restored_boundary_event(), event);
+        restored
+            .resume(Value::Int(1))
+            .expect("selection resumes branch");
+        assert!(restored.step().is_ok());
+    }
+
+    #[test]
+    fn choice_parameters_reject_live_callables() {
+        let bytecode = compile_story_bytecode(
+            "choice.hks",
+            r#"
+            choice { option("Alice") {}.params({ log("alice") }) }
+        "#,
+        )
+        .expect("payload is validated at the UI transport boundary");
+        let mut runtime = StoryRuntime::new(bytecode).expect("runtime starts");
+        let error = runtime
+            .step()
+            .expect_err("callbacks cannot cross the plain-data boundary");
+        assert!(
+            error
+                .to_string()
+                .contains("UI arguments currently require plain"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn choice_enable_is_evaluated_once_and_restored() {
         let source = r#"
             global var affection: Int = 1
@@ -2196,6 +2283,7 @@ mod tests {
             runtime.step().expect("choice must suspend"),
             Some(StoryRuntimeEvent::Choice {
                 prompt: "Select".into(),
+                parameters: vec![None, None],
                 enabled: vec![true, true],
                 options: vec!["Route A".into(), "Route B".into()],
             })
@@ -2397,6 +2485,7 @@ mod tests {
             restored.restored_boundary_event(),
             Some(StoryRuntimeEvent::Choice {
                 prompt: String::new(),
+                parameters: vec![None, None],
                 enabled: vec![true, true],
                 options: vec!["Route A".into(), "Route B".into()],
             })

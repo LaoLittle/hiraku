@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn camera_anchor_uses_active_canvas_and_bottom_left_origin() {
+    for size in [Vec2::new(1920.0, 1080.0), Vec2::new(2560.0, 1440.0)] {
+        assert_eq!(resolve_camera_anchor(Vec2::splat(50.0), size), Vec3::ZERO);
+        assert_eq!(
+            resolve_camera_anchor(Vec2::new(25.0, 50.0), size),
+            Vec3::new(-size.x / 4.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            resolve_camera_anchor(Vec2::splat(100.0), size),
+            (size / 2.0).extend(0.0)
+        );
+        let view = CameraView {
+            offset: resolve_camera_anchor(Vec2::new(75.0, 50.0), size),
+            zoom: 2.0,
+            ..Default::default()
+        };
+        // The selected point appears at center, independent of magnification.
+        assert_eq!(
+            view.transform_picture(Transform::from_translation(view.offset))
+                .translation,
+            Vec3::ZERO
+        );
+    }
+}
+
+#[test]
 fn background_camera_moves_both_crossfade_images_without_changing_depth() {
     let mut states = CameraState::default();
     let view = states.view_mut(CameraEffectScope::Background);

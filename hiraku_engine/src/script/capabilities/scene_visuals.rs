@@ -1438,6 +1438,49 @@ mod tests {
     }
 
     #[test]
+    fn every_virtual_camera_accepts_typed_canvas_positions() {
+        for (name, scope) in [
+            ("background", crate::script::CameraEffectScope::Background),
+            ("scene", crate::script::CameraEffectScope::World),
+            ("ui", crate::script::CameraEffectScope::Ui),
+            ("canvas", crate::script::CameraEffectScope::Canvas),
+        ] {
+            let mut story = runtime(&format!("camera(.{name}).at(.right).zoom(1.5).time(0.25)"));
+            let StoryRuntimeEvent::Effect(StoryEffect::SetCamera {
+                anchor,
+                offset,
+                scope: actual,
+                duration_ms,
+                ..
+            }) = event(&mut story)
+            else {
+                panic!("camera position effect");
+            };
+            assert_eq!(anchor, Some([75.0, 50.0]));
+            assert_eq!(offset, None);
+            assert_eq!(actual, scope);
+            assert_eq!(duration_ms, 250);
+        }
+        for (position, anchor, offset) in [
+            (".center", Some([50.0, 50.0]), None),
+            (".rel(10, 90)", Some([10.0, 90.0]), None),
+            (".pos(10, 90)", None, Some([10.0, 90.0, 0.0])),
+        ] {
+            let mut story = runtime(&format!("camera(.background).at({position})"));
+            let StoryRuntimeEvent::Effect(StoryEffect::SetCamera {
+                anchor: actual_anchor,
+                offset: actual_offset,
+                ..
+            }) = event(&mut story)
+            else {
+                panic!("camera position effect");
+            };
+            assert_eq!(actual_anchor, anchor);
+            assert_eq!(actual_offset, offset);
+        }
+    }
+
+    #[test]
     fn actor_and_camera_use_typed_bezier_and_invalid_controls_report_errors() {
         use crate::script::animation::Easing;
         let curve = Easing::CubicBezier(0.25, 0.1, 0.25, 1.0);

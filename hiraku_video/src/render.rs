@@ -24,7 +24,7 @@ pub(crate) struct Yuv420MaterialKey {
     rgba: bool,
 }
 
-#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone, PartialEq)]
 #[bind_group_data(Yuv420MaterialKey)]
 pub(crate) struct Yuv420Material {
     #[uniform(5)]

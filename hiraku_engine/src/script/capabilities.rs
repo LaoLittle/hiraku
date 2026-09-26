@@ -134,6 +134,7 @@ pub enum StoryEffect {
         zoom: Option<f32>,
         zoom_view_space: bool,
         offset: Option<[f32; 3]>,
+        anchor: Option<[f32; 2]>,
         rotation: Option<[f32; 3]>,
         projection: Option<CameraProjectionMode>,
         scope: CameraEffectScope,
@@ -175,14 +176,38 @@ pub enum StoryTaskKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoryControl {
-    RandomInt { min: i64, max: i64 },
+    RandomInt {
+        min: i64,
+        max: i64,
+    },
     Navigate(NavigationRequest),
-    SpawnTask { kind: StoryTaskKind, closure: Value },
-    BeginChoice { prompt: String, closure: Value },
-    AddChoiceOption { label: String, closure: Value },
-    EnableChoiceOption { id: u64, enabled: bool },
-    OpenUi { path: String, arguments: Vec<Value> },
-    WaitTask { task: u64 },
+    SpawnTask {
+        kind: StoryTaskKind,
+        closure: Value,
+    },
+    BeginChoice {
+        prompt: String,
+        closure: Value,
+    },
+    AddChoiceOption {
+        label: String,
+        closure: Value,
+    },
+    EnableChoiceOption {
+        id: u64,
+        enabled: bool,
+    },
+    SetChoiceParameters {
+        id: u64,
+        value: crate::state::StoredValue,
+    },
+    OpenUi {
+        path: String,
+        arguments: Vec<Value>,
+    },
+    WaitTask {
+        task: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -555,6 +580,7 @@ pub struct StoryNativeHost {
 struct StoryControlBuiltins {
     random_int: BuiltinId,
     enable_option: BuiltinId,
+    option_parameters: BuiltinId,
     goto: BuiltinId,
     sequence: BuiltinId,
     parallel: BuiltinId,
@@ -578,6 +604,9 @@ impl StoryControlBuiltins {
             enable_option: manifest
                 .resolve("enable")
                 .expect("option enable is registered"),
+            option_parameters: manifest
+                .resolve("params")
+                .expect("option params is registered"),
             goto: manifest
                 .resolve_selector("story", "goto")
                 .expect("story.goto is registered"),
@@ -697,6 +726,28 @@ impl StoryNativeHost {
                 label,
                 closure,
             }));
+        }
+        if call.builtin == self.controls.option_parameters {
+            let Some(Value::Handle {
+                type_id: CHOICE_OPTION_HANDLE_TYPE,
+                id,
+            }) = &call.receiver
+            else {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "params requires a ChoiceOption receiver",
+                ));
+            };
+            let argument =
+                call.arguments
+                    .first()
+                    .ok_or(CharacterCapabilityError::InvalidArguments(
+                        "params requires a value",
+                    ))?;
+            let value = super::ui_vm::ui_argument_to_stored(&argument.value)
+                .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
+            return Ok(StoryCallOutcome::Control(
+                StoryControl::SetChoiceParameters { id: *id, value },
+            ));
         }
         if call.builtin == self.controls.enable_option {
             let Some(Value::Handle {
@@ -910,6 +961,7 @@ struct PendingCamera {
     zoom: Option<f32>,
     zoom_view_space: bool,
     offset: Option<[f32; 3]>,
+    anchor: Option<[f32; 2]>,
     rotation: Option<[f32; 3]>,
     projection: Option<CameraProjectionMode>,
     scope: CameraEffectScope,
@@ -1043,6 +1095,7 @@ impl CharacterContext {
                 zoom: None,
                 zoom_view_space: false,
                 offset: None,
+                anchor: None,
                 rotation: None,
                 projection: None,
                 scope: match scope {
@@ -1165,6 +1218,7 @@ impl CharacterContext {
             if pending.blur.is_some()
                 || pending.zoom.is_some()
                 || pending.offset.is_some()
+                || pending.anchor.is_some()
                 || pending.rotation.is_some()
                 || pending.projection.is_some()
             {
@@ -1173,6 +1227,7 @@ impl CharacterContext {
                     zoom: pending.zoom,
                     zoom_view_space: pending.zoom_view_space,
                     offset: pending.offset,
+                    anchor: pending.anchor,
                     rotation: pending.rotation,
                     projection: pending.projection,
                     scope: pending.scope,
@@ -1346,6 +1401,17 @@ mod native_api {
     ) -> Result<ChoiceOptionHandle, NativeError> {
         Err(NativeError::message(
             "option enable requires the story choice builder",
+        ))
+    }
+
+    #[hks(name = "params", receiver)]
+    fn native_option_parameters(
+        _context: &mut CharacterContext,
+        _option: ChoiceOptionHandle,
+        _value: Value,
+    ) -> Result<ChoiceOptionHandle, NativeError> {
+        Err(NativeError::message(
+            "option params requires the story choice builder",
         ))
     }
 
@@ -1873,6 +1939,7 @@ mod native_api {
         camera.zoom = Some(1.0);
         camera.zoom_view_space = false;
         camera.offset = Some([0.0; 3]);
+        camera.anchor = None;
         camera.rotation = Some([0.0; 3]);
         camera.projection = Some(CameraProjectionMode::Orthographic);
         Ok(CameraHandle(handle))
@@ -1929,6 +1996,42 @@ mod native_api {
         Ok(CameraHandle(handle))
     }
 
+    /// Position the view on a canvas point. Unlike actor placement, center has
+    /// no baseline offset. Relative positions resolve against the active canvas
+    /// at submission, not a hardcoded reference resolution.
+    #[hks(name = "at", receiver)]
+    fn native_camera_at(
+        context: &mut CharacterContext,
+        CameraHandle(handle): CameraHandle,
+        position: Position,
+    ) -> Result<CameraHandle, NativeError> {
+        let (offset, anchor) = match position {
+            Position::Absolute(x, y) => {
+                if ![x, y].into_iter().all(is_finite_f32) {
+                    return Err(NativeError::message(
+                        "camera position must be finite and representable",
+                    ));
+                }
+                (Some([x as f32, y as f32, 0.0]), None)
+            }
+            position => {
+                let (x, y) = match position {
+                    Position::Left => (25.0, 50.0),
+                    Position::Center => (50.0, 50.0),
+                    Position::Right => (75.0, 50.0),
+                    Position::Relative(x, y) => (x, y),
+                    Position::Absolute(..) => unreachable!("absolute position handled above"),
+                };
+                Position::rel(x, y)?;
+                (None, Some([x as f32, y as f32]))
+            }
+        };
+        let camera = context.camera_mut(handle)?;
+        camera.offset = offset;
+        camera.anchor = anchor;
+        Ok(CameraHandle(handle))
+    }
+
     #[hks(name = "offset", receiver)]
     fn native_camera_offset(
         context: &mut CharacterContext,
@@ -1949,6 +2052,7 @@ mod native_api {
             ));
         }
         camera.offset = Some([x as f32, y as f32, z as f32]);
+        camera.anchor = None;
         Ok(CameraHandle(handle))
     }
 
@@ -2107,7 +2211,12 @@ mod native_api {
     #[test]
     fn camera_reset_and_planar_validation_share_the_same_builder() {
         let mut host = StoryNativeHost::new();
-        for scope in [CameraScope::Scene, CameraScope::Ui, CameraScope::Canvas] {
+        for scope in [
+            CameraScope::Background,
+            CameraScope::Scene,
+            CameraScope::Ui,
+            CameraScope::Canvas,
+        ] {
             let camera = native_camera(&mut host.context, Some(scope)).expect("camera");
             native_camera_zoom(&mut host.context, camera, 2.0).expect("zoom");
             native_camera_roll(&mut host.context, camera, 30.0).expect("roll");
@@ -2132,6 +2241,35 @@ mod native_api {
                 assert_eq!(host.context.pending_cameras[&camera.0], before);
             }
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn camera_anchor_and_offset_are_one_last_write_wins_position_patch() {
+        let mut host = StoryNativeHost::new();
+        let camera =
+            native_camera(&mut host.context, Some(CameraScope::Background)).expect("camera");
+        native_camera_offset(&mut host.context, camera, 12.0, 34.0, 0.0).expect("offset");
+        native_camera_at(&mut host.context, camera, Position::Right).expect("anchor");
+        assert_eq!(
+            host.context.pending_cameras[&camera.0].anchor,
+            Some([75.0, 50.0])
+        );
+        assert_eq!(host.context.pending_cameras[&camera.0].offset, None);
+        let before = host.context.pending_cameras[&camera.0].clone();
+        assert!(
+            native_camera_at(&mut host.context, camera, Position::Relative(f64::NAN, 0.0)).is_err()
+        );
+        assert_eq!(host.context.pending_cameras[&camera.0], before);
+        native_camera_offset(&mut host.context, camera, 10.0, 0.0, 0.0).expect("override anchor");
+        assert_eq!(host.context.pending_cameras[&camera.0].anchor, None);
+        native_camera_at(&mut host.context, camera, Position::Left).expect("anchor");
+        native_camera_reset(&mut host.context, camera).expect("reset");
+        assert_eq!(host.context.pending_cameras[&camera.0].anchor, None);
+        assert_eq!(
+            host.context.pending_cameras[&camera.0].offset,
+            Some([0.0; 3])
+        );
     }
 
     #[cfg(test)]

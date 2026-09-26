@@ -1,7 +1,9 @@
 //! One background composition boundary within the existing Camera3d schedule.
 use super::{
     kawase::{BlurPipeline, BlurWorkspace},
-    post_process::{EffectPipeline, PostProcessSettings, PreparedEffectUniform, apply_effect},
+    post_process::{
+        EffectInput, EffectPipeline, PostProcessSettings, PreparedEffectUniform, apply_effect,
+    },
     program::LayerEffectShaders,
 };
 use crate::scene::pictures::PictureView;
@@ -17,7 +19,7 @@ use bevy::{
         extract_component::{ExtractComponent, ExtractComponentPlugin},
         render_phase::{SortedRenderPhase, ViewSortedRenderPhases},
         render_resource::*,
-        renderer::{RenderContext, ViewQuery},
+        renderer::{RenderContext, RenderDevice, ViewQuery},
         view::{ExtractedView, ViewDepthStencilTexture, ViewTarget},
     },
 };
@@ -32,9 +34,9 @@ struct BackgroundComposition;
 struct BackgroundPhases(HashMap<Entity, SortedRenderPhase<Transparent3d>>);
 
 #[derive(Component)]
-struct BackgroundWriteback(CachedRenderPipelineId);
+struct BackgroundComposite(CachedRenderPipelineId);
 
-fn prepare_writeback(
+fn prepare_composite(
     mut commands: Commands,
     views: Query<(Entity, &ViewTarget, &Msaa), With<PostProcessSettings>>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BlitPipeline>>,
@@ -42,21 +44,17 @@ fn prepare_writeback(
     cache: Res<PipelineCache>,
 ) {
     for (entity, target, msaa) in &views {
-        if msaa.samples() > 1 {
-            let id = pipelines.specialize(
-                &cache,
-                &blit,
-                BlitPipelineKey {
-                    target_format: target.main_texture_format(),
-                    samples: msaa.samples(),
-                    blend_state: None,
-                    source_space: None,
-                },
-            );
-            commands.entity(entity).insert(BackgroundWriteback(id));
-        } else {
-            commands.entity(entity).remove::<BackgroundWriteback>();
-        }
+        let id = pipelines.specialize(
+            &cache,
+            &blit,
+            BlitPipelineKey {
+                target_format: target.main_texture_format(),
+                samples: msaa.samples(),
+                blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                source_space: None,
+            },
+        );
+        commands.entity(entity).insert(BackgroundComposite(id));
     }
 }
 
@@ -66,7 +64,7 @@ pub(super) fn install(app: &mut App) {
     if let Some(render) = app.get_sub_app_mut(RenderApp) {
         render
             .init_resource::<BackgroundPhases>()
-            .add_systems(Render, prepare_writeback.in_set(RenderSystems::Prepare))
+            .add_systems(Render, prepare_composite.in_set(RenderSystems::Prepare))
             .add_systems(
                 Core3d,
                 (
@@ -134,6 +132,52 @@ fn isolate_background(
     isolated.0.insert(entity, background);
 }
 
+/// Reused layer-local input/output, allocated only while an effect needs it.
+/// MSAA is resolved before sampling; no pass samples its own attachment.
+struct BackgroundTargets {
+    key: (Extent3d, TextureFormat, u32),
+    input: TextureView,
+    output: TextureView,
+    multisampled: Option<TextureView>,
+}
+
+impl BackgroundTargets {
+    fn new(device: &RenderDevice, key: (Extent3d, TextureFormat, u32)) -> Self {
+        let create = |samples, label| {
+            device
+                .create_texture(&TextureDescriptor {
+                    label: Some(label),
+                    size: key.0,
+                    mip_level_count: 1,
+                    sample_count: samples,
+                    dimension: TextureDimension::D2,
+                    format: key.1,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&TextureViewDescriptor::default())
+        };
+        Self {
+            key,
+            input: create(1, "hiraku_background_input"),
+            output: create(1, "hiraku_background_effect"),
+            multisampled: (key.2 > 1).then(|| create(key.2, "hiraku_background_msaa")),
+        }
+    }
+
+    fn attachment(&self) -> RenderPassColorAttachment<'_> {
+        RenderPassColorAttachment {
+            view: self.multisampled.as_ref().unwrap_or(&self.input),
+            resolve_target: self.multisampled.as_ref().map(|_| &*self.input),
+            depth_slice: None,
+            ops: Operations {
+                load: LoadOp::Clear(LinearRgba::NONE.into()),
+                store: StoreOp::Store,
+            },
+        }
+    }
+}
+
 fn draw_background(
     world: &World,
     view: ViewQuery<(
@@ -142,7 +186,8 @@ fn draw_background(
         &ViewDepthStencilTexture,
         &PostProcessSettings,
         Option<&LayerEffectShaders>,
-        Option<&BackgroundWriteback>,
+        Option<&BackgroundComposite>,
+        &Msaa,
     )>,
     isolated: Res<BackgroundPhases>,
     pipeline: Option<Res<EffectPipeline>>,
@@ -151,23 +196,47 @@ fn draw_background(
     mut uniform: Local<Option<PreparedEffectUniform>>,
     blur: Res<BlurPipeline>,
     mut blur_work: Local<BlurWorkspace>,
+    mut textures: Local<Option<BackgroundTargets>>,
     mut ctx: RenderContext,
 ) {
     let entity = view.entity();
-    let (camera, target, depth, settings, programs, writeback) = view.into_inner();
+    let (camera, target, depth, settings, programs, composite, msaa) = view.into_inner();
     let Some(phase) = isolated.0.get(&entity) else {
         return;
     };
     if phase.items.is_empty() {
+        *textures = None;
         *blur_work = BlurWorkspace::default();
         return;
     }
+    let effect_active =
+        settings.background.is_enabled() || programs.is_some_and(|p| p.background.is_some());
+    // A compiling pipeline must not make the background vanish. Until the
+    // compositing pipeline is ready, use the ordinary direct draw.
+    let compiled = effect_active
+        .then(|| composite.and_then(|id| cache.get_render_pipeline(id.0)))
+        .flatten();
+    if compiled.is_some() {
+        let key = (
+            target.main_texture().size(),
+            target.main_texture_format(),
+            msaa.samples(),
+        );
+        if textures.as_ref().is_none_or(|t| t.key != key) {
+            *textures = Some(BackgroundTargets::new(ctx.render_device(), key));
+        }
+    } else {
+        *textures = None;
+        *blur_work = BlurWorkspace::default();
+    }
     {
-        // This is the first main color attachment use: Bevy clears once here,
-        // then its opaque/transparent scene passes load the composed background.
+        let attachment = textures.as_ref().map_or_else(
+            || target.get_color_attachment(),
+            BackgroundTargets::attachment,
+        );
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("hiraku_background"),
-            color_attachments: &[Some(target.get_color_attachment())],
+            color_attachments: &[Some(attachment)],
             depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -180,59 +249,56 @@ fn draw_background(
             error!("background composition failed: {error:?}");
         }
     }
-    if settings.background.is_enabled() || programs.is_some_and(|p| p.background.is_some()) {
-        // Never flip the resolved target until we can seed the MSAA attachment:
-        // the following scene pass would otherwise resolve its stale contents.
-        let msaa_pipeline = if target.sampled_main_texture_view().is_some() {
-            let Some(compiled) = writeback.and_then(|id| cache.get_render_pipeline(id.0)) else {
-                return;
-            };
-            Some(compiled)
-        } else {
-            None
-        };
-        apply_effect(
-            target,
-            &settings.background,
-            3,
-            programs,
-            None,
-            pipeline.as_deref(),
-            &cache,
-            &mut uniform,
-            &blur,
-            &mut blur_work,
-            &mut ctx,
-        );
-        if let (Some(compiled), Some(sampled)) = (msaa_pipeline, target.sampled_main_texture_view())
-        {
-            let output = target.post_process_write();
-            let bind_group = blit.create_bind_group(ctx.render_device(), output.source, &cache);
-            let mut pass = ctx
-                .command_encoder()
-                .begin_render_pass(&RenderPassDescriptor {
-                    label: Some("hiraku_background_msaa_writeback"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: sampled,
-                        depth_slice: None,
-                        resolve_target: Some(output.destination),
-                        ops: Operations {
-                            load: LoadOp::Clear(LinearRgba::BLACK.into()),
-                            store: StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-            pass.set_pipeline(compiled);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+    let (Some(textures), Some(compiled)) = (textures.as_ref(), compiled) else {
+        return;
+    };
+    let processed = apply_effect(
+        target,
+        &settings.background,
+        3,
+        programs,
+        None,
+        pipeline.as_deref(),
+        &cache,
+        &mut uniform,
+        &blur,
+        &mut blur_work,
+        &mut ctx,
+        Some(EffectInput {
+            source: &textures.input,
+            destination: &textures.output,
+            size: UVec2::new(textures.key.0.width, textures.key.0.height),
+        }),
+    );
+    // Both paths contain only background RGBA, never the main clear color or
+    // another camera's contribution. Premultiplied source-over happens once.
+    let image = if processed {
+        &textures.output
     } else {
-        *blur_work = BlurWorkspace::default();
+        &textures.input
+    };
+    let group = blit.create_bind_group(ctx.render_device(), image, &cache);
+    let mut pass = ctx
+        .command_encoder()
+        .begin_render_pass(&RenderPassDescriptor {
+            label: Some("hiraku_background_composite"),
+            color_attachments: &[Some(target.get_color_attachment())],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    pass.set_pipeline(compiled);
+    pass.set_bind_group(0, &group, &[]);
+    if let Some(viewport) = &camera.viewport {
+        pass.set_scissor_rect(
+            viewport.physical_position.x,
+            viewport.physical_position.y,
+            viewport.physical_size.x,
+            viewport.physical_size.y,
+        );
     }
+    pass.draw(0..3, 0..1);
 }
 
 fn restore_background(

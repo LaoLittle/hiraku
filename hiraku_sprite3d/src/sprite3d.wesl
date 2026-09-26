@@ -31,16 +31,24 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
     let dimensions = vec2<f32>(textureDimensions(atlas));
     var masks: array<f32, 8>;
     var result = vec4<f32>(0.0);
+    var previous_base = result;
+    var previous_masks: array<f32, 8>;
     for (var i = 0u; i < min(sprite.count.x, 32u); i += 1u) {
         let layer = sprite.layers[i];
+        let outgoing = result;
+        let outgoing_masks = masks;
+        let replacing = i > 0u && layer.flip.z >= 0.0;
+        if replacing { result = previous_base; masks = previous_masks; }
+        previous_base = result;
+        previous_masks = masks;
         var uv = (mesh.uv - layer.bounds.xy) / layer.bounds.zw;
-        if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) { continue; }
+        let inside = all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
         uv = select(uv, vec2<f32>(1.0) - uv, layer.flip.xy > vec2<f32>(0.0));
         let origin = select(layer.rect.xy, vec2<f32>(0.0), layer.rect.z <= 0.0);
         let size = select(layer.rect.zw, dimensions, layer.rect.z <= 0.0);
         // Clamp to source texel centers, avoiding adjacent atlas entries.
         let sample_uv = (origin + clamp(uv * size, vec2<f32>(0.5), max(size - 0.5, vec2<f32>(0.5)))) / dimensions;
-        let texel = decode_color(textureSampleLevel(atlas, atlas_sampler, sample_uv, 0.0), sampling.x);
+        let texel = decode_color(textureSampleLevel(atlas, atlas_sampler, sample_uv, 0.0), sampling.x) * select(0.0, 1.0, inside);
         let sample_color = texel * layer.tint;
         var alpha = sample_color.a;
         let mode = u32(layer.modes.y);
@@ -50,10 +58,17 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
             else {
                 let coverage = select(select(0.0, alpha, alpha > layer.modes.w), select(0.0, 1.0, texel.a > layer.modes.w), mode >= 4u);
                 masks[reference - 1u] = max(masks[reference - 1u], coverage);
-                if mode == 2u || mode == 4u { continue; }
             }
         }
-        result = compose(result, vec4<f32>(sample_color.rgb * alpha, alpha), layer.modes.x > 0.0);
+        if mode != 2u && mode != 4u {
+            result = compose(result, vec4<f32>(sample_color.rgb * alpha, alpha), layer.modes.x > 0.0);
+        }
+        if replacing {
+            result = mix(outgoing, result, layer.flip.z);
+            for (var m = 0u; m < 8u; m += 1u) {
+                masks[m] = mix(outgoing_masks[m], masks[m], layer.flip.z);
+            }
+        }
     }
     // Apply group opacity only after internal overlaps have been resolved.
     let tint = sprite.tint * select(sprite.backface_tint, vec4<f32>(1.0), front);

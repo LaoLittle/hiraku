@@ -53,6 +53,9 @@ pub struct SpriteLayer {
     pub mask: MaskMode,
     pub flip_x: bool,
     pub flip_y: bool,
+    /// Replace the preceding layer using a linear premultiplied RGBA mix.
+    /// Layer color retains intrinsic alpha; progress is not another opacity.
+    pub crossfade: Option<f32>,
 }
 impl Default for SpriteLayer {
     fn default() -> Self {
@@ -64,6 +67,7 @@ impl Default for SpriteLayer {
             mask: MaskMode::None,
             flip_x: false,
             flip_y: false,
+            crossfade: None,
         }
     }
 }
@@ -148,7 +152,12 @@ impl Sprite3d {
             return Err(Sprite3dError::InvalidDissolve);
         }
         for (index, layer) in self.layers.iter().enumerate() {
-            if !valid_rect(layer.bounds) || !valid_color(layer.color) {
+            if !valid_rect(layer.bounds)
+                || !valid_color(layer.color)
+                || layer.crossfade.is_some_and(|progress| {
+                    index == 0 || !progress.is_finite() || !(0.0..=1.0).contains(&progress)
+                })
+            {
                 return Err(Sprite3dError::InvalidLayer(index));
             }
             let reference = match layer.mask {

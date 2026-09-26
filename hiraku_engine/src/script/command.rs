@@ -95,6 +95,7 @@ pub enum CameraCommand {
         zoom: Option<f32>,
         zoom_view_space: bool,
         offset: Option<Vec3>,
+        anchor: Option<Vec2>,
         rotation: Option<Vec3>,
         projection: Option<CameraProjectionMode>,
         scope: CameraEffectScope,

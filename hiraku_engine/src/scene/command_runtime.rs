@@ -459,6 +459,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 zoom,
                 zoom_view_space,
                 offset,
+                anchor,
                 rotation,
                 projection,
                 scope,
@@ -472,7 +473,14 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     blur_intensity,
                     zoom,
                     zoom_view_space,
-                    offset,
+                    anchor
+                        .map(|point| {
+                            crate::render::camera::resolve_camera_anchor(
+                                point,
+                                render_assets.canvas.size.as_vec2(),
+                            )
+                        })
+                        .or(offset),
                     rotation,
                     projection,
                     scope,

@@ -40,7 +40,8 @@ fn observe_replay_boundary(runtime: &mut ScriptRuntimeState, event: &StoryRuntim
             prompt,
             options,
             enabled,
-        } => replay_signature("choice", &(prompt, options, enabled)),
+            parameters,
+        } => replay_signature("choice", &(prompt, options, enabled, parameters)),
         StoryRuntimeEvent::OpenUi { path, arguments } => replay_signature("ui", &(path, arguments)),
         StoryRuntimeEvent::RandomInt { min, max } => replay_signature("random", &(min, max)),
         _ => None,
@@ -694,6 +695,7 @@ pub fn drive_story_runtime(
                     prompt,
                     options,
                     enabled,
+                    parameters,
                 } => {
                     let request = runtime.allocate_request();
                     runtime.wait_request = Some(request);
@@ -705,6 +707,18 @@ pub fn drive_story_runtime(
                         return;
                     };
                     let choice_model = StoredValue::Map(BTreeMap::from([
+                        (
+                            "parameters".into(),
+                            StoredValue::Map(
+                                parameters
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter_map(|(index, value)| {
+                                        value.map(|value| (index.to_string(), value))
+                                    })
+                                    .collect(),
+                            ),
+                        ),
                         (
                             "enabled".into(),
                             StoredValue::Array(

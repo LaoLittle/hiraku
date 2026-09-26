@@ -97,7 +97,7 @@ impl Sprite3dMaterial {
                 flip: Vec4::new(
                     layer.flip_x as u8 as f32,
                     layer.flip_y as u8 as f32,
-                    0.0,
+                    layer.crossfade.map(|p| p.clamp(0.0, 1.0)).unwrap_or(-1.0),
                     0.0,
                 ),
             };
@@ -180,6 +180,25 @@ mod tests {
             material.uniform.dissolve,
             Vec4::new(0.5, 0.25, 1920.0, 1080.0)
         );
+    }
+
+    #[test]
+    fn crossfade_progress_is_separate_from_intrinsic_opacity() {
+        let sprite = Sprite3d {
+            layers: vec![
+                SpriteLayer::default(),
+                SpriteLayer {
+                    color: Color::linear_rgba(1.0, 0.0, 0.0, 0.4),
+                    crossfade: Some(0.5),
+                    ..default()
+                },
+            ],
+            ..default()
+        };
+        let material = Sprite3dMaterial::try_from(&sprite).expect("valid crossfade");
+        assert_eq!(material.uniform.layers[0].flip.z, -1.0);
+        assert_eq!(material.uniform.layers[1].flip.z, 0.5);
+        assert_eq!(material.uniform.layers[1].tint.w, 0.4);
     }
 
     #[test]

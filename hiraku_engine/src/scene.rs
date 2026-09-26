@@ -79,8 +79,8 @@ pub(crate) mod screen_ui;
 mod snapshot;
 pub(crate) mod ui_hover;
 pub(crate) mod ui_timers;
-mod video_runtime;
 mod video_pictures;
+mod video_runtime;
 pub(crate) mod widgets;
 
 pub use animation_runtime::{
@@ -312,6 +312,7 @@ pub struct PendingCharacterShow {
 }
 
 #[derive(Component, Clone, Debug)]
+#[require(Transform, Visibility)]
 pub struct CharacterRoot {
     pub actor_id: String,
 }

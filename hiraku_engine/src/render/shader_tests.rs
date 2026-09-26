@@ -184,6 +184,10 @@ fn embedded_wesl_modules_link_for_material_variants() {
         ),
         ("blur", include_str!("../effect/shaders/blur.wesl")),
         (
+            "composition_crossfade",
+            include_str!("../effect/shaders/composition_crossfade.wesl"),
+        ),
+        (
             "sprite3d",
             include_str!("../../../hiraku_sprite3d/src/sprite3d.wesl"),
         ),
@@ -254,7 +258,7 @@ fn embedded_wesl_modules_link_for_material_variants() {
         source
     );
     for material in [true, false] {
-        for stage in 0..3 {
+        for stage in 0..4 {
             let linked = cache
                 .get(
                     100 + stage as usize,

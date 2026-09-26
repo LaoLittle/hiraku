@@ -4,6 +4,7 @@ mod character;
 mod data;
 pub mod dependencies;
 mod effect;
+pub use effect::composition::{CompositionBlend, CompositionCrossfadeMaterial};
 pub use effect::post_process::{EffectParameters, PostProcessSettings};
 pub use effect::program::{EffectInstance, EffectShader, EffectUniform, LayerEffectShaders};
 mod glossary;
@@ -287,12 +288,14 @@ impl Plugin for HirakuPlugin {
         app.add_plugins(texture::ArtworkPlugin);
         effect::custom::load_internal_shaders(app);
         effect::transition::load_internal_shaders(app);
+        effect::composition::load_internal_shaders(app);
         render::character_part::load_internal_shaders(app);
         app.add_plugins((
             hiraku_uastc::UastcPlugin,
             hiraku_video::HirakuVideoPlugin,
             MaterialPlugin::<CustomScreenEffectMaterial>::default(),
             MaterialPlugin::<RuleTransitionMaterial>::default(),
+            MaterialPlugin::<CompositionCrossfadeMaterial>::default(),
             MaterialPlugin::<AlphaMaskMaterial>::default(),
             MaterialPlugin::<MultiplyMaterial>::default(),
             PostProcessPlugin,

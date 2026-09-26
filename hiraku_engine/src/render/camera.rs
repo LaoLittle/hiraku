@@ -128,6 +128,11 @@ impl CameraView {
     }
 }
 
+/// Bottom-left percentage point to centered camera-local canvas coordinates.
+pub(crate) fn resolve_camera_anchor(point: Vec2, canvas: Vec2) -> Vec3 {
+    ((point / 100.0 - Vec2::splat(0.5)) * canvas).extend(0.0)
+}
+
 /// Independent virtual views sharing one physical presentation camera.
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
 pub struct CameraState {

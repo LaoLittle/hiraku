@@ -157,13 +157,9 @@ pub fn animate_visual_tweens(
     {
         tween.timer.tick(time.delta());
         let fraction = tween_fraction(&tween.timer);
-        // Ease the incoming image over an opaque predecessor. Fading both
-        // independently makes a pair of half-alpha parts only 75% opaque.
-        let alpha_fraction = if replacement_fade {
-            0.5 - 0.5 * (std::f32::consts::PI * fraction).cos()
-        } else {
-            fraction
-        };
+        // Replacement progress is consumed by the compositor as a linear mix,
+        // not as an additional easing curve or an alpha-over operation.
+        let alpha_fraction = fraction;
         if let (Some(from), Some(to)) = (tween.from_alpha, tween.to_alpha) {
             set_visual_alpha(
                 sprite.as_deref_mut(),

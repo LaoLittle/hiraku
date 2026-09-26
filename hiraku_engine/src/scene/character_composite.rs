@@ -12,7 +12,7 @@ pub(crate) struct LogicalCharacterPart(
     pub CharacterPartDefinition,
     pub Option<Handle<source::AtlasSource>>,
 );
-/// A replacement enters over its still-opaque predecessor in the same slot.
+/// A replacement interpolates with its predecessor in the same slot.
 #[derive(Component)]
 pub(crate) struct ReplacementFadeIn;
 #[derive(Component)]
@@ -226,17 +226,25 @@ fn compose_groups(
         &mut CharacterGroup,
         &super::CharacterRoot,
         Option<&super::character::ActorPlacement>,
+        &mut Transform,
     )>,
-    parts: Query<(
-        &LogicalCharacterPart,
-        &WorldSprite,
-        &Transform,
-        &Visibility,
-        Has<FocusedActorPart>,
-    )>,
+    parts: Query<
+        (
+            &LogicalCharacterPart,
+            &WorldSprite,
+            &Transform,
+            &Visibility,
+            Has<FocusedActorPart>,
+        ),
+        Without<super::CharacterRoot>,
+    >,
     mut displays: Query<
         (&mut Sprite3d, &mut Transform, &mut Visibility),
-        (With<CompositeDisplay>, Without<LogicalCharacterPart>),
+        (
+            With<CompositeDisplay>,
+            Without<LogicalCharacterPart>,
+            Without<super::CharacterRoot>,
+        ),
     >,
 ) {
     let changed = image_events
@@ -252,7 +260,23 @@ fn compose_groups(
         .as_ref()
         .map_or(8192, |device| device.limits().max_texture_dimension_2d);
     let changed_sources = cpu.changed();
-    for (root, children, mut group, identity, placement) in &mut roots {
+    for (root, children, mut group, identity, placement, mut root_transform) in &mut roots {
+        // Stage anchors already specify world-space depth. ADV draw ordering on
+        // the parent would otherwise translate anchored actors by up to one
+        // world unit, and restore changes that ordering by rebuilding by name.
+        let spatial_actor = shared
+            .0
+            .spatial_stage
+            .as_ref()
+            .is_some_and(|s| s.actors.contains_key(&identity.actor_id));
+        root_transform.translation.z = character_root_depth(
+            spatial_actor,
+            stage
+                .character_order
+                .iter()
+                .position(|id| id == &identity.actor_id),
+            stage.character_order.len(),
+        );
         group.packed.invalidate(&changed);
         group.packed.invalidate_sources(&changed_sources);
         let selected = children
@@ -363,6 +387,20 @@ fn compose_groups(
             }
         };
         for (index, layer) in layers.iter_mut().enumerate() {
+            if index > 0 {
+                let previous = selected[index - 1].0;
+                let current = selected[index].0;
+                if current.0.slot.is_some() && current.0.slot == previous.0.slot {
+                    let intrinsic =
+                        crate::render::character_part::rgba8_color(current.0.color).alpha();
+                    layer.crossfade = Some(if intrinsic > 0.0 {
+                        (layer.color.alpha() / intrinsic).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    });
+                    layer.color.set_alpha(intrinsic);
+                }
+            }
             layer.texture_atlas = Some(TextureAtlas {
                 layout: atlas.clone(),
                 index,
@@ -460,6 +498,24 @@ fn compose_groups(
             );
         }
     }
+}
+
+fn character_root_depth(spatial: bool, index: Option<usize>, count: usize) -> f32 {
+    if spatial {
+        0.0
+    } else {
+        index.unwrap_or(0) as f32 / count.max(1) as f32
+    }
+}
+
+#[test]
+fn anchored_actor_depth_is_independent_of_spawn_or_restore_order() {
+    let anchor = Transform::from_xyz(3.0, 0.0, -4.0);
+    for index in 0..4 {
+        let root = Transform::from_xyz(0.0, 0.0, character_root_depth(true, Some(index), 4));
+        assert_eq!(root.mul_transform(anchor), anchor);
+    }
+    assert_eq!(character_root_depth(false, Some(3), 4), 0.75);
 }
 
 fn replacement_order(
@@ -771,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn replaced_slot_renders_opaque_predecessor_below_incoming_part() {
+    fn replaced_slot_keeps_predecessor_adjacent_for_linear_composition() {
         let mut old = part("alice/eyes_old", [0.0, 0.0, 4.0, 4.0]).0;
         old.slot = Some(1);
         old.layer = 30.0;
@@ -784,9 +840,10 @@ mod tests {
         let new_key = replacement_order(&new, "alice", Some(&active), &slots);
         assert_eq!(old_key.0, new_key.0);
         assert!(old_key.1 < new_key.1);
-        // Alpha-over an opaque predecessor stays opaque throughout the fade.
+        // Mixing opaque operands stays opaque; transparent incoming texels
+        // remove the outgoing silhouette progressively, not only at the end.
         for incoming in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let composed = incoming + 1.0 * (1.0 - incoming);
+            let composed = (1.0 - incoming) + incoming;
             assert_eq!(composed, 1.0);
         }
     }

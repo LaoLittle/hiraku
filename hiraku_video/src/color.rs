@@ -7,7 +7,7 @@ use bevy::{
 ///
 /// Each row includes its offset in `w`, allowing the shader to evaluate a
 /// complete output channel with one four-component dot product.
-#[derive(Clone, Copy, Debug, ShaderType)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
 pub(crate) struct YuvColorTransform {
     pub row_r: Vec4,
     pub row_g: Vec4,

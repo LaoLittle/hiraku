@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bevy::{ecs::system::SystemParam, prelude::*};
-use hiraku_video::{VideoAsset, VideoPlaybackId, VideoPlaybackState, VideoPlayer};
+use hiraku_video::{VideoAsset, VideoPlaybackId, VideoPlaybackState, VideoPlayer, VideoWorldView};
 
 use super::pictures::{PictureState, PictureVideo};
 
@@ -13,6 +13,7 @@ pub(crate) struct VideoPicture {
     path: String,
     source: PictureVideo,
     playback: VideoPlaybackId,
+    owns_playback: bool,
 }
 
 impl VideoPicture {
@@ -80,6 +81,7 @@ impl VideoPictures<'_, '_> {
         background_view: Option<&crate::render::camera::CameraView>,
     ) {
         let mut existing = HashSet::new();
+        let mut owners = Vec::new();
         for (entity, mut marker, mut transform) in &mut self.entities {
             let previous = marker.previous.or_else(|| {
                 let incoming = pictures.get(&marker.id)?;
@@ -95,20 +97,37 @@ impl VideoPictures<'_, '_> {
                 picture.path == marker.path && picture.video.as_ref() == Some(&marker.source)
             });
             let Some(picture) = picture else {
-                self.player.skip(marker.playback);
+                if marker.owns_playback {
+                    self.player.skip(marker.playback);
+                }
                 commands.entity(entity).try_despawn();
                 continue;
             };
             marker.previous = previous;
             existing.insert(key);
+            if marker.owns_playback {
+                owners.push((
+                    marker.id.clone(),
+                    marker.path.clone(),
+                    marker.source.clone(),
+                    marker.playback,
+                ));
+            }
             commands.entity(entity).try_insert(picture.view);
             let next =
                 video_transform(picture, previous, pictures, canvas, camera, background_view);
             if *transform != next {
                 *transform = next;
             }
-            self.player
-                .set_opacity(marker.playback, picture.alpha * picture.tint[3]);
+            if marker.owns_playback {
+                self.player
+                    .set_opacity(marker.playback, picture.alpha * picture.tint[3]);
+            } else {
+                let mut view = VideoWorldView::new(marker.playback, Vec2::ONE).expect("unit view");
+                view.set_opacity(picture.alpha * picture.tint[3])
+                    .expect("validated picture alpha");
+                commands.entity(entity).try_insert(view);
+            }
             self.player
                 .set_suspended(marker.playback, self.clock.context().paused);
         }
@@ -135,6 +154,54 @@ impl VideoPictures<'_, '_> {
                 ))
                 .id();
             let layout = source.layout;
+            if let Some((_, _, _, playback)) = owners.iter().find(|(owner_id, path, video, _)| {
+                owner_id == id && path == &picture.path && video == source
+            }) {
+                if previous.is_none() && self.player.reparent_world(*playback, entity) {
+                    // An interrupted replacement may return to a source whose
+                    // owner is currently an outgoing layer. Promote the new
+                    // surface so retiring that layer cannot stop this playback.
+                    for (old_entity, mut old, _) in &mut self.entities {
+                        if old.playback == *playback && old.owns_playback {
+                            old.owns_playback = false;
+                            let mut view =
+                                VideoWorldView::new(*playback, Vec2::ONE).expect("unit view");
+                            if let Some(old_picture) = rendered.get(&(old.id.clone(), old.previous))
+                            {
+                                view.set_opacity(old_picture.alpha * old_picture.tint[3])
+                                    .expect("validated picture alpha");
+                            }
+                            commands.entity(old_entity).try_insert(view);
+                        }
+                    }
+                    self.player
+                        .set_opacity(*playback, picture.alpha * picture.tint[3]);
+                    commands.entity(entity).insert(VideoPicture {
+                        id: id.clone(),
+                        previous: None,
+                        path: picture.path.clone(),
+                        source: source.clone(),
+                        playback: *playback,
+                        owns_playback: true,
+                    });
+                    continue;
+                }
+                let mut view = VideoWorldView::new(*playback, Vec2::ONE).expect("unit view");
+                view.set_opacity(picture.alpha * picture.tint[3])
+                    .expect("validated picture alpha");
+                commands.entity(entity).insert((
+                    view,
+                    VideoPicture {
+                        id: id.clone(),
+                        previous: *previous,
+                        path: picture.path.clone(),
+                        source: source.clone(),
+                        playback: *playback,
+                        owns_playback: false,
+                    },
+                ));
+                continue;
+            }
             let asset: Handle<VideoAsset> = assets
                 .load_builder()
                 .with_settings(move |settings: &mut hiraku_video::VideoLoaderSettings| {
@@ -156,7 +223,9 @@ impl VideoPictures<'_, '_> {
                 path: picture.path.clone(),
                 source: source.clone(),
                 playback,
+                owns_playback: true,
             });
+            owners.push((id.clone(), picture.path.clone(), source.clone(), playback));
         }
     }
 }
@@ -325,6 +394,118 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn same_playback_replacement_creates_a_non_owning_view() {
+        let mut app = fixture();
+        app.update();
+        let playback = app
+            .world_mut()
+            .query::<&VideoPicture>()
+            .single(app.world())
+            .expect("primary")
+            .playback;
+        {
+            let mut shared = app
+                .world_mut()
+                .resource_mut::<crate::state::SceneSharedState>();
+            let picture = shared.0.pictures.get_mut("water").expect("picture");
+            let mut previous = picture.clone();
+            previous.alpha = 1.0;
+            previous.fade = None;
+            previous.motion = None;
+            picture.previous.push(previous);
+            picture.position = [75.0, 50.0];
+        }
+        app.update();
+        let mut query = app.world_mut().query::<&VideoPicture>();
+        let views: Vec<_> = query.iter(app.world()).collect();
+        assert_eq!(views.len(), 2);
+        assert!(views.iter().all(|view| view.playback == playback));
+        assert_eq!(views.iter().filter(|view| view.owns_playback).count(), 1);
+        app.world_mut()
+            .resource_mut::<crate::state::SceneSharedState>()
+            .0
+            .pictures
+            .get_mut("water")
+            .expect("picture")
+            .previous
+            .clear();
+        app.update();
+        let primary = app
+            .world_mut()
+            .query::<&VideoPicture>()
+            .single(app.world())
+            .expect("primary retained");
+        assert_eq!(primary.playback, playback);
+        assert!(primary.owns_playback);
+    }
+
+    #[test]
+    fn returning_to_an_outgoing_video_transfers_ownership_before_retirement() {
+        let mut app = fixture();
+        app.update();
+        let playback = app
+            .world_mut()
+            .query::<&VideoPicture>()
+            .single(app.world())
+            .expect("original")
+            .playback;
+        {
+            let mut shared = app
+                .world_mut()
+                .resource_mut::<crate::state::SceneSharedState>();
+            let picture = shared.0.pictures.get_mut("water").expect("picture");
+            let mut old = picture.clone();
+            old.previous.clear();
+            old.alpha = 1.0;
+            picture.previous.push(old);
+            picture.path = "other.webma".into();
+        }
+        app.update();
+        {
+            let mut shared = app
+                .world_mut()
+                .resource_mut::<crate::state::SceneSharedState>();
+            let picture = shared.0.pictures.get_mut("water").expect("picture");
+            let mut old = picture.clone();
+            old.previous.clear();
+            old.alpha = 1.0;
+            picture.previous.push(old);
+            picture.path = "water.webma".into();
+        }
+        app.update();
+        let mut query = app.world_mut().query::<&VideoPicture>();
+        let primary = query
+            .iter(app.world())
+            .find(|p| p.previous.is_none())
+            .expect("primary");
+        assert_eq!(primary.playback, playback);
+        assert!(primary.owns_playback);
+        assert_eq!(
+            query
+                .iter(app.world())
+                .filter(|p| p.playback == playback && p.owns_playback)
+                .count(),
+            1
+        );
+        app.world_mut()
+            .resource_mut::<crate::state::SceneSharedState>()
+            .0
+            .pictures
+            .get_mut("water")
+            .expect("picture")
+            .previous
+            .clear();
+        app.update();
+        let primary = app
+            .world_mut()
+            .query::<&VideoPicture>()
+            .single(app.world())
+            .expect("surviving owner");
+        assert_eq!(primary.playback, playback);
+        assert!(primary.owns_playback);
     }
 
     #[test]

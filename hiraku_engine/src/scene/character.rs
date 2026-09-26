@@ -697,8 +697,8 @@ pub fn poll_pending_character_shows(
                 commands.entity(entity).try_insert((
                     HideAfterTween,
                     VisualTween {
-                        // Standard alpha-over would reveal the background if
-                        // both old and new parts faded simultaneously.
+                        // Keep intrinsic opacity: the compositor mixes the
+                        // pair once, using the incoming part's progress.
                         from_alpha: (!replaced).then_some(1.0),
                         to_alpha: (!replaced).then_some(0.0),
                         from_translation: None,

@@ -26,6 +26,8 @@ use hiraku_media::{
 };
 
 const VIDEO_Z_INDEX: i32 = 30_000;
+mod views;
+pub use views::VideoWorldView;
 const LAST_FRAME_HOLD: Duration = Duration::from_millis(50);
 const AUDIO_SINK_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -104,6 +106,7 @@ pub struct VideoPlayer {
     next_id: u64,
     pending: VecDeque<PendingPlayback>,
     controls: VecDeque<PlaybackControl>,
+    reparents: Vec<(VideoPlaybackId, Entity)>,
     states: BTreeMap<VideoPlaybackId, VideoPlaybackState>,
     active: Option<VideoPlaybackId>,
     suspended: BTreeSet<VideoPlaybackId>,
@@ -111,6 +114,29 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
+    /// Transfer the owning spatial parent without restarting playback. The old
+    /// parent must remain alive until PostUpdate applies the presentation change.
+    pub fn reparent_world(&mut self, id: VideoPlaybackId, parent: Entity) -> bool {
+        if let Some(pending) = self.pending.iter_mut().find(|p| p.id == id) {
+            if pending.world_size.is_none() {
+                return false;
+            }
+            pending.parent = Some(parent);
+            return true;
+        }
+        if !matches!(
+            self.states.get(&id),
+            Some(
+                VideoPlaybackState::Loading
+                    | VideoPlaybackState::Playing
+                    | VideoPlaybackState::Paused
+            )
+        ) {
+            return false;
+        }
+        self.reparents.push((id, parent));
+        true
+    }
     /// Host animation opacity, multiplied with the video's natural exit fade.
     pub fn set_opacity(&mut self, id: VideoPlaybackId, opacity: f32) -> bool {
         if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) || !self.states.contains_key(&id)
@@ -351,6 +377,7 @@ impl Plugin for HirakuVideoPlugin {
         load_internal_shader(app);
         install_video_upload(app);
         app.insert_non_send(ActiveVideo::default());
+        views::install(app);
         app.init_asset::<VideoAsset>()
             .init_asset_loader::<VideoAssetLoader>()
             .add_audio_source::<VideoAudio>()

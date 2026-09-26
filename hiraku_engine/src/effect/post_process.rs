@@ -387,6 +387,7 @@ fn scene_pass(
             &blur,
             &mut blur_work,
             &mut ctx,
+            None,
         );
     } else {
         *blur_work = BlurWorkspace::default();
@@ -420,6 +421,7 @@ fn canvas_pass(
             &blur,
             &mut blur_work,
             &mut ctx,
+            None,
         );
     } else {
         *blur_work = BlurWorkspace::default();
@@ -563,6 +565,7 @@ fn draw_isolated_ui(
         &blur,
         &mut blur_work,
         &mut ctx,
+        None,
     );
 }
 
@@ -584,6 +587,15 @@ fn restore_ui(
     }
 }
 
+/// Explicit composition targets. Neither target aliases the other; both use
+/// the view's color format. This avoids flipping the main framebuffer when
+/// processing a layer that has not yet been composed into it.
+pub(super) struct EffectInput<'a> {
+    pub source: &'a TextureView,
+    pub destination: &'a TextureView,
+    pub size: UVec2,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_effect(
     target: &ViewTarget,
@@ -597,18 +609,19 @@ pub(super) fn apply_effect(
     blur: &BlurPipeline,
     blur_work: &mut BlurWorkspace,
     ctx: &mut RenderContext,
-) {
+    input: Option<EffectInput<'_>>,
+) -> bool {
     let Some(pipeline) = pipeline else {
-        return;
+        return false;
     };
     let Some(id) = pipeline
         .pipelines
         .get(&pipeline.key(target, stage, programs))
     else {
-        return;
+        return false;
     };
     let Some(compiled) = cache.get_render_pipeline(*id) else {
-        return;
+        return false;
     };
     let data = programs
         .and_then(|p| p.get(stage))
@@ -632,20 +645,32 @@ pub(super) fn apply_effect(
     let buffer = &uniform.as_ref().expect("effect uniform prepared").buffer;
     let use_blur = programs.and_then(|p| p.get(stage)).is_none() && settings.blur_radius > 0.001;
     if use_blur && !blur.ready(cache) {
-        return;
+        return false;
     }
-    let textures = target.post_process_write();
+    let textures;
+    let input = match input {
+        Some(input) => input,
+        None => {
+            textures = target.post_process_write();
+            let size = target.main_texture().size();
+            EffectInput {
+                source: textures.source,
+                destination: textures.destination,
+                size: UVec2::new(size.width, size.height),
+            }
+        }
+    };
     let blurred = if use_blur {
         let device = ctx.render_device().clone();
-        let size = target.main_texture().size();
+        let size = input.size;
         Some(
             blur.render(
                 &device,
                 cache,
                 ctx.command_encoder(),
-                ui.unwrap_or(textures.source),
-                UVec2::new(size.width, size.height),
-                Vec4::new(0.0, 0.0, size.width as f32, size.height as f32),
+                ui.unwrap_or(input.source),
+                size,
+                Vec4::new(0.0, 0.0, size.x as f32, size.y as f32),
                 0,
                 true,
                 settings.blur_radius,
@@ -658,15 +683,15 @@ pub(super) fn apply_effect(
         None
     };
     let scene_source = if stage == 1 {
-        textures.source
+        input.source
     } else {
-        blurred.as_ref().unwrap_or(textures.source)
+        blurred.as_ref().unwrap_or(input.source)
     };
     let ui_source = blurred
         .as_ref()
         .filter(|_| stage == 1)
         .or(ui)
-        .unwrap_or(textures.source);
+        .unwrap_or(input.source);
     let group = ctx.render_device().create_bind_group(
         "hiraku_effects",
         &cache.get_bind_group_layout(&pipeline.layout),
@@ -682,7 +707,7 @@ pub(super) fn apply_effect(
         .begin_render_pass(&RenderPassDescriptor {
             label: Some("hiraku_post_process"),
             color_attachments: &[Some(RenderPassColorAttachment {
-                view: textures.destination,
+                view: input.destination,
                 depth_slice: None,
                 resolve_target: None,
                 ops: Operations::default(),
@@ -695,4 +720,5 @@ pub(super) fn apply_effect(
     pass.set_pipeline(compiled);
     pass.set_bind_group(0, &group, &[]);
     pass.draw(0..3, 0..1);
+    true
 }
