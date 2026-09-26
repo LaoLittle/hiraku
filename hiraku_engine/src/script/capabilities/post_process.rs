@@ -37,9 +37,12 @@ mod modifiers {
                 "blur radius must be in 0..=128 texture pixels",
             ));
         }
-        modify(effect, |PostProcess::Settings(_, exposure, saturation, r, g, b)| {
-            PostProcess::Settings(radius, exposure, saturation, r, g, b)
-        })
+        modify(
+            effect,
+            |PostProcess::Settings(_, exposure, saturation, r, g, b)| {
+                PostProcess::Settings(radius, exposure, saturation, r, g, b)
+            },
+        )
     }
 
     #[hks(
@@ -56,9 +59,12 @@ mod modifiers {
         if !stops.is_finite() || !(-16.0..=16.0).contains(&stops) {
             return Err(NativeError::message("exposure must be in -16..=16 stops"));
         }
-        modify(effect, |PostProcess::Settings(blur, _, saturation, r, g, b)| {
-            PostProcess::Settings(blur, stops, saturation, r, g, b)
-        })
+        modify(
+            effect,
+            |PostProcess::Settings(blur, _, saturation, r, g, b)| {
+                PostProcess::Settings(blur, stops, saturation, r, g, b)
+            },
+        )
     }
 
     #[hks(
@@ -75,9 +81,12 @@ mod modifiers {
         if !value.is_finite() || !(0.0..=8.0).contains(&value) {
             return Err(NativeError::message("saturation must be in 0..=8"));
         }
-        modify(effect, |PostProcess::Settings(blur, exposure, _, r, g, b)| {
-            PostProcess::Settings(blur, exposure, value, r, g, b)
-        })
+        modify(
+            effect,
+            |PostProcess::Settings(blur, exposure, _, r, g, b)| {
+                PostProcess::Settings(blur, exposure, value, r, g, b)
+            },
+        )
     }
 
     #[hks(
@@ -94,12 +103,18 @@ mod modifiers {
         blue: f64,
     ) -> Result<Value, NativeError> {
         let _ = context;
-        if [red, green, blue].into_iter().any(|v| !v.is_finite() || v <= 0.0 || v > 16.0) {
+        if [red, green, blue]
+            .into_iter()
+            .any(|v| !v.is_finite() || v <= 0.0 || v > 16.0)
+        {
             return Err(NativeError::message("grayscale gamma must be in 0..=16"));
         }
-        modify(effect, |PostProcess::Settings(blur, exposure, saturation, _, _, _)| {
-            PostProcess::Settings(blur, exposure, saturation, red, green, blue)
-        })
+        modify(
+            effect,
+            |PostProcess::Settings(blur, exposure, saturation, _, _, _)| {
+                PostProcess::Settings(blur, exposure, saturation, red, green, blue)
+            },
+        )
     }
 }
 

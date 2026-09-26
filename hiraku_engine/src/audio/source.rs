@@ -67,9 +67,10 @@ impl EngineAudioSource {
                 if tags.stream_serial() != serial || !valid_tags(&tags.data) {
                     return Err(invalid("missing OpusTags or multiplexed stream"));
                 }
-                let mut decoder =
-                    AudioPacketDecoder::new(&AudioDecoderConfig::new("opus", 48000, channels))
-                        .map_err(invalid)?;
+                let mut decoder = AudioPacketDecoder::new(
+                    &AudioDecoderConfig::new("opus", 48000, channels).map_err(invalid)?,
+                )
+                .map_err(invalid)?;
                 let mut scratch = vec![0.0; decoder.output_capacity()];
                 let mut decoded = 0u64;
                 let mut previous_page_end = 0u64;
@@ -256,9 +257,10 @@ struct OpusPlayback {
 
 impl OpusPlayback {
     fn new(data: Arc<OpusData>) -> Result<Self, String> {
-        let decoder =
-            AudioPacketDecoder::new(&AudioDecoderConfig::new("opus", 48000, data.channels))
-                .map_err(|e| e.to_string())?;
+        let decoder = AudioPacketDecoder::new(
+            &AudioDecoderConfig::new("opus", 48000, data.channels).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self {
             buffer: vec![0.0; decoder.output_capacity()],
             data,

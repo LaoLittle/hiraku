@@ -990,6 +990,7 @@ fn packed_alpha_frame_is_blank(frame: &DecodedFrame, layout: Option<crate::Alpha
         return false;
     }
     let (bytes, stride, channels): (&[u8], usize, usize) = match &frame.pixels {
+        DecodedPixels::Planar16 { .. } | DecodedPixels::P010 { .. } => return false,
         DecodedPixels::I420Planar { y, .. } => (y, width, 1),
         DecodedPixels::I420Strided {
             planes, y_stride, ..
@@ -1113,7 +1114,7 @@ fn present_frame(
             });
             return;
         }
-        pixels @ DecodedPixels::I420Strided { .. } => {
+        pixels @ (DecodedPixels::I420Strided { .. } | DecodedPixels::Planar16 { .. }) => {
             present_strided_frame(
                 commands,
                 images,
@@ -1125,7 +1126,7 @@ fn present_frame(
             );
             return;
         }
-        pixels @ DecodedPixels::Nv12Strided { .. } => {
+        pixels @ (DecodedPixels::Nv12Strided { .. } | DecodedPixels::P010 { .. }) => {
             present_nv12_frame(
                 commands,
                 images,
@@ -1194,6 +1195,21 @@ fn present_strided_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
+    let wide = matches!(frame.pixels, DecodedPixels::Planar16 { .. });
+    if let Some(VideoSurface::YuvI420 {
+        y_image, u_image, ..
+    }) = &playback.surface
+    {
+        if images.get(y_image).is_none_or(|image| {
+            (image.texture_descriptor.format == TextureFormat::R16Float) != wide
+                || image.width() != frame.width
+                || image.height() != frame.height
+        }) || images.get(u_image).is_none_or(|image| {
+            image.width() != frame.chroma_width || image.height() != frame.chroma_height
+        }) {
+            replace_surface(commands, playback);
+        }
+    }
     let aspect_ratio = playback.display_aspect(frame.width, frame.height);
     let (y_image, u_image, v_image, image_entity) = if let Some(VideoSurface::YuvI420 {
         y_image,
@@ -1210,9 +1226,19 @@ fn present_strided_frame(
         )
     } else {
         replace_surface(commands, playback);
-        let y_image = images.add(empty_plane_image(frame.width, frame.height));
-        let u_image = images.add(empty_plane_image(frame.chroma_width, frame.chroma_height));
-        let v_image = images.add(empty_plane_image(frame.chroma_width, frame.chroma_height));
+        let y_image = images.add(empty_video_plane(frame.width, frame.height, wide, false));
+        let u_image = images.add(empty_video_plane(
+            frame.chroma_width,
+            frame.chroma_height,
+            wide,
+            false,
+        ));
+        let v_image = images.add(empty_video_plane(
+            frame.chroma_width,
+            frame.chroma_height,
+            wide,
+            false,
+        ));
         let material = materials.add(Yuv420Material {
             opacity: 1.0,
             alpha_layout: playback.alpha_layout,
@@ -1256,6 +1282,21 @@ fn present_nv12_frame(
     playback: &mut ActivePlayback,
     frame: DecodedFrame,
 ) {
+    let wide = matches!(frame.pixels, DecodedPixels::P010 { .. });
+    if let Some(VideoSurface::YuvNv12 {
+        y_image, uv_image, ..
+    }) = &playback.surface
+    {
+        if images.get(y_image).is_none_or(|image| {
+            (image.texture_descriptor.format == TextureFormat::R16Float) != wide
+                || image.width() != frame.width
+                || image.height() != frame.height
+        }) || images.get(uv_image).is_none_or(|image| {
+            image.width() != frame.chroma_width || image.height() != frame.chroma_height
+        }) {
+            replace_surface(commands, playback);
+        }
+    }
     let aspect_ratio = playback.display_aspect(frame.width, frame.height);
 
     let (y_image, uv_image, image_entity) = if let Some(VideoSurface::YuvNv12 {
@@ -1268,11 +1309,13 @@ fn present_nv12_frame(
     } else {
         replace_surface(commands, playback);
 
-        let y_image = images.add(empty_plane_image(frame.width, frame.height));
+        let y_image = images.add(empty_video_plane(frame.width, frame.height, wide, false));
 
-        let uv_image = images.add(empty_uv_plane_image(
+        let uv_image = images.add(empty_video_plane(
             frame.chroma_width,
             frame.chroma_height,
+            wide,
+            true,
         ));
 
         let dummy_image = images.add(empty_plane_image(1, 1));
@@ -1453,6 +1496,31 @@ fn empty_plane_image(width: u32, height: u32) -> Image {
         TextureDimension::D2,
         &[0],
         TextureFormat::R8Unorm,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+fn empty_video_plane(width: u32, height: u32, wide: bool, interleaved: bool) -> Image {
+    if !wide {
+        return if interleaved {
+            empty_uv_plane_image(width, height)
+        } else {
+            empty_plane_image(width, height)
+        };
+    }
+    Image::new_fill(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        if interleaved { &[0, 0, 0, 0] } else { &[0, 0] },
+        if interleaved {
+            TextureFormat::Rg16Float
+        } else {
+            TextureFormat::R16Float
+        },
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     )
 }

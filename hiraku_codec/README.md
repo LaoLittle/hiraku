@@ -32,7 +32,7 @@ them through ordinary Rust ownership.
 use hiraku_codec::{AudioDecoder, AudioDecoderConfig, DecoderEvent};
 
 let mut decoder = AudioDecoder::new()?;
-decoder.configure(AudioDecoderConfig::new("opus", 48_000, 2))?;
+decoder.configure(AudioDecoderConfig::new("opus", 48_000, 2)?)?;
 // Feed EncodedAudioChunk values supplied by your demuxer or network transport.
 let barrier = decoder.flush()?;
 
@@ -63,23 +63,28 @@ This is an interface, not a promise that a platform's encoder is wired up.
 
 ## Backend support
 
-Codec identifiers are open strings, not an exhaustive codec enum. New codecs can
-be added in backend dispatch without changing the API.
+`Codec` is a parsed enum with AV1/VP9 profile and color metadata. Constructors
+accept `TryInto<Codec>`: either a registry string or a `Codec` value. Parsing uses
+`FromStr`/`TryFrom`, not infallible `From`; malformed and unsupported identifiers
+return errors. Parsing success does not imply adapter support.
 
 | Backend | Current support |
 | --- | --- |
-| Software | AV1 profile 0, 8-bit 4:2:0 via rav1d; mono/stereo Opus via hiraku-opus |
-| macOS / iOS | AV1 and VP9 VideoToolbox, subject to device capability |
-| Windows | AV1, VP8 and VP9 hardware Media Foundation transforms |
-| Android | AV1, VP8 and VP9 MediaCodec byte-buffer output |
+| Software | AV1 profiles 0/1/2, 8/10/12-bit planar output via rav1d; mono/stereo Opus via hiraku-opus |
+| macOS / iOS | AV1, VP9, AVC and HEVC VideoToolbox, subject to device capability |
+| Windows | AV1, VP8, VP9, AVC and HEVC hardware Media Foundation transforms |
+| Android | AV1, VP8, VP9, AVC and HEVC MediaCodec byte-buffer output |
 | Linux | AV1 and VP9 VA-API through cros-codecs |
 | Web | Configuration and chunks forwarded to browser WebCodecs; support depends on the browser |
 
 Native work runs on dedicated workers with bounded output queues and cancellable
 sends. Browser bindings are private to `platform/wasm`, including the audio types
 that web-sys gates as unstable; no `web_sys_unstable_apis` rustc flag is required.
-Raw-frame copy conversion currently supports SDR I420/NV12 or RGBA; HDR tone
-mapping and higher-bit-depth output are not implemented.
+Frames support planar 8/10/12-bit, NV12, P010 and RGBA. VideoToolbox exposes P010;
+WebCodecs exposes its planar high-depth formats. Windows/Android/VA-API bridges
+currently reject high-depth output before input submission, allowing AV1 software
+fallback. PQ/HLG and BT.2020 conversion are supported by the video renderer, which
+tone maps to its SDR output; HDR display/swapchain output is not implemented.
 
 The default `hardware` feature enables native platform backends.
 Native default selection tries platform hardware, then the AV1 software adapter,
@@ -88,12 +93,13 @@ No codec is rejected just because the software adapter does not implement it.
 Support queries use the same adapter creation/negotiation as configure; native
 queries can allocate a temporary hardware session. No fallback occurs after input
 has been consumed. Use `--no-default-features --features software` for software only.
-With no features, codec creation reports unsupported instead of failing to compile.
+With no features, video decoding reports unsupported; native Opus audio remains
+available. Video feature flags never disable audio decoding or the synchronous
+Opus packet decoder. Web's asynchronous audio decoder continues to use WebCodecs.
 
-Native VP9 currently accepts profile 0, 8-bit 4:2:0 SDR registry strings, with no
-description (as required by the WebCodecs VP9 registration). Other profiles are
-rejected. Platform support also depends on CPU-readable I420/NV12 output.
-Web forwards open codec strings and acceleration preferences to WebCodecs; the
+VP9 profiles 0–3 parse successfully; support depends on the adapter and its output
+bridge. VP9 requires no description, following the WebCodecs registration.
+Web forwards validated codec strings and acceleration preferences to WebCodecs; the
 browser does not expose the adapter identity or guarantee hardware execution.
 Android NDK codec selection rejects known Android/Google software implementations;
 vendor codec hardware classification is not exposed by the supported NDK API level.
@@ -101,3 +107,43 @@ vendor codec hardware classification is not exposed by the supported NDK API lev
 Windows uses synchronous/asynchronous MFTs with CPU-readable NV12 output.
 D3D-only transforms needing a device manager and GPU surface sharing are not
 supported yet. Windows x86 builds with rav1d assembly require NASM.
+
+## AVC / HEVC input
+
+AVC uses `avc1.PPCCLL` / `avc3.PPCCLL`; HEVC uses `hvc1` / `hev1` registry
+identifiers with profile-space, compatibility, tier/level and constraint bytes.
+Names such as `h264` and `h265` are not WebCodecs codec strings and are rejected.
+The parsed Rust representations are `AvcCodec` and `HevcCodec`.
+
+Following the registrations, a present description means an avcC/hvcC record
+and length-prefixed access units; absent description means Annex B. Windows and
+Android convert configuration records and input NALs to Annex B. VideoToolbox
+accepts description records directly, or creates its session from parameter sets
+in the first Annex B key chunk. This deferred path cannot validate a specific
+stream's hardware profile until the first key chunk arrives. In-band format
+changes drain delayed output before replacing the session.
+
+There is no AVC/HEVC software fallback. Linux VA-API AVC/HEVC integration remains
+pending and returns Unsupported. Windows/Android still negotiate only 8-bit CPU
+output; their high-depth bridges remain pending. No FFmpeg dependency is used.
+
+## API coverage
+
+All requested interface names are exported: AudioData, AudioDecoder, AudioEncoder,
+EncodedAudioChunk, EncodedVideoChunk, ImageDecoder, ImageTrack, ImageTrackList,
+VideoDecoder, VideoEncoder, VideoColorSpace and VideoFrame.
+
+ImageDecoder and encoders are interface-only: queries return false and creation
+or configuration returns Unsupported. Image decoding uses MIME types and async
+decode results; no empty successful output is fabricated. VideoColorSpace keeps
+nullable registry metadata independently of resolved renderer color transforms.
+It is currently a standalone metadata contract, not a decoder override.
+AudioData exposes validated f32 buffer construction and f32/interleaved-or-planar
+copying; other sample conversion formats are declared but return Unsupported.
+Encoded chunks expose byte_length/copy_to. Rust ownership and consuming close
+replace JS detached-object lifetimes. VideoFrame buffer constructors/copy formats
+and streaming ImageDecoder input are not yet a complete Web IDL implementation.
+
+References: [WebCodecs](https://www.w3.org/TR/webcodecs/),
+[AVC registration](https://www.w3.org/TR/webcodecs-avc-codec-registration/),
+[HEVC registration](https://www.w3.org/TR/webcodecs-hevc-codec-registration/).

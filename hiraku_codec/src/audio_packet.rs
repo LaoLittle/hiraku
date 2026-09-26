@@ -22,20 +22,23 @@ impl AudioPacketDecoder {
     }
 }
 
-#[cfg(all(test, feature = "software"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Codec;
     #[test]
     fn packet_decoder_validates_config_and_output_before_decoding() {
         for config in [
-            AudioDecoderConfig::new("unknown", 48000, 2),
-            AudioDecoderConfig::new("opus", 48000, 3),
-            AudioDecoderConfig::new("opus", 0, 1),
+            AudioDecoderConfig::new(Codec::Vp8, 48000, 2).expect("valid codec identifier"),
+            AudioDecoderConfig::new("opus", 48000, 3).expect("valid codec identifier"),
+            AudioDecoderConfig::new("opus", 0, 1).expect("valid codec identifier"),
         ] {
             assert!(AudioPacketDecoder::new(&config).is_err());
         }
-        let mut decoder =
-            AudioPacketDecoder::new(&AudioDecoderConfig::new("opus", 48000, 1)).expect("Opus");
+        let mut decoder = AudioPacketDecoder::new(
+            &AudioDecoderConfig::new("opus", 48000, 1).expect("valid codec identifier"),
+        )
+        .expect("Opus");
         assert_eq!(decoder.output_capacity(), 5760);
         assert!(
             decoder

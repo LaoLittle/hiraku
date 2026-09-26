@@ -1,6 +1,6 @@
 //! Rust control surface modelled on WebCodecs. Calls enqueue work; output and
 //! flush completion are polled, so an ECS system never waits for a decoder.
-use crate::{AudioData, DecodeSettings, VideoFrame, platform};
+use crate::{AudioData, Codec, DecodeSettings, VideoFrame, platform};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -32,22 +32,6 @@ pub enum HardwareAcceleration {
     PreferSoftware,
 }
 
-/// An open codec string, using WebCodecs codec registry identifiers.
-/// A backend decides support; adding a codec never changes this public type.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Codec(pub String);
-
-impl From<&str> for Codec {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-impl From<String> for Codec {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct VideoDecoderConfig {
     pub codec: Codec,
@@ -61,16 +45,20 @@ pub struct VideoDecoderConfig {
 }
 
 impl VideoDecoderConfig {
-    pub fn new(codec: impl Into<Codec>, width: u32, height: u32) -> Self {
-        Self {
-            codec: codec.into(),
+    pub fn new(
+        codec: impl TryInto<Codec, Error: Into<CodecError>>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            codec: codec.try_into().map_err(Into::into)?,
             coded_width: width,
             coded_height: height,
             description: None,
             hardware_acceleration: HardwareAcceleration::NoPreference,
             optimize_for_latency: false,
             software: DecodeSettings::default(),
-        }
+        })
     }
     pub(crate) fn validate(&self) -> Result<(), CodecError> {
         validate_codec(&self.codec)?;
@@ -92,13 +80,17 @@ pub struct AudioDecoderConfig {
 }
 
 impl AudioDecoderConfig {
-    pub fn new(codec: impl Into<Codec>, sample_rate: u32, channels: u16) -> Self {
-        Self {
-            codec: codec.into(),
+    pub fn new(
+        codec: impl TryInto<Codec, Error: Into<CodecError>>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            codec: codec.try_into().map_err(Into::into)?,
             sample_rate,
             number_of_channels: channels,
             description: None,
-        }
+        })
     }
     pub(crate) fn validate(&self) -> Result<(), CodecError> {
         validate_codec(&self.codec)?;
@@ -112,13 +104,7 @@ impl AudioDecoderConfig {
 }
 
 pub(crate) fn validate_codec(codec: &Codec) -> Result<(), CodecError> {
-    if codec.0.is_empty() || codec.0.chars().any(char::is_whitespace) {
-        Err(CodecError::Configuration(
-            "codec must be a nonempty registry identifier".into(),
-        ))
-    } else {
-        Ok(())
-    }
+    codec.validate()
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +132,39 @@ pub struct EncodedChunk {
 pub struct EncodedVideoChunk(pub EncodedChunk);
 #[derive(Clone, Debug)]
 pub struct EncodedAudioChunk(pub EncodedChunk);
+
+macro_rules! chunk_accessors {
+    ($name:ident) => {
+        impl $name {
+            pub fn new(init: EncodedChunk) -> Self {
+                Self(init)
+            }
+            pub fn kind(&self) -> ChunkType {
+                self.0.kind
+            }
+            pub fn timestamp(&self) -> i64 {
+                self.0.timestamp
+            }
+            pub fn duration(&self) -> Option<u64> {
+                self.0.duration
+            }
+            pub fn byte_length(&self) -> usize {
+                self.0.data.len()
+            }
+            pub fn copy_to(&self, destination: &mut [u8]) -> Result<(), CodecError> {
+                let output = destination.get_mut(..self.byte_length()).ok_or_else(|| {
+                    CodecError::Configuration("chunk destination is too small".into())
+                })?;
+                output.copy_from_slice(&self.0.data);
+                Ok(())
+            }
+        }
+    };
+}
+chunk_accessors!(EncodedAudioChunk);
+chunk_accessors!(EncodedVideoChunk);
+pub type EncodedAudioChunkInit = EncodedChunk;
+pub type EncodedVideoChunkInit = EncodedChunk;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlushId(pub u64);

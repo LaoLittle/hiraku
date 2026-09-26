@@ -39,12 +39,12 @@ pub fn workspace_base_path() -> PathBuf {
     #[cfg(target_os = "android")]
     {
         bevy::android::ANDROID_APP
-                    .get()
-                    .expect("Android context must be initialized")
-                    .internal_data_path()
-                    .expect("Android internal data directory is unavailable")
+            .get()
+            .expect("Android context must be initialized")
+            .internal_data_path()
+            .expect("Android internal data directory is unavailable")
     }
-    
+
     #[cfg(not(target_os = "android"))]
     {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))

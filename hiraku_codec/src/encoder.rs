@@ -3,6 +3,35 @@
 use crate::*;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AvcBitstreamFormat {
+    #[default]
+    Avc,
+    AnnexB,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HevcBitstreamFormat {
+    #[default]
+    Hevc,
+    AnnexB,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AvcEncoderConfig {
+    pub format: AvcBitstreamFormat,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HevcEncoderConfig {
+    pub format: HevcBitstreamFormat,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VideoEncoderEncodeOptionsForAvc {
+    pub quantizer: Option<u16>,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VideoEncoderEncodeOptionsForHevc {
+    pub quantizer: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AlphaOption {
     #[default]
     Discard,
@@ -30,6 +59,8 @@ pub enum AudioEncoderBitrateMode {
 
 #[derive(Clone, Debug)]
 pub struct VideoEncoderConfig {
+    pub avc: Option<AvcEncoderConfig>,
+    pub hevc: Option<HevcEncoderConfig>,
     pub codec: Codec,
     pub width: u32,
     pub height: u32,
@@ -44,9 +75,15 @@ pub struct VideoEncoderConfig {
     pub latency_mode: LatencyMode,
 }
 impl VideoEncoderConfig {
-    pub fn new(codec: impl Into<Codec>, width: u32, height: u32) -> Self {
-        Self {
-            codec: codec.into(),
+    pub fn new(
+        codec: impl TryInto<Codec, Error: Into<CodecError>>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            avc: None,
+            hevc: None,
+            codec: codec.try_into().map_err(Into::into)?,
             width,
             height,
             display_width: None,
@@ -58,7 +95,7 @@ impl VideoEncoderConfig {
             scalability_mode: None,
             bitrate_mode: VideoEncoderBitrateMode::Variable,
             latency_mode: LatencyMode::Quality,
-        }
+        })
     }
     fn validate(&self) -> Result<(), CodecError> {
         crate::codec::validate_codec(&self.codec)?;
@@ -89,21 +126,25 @@ pub struct AudioEncoderConfig {
     pub bitrate_mode: AudioEncoderBitrateMode,
 }
 impl AudioEncoderConfig {
-    pub fn new(codec: impl Into<Codec>, sample_rate: u32, number_of_channels: u16) -> Self {
-        Self {
-            codec: codec.into(),
+    pub fn new(
+        codec: impl TryInto<Codec, Error: Into<CodecError>>,
+        sample_rate: u32,
+        number_of_channels: u16,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            codec: codec.try_into().map_err(Into::into)?,
             sample_rate,
             number_of_channels,
             bitrate: None,
             bitrate_mode: AudioEncoderBitrateMode::Variable,
-        }
+        })
     }
     fn validate(&self) -> Result<(), CodecError> {
         AudioDecoderConfig::new(
             self.codec.clone(),
             self.sample_rate,
             self.number_of_channels,
-        )
+        )?
         .validate()?;
         if self.bitrate == Some(0) {
             return Err(CodecError::Configuration("bitrate must be positive".into()));
@@ -115,6 +156,8 @@ impl AudioEncoderConfig {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VideoEncoderEncodeOptions {
     pub key_frame: bool,
+    pub avc: Option<VideoEncoderEncodeOptionsForAvc>,
+    pub hevc: Option<VideoEncoderEncodeOptionsForHevc>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -234,7 +277,8 @@ mod tests {
     use futures_lite::future::block_on;
     #[test]
     fn encoder_never_claims_an_unimplemented_backend() {
-        let config = VideoEncoderConfig::new("vp09.00.10.08", 64, 64);
+        let config =
+            VideoEncoderConfig::new("vp09.00.10.08", 64, 64).expect("valid codec identifier");
         assert!(
             !block_on(VideoEncoder::is_config_supported(&config))
                 .expect("support")
@@ -257,13 +301,14 @@ mod tests {
     }
     #[test]
     fn invalid_encoder_configuration_is_not_reported_as_unsupported() {
-        let mut config = VideoEncoderConfig::new("av01.0.04M.08", 64, 64);
+        let mut config =
+            VideoEncoderConfig::new("av01.0.04M.08", 64, 64).expect("valid codec identifier");
         config.framerate = Some(f64::NAN);
         assert!(matches!(
             block_on(VideoEncoder::is_config_supported(&config)),
             Err(CodecError::Configuration(_))
         ));
-        let config = AudioEncoderConfig::new("opus", 0, 2);
+        let config = AudioEncoderConfig::new("opus", 0, 2).expect("valid codec identifier");
         assert!(block_on(AudioEncoder::is_config_supported(&config)).is_err());
     }
 }

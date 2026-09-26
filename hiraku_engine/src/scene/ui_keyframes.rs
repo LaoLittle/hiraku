@@ -151,8 +151,14 @@ mod tests {
     #[test]
     fn discrete_layer_handoff_never_exposes_the_background() {
         use UiKeyframe::QuadStepAlpha as Key;
-        let outgoing = [Key(0., 0., 0., 10., 0., 0., 10., 1.), Key(1., 20., 0., 10., 0., 0., 10., 0.)];
-        let incoming = [Key(0., 0., 0., 10., 0., 0., 10., 0.), Key(1., 20., 0., 10., 0., 0., 10., 1.)];
+        let outgoing = [
+            Key(0., 0., 0., 10., 0., 0., 10., 1.),
+            Key(1., 20., 0., 10., 0., 0., 10., 0.),
+        ];
+        let incoming = [
+            Key(0., 0., 0., 10., 0., 0., 10., 0.),
+            Key(1., 20., 0., 10., 0., 0., 10., 1.),
+        ];
         assert!(validate(&outgoing));
         assert!(UiKeyframes::new(&outgoing).projected);
         for t in [0., 0.25, 0.5, 0.999999, 1., 1.000001, 2.] {
@@ -160,7 +166,11 @@ mod tests {
             let b = sample(&incoming, t);
             assert_eq!(a[7] + b[7] * (1. - a[7]), 1., "coverage at {t}");
         }
-        assert_eq!(sample(&outgoing, 0.5)[1], 10., "geometry still interpolates");
+        assert_eq!(
+            sample(&outgoing, 0.5)[1],
+            10.,
+            "geometry still interpolates"
+        );
         assert_eq!(sample(&outgoing, 1.)[7], 0.);
         assert_eq!(sample(&incoming, 1.)[7], 1.);
     }

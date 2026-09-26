@@ -17,6 +17,7 @@ use std::{
 };
 
 pub(super) struct MediaCodecDecoder {
+    nal: Option<super::nal::NalInput>,
     codec: MediaCodec,
     origin: Option<i64>,
     codec_name: String,
@@ -40,16 +41,29 @@ impl Drop for MediaCodecDecoder {
 }
 impl MediaCodecDecoder {
     pub fn new(config: &VideoDecoderConfig) -> Result<Self, CodecError> {
-        let mime = match config.codec.0.split('.').next() {
+        let nal = super::nal::NalInput::new(config)?;
+        if nal
+            .as_ref()
+            .and_then(|n| n.bit_depth)
+            .or(config.codec.bit_depth())
+            .is_some_and(|depth| depth > 8)
+        {
+            return Err(CodecError::Unsupported(
+                "MediaCodec bridge currently negotiates 8-bit output only".into(),
+            ));
+        }
+        let mime = match Some(config.codec.family()) {
+            Some("avc1" | "avc3") => "video/avc",
+            Some("hvc1" | "hev1") => "video/hevc",
             Some("av01") => "video/av01",
             Some("vp09") => {
                 super::vp9::configuration(config)?;
                 "video/x-vnd.on2.vp9"
             }
-            Some("vp8") if config.codec.0 == "vp8" && config.description.is_none() => {
+            Some("vp8") if config.codec == crate::Codec::Vp8 && config.description.is_none() => {
                 "video/x-vnd.on2.vp8"
             }
-            _ => return Err(CodecError::Unsupported(config.codec.0.clone())),
+            _ => return Err(CodecError::Unsupported(config.codec.to_string())),
         };
         let codec = MediaCodec::from_decoder_type(mime)
             .ok_or_else(|| error(format!("no MediaCodec decoder for {mime}")))?;
@@ -70,7 +84,9 @@ impl MediaCodecDecoder {
         if config.optimize_for_latency {
             format.set_i32("low-latency", 1);
         }
-        if let Some(description) = &config.description {
+        // NAL parameter sets are prepended to key access units below. Passing
+        // avcC/hvcC as csd-0 would incorrectly treat a record as Annex B.
+        if let Some(description) = config.description.as_ref().filter(|_| nal.is_none()) {
             format.set_buffer("csd-0", description);
         }
         codec
@@ -78,9 +94,10 @@ impl MediaCodecDecoder {
             .map_err(error)?;
         codec.start().map_err(error)?;
         Ok(Self {
+            nal,
             codec,
             origin: None,
-            codec_name: config.codec.0.clone(),
+            codec_name: config.codec.to_string(),
         })
     }
     pub fn decode(
@@ -95,7 +112,11 @@ impl MediaCodecDecoder {
             .and_then(|v| u64::try_from(v).ok())
             .ok_or_else(|| error("timestamp is outside the configured MediaCodec timeline"))?;
         let mut frames = Vec::new();
-        self.submit(&chunk.data, timestamp, 0, cancelled, &mut frames)?;
+        let bytes = match &self.nal {
+            Some(nal) => nal.annex_b(&chunk.data, chunk.kind == ChunkType::Key)?,
+            None => std::borrow::Cow::Borrowed(chunk.data.as_ref()),
+        };
+        self.submit(&bytes, timestamp, 0, cancelled, &mut frames)?;
         self.drain(false, cancelled, &mut frames)?;
         Ok(frames)
     }

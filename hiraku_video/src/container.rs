@@ -95,7 +95,8 @@ impl MatroskaDemuxer {
                 )
             })
             .unwrap_or_else(|| "av01.0.04M.08".into());
-        let mut video_config = VideoDecoderConfig::new(codec.as_str(), width.into(), height.into());
+        let mut video_config = VideoDecoderConfig::new(codec.as_str(), width.into(), height.into())
+            .map_err(|e| MediaError::Container(e.to_string()))?;
         video_config.description = description;
         let audio_config = if let Some(ap) = audio
             .and_then(|t| t.codec_params.as_ref())
@@ -111,7 +112,10 @@ impl MatroskaDemuxer {
             if rate == 0 {
                 return Err(MediaError::InvalidSampleRate);
             }
-            Some(AudioDecoderConfig::new("opus", rate, channels))
+            Some(
+                AudioDecoderConfig::new("opus", rate, channels)
+                    .map_err(|e| MediaError::Container(e.to_string()))?,
+            )
         } else {
             None
         };

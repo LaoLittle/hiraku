@@ -27,6 +27,9 @@ struct YuvColorTransform {
     row_g: vec4<f32>,
     row_b: vec4<f32>,
     luma: vec2<f32>,
+    gamut_r: vec4<f32>,
+    gamut_g: vec4<f32>,
+    gamut_b: vec4<f32>,
 };
 
 @group(VIDEO_GROUP) @binding(4) var<uniform> color_transform: YuvColorTransform;
@@ -47,6 +50,21 @@ fn to_linear_vec3(val: vec3<f32>) -> vec3<f32> {
 
     @elif(TRANSFER_GAMMA_28)
     return pow(x, vec3<f32>(2.8));
+
+    // ST 2084 absolute luminance, in units of 203-nit diffuse white.
+    @elif(TRANSFER_PQ) {
+        let p = pow(x, vec3<f32>(1.0 / 78.84375));
+        return pow(max(p - vec3<f32>(0.8359375), vec3<f32>(0.0)) /
+            max(vec3<f32>(18.8515625) - 18.6875 * p, vec3<f32>(0.000001)),
+            vec3<f32>(1.0 / 0.1593017578125)) * (10000.0 / 203.0);
+    }
+    // BT.2100 HLG inverse OETF followed by the reference 1000-nit OOTF.
+    @elif(TRANSFER_HLG) {
+        let scene = select((exp((x - vec3<f32>(0.55991073)) / 0.17883277) + 0.28466892) / 12.0,
+            x * x / 3.0, x <= vec3<f32>(0.5));
+        let y = dot(scene, vec3<f32>(0.2627, 0.6780, 0.0593));
+        return scene * pow(max(y, 0.0), 0.2) * (1000.0 / 203.0);
+    }
 
     // Conventional BT.709/BT.601/BT.2020 SDR is displayed using BT.1886.
     // For an ideal black level its EOTF is a pure 2.4 power function. The
@@ -113,7 +131,15 @@ fn video_color(uv: vec2<f32>) -> vec4<f32> {
         dot(color_transform.row_b, yuv),
     );
 
-    let linear_rgb = to_linear_vec3(encoded_rgb);
+    let source = vec4<f32>(to_linear_vec3(encoded_rgb), 1.0);
+    var linear_rgb = max(vec3<f32>(dot(color_transform.gamut_r, source),
+        dot(color_transform.gamut_g, source), dot(color_transform.gamut_b, source)), vec3<f32>(0.0));
+    // Current presentation targets are SDR. Preserve HDR in codec frames and
+    // perform luminance-preserving tone mapping only at this presentation edge.
+    @if(TRANSFER_PQ || TRANSFER_HLG) {
+        let luminance = dot(linear_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        linear_rgb = linear_rgb / (1.0 + luminance);
+    }
 
     return vec4<f32>(linear_rgb, clamp(alpha, 0.0, 1.0) * opacity);
     }

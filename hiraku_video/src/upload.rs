@@ -95,6 +95,14 @@ fn upload_frame(
             v_offset,
             y_stride,
             chroma_stride,
+        }
+        | VideoPixels::Planar16 {
+            planes: data,
+            u_offset,
+            v_offset,
+            y_stride,
+            chroma_stride,
+            ..
         } => {
             planes = [
                 (&data[..*u_offset], *y_stride),
@@ -104,6 +112,12 @@ fn upload_frame(
             count = 3;
         }
         VideoPixels::Nv12Strided {
+            planes: data,
+            uv_offset,
+            y_stride,
+            uv_stride,
+        }
+        | VideoPixels::P010 {
             planes: data,
             uv_offset,
             y_stride,
@@ -125,6 +139,20 @@ fn upload_frame(
         return;
     }
     for (index, (bytes, stride)) in planes[..count].iter().enumerate() {
+        // Half-float planes work on baseline WebGPU without optional normalized
+        // 16-bit texture features. Color/EOTF/gamut conversion stays on the GPU.
+        let converted;
+        let bytes = match frame.pixels {
+            VideoPixels::Planar16 { bit_depth, .. } => {
+                converted = float_plane(bytes, bit_depth, 0);
+                converted.as_slice()
+            }
+            VideoPixels::P010 { .. } => {
+                converted = float_plane(bytes, 10, 6);
+                converted.as_slice()
+            }
+            _ => *bytes,
+        };
         let (width, height) = if index == 0 {
             (frame.width, frame.height)
         } else {
@@ -140,6 +168,17 @@ fn upload_frame(
         );
     }
     *uploaded_generation = upload.generation;
+}
+
+fn float_plane(bytes: &[u8], bit_depth: u8, shift: u8) -> Vec<u8> {
+    let maximum = ((1u32 << bit_depth) - 1) as f32;
+    bytes
+        .chunks_exact(2)
+        .flat_map(|b| {
+            let sample = u16::from_le_bytes([b[0], b[1]]) >> shift;
+            half::f16::from_f32(sample as f32 / maximum).to_le_bytes()
+        })
+        .collect()
 }
 
 fn write_plane(
@@ -169,6 +208,24 @@ fn write_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_depth_upload_preserves_endpoints_and_alignment() {
+        for (depth, shift) in [(10, 6), (10, 0), (12, 0)] {
+            let max = (1u16 << depth) - 1;
+            let bytes: Vec<_> = [0, max / 2, max]
+                .into_iter()
+                .flat_map(|sample| (sample << shift).to_le_bytes())
+                .collect();
+            let floats: Vec<_> = float_plane(&bytes, depth, shift)
+                .chunks_exact(2)
+                .map(|v| half::f16::from_le_bytes([v[0], v[1]]).to_f32())
+                .collect();
+            assert_eq!(floats[0], 0.0);
+            assert!((floats[1] - 0.5).abs() < 0.001);
+            assert_eq!(floats[2], 1.0);
+        }
+    }
 
     fn frame(timestamp: i64) -> VideoFrame {
         VideoFrame {

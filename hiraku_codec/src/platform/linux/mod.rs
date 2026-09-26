@@ -54,7 +54,12 @@ fn cancelled(flag: &AtomicBool) -> Result<(), CodecError> {
 
 impl VaapiDecoder {
     pub fn new(config: &VideoDecoderConfig) -> Result<Self, CodecError> {
-        let configuration = match config.codec.0.split('.').next() {
+        if config.codec.bit_depth().is_some_and(|depth| depth > 8) {
+            return Err(CodecError::Unsupported(
+                "VA-API bridge currently negotiates 8-bit NV12 only".into(),
+            ));
+        }
+        let configuration = match Some(config.codec.family()) {
             Some("av01") => stream::configuration_obus(config.description.as_deref())?,
             Some("vp09") => {
                 super::vp9::configuration(config)?;
@@ -63,7 +68,7 @@ impl VaapiDecoder {
             _ => {
                 return Err(CodecError::Unsupported(format!(
                     "VA-API adapter: {}",
-                    config.codec.0
+                    config.codec
                 )));
             }
         };
@@ -96,7 +101,7 @@ impl VaapiDecoder {
         config: &VideoDecoderConfig,
     ) -> Result<Self, CodecError> {
         let display = cros_libva::Display::open_drm_display(path).map_err(error)?;
-        let vp9 = config.codec.0.starts_with("vp09.");
+        let vp9 = matches!(config.codec, crate::Codec::Vp9(_));
         let profile = if vp9 {
             cros_libva::VAProfile::VAProfileVP9Profile0
         } else {

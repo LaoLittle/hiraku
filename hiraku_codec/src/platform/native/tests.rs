@@ -7,7 +7,7 @@ use std::{
 
 #[test]
 fn adapter_selection_is_not_gated_by_software_codec_support() {
-    let vp9 = VideoDecoderConfig::new("vp09.00.10.08", 64, 64);
+    let vp9 = VideoDecoderConfig::new("vp09.00.10.08", 64, 64).expect("valid codec identifier");
     let result = super::select_video(
         &vp9,
         || Ok("hardware vp9"),
@@ -21,8 +21,9 @@ fn adapter_selection_is_not_gated_by_software_codec_support() {
     );
     let error = result.expect_err("no VP9 software adapter").to_string();
     assert!(error.contains("vp09") && error.contains("hardware") && error.contains("software"));
+    #[cfg(feature = "software")]
     assert!(!super::software::supports_video(&vp9));
-    let av1 = VideoDecoderConfig::new("av01.0.04M.08", 64, 64);
+    let av1 = VideoDecoderConfig::new("av01.0.04M.08", 64, 64).expect("valid codec identifier");
     let result = super::select_video(
         &av1,
         || Err(CodecError::Unsupported("hardware".into())),
@@ -33,7 +34,8 @@ fn adapter_selection_is_not_gated_by_software_codec_support() {
 
 #[test]
 fn software_preference_is_an_order_not_a_hardware_ban() {
-    let mut config = VideoDecoderConfig::new("vp09.00.10.08", 64, 64);
+    let mut config =
+        VideoDecoderConfig::new("vp09.00.10.08", 64, 64).expect("valid codec identifier");
     config.hardware_acceleration = HardwareAcceleration::PreferSoftware;
     let called = std::cell::Cell::new(false);
     let result = super::select_video(
@@ -50,6 +52,7 @@ fn software_preference_is_an_order_not_a_hardware_ban() {
     assert_eq!(result.expect("fallback"), "platform");
 }
 // Synthetic 64x64 solid-red AV1 frames generated with SVT-AV1; no project assets.
+#[cfg(feature = "software")]
 const AV1: &[&[u8]] = &[
     &[
         0x12, 0x00, 0x0a, 0x0b, 0x02, 0x00, 0x00, 0x05, 0x15, 0x7f, 0xfc, 0x4a, 0xf9, 0x00, 0x40,
@@ -93,7 +96,7 @@ fn poll_audio(decoder: &mut AudioDecoder) -> DecoderEvent<AudioData> {
 fn opus_output_precedes_flush_and_preserves_timestamps() {
     let mut decoder = AudioDecoder::new().expect("decoder");
     decoder
-        .configure(AudioDecoderConfig::new("opus", 48_000, 2))
+        .configure(AudioDecoderConfig::new("opus", 48_000, 2).expect("valid codec identifier"))
         .expect("configure");
     let mut chunk = opus(-20_000);
     chunk.0.data = Arc::from([0xfc, 0xff, 0xfe]);
@@ -112,7 +115,7 @@ fn opus_output_precedes_flush_and_preserves_timestamps() {
 fn reset_discards_output_and_flushes_without_reusing_ids() {
     let mut decoder = AudioDecoder::new().expect("decoder");
     decoder
-        .configure(AudioDecoderConfig::new("opus", 48_000, 1))
+        .configure(AudioDecoderConfig::new("opus", 48_000, 1).expect("valid codec identifier"))
         .expect("configure");
     decoder.decode(opus(1)).expect("decode");
     let old_flush = decoder.flush().expect("flush");
@@ -122,7 +125,7 @@ fn reset_discards_output_and_flushes_without_reusing_ids() {
     assert!(decoder.poll().is_none());
     assert!(decoder.decode(opus(2)).is_err());
     decoder
-        .configure(AudioDecoderConfig::new("opus", 48_000, 1))
+        .configure(AudioDecoderConfig::new("opus", 48_000, 1).expect("valid codec identifier"))
         .expect("reconfigure");
     decoder.decode(opus(42)).expect("decode");
     let flush = decoder.flush().expect("flush");
@@ -137,31 +140,30 @@ fn reset_discards_output_and_flushes_without_reusing_ids() {
     assert!(decoder.reset().is_err());
     assert!(
         decoder
-            .configure(AudioDecoderConfig::new("opus", 48_000, 1))
+            .configure(AudioDecoderConfig::new("opus", 48_000, 1).expect("valid codec identifier"))
             .is_err()
     );
 }
 #[test]
 fn codec_support_is_backend_policy_and_unknown_codec_closes_on_error() {
-    let config = AudioDecoderConfig::new("future-codec", 48000, 2);
+    assert!(AudioDecoderConfig::new("future-codec", 48000, 2).is_err());
+    let config = AudioDecoderConfig::new(Codec::Vp8, 48000, 2).expect("valid codec identifier");
     assert!(
         !block_on(AudioDecoder::is_config_supported(&config))
             .expect("query")
             .supported
     );
     assert!(
-        !block_on(VideoDecoder::is_config_supported(&VideoDecoderConfig::new(
-            "future-codec",
-            64,
-            64
-        )))
+        !block_on(VideoDecoder::is_config_supported(
+            &VideoDecoderConfig::new(Codec::Opus, 64, 64).expect("valid codec identifier")
+        ))
         .expect("query")
         .supported
     );
     assert!(
-        block_on(AudioDecoder::is_config_supported(&AudioDecoderConfig::new(
-            "opus", 48000, 2
-        )))
+        block_on(AudioDecoder::is_config_supported(
+            &AudioDecoderConfig::new("opus", 48000, 2).expect("valid codec identifier")
+        ))
         .expect("query")
         .supported
     );
@@ -178,7 +180,7 @@ fn key_requirement_applies_after_configure_and_flush() {
     let mut decoder = AudioDecoder::new().expect("decoder");
     assert!(decoder.flush().is_err());
     decoder
-        .configure(AudioDecoderConfig::new("opus", 48000, 2))
+        .configure(AudioDecoderConfig::new("opus", 48000, 2).expect("valid codec identifier"))
         .expect("configure");
     let mut delta = opus(0);
     delta.0.kind = ChunkType::Delta;
@@ -193,7 +195,7 @@ fn key_requirement_applies_after_configure_and_flush() {
 fn reset_unblocks_a_worker_with_a_full_output_queue() {
     let mut decoder = AudioDecoder::new().expect("decoder");
     decoder
-        .configure(AudioDecoderConfig::new("opus", 48000, 1))
+        .configure(AudioDecoderConfig::new("opus", 48000, 1).expect("valid codec identifier"))
         .expect("configure");
     for timestamp in 0..100 {
         decoder.decode(opus(timestamp)).expect("enqueue");
@@ -208,7 +210,7 @@ fn reset_unblocks_a_worker_with_a_full_output_queue() {
     }
     decoder.reset().expect("reset full queue");
     decoder
-        .configure(AudioDecoderConfig::new("opus", 48000, 1))
+        .configure(AudioDecoderConfig::new("opus", 48000, 1).expect("valid codec identifier"))
         .expect("reconfigure");
     decoder.decode(opus(1000)).expect("enqueue new generation");
     let DecoderEvent::Output(data) = poll_audio(&mut decoder) else {
@@ -217,9 +219,11 @@ fn reset_unblocks_a_worker_with_a_full_output_queue() {
     assert_eq!(data.timestamp, 1000);
 }
 #[test]
+#[cfg(feature = "software")]
 fn av1_delayed_frames_survive_flush() {
     let mut decoder = VideoDecoder::new().expect("decoder");
-    let mut config = VideoDecoderConfig::new("av01.0.04M.08", 64, 64);
+    let mut config =
+        VideoDecoderConfig::new("av01.0.04M.08", 64, 64).expect("valid codec identifier");
     config.hardware_acceleration = HardwareAcceleration::PreferSoftware;
     config.software = DecodeSettings {
         decoder_threads: Some(4),

@@ -11,6 +11,7 @@ bevy.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 hiraku-codec.workspace = true
+half = "2"
 crossbeam-channel.workspace = true
 
 [dependencies.symphonia]

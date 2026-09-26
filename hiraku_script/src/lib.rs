@@ -71,11 +71,11 @@ pub use objects::{ObjectHeap, ObjectId};
 mod fingerprint;
 mod nanbox;
 mod value_heap;
-pub use string_pool::SharedStrings;
 pub use fingerprint::ProgramFingerprint;
+pub use string_pool::SharedStrings;
+pub mod contract;
 pub mod debug;
 pub mod project;
-pub mod contract;
 pub use project::{
     CompiledProject, ProjectError, ProjectLinkPolicy, ScriptSource, compile_project,
     compile_project_with_policy,
@@ -83,12 +83,12 @@ pub use project::{
 pub mod parse;
 pub mod register;
 pub mod runtime;
+mod snapshot_validation;
 pub mod span;
 pub mod string_pool;
 pub mod symbol;
 pub mod template;
 pub mod vm;
-mod snapshot_validation;
 
 pub use ast::{
     Argument, BinaryOp, Block, CastMode, Expr, ExprKind, FunctionParameter, MapField, NumberUnit,

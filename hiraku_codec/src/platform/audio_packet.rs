@@ -8,7 +8,7 @@ pub(crate) struct AudioPacketDecoder {
 
 impl AudioPacketDecoder {
     pub fn new(config: &AudioDecoderConfig) -> Result<Self, CodecError> {
-        if config.codec.0 != "opus"
+        if config.codec != crate::Codec::Opus
             || !matches!(config.number_of_channels, 1 | 2)
             || !matches!(config.sample_rate, 8000 | 12000 | 16000 | 24000 | 48000)
             || config

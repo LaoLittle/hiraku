@@ -1,4 +1,4 @@
-use super::software;
+use super::{audio, software};
 use crate::*;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::sync::{
@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-#[cfg(all(test, feature = "software"))]
+#[cfg(test)]
 mod tests;
 
 trait Processor<F> {
@@ -187,10 +187,10 @@ impl Processor<VideoFrame> for VideoCodec {
 }
 impl Configuration<AudioData> for AudioDecoderConfig {
     fn open(self) -> Result<Box<dyn Processor<AudioData>>, CodecError> {
-        Ok(Box::new(software::Audio::new(self)?))
+        Ok(Box::new(audio::Audio::new(self)?))
     }
 }
-impl Processor<AudioData> for software::Audio {
+impl Processor<AudioData> for audio::Audio {
     fn decode(
         &mut self,
         chunk: EncodedChunk,
@@ -210,7 +210,7 @@ pub(crate) async fn video_config_supported(
 pub(crate) async fn audio_config_supported(
     config: &AudioDecoderConfig,
 ) -> Result<bool, CodecError> {
-    Ok(software::supports_audio(config))
+    Ok(audio::supports_audio(config))
 }
 
 /// Selection happens before consuming input. Never retry another decoder after
@@ -234,7 +234,7 @@ fn select_video<T>(
     second.map_err(|error| {
         CodecError::Unsupported(format!(
             "no adapter accepts {}: {first}; {error}",
-            config.codec.0
+            config.codec
         ))
     })
 }

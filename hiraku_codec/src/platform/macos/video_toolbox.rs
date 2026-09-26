@@ -34,12 +34,63 @@ pub(in crate::platform) struct VideoToolboxDecoder {
 }
 
 impl VideoToolboxDecoder {
-    pub(in crate::platform) fn new(width: u32, height: u32, codec_type: OSType, atom: &str, description: &[u8]) -> Result<Self, String> {
-        let format_description = create_format_description(width, height, codec_type, atom, description)?;
+    pub(in crate::platform) fn new(
+        width: u32,
+        height: u32,
+        codec_type: OSType,
+        atom: &str,
+        description: &[u8],
+        depth: u8,
+    ) -> Result<Self, String> {
+        let format_description =
+            create_format_description(width, height, codec_type, atom, description)?;
+        Self::from_format(format_description, depth)
+    }
+
+    pub(in crate::platform) fn from_parameter_sets(
+        hevc: bool,
+        sets: &[Vec<u8>],
+        depth: u8,
+    ) -> Result<Self, String> {
+        let pointers: Vec<_> = sets.iter().map(|v| v.as_ptr()).collect();
+        let sizes: Vec<_> = sets.iter().map(Vec::len).collect();
+        let mut format = ptr::null_mut();
+        let status = unsafe {
+            if hevc {
+                CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    kCFAllocatorDefault,
+                    sets.len(),
+                    pointers.as_ptr(),
+                    sizes.as_ptr(),
+                    4,
+                    ptr::null(),
+                    &mut format,
+                )
+            } else {
+                CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    kCFAllocatorDefault,
+                    sets.len(),
+                    pointers.as_ptr(),
+                    sizes.as_ptr(),
+                    4,
+                    &mut format,
+                )
+            }
+        };
+        if status != 0 || format.is_null() {
+            return Err(format!("CoreMedia parameter-set format failed: {status}"));
+        }
+        Self::from_format(format, depth)
+    }
+
+    fn from_format(
+        format_description: CMVideoFormatDescriptionRef,
+        depth: u8,
+    ) -> Result<Self, String> {
         let mut callback_context = Box::new(CallbackContext::default());
         let callback_ref_con = (&mut *callback_context as *mut CallbackContext).cast();
 
-        let result = create_decoder(format_description, callback_ref_con);
+        let result = create_decoder(format_description, callback_ref_con, depth);
         let session = match result {
             Ok(value) => value,
             Err(error) => {
@@ -119,6 +170,8 @@ impl Drop for VideoToolboxDecoder {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputPixelFormat {
+    P010,
+    P010Full,
     Nv12,
     Nv12Full,
     I420,
@@ -127,6 +180,8 @@ enum OutputPixelFormat {
 impl OutputPixelFormat {
     const fn ostype(self) -> OSType {
         match self {
+            Self::P010 => u32::from_be_bytes(*b"x420"),
+            Self::P010Full => u32::from_be_bytes(*b"xf20"),
             Self::Nv12 => K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE,
             Self::Nv12Full => K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE,
             Self::I420 => K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR,
@@ -135,6 +190,8 @@ impl OutputPixelFormat {
 
     const fn name(self) -> &'static str {
         match self {
+            Self::P010 => "P010 / x420",
+            Self::P010Full => "P010 / xf20",
             Self::Nv12 => "NV12 / 420v",
             Self::Nv12Full => "NV12 / 420f",
             Self::I420 => "I420 / y420",
@@ -215,7 +272,11 @@ unsafe fn copy_pixel_buffer(
     let plane_count = unsafe { CVPixelBufferGetPlaneCount(pixel_buffer) };
     let timestamp = cm_time_to_timestamp(presentation_time_stamp)?;
 
+    let wide = pixel_format == u32::from_be_bytes(*b"x420")
+        || pixel_format == u32::from_be_bytes(*b"xf20");
     let limited_range = match pixel_format {
+        value if value == u32::from_be_bytes(*b"x420") => true,
+        value if value == u32::from_be_bytes(*b"xf20") => false,
         K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE => false,
         K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE
         | K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_PLANAR => true,
@@ -229,7 +290,20 @@ unsafe fn copy_pixel_buffer(
 
     let (kr, kb) = unsafe { pixel_buffer_luma_coefficients(pixel_buffer) }?;
     let transfer = unsafe { pixel_buffer_transfer(pixel_buffer) }?;
-    let color_transform = YuvColorTransform::from_luma_coefficients(kr, kb, limited_range);
+    let primaries = unsafe { copy_attachment(pixel_buffer, kCVImageBufferColorPrimariesKey) };
+    let bt2020 = primaries.is_some_and(
+        |value| unsafe { CFEqual(value, kCVImageBufferColorPrimaries_ITU_R_2020) } != 0,
+    );
+    if let Some(value) = primaries {
+        unsafe { cf_release(value) };
+    }
+    let color_transform = YuvColorTransform::from_luma_coefficients_depth(
+        kr,
+        kb,
+        limited_range,
+        if wide { 10 } else { 8 },
+    )
+    .with_bt2020_primaries(bt2020);
 
     check_cv_return(
         unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, K_CV_PIXEL_BUFFER_LOCK_READ_ONLY) },
@@ -237,6 +311,34 @@ unsafe fn copy_pixel_buffer(
     )?;
 
     let result = match pixel_format {
+        _ if wide => unsafe {
+            copy_nv12(
+                pixel_buffer,
+                timestamp,
+                width,
+                height,
+                color_transform,
+                transfer,
+                plane_count,
+            )
+            .map(|mut frame| {
+                if let VideoPixels::Nv12Strided {
+                    planes,
+                    uv_offset,
+                    y_stride,
+                    uv_stride,
+                } = frame.pixels
+                {
+                    frame.pixels = VideoPixels::P010 {
+                        planes,
+                        uv_offset,
+                        y_stride,
+                        uv_stride,
+                    };
+                }
+                frame
+            })
+        },
         K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_VIDEO_RANGE
         | K_CV_PIXEL_FORMAT_TYPE_420YPCBCR8_BIPLANAR_FULL_RANGE => unsafe {
             copy_nv12(
@@ -461,9 +563,9 @@ unsafe fn pixel_buffer_transfer(
     let result = if unsafe { CFEqual(value, kCVImageBufferTransferFunction_sRGB) } != 0 {
         Ok(TransferFunction::Srgb)
     } else if unsafe { CFEqual(value, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) } != 0 {
-        Err("unsupported VideoToolbox transfer function: SMPTE ST 2084 PQ (HDR tone mapping is not implemented)".into())
+        Ok(TransferFunction::Pq)
     } else if unsafe { CFEqual(value, kCVImageBufferTransferFunction_ITU_R_2100_HLG) } != 0 {
-        Err("unsupported VideoToolbox transfer function: ITU-R BT.2100 HLG (HDR tone mapping is not implemented)".into())
+        Ok(TransferFunction::Hlg)
     } else if unsafe { CFEqual(value, kCVImageBufferTransferFunction_SMPTE_ST_428_1) } != 0 {
         Err("unsupported VideoToolbox transfer function: SMPTE ST 428-1 (HDR/log transfer is not implemented)".into())
     } else {
@@ -485,7 +587,22 @@ unsafe fn copy_attachment(pixel_buffer: CVPixelBufferRef, key: CFStringRef) -> O
 fn create_decoder(
     format_description: CMVideoFormatDescriptionRef,
     callback_ref_con: *mut c_void,
+    depth: u8,
 ) -> Result<VTDecompressionSessionRef, String> {
+    if depth > 8 {
+        return create_hardware_decoder_session(
+            format_description,
+            Some(OutputPixelFormat::P010Full),
+            callback_ref_con,
+        )
+        .or_else(|_| {
+            create_hardware_decoder_session(
+                format_description,
+                Some(OutputPixelFormat::P010),
+                callback_ref_con,
+            )
+        });
+    }
     let probe = create_hardware_decoder_session(format_description, None, callback_ref_con)?;
     let performance_order = copy_performance_ordered_pixel_formats(probe);
     unsafe {
@@ -696,7 +813,8 @@ fn create_format_description(
         CFDataCreate(
             kCFAllocatorDefault,
             description.as_ptr(),
-            isize::try_from(description.len()).map_err(|_| "codec description is too large".to_string())?,
+            isize::try_from(description.len())
+                .map_err(|_| "codec description is too large".to_string())?,
         )
     };
     if atom_data.is_null() {
@@ -1061,6 +1179,23 @@ unsafe extern "C" {
 unsafe extern "C" {
     static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CFStringRef;
 
+    fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        allocator: CFAllocatorRef,
+        count: usize,
+        pointers: *const *const u8,
+        sizes: *const usize,
+        length_size: i32,
+        out: *mut CMVideoFormatDescriptionRef,
+    ) -> OSStatus;
+    fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+        allocator: CFAllocatorRef,
+        count: usize,
+        pointers: *const *const u8,
+        sizes: *const usize,
+        length_size: i32,
+        extensions: CFDictionaryRef,
+        out: *mut CMVideoFormatDescriptionRef,
+    ) -> OSStatus;
     fn CMVideoFormatDescriptionCreate(
         allocator: CFAllocatorRef,
         codec_type: OSType,
@@ -1104,6 +1239,8 @@ unsafe extern "C" {
     static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
 
     static kCVImageBufferYCbCrMatrixKey: CFStringRef;
+    static kCVImageBufferColorPrimariesKey: CFStringRef;
+    static kCVImageBufferColorPrimaries_ITU_R_2020: CFStringRef;
     static kCVImageBufferYCbCrMatrix_ITU_R_601_4: CFStringRef;
     static kCVImageBufferYCbCrMatrix_ITU_R_2020: CFStringRef;
     static kCVImageBufferYCbCrMatrix_SMPTE_240M_1995: CFStringRef;

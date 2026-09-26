@@ -13,6 +13,9 @@ pub(crate) struct YuvColorTransform {
     pub row_g: Vec4,
     pub row_b: Vec4,
     pub luma: Vec2,
+    pub gamut_r: Vec4,
+    pub gamut_g: Vec4,
+    pub gamut_b: Vec4,
 }
 
 // GPU layout adapter only; color conversion math belongs to hiraku-codec.
@@ -23,6 +26,9 @@ impl From<hiraku_codec::YuvColorTransform> for YuvColorTransform {
             row_g: Vec4::from_array(value.row_g),
             row_b: Vec4::from_array(value.row_b),
             luma: Vec2::from_array(value.luma),
+            gamut_r: Vec4::from_array(value.gamut[0]),
+            gamut_g: Vec4::from_array(value.gamut[1]),
+            gamut_b: Vec4::from_array(value.gamut[2]),
         }
     }
 }

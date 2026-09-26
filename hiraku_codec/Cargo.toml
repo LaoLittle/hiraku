@@ -12,7 +12,6 @@ crossbeam-channel.workspace = true
 
 [dependencies.hiraku-opus]
 git = "https://github.com/Hiraku-Project/opus-rs.git"
-optional = true
 version = "0.1.32"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.hiraku-rav1d]
@@ -34,6 +33,7 @@ features = [
     "ImageData",
     "PlaneLayout",
     "VideoColorSpace",
+    "VideoColorPrimaries",
     "VideoFrame",
     "VideoFrameCopyToOptions",
     "VideoMatrixCoefficients",
@@ -44,7 +44,7 @@ features = [
 
 [features]
 default = ["software", "hardware"]
-software = ["dep:hiraku-rav1d", "dep:hiraku-opus"]
+software = ["dep:hiraku-rav1d"]
 hardware = ["video-toolbox" ,"media-foundation", "media-codec", "vaapi"]
 video-toolbox = []
 vaapi = ["dep:cros-codecs", "dep:cros-libva"]

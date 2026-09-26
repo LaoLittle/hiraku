@@ -1837,11 +1837,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 // Preserve bottom instead of widening recovery to Any and
                 // producing a new call/cast diagnostic at every fluent step.
                 if self.expression_type(object) == &ScriptType::Never {
-                    return self.alloc_expression(
-                        object.kind,
-                        ScriptType::Never,
-                        expression.span,
-                    );
+                    return self.alloc_expression(object.kind, ScriptType::Never, expression.span);
                 }
                 let member = self.symbol(name);
                 if !self.direct_callee && self.protocol_methods.contains_key(&(object.ty, member)) {
@@ -4952,7 +4948,9 @@ mod tests {
                 .expect_err("unknown method must fail statically");
             assert_eq!(errors.len(), 1, "{source}: {errors:?}");
             assert!(
-                errors[0].message.contains("unknown method `missing` for `Builder`"),
+                errors[0]
+                    .message
+                    .contains("unknown method `missing` for `Builder`"),
                 "{source}: {errors:?}"
             );
         }
@@ -5351,14 +5349,24 @@ mod tests {
     #[test]
     fn typed_records_default_only_missing_optional_fields() {
         for (source, valid) in [
-            ("let x: .{ name: String, enabled: Bool? } = .{ name: \"Alice\" }", true),
-            ("let x: .{ name: String, enabled: Bool? } = .{ enabled: true }", false),
+            (
+                "let x: .{ name: String, enabled: Bool? } = .{ name: \"Alice\" }",
+                true,
+            ),
+            (
+                "let x: .{ name: String, enabled: Bool? } = .{ enabled: true }",
+                false,
+            ),
             ("let x: .{ enabled: Bool? } = .{ enabled: 1 }", false),
             ("let x: .{ enabled: Bool? } = .{ other: true }", false),
         ] {
             let syntax = parse_program(source).expect("source parses");
             let arena = HirArena::new();
-            assert_eq!(lower_to_hir(&arena, &syntax, None).is_ok(), valid, "{source}");
+            assert_eq!(
+                lower_to_hir(&arena, &syntax, None).is_ok(),
+                valid,
+                "{source}"
+            );
         }
     }
 

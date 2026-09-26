@@ -156,9 +156,7 @@ extern "C" {
     pub fn set_timestamp_f64(this: &EncodedVideoChunkInit, val: f64);
 
     #[wasm_bindgen(method, getter = "transfer")]
-    pub fn get_transfer(
-        this: &EncodedVideoChunkInit,
-    ) -> Option<::js_sys::Array>;
+    pub fn get_transfer(this: &EncodedVideoChunkInit) -> Option<::js_sys::Array>;
 
     #[wasm_bindgen(method, setter = "transfer")]
     pub fn set_transfer(this: &EncodedVideoChunkInit, val: &[::js_sys::ArrayBuffer]);
@@ -277,7 +275,9 @@ impl EncodedVideoChunkInit {
         type_: EncodedVideoChunkType,
     ) -> Self {
         let mut ret: Self = ::wasm_bindgen::JsCast::unchecked_into(::js_sys::Object::new());
-        unsafe { ret.set_data_u8_slice(data); }
+        unsafe {
+            ret.set_data_u8_slice(data);
+        }
         ret.set_timestamp(timestamp);
         ret.set_type(type_);
         ret
@@ -553,11 +553,7 @@ extern "C" {
 }
 
 impl EncodedAudioChunkInit {
-    pub fn new(
-        data: &::js_sys::Object,
-        timestamp: i32,
-        type_: EncodedAudioChunkType,
-    ) -> Self {
+    pub fn new(data: &::js_sys::Object, timestamp: i32, type_: EncodedAudioChunkType) -> Self {
         let value: Self = ::wasm_bindgen::JsCast::unchecked_into(::js_sys::Object::new());
         value.set_data(data);
         value.set_timestamp_f64(f64::from(timestamp));

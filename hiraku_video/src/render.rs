@@ -109,6 +109,8 @@ fn specialize_video(descriptor: &mut RenderPipelineDescriptor, key: Yuv420Materi
         TransferFunction::Srgb => Some("TRANSFER_SRGB"),
         TransferFunction::Gamma22 => Some("TRANSFER_GAMMA_22"),
         TransferFunction::Gamma28 => Some("TRANSFER_GAMMA_28"),
+        TransferFunction::Pq => Some("TRANSFER_PQ"),
+        TransferFunction::Hlg => Some("TRANSFER_HLG"),
     };
 
     if let Some(transfer_def) = transfer_def {
@@ -174,24 +176,26 @@ mod tests {
             .enumerate()
         {
             for layout in [None, Some("ALPHA_VERTICAL"), Some("ALPHA_HORIZONTAL")] {
-                let mut defs = vec![
-                    ShaderDefVal::Bool(format.into(), true),
-                    ShaderDefVal::Bool("TRANSFER_SRGB".into(), true),
-                ];
-                if format == "FORMAT_RGBA" {
-                    defs.push(ShaderDefVal::Bool("FORMAT_I420".into(), true));
+                for transfer in ["TRANSFER_SRGB", "TRANSFER_PQ", "TRANSFER_HLG"] {
+                    let mut defs = vec![
+                        ShaderDefVal::Bool(format.into(), true),
+                        ShaderDefVal::Bool(transfer.into(), true),
+                    ];
+                    if format == "FORMAT_RGBA" {
+                        defs.push(ShaderDefVal::Bool("FORMAT_I420".into(), true));
+                    }
+                    if let Some(layout) = layout {
+                        defs.push(ShaderDefVal::Bool(layout.into(), true));
+                    }
+                    cache
+                        .get(index, fragment.id(), &defs)
+                        .unwrap_or_else(|error| panic!("{format}/{layout:?}: {error}"));
+                    defs.push(ShaderDefVal::Bool("WORLD_VIDEO".into(), true));
+                    defs.push(ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 3));
+                    cache
+                        .get(index + 10, fragment.id(), &defs)
+                        .unwrap_or_else(|error| panic!("world {format}/{layout:?}: {error}"));
                 }
-                if let Some(layout) = layout {
-                    defs.push(ShaderDefVal::Bool(layout.into(), true));
-                }
-                cache
-                    .get(index, fragment.id(), &defs)
-                    .unwrap_or_else(|error| panic!("{format}/{layout:?}: {error}"));
-                defs.push(ShaderDefVal::Bool("WORLD_VIDEO".into(), true));
-                defs.push(ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 3));
-                cache
-                    .get(index + 10, fragment.id(), &defs)
-                    .unwrap_or_else(|error| panic!("world {format}/{layout:?}: {error}"));
             }
         }
     }

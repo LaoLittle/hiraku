@@ -161,13 +161,21 @@ mod tests {
         .expect("compile actor sequence");
         let mut runtime = StoryRuntime::new(code).expect("runtime");
         let first = runtime.step().expect("first show");
-        assert!(matches!(first, Some(StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
-            dissolve: Some(_), ..
-        }))));
+        assert!(matches!(
+            first,
+            Some(StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
+                dissolve: Some(_),
+                ..
+            }))
+        ));
         let second = runtime.step().expect("second show");
-        assert!(matches!(second, Some(StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
-            dissolve: None, ..
-        }))));
+        assert!(matches!(
+            second,
+            Some(StoryRuntimeEvent::Effect(StoryEffect::ShowCharacter {
+                dissolve: None,
+                ..
+            }))
+        ));
     }
 
     #[test]
