@@ -16,14 +16,14 @@ pub(crate) enum AudioEvent {
     End,
 }
 
-use crate::container::{DemuxedChunk, MatroskaDemuxer};
+use crate::container::{DemuxedChunk, MediaDemuxer};
 
 pub(crate) struct MediaDecoder {
     pub video: Receiver<VideoEvent>,
     pub audio: Receiver<AudioEvent>,
     video_sender: Sender<VideoEvent>,
     audio_sender: Sender<AudioEvent>,
-    demuxer: MatroskaDemuxer,
+    demuxer: MediaDemuxer,
     video_decoder: VideoDecoder,
     audio_decoder: Option<AudioDecoder>,
     pending: Option<DemuxedChunk>,
@@ -34,7 +34,7 @@ pub(crate) struct MediaDecoder {
 
 impl MediaDecoder {
     pub fn new(media: &EncodedMedia, settings: DecodeSettings) -> Result<Self, CodecError> {
-        let mut demuxer = MatroskaDemuxer::new(media.bytes.clone(), "mkv")
+        let mut demuxer = MediaDemuxer::new(media.bytes.clone(), &media.extension)
             .map_err(|e| CodecError::Operation(e.to_string()))?;
         demuxer.video_config.software = settings;
         let mut video_decoder = VideoDecoder::new()?;

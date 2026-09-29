@@ -87,6 +87,7 @@ pub struct PictureTint {
     pub to: [f32; 4],
     pub elapsed: f32,
     pub seconds: f32,
+    pub ease: crate::script::animation::Easing,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -147,6 +148,7 @@ pub enum PictureCommand {
         id: String,
         color: [f32; 4],
         seconds: f32,
+        ease: crate::script::animation::Easing,
     },
     Blur {
         id: String,
@@ -293,7 +295,12 @@ pub(super) fn apply_picture_command(
                 picture.motion = None;
             }
         }
-        PictureCommand::Tint { id, color, seconds } => {
+        PictureCommand::Tint {
+            id,
+            color,
+            seconds,
+            ease,
+        } => {
             if !color
                 .iter()
                 .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
@@ -310,6 +317,7 @@ pub(super) fn apply_picture_command(
                 to: color,
                 elapsed: 0.0,
                 seconds,
+                ease,
             });
             if seconds == 0.0 {
                 picture.tint = color;
@@ -930,7 +938,12 @@ fn tick_picture(picture: &mut PictureState, delta: f32) -> bool {
     if let Some(tint) = &mut picture.tint_tween {
         tint.elapsed = (tint.elapsed + delta).min(tint.seconds);
         picture.tint = std::array::from_fn(|i| {
-            tint.from[i] + (tint.to[i] - tint.from[i]) * (tint.elapsed / tint.seconds)
+            tint.from[i]
+                + (tint.to[i] - tint.from[i])
+                    * tint
+                        .ease
+                        .sample(tint.elapsed / tint.seconds)
+                        .clamp(0.0, 1.0)
         });
         if tint.elapsed >= tint.seconds {
             picture.tint_tween = None;
@@ -1516,6 +1529,7 @@ mod tests {
                 id: "room".into(),
                 color: [0.0, 0.0, 0.0, 0.5],
                 seconds: 1.0,
+                ease: crate::script::animation::Easing::Linear,
             },
         )
         .expect("tint");
@@ -1545,11 +1559,35 @@ mod tests {
                 PictureCommand::Tint {
                     id: "missing".into(),
                     color: [1.0; 4],
-                    seconds: 0.0
+                    seconds: 0.0,
+                    ease: crate::script::animation::Easing::Linear,
                 }
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn tint_curve_survives_snapshot_and_reaches_exact_endpoint() {
+        let mut pictures = shown();
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Tint {
+                id: "room".into(),
+                color: [1.0, 1.0, 1.0, 0.0],
+                seconds: 1.0,
+                ease: crate::script::animation::Easing::SmoothStep,
+            },
+        )
+        .expect("tint must start");
+        tick_picture(pictures.get_mut("room").expect("picture exists"), 0.25);
+        assert_eq!(pictures["room"].tint[3], 0.84375);
+        let data = hiraku_script::hson::to_vec(&pictures).expect("snapshot must encode");
+        let mut restored: BTreeMap<String, PictureState> =
+            hiraku_script::hson::from_slice(&data).expect("snapshot must decode");
+        tick_picture(restored.get_mut("room").expect("picture restored"), 0.75);
+        assert_eq!(restored["room"].tint[3], 0.0);
+        assert!(restored["room"].tint_tween.is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 use super::{capabilities::story_manifest, execution_runtime::ExecutionRuntimeError};
 use hiraku_script::{Bytecode, LinkedProgram, ModuleId, ScriptSource};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum StoryProgram {
     Single(Bytecode),
     Project {

@@ -68,13 +68,13 @@ pub fn load_movie_catalog(vfs: &HdpVfs) -> Result<MovieCatalog, MovieCatalogErro
             });
         }
         let lower = file.video.to_ascii_lowercase();
-        if ![".mkv", ".webm", ".mkva", ".webma"]
+        if ![".mkv", ".webm", ".mkva", ".webma", ".mp4"]
             .iter()
             .any(|ext| lower.ends_with(ext))
         {
             return Err(MovieCatalogError::Data {
                 path: descriptor_path,
-                message: "movie video must be a `.mkv`, `.webm`, `.mkva` or `.webma` AV1 + optional Opus asset".into(),
+                message: "movie video must be a `.mkv`, `.webm`, `.mkva`, `.webma` or `.mp4` asset with a supported video codec and optional Opus audio".into(),
             });
         }
         let definition = MovieDefinition {
@@ -120,7 +120,7 @@ mod tests {
         std::fs::write(root.join("settings.hson"), ".{}").expect("test settings must be written");
         std::fs::write(
             root.join("movies/intro.movie.hson"),
-            ".{ name: \"intro\", video: \"intro.webm\" }",
+            ".{ name: \"intro\", video: \"intro.mp4\" }",
         )
         .expect("test descriptor must be written");
 
@@ -131,7 +131,7 @@ mod tests {
                 .resolve("intro")
                 .expect("named movie must resolve")
                 .path,
-            "movies/intro.webm"
+            "movies/intro.mp4"
         );
 
         std::fs::remove_dir_all(root).expect("test directory must be removed");

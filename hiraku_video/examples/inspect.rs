@@ -1,8 +1,12 @@
 //! Read-only container validation, without starting a window or decoding audio.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).ok_or("usage: inspect VIDEO.webm")?;
-    let bytes = std::fs::read(path)?;
-    let mut demuxer = hiraku_video::container::MatroskaDemuxer::new(bytes.into(), "webm")?;
+    let path = std::env::args().nth(1).ok_or("usage: inspect VIDEO")?;
+    let extension = std::path::Path::new(&path)
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("");
+    let bytes = std::fs::read(&path)?;
+    let mut demuxer = hiraku_video::container::MediaDemuxer::new(bytes.into(), extension)?;
     let mut video = 0;
     let mut audio = 0;
     while let Some(chunk) = demuxer.next_chunk()? {

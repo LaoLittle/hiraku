@@ -400,6 +400,9 @@ pub(super) fn dispatch_audio_command(
                 .queue(move |world: &mut World| stop_music(world, previous, fade, animation_id));
             shared_state.0.bgm = None;
         }
+        AudioCommand::StopVoice => {
+            finish_all_voices(commands, animations, voice_state);
+        }
         AudioCommand::PlayVoice {
             path,
             volume,

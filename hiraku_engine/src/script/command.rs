@@ -30,7 +30,12 @@ pub enum ScriptCommand {
 pub enum RuntimeCommand {
     SaveSlot(String),
     Log(String),
-    Navigate(NavigationRequest),
+    Navigate {
+        request: NavigationRequest,
+        /// Host reloads carry freshly compiled code; ordinary story navigation
+        /// can reuse the current linked project.
+        program: Option<Box<super::StoryProgram>>,
+    },
     Exit,
 }
 
@@ -208,6 +213,7 @@ pub enum AudioCommand {
         fade: Duration,
         animation_id: Option<String>,
     },
+    StopVoice,
     PlayVoice {
         path: String,
         volume: f32,

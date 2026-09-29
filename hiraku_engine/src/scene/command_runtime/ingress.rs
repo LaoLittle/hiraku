@@ -650,7 +650,7 @@ pub fn drive_story_runtime(
                         .map(|definition| (definition.path.clone(), definition.layout))
                         .or_else(|| {
                             let lower = path.to_ascii_lowercase();
-                            [".mkv", ".webm", ".mkva", ".webma"]
+                            [".mkv", ".webm", ".mkva", ".webma", ".mp4"]
                                 .iter()
                                 .any(|ext| lower.ends_with(ext))
                                 .then(|| {
@@ -1173,7 +1173,7 @@ mod batch_tests {
         ));
         assert!(matches!(
             queue.items.back().expect("last").command,
-            ScriptCommand::Runtime(RuntimeCommand::Navigate(_))
+            ScriptCommand::Runtime(RuntimeCommand::Navigate { .. })
         ));
     }
 }

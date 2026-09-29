@@ -658,7 +658,7 @@ mod api {
         g: i32,
         b: i32,
         a: i32,
-    ) -> Result<FadeTransitionHandle, NativeError> {
+    ) -> Result<PictureTintHandle, NativeError> {
         let bytes = [r, g, b, a];
         if id.trim().is_empty() || !bytes.iter().all(|v| (0..=255).contains(v)) {
             return Err(NativeError::message(
@@ -671,6 +671,7 @@ mod api {
                 id,
                 color: bytes.map(|v| v as f32 / 255.0),
                 seconds: 0.0,
+                ease: crate::script::animation::Easing::Linear,
             }))
     }
 
@@ -885,7 +886,8 @@ mod api {
             Some((
                 SceneVisualTarget::Picture(
                     PictureCommand::Transform { seconds, ease, .. }
-                    | PictureCommand::Exit { seconds, ease, .. },
+                    | PictureCommand::Exit { seconds, ease, .. }
+                    | PictureCommand::Tint { seconds, ease, .. },
                 ),
                 _,
             )) => Ok(AnimationSpec::new(*seconds as f64, *ease, false)),
@@ -910,7 +912,8 @@ mod api {
             Some((
                 SceneVisualTarget::Picture(
                     PictureCommand::Transform { seconds, ease, .. }
-                    | PictureCommand::Exit { seconds, ease, .. },
+                    | PictureCommand::Exit { seconds, ease, .. }
+                    | PictureCommand::Tint { seconds, ease, .. },
                 ),
                 _,
             )) => {
@@ -2160,9 +2163,26 @@ mod tests {
             runtime("scene.tintPicture(\"room\", 0, 128, 255, 255).fade(300).await()");
         assert!(
             matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect { effect: StoryEffect::Picture(
-            PictureCommand::Tint { id, color, seconds }
+            PictureCommand::Tint { id, color, seconds, .. }
         ), .. } if id == "room" && color == [0.0, 128.0 / 255.0, 1.0, 1.0] && (seconds - 0.3).abs() < 0.001)
         );
+    }
+
+    #[test]
+    fn picture_tint_easing_is_independent_of_modifier_order() {
+        for modifiers in [
+            ".time(1).easing(.smoothStep)",
+            ".easing(.smoothStep).time(1)",
+        ] {
+            let mut runtime = runtime(&format!(
+                "scene.tintPicture(\"alice\", 255, 255, 255, 0){modifiers}.await()"
+            ));
+            assert!(
+                matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect {
+                effect: StoryEffect::Picture(PictureCommand::Tint { seconds, ease, .. }), ..
+            } if seconds == 1.0 && ease == crate::script::animation::Easing::SmoothStep)
+            );
+        }
     }
 
     #[test]

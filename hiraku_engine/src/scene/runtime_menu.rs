@@ -492,7 +492,10 @@ fn dispatch_ui_effects(
             }
             crate::ui::UiEffect::Navigate(navigation) => {
                 ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
-                    RuntimeCommand::Navigate(navigation.clone()),
+                    RuntimeCommand::Navigate {
+                        request: navigation.clone(),
+                        program: None,
+                    },
                 ));
             }
             crate::ui::UiEffect::NextDialogue => {

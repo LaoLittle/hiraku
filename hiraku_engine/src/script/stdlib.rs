@@ -6,7 +6,7 @@ pub(super) const DIALOGUE_CAPABILITY: &str = "dialogue.write";
 pub(super) const ACTOR_CAPABILITY: &str = "scene.actor";
 const DIALOGUE_SOURCE: &str = include_str!("std/dialogue.hks");
 
-pub(super) fn dialogue_source() -> ScriptSource {
+pub(crate) fn dialogue_source() -> ScriptSource {
     ScriptSource {
         path: DIALOGUE_PATH.into(),
         source: DIALOGUE_SOURCE.into(),

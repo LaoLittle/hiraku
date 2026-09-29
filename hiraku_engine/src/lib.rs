@@ -1,5 +1,6 @@
 mod assets;
 mod audio;
+pub mod authoring;
 mod character;
 mod data;
 pub mod dependencies;
@@ -14,6 +15,7 @@ mod movie;
 mod proto;
 mod redraw;
 pub mod render;
+pub mod runtime_control;
 mod scene;
 pub use scene::DialogueHistoryState;
 pub use scene::clock::SceneClock;
@@ -282,6 +284,7 @@ struct HirakuRuntimeSystems;
 
 impl Plugin for HirakuPlugin {
     fn build(&self, app: &mut App) {
+        runtime_control::install(app);
         scene::screen_ui::configure_screen_ui_phases(app);
         app.add_plugins(stage::StagePlugin);
         render::ui_quad::register(app);

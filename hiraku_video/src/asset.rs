@@ -47,6 +47,7 @@ pub struct VideoMetadata {
 #[derive(Clone, Debug)]
 pub(crate) struct EncodedMedia {
     pub bytes: std::sync::Arc<[u8]>,
+    pub extension: String,
 }
 
 #[derive(Asset, Clone, Debug, TypePath)]
@@ -102,6 +103,7 @@ impl AssetLoader for VideoAssetLoader {
         }
         let media = EncodedMedia {
             bytes: bytes.into(),
+            extension: container.into(),
         };
         Ok(VideoAsset {
             media,
@@ -111,7 +113,7 @@ impl AssetLoader for VideoAssetLoader {
     }
 
     fn extensions(&self) -> &[&str] {
-        &["mkv", "webm", "mkva", "webma"]
+        &["mkv", "webm", "mkva", "webma", "mp4"]
     }
 }
 
@@ -138,6 +140,9 @@ mod tests {
     #[test]
     fn loader_only_claims_the_supported_container_extensions() {
         let loader = VideoAssetLoader;
-        assert_eq!(loader.extensions(), &["mkv", "webm", "mkva", "webma"]);
+        assert_eq!(
+            loader.extensions(),
+            &["mkv", "webm", "mkva", "webma", "mp4"]
+        );
     }
 }

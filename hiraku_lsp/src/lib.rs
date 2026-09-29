@@ -1,6 +1,7 @@
 //! Small synchronous LSP server. JSON and stdio live here, not in the language VM.
 //! Open document buffers are authoritative; the server never writes project files.
 pub mod analysis;
+pub mod completion;
 use hiraku_script::{
     Stmt,
     cst::{SyntaxKind, SyntaxTree, statement_span},
@@ -18,6 +19,7 @@ struct Document {
 #[derive(Default)]
 pub struct Server {
     documents: BTreeMap<String, Document>,
+    completion_symbols: Vec<completion::CompletionSymbol>,
     initialized: bool,
     shutdown: bool,
 }
@@ -46,6 +48,12 @@ fn log_error(message: &str) -> Value {
 }
 
 impl Server {
+    /// Host/project catalogues can be injected without making the language
+    /// server depend on an engine. Unsaved local declarations take precedence.
+    pub fn set_completion_symbols(&mut self, symbols: Vec<completion::CompletionSymbol>) {
+        self.completion_symbols = symbols;
+    }
+
     /// Returns outbound JSON-RPC messages. Requests and notifications share the
     /// same implementation used by the stdio binary and protocol tests.
     pub fn handle(&mut self, message: Value) -> Vec<Value> {
@@ -85,7 +93,8 @@ impl Server {
             return Ok(
                 json!({"serverInfo":{"name":"hiraku-lsp","version":env!("CARGO_PKG_VERSION")},"capabilities":{
                     "positionEncoding":"utf-16", "textDocumentSync":{"openClose":true,"change":2},
-                    "documentFormattingProvider":true,"documentSymbolProvider":true,"foldingRangeProvider":true
+                    "documentFormattingProvider":true,"documentSymbolProvider":true,"foldingRangeProvider":true,
+                    "completionProvider":{"triggerCharacters":["."],"resolveProvider":false}
                 }}),
             );
         }
@@ -101,7 +110,10 @@ impl Server {
         }
         if !matches!(
             method,
-            "textDocument/formatting" | "textDocument/documentSymbol" | "textDocument/foldingRange"
+            "textDocument/formatting"
+                | "textDocument/documentSymbol"
+                | "textDocument/foldingRange"
+                | "textDocument/completion"
         ) {
             return Err((-32601, format!("method not supported: {method}")));
         }
@@ -111,6 +123,26 @@ impl Server {
             .ok_or((-32602, "document is not open".into()))?;
         let source = &document.tree.source;
         match method {
+            "textDocument/completion" => {
+                let cursor = position(&params["position"])
+                    .and_then(|position| LineIndex::new(source).offset(position))
+                    .ok_or((-32602, "invalid UTF-16 completion position".into()))?;
+                let items = completion::complete_tree(&document.tree, cursor, &self.completion_symbols)
+                    .into_iter()
+                    .map(|item| {
+                        let kind = match item.kind {
+                            completion::CompletionKind::Function => 3,
+                            completion::CompletionKind::Variable => 6,
+                            completion::CompletionKind::Type => 7,
+                            completion::CompletionKind::Module => 9,
+                            completion::CompletionKind::Keyword => 14,
+                            completion::CompletionKind::Field => 5,
+                        };
+                        json!({"label":item.label,"detail":item.detail,"kind":kind,"insertTextFormat":1,
+                            "textEdit":{"range":range(source,item.replacement),"newText":item.insert_text}})
+                    }).collect::<Vec<_>>();
+                Ok(json!({"isIncomplete":false,"items":items}))
+            }
             "textDocument/formatting" => {
                 let formatted = format_tree(
                     &document.tree,
@@ -404,5 +436,25 @@ mod tests {
             .send(lsp_server::Notification::new("exit".into(), ()).into())
             .expect("send exit");
         assert!(serve_connection(server).is_err());
+    }
+
+    #[test]
+    fn completion_matches_embedded_service_with_utf16_edits() {
+        let mut server = server();
+        let source = "let 名前 = \"😀\"\n名";
+        let uri = "untitled:sample.hks";
+        server.handle(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"version":1,"text":source}}}));
+        let items = completion::complete(source, source.len(), &[]);
+        let response = server.handle(json!({"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":1}}}));
+        let wire = response[0]["result"]["items"]
+            .as_array()
+            .expect("completion items");
+        assert_eq!(wire.len(), items.len());
+        assert_eq!(wire[0]["label"], "名前");
+        assert_eq!(
+            wire[0]["textEdit"]["range"],
+            range(source, items[0].replacement)
+        );
+        assert_eq!(wire[0]["textEdit"]["newText"], items[0].insert_text);
     }
 }

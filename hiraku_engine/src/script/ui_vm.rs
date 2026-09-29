@@ -2075,13 +2075,24 @@ impl UiComposition {
     }
 }
 
+fn ui_stdlib_source() -> hiraku_script::ScriptSource {
+    hiraku_script::ScriptSource {
+        path: UI_STDLIB_PATH.into(),
+        namespace: Some("ui.widgets".into()),
+        source: UI_STDLIB_SOURCE.into(),
+    }
+}
+
+pub(crate) fn authoring_api() -> (hiraku_script::BuiltinManifest, hiraku_script::ScriptSource) {
+    (
+        ui_registry(&UiContext::default()).manifest(),
+        ui_stdlib_source(),
+    )
+}
+
 fn ui_sources(path: &str, source: &str) -> Vec<hiraku_script::ScriptSource> {
     vec![
-        hiraku_script::ScriptSource {
-            path: UI_STDLIB_PATH.into(),
-            namespace: Some("ui.widgets".into()),
-            source: UI_STDLIB_SOURCE.into(),
-        },
+        ui_stdlib_source(),
         hiraku_script::ScriptSource {
             path: path.into(),
             namespace: None,

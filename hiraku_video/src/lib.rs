@@ -1,8 +1,8 @@
-//! Streaming Matroska/WebM video playback for Bevy.
+//! Streaming Matroska/WebM/MP4 video playback for Bevy.
 //!
-//! Hiraku intentionally supports one deterministic media profile: an AV1 video
-//! track and an optional Opus audio track inside a Matroska (`.mkv`) or WebM (`.webm`)
-//! container. Decoding lives in hiraku-codec; this crate owns Bevy playback and presentation;
+//! Video and optional Opus audio are demuxed with Symphonia from Matroska (`.mkv`),
+//! WebM (`.webm`) or MP4 (`.mp4`). Supported tracks depend on the container reader
+//! and codec adapter. Decoding lives in hiraku-codec; this crate owns Bevy playback and presentation;
 //! story semantics belong to the embedding engine.
 
 mod asset;

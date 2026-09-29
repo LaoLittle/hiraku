@@ -141,6 +141,15 @@ builder! {
     wait["await"]() -> () => await_transition;
 }
 
+builder! {
+    picture_tint, PictureTintHandle, "PictureTint", 20;
+    time["time"](seconds: f64) -> PictureTintHandle => transition_time;
+    fade["fade"](milliseconds: f64) -> PictureTintHandle => fade_in;
+    easing["easing"](curve: crate::script::animation::Easing)
+        -> PictureTintHandle => transition_easing;
+    wait["await"]() -> () => await_transition;
+}
+
 pub(super) fn register(
     registry: &mut NativeRegistry<CharacterContext>,
 ) -> Result<(), RegistrationError> {
@@ -155,5 +164,6 @@ pub(super) fn register(
     effect::register_hks(registry)?;
     stage_camera::register_hks(registry)?;
     stage_view::register_hks(registry)?;
+    picture_tint::register_hks(registry)?;
     Ok(())
 }

@@ -24,7 +24,9 @@ mod story_runtime;
 pub mod ui_runtime;
 mod ui_vm;
 pub(crate) use project::{StoryProgram, compile_story_program};
+pub(crate) use stdlib::dialogue_source;
 pub(crate) use ui_vm::UiComposition;
+pub(crate) use ui_vm::authoring_api as ui_authoring_api;
 pub(crate) use ui_vm::ui_argument_to_stored;
 pub(crate) use ui_vm::validate_ui_source;
 
@@ -98,10 +100,12 @@ pub(crate) fn script_command_from_effect(
             fade: Duration::from_millis(fade_ms),
             animation_id: None,
         }),
+        StoryEffect::StopVoice => ScriptCommand::Audio(AudioCommand::StopVoice),
         StoryEffect::Exit => ScriptCommand::Runtime(RuntimeCommand::Exit),
-        StoryEffect::Navigate(navigation) => {
-            ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation))
-        }
+        StoryEffect::Navigate(navigation) => ScriptCommand::Runtime(RuntimeCommand::Navigate {
+            request: navigation,
+            program: None,
+        }),
         StoryEffect::AdjustSetting { name, delta } => {
             ScriptCommand::Settings(SettingsCommand::Adjust { name, delta })
         }

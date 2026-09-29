@@ -60,6 +60,7 @@ pub enum StoryEffect {
     StopBgm {
         fade_ms: u64,
     },
+    StopVoice,
     StopSfxChannel {
         channel: String,
         fade_ms: u64,

@@ -173,6 +173,21 @@ mod tests {
     use crate::script::{StoryRuntime, StoryRuntimeEvent};
 
     #[test]
+    fn story_can_stop_an_active_voice() {
+        let code = compile_story_bytecode("story.hks", "stopVoice()\n\"Alice\"")
+            .expect("typed voice stop");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        assert!(matches!(
+            runtime.step().expect("voice stop"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::StopVoice))
+        ));
+        assert!(matches!(
+            runtime.step().expect("following dialogue"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::Say { .. }))
+        ));
+    }
+
+    #[test]
     fn music_stop_can_be_awaited_and_restored() {
         let code = compile_story_bytecode("music.hks", "stopBgm(3000).await()\n\"Alice\"")
             .expect("typed stop builder");
@@ -326,6 +341,12 @@ mod tests {
 #[hiraku_script::hks_module]
 mod api {
     use super::*;
+
+    #[hks(name = "stopVoice")]
+    fn stop_voice(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::StopVoice);
+        Ok(())
+    }
 
     #[hks(name = "stopBgm")]
     fn stop_bgm(

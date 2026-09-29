@@ -21,7 +21,7 @@ pub struct SequencedScriptCommand {
     pub command: ScriptCommand,
 }
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Debug)]
 pub struct PendingScriptCommands {
     next_sequence: u64,
     last_dispatched_sequence: Option<u64>,
@@ -80,6 +80,7 @@ pub struct ScriptExecutionCommandContext<'w> {
     pub animations: ResMut<'w, AnimationState>,
     pub video_player: ResMut<'w, VideoPlayer>,
     pub movie_waits: ResMut<'w, PendingMovieWaits>,
+    pub host_control: ResMut<'w, crate::runtime_control::RuntimeControlStatus>,
 }
 
 #[derive(SystemParam)]
@@ -148,6 +149,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
     let mut animations = execution.animations;
     let mut video_player = execution.video_player;
     let mut movie_waits = execution.movie_waits;
+    let mut host_control = execution.host_control;
     let mut voice_state = ctx.voice_state;
     let mut pending_characters = ctx.pending_characters;
     let mut waits = ctx.waits;
@@ -165,7 +167,11 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
         // Inspect without consuming the command: its sequence and the caller
         // remain intact throughout asynchronous preload.
         if let Some(SequencedScriptCommand {
-            command: ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation)),
+            command:
+                ScriptCommand::Runtime(RuntimeCommand::Navigate {
+                    request: navigation,
+                    ..
+                }),
             ..
         }) = pending_script_commands.items.front()
             && navigation.should_preload(script_runtime.story.as_ref())
@@ -732,7 +738,11 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
             ScriptCommand::Runtime(RuntimeCommand::Exit) => {
                 app_exit.write(AppExit::Success);
             }
-            ScriptCommand::Runtime(RuntimeCommand::Navigate(navigation)) => {
+            ScriptCommand::Runtime(RuntimeCommand::Navigate {
+                request: navigation,
+                program,
+            }) => {
+                let host_restart = program.is_some();
                 let target = vfs.0.resolve_path(
                     navigation
                         .origin
@@ -740,10 +750,12 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         .or(script_runtime.current_script.as_deref()),
                     &navigation.path,
                 );
-                let cached = script_runtime
-                    .story
-                    .as_ref()
-                    .and_then(|story| story.program_for_path(&target));
+                let cached = program.map(|program| *program).or_else(|| {
+                    script_runtime
+                        .story
+                        .as_ref()
+                        .and_then(|story| story.program_for_path(&target))
+                });
                 let prepared = cached
                     .map(Ok)
                     .unwrap_or_else(|| {
@@ -760,6 +772,9 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 let mut next_story = match prepared {
                     Ok(story) => story,
                     Err(error) => {
+                        if host_restart {
+                            host_control.restart = crate::runtime_control::RestartState::Failed;
+                        }
                         crate::script::emit_script_diagnostic(
                             &format!("failed to navigate to HKS script `{target}`:"),
                             &error,
@@ -832,6 +847,15 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     if navigation.reset == NavigationReset::Session {
                         dialogue_history.entries.clear();
                     }
+                    if host_restart {
+                        // Restart re-executes startup, unlike an in-story
+                        // session reset which keeps project UI registration.
+                        script_runtime.ui_registry.clear();
+                        script_runtime.replay = None;
+                        script_runtime.replay_dialogue.clear();
+                        video_player.stop_all();
+                        *movie_waits = PendingMovieWaits::default();
+                    }
                 }
 
                 if navigation.kind == NavigationKind::Call {
@@ -850,6 +874,11 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     script_runtime.call_stack.clear();
                 }
                 script_runtime.story = Some(next_story);
+                if host_restart {
+                    dependencies.loading = false;
+                    dependencies.error = None;
+                    host_control.restart = crate::runtime_control::RestartState::Restarted;
+                }
                 script_runtime.current_script = Some(target);
                 script_runtime.task_requests.clear();
                 frontend.runtime_started = true;
