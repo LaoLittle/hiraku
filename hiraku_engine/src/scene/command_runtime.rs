@@ -595,6 +595,12 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 }
             }
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }) => {
+                for (id, blur) in &mut shared_state.0.actor_blurs {
+                    if actor_id.as_ref().is_none_or(|actor| actor == id) {
+                        blur.advance(blur.animation.duration());
+                        complete_missing_animation(&mut animations, blur.animation_id.take());
+                    }
+                }
                 for (id, motion) in &mut shared_state.0.actor_motions {
                     if actor_id.as_ref().is_none_or(|actor| actor == id) {
                         actor_motion::finish(motion, &mut animations);
@@ -608,6 +614,28 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     actor_id.as_deref(),
                     fade_ms,
                 );
+            }
+            ScriptCommand::Character(CharacterCommand::Blur {
+                actor_id,
+                radius,
+                animation,
+                animation_id,
+            }) => {
+                let previous = shared_state.0.actor_blurs.remove(&actor_id);
+                if let Some(previous) = &previous {
+                    complete_missing_animation(&mut animations, previous.animation_id.clone());
+                }
+                let mut blur = crate::script::actor_blur::ActorBlur::new(
+                    previous.map_or(0.0, |blur| blur.radius),
+                    radius,
+                    animation,
+                    animation_id,
+                );
+                if animation.duration() <= 0.0 {
+                    blur.advance(0.0);
+                    complete_missing_animation(&mut animations, blur.animation_id.take());
+                }
+                shared_state.0.actor_blurs.insert(actor_id, blur);
             }
             ScriptCommand::Character(CharacterCommand::Show {
                 rotation,

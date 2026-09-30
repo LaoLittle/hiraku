@@ -52,17 +52,22 @@ struct ExtractedFrame {
     materials: Vec<bevy::asset::UntypedAssetId>,
     surfaces_ready: bool,
     visible_entities: Vec<Entity>,
+    cameras: Vec<Entity>,
 }
 
 fn extract(
     mut commands: Commands,
     pending: Extract<Res<PendingFrame>>,
+    shared: Extract<Res<crate::state::SceneSharedState>>,
+    stage: Extract<Res<super::runtime::StageRuntime>>,
+    cameras: Extract<Query<(Entity, &Camera), With<super::views::ViewCamera>>>,
     surfaces: Extract<
         Query<
             (
                 Entity,
                 Option<&Mesh3d>,
                 Option<&MeshMaterial3d<StandardMaterial>>,
+                Option<&MeshMaterial3d<super::shading::GammaStageMaterial>>,
                 Option<&ViewVisibility>,
             ),
             With<super::runtime::StageSurface>,
@@ -84,10 +89,25 @@ fn extract(
     let mut materials = Vec::new();
     let mut surfaces_ready = true;
     let mut visible_entities = Vec::new();
+    let cameras = cameras
+        .iter()
+        .filter(|(_, camera)| camera.is_active)
+        .map(|(entity, _)| entity)
+        .collect::<Vec<_>>();
     if pending.pending() {
-        for (entity, mesh, material, visibility) in &surfaces {
+        // Instantiation, view creation and GPU targets become ready in different
+        // schedules. An empty extraction must not acknowledge a loading stage.
+        if let Some(state) = &shared.0.spatial_stage {
+            let expected_views = state
+                .views
+                .values()
+                .filter(|view| view.camera.is_some() && (view.alpha > 0.0 || view.fade.is_some()))
+                .count();
+            surfaces_ready = stage.ready(state) && cameras.len() == expected_views;
+        }
+        for (entity, mesh, material, gamma_material, visibility) in &surfaces {
             if mesh.is_some()
-                && material.is_some()
+                && (material.is_some() || gamma_material.is_some())
                 && visibility.is_some_and(|visible| visible.get())
             {
                 visible_entities.push(entity);
@@ -96,6 +116,9 @@ fn extract(
                 meshes.push(mesh.id());
             }
             if let Some(material) = material {
+                materials.push(material.id().untyped());
+            }
+            if let Some(material) = gamma_material {
                 materials.push(material.id().untyped());
             }
         }
@@ -124,6 +147,7 @@ fn extract(
         materials,
         surfaces_ready,
         visible_entities,
+        cameras,
     });
 }
 
@@ -133,9 +157,15 @@ fn acknowledge(
     meshes: Option<Res<RenderAssets<RenderMesh>>>,
     materials: Option<Res<ErasedRenderAssets<bevy::pbr::PreparedMaterial>>>,
     specialized: Option<Res<bevy::pbr::SpecializedMaterialPipelineCache>>,
+    targets: Query<&bevy::render::sync_world::MainEntity, With<bevy::render::view::ViewTarget>>,
 ) {
     let Some(frame) = frame else { return };
     if !frame.surfaces_ready
+        || !camera_targets_ready(&frame.cameras, |entity| {
+            targets
+                .iter()
+                .any(|main| *main == bevy::render::sync_world::MainEntity::from(entity))
+        })
         || pipelines.waiting_pipelines().next().is_some()
         || frame.meshes.iter().any(|id| {
             meshes
@@ -181,6 +211,10 @@ fn draws_ready(
     })
 }
 
+fn camera_targets_ready(cameras: &[Entity], ready: impl Fn(Entity) -> bool) -> bool {
+    cameras.iter().copied().all(ready)
+}
+
 fn keep_awake(pending: Res<PendingFrame>, mut redraw: crate::redraw::Redraw) {
     if pending.pending() {
         redraw.request();
@@ -203,6 +237,14 @@ pub(super) fn register(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stage_frame_waits_for_every_offscreen_camera_target() {
+        let first = Entity::from_bits(42);
+        let second = Entity::from_bits(43);
+        assert!(!camera_targets_ready(&[first, second], |entity| entity == first));
+        assert!(camera_targets_ready(&[first, second], |_| true));
+        assert!(camera_targets_ready(&[], |_| false));
+    }
     #[test]
     fn prepared_assets_are_not_enough_until_draw_pipeline_is_ready() {
         let entity = Entity::from_bits(42);

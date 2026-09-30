@@ -1034,6 +1034,9 @@ pub fn drive_story_runtime(
                         | ScriptCommand::Character(CharacterCommand::Motion {
                             animation_id, ..
                         })
+                        | ScriptCommand::Character(CharacterCommand::Blur {
+                            animation_id, ..
+                        })
                         | ScriptCommand::Dialogue(DialogueCommand::Say { animation_id, .. })
                         | ScriptCommand::Dialogue(DialogueCommand::Continue {
                             animation_id, ..

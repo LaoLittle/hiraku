@@ -146,6 +146,11 @@ pub enum StoryEffect {
         scope: CameraEffectScope,
         parameters: crate::effect::post_process::EffectParameters,
     },
+    ActorBlur {
+        actor_id: String,
+        radius: f32,
+        animation: AnimationSpec,
+    },
     ShowCharacter {
         rotation: f32,
         placement_animation: Option<AnimationSpec>,
@@ -439,9 +444,22 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
             )
             .expect("task closure signature must target its registered builtin");
     }
-    registry
+    let choice = registry
         .register_raw_fn("choice", async_capability_placeholder)
         .expect("built-in `choice` registration must be unique");
+    registry
+        .set_signature(
+            choice,
+            hiraku_script::FunctionSignature {
+                receiver: None,
+                // Both choice { ... } and choice("prompt") { ... } are accepted.
+                // The host validates their shapes before collecting options.
+                parameters: vec![],
+                variadic: Some(ScriptType::Any),
+                result: ScriptType::Int,
+            },
+        )
+        .expect("choice has a typed selection result");
     let option = registry
         .register_raw_fn("option", async_capability_placeholder)
         .expect("built-in `option` registration must be unique");
@@ -639,6 +657,9 @@ impl Default for StoryNativeHost {
 }
 
 impl StoryNativeHost {
+    pub(super) fn set_symbols(&mut self, symbols: hiraku_script::symbol::SymbolManifest) {
+        self.context.symbols = symbols;
+    }
     pub(super) fn actor_motion_is_current(&self, display: &str, revision: u64) -> bool {
         self.context
             .actors
@@ -899,6 +920,7 @@ impl StoryNativeHost {
         let controls = StoryControlBuiltins::new(&registry.manifest());
         Self {
             context: CharacterContext {
+                symbols: Default::default(),
                 await_effects: snapshot.await_effects,
                 next_handle: snapshot.next_handle,
                 actors: snapshot.actors,
@@ -972,6 +994,7 @@ struct PendingCamera {
 
 #[derive(Default)]
 struct CharacterContext {
+    symbols: hiraku_script::symbol::SymbolManifest,
     await_effects: bool,
     scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
@@ -2901,6 +2924,35 @@ not_actor.at(.left)"#,
 #[hiraku_script::hks_module("profile")]
 mod profile_api {
     use super::*;
+    #[hks(name = "read_any")]
+    fn read_any(
+        context: &mut CharacterContext,
+        key: String,
+        fallback: Value,
+    ) -> Result<Value, NativeError> {
+        crate::storage::profile::read_object(&key, &context.symbols)
+            .map(|value| value.unwrap_or(fallback))
+            .map_err(NativeError::message)
+    }
+    #[hks]
+    fn write(context: &mut CharacterContext, key: String, value: Value) -> Result<(), NativeError> {
+        crate::storage::profile::write_object(&key, &value, &context.symbols)
+            .map_err(NativeError::message)
+    }
+    #[hks(name = "readInt")]
+    fn read_int(_context: &mut CharacterContext, key: String) -> Result<i64, NativeError> {
+        crate::storage::profile::read_int(&key)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
+    #[hks(name = "writeInt")]
+    fn write_int(
+        _context: &mut CharacterContext,
+        key: String,
+        value: i64,
+    ) -> Result<(), NativeError> {
+        crate::storage::profile::write_int(&key, value)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
     #[hks(name = "readBool")]
     fn read_bool(_context: &mut CharacterContext, key: String) -> Result<bool, NativeError> {
         crate::storage::profile::read_bool(&key)

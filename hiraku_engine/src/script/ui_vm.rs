@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use hiraku_script::native::{
-    FromHksValue, HksBindable, HksBinding, HksCallable, HksClosure, IntoHksValue, NativeError,
+    FromHksValue, HksBindable, HksBinding, HksCallable, HksScriptType, IntoHksValue, NativeError,
     NativeRegistry,
 };
 use hiraku_script::{LinkedVm, LinkedVmEvent, RenderOptions, ScriptType, StatementValue, Value};
@@ -36,6 +36,58 @@ struct UiNodeHandle(u64);
 #[derive(Clone, Copy, hiraku_script::HksHandle)]
 #[hks(name = "UiEffect", handle_type = UI_EFFECT_HANDLE_TYPE)]
 struct UiEffectHandle(u64);
+
+/// A no-argument UI callback. Keep its signature in the native manifest so
+/// closures are checked (and their statement results discarded) at compile time.
+/// Named functions are valid callbacks too; this is not restricted to closures.
+#[derive(Clone, Debug)]
+struct UiVoidCallable(HksCallable);
+
+impl FromHksValue for UiVoidCallable {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        HksCallable::from_hks_value(value).map(Self)
+    }
+}
+
+impl IntoHksValue for UiVoidCallable {
+    fn into_hks_value(self) -> Value {
+        self.0.into_value()
+    }
+}
+
+impl HksScriptType for UiVoidCallable {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> ScriptType {
+        ScriptType::Callable {
+            parameters: Vec::new(),
+            result: Box::new(ScriptType::Unit),
+        }
+    }
+}
+
+/// UiNode currently erases the particular input widget, so its exact payload
+/// still needs validation when materialized. Do not erase the callback's arity
+/// and return type as well: every supported input sends one scalar and expects Unit.
+struct UiInputCallable(HksCallable);
+
+impl FromHksValue for UiInputCallable {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        HksCallable::from_hks_value(value).map(Self)
+    }
+}
+
+impl HksScriptType for UiInputCallable {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> ScriptType {
+        ScriptType::Union(
+            [ScriptType::Bool, ScriptType::Float, ScriptType::String]
+                .into_iter()
+                .map(|parameter| ScriptType::Callable {
+                    parameters: vec![parameter],
+                    result: Box::new(ScriptType::Unit),
+                })
+                .collect(),
+        )
+    }
+}
 
 hiraku_script::hks_define! {
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,11 +149,11 @@ struct UiDraft {
     timers: Vec<(f32, HksCallable)>,
     slider_skin: Option<[String; 3]>,
     kind: UiDraftKind,
-    content: Option<HksClosure>,
-    hovered: Option<HksClosure>,
-    pressed: Option<HksClosure>,
-    checked: Option<HksClosure>,
-    on_click: Option<HksClosure>,
+    content: Option<UiVoidCallable>,
+    hovered: Option<UiVoidCallable>,
+    pressed: Option<UiVoidCallable>,
+    checked: Option<UiVoidCallable>,
+    on_click: Option<UiVoidCallable>,
     on_change: Option<HksCallable>,
     on_commit: Option<HksCallable>,
     placeholder: String,
@@ -135,7 +187,7 @@ struct UiDraft {
 }
 
 impl UiDraft {
-    fn new(kind: UiDraftKind, content: Option<HksClosure>) -> Self {
+    fn new(kind: UiDraftKind, content: Option<UiVoidCallable>) -> Self {
         Self {
             allowed_overlays: Vec::new(),
             timers: Vec::new(),
@@ -184,6 +236,7 @@ impl UiDraft {
 }
 
 struct UiVmContext {
+    symbols: hiraku_script::symbol::SymbolManifest,
     owned_globals: std::collections::BTreeSet<String>,
     local_globals: BTreeMap<String, Value>,
     values: UiContext,
@@ -198,6 +251,7 @@ struct UiVmContext {
 impl UiVmContext {
     fn new(values: UiContext, terms: TermCatalog) -> Self {
         Self {
+            symbols: Default::default(),
             owned_globals: Default::default(),
             local_globals: Default::default(),
             values,
@@ -241,7 +295,7 @@ mod native_ui {
     #[hks(name = "__uiScreen")]
     fn ui_screen(
         context: &mut UiVmContext,
-        content: HksClosure,
+        content: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Screen, Some(content))))
     }
@@ -249,20 +303,23 @@ mod native_ui {
     #[hks(name = "__uiColumn")]
     fn ui_column(
         context: &mut UiVmContext,
-        content: HksClosure,
+        content: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Column, Some(content))))
     }
 
     #[hks(name = "__uiRow")]
-    fn ui_row(context: &mut UiVmContext, content: HksClosure) -> Result<UiNodeHandle, NativeError> {
+    fn ui_row(
+        context: &mut UiVmContext,
+        content: UiVoidCallable,
+    ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Row, Some(content))))
     }
 
     #[hks(name = "__uiScrollable")]
     fn ui_scrollable(
         context: &mut UiVmContext,
-        content: HksClosure,
+        content: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Scrollable, Some(content))))
     }
@@ -271,7 +328,7 @@ mod native_ui {
     fn ui_toggle(
         context: &mut UiVmContext,
         value: HksBindable<bool>,
-        content: HksClosure,
+        content: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Toggle(value), Some(content))))
     }
@@ -350,7 +407,7 @@ mod native_ui {
     fn on_change(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        handler: HksCallable,
+        handler: UiInputCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(
@@ -362,7 +419,7 @@ mod native_ui {
         ) {
             return Err(NativeError::message("onChange requires an input widget"));
         }
-        draft.on_change = Some(handler);
+        draft.on_change = Some(handler.0);
         Ok(node)
     }
 
@@ -429,19 +486,37 @@ mod native_ui {
         Ok(node)
     }
 
-    /// Read-only collection size; element values never leave the Any boundary.
-    #[hks]
-    fn count(_context: &mut UiVmContext, values: Vec<Value>) -> Result<i32, NativeError> {
-        i32::try_from(values.len())
+    /// Read-only collection size; the registry preserves the element type.
+    #[hks(raw)]
+    fn count(
+        _context: &mut UiVmContext,
+        call: &hiraku_script::BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        let [argument] = call.arguments.as_slice() else {
+            return Err(NativeError::message("count expects one list"));
+        };
+        let Value::List(values) = &argument.value else {
+            return Err(NativeError::message("count expects a list"));
+        };
+        i64::try_from(values.len())
+            .map(Value::Int)
             .map_err(|_| NativeError::message("collection size exceeds Int range"))
     }
 
-    #[hks]
+    #[hks(raw)]
     fn item(
         _context: &mut UiVmContext,
-        values: Vec<Value>,
-        index: i32,
+        call: &hiraku_script::BuiltinCall,
     ) -> Result<Value, NativeError> {
+        let [argument, index] = call.arguments.as_slice() else {
+            return Err(NativeError::message("item expects a list and an index"));
+        };
+        let Value::List(values) = &argument.value else {
+            return Err(NativeError::message("item expects a list"));
+        };
+        let index = i64::from_hks_value(&index.value)?;
+        // Borrow the host call's list instead of cloning every element into a
+        // second Vec just to read one item (or, above, its length).
         usize::try_from(index)
             .ok()
             .and_then(|index| values.get(index))
@@ -559,7 +634,7 @@ mod native_ui {
         context: &mut UiVmContext,
         node: UiNodeHandle,
         seconds: f64,
-        handler: HksCallable,
+        handler: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         if !seconds.is_finite() || !(0.0..=86400.0).contains(&seconds) {
             return Err(NativeError::message(
@@ -570,7 +645,7 @@ mod native_ui {
         if !matches!(draft.kind, UiDraftKind::Screen) {
             return Err(NativeError::message("after requires a screen or canvas"));
         }
-        draft.timers.push((seconds as f32, handler));
+        draft.timers.push((seconds as f32, handler.0));
         Ok(node)
     }
 
@@ -578,7 +653,7 @@ mod native_ui {
     fn on_commit(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        handler: HksCallable,
+        handler: UiInputCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(
@@ -589,7 +664,7 @@ mod native_ui {
                 "onCommit requires slider or textInput",
             ));
         }
-        draft.on_commit = Some(handler);
+        draft.on_commit = Some(handler.0);
         Ok(node)
     }
 
@@ -664,10 +739,11 @@ mod native_ui {
         call: &hiraku_script::BuiltinCall,
     ) -> Result<Value, NativeError> {
         let (value, content) = match call.arguments.as_slice() {
-            [content] => (Value::Unit, HksClosure::from_hks_value(&content.value)?),
+            [content] => (Value::Unit, UiVoidCallable::from_hks_value(&content.value)?),
             [value, content] => (
                 value.value.clone(),
-                HksClosure::from_hks_value(&content.value)?,
+                Option::<UiVoidCallable>::from_hks_value(&content.value)?
+                    .ok_or_else(|| NativeError::message("button requires content"))?,
             ),
             arguments => {
                 return Err(NativeError::Arity {
@@ -1158,7 +1234,7 @@ mod native_ui {
     fn ui_checked(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        content: HksClosure,
+        content: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Toggle(_)) {
@@ -1174,7 +1250,7 @@ mod native_ui {
     fn ui_hovered(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        content: HksClosure,
+        content: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.hovered = Some(content);
         Ok(node)
@@ -1184,7 +1260,7 @@ mod native_ui {
     fn ui_pressed(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        content: HksClosure,
+        content: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Button(_)) {
@@ -1226,7 +1302,7 @@ mod native_ui {
     fn ui_on_click(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        handler: HksClosure,
+        handler: UiVoidCallable,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
         if !matches!(draft.kind, UiDraftKind::Button(_)) {
@@ -1770,9 +1846,10 @@ fn validate_phase_animation(
 }
 
 fn finite_f32(value: f64, label: &str) -> Result<f32, NativeError> {
+    let value = value as f32;
     value
         .is_finite()
-        .then_some(value as f32)
+        .then_some(value)
         .ok_or_else(|| NativeError::message(format!("{label} must be finite")))
 }
 
@@ -1782,7 +1859,7 @@ fn non_negative(value: f64, label: &str) -> Result<f32, NativeError> {
             "{label} must be a non-negative number"
         )));
     }
-    Ok(value as f32)
+    finite_f32(value, label)
 }
 
 fn positive(value: f64, label: &str) -> Result<f32, NativeError> {
@@ -1791,7 +1868,13 @@ fn positive(value: f64, label: &str) -> Result<f32, NativeError> {
             "{label} must be greater than zero"
         )));
     }
-    Ok(value as f32)
+    let value = finite_f32(value, label)?;
+    if value == 0.0 {
+        return Err(NativeError::message(format!(
+            "{label} is too small to represent as a positive f32"
+        )));
+    }
+    Ok(value)
 }
 
 fn percent(value: f64, label: &str) -> Result<f32, NativeError> {
@@ -1830,6 +1913,33 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     let ui_effect = registry.define_type("UiEffect");
     native_ui::register_hks(&mut registry)
         .expect("UI native primitives must be internally consistent");
+    // Preserve collection element types across the native boundary. The host
+    // reads a Value, but authors see item<T>(List<T>, Int) -> T, never Any.
+    let element = ScriptType::TypeParameter(registry.define_type("UiCollectionElement"));
+    for (name, parameters, result) in [
+        (
+            "item",
+            vec![ScriptType::List(Box::new(element.clone())), ScriptType::Int],
+            element.clone(),
+        ),
+        (
+            "count",
+            vec![ScriptType::List(Box::new(element))],
+            ScriptType::Int,
+        ),
+    ] {
+        registry
+            .set_signature(
+                hiraku_script::native::stable_builtin_id(name),
+                hiraku_script::FunctionSignature {
+                    receiver: None,
+                    parameters,
+                    variadic: None,
+                    result,
+                },
+            )
+            .expect("collection primitive is registered");
+    }
     ui_actions::register_hks(&mut registry).expect("UI actions must be internally consistent");
     profile_api::register_hks(&mut registry).expect("profile API must register once");
     registry
@@ -1880,7 +1990,10 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
                 receiver: None,
                 parameters: vec![
                     ScriptType::Any,
-                    ScriptType::Optional(Box::new(ScriptType::Function)),
+                    ScriptType::Optional(Box::new(ScriptType::Callable {
+                        parameters: Vec::new(),
+                        result: Box::new(ScriptType::Unit),
+                    })),
                 ],
                 variadic: None,
                 result: ScriptType::Named(ui_node),
@@ -1910,8 +2023,23 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
             ])),
         )
         .expect("built-in dialogue model must be defined once");
+    registry
+        .define_global(
+            "history",
+            ScriptType::Record(BTreeMap::from([
+                (
+                    "entries".into(),
+                    ScriptType::List(Box::new(ScriptType::Record(BTreeMap::from([
+                        ("speaker".into(), ScriptType::String),
+                        ("text".into(), ScriptType::String),
+                    ])))),
+                ),
+                ("text".into(), ScriptType::String),
+            ])),
+        )
+        .expect("history schema must not depend on whether it currently has entries");
     for (name, value) in values.story_values() {
-        if name == "time" || name == "dialogue" {
+        if name == "time" || name == "dialogue" || name == "history" {
             continue;
         }
         registry
@@ -2093,6 +2221,7 @@ pub(crate) fn authoring_api() -> (hiraku_script::BuiltinManifest, hiraku_script:
 fn ui_sources(path: &str, source: &str) -> Vec<hiraku_script::ScriptSource> {
     vec![
         ui_stdlib_source(),
+        super::stdlib::profile_source(),
         hiraku_script::ScriptSource {
             path: path.into(),
             namespace: None,
@@ -2118,6 +2247,9 @@ fn collect_nodes(
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
 ) -> Result<Vec<UiNodeHandle>, UiVmError> {
+    if &context.symbols != vm.symbols() {
+        context.symbols = vm.symbols().clone();
+    }
     let globals = context_globals(context);
     let owned = context.owned_globals.clone();
     let mut nodes = Vec::new();
@@ -2140,7 +2272,7 @@ fn collect_nodes(
 }
 
 fn closure_children(
-    closure: Option<HksClosure>,
+    closure: Option<UiVoidCallable>,
     program: &hiraku_script::LinkedProgram,
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
@@ -2217,6 +2349,12 @@ pub(crate) fn evaluate_ui_callback_with_args(
                 ));
             }
             Some(LinkedVmEvent::Call(call)) => {
+                if ["profile.read_any", "profile.write"]
+                    .iter()
+                    .any(|name| hiraku_script::native::stable_builtin_id(name) == call.builtin)
+                {
+                    context.symbols = vm.symbols().clone();
+                }
                 if Some(call.builtin) == goto {
                     let request = NavigationRequest::from_goto_call(&call)
                         .map_err(|error| UiVmError::Runtime(error.to_string()))?
@@ -2324,6 +2462,13 @@ fn evaluate_binding_value(
     registry: &NativeRegistry<UiVmContext>,
     context: &mut UiVmContext,
 ) -> Result<Value, UiVmError> {
+    let owner = match &binding.getter {
+        Value::Function { module, .. } | Value::Closure { module, .. } => module.unwrap_or(0),
+        _ => 0,
+    };
+    if let Some(module) = binding.program.modules.get(owner as usize) {
+        context.symbols = module.bytecode.symbols.clone();
+    }
     binding
         .evaluate(registry, context, 100_000)
         .map_err(|error| UiVmError::Runtime(error.to_string()))
@@ -4034,6 +4179,99 @@ global var name: String = "alice"
         assert!(error.to_string().contains("(Bool) -> Unit"), "{error}");
     }
 
+    #[test]
+    fn fixed_ui_callbacks_reject_wrong_signatures_during_offline_compilation() {
+        for source in [
+            "screen {}.after(1.0) { name: String -> () }",
+            "screen { button { text(\"alice\") }.onClick { value: Bool -> () } }",
+            "screen { button { text(\"alice\") }.hovered { value: Int -> () } }",
+            "screen { button { text(\"alice\") }.pressed { value: Int -> () } }",
+            "screen { toggle(false) { value: Bool -> () } }",
+            "screen { toggle(false) {}.checked { value: Bool -> () } }",
+            "fn alice() -> String { \"alice\" }\nscreen {}.after(1.0, alice)",
+            "fn alice() -> String { \"alice\" }\nscreen { button {}.onClick(alice) }",
+            "screen { button(\"alice\") { value: String -> () } }",
+        ] {
+            let source = format!("import ui.widgets.*\n{source}");
+            assert!(
+                validate_ui_source("memory://callback.ui.hks", &source).is_err(),
+                "invalid callback compiled: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_callback_shapes_are_checked_during_offline_compilation() {
+        for source in [
+            "checkbox(false).onChange { () }",
+            "checkbox(false).onChange { value: Int -> () }",
+            "checkbox(false).onChange { value: Bool, name: String -> () }",
+            "checkbox(false).onChange { value: Bool -> value }",
+            "textInput(\"alice\").onCommit { value: String -> value }",
+            "slider(0.5, 0.0, 1.0).onCommit { value: Float -> 1 }",
+        ] {
+            let source = format!("import ui.widgets.*\nscreen {{ {source} }}");
+            assert!(
+                validate_ui_source("memory://input_callback.ui.hks", &source).is_err(),
+                "invalid input callback compiled: {source}"
+            );
+        }
+        for source in [
+            "checkbox(false).onChange { value: Bool -> () }",
+            "textInput(\"alice\").onChange { value: String -> () }.onCommit { value: String -> () }",
+            "slider(0.5, 0.0, 1.0).onChange { value: Float -> () }.onCommit { value: Float -> () }",
+        ] {
+            let source = format!("import ui.widgets.*\nscreen {{ {source} }}");
+            validate_ui_source("memory://input_callback.ui.hks", &source)
+                .unwrap_or_else(|error| panic!("valid callback failed: {source}\n{error}"));
+        }
+    }
+
+    #[test]
+    fn named_ui_callbacks_and_unit_coerced_action_closures_execute() {
+        let screen = evaluate_ui_component_named(
+            "memory://named_callback.ui.hks",
+            r#"import ui.widgets.*
+global var name = "alice"
+fn caption() -> Unit { text("alice") }
+fn chooseBob() { name = "bob" }
+screen {
+    button("alice", caption).onClick(chooseBob)
+    button(caption).onClick { ui.close("bob") }
+}.after(1.0, chooseBob)
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("named content, click and timer callbacks are callable");
+        let [ScreenNode::Button(named), ScreenNode::Button(action)] = screen.children.as_slice()
+        else {
+            panic!("expected two buttons");
+        };
+        let models = crate::ui::UiModels::default();
+        let (_, globals) = evaluate_ui_callback(
+            named.on_click.as_ref().expect("named callback"),
+            &BTreeMap::new(),
+            &models,
+        )
+        .expect("invoke named click callback");
+        assert_eq!(globals["name"], Value::String("bob".into()));
+        let (_, globals) = evaluate_ui_callback(&screen.timers[0].1, &BTreeMap::new(), &models)
+            .expect("invoke named timer callback");
+        assert_eq!(globals["name"], Value::String("bob".into()));
+        let (effects, _) = evaluate_ui_callback(
+            action.on_click.as_ref().expect("action callback"),
+            &BTreeMap::new(),
+            &models,
+        )
+        .expect("Unit callback retains its action statement");
+        assert!(matches!(
+            effects.as_slice(),
+            [UiEffect::CloseUi { value: Value::String(name) }] if name == "bob"
+        ));
+    }
+
     #[derive(Default)]
     struct NamespaceTestContext;
 
@@ -4463,6 +4701,63 @@ global fn viewer(imageName: String, title: String) -> UiNode {
     }
 
     #[test]
+    fn history_schema_and_collection_results_stay_typed_when_empty() {
+        let values = UiContext::new(BTreeMap::from([(
+            "history".into(),
+            StoredValue::Map(BTreeMap::from([
+                ("entries".into(), StoredValue::Array(Vec::new())),
+                ("text".into(), StoredValue::String(String::new())),
+            ])),
+        )]));
+        let source = r#"import ui.widgets.*
+            canvas {
+                var index = 0
+                while index < count(history.entries) {
+                    let entry = item(history.entries, index)
+                    text(entry.speaker + entry.text)
+                    index += 1
+                }
+            }
+        "#;
+        evaluate_ui_component_named(
+            "memory://history.ui.hks",
+            source,
+            values.clone(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("empty typed history");
+        let error = evaluate_ui_component_named(
+            "memory://history.ui.hks",
+            &source.replace("entry.speaker", "entry.missing"),
+            values,
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect_err("bad field must fail before iteration");
+        assert!(error.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn ui_numeric_boundaries_reject_f32_overflow_and_positive_underflow() {
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            assert!(finite_f32(value, "offset").is_err());
+            assert!(non_negative(value, "size").is_err());
+            assert!(positive(value, "scale").is_err());
+        }
+        assert!(positive(f64::MIN_POSITIVE, "scale").is_err());
+        assert_eq!(non_negative(0.0, "size").expect("zero permitted"), 0.0);
+        assert_eq!(finite_f32(-12.5, "offset").expect("signed offset"), -12.5);
+        assert_eq!(positive(1.5, "scale").expect("scale"), 1.5);
+    }
+
+    #[test]
     fn typed_collection_arguments_render_and_callbacks_capture_the_selected_record() {
         let source = r#"import ui.widgets.*
             fn part(span: .{ text: String, id: String }) -> UiNode {
@@ -4472,11 +4767,11 @@ global fn viewer(imageName: String, title: String) -> UiNode {
                 canvas { column {
                     var rowIndex=0
                     while rowIndex<count(rows) {
-                        let spans=item(rows,rowIndex) as! List<.{ text: String, id: String }>
+                        let spans=item(rows,rowIndex)
                         row {
                             var index=0
                             while index<count(spans) {
-                                part(item(spans,index) as! .{ text: String, id: String })
+                                part(item(spans,index))
                                 index+=1
                             }
                         }
@@ -5682,6 +5977,31 @@ screen {
 #[hiraku_script::hks_module("profile")]
 mod profile_api {
     use super::*;
+    #[hks(name = "read_any")]
+    fn read_any(
+        context: &mut UiVmContext,
+        key: String,
+        fallback: Value,
+    ) -> Result<Value, NativeError> {
+        crate::storage::profile::read_object(&key, &context.symbols)
+            .map(|value| value.unwrap_or(fallback))
+            .map_err(NativeError::message)
+    }
+    #[hks]
+    fn write(context: &mut UiVmContext, key: String, value: Value) -> Result<(), NativeError> {
+        crate::storage::profile::write_object(&key, &value, &context.symbols)
+            .map_err(NativeError::message)
+    }
+    #[hks(name = "readInt")]
+    fn read_int(_context: &mut UiVmContext, key: String) -> Result<i64, NativeError> {
+        crate::storage::profile::read_int(&key)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
+    #[hks(name = "writeInt")]
+    fn write_int(_context: &mut UiVmContext, key: String, value: i64) -> Result<(), NativeError> {
+        crate::storage::profile::write_int(&key, value)
+            .map_err(|error| NativeError::message(error.to_string()))
+    }
     #[hks(name = "readBool")]
     fn read_bool(_context: &mut UiVmContext, key: String) -> Result<bool, NativeError> {
         crate::storage::profile::read_bool(&key)

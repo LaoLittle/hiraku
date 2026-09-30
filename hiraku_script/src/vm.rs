@@ -13,7 +13,7 @@ use crate::{
     runtime::{BuiltinManifest, CallArgument, Value},
 };
 
-pub const BYTECODE_VERSION: u16 = 22;
+pub const BYTECODE_VERSION: u16 = 23;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterSlice {
@@ -33,6 +33,8 @@ pub struct Bytecode {
     pub globals: Vec<SymbolId>,
     pub locals: Vec<SymbolId>,
     pub local_count: u32,
+    /// Captured bindings live in execution-owned heap cells, indexed by local ID.
+    pub shared_locals: Vec<bool>,
     pub register_count: u16,
     pub instructions: Vec<Instruction>,
     pub functions: Vec<BytecodeFunction>,
@@ -52,6 +54,7 @@ pub struct BytecodeFunction {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BytecodeRegion {
+    pub captures: Vec<u32>,
     pub signature: crate::FunctionSignature,
     pub parameters: Vec<u32>,
     pub register_count: u16,
@@ -60,6 +63,8 @@ pub struct BytecodeRegion {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
+    /// Allocate captured parameter cells after the embedding lends its heap.
+    InitializeParameters,
     Panic {
         message: Register,
     },
@@ -83,6 +88,7 @@ pub enum Instruction {
     StoreLocal {
         local: u32,
         src: Register,
+        initialize: bool,
     },
     LoadGlobal {
         dst: Register,
@@ -349,6 +355,69 @@ fn compile_program(
             instructions: code.instructions,
         });
     }
+    // Regions are emitted in postorder, so a parent's free variables include
+    // its children's captures before subtracting its own bindings.
+    let mut scopes = vec![std::collections::BTreeSet::new(); regions.len()];
+    collect_capture_scopes(
+        &entry.instructions,
+        &entry.parameters,
+        &Default::default(),
+        &regions,
+        &mut scopes,
+    );
+    for function in &functions {
+        collect_capture_scopes(
+            &function.instructions,
+            &function.parameters,
+            &Default::default(),
+            &regions,
+            &mut scopes,
+        );
+    }
+    let mut shared_locals = vec![false; hir.locals.len()];
+    for index in 0..regions.len() {
+        let region = &regions[index];
+        let mut owned: std::collections::BTreeSet<_> = region.parameters.iter().copied().collect();
+        let mut captures = std::collections::BTreeSet::new();
+        for instruction in &region.instructions {
+            match instruction {
+                Instruction::StoreLocal {
+                    local,
+                    initialize: true,
+                    ..
+                } => {
+                    owned.insert(*local);
+                }
+                Instruction::LoadLocal { local, .. }
+                | Instruction::StoreLocal {
+                    local,
+                    initialize: false,
+                    ..
+                } => {
+                    captures.insert(*local);
+                }
+                Instruction::MakeClosure { region, .. } => {
+                    captures.extend(regions[*region as usize].captures.iter().copied());
+                }
+                // Localization hooks may rewrite a template to reference any
+                // binding in its lexical environment. Keep that environment,
+                // even when no LoadLocal instruction mentions the binding.
+                Instruction::Constant {
+                    value: Constant::TextTemplate(_),
+                    ..
+                }
+                | Instruction::Statement { string: true, .. } => {
+                    captures.extend(scopes[index].iter().copied());
+                }
+                _ => {}
+            }
+        }
+        captures.retain(|local| !owned.contains(local));
+        for local in &captures {
+            shared_locals[*local as usize] = true;
+        }
+        regions[index].captures = captures.into_iter().collect();
+    }
     Ok(Bytecode {
         debug,
         version: BYTECODE_VERSION,
@@ -360,11 +429,46 @@ fn compile_program(
         globals: hir.globals.iter().map(|global| global.name).collect(),
         locals: hir.locals.iter().map(|local| local.name).collect(),
         local_count: hir.locals.len() as u32,
+        shared_locals,
         register_count: entry.register_count,
         instructions: entry.instructions,
         functions,
         regions,
     })
+}
+
+fn collect_capture_scopes(
+    instructions: &[Instruction],
+    parameters: &[u32],
+    inherited: &std::collections::BTreeSet<u32>,
+    regions: &[BytecodeRegion],
+    scopes: &mut [std::collections::BTreeSet<u32>],
+) {
+    let mut scope = inherited.clone();
+    scope.extend(parameters.iter().copied());
+    for instruction in instructions {
+        if let Instruction::StoreLocal {
+            local,
+            initialize: true,
+            ..
+        } = instruction
+        {
+            scope.insert(*local);
+        }
+    }
+    for instruction in instructions {
+        if let Instruction::MakeClosure { region, .. } = instruction {
+            scopes[*region as usize] = scope.clone();
+            let body = &regions[*region as usize];
+            collect_capture_scopes(
+                &body.instructions,
+                &body.parameters,
+                &scope,
+                regions,
+                scopes,
+            );
+        }
+    }
 }
 
 fn compile_register_code(
@@ -409,6 +513,7 @@ fn compile_register_code(
     )?;
     Ok((
         BytecodeRegion {
+            captures: Vec::new(),
             signature: function.signature.clone(),
             parameters: function
                 .parameters
@@ -499,9 +604,14 @@ fn emit_function(
                     dst: register(*dst),
                     local: local.0,
                 },
-                MirInstruction::StoreLocal { local, src } => Instruction::StoreLocal {
+                MirInstruction::StoreLocal {
+                    local,
+                    src,
+                    initialize,
+                } => Instruction::StoreLocal {
                     local: local.0,
                     src: register(*src),
+                    initialize: *initialize,
                 },
                 MirInstruction::LoadGlobal { dst, global } => Instruction::LoadGlobal {
                     dst: register(*dst),
@@ -801,12 +911,15 @@ fn emit_function(
         blocks.push((emitted, block.terminator.clone(), locations));
     }
     let mut starts = Vec::with_capacity(blocks.len());
-    let mut offset = 0usize;
+    let mut offset = usize::from(!function.parameters.is_empty());
     for (instructions, _, _) in &blocks {
         starts.push(offset);
         offset += instructions.len() + 1;
     }
     let mut output = Vec::with_capacity(offset);
+    if !function.parameters.is_empty() {
+        output.push(Instruction::InitializeParameters);
+    }
     let mut debug = crate::debug::CodeDebugInfo::default();
     for (mut instructions, terminator, locations) in blocks {
         debug.locations.extend(
@@ -953,6 +1066,7 @@ impl SymbolCall {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmSnapshot {
+    pub bytecode_version: u16,
     #[serde(with = "type_binding_table")]
     pub type_bindings: BTreeMap<SymbolId, crate::ScriptType>,
     #[serde(default)]
@@ -1253,6 +1367,26 @@ impl Vm {
                 .ok_or(VmError::InvalidProgramCounter(self.pc))?;
             self.pc += 1;
             match instruction {
+                Instruction::InitializeParameters => {
+                    let parameters = match self.location {
+                        CodeLocation::Function(index) => {
+                            self.bytecode.functions[index as usize].parameters.clone()
+                        }
+                        CodeLocation::Region(index) => {
+                            self.bytecode.regions[index as usize].parameters.clone()
+                        }
+                        CodeLocation::Entry => Vec::new(),
+                    };
+                    for local in parameters {
+                        if self.bytecode.shared_locals[local as usize] {
+                            let value = self
+                                .locals
+                                .get(local as usize)
+                                .ok_or(VmError::InvalidLocal(local))?;
+                            self.write_local(local, value, true)?;
+                        }
+                    }
+                }
                 Instruction::Panic { message } => {
                     let Value::String(message) = self.read(message)? else {
                         return Err(VmError::UndefinedInstruction(
@@ -1276,8 +1410,18 @@ impl Vm {
                         .map_err(|error| VmError::InvalidRegister(error.0))?;
                 }
                 Instruction::MakeClosure { dst, region } => {
-                    if self.bytecode.regions.get(region as usize).is_none() {
-                        return Err(VmError::UnknownRegion(region));
+                    let code = self
+                        .bytecode
+                        .regions
+                        .get(region as usize)
+                        .ok_or(VmError::UnknownRegion(region))?;
+                    let mut captures =
+                        vec![Value::Uninitialized; self.bytecode.local_count as usize];
+                    for local in &code.captures {
+                        captures[*local as usize] = self
+                            .locals
+                            .get(*local as usize)
+                            .ok_or(VmError::InvalidLocal(*local))?;
                     }
                     self.write(
                         dst,
@@ -1290,11 +1434,19 @@ impl Vm {
                             objects: None,
                             module: self.module,
                             region,
-                            captures: self.locals.values().collect(),
+                            captures,
                         },
                     )?;
                 }
                 Instruction::LoadLocal { dst, local } => {
+                    if self.bytecode.shared_locals[local as usize] {
+                        let value = self.local(local)?;
+                        if value == Value::Uninitialized {
+                            return Err(VmError::UninitializedLocal(local));
+                        }
+                        self.write(dst, value)?;
+                        continue;
+                    }
                     if !self
                         .locals
                         .is_initialized(local as usize)
@@ -1311,7 +1463,15 @@ impl Vm {
                             }
                         })?;
                 }
-                Instruction::StoreLocal { local, src } => {
+                Instruction::StoreLocal {
+                    local,
+                    src,
+                    initialize,
+                } => {
+                    if self.bytecode.shared_locals[local as usize] {
+                        self.write_local(local, self.read(src)?, initialize)?;
+                        continue;
+                    }
                     self.locals
                         .copy_from(local as usize, &self.registers, src.0 as usize)
                         .map_err(|error| match error {
@@ -1756,6 +1916,7 @@ impl Vm {
 
     pub fn snapshot(&self) -> VmSnapshot {
         VmSnapshot {
+            bytecode_version: self.bytecode.version,
             type_bindings: self.type_bindings.clone(),
             read_only_globals: self.read_only_globals.clone(),
             objects: self.objects.clone(),
@@ -1803,6 +1964,9 @@ impl Vm {
         crate::SharedStrings::default().prepare(&bytecode.strings, &bytecode.symbols);
         if bytecode.version != BYTECODE_VERSION {
             return Err(VmError::UnsupportedBytecode(bytecode.version));
+        }
+        if snapshot.bytecode_version != bytecode.version {
+            return Err(VmError::UnsupportedBytecode(snapshot.bytecode_version));
         }
         if bytecode.source_hash != snapshot.source_hash {
             return Err(VmError::SourceHashMismatch);
@@ -2004,7 +2168,10 @@ impl Vm {
                 context.insert(name.to_string(), value.clone());
             }
         }
-        for (symbol, value) in self.bytecode.locals.iter().zip(self.locals.values()) {
+        for (index, symbol) in self.bytecode.locals.iter().enumerate() {
+            let Ok(value) = self.local(index as u32) else {
+                continue;
+            };
             if value != Value::Uninitialized
                 && let Some(name) = self.bytecode.symbols.resolve(*symbol)
             {
@@ -2164,7 +2331,14 @@ impl Vm {
         let types = signature.receiver.iter().chain(&signature.parameters);
         for (index, (local, ty)) in parameters.iter().zip(types).enumerate() {
             let ty = crate::hir::substitute_type(ty, &self.type_bindings);
-            if !argument_matches(&self.local(*local)?, &ty, &self.objects)? {
+            if !argument_matches(
+                &self
+                    .locals
+                    .get(*local as usize)
+                    .ok_or(VmError::InvalidLocal(*local))?,
+                &ty,
+                &self.objects,
+            )? {
                 return Err(VmError::ArgumentTypeMismatch {
                     argument: index + 1,
                     expected: format!("{ty:?}"),
@@ -2292,12 +2466,39 @@ impl Vm {
     }
 
     fn local(&self, local: u32) -> Result<Value, VmError> {
-        self.locals
+        let value = self
+            .locals
             .get(local as usize)
-            .ok_or(VmError::InvalidLocal(local))
+            .ok_or(VmError::InvalidLocal(local))?;
+        if self.bytecode.shared_locals[local as usize]
+            && let Value::Object(id) = value
+        {
+            self.objects.get(id)
+        } else {
+            Ok(value)
+        }
     }
 
     fn set_local(&mut self, local: u32, value: Value) -> Result<(), VmError> {
+        self.locals
+            .set(local as usize, value)
+            .map_err(|_| VmError::InvalidLocal(local))
+    }
+
+    fn write_local(&mut self, local: u32, value: Value, initialize: bool) -> Result<(), VmError> {
+        let value = if *self
+            .bytecode
+            .shared_locals
+            .get(local as usize)
+            .ok_or(VmError::InvalidLocal(local))?
+        {
+            if !initialize && let Some(Value::Object(id)) = self.locals.get(local as usize) {
+                return self.objects.replace(id, value);
+            }
+            self.objects.allocate(value)
+        } else {
+            value
+        };
         self.locals
             .set(local as usize, value)
             .map_err(|_| VmError::InvalidLocal(local))
@@ -2917,6 +3118,91 @@ mod tests {
     fn compile(source: &str, manifest: &BuiltinManifest) -> Bytecode {
         compile_with_manifest(&parse_program(source).expect("source parses"), 91, manifest)
             .expect("register bytecode compiles")
+    }
+
+    #[test]
+    fn closures_share_bindings_and_loop_declarations_have_distinct_cells() {
+        let code = compile(
+            r#"
+            var value = 0
+            let increment = { value += 1 }
+            let read = { return value }
+            increment()
+            global let first = read()
+            value = 9
+            global let second = read()
+
+            var alice: () -> Int = { return 0 }
+            var bob: () -> Int = { return 0 }
+            var index = 0
+            while index < 2 {
+                var local = index
+                let next: () -> Int = { local += 1; return local }
+                if index == 0 { alice = next } else { bob = next }
+                index += 1
+            }
+            global let aliceFirst = alice()
+            global let bobFirst = bob()
+            global let aliceSecond = alice()
+        "#,
+            &BuiltinManifest::new(Vec::<(String, BuiltinId)>::new()),
+        );
+        let mut vm = Vm::new(code).expect("initialize");
+        while !matches!(
+            vm.step().expect("execute shared closures"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        for (name, expected) in [
+            ("first", 1),
+            ("second", 9),
+            ("aliceFirst", 1),
+            ("bobFirst", 2),
+            ("aliceSecond", 2),
+        ] {
+            assert_eq!(vm.global(name), Some(Value::Int(expected)), "{name}");
+        }
+    }
+
+    #[test]
+    fn escaped_nested_captures_survive_collection_and_serialized_host_waits() {
+        let manifest = BuiltinManifest::new([("pause", BuiltinId(0))]);
+        let code = Arc::new(compile(
+            r#"
+            fn counter(start: Int) -> () -> Int {
+                var value = 0
+                let make: () -> (() -> Int) = {
+                    return { pause(); value += 1; return start + value }
+                }
+                return make()
+            }
+            let next = counter(10)
+            global let first = next()
+            global let second = next()
+        "#,
+            &manifest,
+        ));
+        let mut vm = Vm::new(code.clone()).expect("initialize");
+        let mut waits = 0;
+        loop {
+            match vm.step().expect("step") {
+                Some(VmEvent::Call(_)) => {
+                    waits += 1;
+                    vm.collect_objects(&[]).expect("collect unreachable values");
+                    let bytes = crate::hson::to_vec(&vm.snapshot()).expect("serialize");
+                    vm = Vm::restore(
+                        code.clone(),
+                        crate::hson::from_slice(&bytes).expect("deserialize"),
+                    )
+                    .expect("restore");
+                    vm.resume(Value::Unit).expect("resume host call");
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(waits, 2);
+        assert_eq!(vm.global("first"), Some(Value::Int(11)));
+        assert_eq!(vm.global("second"), Some(Value::Int(12)));
     }
 
     #[test]
@@ -4080,7 +4366,7 @@ mod tests {
                 ref captures,
                 ..
             }
-                if captures.contains(&Value::Int(4))
+                if captures.iter().any(|value| matches!(value, Value::Object(id) if vm.objects.get(*id).ok() == Some(Value::Int(4))))
         ));
     }
 
@@ -4128,7 +4414,9 @@ mod tests {
         let Some(VmEvent::Call(call)) = vm.step().expect("reactive call yields") else {
             panic!("expected reactive native call")
         };
-        let closure = call.arguments[0].value.clone();
+        let closure = vm
+            .export_value(&call.arguments[0].value)
+            .expect("export the capture heap for an independent invocation");
         assert!(matches!(closure, Value::Closure { .. }));
 
         let mut binding = Vm::from_callable(bytecode, &closure, Vec::new())

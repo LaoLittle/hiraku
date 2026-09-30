@@ -109,6 +109,21 @@ pub struct StoryRuntimeSnapshot {
 }
 
 impl StoryRuntime {
+    fn call_native(
+        &mut self,
+        execution: ExecutionId,
+        call: &hiraku_script::BuiltinCall,
+    ) -> Result<StoryCallOutcome, CharacterCapabilityError> {
+        if ["profile.read_any", "profile.write"]
+            .iter()
+            .any(|name| hiraku_script::native::stable_builtin_id(name) == call.builtin)
+        {
+            if let Some(symbols) = self.execution.symbols(execution) {
+                self.host.set_symbols(symbols.clone());
+            }
+        }
+        self.host.call(call)
+    }
     fn build_plan(
         &mut self,
         kind: StoryTaskKind,
@@ -128,7 +143,9 @@ impl StoryRuntime {
                     .step_execution(task, &mut budget)?
                     .ok_or(StoryRuntimeError::PlanBuildBudgetExceeded)?;
                 match event {
-                    ExecutionEvent::Call { call, .. } => match self.host.call(&call)? {
+                    ExecutionEvent::Call { execution, call } => match self
+                        .call_native(execution, &call)?
+                    {
                         StoryCallOutcome::Return(value) => self.execution.resume(task, value)?,
                         StoryCallOutcome::Control(StoryControl::Navigate(request)) => {
                             plan.record(vec![StoryEffect::Navigate(request)], true);
@@ -527,10 +544,16 @@ impl StoryRuntime {
             let _ = self.execution.unpause(task);
         }
         if let Some(value) = self.deferred_task_completions.remove(&task) {
-            self.completed_groups.insert(task);
-            if self.waiting_task == Some(task) {
-                self.waiting_task = None;
-                self.execution.resume(ExecutionId::MAIN, value)?;
+            // An interactive choice branch may finish its bytecode before its
+            // last sound/animation completes. Route that completion through
+            // the same policy as an immediate VM completion, including choice
+            // continuation and option collection.
+            if let Some(event) = self.handle_task_event(ExecutionEvent::Completed {
+                execution: task,
+                value,
+            })? {
+                self.mark_host_boundary(&event);
+                self.pending.push_back(event);
             }
         }
         Ok(())
@@ -592,7 +615,7 @@ impl StoryRuntime {
             };
             match event {
                 ExecutionEvent::Call { execution, call } if execution.is_main() => {
-                    match self.host.call(&call)? {
+                    match self.call_native(execution, &call)? {
                         StoryCallOutcome::Control(StoryControl::Navigate(request)) => {
                             self.terminated = true;
                             return Ok(Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(
@@ -741,7 +764,7 @@ impl StoryRuntime {
             ExecutionEvent::Call {
                 execution: task,
                 call,
-            } => match self.host.call(&call)? {
+            } => match self.call_native(task, &call)? {
                 StoryCallOutcome::Control(StoryControl::Navigate(mut request)) => {
                     if matches!(self.choice, Some(ChoiceState::RunningBranch { task: branch, .. }) if branch == task)
                     {
@@ -909,14 +932,11 @@ impl StoryRuntime {
                 interactive_delay = Some(StoryWait::Delay { duration_ms });
                 continue;
             }
-            if matches!(
-                effect,
-                StoryEffect::PlayVoice { .. }
-                    | StoryEffect::PlaySfx { .. }
-                    | StoryEffect::PlaySfxChannel { .. }
-                    | StoryEffect::Delay { .. }
-            ) || ((explicit || task_mode != Some(ExecutionMode::Interactive))
-                && animation_effect(&effect))
+            // An interactive option follows ordinary story semantics: starting
+            // audio or animation does not extend the lifetime of its callback.
+            // Only an explicit await (or a noninteractive execution) joins it.
+            if (explicit || task_mode != Some(ExecutionMode::Interactive))
+                && animation_effect(&effect)
             {
                 self.active_task_effects
                     .entry(task)
@@ -961,6 +981,7 @@ fn animation_effect(effect: &StoryEffect) -> bool {
             | StoryEffect::ShowCharacter { .. }
             | StoryEffect::HideCharacter { .. }
             | StoryEffect::ActorMotion { .. }
+            | StoryEffect::ActorBlur { .. }
             | StoryEffect::SetCurtain { .. }
             | StoryEffect::Picture(_)
             | StoryEffect::PlayBgm { .. }
@@ -2309,6 +2330,167 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::Say { ref text, .. }))
                 if text == "after choice"
         ));
+    }
+
+    #[test]
+    fn choice_result_updates_a_surrounding_loop_after_the_branch() {
+        let bytecode = compile_story_bytecode(
+            "choice-loop.story.hks",
+            r#"
+                var answer = ""
+                while answer != "correct" {
+                    let selected = choice {
+                        option("Retry") { sfx("confirm") }
+                        option("Correct") { sfx("confirm") }
+                    }
+                    if selected == 0 { answer = "retry" }
+                    if selected == 1 { answer = "correct" }
+                }
+                "done"
+            "#,
+        )
+        .expect("choice result should be statically typed as Int");
+        let mut runtime = StoryRuntime::new(bytecode).expect("story initializes");
+        assert!(matches!(
+            runtime.step().expect("choice"),
+            Some(StoryRuntimeEvent::Choice { .. })
+        ));
+        runtime.resume(Value::Int(0)).expect("retry selection");
+        assert!(matches!(
+            runtime.step().expect("retry sound"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::PlaySfx { .. }))
+        ));
+        assert!(matches!(
+            runtime.step().expect("retry choice"),
+            Some(StoryRuntimeEvent::Choice { .. })
+        ));
+        runtime.resume(Value::Int(1)).expect("correct selection");
+        assert!(matches!(
+            runtime.step().expect("correct sound"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::PlaySfx { .. }))
+        ));
+        assert!(
+            matches!(runtime.step().expect("after choice"), Some(StoryRuntimeEvent::Effect(StoryEffect::Say { text, .. })) if text == "done")
+        );
+    }
+
+    #[test]
+    fn choice_captured_assignment_continues_without_waiting_for_confirmation_audio() {
+        let code = compile_story_bytecode(
+            "choice.hks",
+            r#"
+            var answer = ""
+            while answer != "correct" {
+                choice {
+                    option("Alice") { sfx("confirm"); answer = "retry" }
+                    option("Bob") { sfx("confirm"); answer = "correct" }
+                }
+            }
+            "done"
+        "#,
+        )
+        .expect("compile choice");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("initialize");
+        assert!(matches!(
+            runtime.step().expect("choice"),
+            Some(StoryRuntimeEvent::Choice { .. })
+        ));
+        runtime = StoryRuntime::restore(code, runtime.snapshot().expect("snapshot"))
+            .expect("restore pending choice");
+        for index in [0, 1] {
+            runtime.resume(Value::Int(index)).expect("select");
+            assert!(matches!(
+                runtime.step().expect("confirmation"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::PlaySfx { .. }))
+            ));
+            let next = runtime
+                .step()
+                .expect("continue without an audio completion");
+            if index == 0 {
+                assert!(matches!(next, Some(StoryRuntimeEvent::Choice { .. })));
+            } else {
+                assert!(
+                    matches!(next, Some(StoryRuntimeEvent::Effect(StoryEffect::Say { text, .. })) if text == "done")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn choice_mutates_captured_local_after_restoring_a_pending_sound() {
+        let code = compile_story_bytecode(
+            "capture.story.hks",
+            r#"
+            global fn run() {
+                var answer = ""
+                while answer != "correct" {
+                    choice {
+                        option("Alice") { answer = "retry"; sfx("confirm").await() }
+                        option("Bob") { answer = "correct"; sfx("confirm").await() }
+                    }
+                    if answer == "retry" { narrate("retry") }
+                }
+                narrate("done")
+            }
+            run()
+        "#,
+        )
+        .expect("compile captured choice binding");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("initialize");
+        assert!(matches!(
+            runtime.step().expect("initial choice"),
+            Some(StoryRuntimeEvent::Choice { .. })
+        ));
+        // The builder execution is already gone; its nested option captures
+        // must still point to the suspended parent function's binding.
+        let bytes = hiraku_script::hson::to_vec(&runtime.snapshot().expect("choice snapshot"))
+            .expect("serialize");
+        runtime = StoryRuntime::restore(
+            code.clone(),
+            hiraku_script::hson::from_slice(&bytes).expect("decode"),
+        )
+        .expect("restore choice");
+        for (index, expected) in [(0, "retry"), (1, "done")] {
+            runtime.resume(Value::Int(index)).expect("select");
+            let Some(StoryRuntimeEvent::TaskEffect { task, effect }) =
+                runtime.step().expect("sound")
+            else {
+                panic!("expected sound")
+            };
+            // Explicit awaits still suspend the callback and remain saveable.
+            assert_eq!(runtime.step().expect("branch awaits sound"), None);
+            let bytes = hiraku_script::hson::to_vec(&runtime.snapshot().expect("sound snapshot"))
+                .expect("serialize");
+            if index == 0 {
+                runtime
+                    .complete_task_effect(task, &effect)
+                    .expect("sound completes after the branch");
+            } else {
+                // Restoring deliberately completes transient audio without
+                // replaying it; that must resume the same captured continuation.
+                runtime = StoryRuntime::restore(
+                    code.clone(),
+                    hiraku_script::hson::from_slice(&bytes).expect("decode"),
+                )
+                .expect("restore sound");
+            }
+            let observed = runtime.step().expect("parent observes assignment");
+            assert!(
+                matches!(&observed, Some(StoryRuntimeEvent::Effect(StoryEffect::Say { text, .. })) if text == expected),
+                "{observed:?}"
+            );
+            assert!(matches!(
+                runtime.step().expect("dialogue waits"),
+                Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+            ));
+            if index == 0 {
+                runtime.resume(Value::Unit).expect("advance retry");
+                assert!(matches!(
+                    runtime.step().expect("choose again"),
+                    Some(StoryRuntimeEvent::Choice { .. })
+                ));
+            }
+        }
     }
 
     #[test]

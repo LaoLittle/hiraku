@@ -2232,21 +2232,35 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         *parameter = substitute_type(parameter, &substitutions);
                     }
                 }
+                // Context flows left to right: the receiver and preceding
+                // arguments determine the input types of subsequent closures.
+                let mut contextual_bindings = self.infer_call_types(function, callee, &[]);
                 let mut arguments = arguments
                     .iter()
                     .enumerate()
-                    .map(|(index, argument)| HirArgument {
-                        label: argument.label.as_deref().map(|label| self.symbol(label)),
-                        value: self.lower_expression_expected(
-                            &argument.value,
-                            expected_parameters
-                                .as_ref()
-                                .and_then(|parameters| {
-                                    parameters.get(index + usize::from(receiver.is_some()))
-                                })
-                                .or(expected_variadic.as_ref()),
-                        ),
-                        span: argument.span,
+                    .map(|(index, argument)| {
+                        let parameter = expected_parameters
+                            .as_ref()
+                            .and_then(|parameters| {
+                                parameters.get(index + usize::from(receiver.is_some()))
+                            })
+                            .or(expected_variadic.as_ref());
+                        let expected =
+                            parameter.map(|ty| substitute_type(ty, &contextual_bindings));
+                        let value =
+                            self.lower_expression_expected(&argument.value, expected.as_ref());
+                        if let Some(parameter) = parameter {
+                            infer_type_argument(
+                                parameter,
+                                self.expression_type(value),
+                                &mut contextual_bindings,
+                            );
+                        }
+                        HirArgument {
+                            label: argument.label.as_deref().map(|label| self.symbol(label)),
+                            value,
+                            span: argument.span,
+                        }
                     })
                     .collect::<Vec<_>>();
                 if let Some(receiver) = receiver {
@@ -2262,8 +2276,9 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 if let Some(block) = trailing_block {
                     let expected = expected_parameters
                         .as_ref()
-                        .and_then(|parameters| parameters.get(arguments.len()));
-                    let closure = self.lower_trailing_closure(block, expected);
+                        .and_then(|parameters| parameters.get(arguments.len()))
+                        .map(|ty| substitute_type(ty, &contextual_bindings));
+                    let closure = self.lower_trailing_closure(block, expected.as_ref());
                     arguments.push(HirArgument {
                         label: None,
                         value: closure,
@@ -2306,7 +2321,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     match self.expression_type(callee) {
                         ScriptType::Callable { result, .. } => (**result).clone(),
                         ScriptType::Function => {
-                            self.call_result(function, arguments, &explicit_types)
+                            self.call_result(function, callee, arguments, &explicit_types)
                         }
                         // check_call has already rejected Any and non-callable
                         // values. Do not advertise a usable Any result for an
@@ -2314,25 +2329,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                         _ => ScriptType::Never,
                     }
                 } else {
-                    self.call_result(function, arguments, &explicit_types)
+                    self.call_result(function, callee, arguments, &explicit_types)
                 };
-                let bindings = if let Some((type_parameters, parameters, _)) =
-                    self.generic_signature(function)
-                {
-                    if explicit_types.is_empty() {
-                        infer_type_arguments(&parameters, arguments, |value| {
-                            self.expression_type(value).clone()
-                        })
+                let bindings =
+                    if let Some((type_parameters, _, _)) = self.generic_signature(function) {
+                        if explicit_types.is_empty() {
+                            self.infer_call_types(function, callee, arguments)
+                        } else {
+                            type_parameters
+                                .iter()
+                                .copied()
+                                .zip(explicit_types.iter().cloned())
+                                .collect()
+                        }
                     } else {
-                        type_parameters
-                            .iter()
-                            .copied()
-                            .zip(explicit_types.iter().cloned())
-                            .collect()
-                    }
-                } else {
-                    BTreeMap::new()
-                };
+                        BTreeMap::new()
+                    };
                 let witnesses = match function {
                     ResolvedFunction::User(id) => self.functions[id.0 as usize].witnesses.clone(),
                     _ => Vec::new(),
@@ -2775,7 +2787,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                             arguments,
                             function: ResolvedFunction::Builtin(builtin),
                         },
-                        self.call_result(ResolvedFunction::Builtin(builtin), arguments, &[]),
+                        self.call_result(
+                            ResolvedFunction::Builtin(builtin),
+                            callee,
+                            arguments,
+                            &[],
+                        ),
                         expression.span,
                     );
                 }
@@ -2815,13 +2832,21 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         block: &crate::Block,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
-        if matches!(expected, Some(ScriptType::Callable { .. })) {
+        let callable = match expected {
+            Some(ScriptType::Optional(inner))
+                if matches!(inner.as_ref(), ScriptType::Callable { .. }) =>
+            {
+                Some(inner.as_ref())
+            }
+            _ => expected,
+        };
+        if matches!(callable, Some(ScriptType::Callable { .. })) {
             return self.lower_expression_expected(
                 &crate::Expr {
                     kind: ExprKind::Block(block.clone()),
                     span: block.span,
                 },
-                expected,
+                callable,
             );
         }
         self.return_context.push(None);
@@ -3216,9 +3241,22 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         if let Some(ScriptType::List(element)) = expected
             && let ExprKind::List(values) = &expression.kind
         {
+            // An unresolved T is not evidence of an element's type. Infer from
+            // the literal, then unify at the call site instead of relabelling it.
+            if element.has_type_parameters() {
+                return self.lower_expression(expression);
+            }
             let values = values
                 .iter()
-                .map(|value| self.lower_expression_expected(value, Some(element)))
+                .map(|value| {
+                    let value = self.lower_expression_expected(value, Some(element));
+                    self.check_assignment(
+                        element,
+                        &self.expression_type(value).clone(),
+                        value.span,
+                    );
+                    value
+                })
                 .collect::<Vec<_>>();
             let values = self.arena.alloc_slice_copy(&values);
             return self.alloc_expression(
@@ -3242,11 +3280,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 && inner.accepts(self.expression_type(value))
             {
                 return self.alloc_expression(
-                    HirExprKind::Cast {
-                        value,
-                        target: self.arena.alloc(expected.clone()),
-                        mode: CastMode::Static,
-                    },
+                    HirExprKind::OptionalSome(value),
                     expected.clone(),
                     expression.span,
                 );
@@ -3272,7 +3306,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                     arguments: &[],
                     function: ResolvedFunction::Builtin(builtin),
                 },
-                self.call_result(ResolvedFunction::Builtin(builtin), &[], &[]),
+                self.call_result(ResolvedFunction::Builtin(builtin), callee, &[], &[]),
                 expression.span,
             );
         }
@@ -3338,7 +3372,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 arguments: lowered_arguments,
                 function,
             },
-            self.call_result(function, lowered_arguments, &[]),
+            self.call_result(function, callee, lowered_arguments, &[]),
             expression.span,
         )
     }
@@ -3360,14 +3394,14 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         {
             self.error("non-generic callable does not accept type arguments", span);
         }
-        if let ResolvedFunction::External(_) = function
-            && let Some((type_parameters, parameters, _)) = self.generic_signature(function)
+        if matches!(
+            function,
+            ResolvedFunction::External(_) | ResolvedFunction::Builtin(_)
+        ) && let Some((type_parameters, parameters, _)) = self.generic_signature(function)
             && !type_parameters.is_empty()
         {
             let bindings = if explicit_types.is_empty() {
-                infer_type_arguments(&parameters, arguments, |value| {
-                    self.expression_type(value).clone()
-                })
+                self.infer_call_types(function, callee, arguments)
             } else {
                 if explicit_types.len() != type_parameters.len() {
                     self.error("wrong number of generic type arguments", span);
@@ -3385,6 +3419,19 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 if !bindings.contains_key(&parameter) {
                     self.error("cannot infer generic parameter; add a result annotation or explicit type arguments", span);
                 }
+            }
+            if let ResolvedFunction::Builtin(id) = function
+                && let Some(expected) = self
+                    .manifest
+                    .and_then(|m| m.signature(id))
+                    .and_then(|s| s.receiver.as_ref())
+                && let HirExprKind::Member { object, .. } = callee.kind
+            {
+                self.check_assignment(
+                    &substitute_type(expected, &bindings),
+                    &self.expression_type(object).clone(),
+                    object.span,
+                );
             }
             for (expected, actual) in parameters.iter().zip(arguments) {
                 self.check_assignment(
@@ -4017,17 +4064,18 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
     fn call_result(
         &self,
         function: ResolvedFunction,
+        callee: &HirExpr<'_>,
         arguments: &[HirArgument<'hir>],
         explicit_types: &[ScriptType],
     ) -> ScriptType {
-        if let ResolvedFunction::External(_) = function
-            && let Some((type_parameters, parameters, result)) = self.generic_signature(function)
+        if matches!(
+            function,
+            ResolvedFunction::External(_) | ResolvedFunction::Builtin(_)
+        ) && let Some((type_parameters, _, result)) = self.generic_signature(function)
             && !type_parameters.is_empty()
         {
             let bindings = if explicit_types.is_empty() {
-                infer_type_arguments(&parameters, arguments, |value| {
-                    self.expression_type(value).clone()
-                })
+                self.infer_call_types(function, callee, arguments)
             } else {
                 type_parameters
                     .into_iter()
@@ -4086,6 +4134,16 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         function: ResolvedFunction,
     ) -> Option<(Vec<SymbolId>, Vec<ScriptType>, ScriptType)> {
         match function {
+            ResolvedFunction::Builtin(id) => self.manifest?.signature(id).and_then(|signature| {
+                // Variadic generic inference is separate from fixed-arity calls.
+                (signature.variadic.is_none()).then(|| {
+                    (
+                        signature.type_parameters(),
+                        signature.parameters.clone(),
+                        signature.result.clone(),
+                    )
+                })
+            }),
             ResolvedFunction::User(id) => self.functions.get(id.0 as usize).map(|f| {
                 (
                     f.type_parameters.clone(),
@@ -4105,6 +4163,34 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }),
             _ => None,
         }
+    }
+
+    fn infer_call_types(
+        &self,
+        function: ResolvedFunction,
+        callee: &HirExpr<'_>,
+        arguments: &[HirArgument<'_>],
+    ) -> BTreeMap<SymbolId, ScriptType> {
+        let mut bindings = BTreeMap::new();
+        if let ResolvedFunction::Builtin(id) = function
+            && let Some(receiver) = self
+                .manifest
+                .and_then(|m| m.signature(id))
+                .and_then(|s| s.receiver.as_ref())
+            && let HirExprKind::Member { object, .. } = callee.kind
+        {
+            infer_type_argument(receiver, self.expression_type(object), &mut bindings);
+        }
+        if let Some((_, parameters, _)) = self.generic_signature(function) {
+            for (parameter, argument) in parameters.iter().zip(arguments) {
+                infer_type_argument(
+                    parameter,
+                    self.expression_type(argument.value),
+                    &mut bindings,
+                );
+            }
+        }
+        bindings
     }
 
     fn external_selector(&self, expression: &Expr) -> Option<SymbolId> {

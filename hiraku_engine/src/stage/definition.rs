@@ -159,6 +159,9 @@ pub struct StageDefinition {
     /// For pre-lit scenery; defaults to the materials authored in the model.
     #[serde(default)]
     pub unlit: bool,
+    /// Lighting arithmetic for legacy imported scenes; native stages use linear.
+    #[serde(default)]
+    pub shading: super::StageShading,
     /// Linear camera exposure multiplier. None uses Bevy's physical default.
     #[serde(default)]
     pub exposure: Option<f32>,

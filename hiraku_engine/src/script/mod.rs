@@ -9,6 +9,7 @@ use crate::{
     vfs::VfsResource,
 };
 
+pub(crate) mod actor_blur;
 pub(crate) mod actor_motion;
 pub(crate) mod animation;
 mod animation_plan;
@@ -25,6 +26,7 @@ pub mod ui_runtime;
 mod ui_vm;
 pub(crate) use project::{StoryProgram, compile_story_program};
 pub(crate) use stdlib::dialogue_source;
+pub(crate) use stdlib::profile_source;
 pub(crate) use ui_vm::UiComposition;
 pub(crate) use ui_vm::authoring_api as ui_authoring_api;
 pub(crate) use ui_vm::ui_argument_to_stored;
@@ -236,6 +238,16 @@ pub(crate) fn script_command_from_effect(
         StoryEffect::HideCharacter { actor_id, fade_ms } => {
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms })
         }
+        StoryEffect::ActorBlur {
+            actor_id,
+            radius,
+            animation,
+        } => ScriptCommand::Character(CharacterCommand::Blur {
+            actor_id,
+            radius,
+            animation,
+            animation_id: None,
+        }),
         StoryEffect::ShowCharacter {
             rotation,
             placement_animation,

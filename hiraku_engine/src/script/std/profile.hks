@@ -1,0 +1,5 @@
+// Durable project data is independent of story save slots. The caller chooses
+// the schema; stale or incompatible data fails rather than becoming Any.
+global fn read<T>(key: String, fallback: T) -> T {
+    profile.read_any(key, fallback) as! T
+}

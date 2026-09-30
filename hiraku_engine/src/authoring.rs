@@ -25,12 +25,15 @@ pub fn script_api(ui: bool) -> ScriptApi {
         let (manifest, source) = crate::script::ui_authoring_api();
         ScriptApi {
             manifest,
-            sources: vec![source],
+            sources: vec![source, crate::script::profile_source()],
         }
     } else {
         ScriptApi {
             manifest: crate::script::capabilities::story_manifest(),
-            sources: vec![crate::script::dialogue_source()],
+            sources: vec![
+                crate::script::dialogue_source(),
+                crate::script::profile_source(),
+            ],
         }
     }
 }
@@ -38,6 +41,32 @@ pub fn script_api(ui: bool) -> ScriptApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_objects_have_the_same_typed_api_in_both_domains() {
+        for ui in [false, true] {
+            let mut api = script_api(ui);
+            api.sources.push(ScriptSource {
+                path: "main.hks".into(),
+                namespace: None,
+                source: r#"
+                    struct Alice { name: String, score: Int }
+                    let fallback = Alice.{ name: "alice", score: 0 }
+                    let loaded: Alice = profile.read("alice", fallback)
+                    profile.write("alice", loaded)
+                "#
+                .into(),
+            });
+            let mut policy = hiraku_script::ProjectLinkPolicy::default();
+            if !ui {
+                let path = &api.sources[0].path;
+                policy.grant(path, "scene.actor");
+                policy.grant(path, "dialogue.write");
+            }
+            hiraku_script::compile_project_with_policy(api.sources, &api.manifest, &policy)
+                .expect("persistent API compiles and links for both story and UI");
+        }
+    }
 
     #[test]
     fn story_description_uses_runtime_signatures_and_script_actor_declarations() {

@@ -53,13 +53,34 @@ pub(crate) fn install(app: &mut App) {
 fn install_runtime_systems(app: &mut App) {
     app.add_systems(
         PostUpdate,
-        (advance_group_fades, compose_groups, retire_hidden_groups)
+        (
+            advance_actor_blurs,
+            advance_group_fades,
+            compose_groups,
+            retire_hidden_groups,
+        )
             .chain()
             .after(crate::dependencies::update_resource_window)
             // Stage resources are created only after runtime content has loaded.
             .run_if(crate::runtime_initialized)
             .before(Sprite3dSync),
     );
+}
+
+fn advance_actor_blurs(
+    time: crate::scene::playback::StoryTime,
+    mut shared: ResMut<SceneSharedState>,
+    mut animations: ResMut<AnimationState>,
+    mut redraw: crate::redraw::Redraw,
+) {
+    for blur in shared.0.actor_blurs.values_mut() {
+        if blur.elapsed < blur.animation.duration() {
+            redraw.request();
+            if blur.advance(time.delta_secs()) {
+                complete_missing_animation(&mut animations, blur.animation_id.take());
+            }
+        }
+    }
 }
 
 /// Execution-based reuse window for hide/show cuts; persistent actor state lives in the
@@ -406,7 +427,22 @@ fn compose_groups(
                 index,
             });
         }
+        let blur = shared
+            .0
+            .actor_blurs
+            .get(&identity.actor_id)
+            .map_or(0.0, |blur| blur.radius);
+        let padded_size = size + Vec2::splat(blur * 4.0);
+        if blur > 0.0 {
+            for layer in &mut layers {
+                layer.bounds.min =
+                    (layer.bounds.min * size + Vec2::splat(blur * 2.0)) / padded_size;
+                layer.bounds.max =
+                    (layer.bounds.max * size + Vec2::splat(blur * 2.0)) / padded_size;
+            }
+        }
         let sprite = Sprite3d {
+            blur,
             clip: shared.0.clips.actor(&identity.actor_id),
             dissolve: group.dissolve.as_ref().map(|mask| SpriteDissolve {
                 progress: group.alpha,
@@ -414,7 +450,7 @@ fn compose_groups(
             }),
             image: Some(image),
             layers,
-            custom_size: Some(size),
+            custom_size: Some(padded_size),
             color: Color::linear_rgba(
                 1.0,
                 1.0,

@@ -2,7 +2,9 @@
 //! story-specific trial mechanics. Explicit views allocate on-demand cameras.
 mod definition;
 mod model;
+mod shading;
 pub use model::{StageAlpha, StageLight, StageLightKind, StageMaterial};
+pub use shading::StageShading;
 mod clip;
 mod redraw;
 pub use clip::ViewClip;
@@ -21,6 +23,7 @@ use bevy::{
 pub struct StagePlugin;
 impl Plugin for StagePlugin {
     fn build(&self, app: &mut App) {
+        shading::register(app);
         redraw::register(app);
         app.init_asset::<StageDefinition>()
             .init_asset_loader::<StageLoader>();

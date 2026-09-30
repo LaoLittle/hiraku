@@ -114,6 +114,14 @@ pub struct ExecutionRuntime {
 }
 
 impl ExecutionRuntime {
+    pub(super) fn symbols(
+        &self,
+        execution: ExecutionId,
+    ) -> Option<&hiraku_script::symbol::SymbolManifest> {
+        self.executions
+            .get(&execution)
+            .map(|state| &state.vm.bytecode().symbols)
+    }
     pub(super) fn has_executions(&self) -> bool {
         !self.executions.is_empty()
     }

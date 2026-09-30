@@ -28,6 +28,79 @@ pub struct FunctionSignature {
     pub result: ScriptType,
 }
 
+impl FunctionSignature {
+    /// Free type parameters in declaration order (first occurrence). Native
+    /// signatures use the same type variables and inference as script functions;
+    /// no runtime type-name strings or UI-specific compiler rules are needed.
+    pub fn type_parameters(&self) -> Vec<SymbolId> {
+        fn collect(ty: &ScriptType, out: &mut Vec<SymbolId>) {
+            use ScriptType::*;
+            match ty {
+                TypeParameter(id) => {
+                    if !out.contains(id) {
+                        out.push(*id);
+                    }
+                }
+                Callable { parameters, result } => {
+                    for ty in parameters {
+                        collect(ty, out);
+                    }
+                    collect(result, out);
+                }
+                Optional(ty) | List(ty) | Binding(ty) => collect(ty, out),
+                TupleOf(types) | Union(types) => {
+                    for ty in types {
+                        collect(ty, out);
+                    }
+                }
+                Map(key, value) => {
+                    collect(key, out);
+                    collect(value, out);
+                }
+                Record(fields) => {
+                    for ty in fields.values() {
+                        collect(ty, out);
+                    }
+                }
+                Struct {
+                    arguments, fields, ..
+                } => {
+                    for ty in arguments {
+                        collect(ty, out);
+                    }
+                    for ty in fields.values() {
+                        collect(ty, out);
+                    }
+                }
+                Enum {
+                    arguments,
+                    variants,
+                    ..
+                } => {
+                    for ty in arguments {
+                        collect(ty, out);
+                    }
+                    for ty in variants.values().flatten() {
+                        collect(ty, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut parameters = Vec::new();
+        for ty in self
+            .receiver
+            .iter()
+            .chain(&self.parameters)
+            .chain(self.variadic.iter())
+            .chain(std::iter::once(&self.result))
+        {
+            collect(ty, &mut parameters);
+        }
+        parameters
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StaticMemberKind {
     Method,

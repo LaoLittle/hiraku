@@ -6,6 +6,14 @@ pub(super) const DIALOGUE_CAPABILITY: &str = "dialogue.write";
 pub(super) const ACTOR_CAPABILITY: &str = "scene.actor";
 const DIALOGUE_SOURCE: &str = include_str!("std/dialogue.hks");
 
+pub(crate) fn profile_source() -> ScriptSource {
+    ScriptSource {
+        path: "embedded://hiraku_engine/std/profile.hks".into(),
+        namespace: Some("profile".into()),
+        source: include_str!("std/profile.hks").into(),
+    }
+}
+
 pub(crate) fn dialogue_source() -> ScriptSource {
     ScriptSource {
         path: DIALOGUE_PATH.into(),

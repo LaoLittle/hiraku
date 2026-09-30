@@ -27,16 +27,36 @@ fn code_at(code: &Bytecode, location: CodeLocation) -> Result<(u16, &[Instructio
     }
 }
 
-fn validate_frame(
-    code: &Bytecode,
+fn validate_frame<'a>(
+    code: &'a Bytecode,
     location: CodeLocation,
     pc: usize,
     registers: usize,
-    locals: usize,
-) -> Result<&[Instruction], VmError> {
+    locals: &[crate::Value],
+) -> Result<&'a [Instruction], VmError> {
     let (expected, instructions) = code_at(code, location)?;
-    if registers != expected as usize || locals != code.local_count as usize {
+    if registers != expected as usize
+        || locals.len() != code.local_count as usize
+        || code.shared_locals.len() != locals.len()
+    {
         return Err(VmError::FrameShapeMismatch);
+    }
+    let parameters: &[u32] = if pc == 0 {
+        match location {
+            CodeLocation::Entry => &[],
+            CodeLocation::Function(id) => &code.functions[id as usize].parameters,
+            CodeLocation::Region(id) => &code.regions[id as usize].parameters,
+        }
+    } else {
+        &[]
+    };
+    for (index, value) in locals.iter().enumerate() {
+        if code.shared_locals[index]
+            && !parameters.contains(&(index as u32))
+            && !matches!(value, crate::Value::Uninitialized | crate::Value::Object(_))
+        {
+            return Err(invalid("captured local is missing its heap cell"));
+        }
     }
     if pc > instructions.len() {
         return Err(VmError::InvalidProgramCounter(pc));
@@ -93,7 +113,7 @@ pub(crate) fn validate(code: &Bytecode, saved: &VmSnapshot) -> Result<(), VmErro
         saved.location,
         saved.pc,
         saved.registers.len(),
-        saved.locals.len(),
+        &saved.locals,
     )?;
     match (saved.status, saved.waiting_destination) {
         (VmStatus::WaitingForHost, Some(dst)) => {
@@ -122,7 +142,7 @@ pub(crate) fn validate(code: &Bytecode, saved: &VmSnapshot) -> Result<(), VmErro
             frame.location,
             frame.pc,
             frame.registers.len(),
-            frame.locals.len(),
+            &frame.locals,
         )?;
         validate_destination(
             instructions,

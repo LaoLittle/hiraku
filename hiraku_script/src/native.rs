@@ -1110,6 +1110,190 @@ mod integer_tests {
     use super::*;
 
     #[test]
+    fn generic_native_receivers_contextually_type_callbacks_and_fluent_results() {
+        use crate::ScriptType as T;
+        let mut registry = NativeRegistry::<()>::new();
+        let element = T::TypeParameter(registry.define_type("Element"));
+        let list = T::List(Box::new(element.clone()));
+        let callback = T::Callable {
+            parameters: vec![element],
+            result: Box::new(T::Unit),
+        };
+        for (name, receiver, parameters) in [
+            ("visit", Some(list.clone()), vec![callback.clone()]),
+            ("visitList", None, vec![list.clone(), callback]),
+        ] {
+            let id = registry
+                .register_raw_fn(name, |_, _| Ok(Value::Unit))
+                .expect("register");
+            registry
+                .set_signature(
+                    id,
+                    FunctionSignature {
+                        receiver,
+                        parameters,
+                        variadic: None,
+                        result: list.clone(),
+                    },
+                )
+                .expect("signature");
+        }
+        registry
+            .register_fn("print", |_: &mut (), _: String| Ok(()))
+            .expect("register print");
+        let first = registry
+            .register_fn("first", |_: &mut (), values: Vec<Value>| {
+                values
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| NativeError::message("empty list"))
+            })
+            .expect("register first");
+        registry
+            .set_signature(
+                first,
+                FunctionSignature {
+                    receiver: Some(list.clone()),
+                    parameters: vec![],
+                    variadic: None,
+                    result: match &list {
+                        T::List(element) => (**element).clone(),
+                        _ => unreachable!("list signature"),
+                    },
+                },
+            )
+            .expect("first signature");
+        let manifest = registry.manifest();
+        for source in [
+            r#"let names: List<String> = ["Alice"].visit { name -> print(name) }"#,
+            r#"["Alice"].visit { name -> print(name) }.visit { name -> print(name) }"#,
+            r#"visitList(["Alice"]) { name -> print(name) }"#,
+            r#"visitList(["Alice"], { name -> print(name) })"#,
+            r#"let numbers: List<Int> = [1].visit { value -> let n: Int = value }"#,
+            r#"print(["Alice"].first())"#,
+        ] {
+            let syntax = crate::parse_program(source).expect("parse");
+            crate::vm::compile_with_manifest(&syntax, 0, &manifest).expect(source);
+        }
+        for source in [
+            r#"[1].visit { value -> print(value) }"#,
+            r#"visitList([1]) { value -> print(value) }"#,
+            r#"let values: List<Int> = ["Alice"].visit { value -> print(value) }"#,
+            r#"["Alice"].visit<Int> { value -> () }"#,
+            r#"1.visit { value: Int -> () }"#,
+            r#"["Alice"].visit { value: Int -> () }"#,
+            r#"let number: Int = ["Alice"].first()"#,
+        ] {
+            let syntax = crate::parse_program(source).expect("parse");
+            assert!(
+                crate::vm::compile_with_manifest(&syntax, 0, &manifest).is_err(),
+                "{source}"
+            );
+        }
+        let syntax = crate::parse_program(r#"["Alice"].first()"#).expect("parse");
+        let code = crate::vm::compile_with_manifest(&syntax, 0, &manifest).expect("compile");
+        let mut vm = crate::Vm::new(code).expect("VM");
+        loop {
+            match vm.step().expect("execute") {
+                Some(crate::VmEvent::Call(call)) => {
+                    let result = registry
+                        .call(
+                            &mut (),
+                            &BuiltinCall {
+                                builtin: first,
+                                receiver: call.receiver,
+                                arguments: call.arguments,
+                            },
+                        )
+                        .expect("native receiver call");
+                    assert_eq!(String::from_hks_value(&result).expect("string"), "Alice");
+                    vm.resume(result).expect("resume");
+                }
+                Some(crate::VmEvent::Statement(_)) | None => {}
+                Some(crate::VmEvent::Completed(_)) => break,
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn generic_native_collection_signature_preserves_elements_and_rejects_mismatches() {
+        use crate::ScriptType as T;
+        let mut registry = NativeRegistry::<()>::new();
+        let item = registry
+            .register_fn(
+                "item",
+                |_: &mut (), values: Vec<Value>, index: i64| -> Result<Value, NativeError> {
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|i| values.get(i))
+                        .cloned()
+                        .ok_or_else(|| NativeError::message("index out of bounds"))
+                },
+            )
+            .expect("register item");
+        let t = T::TypeParameter(registry.define_type("Element"));
+        registry
+            .set_signature(
+                item,
+                FunctionSignature {
+                    receiver: None,
+                    parameters: vec![T::List(Box::new(t.clone())), T::Int],
+                    variadic: None,
+                    result: t,
+                },
+            )
+            .expect("generic signature");
+        registry
+            .register_fn("print", |_: &mut (), _: String| Ok(()))
+            .expect("register print");
+        let manifest = registry.manifest();
+        for source in [
+            "let rows = [[.{ name: \"Alice\" }]]; let row = item(rows, 0); print(item(row, 0).name)",
+            "let name: String = item([\"Alice\"], 0); print(name)",
+            "print(item<String>([\"Alice\"], 0))",
+        ] {
+            let syntax = crate::parse_program(source).expect("parse");
+            let code = crate::vm::compile_with_manifest(&syntax, 0, &manifest).expect(source);
+            let symbols = code.symbols.clone();
+            let mut vm = crate::Vm::new(code).expect("VM");
+            loop {
+                match vm.step().expect("execute") {
+                    Some(crate::VmEvent::Call(call)) => {
+                        let name = symbols.resolve(call.function).expect("function symbol");
+                        let call = BuiltinCall {
+                            builtin: manifest.resolve(name).expect("native"),
+                            receiver: call.receiver,
+                            arguments: call.arguments,
+                        };
+                        let value = registry.call(&mut (), &call).expect("native call");
+                        vm.resume(value).expect("resume");
+                    }
+                    Some(crate::VmEvent::Statement(_)) | None => {}
+                    Some(crate::VmEvent::Completed(_)) => break,
+                    event => panic!("unexpected event: {event:?}"),
+                }
+            }
+        }
+        for source in [
+            "let values: List<Int> = [\"Alice\"]",
+            "let values: List<List<Int>> = [[\"Alice\"]]",
+            "let values: List<Int?> = [\"Alice\"]",
+            "let n: Int = item([\"Alice\"], 0)",
+            "item<Int>([\"Alice\"], 0)",
+            "print(item([.{ name: \"Alice\" }], 0).missing)",
+            "fn unknown() -> Any { 1 }; print(unknown())",
+            "fn unknown() -> Any { [\"Alice\"] }; let name: String = item(unknown(), 0)",
+        ] {
+            let syntax = crate::parse_program(source).expect("parse");
+            assert!(
+                crate::vm::compile_with_manifest(&syntax, 0, &manifest).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn native_integers_are_exact_and_signedness_is_checked() {
         let mut registry = NativeRegistry::<()>::new();
         assert_eq!(u64::hks_script_type(&mut registry), crate::ScriptType::UInt);

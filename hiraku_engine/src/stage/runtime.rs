@@ -251,6 +251,10 @@ pub(crate) struct StageRuntime {
         (AssetId<StandardMaterial>, Option<String>),
         Handle<StandardMaterial>,
     >,
+    gamma_materials: std::collections::HashMap<
+        AssetId<StandardMaterial>,
+        Handle<super::shading::GammaStageMaterial>,
+    >,
 }
 impl StageRuntime {
     pub fn ready(&self, state: &StageSnapshot) -> bool {
@@ -288,6 +292,7 @@ pub(crate) fn sync(
         runtime.definition = None;
         runtime.instantiated = false;
         runtime.materials.clear();
+        runtime.gamma_materials.clear();
         runtime.error = None;
         runtime.handle = path.as_ref().map(|path| server.load(path.clone()));
         runtime.path = path;
@@ -460,6 +465,7 @@ pub(crate) fn prepare_surfaces(
     mut redraw: super::redraw::StageRedraw,
     mut runtime: ResMut<StageRuntime>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gamma_materials: ResMut<Assets<super::shading::GammaStageMaterial>>,
     surfaces: Query<
         (
             Entity,
@@ -470,7 +476,12 @@ pub(crate) fn prepare_surfaces(
     >,
     markers: Query<(Entity, &Name), Without<StageLightMarker>>,
     mut lights: Query<
-        (Entity, Option<&mut PointLight>, Option<&mut SpotLight>),
+        (
+            Entity,
+            Option<&mut PointLight>,
+            Option<&mut SpotLight>,
+            Option<&mut DirectionalLight>,
+        ),
         (
             Or<(With<PointLight>, With<SpotLight>, With<DirectionalLight>)>,
             Without<StageSurface>,
@@ -487,7 +498,7 @@ pub(crate) fn prepare_surfaces(
                     .iter_ancestors(entity)
                     .any(|ancestor| ancestor == root)
                 {
-                    light.spawn(&mut commands, entity);
+                    light.spawn(&mut commands, entity, definition.shading);
                     redraw.request();
                     commands.entity(entity).insert(StageLightMarker);
                 }
@@ -496,11 +507,25 @@ pub(crate) fn prepare_surfaces(
     }
     // RenderLayers are not inherited through ChildOf. Imported lights must
     // illuminate the stage's layer, not Bevy's default layer zero.
-    for (entity, point, spot) in &mut lights {
+    for (entity, mut point, mut spot, directional) in &mut lights {
         if parents
             .iter_ancestors(entity)
             .any(|ancestor| ancestor == root)
         {
+            let shading = runtime
+                .definition
+                .as_ref()
+                .map(|d| d.shading)
+                .unwrap_or_default();
+            if let Some(light) = point.as_deref_mut() {
+                light.color = shading.light_color(light.color);
+            }
+            if let Some(light) = spot.as_deref_mut() {
+                light.color = shading.light_color(light.color);
+            }
+            if let Some(mut light) = directional {
+                light.color = shading.light_color(light.color);
+            }
             if let Some(radius) = runtime
                 .definition
                 .as_ref()
@@ -529,6 +554,11 @@ pub(crate) fn prepare_surfaces(
         let settings = name
             .and_then(|name| runtime.definition.as_ref()?.materials.get(&name.0))
             .cloned();
+        let gamma = runtime
+            .definition
+            .as_ref()
+            .is_some_and(|d| d.shading == super::StageShading::Gamma);
+        let mut adapted = material.0.clone();
         if unlit || settings.is_some() {
             let key = (
                 material.id(),
@@ -552,7 +582,26 @@ pub(crate) fn prepare_surfaces(
                 runtime.materials.insert(key, handle.clone());
                 handle
             };
-            commands.entity(entity).insert(MeshMaterial3d(handle));
+            adapted = handle;
+        }
+        if gamma {
+            let handle = if let Some(handle) = runtime.gamma_materials.get(&adapted.id()) {
+                handle.clone()
+            } else {
+                let Some(source) = materials.get(&adapted) else {
+                    redraw.request();
+                    continue;
+                };
+                let handle = gamma_materials.add(super::shading::material(source.clone()));
+                runtime.gamma_materials.insert(adapted.id(), handle.clone());
+                handle
+            };
+            commands
+                .entity(entity)
+                .remove::<MeshMaterial3d<StandardMaterial>>()
+                .insert(MeshMaterial3d(handle));
+        } else if adapted != material.0 {
+            commands.entity(entity).insert(MeshMaterial3d(adapted));
         }
         commands
             .entity(entity)
@@ -851,7 +900,8 @@ mod tests {
         app.add_message::<bevy::window::RequestRedraw>();
         let mut redraws =
             bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
-        app.init_resource::<Assets<StandardMaterial>>()
+        app.init_resource::<Assets<super::super::shading::GammaStageMaterial>>()
+            .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<StageRuntime>()
             .add_systems(Update, prepare_surfaces);
         let root = app.world_mut().spawn(StageRoot).id();
@@ -929,7 +979,8 @@ mod tests {
     #[test]
     fn stage_model_settings_are_instance_local_and_light_markers_are_idempotent() {
         let mut app = App::new();
-        app.init_resource::<Assets<StandardMaterial>>()
+        app.init_resource::<Assets<super::super::shading::GammaStageMaterial>>()
+            .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<StageRuntime>()
             .add_systems(Update, prepare_surfaces);
         let root = app.world_mut().spawn(StageRoot).id();
@@ -1058,10 +1109,100 @@ mod tests {
     }
 
     #[test]
+    fn gamma_stage_adaptation_keeps_shared_materials_unchanged_and_reuses_instances() {
+        use super::super::shading::GammaStageMaterial;
+        let mut app = App::new();
+        app.init_resource::<Assets<GammaStageMaterial>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<StageRuntime>()
+            .add_systems(Update, prepare_surfaces);
+        let root = app.world_mut().spawn(StageRoot).id();
+        let source = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color: Color::srgb(0.5, 0.25, 0.75),
+                alpha_mode: AlphaMode::Mask(0.4),
+                ..default()
+            });
+        let alice = app
+            .world_mut()
+            .spawn((ChildOf(root), MeshMaterial3d(source.clone())))
+            .id();
+        let bob = app
+            .world_mut()
+            .spawn((ChildOf(root), MeshMaterial3d(source.clone())))
+            .id();
+        let external = app.world_mut().spawn(MeshMaterial3d(source.clone())).id();
+        let definition: StageDefinition = hiraku_script::hson::from_str(r#".{
+            shading: "gamma", defaultCamera: "wide", cameras: .{
+                wide: .{pose: .{position: (0,0,10)}, projection: .{kind: "perspective", fov: 60, near: 0.1, far: 100}}
+            }
+        }"#).expect("gamma descriptor");
+        definition.validate().expect("valid gamma stage");
+        {
+            let mut runtime = app.world_mut().resource_mut::<StageRuntime>();
+            runtime.root = Some(root);
+            runtime.definition = Some(definition);
+        }
+        app.update();
+        let first = app
+            .world()
+            .get::<MeshMaterial3d<GammaStageMaterial>>(alice)
+            .expect("gamma instance")
+            .0
+            .clone();
+        assert_eq!(
+            app.world()
+                .get::<MeshMaterial3d<GammaStageMaterial>>(bob)
+                .expect("shared instance")
+                .0,
+            first
+        );
+        assert!(
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(alice)
+                .is_none()
+        );
+        assert_eq!(
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(external)
+                .expect("external material")
+                .0,
+            source
+        );
+        let gamma = app
+            .world()
+            .resource::<Assets<GammaStageMaterial>>()
+            .get(&first)
+            .expect("material");
+        assert_eq!(gamma.base.alpha_mode, AlphaMode::Mask(0.4));
+        assert_eq!(gamma.base.base_color, Color::linear_rgb(1.0, 1.0, 1.0));
+        assert_eq!(
+            gamma.extension.color_factor,
+            Vec4::new(0.5, 0.25, 0.75, 1.0)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&source)
+                .expect("original")
+                .base_color,
+            Color::srgb(0.5, 0.25, 0.75)
+        );
+        app.update();
+        assert_eq!(
+            app.world().resource::<Assets<GammaStageMaterial>>().len(),
+            1
+        );
+    }
+
+    #[test]
     fn headless_stage_systems_release_the_owned_hierarchy_on_close() {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
             .init_asset::<StageDefinition>()
+            .init_resource::<Assets<super::super::shading::GammaStageMaterial>>()
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<crate::state::SceneSharedState>()
             .init_resource::<StageRuntime>()
@@ -1087,6 +1228,7 @@ mod tests {
         let runtime = app.world().resource::<StageRuntime>();
         assert!(runtime.root.is_none() && runtime.handle.is_none());
         assert!(runtime.materials.is_empty());
+        assert!(runtime.gamma_materials.is_empty());
     }
 
     fn view(yaw: f32) -> StageCamera {

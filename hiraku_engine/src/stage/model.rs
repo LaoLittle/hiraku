@@ -129,7 +129,12 @@ impl StageLight {
             && outer_angle < 90.0
     }
 
-    pub(super) fn spawn(&self, commands: &mut Commands, parent: Entity) {
+    pub(super) fn spawn(
+        &self,
+        commands: &mut Commands,
+        parent: Entity,
+        shading: super::StageShading,
+    ) {
         let StageLightKind::Spot {
             color: [r, g, b],
             intensity,
@@ -140,7 +145,7 @@ impl StageLight {
         } = self.light;
         commands.spawn((
             SpotLight {
-                color: Color::srgb(r, g, b),
+                color: shading.light_color(Color::srgb(r, g, b)),
                 intensity,
                 range,
                 radius,

@@ -30,6 +30,7 @@ pub(super) fn apply(
     let position: Option<Position> = field(&fields, "position")?;
     let scale: Option<f64> = field(&fields, "scaleValue")?;
     let focus: Option<bool> = field(&fields, "focused")?;
+    let blur: Option<f64> = field(&fields, "blurValue")?;
     let rotation: Option<f64> = field(&fields, "rotationValue")?;
     let depth: Option<f64> = field(&fields, "depthValue")?;
     let clip: Option<Option<String>> = field(&fields, "clipValue")?;
@@ -46,6 +47,26 @@ pub(super) fn apply(
     let stopping: bool = field(&fields, "stopping")?;
     let seconds: Option<f64> = field(&fields, "seconds")?;
     let easing: Option<Easing> = field(&fields, "curve")?;
+    if blur.is_some_and(|radius| !radius.is_finite() || radius < 0.0 || radius > f32::MAX as f64) {
+        return Err(NativeError::message(
+            "Actor.blur requires a finite, non-negative radius",
+        ));
+    }
+    let blur_only = blur.is_some()
+        && expressions.is_empty()
+        && position.is_none()
+        && scale.is_none()
+        && focus.is_none()
+        && rotation.is_none()
+        && depth.is_none()
+        && clip.is_none()
+        && dissolve_mask.is_none()
+        && showing.is_none()
+        && hiding.is_none()
+        && offset.is_none()
+        && oscillation.is_none()
+        && jitter.is_none()
+        && !stopping;
 
     // Visibility owns its own timeline. A hide must not create a placement
     // animation just to consume `.time`, or leave one behind for the next show.
@@ -112,16 +133,34 @@ pub(super) fn apply(
     if let Some(amplitude) = jitter {
         native_api::native_actor_jitter(context, actor, amplitude, jitter_interval)?;
     }
-    if let Some(seconds) = seconds.filter(|_| hide_ms.is_none()) {
+    if let Some(seconds) = seconds.filter(|_| hide_ms.is_none() && !blur_only) {
         native_api::actor_time(context, actor, seconds)?;
     }
-    if let Some(easing) = easing {
+    if let Some(easing) = easing.filter(|_| !blur_only) {
         native_api::actor_easing(context, actor, easing)?;
     }
     if let Some(hide_ms) = hide_ms {
         native_api::native_hide_with_duration(context, actor, hide_ms)?;
     }
-    if wait {
+    if let Some(radius) = blur {
+        let animation = AnimationSpec::Linear(0.3, false)
+            .with_time(seconds.unwrap_or(0.3))?
+            .with_easing(easing.unwrap_or(Easing::Linear))?;
+        let actor_id = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?
+            .display_instance
+            .clone();
+        context.commands.push(StoryEffect::ActorBlur {
+            actor_id,
+            radius: radius as f32,
+            animation,
+        });
+    }
+    if wait && blur_only {
+        context.await_effects = true;
+    }
+    if wait && !blur_only {
         native_api::await_actor(context, actor)?;
     }
     context
@@ -133,6 +172,44 @@ pub(super) fn apply(
 mod tests {
     use super::*;
     use crate::script::{StoryRuntime, StoryRuntimeEvent};
+
+    #[test]
+    fn actor_local_blur_is_awaitable_without_changing_placement_or_showing() {
+        let code = compile_story_bytecode(
+            "test.hks",
+            "let alice = char(\"alice\")\nalice.blur(12).time(0.6).await()\nalice.blur(0).time(0)",
+        )
+        .expect("typed blur receiver");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let Some(StoryRuntimeEvent::TaskEffect { task, effect }) = runtime.step().expect("blur")
+        else {
+            panic!("expected an awaitable blur");
+        };
+        assert!(
+            matches!(&effect, StoryEffect::ActorBlur { actor_id, radius, animation }
+            if actor_id == "alice" && *radius == 12.0 && (animation.duration() - 0.6).abs() < 0.0001)
+        );
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("complete blur");
+        assert!(matches!(runtime.step().expect("clear blur"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::ActorBlur { radius: 0.0, animation, .. })) if animation.duration() == 0.0));
+        assert!(matches!(runtime.step().expect("complete script"), Some(StoryRuntimeEvent::Completed(_))));
+        assert!(runtime.step().expect("exhausted script").is_none());
+    }
+
+    #[test]
+    fn actor_blur_rejects_negative_radius() {
+        let code = compile_story_bytecode("test.hks", "char(\"alice\").blur(-1)").expect("compile");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        assert!(
+            runtime
+                .step()
+                .expect_err("invalid radius")
+                .to_string()
+                .contains("non-negative radius")
+        );
+    }
 
     #[test]
     fn actor_dissolve_is_a_one_shot_typed_show_modifier() {

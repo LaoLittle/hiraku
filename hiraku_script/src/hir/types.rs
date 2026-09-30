@@ -52,11 +52,39 @@ pub enum ScriptType {
 }
 
 impl ScriptType {
-    /// Dynamic native arguments are validated by the host's typed conversion.
-    /// This does not make Any assignable to a concrete script binding.
+    pub(crate) fn has_type_parameters(&self) -> bool {
+        use ScriptType::*;
+        match self {
+            TypeParameter(_) => true,
+            Optional(t) | List(t) | Binding(t) => t.has_type_parameters(),
+            Callable { parameters, result } => {
+                parameters.iter().any(Self::has_type_parameters) || result.has_type_parameters()
+            }
+            TupleOf(types) | Union(types) => types.iter().any(Self::has_type_parameters),
+            Map(k, v) => k.has_type_parameters() || v.has_type_parameters(),
+            Record(fields) => fields.values().any(Self::has_type_parameters),
+            Struct {
+                arguments, fields, ..
+            } => {
+                arguments.iter().any(Self::has_type_parameters)
+                    || fields.values().any(Self::has_type_parameters)
+            }
+            Enum {
+                arguments,
+                variants,
+                ..
+            } => {
+                arguments.iter().any(Self::has_type_parameters)
+                    || variants.values().flatten().any(Self::has_type_parameters)
+            }
+            _ => false,
+        }
+    }
+
+    /// Native calls obey the same Any boundary as script calls. A host's
+    /// conversion checks are defense in depth, not implicit script casts.
     pub(crate) fn accepts_native_argument(&self, actual: &Self) -> bool {
         self.accepts(actual)
-            || actual == &Self::Any
             || matches!(self, Self::Union(types) if types.iter().any(|ty| ty.accepts_native_argument(actual)))
             || matches!((self, actual), (Self::Binding(expected), Self::Binding(actual)) if expected.accepts_native_argument(actual))
     }

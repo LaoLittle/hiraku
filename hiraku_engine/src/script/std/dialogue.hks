@@ -6,6 +6,7 @@ global struct Actor {
     position: Position?
     scaleValue: Float?
     focused: Bool?
+    blurValue: Float?
     rotationValue: Float?
     depthValue: Float?
     clipValue: Optional<Optional<String>>
@@ -26,7 +27,7 @@ global struct Actor {
 
 fn makeActor(identity: ActorIdentity, name: String) -> Actor {
     Actor.{ identity: identity, name: name, expressions: [], position: null,
-        scaleValue: null, focused: null, rotationValue: null, depthValue: null,
+        scaleValue: null, focused: null, blurValue: null, rotationValue: null, depthValue: null,
         clipValue: null, dissolveMask: null, dissolveSoftness: null,
         showing: null, hiding: null, offsetValue: null,
         oscillation: null, jitterValue: null, jitterInterval: 0.0,
@@ -43,6 +44,7 @@ fn clearActorPatch(actor: Actor) {
     actor.position = null
     actor.scaleValue = null
     actor.focused = null
+    actor.blurValue = null
     actor.rotationValue = null
     actor.depthValue = null
     actor.clipValue = null
@@ -73,7 +75,7 @@ fn submitActorPatch(actor: Actor, patch: Actor, wait: Bool) {
 fn commitActor(actor: Actor, wait: Bool) {
     submitActorPatch(actor, Actor.{ identity: actor.identity, name: actor.name,
         expressions: actor.expressions, position: actor.position,
-        scaleValue: actor.scaleValue, focused: actor.focused,
+        scaleValue: actor.scaleValue, focused: actor.focused, blurValue: actor.blurValue,
         rotationValue: actor.rotationValue, depthValue: actor.depthValue,
         clipValue: actor.clipValue, dissolveMask: actor.dissolveMask,
         dissolveSoftness: actor.dissolveSoftness,
@@ -92,6 +94,7 @@ extend Actor {
     global fn at(self, position: Position) -> Actor { self.position = position; self }
     global fn scale(self, scale: Float) -> Actor { self.scaleValue = scale; self }
     global fn focus(self, focused: Bool?) -> Actor { self.focused = focused ?: true; self }
+    global fn blur(self, radius: Float) -> Actor { self.blurValue = radius; self }
     global fn rotation(self, degrees: Float) -> Actor { self.rotationValue = degrees; self }
     global fn depth(self, depth: Float) -> Actor { self.depthValue = depth; self }
     global fn clip(self, region: String?) -> Actor { self.clipValue = .some(region); self }

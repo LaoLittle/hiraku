@@ -54,6 +54,7 @@
 //! unused core definitions are omitted from the self-contained bytecode.
 
 pub mod ast;
+pub mod bhson;
 pub mod blocks;
 pub mod cst;
 pub mod format;
@@ -66,6 +67,7 @@ pub mod linker;
 pub mod mir;
 pub mod native;
 pub mod objects;
+pub mod persistence;
 pub mod source_text;
 pub use objects::{ObjectHeap, ObjectId};
 mod fingerprint;

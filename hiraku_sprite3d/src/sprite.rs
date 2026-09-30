@@ -78,6 +78,8 @@ impl Default for SpriteLayer {
 #[reflect(Component)]
 #[require(Transform, Visibility)]
 pub struct Sprite3d {
+    /// Gaussian radius in the composed quad's local units, before group opacity.
+    pub blur: f32,
     /// Optional world-space clipping, applied after the sprite's layer composition.
     pub clip: Option<crate::ClipRect>,
     pub dissolve: Option<SpriteDissolve>,
@@ -97,6 +99,7 @@ pub struct Sprite3d {
 impl Default for Sprite3d {
     fn default() -> Self {
         Self {
+            blur: 0.0,
             clip: None,
             dissolve: None,
             image: None,
@@ -136,7 +139,9 @@ impl Sprite3d {
         if self.layers.len() > MAX_LAYERS {
             return Err(Sprite3dError::TooManyLayers(self.layers.len()));
         }
-        if self.custom_size.is_some_and(|v| !valid_size(v))
+        if !self.blur.is_finite()
+            || self.blur < 0.0
+            || self.custom_size.is_some_and(|v| !valid_size(v))
             || !valid_color(self.color)
             || !valid_color(self.backface_color)
         {

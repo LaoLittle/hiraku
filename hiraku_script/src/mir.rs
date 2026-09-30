@@ -57,6 +57,7 @@ pub enum MirInstruction {
     StoreLocal {
         local: crate::HirLocalId,
         src: VirtualRegister,
+        initialize: bool,
     },
     LoadGlobal {
         dst: VirtualRegister,
@@ -495,7 +496,11 @@ impl<'types> MirBuilder<'types> {
                 commit,
             } => {
                 let value = self.lower_expression(value, errors)?;
-                self.push(MirInstruction::StoreLocal { local, src: value });
+                self.push(MirInstruction::StoreLocal {
+                    local,
+                    src: value,
+                    initialize: true,
+                });
                 if let Some(commit) = commit {
                     self.lower_expression(commit, errors)?;
                 }
@@ -658,6 +663,7 @@ impl<'types> MirBuilder<'types> {
                         self.push(MirInstruction::StoreLocal {
                             local: *local,
                             src: field,
+                            initialize: true,
                         });
                     }
                     for (index, statement) in arm.body.statements.iter().enumerate() {
@@ -1086,7 +1092,11 @@ impl<'types> MirBuilder<'types> {
 
     fn store_place(&mut self, place: &HirPlace<'_>, value: VirtualRegister) {
         match *place {
-            HirPlace::Local(local) => self.push(MirInstruction::StoreLocal { local, src: value }),
+            HirPlace::Local(local) => self.push(MirInstruction::StoreLocal {
+                local,
+                src: value,
+                initialize: false,
+            }),
             HirPlace::Global(global) => {
                 self.push(MirInstruction::StoreGlobal { global, src: value })
             }

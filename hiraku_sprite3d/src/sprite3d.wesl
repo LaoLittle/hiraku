@@ -6,7 +6,7 @@ struct Layer {
     rect: vec4<f32>, bounds: vec4<f32>, tint: vec4<f32>, modes: vec4<f32>, flip: vec4<f32>,
 };
 
-struct Sprite { clip_bounds: vec4<f32>, clip_axes: vec4<f32>, tint: vec4<f32>, backface_tint: vec4<f32>, dissolve: vec4<f32>, count: vec4<u32>, layers: array<Layer, 32>, };
+struct Sprite { clip_bounds: vec4<f32>, clip_axes: vec4<f32>, tint: vec4<f32>, backface_tint: vec4<f32>, dissolve: vec4<f32>, blur: vec4<f32>, count: vec4<u32>, layers: array<Layer, 32>, };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> sprite: Sprite;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var atlas: texture_2d<f32>;
@@ -23,11 +23,7 @@ fn compose(dst: vec4<f32>, src: vec4<f32>, multiply: bool) -> vec4<f32> {
     return vec4<f32>(src.rgb + dst.rgb * (1.0 - src.a), alpha);
 }
 
-@fragment
-fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let delta = mesh.world_position.xy - sprite.clip_bounds.xy;
-    let local = vec2<f32>(dot(delta, sprite.clip_axes.xy), dot(delta, vec2<f32>(-sprite.clip_axes.y, sprite.clip_axes.x)));
-    let outside = sprite.clip_axes.z > 0.0 && any(abs(local) > sprite.clip_bounds.zw);
+fn composed_color(composed_uv: vec2<f32>) -> vec4<f32> {
     let dimensions = vec2<f32>(textureDimensions(atlas));
     var masks: array<f32, 8>;
     var result = vec4<f32>(0.0);
@@ -41,7 +37,7 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
         if replacing { result = previous_base; masks = previous_masks; }
         previous_base = result;
         previous_masks = masks;
-        var uv = (mesh.uv - layer.bounds.xy) / layer.bounds.zw;
+        var uv = (composed_uv - layer.bounds.xy) / layer.bounds.zw;
         let inside = all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
         uv = select(uv, vec2<f32>(1.0) - uv, layer.flip.xy > vec2<f32>(0.0));
         let origin = select(layer.rect.xy, vec2<f32>(0.0), layer.rect.z <= 0.0);
@@ -69,6 +65,31 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
                 masks[m] = mix(outgoing_masks[m], masks[m], layer.flip.z);
             }
         }
+    }
+    return result;
+}
+
+@fragment
+fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let delta = mesh.world_position.xy - sprite.clip_bounds.xy;
+    let local = vec2<f32>(dot(delta, sprite.clip_axes.xy), dot(delta, vec2<f32>(-sprite.clip_axes.y, sprite.clip_axes.x)));
+    let outside = sprite.clip_axes.z > 0.0 && any(abs(local) > sprite.clip_bounds.zw);
+    var result = vec4<f32>(0.0);
+    if sprite.blur.x > 0.0 {
+        // Normalized binomial Gaussian over PREMULTIPLIED composed RGBA. Mask
+        // coverage is evaluated at each sample, not blurred in the source atlas.
+        let weights = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
+        let natural_size = select(vec2<f32>(textureDimensions(atlas)), sprite.layers[0].rect.zw, sprite.layers[0].rect.z > 0.0);
+        let quad_size = select(natural_size, sprite.blur.yz, all(sprite.blur.yz > vec2<f32>(0.0)));
+        let step_uv = vec2<f32>(sprite.blur.x) / max(quad_size, vec2<f32>(1.0));
+        for (var y = 0u; y < 5u; y += 1u) {
+            for (var x = 0u; x < 5u; x += 1u) {
+                let offset = vec2<f32>(f32(x) - 2.0, f32(y) - 2.0) * step_uv;
+                result += composed_color(mesh.uv + offset) * (weights[x] * weights[y] / 256.0);
+            }
+        }
+    } else {
+        result = composed_color(mesh.uv);
     }
     // Apply group opacity only after internal overlaps have been resolved.
     let tint = sprite.tint * select(sprite.backface_tint, vec4<f32>(1.0), front);

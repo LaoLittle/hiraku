@@ -438,13 +438,19 @@ mod api {
         rotation: f64,
         layer: f64,
     ) -> Result<SceneTransitionHandle, NativeError> {
-        if ![x, y, scale, rotation, layer]
+        if ![x, y, scale, rotation]
             .iter()
             .all(|n| n.is_finite() && n.abs() <= 100000.0)
             || scale <= 0.0
-            || !(0.0..30.0).contains(&layer)
         {
-            return Err(NativeError::message("invalid picture frame"));
+            return Err(NativeError::message(format!(
+                "invalid picture frame: position ({x}, {y}), scale {scale}, rotation {rotation}; these values must be finite, within +/-100000, and scale must be positive"
+            )));
+        }
+        if !(layer as f32).is_finite() {
+            return Err(NativeError::message(format!(
+                "picture frame layer must be representable as a finite f32, got {layer}"
+            )));
         }
         let Some((
             SceneVisualTarget::Picture(PictureCommand::Show {
@@ -474,9 +480,9 @@ mod api {
         handle: SceneTransitionHandle,
         value: f64,
     ) -> Result<SceneTransitionHandle, NativeError> {
-        if !value.is_finite() || !(0.0..30.0).contains(&value) {
+        if !(value as f32).is_finite() {
             return Err(NativeError::message(
-                "picture layer must be finite and in [0, 30)",
+                "picture layer must be representable as a finite f32",
             ));
         }
         let Some((SceneVisualTarget::Picture(PictureCommand::Show { layer, .. }), _)) =
@@ -2181,6 +2187,35 @@ mod tests {
                 matches!(event(&mut runtime), StoryRuntimeEvent::TaskEffect {
                 effect: StoryEffect::Picture(PictureCommand::Tint { seconds, ease, .. }), ..
             } if seconds == 1.0 && ease == crate::script::animation::Easing::SmoothStep)
+            );
+        }
+    }
+
+    #[test]
+    fn picture_layers_have_no_authoring_range_limit() {
+        for layer in [-1000000.0, -1.5, 0.0, 29.0, 30.0, 38.0, 1000000.0] {
+            for modifier in [
+                format!(".frame(50, 50, 1, 0, {layer})"),
+                format!(".layer({layer})"),
+            ] {
+                let mut runtime = runtime(&format!(
+                    "scene.picture(\"panel\", \"alice\").screenSpace(){modifier}"
+                ));
+                assert!(matches!(event(&mut runtime),
+                StoryRuntimeEvent::Effect(StoryEffect::Picture(PictureCommand::Show {
+                    layer: actual, screen_space: true, ..
+                })) if actual == layer as f32));
+            }
+        }
+        for modifier in [".frame(50, 50, 1, 0, 1e100)", ".layer(1e100)"] {
+            let mut runtime = runtime(&format!("scene.picture(\"panel\", \"alice\"){modifier}"));
+            let error = runtime
+                .step()
+                .expect_err("out-of-range layer must be diagnosed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("layer must be representable as a finite f32")
             );
         }
     }

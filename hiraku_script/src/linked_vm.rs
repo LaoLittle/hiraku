@@ -224,6 +224,17 @@ impl LinkedVm {
         &self.program
     }
 
+    /// Symbols of the currently executing module, including a yielded host call.
+    pub fn symbols(&self) -> &crate::symbol::SymbolManifest {
+        &self
+            .frames
+            .last()
+            .expect("an active linked VM has a frame")
+            .1
+            .bytecode()
+            .symbols
+    }
+
     /// Host access policy, inherited by subsequently invoked script modules.
     pub fn set_read_only_globals(&mut self, names: std::collections::BTreeSet<String>) {
         for (_, vm) in &mut self.frames {

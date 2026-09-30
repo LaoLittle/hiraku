@@ -107,6 +107,7 @@ pub(super) fn compile_library_project(
         return Err("user source cannot replace the embedded dialogue library".into());
     }
     sources.push(super::stdlib::dialogue_source());
+    sources.push(super::stdlib::profile_source());
     let mut source_map = hiraku_script::SourceMap::new();
     let ids = sources
         .iter()

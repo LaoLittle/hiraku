@@ -138,6 +138,12 @@ pub enum UiCommand {
 
 #[derive(Debug)]
 pub enum CharacterCommand {
+    Blur {
+        actor_id: String,
+        radius: f32,
+        animation: super::AnimationSpec,
+        animation_id: Option<String>,
+    },
     StopMotion {
         actor_id: String,
     },

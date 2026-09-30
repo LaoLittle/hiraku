@@ -319,6 +319,8 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            actor_blurs_hson: hson::to_vec(&scene.actor_blurs)
+                .expect("serializable actor blur timelines"),
             post_process_hson: hson::to_vec(&scene.post_process)
                 .expect("serializable layer effects"),
             spatial_stage_hson: hson::to_vec(&scene.spatial_stage)
@@ -386,6 +388,16 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
                     stage.validate().map_err(StorageError::InvalidSave)?;
                 }
                 stage
+            },
+            actor_blurs: {
+                let blurs: BTreeMap<String, crate::script::actor_blur::ActorBlur> =
+                    hson::from_slice(&scene.actor_blurs_hson).map_err(|error| {
+                        StorageError::InvalidSave(format!("invalid actor blur state: {error}"))
+                    })?;
+                for blur in blurs.values() {
+                    blur.validate().map_err(StorageError::InvalidSave)?;
+                }
+                blurs
             },
             actor_depths: scene.actor_depths,
             clips: hson::from_slice(&scene.clips_hson).map_err(|error| {
@@ -653,6 +665,14 @@ mod tests {
     #[test]
     fn instance_catalog_identity_survives_scene_storage() {
         let mut scene = SceneSnapshot::default();
+        let mut blur = crate::script::actor_blur::ActorBlur::new(
+            0.0,
+            8.0,
+            crate::script::AnimationSpec::Linear(1.0, false),
+            Some("test-blur".into()),
+        );
+        blur.advance(0.25);
+        scene.actor_blurs.insert("alice-middle".into(), blur);
         let mut motion = crate::script::actor_motion::ActorMotion::new(
             2,
             crate::script::actor_motion::ActorOffset {
@@ -682,6 +702,14 @@ mod tests {
         );
         assert_eq!(restored.character_positions, scene.character_positions);
         assert_eq!(restored.character_rotations, scene.character_rotations);
+        let blur = restored
+            .actor_blurs
+            .get("alice-middle")
+            .expect("restored blur");
+        assert_eq!(blur.radius, 2.0);
+        assert_eq!(blur.elapsed, 0.25);
+        assert_eq!(blur.target, 8.0);
+        assert_eq!(blur.animation_id.as_deref(), Some("test-blur"));
         assert_eq!(restored.actor_motions, scene.actor_motions);
     }
 

@@ -26,6 +26,7 @@ pub struct SpriteUniform {
     tint: Vec4,
     backface_tint: Vec4,
     dissolve: Vec4,
+    blur: Vec4,
     count: UVec4,
     layers: [LayerUniform; MAX_LAYERS],
 }
@@ -124,6 +125,10 @@ impl Sprite3dMaterial {
                     )
                 }),
                 count: UVec4::new(source.len() as u32, 0, 0, 0),
+                blur: {
+                    let size = sprite.custom_size.unwrap_or(Vec2::ZERO);
+                    Vec4::new(sprite.blur, size.x, size.y, 0.0)
+                },
                 layers,
             },
         }
@@ -161,6 +166,22 @@ impl Material for Sprite3dMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blur_uses_composed_quad_coordinates_without_altering_layer_alpha() {
+        let sprite = Sprite3d {
+            blur: 6.0,
+            custom_size: Some(Vec2::new(400.0, 600.0)),
+            layers: vec![SpriteLayer {
+                color: Color::linear_rgba(1.0, 1.0, 1.0, 0.5),
+                ..default()
+            }],
+            ..default()
+        };
+        let material = Sprite3dMaterial::try_from(&sprite).expect("valid blur");
+        assert_eq!(material.uniform.blur, Vec4::new(6.0, 400.0, 600.0, 0.0));
+        assert_eq!(material.uniform.layers[0].tint.w, 0.5);
+    }
 
     #[test]
     fn screen_rule_applies_after_layer_composition() {
