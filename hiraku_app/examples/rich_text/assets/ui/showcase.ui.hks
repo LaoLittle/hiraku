@@ -10,9 +10,6 @@ global fn main() -> UiNode {
                     text('Plain text | *Bold* | _Italic_ | #strike[Deleted] | #underline[Underlined]')
                         .fontFamily("SourceSans3VF")
                         .fontSize(36)
-                    text("""
-                    #ruby("ruby")[Test]
-                    """)
                     text('*Bold _Bold+Italic_ inside* and #strike[_Italic+Deleted_].')
                         .fontFamily("SourceSans3VF")
                         .fontSize(36)
