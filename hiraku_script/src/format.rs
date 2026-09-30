@@ -92,6 +92,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_string_spelling_and_closing_column_survive_formatting() {
+        let source = "if true {\n let message = \"\"\"\n     #ruby(\"reader\")[Alice]\n       Bob\n   \"\"\"\n}\n";
+        let formatted = format_source(source, FormatOptions::default()).expect("raw formatting");
+        let literal = |source: &str| {
+            let tree = SyntaxTree::parse(source);
+            let token = tree
+                .tokens
+                .iter()
+                .find(|token| {
+                    matches!(
+                        token.kind,
+                        TokenKind::Literal {
+                            kind: crate::lex::LiteralKind::RawStr { .. },
+                            ..
+                        }
+                    )
+                })
+                .expect("raw token");
+            tree.token_text(token).to_owned()
+        };
+        assert_eq!(literal(source), literal(&formatted));
+        assert_eq!(
+            format_source(&formatted, FormatOptions::default()).expect("idempotent"),
+            formatted
+        );
+    }
+
+    #[test]
     fn single_quoted_typst_strings_preserve_original_spelling() {
         let source = "fn example() {\n  let text = '#ruby(\"reader\")[Alice]~#br Bob'\n}\n";
         let formatted =

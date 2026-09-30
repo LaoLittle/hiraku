@@ -3366,6 +3366,52 @@ mod tests {
     }
 
     #[test]
+    fn raw_strings_interpolate_or_defer_by_type_and_survive_restore() {
+        let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
+        let code = compile(
+            r####"
+            let name = "Alice"
+            global let text: String = """
+                Hello ${name}
+                  "Bob" \path\n
+                """
+            global let deferred: TextTemplate = """
+                Hello ${undefinedName}
+                #ruby("reader")[Alice]
+                """
+            checkpoint()
+            global let nested = "Nested: ${"""Bob } "Alice" \path"""}"
+        "####,
+            &manifest,
+        );
+        let mut vm = Vm::new(code.clone()).expect("VM");
+        let mut restored = false;
+        loop {
+            match vm.step().expect("raw strings execute") {
+                Some(VmEvent::Call(_)) => {
+                    vm = Vm::restore(code.clone(), vm.snapshot()).expect("restore");
+                    vm.resume(Value::Unit).expect("resume");
+                    restored = true;
+                }
+                Some(VmEvent::Completed(_)) => break,
+                _ => {}
+            }
+        }
+        assert!(restored);
+        assert_eq!(
+            vm.global("text").as_ref(),
+            Some(&Value::String("Hello Alice\n  \"Bob\" \\path\\n".into()))
+        );
+        assert_eq!(
+            vm.global("nested").as_ref(),
+            Some(&Value::String("Nested: Bob } \"Alice\" \\path".into()))
+        );
+        assert!(
+            matches!(vm.global("deferred").as_ref(), Some(Value::TextTemplate(value)) if value.source == "Hello ${undefinedName}\n#ruby(\"reader\")[Alice]")
+        );
+    }
+
+    #[test]
     fn interpolation_uses_lexical_scope_and_calls_resume_normally() {
         let manifest = BuiltinManifest::new([("checkpoint", BuiltinId(1))]);
         let code = compile(

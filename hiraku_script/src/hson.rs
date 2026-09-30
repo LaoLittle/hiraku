@@ -1106,6 +1106,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_data_strings_dedent_and_leave_interpolation_literal() {
+        let value = parse(
+            ".{ text: \"\"\"\n    #ruby(\"reader\")[Alice]\n      ${name} \\path\n    \"\"\" }",
+        )
+        .expect("raw HSON text");
+        assert_eq!(
+            value.as_map().expect("map")["text"].as_str(),
+            Some("#ruby(\"reader\")[Alice]\n  ${name} \\path")
+        );
+        let literal = parse(r####""""${not valid as script}""""####).expect("raw HSON is data");
+        assert_eq!(literal.as_str(), Some("${not valid as script}"));
+    }
+
+    #[test]
     fn single_quoted_data_strings_keep_double_quotes_and_literal_templates() {
         let value = parse(
             r#".{ name: 'Alice says "Hello"', template: '${name}', path: 'audio/bob.opus' }"#,

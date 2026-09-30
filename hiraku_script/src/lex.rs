@@ -156,20 +156,32 @@ pub enum DocStyle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LiteralKind {
     /// "12_u8", "0o100", "0b120i99", "1f32".
-    Int { base: Base, empty_int: bool },
+    Int {
+        base: Base,
+        empty_int: bool,
+    },
     /// "12.34f32", "1e3", but not "1f32".
-    Float { base: Base, empty_exponent: bool },
+    Float {
+        base: Base,
+        empty_exponent: bool,
+    },
     /// "'a'", "'\\'", "'''", "';"
-    Char { terminated: bool },
+    Char {
+        terminated: bool,
+    },
     /// "b'a'", "b'\\'", "b'''", "b';"
-    Byte { terminated: bool },
+    Byte {
+        terminated: bool,
+    },
     /// ""abc"", ""abc"
-    Str { terminated: bool },
+    Str {
+        terminated: bool,
+    },
     // "b"abc"", "b"abc"
     //ByteStr { terminated: bool },
-    /// "r"abc"", "r#"abc"#", "r####"ab"###"c"####", "r#"a". `None` indicates
-    /// an invalid literal.
-    RawStr,
+    RawStr {
+        terminated: bool,
+    },
     // "br"abc"", "br#"abc"#", "br####"ab"###"c"####", "br#"a". `None`
     // indicates an invalid literal.
     // RawByteStr { n_hashes: Option<u8> },
@@ -228,14 +240,19 @@ pub fn strip_shebang(input: &str) -> Option<usize> {
     None
 }
 
-/// Validates a raw string literal. Used for getting more information about a
-/// problem with a `RawStr`/`RawByteStr` with a `None` field.
 #[inline]
 pub fn validate_raw_str(input: &str) -> Result<(), RawStrError> {
-    debug_assert!(!input.is_empty());
     let mut cursor = Cursor::new(input);
-
-    cursor.raw_double_quoted_string()
+    if cursor.bump() != Some('"') || cursor.first() != '"' || cursor.second() != '"' {
+        return Err(RawStrError::InvalidStarter {
+            bad_char: input.chars().next().unwrap_or(EOF_CHAR),
+        });
+    }
+    if cursor.raw_double_quoted_string(true) {
+        Ok(())
+    } else {
+        Err(RawStrError::NoTerminator)
+    }
 }
 
 /// Creates an iterator that produces tokens from the input string.
@@ -338,23 +355,6 @@ impl Cursor<'_> {
             c if is_whitespace(c) => self.whitespace(),
 
             /*
-            // Raw identifier, raw string literal or identifier.
-            'r' => match (self.first(), self.second()) {
-                ('#', _) | ('"', _) => {
-                    let res = self.raw_double_quoted_string(1);
-                    let suffix_start = self.pos_within_token();
-                    if res.is_ok() {
-                        self.eat_literal_suffix();
-                    }
-                    let kind = RawStr { n_hashes: res.ok() };
-                    Literal { kind, suffix_start }
-                }
-                _ => self.ident_or_unknown_prefix(),
-            },
-
-             */
-
-            /*
             // Byte literal, byte string literal, raw byte string literal or identifier.
             'b' => match (self.first(), self.second()) {
                 ('\'', _) => {
@@ -450,12 +450,12 @@ impl Cursor<'_> {
             // String literal.
             '"' => match (self.first(), self.second()) {
                 ('"', '"') => {
-                    let res = self.raw_double_quoted_string();
+                    let terminated = self.raw_double_quoted_string(template_expressions);
                     let suffix_start = self.pos_within_token();
-                    if res.is_ok() {
+                    if terminated {
                         self.eat_literal_suffix();
                     }
-                    let kind = RawStr;
+                    let kind = RawStr { terminated };
                     Literal { kind, suffix_start }
                 }
                 _ => {
@@ -660,7 +660,11 @@ impl Cursor<'_> {
     /// Eats double-quoted string and returns true
     /// if string is terminated.
     fn double_quoted_string(&mut self, template_expressions: bool) -> bool {
-        self.quoted_string('"', template_expressions)
+        if self.first() == '"' && self.second() == '"' {
+            self.raw_double_quoted_string(template_expressions)
+        } else {
+            self.quoted_string('"', template_expressions)
+        }
     }
 
     fn quoted_string(&mut self, delimiter: char, template_expressions: bool) -> bool {
@@ -709,54 +713,25 @@ impl Cursor<'_> {
         false
     }
 
-    /// Eats the double-quoted string and returns `n_hashes` and an error if encountered.
-    fn raw_double_quoted_string(&mut self) -> Result<(), RawStrError> {
-        self.raw_string_unvalidated()
-    }
-
-    fn raw_string_unvalidated(&mut self) -> Result<(), RawStrError> {
+    fn raw_double_quoted_string(&mut self, template_expressions: bool) -> bool {
         debug_assert!(self.prev() == '"' && self.first() == '"' && self.second() == '"');
-
-        // Eat opening '"' symbols.
-        for _ in 0..2 {
-            let c = self.bump();
-            let Some('"') = c else {
-                return Err(RawStrError::InvalidStarter {
-                    bad_char: c.unwrap_or(EOF_CHAR),
-                });
-            };
-        }
-
-        /*// Check that string is started.
-        match self.bump() {
-            Some('"') => (),
-            c => {
-                let c = c.unwrap_or(EOF_CHAR);
-                return Err(RawStrError::InvalidStarter { bad_char: c });
+        self.bump();
+        self.bump();
+        while !self.is_eof() {
+            if self.first() == '"' && self.second() == '"' && self.third() == '"' {
+                self.bump();
+                self.bump();
+                self.bump();
+                return true;
             }
-        }*/
-
-        // Skip the string contents and on each '"""' character met, check if this is
-        // a raw string termination.
-
-        loop {
-            if let (Some('"'), '"', '"') = (self.bump(), self.first(), self.second()) {
-                if self.third() == '"' {
-                    continue;
+            if self.bump() == Some('$') && template_expressions && self.first() == '{' {
+                self.bump();
+                if !self.template_expression() {
+                    return false;
                 }
-
-                break;
-            }
-
-            if self.is_eof() {
-                return Err(RawStrError::NoTerminator);
             }
         }
-
-        self.bump();
-        self.bump();
-
-        return Ok(());
+        false
     }
 
     fn eat_decimal_digits(&mut self) -> bool {

@@ -72,27 +72,22 @@ pub fn eval_template(
 }
 
 pub(crate) fn expression_end(source: &str) -> Option<usize> {
+    use crate::lex::{LiteralKind, TokenKind};
     let mut braces = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in source.char_indices() {
-        if let Some(delimiter) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '{' => braces += 1,
-            '}' if braces == 0 => return Some(index),
-            '}' => braces -= 1,
+    let mut offset = 0;
+    for token in crate::lex::tokenize(source) {
+        match token.kind {
+            TokenKind::OpenBrace => braces += 1,
+            TokenKind::CloseBrace if braces == 0 => return Some(offset),
+            TokenKind::CloseBrace => braces -= 1,
+            TokenKind::Literal {
+                kind:
+                    LiteralKind::Str { terminated: false } | LiteralKind::RawStr { terminated: false },
+                ..
+            } => return None,
             _ => {}
         }
+        offset += token.len as usize;
     }
     None
 }

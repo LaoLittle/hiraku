@@ -297,6 +297,39 @@ impl<'a> TokenAdapter<'a> {
                     }
                 },
                 RawToken::Literal {
+                    kind: LiteralKind::RawStr { terminated: true },
+                    suffix_start,
+                } => {
+                    if suffix_start as usize != lexeme.len() {
+                        errors.push(ParseError {
+                            message: "raw string literal suffixes are not supported".into(),
+                            span: Span {
+                                start: span.start + suffix_start as usize,
+                                end: span.end,
+                            },
+                        });
+                        continue;
+                    }
+                    match decode_raw_string(self.source, span) {
+                        Ok(value) => TokenKind::String(value),
+                        Err(error) => {
+                            errors.push(error);
+                            continue;
+                        }
+                    }
+                }
+                RawToken::Literal {
+                    kind: LiteralKind::RawStr { terminated: false },
+                    ..
+                } => {
+                    errors.push(ParseError {
+                        message: "unterminated raw string literal; expected closing `\"\"\"`"
+                            .into(),
+                        span,
+                    });
+                    continue;
+                }
+                RawToken::Literal {
                     kind: LiteralKind::Str { terminated: true },
                     ..
                 } => match lexeme.chars().next().and_then(|delimiter| {
@@ -359,6 +392,94 @@ impl<'a> TokenAdapter<'a> {
     }
 }
 
+fn decode_raw_string(source: &str, span: Span) -> Result<String, ParseError> {
+    let inner = &source[span.start + 3..span.end - 3];
+    if !inner.contains('\n') {
+        return Ok(inner.to_owned());
+    }
+    let closing = span.end - 3;
+    let line_start = source[..closing].rfind('\n').map_or(0, |index| index + 1);
+    let indent = &source[line_start..closing];
+    if !indent
+        .chars()
+        .all(|character| matches!(character, ' ' | '\t'))
+    {
+        return Err(ParseError {
+            message: "a multiline raw string's closing `\"\"\"` must be on its own line, indented with spaces or tabs".into(),
+            span: Span { start: closing, end: closing + 3 },
+        });
+    }
+    let base = indent.chars().fold(0, |column, character| {
+        if character == '\t' {
+            column + 4 - column % 4
+        } else {
+            column + 1
+        }
+    });
+    let mut body = &source[span.start + 3..line_start];
+    let mut body_start = span.start + 3;
+    let opening_newline = body.starts_with('\n') || body.starts_with("\r\n");
+    if let Some(trimmed) = body.strip_prefix("\r\n") {
+        body_start += 2;
+        body = trimmed;
+    } else if let Some(trimmed) = body.strip_prefix('\n') {
+        body_start += 1;
+        body = trimmed;
+    }
+    body = body
+        .strip_suffix("\r\n")
+        .or_else(|| body.strip_suffix('\n'))
+        .unwrap_or(body);
+    let mut output = String::with_capacity(body.len());
+    let mut offset = body_start;
+    for (index, line) in body.split_inclusive('\n').enumerate() {
+        let newline = line.ends_with('\n');
+        let content = if newline {
+            line.trim_end_matches('\n')
+                .strip_suffix('\r')
+                .unwrap_or(line.trim_end_matches('\n'))
+        } else {
+            line
+        };
+        if index == 0 && !opening_newline {
+            output.push_str(content);
+        } else if !content
+            .chars()
+            .all(|character| matches!(character, ' ' | '\t'))
+        {
+            let mut column = 0;
+            let mut bytes = 0;
+            for character in content.chars() {
+                if column >= base || !matches!(character, ' ' | '\t') {
+                    break;
+                }
+                column += if character == '\t' { 4 - column % 4 } else { 1 };
+                bytes += character.len_utf8();
+            }
+            if column < base {
+                let start = offset + bytes;
+                return Err(ParseError {
+                    message: format!(
+                        "raw string line is indented {column} columns, but closing `\"\"\"` defines a base indent of {base} columns (column {}); indent this line or move the closing delimiter left",
+                        base + 1
+                    ),
+                    span: Span {
+                        start,
+                        end: start + content[bytes..].chars().next().map_or(0, char::len_utf8),
+                    },
+                });
+            }
+            output.extend(std::iter::repeat_n(' ', column - base));
+            output.push_str(&content[bytes..]);
+        }
+        if newline {
+            output.push('\n');
+        }
+        offset += line.len();
+    }
+    Ok(output)
+}
+
 fn unescape_string(
     source: &str,
     template_expressions: bool,
@@ -408,34 +529,7 @@ fn unescape_string_segment(
 }
 
 fn template_expression_end(source: &str, start: usize) -> Option<usize> {
-    let mut braces = 1usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (relative, character) in source[start..].char_indices() {
-        let index = start + relative;
-        if let Some(delimiter) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '{' => braces += 1,
-            '}' => {
-                braces -= 1;
-                if braces == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    crate::template::expression_end(&source[start..]).map(|end| start + end)
 }
 
 struct Parser {
@@ -2233,6 +2327,114 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    fn raw_string_value(source: &str) -> String {
+        let program = super::parse_program(source).expect("raw string parses");
+        let [
+            super::Stmt::Expr(super::Expr {
+                kind: super::ExprKind::String(value),
+                ..
+            }),
+        ] = program.statements.as_slice()
+        else {
+            panic!("expected one string")
+        };
+        value.clone()
+    }
+
+    #[test]
+    fn raw_strings_preserve_quotes_and_backslashes() {
+        assert!(crate::lex::validate_raw_str("\"\"\"\"\"\"").is_ok());
+        assert_eq!(
+            crate::lex::validate_raw_str("\"\"\"Alice"),
+            Err(crate::lex::RawStrError::NoTerminator)
+        );
+        assert!(crate::lex::validate_raw_str("").is_err());
+        assert_eq!(
+            raw_string_value(concat!("\"\"\"", r#"Alice's "Bob" \n\q\u{1234}"#, "\"\"\"")),
+            r#"Alice's "Bob" \n\q\u{1234}"#
+        );
+        assert_eq!(raw_string_value("\"\"\"\"\"\""), "");
+        assert_eq!(
+            raw_string_value("\"\"\"\n    #ruby(\"reader\")[Alice]~\n    \"\"\""),
+            "#ruby(\"reader\")[Alice]~"
+        );
+    }
+
+    #[test]
+    fn raw_strings_use_the_closing_delimiter_not_the_shortest_line() {
+        assert_eq!(
+            raw_string_value("\"\"\"\n      Alice\n        Bob\n    \"\"\""),
+            "  Alice\n    Bob"
+        );
+        assert_eq!(
+            raw_string_value("\"\"\"\n    Alice\n \n      Bob\n\n    \"\"\""),
+            "Alice\n\n  Bob\n"
+        );
+        assert_eq!(
+            raw_string_value("\"\"\"inline\n    Bob\n    \"\"\""),
+            "inline\nBob"
+        );
+        assert_eq!(raw_string_value("\"\"\"\n  Alice\n\"\"\""), "  Alice");
+        assert_eq!(raw_string_value("\"\"\"\n    \"\"\""), "");
+    }
+
+    #[test]
+    fn raw_strings_normalize_crlf_and_use_four_column_tab_stops() {
+        assert_eq!(
+            raw_string_value("\"\"\"\r\n    Alice 🌸\r\n      Bob\r\n    \"\"\""),
+            "Alice 🌸\n  Bob"
+        );
+        assert_eq!(
+            raw_string_value("\"\"\"\n\tAlice\n\t\tBob\n\t\"\"\""),
+            "Alice\n\tBob"
+        );
+        assert_eq!(raw_string_value("\"\"\"\n\tAlice\n  \"\"\""), "  Alice");
+    }
+
+    #[test]
+    fn raw_string_errors_have_precise_unicode_safe_spans() {
+        let source = "\"\"\"\n  🌸Alice\n    \"\"\"";
+        let errors = super::parse_program(source).expect_err("insufficient indentation");
+        assert!(errors[0].message.contains("base indent of 4 columns"));
+        assert_eq!(&source[errors[0].span.range()], "🌸");
+        assert!(
+            super::parse_program("\"\"\"Alice\nBob\"\"\"").expect_err("closing line")[0]
+                .message
+                .contains("on its own line")
+        );
+        assert!(
+            super::parse_program("\"\"\"Alice").expect_err("unclosed")[0]
+                .message
+                .contains("unterminated raw string")
+        );
+        assert!(
+            super::parse_program("\"\"\"Alice\"\"\"suffix").expect_err("no suffix")[0]
+                .message
+                .contains("suffixes")
+        );
+        for end in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(source.len()))
+        {
+            let _ = super::parse_program(&source[..end]);
+        }
+    }
+
+    #[test]
+    fn raw_strings_can_nest_inside_interpolation() {
+        let source = r####""Value: ${"""Alice } "Bob" \path"""}""####;
+        assert_eq!(
+            raw_string_value(source),
+            r####"Value: ${"""Alice } "Bob" \path"""}"####
+        );
+        let source = r####""""${"""Alice } "Bob" \path"""}""""####;
+        assert_eq!(
+            raw_string_value(source),
+            r####"${"""Alice } "Bob" \path"""}"####
+        );
+    }
+
     #[test]
     fn both_quote_delimiters_are_strings_with_matching_escapes() {
         use super::*;
