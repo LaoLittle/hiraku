@@ -24,7 +24,6 @@ pub mod stage;
 mod state;
 mod storage;
 pub use storage::{PreferenceChange, UserSettings};
-mod rich_text;
 mod texture;
 mod ui;
 mod vfs;

@@ -434,8 +434,18 @@ impl Cursor<'_> {
             '^' => Caret,
             '%' => Percent,
 
-            // Lifetime or character literal.
-            '\'' => self.lifetime_or_char(),
+            // Both delimiters denote strings, not Rust character literals.
+            '\'' => {
+                let terminated = self.quoted_string('\'', template_expressions);
+                let suffix_start = self.pos_within_token();
+                if terminated {
+                    self.eat_literal_suffix();
+                }
+                Literal {
+                    kind: Str { terminated },
+                    suffix_start,
+                }
+            }
 
             // String literal.
             '"' => match (self.first(), self.second()) {
@@ -647,69 +657,20 @@ impl Cursor<'_> {
         }
     }
 
-    fn lifetime_or_char(&mut self) -> TokenKind {
-        debug_assert!(self.prev() == '\'');
-
-        let terminated = self.single_quoted_string();
-        let suffix_start = self.pos_within_token();
-        if terminated {
-            self.eat_literal_suffix();
-        }
-        let kind = Char { terminated };
-        return Literal { kind, suffix_start };
-    }
-
-    fn single_quoted_string(&mut self) -> bool {
-        debug_assert!(self.prev() == '\'');
-        // Check if it's a one-symbol literal.
-        if self.second() == '\'' && self.first() != '\\' {
-            self.bump();
-            self.bump();
-            return true;
-        }
-
-        // Literal has more than one symbol.
-
-        // Parse until either quotes are terminated or error is detected.
-        loop {
-            match self.first() {
-                // Quotes are terminated, finish parsing.
-                '\'' => {
-                    self.bump();
-                    return true;
-                }
-                // Probably beginning of the comment, which we don't want to include
-                // to the error report.
-                '/' => break,
-                // Newline without following '\'' means unclosed quote, stop parsing.
-                '\n' if self.second() != '\'' => break,
-                // End of file, stop parsing.
-                EOF_CHAR if self.is_eof() => break,
-                // Escaped slash is considered one character, so bump twice.
-                '\\' => {
-                    self.bump();
-                    self.bump();
-                }
-                // Skip the character.
-                _ => {
-                    self.bump();
-                }
-            }
-        }
-        // String was not terminated.
-        false
-    }
-
     /// Eats double-quoted string and returns true
     /// if string is terminated.
     fn double_quoted_string(&mut self, template_expressions: bool) -> bool {
-        debug_assert!(self.prev() == '"');
+        self.quoted_string('"', template_expressions)
+    }
+
+    fn quoted_string(&mut self, delimiter: char, template_expressions: bool) -> bool {
+        debug_assert!(self.prev() == delimiter);
         while let Some(c) = self.bump() {
             match c {
-                '"' => {
+                c if c == delimiter => {
                     return true;
                 }
-                '\\' if self.first() == '\\' || self.first() == '"' => {
+                '\\' => {
                     // Bump again to skip escaped character.
                     self.bump();
                 }
@@ -734,7 +695,7 @@ impl Cursor<'_> {
         while let Some(c) = self.bump() {
             match c {
                 '"' if !self.double_quoted_string(true) => return false,
-                '\'' if !self.single_quoted_string() => return false,
+                '\'' if !self.quoted_string('\'', true) => return false,
                 '{' => braces += 1,
                 '}' => {
                     braces -= 1;

@@ -86,7 +86,12 @@ where
             let res = unescape_char_or_byte(&mut chars, mode == Mode::Byte);
             callback(0..(src.len() - chars.as_str().len()), res);
         }
-        Mode::Str | Mode::ByteStr => unescape_str_or_byte_str(src, mode == Mode::ByteStr, callback),
+        Mode::Str | Mode::SingleStr | Mode::ByteStr => unescape_str_or_byte_str(
+            src,
+            mode == Mode::ByteStr,
+            mode == Mode::SingleStr,
+            callback,
+        ),
         Mode::RawStr | Mode::RawByteStr => {
             unescape_raw_str_or_raw_byte_str(src, mode == Mode::RawByteStr, callback)
         }
@@ -110,6 +115,7 @@ pub fn unescape_byte(src: &str) -> Result<u8, EscapeError> {
 pub enum Mode {
     Char,
     Str,
+    SingleStr,
     Byte,
     ByteStr,
     RawStr,
@@ -120,14 +126,14 @@ impl Mode {
     pub fn in_double_quotes(self) -> bool {
         match self {
             Mode::Str | Mode::ByteStr | Mode::RawStr | Mode::RawByteStr => true,
-            Mode::Char | Mode::Byte => false,
+            Mode::Char | Mode::Byte | Mode::SingleStr => false,
         }
     }
 
     pub fn is_byte(self) -> bool {
         match self {
             Mode::Byte | Mode::ByteStr | Mode::RawByteStr => true,
-            Mode::Char | Mode::Str | Mode::RawStr => false,
+            Mode::Char | Mode::Str | Mode::SingleStr | Mode::RawStr => false,
         }
     }
 }
@@ -250,7 +256,7 @@ fn unescape_char_or_byte(chars: &mut Chars<'_>, is_byte: bool) -> Result<char, E
 
 /// Takes a contents of a string literal (without quotes) and produces a
 /// sequence of escaped characters or errors.
-fn unescape_str_or_byte_str<F>(src: &str, is_byte: bool, callback: &mut F)
+fn unescape_str_or_byte_str<F>(src: &str, is_byte: bool, single_quotes: bool, callback: &mut F)
 where
     F: FnMut(Range<usize>, Result<char, EscapeError>),
 {
@@ -277,7 +283,8 @@ where
             }
             '\n' => Ok('\n'),
             '\t' => Ok('\t'),
-            '"' => Err(EscapeError::EscapeOnlyChar),
+            '"' if !single_quotes => Err(EscapeError::EscapeOnlyChar),
+            '\'' if single_quotes => Err(EscapeError::EscapeOnlyChar),
             '\r' => Err(EscapeError::BareCarriageReturn),
             _ => ascii_check(c, is_byte),
         };

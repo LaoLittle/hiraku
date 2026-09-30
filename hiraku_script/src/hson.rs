@@ -1105,6 +1105,18 @@ impl<'de> VariantAccess<'de> for HsonVariantAccess {
 mod tests {
     use super::*;
 
+    #[test]
+    fn single_quoted_data_strings_keep_double_quotes_and_literal_templates() {
+        let value = parse(
+            r#".{ name: 'Alice says "Hello"', template: '${name}', path: 'audio/bob.opus' }"#,
+        )
+        .expect("single quoted data");
+        let map = value.as_map().expect("map");
+        assert_eq!(map["name"].as_str(), Some("Alice says \"Hello\""));
+        assert_eq!(map["template"].as_str(), Some("${name}"));
+        assert_eq!(map["path"].as_str(), Some("audio/bob.opus"));
+    }
+
     #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
     struct Document {
         name: String,

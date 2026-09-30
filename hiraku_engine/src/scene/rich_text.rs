@@ -1,18 +1,29 @@
 //! Ruby uses ordinary Bevy text spans and glyph layout, not a second camera.
-use crate::{
-    rich_text::{RichText, Ruby},
-    ui::{PropertyComputation, UiModels},
-};
+use crate::ui::{PropertyComputation, UiModels};
+use hiraku_text::{Document as RichText, Ruby};
 
 fn span_color(document: &RichText, index: u32, fallback: TextColor) -> TextColor {
     document
-        .colors
+        .styles
         .get(index as usize)
         .copied()
-        .flatten()
+        .and_then(|style| style.color)
         .map_or(fallback, |[r, g, b, a]| {
             TextColor(Color::srgba_u8(r, g, b, a))
         })
+}
+
+fn span_font(document: &RichText, index: usize, font: &TextFont) -> TextFont {
+    let mut font = font.clone();
+    if let Some(style) = document.styles.get(index) {
+        if style.bold {
+            font.weight = bevy::text::FontWeight::BOLD;
+        }
+        if style.italic {
+            font.style = bevy::text::FontStyle::Italic;
+        }
+    }
+    font
 }
 use bevy::prelude::*;
 
@@ -55,6 +66,7 @@ pub(crate) struct RubyLabel {
 #[derive(Component, Default)]
 pub(crate) struct RichGlyphs {
     glyphs: Vec<bevy::text::PositionedGlyph>,
+    decorations: Vec<bevy::text::RunGeometry>,
     scale: f32,
     shown: Option<u32>,
 }
@@ -74,6 +86,7 @@ pub(crate) fn reveal_glyphs(
         let shaped = layout.is_changed();
         if shaped {
             cache.glyphs.clone_from(&layout.glyphs);
+            cache.decorations.clone_from(&layout.run_geometry);
             cache.scale = layout.scale_factor;
         }
         if shaped || cache.shown != Some(rich.previous_count) {
@@ -81,6 +94,12 @@ pub(crate) fn reveal_glyphs(
                 .glyphs
                 .iter()
                 .filter(|glyph| glyph.section_index <= rich.previous_count)
+                .cloned()
+                .collect();
+            layout.run_geometry = cache
+                .decorations
+                .iter()
+                .filter(|run| run.section_index <= rich.previous_count)
                 .cloned()
                 .collect();
             cache.shown = Some(rich.previous_count);
@@ -134,21 +153,17 @@ pub(crate) fn update(
             rich.expression = Some(expression);
         }
         if rich.rendered.as_ref() != Some(&rich.source) {
-            let document = match crate::rich_text::parse(&rich.source) {
+            let document = match hiraku_text::parse(&rich.source) {
                 Ok(value) => value,
                 Err(error) => {
-                    crate::script::emit_script_diagnostic("invalid rich text", &error);
+                    crate::script::emit_script_diagnostic("invalid rich text", &error.to_string());
                     // Keep malformed text readable, never panic in a UI system.
-                    RichText {
-                        text: rich.source.clone(),
-                        ruby: Vec::new(),
-                        colors: vec![None; rich.source.chars().count()],
-                    }
+                    RichText::plain(rich.source.clone())
                 }
             };
             let append = document.text.starts_with(&rich.document.text)
                 && document.ruby.starts_with(&rich.document.ruby)
-                && document.colors.starts_with(&rich.document.colors);
+                && document.styles.starts_with(&rich.document.styles);
             if !append {
                 for child in std::mem::take(&mut rich.spans)
                     .into_iter()
@@ -179,12 +194,19 @@ pub(crate) fn update(
                 let span = commands
                     .spawn((
                         TextSpan::new(text),
-                        (*font).clone(),
+                        span_font(&document, index as usize, &font),
                         span_color(&document, index, *color),
                         bevy::text::LineHeight::RelativeToFont(if annotated { 1.8 } else { 1.2 }),
                     ))
                     .id();
                 commands.entity(entity).add_child(span);
+                let style = document.styles[index as usize];
+                if style.strike {
+                    commands.entity(span).insert(bevy::text::Strikethrough);
+                }
+                if style.underline {
+                    commands.entity(span).insert(bevy::text::Underline);
+                }
                 rich.spans.push(span);
             }
             for range in document.ruby.iter().skip(rich.labels.len()) {
@@ -226,7 +248,7 @@ pub(crate) fn update(
         {
             for (index, &span) in rich.spans.iter().enumerate() {
                 commands.entity(span).insert((
-                    (*font).clone(),
+                    span_font(&rich.document, index, &font),
                     span_color(&rich.document, index as u32, *color),
                 ));
             }
@@ -313,6 +335,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn typst_styles_and_linebreaks_reach_bevy_spans() {
+        let mut app = App::new();
+        app.init_resource::<UiModels>().add_systems(Update, update);
+        let root = app
+            .world_mut()
+            .spawn((
+                RichTextSource::new(
+                    "*Alice*#br#strike[Bob]~".into(),
+                    &crate::ui::ScreenLayout::default(),
+                ),
+                TextFont::default(),
+                TextColor::WHITE,
+            ))
+            .id();
+        app.update();
+        let spans = app
+            .world()
+            .get::<RichTextSource>(root)
+            .expect("source")
+            .spans
+            .clone();
+        assert_eq!(spans.len(), 10);
+        assert_eq!(
+            app.world().get::<TextFont>(spans[0]).expect("font").weight,
+            bevy::text::FontWeight::BOLD
+        );
+        assert_eq!(
+            app.world().get::<TextSpan>(spans[5]).expect("linebreak").0,
+            "\n"
+        );
+        assert!(
+            app.world()
+                .get::<bevy::text::Strikethrough>(spans[6])
+                .is_some()
+        );
+        assert_eq!(app.world().get::<TextSpan>(spans[9]).expect("tilde").0, "~");
+        app.world_mut()
+            .get_mut::<TextFont>(root)
+            .expect("root font")
+            .font_size = bevy::text::FontSize::Px(40.0);
+        app.update();
+        assert_eq!(
+            app.world().get::<TextFont>(spans[0]).expect("font").weight,
+            bevy::text::FontWeight::BOLD
+        );
+    }
+
+    #[test]
     fn append_keeps_existing_entities_and_style_changes_reach_children() {
         let mut app = App::new();
         app.init_resource::<UiModels>().add_systems(Update, update);
@@ -320,7 +390,7 @@ mod tests {
             .world_mut()
             .spawn((
                 RichTextSource::new(
-                    "{ruby:reader}Alice{/ruby}".into(),
+                    "#ruby(\"reader\")[Alice]".into(),
                     &crate::ui::ScreenLayout::default(),
                 ),
                 TextFont::default(),
@@ -370,7 +440,7 @@ mod tests {
         app.world_mut()
             .get_mut::<RichTextSource>(root)
             .expect("rich source")
-            .source = "{color:#ff0000}Bob{/color}".into();
+            .source = "#color(\"#ff0000\")[Bob]".into();
         app.update();
         assert!(
             spans
@@ -421,6 +491,12 @@ mod tests {
                 RichTextSource::new("Alice".into(), &crate::ui::ScreenLayout::default()),
                 bevy::text::TextLayoutInfo {
                     glyphs: (1..=5).map(glyph).collect(),
+                    run_geometry: (1..=5)
+                        .map(|section_index| bevy::text::RunGeometry {
+                            section_index,
+                            ..default()
+                        })
+                        .collect(),
                     ..default()
                 },
                 RichGlyphs::default(),
@@ -437,6 +513,14 @@ mod tests {
                     .get::<bevy::text::TextLayoutInfo>(root)
                     .expect("layout")
                     .glyphs
+                    .len(),
+                count as usize
+            );
+            assert_eq!(
+                app.world()
+                    .get::<bevy::text::TextLayoutInfo>(root)
+                    .expect("layout")
+                    .run_geometry
                     .len(),
                 count as usize
             );

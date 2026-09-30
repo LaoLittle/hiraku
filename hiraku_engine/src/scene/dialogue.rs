@@ -371,7 +371,7 @@ pub(super) fn set_dialogue_model_reveal(
     visible_prefix_chars: usize,
     animation_id: Option<String>,
 ) {
-    let total_chars = crate::rich_text::character_count(text);
+    let total_chars = hiraku_text::character_count(text);
     let visible_prefix_chars = visible_prefix_chars.min(total_chars);
     if dialogue_state.effect.mode == DialogueTextEffectMode::Instant
         || visible_prefix_chars >= total_chars

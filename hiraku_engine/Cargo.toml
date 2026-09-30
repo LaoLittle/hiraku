@@ -20,6 +20,7 @@ hiraku-hdp.workspace = true
 hiraku-errors.workspace = true
 hiraku-script.workspace = true
 hiraku-ui.workspace = true
+hiraku-text.workspace = true
 hiraku-storage.workspace = true
 hiraku-video.workspace = true
 prost.workspace = true

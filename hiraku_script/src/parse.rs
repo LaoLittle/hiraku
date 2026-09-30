@@ -299,11 +299,16 @@ impl<'a> TokenAdapter<'a> {
                 RawToken::Literal {
                     kind: LiteralKind::Str { terminated: true },
                     ..
-                } => match lexeme
-                    .strip_prefix('"')
-                    .and_then(|value| value.strip_suffix('"'))
-                {
-                    Some(inner) => match unescape_string(inner, self.template_expressions) {
+                } => match lexeme.chars().next().and_then(|delimiter| {
+                    lexeme
+                        .strip_prefix(delimiter)
+                        .and_then(|value| value.strip_suffix(delimiter))
+                }) {
+                    Some(inner) => match unescape_string(
+                        inner,
+                        self.template_expressions,
+                        lexeme.starts_with('\''),
+                    ) {
                         Ok(value) => TokenKind::String(value),
                         Err(message) => {
                             errors.push(ParseError { message, span });
@@ -354,10 +359,14 @@ impl<'a> TokenAdapter<'a> {
     }
 }
 
-fn unescape_string(source: &str, template_expressions: bool) -> Result<String, String> {
+fn unescape_string(
+    source: &str,
+    template_expressions: bool,
+    single_quotes: bool,
+) -> Result<String, String> {
     if !template_expressions {
         let mut value = String::new();
-        unescape_string_segment(source, &mut value)?;
+        unescape_string_segment(source, &mut value, single_quotes)?;
         return Ok(value);
     }
     let mut value = String::new();
@@ -365,22 +374,30 @@ fn unescape_string(source: &str, template_expressions: bool) -> Result<String, S
     let mut cursor = 0;
     while let Some(relative_start) = source[cursor..].find("${") {
         let start = cursor + relative_start;
-        unescape_string_segment(&source[literal_start..start], &mut value)?;
+        unescape_string_segment(&source[literal_start..start], &mut value, single_quotes)?;
         let end = template_expression_end(source, start + 2)
             .ok_or_else(|| "unterminated template expression".to_string())?;
         value.push_str(&source[start..=end]);
         cursor = end + 1;
         literal_start = cursor;
     }
-    unescape_string_segment(&source[literal_start..], &mut value)?;
+    unescape_string_segment(&source[literal_start..], &mut value, single_quotes)?;
     Ok(value)
 }
 
-fn unescape_string_segment(source: &str, value: &mut String) -> Result<(), String> {
+fn unescape_string_segment(
+    source: &str,
+    value: &mut String,
+    single_quotes: bool,
+) -> Result<(), String> {
     let mut error = None;
     crate::lex::unescape::unescape_literal(
         source,
-        crate::lex::unescape::Mode::Str,
+        if single_quotes {
+            crate::lex::unescape::Mode::SingleStr
+        } else {
+            crate::lex::unescape::Mode::Str
+        },
         &mut |_, character| match character {
             Ok(character) => value.push(character),
             Err(reason) if reason.is_fatal() => error = Some(format!("invalid escape: {reason:?}")),
@@ -2216,6 +2233,32 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn both_quote_delimiters_are_strings_with_matching_escapes() {
+        use super::*;
+        for (source, expected) in [
+            (
+                r#"'Alice says "Hello" / Bob'"#,
+                "Alice says \"Hello\" / Bob",
+            ),
+            (r#"'Alice\'s \\ path\nBob'"#, "Alice's \\ path\nBob"),
+            (r#""Bob's \"Hello\"""#, "Bob's \"Hello\""),
+            ("''", ""),
+            ("'漢字'", "漢字"),
+            (r#"'Hello ${name ?: "Bob"}'"#, "Hello ${name ?: \"Bob\"}"),
+            (r#""Hello ${name ?: 'Alice'}""#, "Hello ${name ?: 'Alice'}"),
+        ] {
+            let program = parse_program(source).expect("string parses");
+            assert!(
+                matches!(&program.statements[0], Stmt::Expr(Expr { kind: ExprKind::String(value), .. }) if value == expected),
+                "{source}"
+            );
+        }
+        assert!(parse_program("'unclosed").is_err());
+        assert!(parse_program(r#"'bad\q'"#).is_err());
+        assert!(parse_program("'${name'").is_err());
+    }
+
     #[test]
     fn enum_variants_require_commas() {
         for source in [

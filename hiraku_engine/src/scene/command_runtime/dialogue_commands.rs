@@ -94,7 +94,7 @@ pub(super) fn dispatch_dialogue_command(
                     .0
                     .dialogue
                     .as_ref()
-                    .map(|dialogue| crate::rich_text::character_count(&dialogue.text))
+                    .map(|dialogue| hiraku_text::character_count(&dialogue.text))
                     .unwrap_or_default();
                 if let Ok(line_root) = line_text_entity.single() {
                     append_dialogue_line_text(
@@ -110,7 +110,7 @@ pub(super) fn dispatch_dialogue_command(
                     append_dialogue_model_reveal(
                         dialogue_state,
                         previous_chars,
-                        crate::rich_text::character_count(&text),
+                        hiraku_text::character_count(&text),
                         None,
                     );
                 }

@@ -2157,7 +2157,7 @@ pub fn update_builtin_ui_models(
         .reveal
         .as_ref()
         .map(|reveal| reveal.next_index)
-        .unwrap_or_else(|| crate::rich_text::character_count(text));
+        .unwrap_or_else(|| hiraku_text::character_count(text));
     models.set(
         "dialogue",
         StoredValue::Map(BTreeMap::from([

@@ -92,6 +92,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn single_quoted_typst_strings_preserve_original_spelling() {
+        let source = "fn example() {\n  let text = '#ruby(\"reader\")[Alice]~#br Bob'\n}\n";
+        let formatted =
+            format_source(source, FormatOptions::default()).expect("format single quotes");
+        assert!(formatted.contains("'#ruby(\"reader\")[Alice]~#br Bob'"));
+        assert_eq!(
+            format_source(&formatted, FormatOptions::default()).expect("idempotent"),
+            formatted
+        );
+    }
+
+    #[test]
     fn standard_library_formatting_is_idempotent_and_keeps_tokens() {
         let source = include_str!("std/core.hks");
         let formatted = format_source(source, FormatOptions::default()).expect("format script std");

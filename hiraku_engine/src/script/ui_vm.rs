@@ -3119,7 +3119,7 @@ fn materialize_node(
                 text
             };
             if draft.layout.rich_text {
-                crate::rich_text::parse(&text).map_err(UiVmError::Invalid)?;
+                hiraku_text::parse(&text).map_err(|error| UiVmError::Invalid(error.to_string()))?;
             }
             Ok(ScreenNode::Text(TextNode {
                 binding: is_template.then(|| text.clone()),
@@ -3847,20 +3847,20 @@ canvas {
     fn rich_text_keeps_markup_and_reveal_as_separate_properties() {
         let screen = evaluate_ui_component_named_with_args(
             "memory://ruby.ui.hks",
-            "import ui.widgets.*; global var count = 1; canvas { richText(\"{ruby:reader}Alice{/ruby}\").reveal(count) }",
+            "import ui.widgets.*; global var count = 1; canvas { richText('#ruby(\"reader\")[Alice]').reveal(count) }",
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("rich text builds");
         let ScreenNode::Text(text) = &screen.children[0] else {
             panic!("expected text")
         };
-        assert_eq!(text.text, "{ruby:reader}Alice{/ruby}");
+        assert_eq!(text.text, "#ruby(\"reader\")[Alice]");
         assert!(text.layout.rich_text);
         assert_eq!(text.layout.text_reveal, Some(1));
         assert!(text.layout.reactive_text_reveal.is_some());
         assert!(
             evaluate_ui_component_named_with_args(
                 "memory://invalid.ui.hks",
-                "import ui.widgets.*; canvas { richText(\"{ruby:reader}Alice\") }",
+                "import ui.widgets.*; canvas { richText('#ruby(\"reader\")[Alice') }",
                 UiContext::default(),
                 &TextureCatalog::default(),
                 &TermCatalog::default(),
