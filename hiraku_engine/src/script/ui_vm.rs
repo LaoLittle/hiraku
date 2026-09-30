@@ -751,16 +751,6 @@ mod native_ui {
         Ok(value.chars().take(count).collect())
     }
 
-    #[hks(name = "richText")]
-    fn rich_text(
-        context: &mut UiVmContext,
-        value: HksBindable<String>,
-    ) -> Result<UiNodeHandle, NativeError> {
-        let mut draft = UiDraft::new(UiDraftKind::Text(value), None);
-        draft.layout.rich_text = true;
-        Ok(context.insert(draft))
-    }
-
     #[hks(name = "reveal", receiver)]
     fn text_reveal(
         context: &mut UiVmContext,
@@ -768,8 +758,8 @@ mod native_ui {
         count: HksBindable<i64>,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
-        if !draft.layout.rich_text {
-            return Err(NativeError::message("reveal requires richText"));
+        if !matches!(draft.kind, UiDraftKind::Text(_)) {
+            return Err(NativeError::message("reveal requires text"));
         }
         match count {
             HksBindable::Value(value) => {
@@ -935,6 +925,19 @@ mod native_ui {
         size: f64,
     ) -> Result<UiNodeHandle, NativeError> {
         context.node_mut(node)?.text_size = Some(non_negative(size, "UI font size")?);
+        Ok(node)
+    }
+
+    #[hks(name = "fontFamily", receiver)]
+    fn ui_font_family(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        family: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if family.trim().is_empty() {
+            return Err(NativeError::message("font family must not be empty"));
+        }
+        context.node_mut(node)?.layout.font_family = Some(family);
         Ok(node)
     }
 
@@ -1149,10 +1152,8 @@ mod native_ui {
         node: UiNodeHandle,
     ) -> Result<UiNodeHandle, NativeError> {
         let draft = context.node_mut(node)?;
-        if !matches!(draft.kind, UiDraftKind::Text(_)) || draft.layout.rich_text {
-            return Err(NativeError::message(
-                "fitText requires a plain text node; richText uses wrapping layout",
-            ));
+        if !matches!(draft.kind, UiDraftKind::Text(_)) {
+            return Err(NativeError::message("fitText requires text"));
         }
         draft.layout.text_fit = true;
         Ok(node)
@@ -3118,9 +3119,7 @@ fn materialize_node(
             } else {
                 text
             };
-            if draft.layout.rich_text {
-                hiraku_text::parse(&text).map_err(|error| UiVmError::Invalid(error.to_string()))?;
-            }
+            hiraku_text::parse(&text).map_err(|error| UiVmError::Invalid(error.to_string()))?;
             Ok(ScreenNode::Text(TextNode {
                 binding: is_template.then(|| text.clone()),
                 reactive_text: if is_template { None } else { reactive },
@@ -3398,13 +3397,20 @@ fn materialize_node(
                             "hovered artwork requires an image button".into(),
                         ));
                     }
-                    let (text, size, align, children, text_color, text_shadow) = match normal {
-                        ScreenNode::Text(text) => (text.text, text.size, text.align, Vec::new(), text.color, text.layout.text_shadow),
-                        content => (String::new(), 16.0, None, vec![content], None, None),
+                    let (text, size, align, children, text_color, text_shadow, font_family) = match normal {
+                        ScreenNode::Text(text) if text.reactive_text.is_some()
+                            || text.binding.is_some()
+                            || text.layout.text_reveal.is_some()
+                            || text.layout.reactive_text_reveal.is_some() => {
+                            (text.text.clone(), text.size, text.align, vec![ScreenNode::Text(text)], None, None, None)
+                        }
+                        ScreenNode::Text(text) => (text.text, text.size, text.align, Vec::new(), text.color, text.layout.text_shadow, text.layout.font_family),
+                        content => (String::new(), 16.0, None, vec![content], None, None, None),
                     };
-                    let custom_content = !children.is_empty();
+                    let custom_content = !children.is_empty() && !matches!(children.first(), Some(ScreenNode::Text(_)));
                     let mut layout = draft.layout;
                     if layout.text_shadow.is_none() { layout.text_shadow = text_shadow; }
+                    if layout.font_family.is_none() { layout.font_family = font_family; }
                     Ok(ScreenNode::Button(ButtonNode {
                         hovered_when_disabled: draft.hovered_when_disabled,
                         children,
@@ -3844,23 +3850,23 @@ canvas {
     }
 
     #[test]
-    fn rich_text_keeps_markup_and_reveal_as_separate_properties() {
+    fn text_keeps_markup_font_family_and_reveal_as_separate_properties() {
         let screen = evaluate_ui_component_named_with_args(
             "memory://ruby.ui.hks",
-            "import ui.widgets.*; global var count = 1; canvas { richText('#ruby(\"reader\")[Alice]').reveal(count) }",
+            "import ui.widgets.*; global var count = 1; canvas { text('#ruby(\"reader\")[Alice]').fontFamily(\"Example Sans\").reveal(count) }",
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("rich text builds");
         let ScreenNode::Text(text) = &screen.children[0] else {
             panic!("expected text")
         };
         assert_eq!(text.text, "#ruby(\"reader\")[Alice]");
-        assert!(text.layout.rich_text);
+        assert_eq!(text.layout.font_family.as_deref(), Some("Example Sans"));
         assert_eq!(text.layout.text_reveal, Some(1));
         assert!(text.layout.reactive_text_reveal.is_some());
         assert!(
             evaluate_ui_component_named_with_args(
                 "memory://invalid.ui.hks",
-                "import ui.widgets.*; canvas { richText('#ruby(\"reader\")[Alice') }",
+                "import ui.widgets.*; canvas { text('#ruby(\"reader\")[Alice') }",
                 UiContext::default(),
                 &TextureCatalog::default(),
                 &TermCatalog::default(),
@@ -3868,6 +3874,23 @@ canvas {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn button_retains_reactive_text_content_and_reveal() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://button.ui.hks",
+            "import ui.widgets.*; global var count = 1; canvas { button { text(count.toString()).reveal(count) } }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("button builds");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected button")
+        };
+        let ScreenNode::Text(text) = &button.children[0] else {
+            panic!("expected text child")
+        };
+        assert!(text.reactive_text.is_some());
+        assert!(text.layout.reactive_text_reveal.is_some());
     }
 
     #[test]
@@ -4382,7 +4405,7 @@ screen {
             @ui
             global fn main() -> UiNode {
                 let entry = .{ text: "Alice" }
-                canvas { richText(entry.text) }
+                canvas { text(entry.text) }
             }"#,
             UiContext::default(),
             &TextureCatalog::default(),

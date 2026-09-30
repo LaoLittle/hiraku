@@ -1,0 +1,33 @@
+import ui.widgets.*
+
+@ui
+global fn main() -> UiNode {
+    screen {
+        column {
+            text("cc").fontFamily("SourceSans3VF").fontSize(48).color(0.65, 0.84, 1.0, 1.0)
+            scrollable {
+                column {
+                    text('Plain text | *Bold* | _Italic_ | #strike[Deleted] | #underline[Underlined]')
+                        .fontFamily("SourceSans3VF")
+                        .fontSize(36)
+                    text('*Bold _Bold+Italic_ inside* and #strike[_Italic+Deleted_].')
+                        .fontFamily("SourceSans3VF")
+                        .fontSize(36)
+                    text('#ruby("ruby")[Alice] and #ruby("Bob")[Robert]')
+                        .fontFamily("SourceSans3VF")
+                        .fontSize(40)
+                    text('#color("#8bd5ff")[Blue] and #color("#f5a97f")[*Bold + Orange*].')
+                        .fontFamily("SourceSans3VF")
+                        .fontSize(36)
+                    text('Line1#br;Line2#linebreak()Line3')
+                        .fontFamily("SourceSans3VF")
+                        .fontSize(32)
+                }.gap(28).padding(12)
+            }.size(.abs(1440, 650))
+            row {
+                button("dialogue") { text("Try the dialogue printer") }
+                button("quit") { text("Exit") }
+            }.gap(24)
+        }.gap(20).padding(32)
+    }.size(.abs(1560, 980)).overlay(0.035, 0.045, 0.075, 1.0)
+}

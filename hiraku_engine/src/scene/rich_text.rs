@@ -25,6 +25,7 @@ fn span_font(document: &RichText, index: usize, font: &TextFont) -> TextFont {
     }
     font
 }
+use bevy::math::Affine2;
 use bevy::prelude::*;
 
 #[derive(Component)]
@@ -38,6 +39,7 @@ pub(crate) struct RichTextSource {
     spans: Vec<Entity>,
     labels: Vec<Entity>,
     previous_count: u32,
+    plain: bool,
 }
 
 impl RichTextSource {
@@ -52,6 +54,7 @@ impl RichTextSource {
             spans: Vec::new(),
             labels: Vec::new(),
             previous_count: 0,
+            plain: false,
         }
     }
 }
@@ -120,9 +123,10 @@ pub(crate) fn update(
         Ref<TextFont>,
         Ref<TextColor>,
         Option<Ref<TextShadow>>,
+        Option<&mut Text>,
     )>,
 ) {
-    for (entity, mut rich, font, color, shadow) in &mut roots {
+    for (entity, mut rich, font, color, shadow, mut root_text) in &mut roots {
         if let Some(mut expression) = rich.expression.take() {
             let local_changed =
                 super::screen_ui::refresh_local_binding(entity, &mut expression, &parents, &locals);
@@ -161,7 +165,16 @@ pub(crate) fn update(
                     RichText::plain(rich.source.clone())
                 }
             };
-            let append = document.text.starts_with(&rich.document.text)
+            let plain = root_text.is_some()
+                && rich.count.is_none()
+                && rich.expression.is_none()
+                && document.ruby.is_empty()
+                && document
+                    .styles
+                    .iter()
+                    .all(|style| *style == hiraku_text::TextStyle::default());
+            let append = plain == rich.plain
+                && document.text.starts_with(&rich.document.text)
                 && document.ruby.starts_with(&rich.document.ruby)
                 && document.styles.starts_with(&rich.document.styles);
             if !append {
@@ -173,7 +186,18 @@ pub(crate) fn update(
                 }
                 rich.previous_count = 0;
             }
-            let old_len = rich.spans.len();
+            if let Some(text) = root_text.as_deref_mut() {
+                if plain {
+                    text.0.clone_from(&document.text);
+                } else {
+                    text.0.clear();
+                }
+            }
+            let old_len = if plain {
+                document.styles.len()
+            } else {
+                rich.spans.len()
+            };
             for (index, ch) in document.text.chars().enumerate().skip(old_len) {
                 let index = index as u32;
                 // Word joiners keep a ruby base on one line without entering
@@ -235,10 +259,12 @@ pub(crate) fn update(
                         Pickable::IGNORE,
                     ))
                     .id();
-                commands.entity(entity).add_child(label);
+                let parent = parents.get(entity).map_or(entity, ChildOf::parent);
+                commands.entity(parent).add_child(label);
                 rich.labels.push(label);
             }
             rich.document = document;
+            rich.plain = plain;
             rich.rendered = Some(rich.source.clone());
             redraw.request();
         }
@@ -265,10 +291,9 @@ pub(crate) fn update(
             }
             redraw.request();
         }
-        let count = rich
-            .count
-            .map_or(rich.spans.len(), |n| (n as usize).min(rich.spans.len()))
-            as u32;
+        let count = rich.count.map_or(rich.document.styles.len(), |n| {
+            (n as usize).min(rich.document.styles.len())
+        }) as u32;
         if count != rich.previous_count {
             rich.previous_count = count;
             redraw.request();
@@ -280,7 +305,14 @@ pub(crate) fn update(
 /// remains hidden until its new Node position has passed through UI layout.
 pub(crate) fn position_ruby(
     mut redraw: crate::redraw::Redraw,
-    roots: Query<(&RichTextSource, &RichGlyphs)>,
+    roots: Query<(
+        &RichTextSource,
+        &RichGlyphs,
+        Option<&UiGlobalTransform>,
+        Option<&ChildOf>,
+        Option<&ComputedNode>,
+    )>,
+    transforms: Query<(&UiGlobalTransform, &ComputedNode)>,
     mut labels: Query<(
         &mut RubyLabel,
         &bevy::text::TextLayoutInfo,
@@ -289,7 +321,7 @@ pub(crate) fn position_ruby(
     )>,
 ) {
     for (mut label, reading, mut node, mut visibility) in &mut labels {
-        let Ok((rich, layout)) = roots.get(label.root) else {
+        let Ok((rich, layout, root_transform, parent, root_node)) = roots.get(label.root) else {
             continue;
         };
         let mut min = Vec2::splat(f32::INFINITY);
@@ -304,8 +336,24 @@ pub(crate) fn position_ruby(
         if !min.is_finite() || reading.size.x <= 0.0 {
             continue;
         }
-        let left = px((min.x + max.x - reading.size.x) * 0.5);
-        let top = px(min.y - reading.size.y);
+        let offset = root_transform
+            .zip(parent)
+            .and_then(|(root, parent)| {
+                transforms
+                    .get(parent.parent())
+                    .ok()
+                    .map(|(parent, parent_node)| {
+                        let relative = Affine2::from(*parent).inverse() * Affine2::from(*root);
+                        (relative.translation
+                            + (parent_node.size()
+                                - root_node.map_or(Vec2::ZERO, ComputedNode::size))
+                                * 0.5)
+                            / layout.scale
+                    })
+            })
+            .unwrap_or(Vec2::ZERO);
+        let left = px(offset.x + (min.x + max.x - reading.size.x) * 0.5);
+        let top = px(offset.y + min.y - reading.size.y);
         let moved = node.left != left || node.top != top;
         if moved {
             node.left = left;
@@ -333,6 +381,186 @@ pub(crate) fn position_ruby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_text_uses_one_text_entity_and_can_switch_to_markup() {
+        let mut app = App::new();
+        app.init_resource::<UiModels>().add_systems(Update, update);
+        let root = app
+            .world_mut()
+            .spawn((
+                Text::new(""),
+                TextFont::default(),
+                TextColor::WHITE,
+                RichTextSource::new("Alice#br;Bob".into(), &crate::ui::ScreenLayout::default()),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(root).expect("plain text").0,
+            "Alice\nBob"
+        );
+        assert!(
+            app.world()
+                .get::<RichTextSource>(root)
+                .expect("source")
+                .spans
+                .is_empty()
+        );
+        app.world_mut()
+            .get_mut::<RichTextSource>(root)
+            .expect("source")
+            .source = "*Alice*".into();
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(root)
+                .expect("rich root")
+                .0
+                .is_empty()
+        );
+        let spans = app
+            .world()
+            .get::<RichTextSource>(root)
+            .expect("source")
+            .spans
+            .clone();
+        assert_eq!(spans.len(), 5);
+        app.world_mut()
+            .get_mut::<RichTextSource>(root)
+            .expect("source")
+            .source = "Bob".into();
+        app.update();
+        assert_eq!(app.world().get::<Text>(root).expect("plain again").0, "Bob");
+        assert!(
+            spans
+                .iter()
+                .all(|&entity| app.world().get_entity(entity).is_err())
+        );
+    }
+
+    #[test]
+    fn ruby_keeps_base_glyphs_in_the_shaped_ui_layout() {
+        use bevy::app::{HierarchyPropagatePlugin, PropagateSet};
+        use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiSystems};
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::text::TextPlugin,
+        ))
+        .init_resource::<Assets<Image>>()
+        .init_resource::<bevy::ui::UiScale>()
+        .init_resource::<bevy::ui::ui_surface::UiSurface>()
+        .init_resource::<UiModels>()
+        .add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(
+            PostUpdate,
+        ))
+        .add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(
+            PostUpdate,
+        ))
+        .configure_sets(
+            PostUpdate,
+            (
+                UiSystems::Prepare,
+                UiSystems::Propagate,
+                UiSystems::Content,
+                UiSystems::Layout,
+            )
+                .chain(),
+        )
+        .configure_sets(
+            PostUpdate,
+            PropagateSet::<ComputedUiTargetCamera>::default().in_set(UiSystems::Propagate),
+        )
+        .configure_sets(
+            PostUpdate,
+            PropagateSet::<ComputedUiRenderTargetInfo>::default().in_set(UiSystems::Propagate),
+        )
+        .add_systems(Update, update)
+        .add_systems(
+            PostUpdate,
+            (
+                bevy::ui::update::propagate_ui_target_cameras.in_set(UiSystems::Prepare),
+                bevy::ui::widget::measure_text_system
+                    .in_set(UiSystems::Content)
+                    .after(bevy::text::detect_text_needs_rerender)
+                    .after(bevy::text::load_font_assets_into_font_collection),
+                bevy::ui::ui_layout_system.in_set(UiSystems::Layout),
+                bevy::ui::widget::text_system.after(UiSystems::Layout),
+                (reveal_glyphs, position_ruby)
+                    .chain()
+                    .after(bevy::ui::widget::text_system),
+            ),
+        );
+        app.world_mut().spawn((
+            Camera2d,
+            Camera {
+                computed: bevy::camera::ComputedCameraValues {
+                    target_info: Some(bevy::camera::RenderTargetInfo {
+                        physical_size: UVec2::new(1920, 1080),
+                        scale_factor: 1.0,
+                    }),
+                    ..default()
+                },
+                ..default()
+            },
+        ));
+        let wrapper = app
+            .world_mut()
+            .spawn(Node {
+                width: px(1200),
+                ..default()
+            })
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: percent(100),
+                    ..default()
+                },
+                ChildOf(wrapper),
+                Text::new(""),
+                TextFont::from_font_size(40.0),
+                TextColor::WHITE,
+                RichTextSource::new(
+                    r#"#ruby("A-lis")[Alice] and #ruby("Bob")[Robert]"#.into(),
+                    &crate::ui::ScreenLayout::default(),
+                ),
+                RichGlyphs::default(),
+            ))
+            .id();
+        for _ in 0..8 {
+            app.update();
+        }
+        let world = app.world();
+        let rich = world.get::<RichTextSource>(root).expect("rich source");
+        let layout = world
+            .get::<bevy::text::TextLayoutInfo>(root)
+            .expect("base layout");
+        assert_eq!(rich.document.text, "Alice and Robert");
+        assert!(!layout.glyphs.is_empty(), "base glyphs must not disappear");
+        assert!(layout.glyphs.iter().any(|glyph| glyph.section_index <= 5));
+        assert!(layout.glyphs.iter().any(|glyph| glyph.section_index >= 11));
+        assert!(
+            world
+                .get::<ComputedNode>(root)
+                .expect("base bounds")
+                .size()
+                .y
+                > 0.0
+        );
+        for &label in &rich.labels {
+            assert!(
+                !world
+                    .get::<bevy::text::TextLayoutInfo>(label)
+                    .expect("reading layout")
+                    .glyphs
+                    .is_empty()
+            );
+        }
+    }
 
     #[test]
     fn typst_styles_and_linebreaks_reach_bevy_spans() {

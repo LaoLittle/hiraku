@@ -1,0 +1,11 @@
+.{
+    startup: "startup.hks",
+    canvasSize: (1920, 1080),
+    fonts: .{ path: "fonts" },
+    texturesDir: ".",
+    charactersDir: ".",
+    backgroundsDir: ".",
+    soundeffectsDir: ".",
+    bgmDir: ".",
+    voiceDir: ".",
+}

@@ -69,6 +69,7 @@ pub(crate) fn fit_screen_text(
     mut texts: Query<(
         &mut FitText,
         &Text,
+        Option<&super::rich_text::RichTextSource>,
         &ComputedNode,
         &bevy::text::TextLayoutInfo,
         &mut TextFont,
@@ -76,7 +77,7 @@ pub(crate) fn fit_screen_text(
         &mut Node,
     )>,
 ) {
-    for (mut fit, text, node, measured, mut font, mut visibility, mut layout) in &mut texts {
+    for (mut fit, text, rich, node, measured, mut font, mut visibility, mut layout) in &mut texts {
         let bevy::text::FontSize::Px(current) = font.font_size else {
             continue;
         };
@@ -85,8 +86,9 @@ pub(crate) fn fit_screen_text(
             continue;
         }
         let width = node.size().x * node.inverse_scale_factor();
-        if fit.content.as_deref() != Some(text.0.as_str()) || (fit.width - width).abs() > 0.01 {
-            fit.content = Some(text.0.clone());
+        let content = rich.map_or(text.0.as_str(), |rich| rich.source.as_str());
+        if fit.content.as_deref() != Some(content) || (fit.width - width).abs() > 0.01 {
+            fit.content = Some(content.to_owned());
             fit.width = width;
             if (current - fit.maximum).abs() > 0.05 {
                 // A different label may fit at the full authored size. Measure
@@ -702,6 +704,30 @@ pub(super) fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
     }
 }
 
+fn screen_text_font(ui_fonts: &UiFonts, size: f32, layout: &ScreenLayout) -> TextFont {
+    let font = ui_text_font(ui_fonts, size);
+    match &layout.font_family {
+        Some(family) => font.with_family(family.clone()),
+        None => font,
+    }
+}
+
+fn screen_text_initial(source: &str, layout: &ScreenLayout) -> String {
+    if layout.text_reveal.is_some() || layout.reactive_text_reveal.is_some() {
+        return String::new();
+    }
+    hiraku_text::parse(source)
+        .ok()
+        .filter(|document| {
+            document.ruby.is_empty()
+                && document
+                    .styles
+                    .iter()
+                    .all(|style| *style == hiraku_text::TextStyle::default())
+        })
+        .map_or_else(String::new, |document| document.text)
+}
+
 fn spawn_screen_node_entity(
     commands: &mut Commands,
     root: Entity,
@@ -734,17 +760,22 @@ fn spawn_screen_node_entity(
             // Authored layout/visibility belongs to the wrapper. The text leaf
             // can hide during fitting without overriding .visible(...) or
             // removing its box from Bevy layout.
-            let fit_wrapper = layout.text_fit.then(|| {
-                commands
-                    .spawn((ScreenUiNode, Pickable::IGNORE, node.clone()))
-                    .id()
-            });
-            if fit_wrapper.is_some() {
+            let wrapper = commands
+                .spawn((ScreenUiNode, Pickable::IGNORE, node.clone()))
+                .id();
+            if layout.text_fit {
                 node = Node {
                     position_type: PositionType::Absolute,
                     left: px(0),
                     width: percent(100),
                     height: percent(100),
+                    min_width: px(0),
+                    flex_shrink: 0.0,
+                    ..default()
+                };
+            } else {
+                node = Node {
+                    width: percent(100),
                     min_width: px(0),
                     flex_shrink: 0.0,
                     ..default()
@@ -755,20 +786,14 @@ fn spawn_screen_node_entity(
                     ScreenUiNode,
                     Pickable::IGNORE,
                     node,
-                    Text::new(if layout.rich_text {
-                        String::new()
-                    } else {
-                        text.clone()
-                    }),
-                    ui_text_font(ui_fonts, *size),
+                    Text::new(screen_text_initial(text, layout)),
+                    screen_text_font(ui_fonts, *size, layout),
                     TextLayout::new(
                         justify_text_from_align(align.unwrap_or(0.0)),
                         if layout.text_fit {
                             LineBreak::NoWrap
-                        } else if layout.rich_text {
-                            LineBreak::WordBoundary
                         } else {
-                            LineBreak::AnyCharacter
+                            LineBreak::WordOrCharacter
                         },
                     ),
                     TextColor(color.map(color_from_rgba).unwrap_or(ui_style.line_color)),
@@ -782,13 +807,11 @@ fn spawn_screen_node_entity(
                     },
                 ))
                 .id();
-            if layout.rich_text {
-                commands.entity(entity).insert((
-                    super::rich_text::RichTextSource::new(text.clone(), layout),
-                    super::rich_text::RichGlyphs::default(),
-                    bevy::text::LineHeight::RelativeToFont(1.2),
-                ));
-            }
+            commands.entity(entity).insert((
+                super::rich_text::RichTextSource::new(text.clone(), layout),
+                super::rich_text::RichGlyphs::default(),
+                bevy::text::LineHeight::RelativeToFont(1.2),
+            ));
             if layout.text_fit {
                 commands.entity(entity).insert((
                     FitText {
@@ -811,14 +834,9 @@ fn spawn_screen_node_entity(
                     rendered_revision: u64::MAX,
                 });
             }
-            let layout_entity = if let Some(wrapper) = fit_wrapper {
-                commands.entity(wrapper).add_child(entity);
-                wrapper
-            } else {
-                entity
-            };
-            apply_live_layout_bindings(commands, layout_entity, layout);
-            layout_entity
+            commands.entity(wrapper).add_child(entity);
+            apply_live_layout_bindings(commands, wrapper, layout);
+            wrapper
         }
         ScreenNode::Button(ButtonNode {
             hovered_when_disabled,
@@ -919,13 +937,18 @@ fn spawn_screen_node_entity(
             } else {
                 insensitive_text_color
             };
+            let label_source = if children.is_empty() {
+                text.clone()
+            } else {
+                String::new()
+            };
             let text = commands
                 .spawn((
                     ScreenUiNode,
                     ScreenUiButtonText,
                     Pickable::IGNORE,
-                    Text::new(text.clone()),
-                    ui_text_font(ui_fonts, *size),
+                    Text::new(screen_text_initial(&label_source, layout)),
+                    screen_text_font(ui_fonts, *size, layout),
                     TextColor(initial_text_color),
                     TextLayout {
                         justify: justify_text_from_align(align.unwrap_or(0.5)),
@@ -941,6 +964,10 @@ fn spawn_screen_node_entity(
                     },
                 ))
                 .id();
+            commands.entity(text).insert((
+                super::rich_text::RichTextSource::new(label_source, layout),
+                super::rich_text::RichGlyphs::default(),
+            ));
             let button = commands
                 .spawn((
                     ScreenUiNode,
@@ -3127,7 +3154,7 @@ mod tests {
                                 row {
                                     spacer().size(.abs(194, 1))
                                     column {
-                                        richText(message).fontSize(44).width(1338)
+                                        text(message).fontSize(44).width(1338)
                                     }.size(.fit()).width(1338)
                                 }.size(.fit()).width(1648).gap(0).padding(16)
                             }.size(.fit()).width(1648).gap(0)
@@ -3389,7 +3416,7 @@ mod tests {
         };
         let screen = evaluate_ui_component_named_with_args(
             "memory://dialogue.ui.hks",
-            "import ui.widgets.*\ncanvas { if dialogue.visible { richText(\"Alice\").reveal(dialogue.revealedCharacters) } }",
+            "import ui.widgets.*\ncanvas { if dialogue.visible { text(\"Alice\").reveal(dialogue.revealedCharacters) } }",
             UiContext::new(BTreeMap::from([("dialogue".into(), model(true, 0))])),
             &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("dialogue UI");
@@ -3461,7 +3488,7 @@ mod tests {
         };
         let screen = evaluate_ui_component_named_with_args(
             "memory://dialogue.ui.hks",
-            "import ui.widgets.*\ncanvas { if dialogue.visible { richText(\"Alice\") } }",
+            "import ui.widgets.*\ncanvas { if dialogue.visible { text(\"*Alice*\") } }",
             UiContext::new(BTreeMap::from([("dialogue".into(), model(true))])),
             &TextureCatalog::default(),
             &TermCatalog::default(),

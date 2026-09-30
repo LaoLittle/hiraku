@@ -1,0 +1,13 @@
+ui.set("showcase", "ui/showcase.ui.hks")
+ui.set("dialogue", "ui/dialogue.ui.hks")
+
+while true {
+    let result = ui.open("showcase")
+    if result == "dialogue" {
+        'Plain text, *bold text*, _italic text_, and #strike[deleted text].'
+        "Alice": '#ruby("A-lis")[Alice] speaks.#br;Ruby reveals alongside its base, not its markup.'
+        ...: '#br;This _continuation_ appends without restarting the previous line.'
+        '#color("#8bd5ff")[A colored sentence.]#br;A literal tilde stays a tilde: Alice~Bob.'
+    }
+    if result == "quit" { exit() }
+}

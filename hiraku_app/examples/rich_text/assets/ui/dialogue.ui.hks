@@ -1,0 +1,15 @@
+import ui.widgets.*
+
+@ui
+global fn main() -> UiNode {
+    canvas {
+        column {
+            text(dialogue.speaker).fontFamily("SourceSans3VF").fontSize(28).color(0.65, 0.84, 1.0, 1.0)
+                .visible(dialogue.speaker != "")
+            text(dialogue.text).reveal(dialogue.revealedCharacters)
+                .fontFamily("SourceSans3VF").fontSize(36).size(.abs(1520, 230))
+            button { text("Continue") }.onClick { story.next() }
+        }.at(.rel(8, 62)).size(.rel(84, 34)).padding(28).gap(16)
+            .surface(0.035, 0.045, 0.075, 0.96).visible(dialogue.visible)
+    }
+}

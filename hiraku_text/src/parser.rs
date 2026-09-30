@@ -295,6 +295,10 @@ mod tests {
     #[test]
     fn tilde_quotes_and_linebreak_constants_are_literal() {
         assert_eq!(
+            parse("Alice#br;Bob").expect("linebreak delimiter").text,
+            "Alice\nBob"
+        );
+        assert_eq!(
             parse("Alice~\"Bob\"#br#br~#linebreak()end")
                 .expect("linebreaks")
                 .text,

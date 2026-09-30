@@ -331,7 +331,7 @@ pub struct ScreenLayout {
     #[serde(default)]
     pub rotation: f32,
     #[serde(default)]
-    pub rich_text: bool,
+    pub font_family: Option<String>,
     #[serde(default)]
     pub text_reveal: Option<u32>,
     #[serde(skip)]

@@ -9,7 +9,7 @@ canvas {
             .color(0.95, 0.72, 0.38, 1.0)
             .visible(dialogue.speaker != "")
 
-        text(dialogue.text.prefix(dialogue.revealedCharacters))
+        text(dialogue.text).reveal(dialogue.revealedCharacters)
             .fontSize(30)
             .color(0.96, 0.97, 1.0, 1.0)
 
