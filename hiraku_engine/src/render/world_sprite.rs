@@ -35,7 +35,10 @@ pub struct WorldSprite {
     pub rect: Option<[f32; 4]>,
     pub color: Color,
     pub custom_size: Option<Vec2>,
+    /// Normalized image pivot, measured from the bottom-left corner.
+    pub pivot: Vec2,
     resolved_size: Option<Vec2>,
+    resolved_pivot: Vec2,
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +65,9 @@ impl WorldSprite {
             rect: None,
             color: Color::WHITE,
             custom_size: None,
+            pivot: Vec2::splat(0.5),
             resolved_size: None,
+            resolved_pivot: Vec2::splat(0.5),
         }
     }
 
@@ -80,7 +85,9 @@ impl WorldSprite {
             rect: None,
             color,
             custom_size: Some(size),
+            pivot: Vec2::splat(0.5),
             resolved_size: Some(size),
+            resolved_pivot: Vec2::splat(0.5),
         }
     }
 
@@ -288,15 +295,22 @@ pub(crate) fn sync_world_sprites(
         });
 
         if let Some(size) = size
-            && (sprite.resolved_size != Some(size) || mesh.is_none())
+            && (sprite.resolved_size != Some(size)
+                || sprite.resolved_pivot != sprite.pivot
+                || mesh.is_none())
         {
-            let mesh_handle = meshes.add(Rectangle::new(size.x.max(1.0), size.y.max(1.0)));
+            let quad = Rectangle::new(size.x.max(1.0), size.y.max(1.0))
+                .mesh()
+                .build()
+                .translated_by(((Vec2::splat(0.5) - sprite.pivot) * size).extend(0.0));
+            let mesh_handle = meshes.add(quad);
             if let Some(mut mesh) = mesh {
                 mesh.0 = mesh_handle;
             } else {
                 commands.entity(entity).try_insert(Mesh3d(mesh_handle));
             }
             sprite.resolved_size = Some(size);
+            sprite.resolved_pivot = sprite.pivot;
         }
 
         if let Some(material_handle) = material_handle {
@@ -326,6 +340,61 @@ fn fit_background(source: Vec2, viewport: Vec2) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn off_center_pivot_moves_geometry_not_the_entity_and_resolves_lazily() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<WorldSpriteMaterial>>()
+            .add_systems(Update, sync_world_sprites);
+        let mut sprite = WorldSprite::from_image(Handle::default());
+        sprite.pivot = Vec2::new(0.25, 0.75);
+        let transform = Transform::from_xyz(10.0, 20.0, 1.0)
+            .with_scale(Vec3::splat(2.0))
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+        let entity = app.world_mut().spawn((sprite, transform)).id();
+        app.update();
+        assert!(app.world().get::<Mesh3d>(entity).is_none());
+        app.world_mut()
+            .get_mut::<WorldSprite>(entity)
+            .expect("sprite")
+            .custom_size = Some(Vec2::new(100.0, 200.0));
+        app.update();
+        let mesh = app.world().get::<Mesh3d>(entity).expect("resolved mesh");
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let bevy::mesh::VertexAttributeValues::Float32x3(vertices) = meshes
+            .get(&mesh.0)
+            .expect("quad")
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("positions")
+        else {
+            panic!("position format")
+        };
+        let center =
+            vertices.iter().map(|p| Vec3::from_array(*p)).sum::<Vec3>() / vertices.len() as f32;
+        assert_eq!(center, Vec3::new(25.0, -50.0, 0.0));
+        assert_eq!(
+            transform.transform_point(center),
+            Vec3::new(110.0, 70.0, 1.0)
+        );
+        assert_eq!(
+            *app.world().get::<Transform>(entity).expect("logical pivot"),
+            transform
+        );
+        app.world_mut()
+            .get_mut::<WorldSprite>(entity)
+            .expect("sprite")
+            .pivot = Vec2::splat(0.5);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<WorldSprite>(entity)
+                .expect("reset")
+                .resolved_pivot,
+            Vec2::splat(0.5)
+        );
+    }
 
     #[test]
     fn custom_program_selects_material_pipeline_but_parameter_changes_do_not() {

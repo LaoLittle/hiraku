@@ -158,7 +158,8 @@ pub fn handle_runtime_menu_buttons(
     if !deferred.is_empty() {
         redraw.request();
         let effects = std::mem::take(&mut *deferred);
-        dispatch_ui_effects(&mut ctx, effects, &mut deferred);
+        let root = ctx.screen_state.active_root;
+        dispatch_ui_effects(&mut ctx, effects, &mut deferred, root);
         ctx.clicks.clear();
         ctx.widget_callbacks.clear();
         return;
@@ -294,7 +295,7 @@ pub fn handle_runtime_menu_buttons(
                 }
             }
         }
-        dispatch_ui_effects(&mut ctx, effects, &mut deferred);
+        dispatch_ui_effects(&mut ctx, effects, &mut deferred, root);
         if !crate::storage::storage_ready() {
             return;
         }
@@ -305,6 +306,7 @@ fn dispatch_ui_effects(
     ctx: &mut RuntimeMenuContext,
     effects: Vec<crate::ui::UiEffect>,
     deferred: &mut Vec<crate::ui::UiEffect>,
+    root: Option<Entity>,
 ) {
     if !crate::storage::storage_ready() {
         deferred.extend(effects);
@@ -339,9 +341,11 @@ fn dispatch_ui_effects(
                     },
                 ));
             }
-            crate::ui::UiEffect::PlaySfx { .. } => {
+            crate::ui::UiEffect::PlaySfx { .. }
+            | crate::ui::UiEffect::PlaySfxChannel { .. }
+            | crate::ui::UiEffect::StopSfx { .. } => {
                 ctx.effects
-                    .write(super::screen_ui::UiEffectMessage(effect.clone()));
+                    .write(super::screen_ui::UiEffectMessage(effect.clone(), root));
             }
             crate::ui::UiEffect::Save { slot } => {
                 if let Err(error) = save_runtime_slot(

@@ -1,6 +1,8 @@
 //! Data-driven 3D stages. Anchors and camera presets are scene data, not
 //! story-specific trial mechanics. Explicit views allocate on-demand cameras.
+mod animation;
 mod definition;
+pub use animation::{StageAnimation, StagePlayback};
 mod model;
 mod shading;
 pub use model::{StageAlpha, StageLight, StageLightKind, StageMaterial};
@@ -44,6 +46,13 @@ impl Plugin for StagePlugin {
         app.add_systems(
             PostUpdate,
             runtime::prepare_surfaces.run_if(crate::runtime_initialized),
+        );
+        app.add_systems(
+            PostUpdate,
+            animation::sync
+                .after(runtime::prepare_surfaces)
+                .before(bevy::app::AnimationSystems)
+                .run_if(crate::runtime_initialized),
         );
     }
 }
@@ -89,6 +98,13 @@ impl AssetLoader for StageLoader {
                     })
                     .load(path),
             );
+        }
+        for animation in stage.animations.values() {
+            let path = context
+                .path()
+                .resolve_embed_str(&animation.clip)
+                .map_err(|error| StageError::Invalid(error.to_string()))?;
+            stage.animation_handles.push(context.load(path));
         }
         Ok(stage)
     }

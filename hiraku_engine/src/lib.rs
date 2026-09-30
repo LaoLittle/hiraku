@@ -417,9 +417,15 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 Update,
-                scene::ui_timers::tick
+                (
+                    scene::screen_ui::cleanup_ui_sounds,
+                    scene::ui_timers::pressed_changes,
+                    scene::ui_timers::update,
+                    scene::ui_timers::tick,
+                )
+                    .chain()
                     .after(cleanup_stale_screen_ui)
-                    .after(scene::recompose_screen_ui)
+                    .before(handle_runtime_menu_buttons)
                     .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
@@ -466,6 +472,7 @@ impl Plugin for HirakuPlugin {
                 Update,
                 (
                     update_ui_text_bindings,
+                    scene::screen_ui::update_ui_geometry,
                     update_ui_reactive_bindings,
                     scene::rich_text::update,
                     animate_screen_ui,

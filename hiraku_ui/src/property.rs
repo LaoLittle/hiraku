@@ -32,10 +32,18 @@ impl From<hiraku_script::linked_vm::LinkedVmError> for PropertyError {
 }
 
 impl PropertyComputation {
-    pub fn new(
+    pub fn new(program: LinkedProgram, getter: Value, globals: BTreeMap<String, Value>) -> Self {
+        Self::with_native_reads(program, getter, globals, |_| None)
+    }
+
+    /// Host-declared implicit reads for native functions. An empty set means
+    /// the function depends only on its arguments, not on the host context.
+    /// Unknown functions remain conservative; script calls are scanned normally.
+    pub fn with_native_reads(
         program: LinkedProgram,
         getter: Value,
         mut globals: BTreeMap<String, Value>,
+        native_reads: impl Fn(&str) -> Option<BTreeSet<String>>,
     ) -> Self {
         let mut reads = BTreeSet::new();
         let mut visited = BTreeSet::new();
@@ -53,11 +61,38 @@ impl PropertyComputation {
                         opaque = true;
                         continue;
                     };
-                    match owner.resolve(symbol) {
+                    // A local function used only as a first-class value need
+                    // not have an entry in the direct-call linker table.
+                    let function = owner.resolve(symbol).or_else(|| {
+                        owner
+                            .bytecode
+                            .functions
+                            .iter()
+                            .position(|f| f.name == symbol)
+                            .and_then(|index| u32::try_from(index).ok())
+                            .map(|function| LinkedFunction::Script {
+                                module: owner.id,
+                                function,
+                            })
+                    });
+                    match function {
                         Some(LinkedFunction::Script {
                             module: ModuleId(module),
                             function,
                         }) => (module, false, function),
+                        Some(LinkedFunction::Native(_)) => {
+                            if let Some(dependencies) = owner
+                                .bytecode
+                                .symbols
+                                .resolve(symbol)
+                                .and_then(&native_reads)
+                            {
+                                reads.extend(dependencies);
+                            } else {
+                                opaque = true;
+                            }
+                            continue;
+                        }
                         _ => {
                             opaque = true;
                             continue;

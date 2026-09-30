@@ -1013,6 +1013,29 @@ mod api {
         Ok(())
     }
 
+    /// Select the image point used by subsequent placement, scale and rotation.
+    #[hks(name = "pivotPicture", selector = "scene")]
+    fn pivot_picture(
+        context: &mut CharacterContext,
+        id: String,
+        x: f64,
+        y: f64,
+    ) -> Result<(), NativeError> {
+        if ![x, y]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            return Err(NativeError::message("picture pivot must be within 0..1"));
+        }
+        context
+            .commands
+            .push(StoryEffect::Picture(PictureCommand::Pivot {
+                id,
+                pivot: [x as f32, y as f32],
+            }));
+        Ok(())
+    }
+
     /// Freeze placement at its displayed value; tint, blur and fade continue.
     #[hks(name = "stopPictureMotion", selector = "scene")]
     fn stop_picture_motion(context: &mut CharacterContext, id: String) -> Result<(), NativeError> {

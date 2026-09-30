@@ -1,5 +1,5 @@
 use super::scene_visuals::{
-    SceneVisualTarget, StageCameraTransitionHandle, StageViewTransitionHandle,
+    SceneVisualTarget, StageAnimationHandle, StageCameraTransitionHandle, StageViewTransitionHandle,
 };
 use super::*;
 use crate::stage::runtime::StageCommand;
@@ -17,6 +17,43 @@ pub(super) fn register(registry: &mut NativeRegistry<CharacterContext>) {
 mod tests {
     use super::*;
     use crate::script::story_runtime::{StoryRuntime, StoryRuntimeEvent};
+
+    #[test]
+    fn stage_animation_is_typed_and_waits_for_its_own_completion() {
+        let code = compile_story_bytecode(
+            "stage.hks",
+            r#"
+            let room = stage.open("room.stage.hson")
+            room.play("opening").await()
+            room.play("idle").looped(true)
+        "#,
+        )
+        .expect("typed model animation API");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let Some(StoryRuntimeEvent::TaskEffect { task, effect }) = runtime.step().expect("open")
+        else {
+            panic!("stage load event");
+        };
+        runtime.complete_task_effect(task, &effect).expect("loaded");
+        let Some(StoryRuntimeEvent::TaskEffect { task, effect }) =
+            runtime.step().expect("animation")
+        else {
+            panic!("stage animation event");
+        };
+        assert!(matches!(&effect, StoryEffect::Spatial(StageCommand::Play {
+            name, looping: false, playback, ..
+        }) if name == "opening" && *playback != 0));
+        assert!(runtime.step().expect("waiting").is_none());
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("opening completed");
+        let Some(StoryRuntimeEvent::Effect(effect)) = runtime.step().expect("idle") else {
+            panic!("looping stage animation event");
+        };
+        assert!(matches!(&effect, StoryEffect::Spatial(StageCommand::Play {
+            name, looping: true, ..
+        }) if name == "idle"));
+    }
 
     #[test]
     fn stage_open_waits_for_host_before_anchoring_or_camera_commands() {
@@ -55,6 +92,51 @@ mod tests {
 #[hiraku_script::hks_module]
 mod api {
     use super::*;
+
+    #[hks(name = "play", selector = "Stage", receiver)]
+    fn play(
+        context: &mut CharacterContext,
+        stage: Stage,
+        name: String,
+    ) -> Result<StageAnimationHandle, NativeError> {
+        if name.trim().is_empty() {
+            return Err(NativeError::message(
+                "stage animation name must not be empty",
+            ));
+        }
+        let handle: StageAnimationHandle =
+            context
+                .scene_visuals
+                .begin_as(SceneVisualTarget::Spatial(StageCommand::Play {
+                    id: stage.0,
+                    playback: 0,
+                    name,
+                    looping: false,
+                }))?;
+        if let Some((SceneVisualTarget::Spatial(StageCommand::Play { playback, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        {
+            *playback = handle.0;
+        }
+        Ok(handle)
+    }
+
+    #[hks(name = "looped", selector = "StageAnimation", receiver)]
+    fn looped(
+        context: &mut CharacterContext,
+        handle: StageAnimationHandle,
+        value: bool,
+    ) -> Result<StageAnimationHandle, NativeError> {
+        let Some((SceneVisualTarget::Spatial(StageCommand::Play { looping, .. }), _)) =
+            context.scene_visuals.pending.get_mut(&handle.0)
+        else {
+            return Err(NativeError::message(
+                "looped requires an uncommitted stage animation",
+            ));
+        };
+        *looping = value;
+        Ok(handle)
+    }
 
     #[hks(name = "clipView", selector = "Stage", receiver)]
     fn clip_view(

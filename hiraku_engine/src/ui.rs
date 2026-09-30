@@ -61,6 +61,15 @@ pub struct UiShaderSpec {
 /// declarative screen remains serializable and the ECS owns the actual work.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum UiEffect {
+    PlaySfxChannel {
+        name: String,
+        volume: f32,
+        channel: String,
+        looped: bool,
+    },
+    StopSfx {
+        channel: String,
+    },
     StopVoice,
     PlaySfx {
         name: String,
@@ -130,6 +139,9 @@ pub struct UiPhaseAnimation {
 /// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSpec {
+    /// Mount-owned frame callback, receiving elapsed seconds from the UI clock.
+    #[serde(skip)]
+    pub(crate) on_update: Option<UiCallback>,
     /// Mounted overlays explicitly allowed above this modal screen.
     #[serde(default)]
     pub allowed_overlays: Vec<String>,
@@ -298,6 +310,15 @@ pub struct InputNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    #[serde(skip)]
+    pub(crate) reactive_size: Option<Box<PropertyComputation>>,
+    #[serde(skip)]
+    pub(crate) reactive_position: Option<Box<PropertyComputation>>,
+    #[serde(skip)]
+    pub(crate) size_width_override: bool,
+    /// Button press state, independent of accepted clicks (release inside).
+    #[serde(skip)]
+    pub(crate) on_pressed_change: Option<Box<UiCallback>>,
     #[serde(default)]
     pub hover_brightness: Option<f32>,
     #[serde(default)]

@@ -69,6 +69,25 @@ impl HksScriptType for UiVoidCallable {
 /// and return type as well: every supported input sends one scalar and expects Unit.
 struct UiInputCallable(HksCallable);
 
+/// For callbacks whose scalar payload is known independently of widget kind,
+/// retain the exact parameter type in the native compilation manifest.
+struct UiScalarCallable<T>(HksCallable, std::marker::PhantomData<T>);
+
+impl<T> FromHksValue for UiScalarCallable<T> {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        HksCallable::from_hks_value(value).map(|callable| Self(callable, std::marker::PhantomData))
+    }
+}
+
+impl<T: HksScriptType> HksScriptType for UiScalarCallable<T> {
+    fn hks_script_type<C>(registry: &mut NativeRegistry<C>) -> ScriptType {
+        ScriptType::Callable {
+            parameters: vec![T::hks_script_type(registry)],
+            result: Box::new(ScriptType::Unit),
+        }
+    }
+}
+
 impl FromHksValue for UiInputCallable {
     fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
         HksCallable::from_hks_value(value).map(Self)
@@ -147,6 +166,11 @@ struct UiDraft {
     timers_paused: bool,
     pauses_scene: bool,
     timers: Vec<(f32, HksCallable)>,
+    on_update: Option<HksCallable>,
+    on_pressed_change: Option<HksCallable>,
+    size_binding: Option<HksBinding<UiSize>>,
+    position_binding: Option<HksBinding<UiPosition>>,
+    size_width_override: bool,
     slider_skin: Option<[String; 3]>,
     kind: UiDraftKind,
     content: Option<UiVoidCallable>,
@@ -191,6 +215,11 @@ impl UiDraft {
         Self {
             allowed_overlays: Vec::new(),
             timers: Vec::new(),
+            on_update: None,
+            on_pressed_change: None,
+            size_binding: None,
+            position_binding: None,
+            size_width_override: false,
             timers_paused: false,
             fade_seconds: 0.0,
             pauses_scene: false,
@@ -607,7 +636,9 @@ mod native_ui {
         node: UiNodeHandle,
         width: f64,
     ) -> Result<UiNodeHandle, NativeError> {
-        let layout = &mut context.node_mut(node)?.layout;
+        let draft = context.node_mut(node)?;
+        draft.size_width_override = true;
+        let layout = &mut draft.layout;
         layout.width = Some(non_negative(width, "UI width")?);
         layout.width_percent = None;
         Ok(node)
@@ -646,6 +677,34 @@ mod native_ui {
             return Err(NativeError::message("after requires a screen or canvas"));
         }
         draft.timers.push((seconds as f32, handler.0));
+        Ok(node)
+    }
+
+    #[hks(name = "onUpdate", receiver)]
+    fn on_update(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        handler: UiScalarCallable<f64>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Screen) {
+            return Err(NativeError::message("onUpdate requires a screen or canvas"));
+        }
+        draft.on_update = Some(handler.0);
+        Ok(node)
+    }
+
+    #[hks(name = "onPressedChange", receiver)]
+    fn on_pressed_change(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        handler: UiScalarCallable<bool>,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Button(_)) {
+            return Err(NativeError::message("onPressedChange requires a button"));
+        }
+        draft.on_pressed_change = Some(handler.0);
         Ok(node)
     }
 
@@ -781,17 +840,14 @@ mod native_ui {
     fn ui_at(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        position: UiPosition,
+        position: HksBindable<UiPosition>,
     ) -> Result<UiNodeHandle, NativeError> {
-        let layout = &mut context.node_mut(node)?.layout;
+        let draft = context.node_mut(node)?;
         match position {
-            UiPosition::Absolute(x, y) => {
-                layout.left = Some(finite_f32(x, "absolute UI x")?);
-                layout.top = Some(finite_f32(y, "absolute UI y")?);
-            }
-            UiPosition::Relative(x, y) => {
-                layout.left_percent = Some(percent(x, "relative UI x")?);
-                layout.top_percent = Some(percent(y, "relative UI y")?);
+            HksBindable::Binding(binding) => draft.position_binding = Some(binding),
+            HksBindable::Value(position) => {
+                draft.position_binding = None;
+                assign_ui_position(&mut draft.layout, position)?;
             }
         }
         Ok(node)
@@ -801,26 +857,17 @@ mod native_ui {
     fn ui_size(
         context: &mut UiVmContext,
         node: UiNodeHandle,
-        size: UiSize,
+        size: HksBindable<UiSize>,
     ) -> Result<UiNodeHandle, NativeError> {
-        let layout = &mut context.node_mut(node)?.layout;
+        let draft = context.node_mut(node)?;
         match size {
-            UiSize::Fit => {
-                layout.fit_content = true;
-                layout.width = None;
-                layout.height = None;
-                layout.width_percent = None;
-                layout.height_percent = None;
-            }
-            UiSize::Absolute(width, height) => {
-                layout.width = Some(non_negative(width, "absolute UI width")?);
-                layout.height = Some(non_negative(height, "absolute UI height")?);
-            }
-            UiSize::Relative(width, height) => {
-                layout.width_percent = Some(percent(width, "relative UI width")?);
-                layout.height_percent = Some(percent(height, "relative UI height")?);
+            HksBindable::Binding(binding) => draft.size_binding = Some(binding),
+            HksBindable::Value(size) => {
+                draft.size_binding = None;
+                assign_ui_size(&mut draft.layout, size)?;
             }
         }
+        draft.size_width_override = false;
         Ok(node)
     }
 
@@ -1298,6 +1345,53 @@ mod native_ui {
         }))
     }
 
+    #[hks(name = "channel", receiver)]
+    fn sfx_channel(
+        context: &mut UiVmContext,
+        effect: UiEffectHandle,
+        channel: String,
+    ) -> Result<UiEffectHandle, NativeError> {
+        if channel.trim().is_empty() {
+            return Err(NativeError::message("sound channel must not be empty"));
+        }
+        let entry = context
+            .effects
+            .get_mut(&effect.0)
+            .ok_or_else(|| NativeError::message("unknown UI effect"))?;
+        match entry {
+            UiEffect::PlaySfx { name, volume } => {
+                *entry = UiEffect::PlaySfxChannel {
+                    name: name.clone(),
+                    volume: *volume,
+                    channel,
+                    looped: false,
+                };
+            }
+            UiEffect::PlaySfxChannel {
+                channel: existing, ..
+            } => *existing = channel,
+            _ => return Err(NativeError::message("channel requires a sound effect")),
+        }
+        Ok(effect)
+    }
+
+    #[hks(name = "looped", receiver)]
+    fn sfx_looped(
+        context: &mut UiVmContext,
+        effect: UiEffectHandle,
+        enabled: bool,
+    ) -> Result<UiEffectHandle, NativeError> {
+        match context.effects.get_mut(&effect.0) {
+            Some(UiEffect::PlaySfxChannel { looped, .. }) => *looped = enabled,
+            _ => {
+                return Err(NativeError::message(
+                    "looped requires sfx(...).channel(...)",
+                ));
+            }
+        }
+        Ok(effect)
+    }
+
     #[hks(name = "onClick", receiver)]
     fn ui_on_click(
         context: &mut UiVmContext,
@@ -1731,6 +1825,14 @@ mod settings_actions {
         Ok(context.insert_effect(UiEffect::StopVoice))
     }
 
+    #[hks(name = "stopSfx")]
+    fn stop_sfx(context: &mut UiVmContext, channel: String) -> Result<UiEffectHandle, NativeError> {
+        if channel.trim().is_empty() {
+            return Err(NativeError::message("sound channel must not be empty"));
+        }
+        Ok(context.insert_effect(UiEffect::StopSfx { channel }))
+    }
+
     fn current_volume(context: &UiVmContext, channel: &str) -> f64 {
         let settings = context.values.preferences();
         match channel {
@@ -1843,6 +1945,54 @@ fn validate_phase_animation(
         ));
     }
     Ok(())
+}
+
+fn assign_ui_position(layout: &mut ScreenLayout, position: UiPosition) -> Result<(), NativeError> {
+    layout.left = None;
+    layout.top = None;
+    layout.left_percent = None;
+    layout.top_percent = None;
+    match position {
+        UiPosition::Absolute(x, y) => {
+            layout.left = Some(finite_f32(x, "absolute UI x")?);
+            layout.top = Some(finite_f32(y, "absolute UI y")?);
+        }
+        UiPosition::Relative(x, y) => {
+            layout.left_percent = Some(percent(x, "relative UI x")?);
+            layout.top_percent = Some(percent(y, "relative UI y")?);
+        }
+    }
+    Ok(())
+}
+
+fn assign_ui_size(layout: &mut ScreenLayout, size: UiSize) -> Result<(), NativeError> {
+    layout.fit_content = matches!(size, UiSize::Fit);
+    layout.width = None;
+    layout.height = None;
+    layout.width_percent = None;
+    layout.height_percent = None;
+    match size {
+        UiSize::Fit => layout.fit_content = true,
+        UiSize::Absolute(width, height) => {
+            layout.width = Some(non_negative(width, "absolute UI width")?);
+            layout.height = Some(non_negative(height, "absolute UI height")?);
+        }
+        UiSize::Relative(width, height) => {
+            layout.width_percent = Some(percent(width, "relative UI width")?);
+            layout.height_percent = Some(percent(height, "relative UI height")?);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ui_geometry(value: &Value, size: bool) -> Result<ScreenLayout, NativeError> {
+    let mut layout = ScreenLayout::default();
+    if size {
+        assign_ui_size(&mut layout, UiSize::from_hks_value(value)?)?;
+    } else {
+        assign_ui_position(&mut layout, UiPosition::from_hks_value(value)?)?;
+    }
+    Ok(layout)
 }
 
 fn finite_f32(value: f64, label: &str) -> Result<f32, NativeError> {
@@ -2450,10 +2600,19 @@ fn reactive_binding<T>(
     program: &hiraku_script::LinkedProgram,
     context: &UiVmContext,
 ) -> PropertyComputation {
-    PropertyComputation::new(
+    PropertyComputation::with_native_reads(
         program.clone(),
         binding.getter().value().clone(),
         context_globals(context),
+        |name| match name {
+            // Pure geometry constructors do not read UiVmContext. Without this
+            // declaration every static .abs/.rel subscribes to the entire log,
+            // clock and typewriter model, reevaluating all history rows per tick.
+            "UiPosition.abs" | "UiPosition.rel" | "UiSize.abs" | "UiSize.rel" | "UiSize.fit" => {
+                Some(Default::default())
+            }
+            _ => None,
+        },
     )
 }
 
@@ -2557,7 +2716,13 @@ fn materialize_screen(
         .as_deref()
         .map(|name| resolve_texture(textures, name))
         .transpose()?;
+    if let Some(handler) = &draft.on_update {
+        validate_input_handler(handler, &ScriptType::Float, program)?;
+    }
     Ok(ScreenSpec {
+        on_update: draft
+            .on_update
+            .map(|handler| ui_callback(handler, program, context)),
         allowed_overlays: draft.allowed_overlays,
         timers_paused: draft.timers_paused,
         fade_seconds: draft.fade_seconds,
@@ -2755,6 +2920,49 @@ fn materialize_node(
         .get(&handle.0)
         .cloned()
         .ok_or_else(|| UiVmError::Invalid(format!("unknown UiNode handle {}", handle.0)))?;
+    for (size, binding) in [
+        (
+            true,
+            draft
+                .size_binding
+                .as_ref()
+                .map(|binding| reactive_binding(binding, program, context)),
+        ),
+        (
+            false,
+            draft
+                .position_binding
+                .as_ref()
+                .map(|binding| reactive_binding(binding, program, context)),
+        ),
+    ] {
+        if let Some(binding) = binding {
+            let value = evaluate_binding_value(&binding, registry, context)?;
+            if size {
+                let width = (draft.layout.width, draft.layout.width_percent);
+                assign_ui_size(
+                    &mut draft.layout,
+                    UiSize::from_hks_value(&value)
+                        .map_err(|e| UiVmError::Invalid(e.to_string()))?,
+                )
+                .map_err(|e| UiVmError::Invalid(e.to_string()))?;
+                if draft.size_width_override {
+                    draft.layout.width = width.0;
+                    draft.layout.width_percent = width.1;
+                }
+                draft.layout.size_width_override = draft.size_width_override;
+                draft.layout.reactive_size = Some(Box::new(binding));
+            } else {
+                assign_ui_position(
+                    &mut draft.layout,
+                    UiPosition::from_hks_value(&value)
+                        .map_err(|e| UiVmError::Invalid(e.to_string()))?,
+                )
+                .map_err(|e| UiVmError::Invalid(e.to_string()))?;
+                draft.layout.reactive_position = Some(Box::new(binding));
+            }
+        }
+    }
     draft.layout.hidden = !draft.visible;
     draft.layout.animation = draft.animation;
     draft.layout.phase_animation = draft.phase_animation.clone();
@@ -3144,6 +3352,11 @@ fn materialize_node(
             })
         }
         UiDraftKind::Button(value) => {
+            if let Some(handler) = &draft.on_pressed_change {
+                validate_input_handler(handler, &ScriptType::Bool, program)?;
+                draft.layout.on_pressed_change =
+                    Some(Box::new(ui_callback(handler.clone(), program, context)));
+            }
             let on_click = draft.on_click.map(|closure| UiCallback {
                 owned_globals: context.owned_globals.clone(),
                 program: program.clone(),
@@ -3298,6 +3511,14 @@ fn materialize_node(
 /// The compact image-button representation must retain the outer button's
 /// placement. Explicit button dimensions/insets override the image defaults.
 fn image_button_layout(mut image: ScreenLayout, button: &ScreenLayout) -> ScreenLayout {
+    image.on_pressed_change = button.on_pressed_change.clone();
+    if button.reactive_size.is_some() {
+        image.reactive_size = button.reactive_size.clone();
+        image.size_width_override = button.size_width_override;
+    }
+    if button.reactive_position.is_some() {
+        image.reactive_position = button.reactive_position.clone();
+    }
     if button.fit_content {
         image.fit_content = true;
         image.width = None;
@@ -3369,6 +3590,178 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn press_and_frame_callbacks_drive_hold_decay_and_confirm_once() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+global var held: Bool = false
+global var amount: Float = 0.0
+global var confirmed: Bool = false
+global var remaining: Float = 1.6
+canvas {
+    button { text("Alice") }.onPressedChange { pressed: Bool ->
+        held = pressed
+        if pressed { sfx("ui/alice").channel("alice").looped(true) }
+        else { audio.stopSfx("alice") }
+    }
+}.onUpdate { delta: Float ->
+    if confirmed {
+        if remaining >= 0 {
+            remaining -= delta
+            if remaining <= 0 { remaining = -1; ui.complete() }
+        }
+    } else {
+        if held { amount += delta } else { amount -= delta * 2 }
+        if amount < 0 { amount = 0 }
+        if amount >= 1 { amount = 1; confirmed = true; audio.stopSfx("alice") }
+    }
+}"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("typed hold callbacks compile");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("button")
+        };
+        let press = button
+            .layout
+            .on_pressed_change
+            .as_ref()
+            .expect("press callback");
+        let update = screen.on_update.as_ref().expect("frame callback");
+        let mut globals = screen
+            .composition
+            .as_ref()
+            .expect("composition")
+            .globals
+            .clone();
+        assert!(
+            !screen
+                .composition
+                .as_ref()
+                .expect("composition")
+                .document
+                .plan
+                .structural_globals
+                .contains("amount")
+        );
+        let mut invoke = |callback: &UiCallback, argument: Value| {
+            let (effects, next) = evaluate_ui_callback_with_args(
+                callback,
+                &globals,
+                &crate::ui::UiModels::default(),
+                vec![argument],
+            )
+            .expect("callback");
+            globals = next;
+            effects
+        };
+        assert!(matches!(
+            invoke(press, Value::Bool(true)).as_slice(),
+            [UiEffect::PlaySfxChannel { looped: true, .. }]
+        ));
+        assert!(invoke(update, Value::Number(0.4)).is_empty());
+        assert!(matches!(
+            invoke(press, Value::Bool(false)).as_slice(),
+            [UiEffect::StopSfx { .. }]
+        ));
+        assert!(invoke(update, Value::Number(0.1)).is_empty());
+        invoke(press, Value::Bool(true));
+        // Decay left 0.2, so another 0.7 seconds must not confirm.
+        assert!(invoke(update, Value::Number(0.7)).is_empty());
+        assert!(matches!(
+            invoke(update, Value::Number(0.2)).as_slice(),
+            [UiEffect::StopSfx { .. }]
+        ));
+        assert!(invoke(update, Value::Number(1.0)).is_empty());
+        assert!(matches!(
+            invoke(update, Value::Number(0.7)).as_slice(),
+            [UiEffect::CompleteUi { .. }]
+        ));
+        assert!(invoke(update, Value::Number(5.0)).is_empty());
+    }
+
+    #[test]
+    fn press_and_frame_callbacks_reject_wrong_payload_types() {
+        for source in [
+            "import ui.widgets.*; canvas {}.onUpdate { value: Bool -> }",
+            "import ui.widgets.*; canvas { button { text(\"Alice\") }.onPressedChange { value: Float -> } }",
+            "import ui.widgets.*; canvas { text(\"Bob\").onPressedChange { value: Bool -> } }",
+        ] {
+            assert!(
+                evaluate_ui_component_named(
+                    "memory://alice.ui.hks",
+                    source,
+                    UiContext::default(),
+                    &TextureCatalog::default(),
+                    &TermCatalog::default()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_layout_properties_update_without_rebuilding_pressed_nodes() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+                global var amount: Float = 0.25
+                canvas { column {}.at(.abs(20, 100 * (1 - amount))).size(.abs(80, 100 * amount)) }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("dynamic geometry compiles");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("column")
+        };
+        assert_eq!(column.layout.height, Some(25.0));
+        assert_eq!(column.layout.top, Some(75.0));
+        let evaluator = UiPropertyEvaluator::default();
+        for (size, property, expected) in [
+            (true, column.layout.reactive_size.as_ref(), 75.0),
+            (false, column.layout.reactive_position.as_ref(), 25.0),
+        ] {
+            let mut property = property
+                .expect("property is extracted, not structural")
+                .clone();
+            property
+                .globals
+                .insert("amount".into(), Value::Number(0.75));
+            let value = evaluator
+                .evaluate(&property, &crate::ui::UiModels::default())
+                .expect("new geometry");
+            let layout = ui_geometry(&value, size).expect("typed geometry");
+            assert_eq!(
+                if size { layout.height } else { layout.top },
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn width_after_size_overrides_only_width() {
+        for size in [".fit()", ".abs(80, 120)"] {
+            let screen = evaluate_ui_component_named(
+                "memory://alice.ui.hks",
+                &format!("import ui.widgets.*; canvas {{ column {{}}.size({size}).width(200) }}"),
+                UiContext::default(),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("ordered layout modifiers");
+            let ScreenNode::Column(column) = &screen.children[0] else {
+                panic!("column")
+            };
+            assert_eq!(column.layout.width, Some(200.0));
+            assert!(column.layout.size_width_override);
+        }
+    }
 
     #[test]
     fn image_button_preserves_outer_placement_in_all_visual_states() {
@@ -5186,10 +5579,13 @@ canvas {
 global let displayAvailable = preferences.displayAvailable()
 global let fullscreen = preferences.fullscreen()
 global let bgmVolume = audio.bgmVolume()
-canvas {
+@ui
+global fn preferenceScreen() -> UiNode {
+ canvas {
     button { text("Settings") }.enabled(displayAvailable)
     button { text("Fullscreen") }.enabled(fullscreen)
     progress(bgmVolume)
+ }
 }"#,
             context,
             &TextureCatalog::default(),
@@ -5206,6 +5602,33 @@ canvas {
             panic!("expected progress")
         };
         assert_eq!(bar.value, 0.25);
+    }
+
+    #[test]
+    fn geometry_constructors_depend_on_arguments_not_unrelated_ui_models() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            "import ui.widgets.*; global var unrelated: Bool = false; global var x: Float = 20; canvas { column {}.at(.abs(x, 30)).size(.abs(80, 40)) }",
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(),
+        ).expect("geometry compiles");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("column")
+        };
+        let position = column
+            .layout
+            .reactive_position
+            .as_deref()
+            .expect("position");
+        let size = column.layout.reactive_size.as_deref().expect("size");
+        assert_eq!(
+            position.dependencies,
+            std::collections::BTreeSet::from(["x".into()])
+        );
+        assert!(
+            size.dependencies.is_empty(),
+            "static geometry has dependencies {:?}",
+            size.dependencies
+        );
     }
 
     #[test]

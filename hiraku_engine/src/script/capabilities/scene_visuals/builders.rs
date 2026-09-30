@@ -150,6 +150,11 @@ builder! {
     wait["await"]() -> () => await_transition;
 }
 
+builder! {
+    stage_animation, StageAnimationHandle, "StageAnimation", 21;
+    wait["await"]() -> () => await_transition;
+}
+
 pub(super) fn register(
     registry: &mut NativeRegistry<CharacterContext>,
 ) -> Result<(), RegistrationError> {
@@ -165,5 +170,6 @@ pub(super) fn register(
     stage_camera::register_hks(registry)?;
     stage_view::register_hks(registry)?;
     picture_tint::register_hks(registry)?;
+    stage_animation::register_hks(registry)?;
     Ok(())
 }

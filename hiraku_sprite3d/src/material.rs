@@ -184,6 +184,16 @@ mod tests {
     }
 
     #[test]
+    fn natural_size_blur_retains_radius_for_shader_dimension_resolution() {
+        let material = Sprite3dMaterial::try_from(&Sprite3d {
+            blur: 4.0,
+            ..default()
+        })
+        .expect("natural-size blur");
+        assert_eq!(material.uniform.blur, Vec4::new(4.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
     fn screen_rule_applies_after_layer_composition() {
         let mask = Handle::<Image>::default();
         let sprite = Sprite3d {

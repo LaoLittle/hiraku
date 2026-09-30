@@ -239,6 +239,10 @@ fn video_transform(
     background_view: Option<&crate::render::camera::CameraView>,
 ) -> Transform {
     let mut transform = super::pictures::viewed_picture_transform(picture, canvas, background_view);
+    let size = picture.size.map(Vec2::from_array).unwrap_or(canvas);
+    transform.translation += transform.rotation
+        * (((Vec2::splat(0.5) - Vec2::from_array(picture.pivot)) * size).extend(0.0)
+            * transform.scale);
     if let Some(index) = previous {
         let incoming = &pictures[&picture.id];
         transform.translation.z = incoming.layer - (incoming.previous.len() - index) as f32 * 0.001;
@@ -249,7 +253,6 @@ fn video_transform(
         transform =
             super::pictures::screen_picture_transform(transform, canvas, camera, projection);
     }
-    let size = picture.size.map(Vec2::from_array).unwrap_or(canvas);
     transform.scale *= Vec3::new(size.x, size.y, 1.0);
     transform
 }

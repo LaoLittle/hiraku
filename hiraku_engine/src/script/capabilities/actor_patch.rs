@@ -194,7 +194,10 @@ mod tests {
             .expect("complete blur");
         assert!(matches!(runtime.step().expect("clear blur"),
             Some(StoryRuntimeEvent::Effect(StoryEffect::ActorBlur { radius: 0.0, animation, .. })) if animation.duration() == 0.0));
-        assert!(matches!(runtime.step().expect("complete script"), Some(StoryRuntimeEvent::Completed(_))));
+        assert!(matches!(
+            runtime.step().expect("complete script"),
+            Some(StoryRuntimeEvent::Completed(_))
+        ));
         assert!(runtime.step().expect("exhausted script").is_none());
     }
 

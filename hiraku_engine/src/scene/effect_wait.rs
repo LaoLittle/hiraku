@@ -79,6 +79,13 @@ pub fn complete(
                     use crate::stage::runtime::StageCommand;
                     match command {
                         StageCommand::Close { .. } => false,
+                        StageCommand::Play { id, playback, .. } => {
+                            state.id == *id
+                                && (!spatial.ready(state)
+                                    || state.animation.as_ref().is_some_and(|animation| {
+                                        animation.id == *playback && !animation.completed
+                                    }))
+                        }
                         StageCommand::Clip { id, .. } => state.id == *id && !spatial.ready(state),
                         StageCommand::Open { id, .. } | StageCommand::Place { id, .. } => {
                             state.id == *id && !spatial.ready(state)
@@ -106,7 +113,9 @@ pub fn complete(
                         && groups.get(*root).is_ok_and(|group| group.is_animating())
                 })
             }
-            SceneEffect::Picture(P::Clear | P::StopMotion { .. } | P::Noise { .. }) => false,
+            SceneEffect::Picture(
+                P::Clear | P::StopMotion { .. } | P::Noise { .. } | P::Pivot { .. },
+            ) => false,
             SceneEffect::Picture(command) => {
                 let (P::Show { id, .. }
                 | P::Hide { id, .. }
@@ -173,7 +182,8 @@ pub fn complete(
                         P::Clear
                         | P::StopMotion { .. }
                         | P::Noise { .. }
-                        | P::PostProcess { .. } => false,
+                        | P::PostProcess { .. }
+                        | P::Pivot { .. } => false,
                     }
                 } else {
                     false

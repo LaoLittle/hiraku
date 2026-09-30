@@ -2,7 +2,7 @@ use super::super::audio_runtime::{NamedSfxChannel, SfxChannel, SfxCompletion, St
 use super::*;
 use std::time::Duration;
 
-fn stop_sfx_channel(world: &mut World, channel: &str, duration: Duration) {
+pub(in crate::scene) fn stop_sfx_channel(world: &mut World, channel: &str, duration: Duration) {
     let entities: Vec<_> = world
         .query::<(Entity, &NamedSfxChannel)>()
         .iter(world)

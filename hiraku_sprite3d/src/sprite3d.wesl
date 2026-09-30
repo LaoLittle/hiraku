@@ -81,7 +81,7 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) front: bool) -> @location
         let weights = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
         let natural_size = select(vec2<f32>(textureDimensions(atlas)), sprite.layers[0].rect.zw, sprite.layers[0].rect.z > 0.0);
         let quad_size = select(natural_size, sprite.blur.yz, all(sprite.blur.yz > vec2<f32>(0.0)));
-        let step_uv = vec2<f32>(sprite.blur.x) / max(quad_size, vec2<f32>(1.0));
+        let step_uv = vec2<f32>(sprite.blur.x * 0.5) / max(quad_size, vec2<f32>(1.0));
         for (var y = 0u; y < 5u; y += 1u) {
             for (var x = 0u; x < 5u; x += 1u) {
                 let offset = vec2<f32>(f32(x) - 2.0, f32(y) - 2.0) * step_uv;

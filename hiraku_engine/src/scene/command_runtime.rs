@@ -7,6 +7,7 @@ mod ui_commands;
 
 use crate::script::navigation::{NavigationKind, NavigationReset};
 use audio_commands::dispatch_audio_command;
+pub(super) use audio_commands::stop_sfx_channel;
 use dialogue_commands::dispatch_dialogue_command;
 pub use ingress::drive_story_runtime;
 pub(super) use ingress::evaluate_ui_at;

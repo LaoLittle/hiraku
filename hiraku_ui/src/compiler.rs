@@ -249,7 +249,13 @@ impl<'h> Lower<'_, 'h> {
                         self.manifest.callable_name(id).is_some_and(|name| {
                             matches!(
                                 name.rsplit('.').next(),
-                                Some("onClick" | "onChange" | "onCommit")
+                                Some(
+                                    "onClick"
+                                        | "onChange"
+                                        | "onCommit"
+                                        | "onUpdate"
+                                        | "onPressedChange"
+                                )
                             )
                         })
                     }

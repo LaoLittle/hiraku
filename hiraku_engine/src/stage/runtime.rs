@@ -5,6 +5,12 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StageCommand {
+    Play {
+        id: u64,
+        playback: u64,
+        name: String,
+        looping: bool,
+    },
     Clip {
         id: u64,
         view: String,
@@ -42,6 +48,8 @@ pub struct StageSnapshot {
     pub path: String,
     pub views: BTreeMap<String, StageViewSnapshot>,
     pub actors: BTreeMap<String, String>,
+    #[serde(default)]
+    pub animation: Option<super::animation::StagePlayback>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -79,6 +87,10 @@ impl StageSnapshot {
         if self.id == 0
             || self.path.trim().is_empty()
             || self
+                .animation
+                .as_ref()
+                .is_some_and(|animation| !animation.valid())
+            || self
                 .views
                 .iter()
                 .any(|(name, view)| name.trim().is_empty() || !view.valid())
@@ -99,6 +111,7 @@ impl StageSnapshot {
         let id = match &command {
             StageCommand::Open { .. } => None,
             StageCommand::Close { id }
+            | StageCommand::Play { id, .. }
             | StageCommand::Clip { id, .. }
             | StageCommand::View { id, .. }
             | StageCommand::Camera { id, .. }
@@ -110,6 +123,19 @@ impl StageSnapshot {
             }
         }
         match command {
+            StageCommand::Play {
+                playback,
+                name,
+                looping,
+                ..
+            } => {
+                if playback == 0 || name.trim().is_empty() {
+                    return Err("invalid stage animation request".into());
+                }
+                state.as_mut().ok_or("stage is not open")?.animation = Some(
+                    super::animation::StagePlayback::new(playback, name, looping),
+                );
+            }
             StageCommand::Clip { view, clip, .. } => {
                 if !clip.valid() {
                     return Err("invalid stage view clip".into());
@@ -134,6 +160,7 @@ impl StageSnapshot {
                         },
                     )]),
                     actors: BTreeMap::new(),
+                    animation: None,
                 });
             }
             StageCommand::Close { .. } => *state = None,
@@ -243,7 +270,7 @@ pub(crate) struct StageRuntime {
     path: Option<String>,
     id: Option<u64>,
     handle: Option<Handle<StageDefinition>>,
-    root: Option<Entity>,
+    pub(super) root: Option<Entity>,
     instantiated: bool,
     pub error: Option<String>,
     pub definition: Option<StageDefinition>,

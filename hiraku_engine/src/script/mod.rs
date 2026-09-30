@@ -30,6 +30,7 @@ pub(crate) use stdlib::profile_source;
 pub(crate) use ui_vm::UiComposition;
 pub(crate) use ui_vm::authoring_api as ui_authoring_api;
 pub(crate) use ui_vm::ui_argument_to_stored;
+pub(crate) use ui_vm::ui_geometry;
 pub(crate) use ui_vm::validate_ui_source;
 
 pub use animation::{AnimationPhase, AnimationSpec, Easing};

@@ -450,6 +450,9 @@ struct Lowerer<'hir, 'manifest> {
     numeric_dependencies: BTreeMap<usize, BTreeSet<usize>>,
     float_requirements: BTreeSet<usize>,
     numeric_resolved: bool,
+    /// Initialization types discovered after function signatures are available.
+    /// Recheck bodies with these types instead of retaining provisional Any HIR.
+    inferred_globals: BTreeMap<String, ScriptType>,
 }
 
 impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
@@ -537,6 +540,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             numeric_dependencies: BTreeMap::new(),
             float_requirements: BTreeSet::new(),
             numeric_resolved: false,
+            inferred_globals: BTreeMap::new(),
         }
     }
 
@@ -584,6 +588,32 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             ),
             false,
         );
+        let mut inferred_globals = self.inferred_globals.clone();
+        for statement in &source.statements {
+            if let Stmt::Global {
+                name,
+                type_annotation: None,
+                ..
+            } = statement
+            {
+                let symbol = self.symbol(name);
+                if !inferred_globals.contains_key(name)
+                    && let Some(global) = self.global_names.get(&symbol)
+                    && let Some(ty) = self.types.get(self.globals[global.0 as usize].ty)
+                    && *ty != ScriptType::Any
+                    && !is_untyped_none(ty)
+                {
+                    inferred_globals.insert(name.clone(), ty.clone());
+                }
+            }
+        }
+        // Monotonic: each pass resolves at least one previously unknown global.
+        // This also handles initializer dependencies through script functions.
+        if inferred_globals.len() > self.inferred_globals.len() {
+            let hints = self.numeric_hints.clone();
+            let numeric_resolved = self.numeric_resolved;
+            return self.recheck(source, inferred_globals, hints, numeric_resolved);
+        }
         if !self.numeric_resolved && !self.float_requirements.is_empty() {
             let mut hints = self.float_requirements.clone();
             let mut pending = hints.iter().copied().collect::<Vec<_>>();
@@ -598,20 +628,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             }
             // Solve use-site constraints before producing the final typed HIR. The
             // second pass also rechecks earlier uses against the resolved types.
-            let mut resolved = Self::new(self.arena, source, self.manifest);
-            // Numeric inference rebuilds local typing state, not the project's
-            // imported interface. Its signatures refer to this symbol table.
-            resolved.symbols = SymbolInterner::from_manifest(self.symbols.manifest())
-                .expect("the existing project symbol table is valid");
-            resolved.external_functions = self.external_functions;
-            resolved.external_receiver_functions = self.external_receiver_functions;
-            resolved.external_types = self.external_types;
-            resolved.external_globals = self.external_globals;
-            resolved.external_statement_hooks = self.external_statement_hooks;
-            resolved.external_type_parameters = self.external_type_parameters;
-            resolved.numeric_hints = hints;
-            resolved.numeric_resolved = true;
-            return resolved.lower(source);
+            let globals = self.inferred_globals.clone();
+            return self.recheck(source, globals, hints, true);
         }
         if !self.errors.is_empty() {
             return Err(self.errors);
@@ -647,6 +665,29 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             functions,
             entry,
         })
+    }
+
+    fn recheck(
+        self,
+        source: &Program,
+        globals: BTreeMap<String, ScriptType>,
+        numeric_hints: BTreeSet<usize>,
+        numeric_resolved: bool,
+    ) -> Result<HirProgram<'hir>, Vec<LoweringError>> {
+        let mut resolved = Self::new(self.arena, source, self.manifest);
+        // Imported signatures and inferred named types refer to this symbol table.
+        resolved.symbols = SymbolInterner::from_manifest(self.symbols.manifest())
+            .expect("the existing project symbol table is valid");
+        resolved.external_functions = self.external_functions;
+        resolved.external_receiver_functions = self.external_receiver_functions;
+        resolved.external_types = self.external_types;
+        resolved.external_globals = self.external_globals;
+        resolved.external_statement_hooks = self.external_statement_hooks;
+        resolved.external_type_parameters = self.external_type_parameters;
+        resolved.numeric_hints = numeric_hints;
+        resolved.numeric_resolved = numeric_resolved;
+        resolved.inferred_globals = globals;
+        resolved.lower(source)
     }
 
     fn symbol(&mut self, name: &str) -> SymbolId {
@@ -784,6 +825,7 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             let ty = type_annotation
                 .as_ref()
                 .and_then(|ty| self.type_from_ast(ty))
+                .or_else(|| self.inferred_globals.get(name).cloned())
                 .unwrap_or(ScriptType::Any);
             self.push_global(name, ty, *mutable, false, Some(*span));
         }
@@ -2860,6 +2902,24 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
         expression: &Expr,
         expected: Option<&ScriptType>,
     ) -> &'hir HirExpr<'hir> {
+        if let Some(ScriptType::Union(types)) = expected
+            && (matches!(expression.kind, ExprKind::Symbol(_))
+                || matches!(&expression.kind, ExprKind::Call { callee, .. } if matches!(callee.kind, ExprKind::Symbol(_))))
+        {
+            // Deferred alternatives do not add another owner for a contextual
+            // constructor/getter. Keep ambiguous concrete unions ambiguous.
+            let mut owners = types.iter().filter(|ty| {
+                !matches!(
+                    ty,
+                    ScriptType::Binding(_) | ScriptType::Callable { .. } | ScriptType::Function
+                )
+            });
+            if let Some(owner) = owners.next()
+                && owners.next().is_none()
+            {
+                return self.lower_expression_expected(expression, Some(owner));
+            }
+        }
         if expected == Some(&ScriptType::Symbol)
             && let ExprKind::Symbol(name) = &expression.kind
         {
@@ -5013,6 +5073,37 @@ mod tests {
     }
     use super::*;
     use crate::parse_program;
+
+    #[test]
+    fn functions_see_inferred_global_types_instead_of_provisional_any() {
+        for source in [
+            "fn read() -> Bool { available }\nglobal let available = true",
+            "fn select() { available }\nfn read() -> Bool { chosen }\nglobal let available = true\nglobal let chosen = select()",
+            "global let label = \"alice\"\nfn read() -> String { label }",
+        ] {
+            let syntax = parse_program(source).expect("synthetic globals parse");
+            let arena = HirArena::new();
+            let hir = lower_to_hir(&arena, &syntax, None)
+                .expect("global inference precedes final function checking");
+            assert!(
+                hir.globals
+                    .iter()
+                    .all(|global| hir.types.get(global.ty) != Some(&ScriptType::Any))
+            );
+        }
+        for source in [
+            "global let available = true\nfn read() -> String { available }",
+            "global let missing = null\nfn read() -> String { missing }",
+            "global let available: Any = true\nfn read() -> Bool { available }",
+        ] {
+            let syntax = parse_program(source).expect("invalid types still parse");
+            let arena = HirArena::new();
+            assert!(
+                lower_to_hir(&arena, &syntax, None).is_err(),
+                "must not weaken static checking: {source}"
+            );
+        }
+    }
 
     #[test]
     fn unknown_native_methods_do_not_cascade_through_fluent_calls() {

@@ -5,9 +5,26 @@ use bevy::{
     ui::{VisualBox, widget::NodeImageMode},
     ui_widgets::Button,
 };
+use std::time::Duration;
 
 #[derive(Clone, Debug, Message)]
-pub struct UiEffectMessage(pub UiEffect);
+pub struct UiEffectMessage(pub UiEffect, pub Option<Entity>);
+
+/// Looping UI audio cannot outlive the screen that started it.
+#[derive(Component)]
+pub(crate) struct UiSoundOwner(Entity);
+
+pub(crate) fn cleanup_ui_sounds(
+    roots: Query<(), With<ScreenUiRoot>>,
+    sounds: Query<(Entity, &UiSoundOwner)>,
+    mut commands: Commands,
+) {
+    for (sound, owner) in &sounds {
+        if !roots.contains(owner.0) {
+            commands.entity(sound).try_despawn();
+        }
+    }
+}
 
 #[derive(Component)]
 pub(crate) struct OverlayLifetime(pub Timer);
@@ -339,6 +356,14 @@ pub fn recompose_screen_ui(
             commands.entity(child).try_despawn();
         }
         commands.entity(root).add_children(&next);
+        if let Some(callback) = &screen.on_update {
+            commands.entity(root).insert((
+                super::ui_timers::UiUpdate(callback.clone()),
+                crate::render::ui_quad::UiImageAssets(handles.clone()),
+            ));
+        } else {
+            commands.entity(root).remove::<super::ui_timers::UiUpdate>();
+        }
         commands
             .entity(root)
             .insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
@@ -419,6 +444,11 @@ pub(super) fn spawn_screen_ui(
         .id();
 
     let mut image_handles = Vec::new();
+    if let Some(callback) = &screen.on_update {
+        commands
+            .entity(root)
+            .insert(super::ui_timers::UiUpdate(callback.clone()));
+    }
     commands
         .entity(root)
         .insert(super::ui_timers::UiTimersPaused(screen.timers_paused));
@@ -430,7 +460,7 @@ pub(super) fn spawn_screen_ui(
             .entity(root)
             .insert(super::ui_visuals::ScreenFade::new(screen.fade_seconds));
     }
-    if !screen.timers.is_empty() {
+    if !screen.timers.is_empty() || screen.on_update.is_some() {
         commands.entity(root).insert((
             super::ui_timers::UiTimers::new(&screen.timers),
             super::ui_timers::UiTimersPaused(screen.timers_paused),
@@ -456,7 +486,7 @@ pub(super) fn spawn_screen_ui(
     );
     commands.entity(root).add_children(&children);
 
-    if !screen.timers.is_empty() {
+    if !screen.timers.is_empty() || screen.on_update.is_some() {
         commands
             .entity(root)
             .insert(crate::render::ui_quad::UiImageAssets(image_handles.clone()));
@@ -1452,6 +1482,30 @@ pub(super) fn apply_live_layout_bindings(
     entity: Entity,
     layout: &ScreenLayout,
 ) {
+    let properties = [
+        (true, layout.reactive_size.as_deref()),
+        (false, layout.reactive_position.as_deref()),
+    ]
+    .into_iter()
+    // Materialization already evaluated immutable geometry. Do not attach a
+    // per-frame evaluator to every static artwork in a long history list.
+    .filter_map(|(size, property)| {
+        property
+            .filter(|property| !property.dependencies.is_empty())
+            .map(|property| (size, property.clone(), u64::MAX))
+    })
+    .collect::<Vec<_>>();
+    if !properties.is_empty() {
+        commands.entity(entity).insert(UiReactiveGeometry {
+            properties,
+            preserve_width: layout.size_width_override,
+        });
+    }
+    if let Some(callback) = layout.on_pressed_change.as_deref() {
+        commands
+            .entity(entity)
+            .insert(super::ui_timers::UiPressCallback(callback.clone()));
+    }
     if let Some(factor) = layout.hover_brightness {
         commands
             .entity(entity)
@@ -1749,9 +1803,15 @@ pub fn process_ui_effects(
     user_settings: Res<UserSettings>,
     mut effects: MessageReader<UiEffectMessage>,
 ) {
-    for UiEffectMessage(effect) in effects.read() {
+    for UiEffectMessage(effect, owner) in effects.read() {
         match effect {
-            UiEffect::PlaySfx { name, volume } => {
+            UiEffect::StopSfx { channel } => {
+                let channel = channel.clone();
+                commands.queue(move |world: &mut World| {
+                    super::command_runtime::stop_sfx_channel(world, &channel, Duration::ZERO)
+                });
+            }
+            UiEffect::PlaySfx { name, volume } | UiEffect::PlaySfxChannel { name, volume, .. } => {
                 let Some(definition) = audio.resolve_sfx(name) else {
                     warn!("UI sound effect `{name}` is not defined");
                     continue;
@@ -1760,13 +1820,38 @@ pub fn process_ui_effects(
                     *volume,
                     user_settings.sfx_volume * user_settings.master_volume,
                 );
-                commands.spawn((
+                let channel = match effect {
+                    UiEffect::PlaySfxChannel {
+                        channel, looped, ..
+                    } => Some((channel.clone(), *looped)),
+                    _ => None,
+                };
+                if let Some((channel, _)) = &channel {
+                    let channel = channel.clone();
+                    commands.queue(move |world: &mut World| {
+                        super::command_runtime::stop_sfx_channel(world, &channel, Duration::ZERO)
+                    });
+                }
+                let mut sound = commands.spawn((
                     SfxChannel { volume: *volume },
                     bevy::audio::AudioPlayer::<AudioSource>(
                         asset_server.load(definition.path.clone()),
                     ),
-                    PlaybackSettings::DESPAWN.with_volume(Volume::Linear(playback_volume)),
+                    (if channel.as_ref().is_some_and(|(_, looped)| *looped) {
+                        PlaybackSettings::LOOP
+                    } else {
+                        PlaybackSettings::DESPAWN
+                    })
+                    .with_volume(Volume::Linear(playback_volume)),
                 ));
+                if let Some((channel, _)) = channel {
+                    sound.insert(super::audio_runtime::NamedSfxChannel(channel));
+                }
+                if matches!(effect, UiEffect::PlaySfxChannel { looped: true, .. })
+                    && let Some(owner) = owner
+                {
+                    sound.insert(UiSoundOwner(*owner));
+                }
             }
             _ => warn!("state-changing UI action reached the passive effect dispatcher"),
         }
@@ -1792,6 +1877,23 @@ fn apply_screen_button_image(
     }
 }
 
+fn image_button_node(button: &ScreenUiImageButton, interaction: PickingInteraction) -> &Node {
+    match interaction {
+        PickingInteraction::Pressed if button.enabled => {
+            if button.pressed_texture.is_some() {
+                button.pressed_node.as_ref()
+            } else {
+                button.hovered_node.as_ref()
+            }
+        }
+        PickingInteraction::Hovered if button.enabled || button.hovered_when_disabled => {
+            button.hovered_node.as_ref()
+        }
+        _ => None,
+    }
+    .unwrap_or(&button.normal_node)
+}
+
 pub fn handle_screen_image_buttons(
     mut screen_state: ResMut<ScreenUiState>,
     mut responses: MessageWriter<ScriptResponseMessage>,
@@ -1813,6 +1915,8 @@ pub fn handle_screen_image_buttons(
             continue;
         }
 
+        node.set_if_neq(image_button_node(button, *interaction).clone());
+
         match *interaction {
             PickingInteraction::Pressed if button.enabled => {
                 transform.scale = Vec2::splat(button.press_scale);
@@ -1820,10 +1924,6 @@ pub fn handle_screen_image_buttons(
                     image.image = texture.clone();
                     image.texture_atlas = None;
                     image.rect = button.pressed_rect;
-                    *node = button
-                        .pressed_node
-                        .clone()
-                        .unwrap_or_else(|| button.normal_node.clone());
                     continue;
                 }
                 image.image = button
@@ -1835,10 +1935,6 @@ pub fn handle_screen_image_buttons(
                     .clone()
                     .or_else(|| button.normal_atlas.clone());
                 image.rect = button.hovered_rect.or(button.normal_rect);
-                *node = button
-                    .hovered_node
-                    .clone()
-                    .unwrap_or_else(|| button.normal_node.clone());
             }
             PickingInteraction::Hovered if button.enabled || button.hovered_when_disabled => {
                 transform.scale = Vec2::splat(button.hover_scale);
@@ -1851,24 +1947,18 @@ pub fn handle_screen_image_buttons(
                     .clone()
                     .or_else(|| button.normal_atlas.clone());
                 image.rect = button.hovered_rect.or(button.normal_rect);
-                *node = button
-                    .hovered_node
-                    .clone()
-                    .unwrap_or_else(|| button.normal_node.clone());
             }
             PickingInteraction::None => {
                 transform.scale = Vec2::ONE;
                 image.image = button.normal_texture.clone();
                 image.texture_atlas = button.normal_atlas.clone();
                 image.rect = button.normal_rect;
-                *node = button.normal_node.clone();
             }
             _ => {
                 transform.scale = Vec2::ONE;
                 image.image = button.normal_texture.clone();
                 image.texture_atlas = button.normal_atlas.clone();
                 image.rect = button.normal_rect;
-                *node = button.normal_node.clone();
             }
         }
     }
@@ -2234,6 +2324,86 @@ pub fn update_ui_text_bindings(
             node.width = percent(progress * 100.0);
         }
         binding.rendered_revision = revision;
+    }
+}
+
+#[derive(Component)]
+pub(crate) struct UiReactiveGeometry {
+    properties: Vec<(bool, crate::ui::PropertyComputation, u64)>,
+    preserve_width: bool,
+}
+
+/// Layout properties update in place, including while picking holds the node.
+/// Keep this separate from the progress/widget queries to avoid mutable Node
+/// aliases and let Bevy schedule the systems using their component accesses.
+pub(crate) fn update_ui_geometry(
+    evaluator: Local<crate::script::UiPropertyEvaluator>,
+    models: Res<UiModels>,
+    parents: Query<&ChildOf>,
+    states: Query<&super::widgets::UiLocalState>,
+    mut nodes: Query<(
+        Entity,
+        &mut UiReactiveGeometry,
+        &mut Node,
+        Option<&mut ScreenUiImageButton>,
+        Option<&PickingInteraction>,
+    )>,
+    mut redraw: crate::redraw::Redraw,
+) {
+    for (entity, mut geometry, mut node, mut button, interaction) in &mut nodes {
+        let preserve_width = geometry.preserve_width;
+        geometry
+            .properties
+            .retain_mut(|(size, expression, revision)| {
+                let changed = refresh_local_binding(entity, expression, &parents, &states);
+                if *revision == models.revision() && !changed {
+                    return true;
+                }
+                let models_changed = crate::script::refresh_ui_property_models(expression, &models);
+                if *revision != u64::MAX && !changed && !models_changed {
+                    *revision = models.revision();
+                    return true;
+                }
+                *revision = models.revision();
+                match evaluator
+                    .evaluate(expression, &models)
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| {
+                        crate::script::ui_geometry(&value, *size).map_err(|error| error.to_string())
+                    }) {
+                    Ok(layout) => {
+                        // These properties belong to the normal artwork. Updating
+                        // the displayed Node directly would replace hover/press
+                        // geometry until the next pointer movement reapplies it.
+                        let mut next = button
+                            .as_ref()
+                            .map_or_else(|| node.clone(), |button| button.normal_node.clone());
+                        let width = next.width;
+                        apply_screen_layout(&mut next, &layout);
+                        if *size && preserve_width {
+                            next.width = width;
+                        }
+                        if let Some(button) = button.as_deref_mut() {
+                            if button.normal_node != next {
+                                button.normal_node = next;
+                            }
+                            let active = image_button_node(
+                                button,
+                                interaction.copied().unwrap_or(PickingInteraction::None),
+                            );
+                            node.set_if_neq(active.clone());
+                        } else {
+                            node.set_if_neq(next);
+                        }
+                        redraw.request();
+                        true
+                    }
+                    Err(error) => {
+                        crate::script::emit_script_diagnostic("UI geometry failed", &error);
+                        false
+                    }
+                }
+            });
     }
 }
 
@@ -3819,6 +3989,309 @@ mod tests {
                 .0,
             Color::BLACK
         );
+    }
+
+    #[test]
+    fn held_controls_receive_geometry_updates_in_place() {
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://alice.ui.hks",
+            "import ui.widgets.*; global var amount: Float = 0.25; canvas { column {}.at(.abs(20, 100 * (1 - amount))).size(.abs(80, 100 * amount)).width(90) }",
+            crate::script::ui_runtime::UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("geometry fixture");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("column")
+        };
+        let mut app = App::new();
+        app.init_resource::<UiModels>()
+            .add_systems(Update, update_ui_geometry);
+        let root = app
+            .world_mut()
+            .spawn(super::widgets::UiLocalState(
+                screen.composition.expect("composition").globals.clone(),
+            ))
+            .id();
+        let properties = [
+            (
+                true,
+                column
+                    .layout
+                    .reactive_size
+                    .as_deref()
+                    .expect("size")
+                    .clone(),
+                u64::MAX,
+            ),
+            (
+                false,
+                column
+                    .layout
+                    .reactive_position
+                    .as_deref()
+                    .expect("position")
+                    .clone(),
+                u64::MAX,
+            ),
+        ]
+        .into();
+        let entity = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                PickingInteraction::Pressed,
+                Node {
+                    width: px(90),
+                    ..default()
+                },
+                UiReactiveGeometry {
+                    properties,
+                    preserve_width: true,
+                },
+            ))
+            .id();
+        for (amount, height, top) in [(0.25, 25.0, 75.0), (0.75, 75.0, 25.0)] {
+            app.world_mut()
+                .get_mut::<super::widgets::UiLocalState>(root)
+                .expect("local state")
+                .0
+                .insert("amount".into(), hiraku_script::Value::Number(amount));
+            app.update();
+            let node = app.world().get::<Node>(entity).expect("same entity");
+            assert_eq!(node.width, px(90));
+            assert_eq!(node.height, px(height));
+            assert_eq!(node.top, px(top));
+            assert_eq!(
+                app.world().get::<PickingInteraction>(entity),
+                Some(&PickingInteraction::Pressed)
+            );
+        }
+    }
+
+    #[test]
+    fn looping_ui_audio_dies_with_its_owner_not_other_sounds() {
+        let mut app = App::new();
+        app.add_systems(Update, cleanup_ui_sounds);
+        let root = app.world_mut().spawn(ScreenUiRoot).id();
+        let sound = app.world_mut().spawn(UiSoundOwner(root)).id();
+        let unrelated = app.world_mut().spawn_empty().id();
+        app.update();
+        assert!(app.world().entities().contains(sound));
+        app.world_mut().despawn(root);
+        app.update();
+        assert!(!app.world().entities().contains(sound));
+        assert!(app.world().entities().contains(unrelated));
+    }
+
+    #[test]
+    fn image_hover_geometry_is_stable_across_pointer_moves_and_normal_updates() {
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://alice.ui.hks",
+            "import ui.widgets.*; global var x: Float = 20; canvas { column {}.at(.abs(x, 20)).size(.abs(100, 50)) }",
+            crate::script::ui_runtime::UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("synthetic geometry");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("column")
+        };
+        let mut app = App::new();
+        app.init_resource::<UiModels>()
+            .init_resource::<ScreenUiState>()
+            .add_message::<PointerClick>()
+            .add_message::<ScriptResponseMessage>()
+            // Reproduce geometry evaluation after the hover appearance update.
+            .add_systems(
+                Update,
+                (handle_screen_image_buttons, update_ui_geometry).chain(),
+            );
+        let root = app
+            .world_mut()
+            .spawn(super::widgets::UiLocalState(
+                screen.composition.expect("composition").globals.clone(),
+            ))
+            .id();
+        let mut normal = Node::default();
+        apply_screen_layout(&mut normal, &column.layout);
+        let hovered = Node {
+            left: px(30),
+            top: px(10),
+            width: px(120),
+            height: px(60),
+            ..normal.clone()
+        };
+        let button = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                PickingInteraction::Hovered,
+                ImageNode::default(),
+                normal.clone(),
+                UiTransform::IDENTITY,
+                UiReactiveGeometry {
+                    properties: vec![
+                        (
+                            true,
+                            column
+                                .layout
+                                .reactive_size
+                                .as_deref()
+                                .expect("size")
+                                .clone(),
+                            u64::MAX,
+                        ),
+                        (
+                            false,
+                            column
+                                .layout
+                                .reactive_position
+                                .as_deref()
+                                .expect("position")
+                                .clone(),
+                            u64::MAX,
+                        ),
+                    ],
+                    preserve_width: false,
+                },
+                ScreenUiImageButton {
+                    root,
+                    value: None,
+                    enabled: true,
+                    hovered_when_disabled: false,
+                    normal_rect: None,
+                    normal_texture: Handle::default(),
+                    normal_atlas: None,
+                    hovered_rect: None,
+                    hovered_texture: Some(Handle::default()),
+                    hovered_atlas: None,
+                    hovered_node: Some(hovered.clone()),
+                    pressed_texture: None,
+                    pressed_rect: None,
+                    pressed_node: None,
+                    normal_node: normal,
+                    hover_scale: 1.0,
+                    press_scale: 1.0,
+                },
+            ))
+            .id();
+        for x in [20.0, 40.0, 40.0] {
+            app.world_mut()
+                .get_mut::<super::widgets::UiLocalState>(root)
+                .expect("state")
+                .0
+                .insert("x".into(), hiraku_script::Value::Number(x));
+            // Bevy may mark the same aggregate hover state changed on a move.
+            *app.world_mut()
+                .get_mut::<PickingInteraction>(button)
+                .expect("pointer") = PickingInteraction::Hovered;
+            app.update();
+            assert_eq!(
+                *app.world().get::<Node>(button).expect("hover geometry"),
+                hovered
+            );
+            assert_eq!(
+                app.world()
+                    .get::<ScreenUiImageButton>(button)
+                    .expect("normal cache")
+                    .normal_node
+                    .left,
+                px(x as f32)
+            );
+        }
+        *app.world_mut()
+            .get_mut::<PickingInteraction>(button)
+            .expect("leave") = PickingInteraction::None;
+        app.update();
+        let node = app.world().get::<Node>(button).expect("restored geometry");
+        assert_eq!(node.left, px(40));
+        assert_eq!(node.top, px(20));
+        assert_eq!(node.width, px(100));
+        assert_eq!(node.height, px(50));
+    }
+
+    #[test]
+    fn clock_and_typewriter_ticks_do_not_recompute_unrelated_geometry() {
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://alice.ui.hks",
+            "import ui.widgets.*; global var unrelated: Bool = false; global var x: Float = 20; canvas { column {}.at(.abs(x, 20)).size(.abs(100, 50)) }",
+            crate::script::ui_runtime::UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("geometry fixture");
+        let ScreenNode::Column(column) = &screen.children[0] else {
+            panic!("column")
+        };
+        let mut app = App::new();
+        app.init_resource::<UiModels>()
+            .add_systems(Update, update_ui_geometry);
+        let root = app
+            .world_mut()
+            .spawn(super::widgets::UiLocalState(
+                screen.composition.expect("composition").globals.clone(),
+            ))
+            .id();
+        let rows = (0..128)
+            .map(|_| {
+                app.world_mut()
+                    .spawn((
+                        ChildOf(root),
+                        Node::default(),
+                        UiReactiveGeometry {
+                            properties: vec![
+                                (
+                                    true,
+                                    column
+                                        .layout
+                                        .reactive_size
+                                        .as_deref()
+                                        .expect("size")
+                                        .clone(),
+                                    u64::MAX,
+                                ),
+                                (
+                                    false,
+                                    column
+                                        .layout
+                                        .reactive_position
+                                        .as_deref()
+                                        .expect("position")
+                                        .clone(),
+                                    u64::MAX,
+                                ),
+                            ],
+                            preserve_width: false,
+                        },
+                    ))
+                    .id()
+            })
+            .collect::<Vec<_>>();
+        app.update();
+        for &row in &rows {
+            let mut node = app.world_mut().get_mut::<Node>(row).expect("row");
+            // Sentinels detect reevaluation even if the computed value is equal.
+            node.left = px(999);
+            node.width = px(777);
+        }
+        for tick in 0..6 {
+            app.world_mut()
+                .resource_mut::<UiModels>()
+                .set("time", StoredValue::Int(tick));
+            app.world_mut().resource_mut::<UiModels>().set(
+                "dialogue",
+                StoredValue::Map(BTreeMap::from([(
+                    "revealedCharacters".into(),
+                    StoredValue::Int(tick),
+                )])),
+            );
+            app.world_mut()
+                .get_mut::<super::widgets::UiLocalState>(root)
+                .expect("state")
+                .0
+                .insert(
+                    "unrelated".into(),
+                    hiraku_script::Value::Bool(tick % 2 == 0),
+                );
+            app.update();
+            for &row in &rows {
+                let node = app.world().get::<Node>(row).expect("same row");
+                assert_eq!(node.left, px(999));
+                assert_eq!(node.width, px(777));
+            }
+        }
     }
 
     #[test]

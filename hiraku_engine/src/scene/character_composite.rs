@@ -432,13 +432,11 @@ fn compose_groups(
             .actor_blurs
             .get(&identity.actor_id)
             .map_or(0.0, |blur| blur.radius);
-        let padded_size = size + Vec2::splat(blur * 4.0);
+        let padded_size = size + Vec2::splat(blur * 2.0);
         if blur > 0.0 {
             for layer in &mut layers {
-                layer.bounds.min =
-                    (layer.bounds.min * size + Vec2::splat(blur * 2.0)) / padded_size;
-                layer.bounds.max =
-                    (layer.bounds.max * size + Vec2::splat(blur * 2.0)) / padded_size;
+                layer.bounds.min = (layer.bounds.min * size + Vec2::splat(blur)) / padded_size;
+                layer.bounds.max = (layer.bounds.max * size + Vec2::splat(blur)) / padded_size;
             }
         }
         let sprite = Sprite3d {

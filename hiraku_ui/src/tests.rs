@@ -11,6 +11,48 @@ mod api {
     fn display(_context: &mut (), _value: HksBindable<String>) -> Result<(), NativeError> {
         Ok(())
     }
+    #[hks]
+    fn sample(_context: &mut ()) -> Result<i64, NativeError> {
+        Ok(1)
+    }
+}
+
+#[test]
+fn native_property_reads_are_explicit_and_unknown_hosts_remain_conservative() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut registry = NativeRegistry::<()>::new();
+    api::register_hks(&mut registry).expect("native samples");
+    let document = UiDocument::compile(
+        "memory://alice.ui.hks",
+        vec![ScriptSource {
+            path: "memory://alice.ui.hks".into(),
+            namespace: None,
+            source: "fn value() -> Int { sample() }".into(),
+        }],
+        &registry.manifest(),
+        RenderOptions::plain(),
+    )
+    .expect("sample property compiles");
+    let module = &document.program.modules[document.entry.0 as usize];
+    let callable = Value::Function {
+        module: Some(document.entry.0),
+        symbol: module.bytecode.symbols.find("value").expect("getter"),
+    };
+    let inputs = BTreeMap::from([
+        ("time".into(), Value::Int(1)),
+        ("unrelated".into(), Value::Bool(false)),
+    ]);
+    let conservative =
+        PropertyComputation::new(document.program.clone(), callable.clone(), inputs.clone());
+    assert_eq!(
+        conservative.dependencies,
+        BTreeSet::from(["time".into(), "unrelated".into()])
+    );
+    let declared =
+        PropertyComputation::with_native_reads(document.program, callable, inputs, |name| {
+            (name == "sample").then(|| BTreeSet::from(["time".into()]))
+        });
+    assert_eq!(declared.dependencies, BTreeSet::from(["time".into()]));
 }
 
 fn document(source: &str) -> UiDocument {

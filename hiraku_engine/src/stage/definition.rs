@@ -156,6 +156,12 @@ impl StageCameraPose {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StageDefinition {
     pub scene: Option<String>,
+    /// Named model clips and optional material opacity curves, in seconds.
+    #[serde(default)]
+    pub animations: BTreeMap<String, super::animation::StageAnimation>,
+    #[serde(skip)]
+    #[dependency]
+    pub(super) animation_handles: Vec<Handle<AnimationClip>>,
     /// For pre-lit scenery; defaults to the materials authored in the model.
     #[serde(default)]
     pub unlit: bool,
@@ -187,6 +193,14 @@ pub struct StageDefinition {
 }
 impl StageDefinition {
     pub fn validate(&self) -> Result<(), String> {
+        if !self.animations.is_empty() && self.scene.is_none() {
+            return Err("stage animations require a model scene".into());
+        }
+        for (name, animation) in &self.animations {
+            if name.trim().is_empty() || !animation.valid() {
+                return Err(format!("invalid stage animation `{name}`"));
+            }
+        }
         for (name, material) in &self.materials {
             if name.trim().is_empty() || !material.validate() {
                 return Err(format!("invalid stage material `{name}`"));

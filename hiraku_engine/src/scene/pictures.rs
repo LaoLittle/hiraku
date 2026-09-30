@@ -39,8 +39,11 @@ pub struct PictureState {
     pub id: String,
     pub path: String,
     pub rect: Option<[f32; 4]>,
-    /// Center position in virtual-screen percentages; offscreen values allowed.
+    /// Pivot position in virtual-screen percentages; offscreen values allowed.
     pub position: [f32; 2],
+    /// Normalized bottom-left pivot; placement identifies this point.
+    #[serde(default = "center_pivot")]
+    pub pivot: [f32; 2],
     pub scale: f32,
     pub rotation: f32,
     pub layer: f32,
@@ -129,6 +132,10 @@ pub struct PictureOscillation {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PictureCommand {
+    Pivot {
+        id: String,
+        pivot: [f32; 2],
+    },
     PostProcess {
         id: String,
         parameters: crate::effect::post_process::EffectParameters,
@@ -213,6 +220,10 @@ fn values(p: &PictureState) -> [f32; 5] {
     [p.position[0], p.position[1], p.scale, p.rotation, p.alpha]
 }
 
+fn center_pivot() -> [f32; 2] {
+    [0.5; 2]
+}
+
 fn picture_dissolve_mask(
     picture: &PictureState,
     assets: &AssetServer,
@@ -270,6 +281,18 @@ pub(super) fn apply_picture_command(
         return Err("video pictures currently support opacity, pose and transitions, but not RGB tint, blur, noise or atlas slicing".into());
     }
     match command {
+        PictureCommand::Pivot { id, pivot } => {
+            if !pivot
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            {
+                return Err("picture pivot must be finite and within 0..1".into());
+            }
+            let picture = pictures
+                .get_mut(&id)
+                .ok_or_else(|| format!("picture `{id}` is not shown"))?;
+            picture.pivot = pivot;
+        }
         PictureCommand::Noise { id, grid, interval } => {
             if grid.iter().any(|size| *size == 0 || *size > 16384)
                 || !interval.is_finite()
@@ -444,6 +467,9 @@ pub(super) fn apply_picture_command(
                 seconds,
                 remove: false,
             });
+            let pivot = pictures
+                .get(&id)
+                .map_or(center_pivot(), |picture| picture.pivot);
             pictures.insert(
                 id.clone(),
                 PictureState {
@@ -464,6 +490,7 @@ pub(super) fn apply_picture_command(
                     path,
                     rect,
                     position: [initial[0], initial[1]],
+                    pivot,
                     scale: initial[2],
                     rotation: initial[3],
                     layer,
@@ -752,6 +779,9 @@ pub fn sync_pictures(
         };
         existing.insert(key.clone());
         let size = picture.size.map(Vec2::from_array);
+        if sprite.pivot != Vec2::from_array(picture.pivot) {
+            sprite.pivot = Vec2::from_array(picture.pivot);
+        }
         if sprite.custom_size != size {
             sprite.custom_size = size;
         }
@@ -842,6 +872,7 @@ pub fn sync_pictures(
             picture.path.clone(),
         ));
         sprite.custom_size = picture.size.map(Vec2::from_array);
+        sprite.pivot = Vec2::from_array(picture.pivot);
         sprite.slice = picture.slice;
         sprite.clip = picture
             .resolved_clip
@@ -1113,6 +1144,73 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn pivot_survives_replacement_and_snapshot_without_retiring_backing_pivot() {
+        let mut pictures = shown();
+        assert!(tick_picture(
+            pictures.get_mut("room").expect("entrance"),
+            0.3
+        ));
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Pivot {
+                id: "room".into(),
+                pivot: [0.25, 0.75],
+            },
+        )
+        .expect("set pivot");
+        let old = pictures["room"].clone();
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Show {
+                view: old.view,
+                dissolve: None,
+                post_process: None,
+                video: None,
+                replace: true,
+                screen_space: false,
+                size: old.size,
+                slice: None,
+                color: None,
+                id: old.id,
+                path: "bob.png".into(),
+                rect: None,
+                position: old.position,
+                scale: 2.0,
+                rotation: 90.0,
+                layer: old.layer,
+                seconds: 1.0,
+            },
+        )
+        .expect("replace image");
+        apply_picture_command(
+            &mut pictures,
+            PictureCommand::Pivot {
+                id: "room".into(),
+                pivot: [0.5; 2],
+            },
+        )
+        .expect("reset incoming pivot");
+        assert_eq!(pictures["room"].pivot, [0.5; 2]);
+        assert_eq!(pictures["room"].previous[0].pivot, [0.25, 0.75]);
+        let saved = hiraku_script::hson::to_vec(&pictures).expect("save pivot");
+        let restored: BTreeMap<String, PictureState> =
+            hiraku_script::hson::from_slice(&saved).expect("restore pivot");
+        assert_eq!(restored, pictures);
+        for pivot in [[f32::NAN, 0.5], [-0.1, 0.5], [0.5, 1.1]] {
+            assert!(
+                apply_picture_command(
+                    &mut pictures,
+                    PictureCommand::Pivot {
+                        id: "room".into(),
+                        pivot
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn replacement_reuses_the_outgoing_render_entity_as_its_backing() {

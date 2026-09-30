@@ -786,6 +786,7 @@ mod tests {
         data.scene.pictures.insert(
             "room".into(),
             PictureState {
+                pivot: [0.25, 0.75],
                 view: crate::scene::pictures::PictureView::Scene,
                 dissolve: None,
                 video: None,
