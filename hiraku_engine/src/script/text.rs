@@ -32,10 +32,13 @@ pub(super) fn evaluate_recorded(
         source,
         context: Arc::new(context),
     };
-    let rendered = text
-        .render_with(|_, source| Ok(source.to_owned()))
-        .map_err(|error| TemplateError::InvalidExpression(error.to_string()))?
-        .to_markup();
+    let rendered = evaluate_with(&text.source, |root| {
+        match value.captures.get(root) {
+            Some(value) => vm.export_value(value).map(Some),
+            None => vm.lexical_value(root),
+        }
+        .map_err(|error| TemplateError::InvalidExpression(error.to_string()))
+    })?;
     if records.len() >= 64 {
         records.remove(0);
     }
@@ -44,17 +47,6 @@ pub(super) fn evaluate_recorded(
         rendered: rendered.clone(),
     });
     Ok(rendered)
-}
-
-pub(super) fn evaluate(vm: &Vm, value: &TemplateValue) -> Result<String, TemplateError> {
-    let source = vm.eval_template_value_with(value, |source| Ok(source.to_owned()))?;
-    evaluate_with(&source, |root| {
-        match value.captures.get(root) {
-            Some(value) => vm.export_value(value).map(Some),
-            None => vm.lexical_value(root),
-        }
-        .map_err(|error| TemplateError::InvalidExpression(error.to_string()))
-    })
 }
 
 pub(super) fn evaluate_with(
@@ -135,6 +127,23 @@ line(1)
                     })
                     .unwrap_or_else(|| panic!("expected text argument in {call:?}"));
                 assert_eq!(hiraku_text::parse(source).expect("render").text, "It's 1");
+                let records = runtime.take_text_records();
+                let captured = records
+                    .iter()
+                    .find(|record| record.text.source.contains("{a}"))
+                    .expect("original source survives wrapper evaluation");
+                assert_eq!(
+                    captured.text.context.values["a"].as_ref(),
+                    &TextValue::Int(1)
+                );
+                assert_eq!(
+                    captured
+                        .text
+                        .render_with(|_, _| Ok("Translated {a}".into()))
+                        .expect("translation uses captured local")
+                        .text,
+                    "Translated 1"
+                );
                 return;
             }
         }

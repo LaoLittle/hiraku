@@ -2226,6 +2226,8 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
                 (
                     "entries".into(),
                     ScriptType::List(Box::new(ScriptType::Record(BTreeMap::from([
+                        ("id".into(), ScriptType::Int),
+                        ("canRollback".into(), ScriptType::Bool),
                         ("speaker".into(), ScriptType::String),
                         ("text".into(), ScriptType::String),
                     ])))),
@@ -5864,6 +5866,38 @@ global fn preferenceScreen() -> UiNode {
             "static geometry has dependencies {:?}",
             size.dependencies
         );
+    }
+
+    #[test]
+    fn rollback_is_only_requested_by_an_explicit_game_callback() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            "import ui.widgets.*; screen { let entry = item(history.entries, 0); button { text(\"Back\") }.enabled(entry.canRollback).onClick { history.rollback(entry.id) } }",
+            UiContext::new(BTreeMap::from([("history".into(), StoredValue::Map(BTreeMap::from([
+                ("entries".into(), StoredValue::Array(vec![StoredValue::Map(BTreeMap::from([
+                    ("id".into(), StoredValue::Int(7)),
+                    ("canRollback".into(), StoredValue::Bool(true)),
+                    ("speaker".into(), StoredValue::String("alice".into())),
+                    ("text".into(), StoredValue::String("Ready".into())),
+                ]))])),
+                ("text".into(), StoredValue::String("Ready".into())),
+            ])))])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        ).expect("game defines rollback button");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("game callback"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+        )
+        .expect("explicit rollback callback");
+        assert!(matches!(
+            effects.as_slice(),
+            [UiEffect::HistoryRollback { id: 7 }]
+        ));
     }
 
     #[test]

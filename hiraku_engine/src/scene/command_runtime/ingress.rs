@@ -1197,6 +1197,7 @@ mod batch_tests {
             ))))
             .init_resource::<UserSettings>()
             .init_resource::<crate::ui::UiModels>()
+            .init_resource::<DialogueHistoryState>()
             .add_systems(Update, drive_story_runtime);
         app.update();
         let queue = app.world().resource::<PendingScriptCommands>();

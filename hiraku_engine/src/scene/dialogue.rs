@@ -121,6 +121,11 @@ impl DialogueHistoryState {
         &self,
         id: u64,
     ) -> Result<crate::state::SaveGameData, crate::storage::StorageError> {
+        if self.records.len() != self.entries.len() {
+            return Err(crate::storage::StorageError::InvalidSave(
+                "history checkpoint and dialogue tables do not match".into(),
+            ));
+        }
         let index = self
             .records
             .iter()
@@ -159,6 +164,44 @@ impl DialogueHistoryState {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn rollback_is_opt_in_and_discards_only_the_future_branch() {
+        let mut history = DialogueHistoryState::default();
+        for text in ["Ready", "Future"] {
+            history.push(DialogueSnapshot {
+                speaker: "alice".into(),
+                text: text.into(),
+            });
+        }
+        let id = history.records[0].id;
+        assert!(history.rollback_save(id).is_err());
+        let checkpoint = crate::state::SaveGameData {
+            resume_script: "alice.hks".into(),
+            ..default()
+        };
+        history.records[0].checkpoint = Some(std::sync::Arc::new(checkpoint));
+        let restored = history.rollback_save(id).expect("available checkpoint");
+        assert_eq!(restored.resume_script, "alice.hks");
+        assert_eq!(restored.dialogue_history.len(), 1);
+        assert_eq!(restored.history_records[0].id, id);
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "preparing rollback must not change live history"
+        );
+        assert!(history.rollback_save(u64::MAX).is_err());
+        history.restore(restored.dialogue_history);
+        history.restore_records(restored.history_records);
+        history.push(DialogueSnapshot {
+            speaker: "bob".into(),
+            text: "New branch".into(),
+        });
+        assert!(
+            history.records[1].id > id + 1,
+            "discarded IDs must not be reused"
+        );
+    }
 
     #[test]
     fn restore_replaces_future_history_and_obeys_current_limit() {

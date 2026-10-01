@@ -132,6 +132,11 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                     }
                 }
             };
+        if !history_records.is_empty() && history_records.len() != data.dialogue_history.len() {
+            return Err(StorageError::InvalidSave(
+                "history checkpoint and dialogue tables do not match".into(),
+            ));
+        }
         Ok(Self {
             history_records,
             thumbnail_png: Vec::new(),

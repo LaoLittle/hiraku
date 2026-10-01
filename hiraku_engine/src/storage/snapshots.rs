@@ -235,6 +235,42 @@ mod tests {
     }
 
     #[test]
+    fn history_checkpoints_and_translation_contexts_restore_shared_storage() {
+        let snapshot = fixture();
+        let context = std::sync::Arc::new(hiraku_text::template::TextSnapshot::default());
+        let records = (1..=2)
+            .map(|id| crate::state::HistoryRecord {
+                id,
+                checkpoint: Some(std::sync::Arc::new(crate::state::SaveGameData {
+                    vm_snapshot: Some(snapshot.clone()),
+                    resume_script: "alice.hks".into(),
+                    ..Default::default()
+                })),
+                text: vec![hiraku_text::template::LocalizableText {
+                    key: Some("greeting".into()),
+                    source: "Hello".into(),
+                    context: context.clone(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let bytes = encode(&Some(snapshot.clone()), &[], &records);
+        let saved: SharedSnapshots = bhson::from_slice(&bytes).expect("wire format");
+        assert_eq!(saved.text_contexts.len(), 1);
+        let (current, _, restored) = decode(&bytes).expect("history roundtrip");
+        assert_eq!(current, Some(snapshot.clone()));
+        assert_eq!(restored.len(), 2);
+        for record in &restored {
+            let checkpoint = record.checkpoint.as_ref().expect("checkpoint");
+            assert_eq!(checkpoint.vm_snapshot, Some(snapshot.clone()));
+            assert!(checkpoint.history_records.is_empty());
+        }
+        assert!(std::sync::Arc::ptr_eq(
+            &restored[0].text[0].context,
+            &restored[1].text[0].context
+        ));
+    }
+
+    #[test]
     fn corrupt_reference_tables_are_rejected() {
         let bytes = encode(&Some(fixture()), &[], &[]);
         for corruption in 0..3 {

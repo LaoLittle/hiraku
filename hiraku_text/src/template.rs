@@ -431,4 +431,30 @@ mod tests {
         assert_eq!(template.render(&old).expect("old").text, "Alice");
         assert_eq!(template.render(&current).expect("new").text, "Bob");
     }
+
+    #[test]
+    fn translation_can_use_other_captured_variables_without_executing_script() {
+        let text = LocalizableText {
+            key: Some("greeting".into()),
+            source: "Hello {name}".into(),
+            context: Arc::new(TextSnapshot {
+                values: BTreeMap::from([
+                    ("name".into(), Arc::new(TextValue::String("Alice".into()))),
+                    (
+                        "surname".into(),
+                        Arc::new(TextValue::String("#include evil".into())),
+                    ),
+                ]),
+            }),
+        };
+        let translated = text
+            .render_with(|key, source| {
+                assert_eq!(key, Some("greeting"));
+                assert_eq!(source, "Hello {name}");
+                Ok("Welcome {surname}".into())
+            })
+            .expect("translated captured values");
+        assert_eq!(translated.text, "Welcome #include evil");
+        assert!(text.render_with(|_, _| Ok("{time()}".into())).is_err());
+    }
 }
