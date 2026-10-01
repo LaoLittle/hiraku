@@ -25,6 +25,40 @@ use super::{
 };
 
 const UI_NODE_HANDLE_TYPE: u32 = 0x5549_4e4f;
+
+#[derive(Clone, Debug, PartialEq)]
+struct UiText(hiraku_script::runtime::TemplateValue);
+
+impl FromHksValue for UiText {
+    fn from_hks_value(value: &Value) -> Result<Self, NativeError> {
+        match value {
+            Value::TextTemplate(value) => Ok(Self(value.clone())),
+            Value::String(value) => Ok(Self(value.clone().into())),
+            _ => Err(NativeError::TypeMismatch("TextTemplate")),
+        }
+    }
+}
+
+impl HksScriptType for UiText {
+    fn hks_script_type<C>(_registry: &mut NativeRegistry<C>) -> ScriptType {
+        ScriptType::TextTemplate
+    }
+}
+
+fn resolve_ui_text(value: UiText, context: &UiVmContext) -> Result<String, UiVmError> {
+    let mut globals = context_globals(context);
+    globals.extend(
+        value
+            .0
+            .captures
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    let source = hiraku_script::eval_template(&value.0.source, &mut globals)
+        .map_err(|error| UiVmError::Invalid(error.to_string()))?;
+    super::text::evaluate_with(&source, |root| Ok(globals.get(root).cloned()))
+        .map_err(|error| UiVmError::Invalid(error.to_string()))
+}
 const UI_EFFECT_HANDLE_TYPE: u32 = 0x5549_4546;
 const UI_STDLIB_PATH: &str = "hiraku://std/ui.hks";
 const UI_STDLIB_SOURCE: &str = include_str!("std/ui.hks");
@@ -148,7 +182,7 @@ enum UiDraftKind {
     TextInput(HksBindable<String>),
     ChoiceOptions(HksCallable),
     Image(String),
-    Text(HksBindable<String>),
+    Text(HksBindable<UiText>),
     Term(TermId),
     Button(Value),
     Progress {
@@ -735,7 +769,7 @@ mod native_ui {
     #[hks(name = "text")]
     fn ui_text(
         context: &mut UiVmContext,
-        value: HksBindable<String>,
+        value: HksBindable<UiText>,
     ) -> Result<UiNodeHandle, NativeError> {
         Ok(context.insert(UiDraft::new(UiDraftKind::Text(value), None)))
     }
@@ -3101,13 +3135,13 @@ fn materialize_node(
         }
         UiDraftKind::Text(binding) => {
             let (text, reactive) = match binding {
-                HksBindable::Value(value) => (value, None),
+                HksBindable::Value(value) => (resolve_ui_text(value, context)?, None),
                 HksBindable::Binding(binding) => {
                     let reactive = reactive_binding(&binding, program, context);
                     let value = evaluate_binding_value(&reactive, registry, context)?;
-                    let value = String::from_hks_value(&value)
+                    let value = UiText::from_hks_value(&value)
                         .map_err(|error| UiVmError::Invalid(error.to_string()))?;
-                    (value, Some(reactive))
+                    (resolve_ui_text(value, context)?, Some(reactive))
                 }
             };
             let is_template = reactive.is_none() && text.contains("${");
@@ -3398,10 +3432,11 @@ fn materialize_node(
                         ));
                     }
                     let (text, size, align, children, text_color, text_shadow, font_family) = match normal {
-                        ScreenNode::Text(text) if text.reactive_text.is_some()
+                        ScreenNode::Text(mut text) if text.reactive_text.is_some()
                             || text.binding.is_some()
                             || text.layout.text_reveal.is_some()
                             || text.layout.reactive_text_reveal.is_some() => {
+                            text.align = Some(text.align.or(draft.text_align).unwrap_or(0.5));
                             (text.text.clone(), text.size, text.align, vec![ScreenNode::Text(text)], None, None, None)
                         }
                         ScreenNode::Text(text) => (text.text, text.size, text.align, Vec::new(), text.color, text.layout.text_shadow, text.layout.font_family),
@@ -3596,6 +3631,67 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_list_and_index_are_frozen_per_text_node() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://indices.ui.hks",
+            r##"import ui.widgets.*
+canvas {
+    let a = ["Alice", "Bob"]
+    var i = 0
+    while i < 2 {
+        text('#ruby("{i}")[{a[i]}]')
+        i += 1
+    }
+}"##,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("snapshot indexed UI");
+        for (index, expected) in ["Alice", "Bob"].into_iter().enumerate() {
+            let ScreenNode::Text(text) = &screen.children[index] else {
+                panic!("text node")
+            };
+            let document = hiraku_text::parse(&text.text).expect("resolved text");
+            assert_eq!(document.text, expected);
+            assert_eq!(document.ruby[0].reading, index.to_string());
+        }
+    }
+
+    #[test]
+    fn local_loop_variables_interpolate_in_raw_ruby_text() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://loop.ui.hks",
+            r####"import ui.widgets.*
+canvas {
+    var a = 0
+    while a <= 2 {
+        text("""
+        #ruby("{a}")[Iter {a}]
+        """)
+        a += 1
+    }
+}
+"####,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("loop text composes");
+        assert_eq!(screen.children.len(), 3);
+        for (index, node) in screen.children.iter().enumerate() {
+            let ScreenNode::Text(text) = node else {
+                panic!("text node")
+            };
+            let document = hiraku_text::parse(&text.text).expect("safe generated text");
+            assert_eq!(document.text, format!("Iter {index}"));
+            assert_eq!(document.ruby[0].reading, index.to_string());
+        }
+    }
 
     #[test]
     fn press_and_frame_callbacks_drive_hold_decay_and_confirm_once() {
@@ -3874,6 +3970,24 @@ canvas {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn placeholder_labels_are_valid_inline_text() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://settings.ui.hks",
+            r#"import ui.widgets.*
+                canvas {
+                    text("-")
+                    button { text("-") }
+                    let label = "-"
+                    text(label)
+                }"#,
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("placeholder UI builds");
+        assert!(matches!(&screen.children[0], ScreenNode::Text(text) if text.text == "-"));
+        assert!(matches!(&screen.children[1], ScreenNode::Button(button) if button.text == "-"));
+        assert!(matches!(&screen.children[2], ScreenNode::Text(text) if text.text == "-"));
     }
 
     #[test]
@@ -5114,6 +5228,62 @@ global fn viewer(imageName: String, title: String) -> UiNode {
         assert_eq!(shader.blend, crate::ui::UiShaderBlend::Multiply);
         assert_eq!(shader.path, "memory://screens/shaders/fade.wgsl");
         assert_eq!(shader.keys.len(), 2);
+    }
+
+    #[test]
+    fn narration_history_rows_do_not_emit_speaker_artwork() {
+        let entries = [("alice", "Hello"), ("", "A quiet room"), ("bob", "Goodbye")]
+            .into_iter().map(|(speaker, text)| StoredValue::Map(BTreeMap::from([
+                ("speaker".into(), StoredValue::String(speaker.into())),
+                ("text".into(), StoredValue::String(text.into())),
+            ]))).collect();
+        let screen = evaluate_ui_component_named(
+            "memory://history.ui.hks",
+            r#"import ui.widgets.*
+            fn historyEntry(speaker: String, message: String) -> UiNode {
+                column {
+                    if speaker != "" {
+                        column { spacer().size(.abs(139, 139)); text(speaker) }
+                    }
+                    text(message)
+                }
+            }
+            canvas {
+                column {
+                    var index = 0
+                    while index < count(history.entries) {
+                        let entry = item(history.entries, index)
+                        historyEntry(entry.speaker, entry.text)
+                        index += 1
+                    }
+                }
+            }"#,
+            UiContext::new(BTreeMap::from([("history".into(), StoredValue::Map(BTreeMap::from([
+                ("entries".into(), StoredValue::Array(entries)),
+            ])))])),
+            &TextureCatalog::default(), &TermCatalog::default(),
+        ).expect("mixed history builds");
+        let ScreenNode::Column(list) = &screen.children[0] else { panic!("history list"); };
+        for (row, expected) in list.children.iter().zip([2, 1, 2]) {
+            let ScreenNode::Column(row) = row else { panic!("history row"); };
+            assert_eq!(row.children.len(), expected);
+        }
+        let mut models = crate::ui::UiModels::default();
+        models.set("history", StoredValue::Map(BTreeMap::from([(
+            "entries".into(), StoredValue::Array(vec![StoredValue::Map(BTreeMap::from([
+                ("speaker".into(), StoredValue::String(String::new())),
+                ("text".into(), StoredValue::String("A quiet room".into())),
+            ]))]),
+        )])));
+        let renderer = screen.composition.as_ref().expect("history renderer");
+        let next = renderer.with_models(&models)
+            .render(&renderer.globals, &TextureCatalog::default(), &TermCatalog::default())
+            .expect("updated narration builds");
+        let ScreenNode::Column(list) = &next.children[0] else { panic!("updated history list"); };
+        assert_eq!(list.children.len(), 1);
+        let ScreenNode::Column(row) = &list.children[0] else { panic!("updated history row"); };
+        assert_eq!(row.children.len(), 1);
+        assert!(matches!(&row.children[0], ScreenNode::Text(text) if text.text == "A quiet room"));
     }
 
     #[test]

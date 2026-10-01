@@ -3176,7 +3176,8 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             self.float_requirements.extend(self.numeric_sources(value));
             return value;
         }
-        if expected == Some(&ScriptType::TextTemplate)
+        if (expected == Some(&ScriptType::TextTemplate)
+            || matches!(expected, Some(ScriptType::Union(types)) if types.contains(&ScriptType::TextTemplate) && !types.contains(&ScriptType::String)))
             && let ExprKind::String(value) = &expression.kind
         {
             return self.alloc_expression(

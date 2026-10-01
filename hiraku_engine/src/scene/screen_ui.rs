@@ -774,9 +774,10 @@ fn spawn_screen_node_entity(
                     ..default()
                 };
             } else {
+                let constrained = layout.width.is_some() || layout.width_percent.is_some();
                 node = Node {
-                    width: percent(100),
-                    min_width: px(0),
+                    width: if constrained { percent(100) } else { Val::Auto },
+                    min_width: if constrained { px(0) } else { Val::Auto },
                     flex_shrink: 0.0,
                     ..default()
                 };
@@ -3074,6 +3075,123 @@ mod tests {
         assert_eq!(viewport.width, vw(100));
         assert_eq!(viewport.height, vh(100));
     }
+
+    #[test]
+    fn text_labels_have_nonzero_layout() {
+        use bevy::app::{HierarchyPropagatePlugin, PropagateSet};
+        use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiSystems};
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::text::TextPlugin,
+        ));
+        app.init_resource::<bevy::ui::UiScale>()
+            .init_resource::<bevy::ui::ui_surface::UiSurface>()
+            .init_resource::<UiModels>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(
+                PostUpdate,
+            ))
+            .add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(
+                PostUpdate,
+            ))
+            .configure_sets(
+                PostUpdate,
+                (
+                    UiSystems::Prepare,
+                    UiSystems::Propagate,
+                    UiSystems::Content,
+                    UiSystems::Layout,
+                )
+                    .chain(),
+            )
+            .configure_sets(
+                PostUpdate,
+                PropagateSet::<ComputedUiTargetCamera>::default().in_set(UiSystems::Propagate),
+            )
+            .configure_sets(
+                PostUpdate,
+                PropagateSet::<ComputedUiRenderTargetInfo>::default().in_set(UiSystems::Propagate),
+            )
+            .add_systems(Update, super::super::rich_text::update)
+            .add_systems(
+                PostUpdate,
+                (
+                    bevy::ui::update::propagate_ui_target_cameras.in_set(UiSystems::Prepare),
+                    bevy::ui::widget::measure_text_system
+                        .in_set(UiSystems::Content)
+                        .after(bevy::text::detect_text_needs_rerender)
+                        .after(bevy::text::load_font_assets_into_font_collection),
+                    bevy::ui::ui_layout_system.in_set(UiSystems::Layout),
+                ),
+            );
+        app.world_mut().spawn((
+            Camera2d,
+            Camera {
+                computed: bevy::camera::ComputedCameraValues {
+                    target_info: Some(bevy::camera::RenderTargetInfo {
+                        physical_size: UVec2::new(2560, 1440),
+                        scale_factor: 1.0,
+                    }),
+                    ..default()
+                },
+                ..default()
+            },
+        ));
+
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://buttons.ui.hks",
+            r#"import ui.widgets.*
+            fn heading(label: String) -> UiNode {
+                text(label).at(.rel(13, 16)).fontSize(40)
+            }
+            fn testimony(label: String) -> UiNode {
+                button { row { text(label).fontSize(96) }.size(.fit()) }
+                    .size(.fit()).surface(0, 0, 0, 0)
+            }
+            canvas {
+                column {
+                    button { text("Alice").fontSize(56) }.size(.abs(1297, 220))
+                    let label = "Bob"
+                    button { text(label).fontSize(56) }.size(.abs(1297, 220))
+                    choiceOptions { index: Int, label: String ->
+                        button(index) { text(label).fontSize(56) }.size(.abs(1297, 220))
+                    }
+                }.size(.abs(1297, 900))
+                heading("Heading")
+                text("Placeholder").at(.rel(51, 34)).fontSize(36)
+                text("0.5").at(.rel(47, 16)).size(.rel(4, 3)).fontSize(40)
+                column {
+                    row { testimony("Objection"); text("Testimony").fontSize(96) }.gap(0).centered()
+                }.centered().size(.abs(1920, 120)).at(.abs(0, 1000))
+            }"#,
+            UiContext::new(BTreeMap::from([("choice".into(), StoredValue::Map(BTreeMap::from([
+                ("options".into(), StoredValue::Array(vec![StoredValue::String("Route A".into())])),
+            ])))])), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("synthetic buttons compile");
+        let server = app.world().resource::<AssetServer>().clone();
+        let root = app.world_mut().spawn(screen_root_node(&screen)).id();
+        for child in &screen.children {
+            let entity = spawn_screen_node_entity(
+            &mut app.world_mut().commands(), root, &server,
+            &UiFonts { regular: Handle::default(), _fonts: vec![] },
+            &UiStyle::default(), child, &mut vec![],
+            );
+            app.world_mut().commands().entity(root).add_child(entity);
+        }
+        app.world_mut().flush();
+        for _ in 0..5 { app.update(); }
+        let mut texts = app.world_mut().query::<(&Text, &ComputedNode)>();
+        let labels: Vec<_> = texts.iter(app.world())
+            .filter(|(text, _)| !text.0.is_empty())
+            .map(|(text, node)| (text.0.clone(), node.size())).collect();
+        assert_eq!(labels.len(), 8, "{labels:?}");
+        for (text, size) in labels {
+            assert!(size.x > 0.0 && size.y > 0.0, "{text}: {size:?}");
+        }
+    }
+
 
     #[test]
     fn rich_history_rows_measure_content_instead_of_viewport_height() {

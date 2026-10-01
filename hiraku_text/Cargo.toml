@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 typst-syntax = "0.15.1"
+typst-library = "0.15.1"
+typst-eval = "0.15.1"
+typst-utils = "0.15.1"
+comemo = "0.5.1"
 serde = { workspace = true, features = ["rc"] }
 thiserror.workspace = true
 hiraku-errors.workspace = true

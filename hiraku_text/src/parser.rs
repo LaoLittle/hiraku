@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeSet, ops::Range};
+use typst_library::foundations::{Binding, Scope, Value};
 use typst_syntax::{
     Source,
     ast::{self, AstNode, Expr},
 };
 
 use crate::{
-    Document, Ruby, TextError,
-    library::{self, Function},
+    Document, TextError, library,
+    template::{Segment, Selector, TextSnapshot, TextValue, parse_selector, scalar, segments},
 };
 
 const MAX_BYTES: usize = 64 * 1024;
@@ -14,6 +15,10 @@ const MAX_DEPTH: usize = 64;
 const MAX_NODES: usize = 16 * 1024;
 
 pub fn parse(text: &str) -> Result<Document, TextError> {
+    evaluate(text, None)
+}
+
+fn source(text: &str) -> Result<Source, TextError> {
     if text.len() > MAX_BYTES {
         return Err(TextError::new(
             "rich text exceeds the 64 KiB limit",
@@ -31,114 +36,380 @@ pub fn parse(text: &str) -> Result<Document, TextError> {
         .unwrap_or(0..0);
         return Err(TextError::new(error.message.to_string(), range));
     }
-    let mut evaluator = Evaluator {
+    Ok(source)
+}
+
+pub fn parse_with_snapshot(text: &str, snapshot: &TextSnapshot) -> Result<Document, TextError> {
+    evaluate(text, Some(snapshot))
+}
+
+fn evaluate(text: &str, snapshot: Option<&TextSnapshot>) -> Result<Document, TextError> {
+    let source = source(text)?;
+    let mut prefix = "__hiraku_data_".to_owned();
+    while text.contains(&prefix) {
+        prefix.push('_');
+    }
+    let mut lowerer = Lowerer {
         source: &source,
-        constants: BTreeMap::from([("br".into(), Value::Content(Document::plain("\n")))]),
+        snapshot,
+        scope: library::SCOPE.clone(),
+        constants: BTreeSet::from(["br".to_owned()]),
         nodes: 0,
+        bindings: 0,
+        prefix,
     };
-    let mut result = Document::default();
-    evaluator.markup(
-        source.root().cast().expect("Typst source root is markup"),
-        &mut result,
-        0,
-    )?;
-    Ok(result)
+    let (code, mappings) = lowerer.markup(source.root().cast().expect("markup"), 0)?;
+    crate::runtime::evaluate(code, lowerer.scope, &mappings)
 }
 
-#[derive(Clone)]
-enum Value {
-    String(String),
-    Content(Document),
-    Empty,
-}
-
-struct Evaluator<'a> {
+struct Lowerer<'a> {
     source: &'a Source,
-    constants: BTreeMap<String, Value>,
+    snapshot: Option<&'a TextSnapshot>,
+    scope: Scope,
+    constants: BTreeSet<String>,
     nodes: usize,
+    bindings: usize,
+    prefix: String,
 }
 
-impl Evaluator<'_> {
+pub(crate) fn selectors(text: &str) -> Result<Vec<Selector>, TextError> {
+    let source = source(text)?;
+    let mut output = Vec::new();
+    let mut nodes = vec![(source.root(), 0)];
+    let mut visited = 0;
+    while let Some((node, depth)) = nodes.pop() {
+        visited += 1;
+        if depth > MAX_DEPTH || visited > MAX_NODES || output.len() > MAX_NODES {
+            return Err(TextError::new(
+                "text selector limit exceeded",
+                0..text.len(),
+            ));
+        }
+        let range = source
+            .find(node.span())
+            .map(|node| node.range())
+            .unwrap_or(0..0);
+        match node.kind() {
+            typst_syntax::SyntaxKind::Str => {
+                for segment in string_segments(&text[range.clone()], range.start)? {
+                    if let Segment::Selector(selector) = segment {
+                        output.push(selector);
+                    }
+                }
+            }
+            typst_syntax::SyntaxKind::Markup => {
+                for (expr, range) in markup_exprs(&source, node.cast().expect("markup"))? {
+                    if matches!(expr, Expr::Text(_)) {
+                        for segment in segments(&text[range.clone()], range.start)? {
+                            if let Segment::Selector(selector) = segment {
+                                output.push(selector);
+                            }
+                        }
+                    } else {
+                        nodes.push((expr.to_untyped(), depth + 1));
+                    }
+                }
+            }
+            typst_syntax::SyntaxKind::CodeBlock => {
+                let block = &text[range.clone()];
+                output.push(parse_selector(&block[1..block.len() - 1], range)?);
+            }
+            typst_syntax::SyntaxKind::Text => {
+                for segment in segments(node.leaf_text().as_str(), range.start)? {
+                    if let Segment::Selector(selector) = segment {
+                        output.push(selector);
+                    }
+                }
+            }
+            _ => nodes.extend(node.children().rev().map(|node| (node, depth + 1))),
+        }
+    }
+    Ok(output)
+}
+
+fn markup_exprs<'a>(
+    source: &Source,
+    markup: ast::Markup<'a>,
+) -> Result<Vec<(Expr<'a>, std::ops::Range<usize>)>, TextError> {
+    let mut items = markup.exprs();
+    let mut output = Vec::new();
+    while let Some(expr) = items.next() {
+        let mut range = source
+            .find(expr.span())
+            .map(|node| node.range())
+            .unwrap_or(0..0);
+        if matches!(expr, Expr::Text(_)) {
+            loop {
+                match segments(&source.text()[range.clone()], range.start) {
+                    Err(error) if error.message == "unclosed text selector" => {
+                        let next = items.next().ok_or_else(|| error.clone())?;
+                        if !matches!(
+                            next,
+                            Expr::Text(_)
+                                | Expr::Space(_)
+                                | Expr::SmartQuote(_)
+                                | Expr::Shorthand(_)
+                        ) {
+                            return Err(error);
+                        }
+                        range.end = source
+                            .find(next.span())
+                            .map(|node| node.range().end)
+                            .unwrap_or(range.end);
+                    }
+                    Err(error) => return Err(error),
+                    Ok(_) => break,
+                }
+            }
+        }
+        output.push((expr, range));
+    }
+    Ok(output)
+}
+
+fn string_segments(token: &str, base: usize) -> Result<Vec<Segment>, TextError> {
+    let source = &token[1..token.len() - 1];
+    let mut output = Vec::new();
+    let mut offset = 0;
+    let mut start = 0;
+    let literal = |part: &str| -> Result<Segment, TextError> {
+        let code = typst_syntax::parse_code(&format!(
+            "\"{}\"",
+            part.replace("{{", "{").replace("}}", "}")
+        ));
+        let value = code
+            .children()
+            .find_map(|node| node.cast::<ast::Str>())
+            .ok_or_else(|| TextError::new("invalid text string", base..base + token.len()))?;
+        Ok(Segment::Markup(value.get().to_string()))
+    };
+    while offset < source.len() {
+        let rest = &source[offset..];
+        if rest.starts_with("\\u{") {
+            offset += rest.find('}').map(|end| end + 1).unwrap_or(rest.len());
+        } else if rest.starts_with('\\') {
+            offset += 1;
+            if let Some(ch) = source[offset..].chars().next() {
+                offset += ch.len_utf8();
+            }
+        } else if rest.starts_with("{{") || rest.starts_with("}}") {
+            offset += 2;
+        } else if rest.starts_with('{') {
+            if start < offset {
+                output.push(literal(&source[start..offset])?);
+            }
+            let end = rest.find('}').ok_or_else(|| {
+                TextError::new(
+                    "unclosed text selector",
+                    base + 1 + offset..base + token.len() - 1,
+                )
+            })?;
+            output.push(Segment::Selector(parse_selector(
+                &rest[1..end],
+                base + 1 + offset..base + 1 + offset + end + 1,
+            )?));
+            offset += end + 1;
+            start = offset;
+        } else {
+            offset += rest.chars().next().expect("UTF-8 suffix").len_utf8();
+        }
+    }
+    if start < source.len() {
+        output.push(literal(&source[start..])?);
+    }
+    Ok(output)
+}
+
+impl Lowerer<'_> {
+    fn range(&self, expr: Expr<'_>) -> Range<usize> {
+        self.source
+            .find(expr.span())
+            .map(|node| node.range())
+            .unwrap_or(0..0)
+    }
+
     fn error(&self, expr: Expr<'_>, message: impl Into<String>) -> TextError {
-        TextError::new(
-            message,
-            self.source
-                .find(expr.span())
-                .map(|node| node.range())
-                .unwrap_or(0..0),
-        )
+        TextError::new(message, self.range(expr))
+    }
+
+    fn bind(&mut self, value: Value) -> String {
+        let name = format!("{}{}", self.prefix, self.bindings);
+        self.bindings += 1;
+        self.scope
+            .bind(name.clone().into(), Binding::detached(value));
+        name
+    }
+
+    fn scalar(&mut self, value: &TextValue, range: Range<usize>) -> Result<String, TextError> {
+        if let TextValue::String(value) = value
+            && value.len() > MAX_BYTES
+        {
+            return Err(TextError::new(
+                "text selector exceeds the 64 KiB limit",
+                range,
+            ));
+        }
+        let native = match value {
+            TextValue::Int(value) => Value::Int(*value),
+            TextValue::Bool(value) => Value::Bool(*value),
+            TextValue::Float(value) if value.is_finite() => Value::Float((*value).into()),
+            TextValue::String(value) => Value::Str(value.as_str().into()),
+            TextValue::UInt(value) => match i64::try_from(*value) {
+                Ok(value) => Value::Int(value),
+                Err(_) => Value::Str(value.to_string().into()),
+            },
+            _ => {
+                return Err(TextError::new(
+                    "text selector must resolve to a finite scalar value",
+                    range,
+                ));
+            }
+        };
+        Ok(self.bind(native))
+    }
+
+    fn fragments(&mut self, segments: Vec<Segment>) -> Result<String, TextError> {
+        let mut output = String::new();
+        for segment in segments {
+            let value = match segment {
+                Segment::Markup(text) => self.bind(Value::Str(text.into())),
+                Segment::Selector(selector) => {
+                    let snapshot = self.snapshot.ok_or_else(|| {
+                        TextError::new(
+                            "text selectors require a data snapshot",
+                            selector.range.clone(),
+                        )
+                    })?;
+                    self.scalar(snapshot.resolve(&selector)?, selector.range.clone())?
+                }
+            };
+            output.push_str(&format!("#text({value});"));
+        }
+        Ok(output)
     }
 
     fn markup(
         &mut self,
         markup: ast::Markup<'_>,
-        out: &mut Document,
         depth: usize,
-    ) -> Result<(), TextError> {
+    ) -> Result<(String, Vec<(Range<usize>, Range<usize>)>), TextError> {
         let saved = self.constants.clone();
-        for expr in markup.exprs() {
-            let value = self.expr(expr, depth + 1)?;
-            match value {
-                Value::Content(document) => out.append(&document),
-                Value::String(text) => out.append(&Document::plain(text)),
-                Value::Empty => {}
-            }
-            if out.text.len() > MAX_BYTES {
-                return Err(self.error(expr, "expanded rich text exceeds the 64 KiB limit"));
-            }
+        let mut output = String::new();
+        let mut mappings = Vec::new();
+        for (expr, range) in markup_exprs(self.source, markup)? {
+            let start = output.len();
+            let code = if matches!(expr, Expr::Text(_)) {
+                self.check(expr, depth)?;
+                let text = &self.source.text()[range.clone()];
+                if self.snapshot.is_some() {
+                    self.fragments(segments(text, range.start)?)?
+                } else {
+                    let value = self.bind(Value::Str(text.into()));
+                    format!("#text({value});")
+                }
+            } else {
+                let code = self.expr(expr, depth + 1)?;
+                if matches!(expr, Expr::LetBinding(_)) {
+                    format!("#{code};")
+                } else {
+                    format!("#text({code});")
+                }
+            };
+            output.push_str(&code);
+            mappings.push((start..output.len(), range));
         }
         self.constants = saved;
-        Ok(())
+        Ok((output, mappings))
     }
 
-    fn expr(&mut self, expr: Expr<'_>, depth: usize) -> Result<Value, TextError> {
+    fn check(&mut self, expr: Expr<'_>, depth: usize) -> Result<(), TextError> {
         self.nodes += 1;
         if depth > MAX_DEPTH || self.nodes > MAX_NODES {
             return Err(self.error(expr, "rich text evaluation limit exceeded"));
         }
-        let value = match expr {
-            Expr::Text(v) => Value::String(v.get().to_string()),
-            Expr::Space(v) => Value::String(v.to_untyped().leaf_text().to_string()),
-            Expr::Shorthand(v) => Value::String(v.to_untyped().leaf_text().to_string()),
-            Expr::SmartQuote(v) => Value::String(v.to_untyped().leaf_text().to_string()),
-            Expr::Parbreak(v) => Value::String(v.to_untyped().leaf_text().to_string()),
-            Expr::Linebreak(_) => Value::String("\n".into()),
-            Expr::Escape(v) => Value::String(v.get().to_string()),
-            Expr::Str(v) => Value::String(v.get().to_string()),
-            Expr::ContentBlock(v) => Value::Content(self.body(v.body(), depth)?),
-            Expr::Strong(v) => {
-                let mut document = self.body(v.body(), depth)?;
-                for style in &mut document.styles {
-                    style.bold = true;
-                }
-                Value::Content(document)
+        Ok(())
+    }
+
+    fn expr(&mut self, expr: Expr<'_>, depth: usize) -> Result<String, TextError> {
+        self.check(expr, depth)?;
+        Ok(match expr {
+            Expr::Text(value) => self.bind(Value::Str(value.get().as_str().into())),
+            Expr::Space(value) => {
+                self.bind(Value::Str(value.to_untyped().leaf_text().as_str().into()))
             }
-            Expr::Emph(v) => {
-                let mut document = self.body(v.body(), depth)?;
-                for style in &mut document.styles {
-                    style.italic = true;
-                }
-                Value::Content(document)
+            Expr::Shorthand(value) => {
+                self.bind(Value::Str(value.to_untyped().leaf_text().as_str().into()))
             }
-            Expr::Ident(v) => self
-                .constants
-                .get(v.get().as_str())
-                .cloned()
-                .ok_or_else(|| self.error(expr, format!("unknown text constant `{}`", v.get())))?,
-            Expr::LetBinding(v) => {
-                let ast::LetBindingKind::Normal(ast::Pattern::Normal(Expr::Ident(name))) = v.kind()
+            Expr::SmartQuote(value) => {
+                self.bind(Value::Str(value.to_untyped().leaf_text().as_str().into()))
+            }
+            Expr::Parbreak(value) => {
+                self.bind(Value::Str(value.to_untyped().leaf_text().as_str().into()))
+            }
+            Expr::ListItem(value)
+                if value.body().exprs().all(|expr| matches!(expr, Expr::Space(_))) =>
+            {
+                let range = self.range(expr);
+                self.bind(Value::Str(self.source.text()[range].into()))
+            }
+            Expr::Linebreak(_) => "linebreak()".into(),
+            Expr::Escape(value) => self.bind(Value::Str(value.get().to_string().into())),
+            Expr::Str(value) => {
+                let mut text = String::new();
+                if let Some(snapshot) = self.snapshot {
+                    let range = self.range(expr);
+                    for segment in string_segments(&self.source.text()[range.clone()], range.start)?
+                    {
+                        text.push_str(&match segment {
+                            Segment::Markup(text) => text,
+                            Segment::Selector(selector) => {
+                                scalar(snapshot.resolve(&selector)?, selector.range.clone())?
+                            }
+                        });
+                    }
+                } else {
+                    text = value.get().to_string();
+                }
+                self.bind(Value::Str(text.into()))
+            }
+            Expr::Int(value) => self.bind(Value::Int(value.get())),
+            Expr::Float(value) => self.bind(Value::Float(value.get().into())),
+            Expr::Bool(value) => self.bind(Value::Bool(value.get())),
+            Expr::CodeBlock(_) => {
+                let range = self.range(expr);
+                let text = &self.source.text()[range.clone()];
+                let selector = parse_selector(&text[1..text.len() - 1], range)?;
+                let snapshot = self
+                    .snapshot
+                    .ok_or_else(|| self.error(expr, "text selectors require a data snapshot"))?;
+                self.scalar(snapshot.resolve(&selector)?, selector.range.clone())?
+            }
+            Expr::ContentBlock(value) => format!("[{}]", self.markup(value.body(), depth + 1)?.0),
+            Expr::Strong(value) => format!("strong[{}]", self.markup(value.body(), depth + 1)?.0),
+            Expr::Emph(value) => format!("emph[{}]", self.markup(value.body(), depth + 1)?.0),
+            Expr::Ident(value) => {
+                let name = value.get();
+                if !self.constants.contains(name.as_str()) {
+                    return Err(self.error(expr, format!("unknown text constant `{name}`")));
+                }
+                name.to_string()
+            }
+            Expr::LetBinding(value) => {
+                let ast::LetBindingKind::Normal(ast::Pattern::Normal(Expr::Ident(name))) =
+                    value.kind()
                 else {
                     return Err(self.error(expr, "only simple text constants are allowed; functions and destructuring are disabled"));
                 };
-                if library::lookup(name.get().as_str()).is_some() {
+                let name = name.get().to_string();
+                if library::contains(&name) && name != "br" {
                     return Err(self.error(expr, "text library functions cannot be shadowed"));
                 }
-                let init = v
+                let init = value
                     .init()
                     .ok_or_else(|| self.error(expr, "text constants require an initializer"))?;
-                let value = self.expr(init, depth + 1)?;
-                self.constants.insert(name.get().to_string(), value);
-                Value::Empty
+                let init = self.expr(init, depth + 1)?;
+                self.constants.insert(name.clone());
+                format!("let {name} = {init}")
             }
             Expr::FuncCall(call) => {
                 let Expr::Ident(name) = call.callee() else {
@@ -146,18 +417,20 @@ impl Evaluator<'_> {
                         self.error(expr, "only calls to the Hiraku text library are allowed")
                     );
                 };
-                let function = library::lookup(name.get().as_str()).ok_or_else(|| self.error(expr,
-                    format!("unknown Hiraku text function `{}`; the Typst standard library is disabled", name.get())))?;
-                let mut arguments = Vec::new();
-                for argument in call.args().items() {
-                    let ast::Arg::Pos(argument) = argument else {
+                let name = name.get();
+                if !library::contains(name.as_str()) || name == "br" {
+                    return Err(self.error(expr, format!("unknown Hiraku text function `{name}`; the Typst standard library is disabled")));
+                }
+                let mut args = Vec::new();
+                for arg in call.args().items() {
+                    let ast::Arg::Pos(arg) = arg else {
                         return Err(
                             self.error(expr, "named and spread text arguments are disabled")
                         );
                     };
-                    arguments.push(self.expr(argument, depth + 1)?);
+                    args.push(self.expr(arg, depth + 1)?);
                 }
-                self.call(function, arguments, expr)?
+                format!("{name}({})", args.join(","))
             }
             _ => {
                 return Err(self.error(
@@ -168,111 +441,14 @@ impl Evaluator<'_> {
                     ),
                 ));
             }
-        };
-        Ok(value)
-    }
-
-    fn body(&mut self, body: ast::Markup<'_>, depth: usize) -> Result<Document, TextError> {
-        let mut document = Document::default();
-        self.markup(body, &mut document, depth)?;
-        Ok(document)
-    }
-
-    fn call(
-        &self,
-        function: Function,
-        mut arguments: Vec<Value>,
-        expr: Expr<'_>,
-    ) -> Result<Value, TextError> {
-        let arity = match function {
-            Function::Linebreak => 0,
-            Function::Ruby | Function::Color => 2,
-            _ => 1,
-        };
-        if arguments.len() != arity {
-            return Err(self.error(
-                expr,
-                format!(
-                    "text function expects {arity} arguments, got {}",
-                    arguments.len()
-                ),
-            ));
-        }
-        if matches!(function, Function::Linebreak) {
-            return Ok(Value::Content(Document::plain("\n")));
-        }
-        let mut body = match arguments.pop().expect("checked nonzero arity") {
-            Value::Content(body) => body,
-            Value::String(text) => Document::plain(text),
-            Value::Empty => return Err(self.error(expr, "text function requires text or content")),
-        };
-        match function {
-            Function::Text => {}
-            Function::Strong => {
-                for style in &mut body.styles {
-                    style.bold = true;
-                }
-            }
-            Function::Emph => {
-                for style in &mut body.styles {
-                    style.italic = true;
-                }
-            }
-            Function::Strike => {
-                for style in &mut body.styles {
-                    style.strike = true;
-                }
-            }
-            Function::Underline => {
-                for style in &mut body.styles {
-                    style.underline = true;
-                }
-            }
-            Function::Ruby | Function::Color => {
-                let Value::String(parameter) = arguments.pop().expect("checked two arguments")
-                else {
-                    return Err(self.error(expr, "ruby/color requires a string parameter"));
-                };
-                if matches!(function, Function::Ruby) {
-                    if parameter.is_empty()
-                        || parameter.contains(['\n', '\r'])
-                        || body.text.is_empty()
-                        || body.text.contains(['\n', '\r'])
-                        || !body.ruby.is_empty()
-                    {
-                        return Err(self.error(expr, "ruby requires nonempty single-line reading and base; nested ruby is disabled"));
-                    }
-                    body.ruby.push(Ruby {
-                        start: 0,
-                        end: body.styles.len() as u32,
-                        reading: parameter,
-                    });
-                } else {
-                    let hex = parameter.strip_prefix('#').unwrap_or("");
-                    if !matches!(hex.len(), 6 | 8) || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
-                        return Err(self.error(expr, "color requires #RRGGBB or #RRGGBBAA"));
-                    }
-                    let mut color = [255; 4];
-                    for (i, channel) in color.iter_mut().enumerate().take(hex.len() / 2) {
-                        *channel =
-                            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("validated hex");
-                    }
-                    for style in &mut body.styles {
-                        if style.color.is_none() {
-                            style.color = Some(color);
-                        }
-                    }
-                }
-            }
-            Function::Linebreak => unreachable!("returned above"),
-        }
-        Ok(Value::Content(body))
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Ruby;
 
     #[test]
     fn ruby_and_nested_styles_use_display_indices() {
@@ -323,6 +499,20 @@ mod tests {
         );
         assert!(parse("#name").is_err());
         assert!(parse("#let linebreak = \"x\";#linebreak").is_err());
+    }
+
+    #[test]
+    fn empty_list_markers_are_literal_ui_labels() {
+        for source in ["-", "- ", "-\n-", "#text(\"-\")"] {
+            let expected = if source.starts_with('#') { "-" } else { source };
+            assert_eq!(parse(source).expect("literal label").text, expected);
+            assert_eq!(
+                parse_with_snapshot(source, &TextSnapshot::default())
+                    .expect("literal template label").text,
+                expected,
+            );
+        }
+        assert!(parse("- Alice").is_err());
     }
 
     #[test]

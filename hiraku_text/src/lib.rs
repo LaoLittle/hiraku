@@ -1,10 +1,11 @@
 mod document;
 mod library;
 mod parser;
+mod runtime;
 pub mod template;
 
 pub use document::{Document, Ruby, TextStyle};
-pub use parser::parse;
+pub use parser::{parse, parse_with_snapshot};
 
 use std::ops::Range;
 

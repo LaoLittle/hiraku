@@ -22,6 +22,7 @@ pub mod replay;
 mod runtime;
 mod stdlib;
 mod story_runtime;
+mod text;
 pub mod ui_runtime;
 mod ui_vm;
 pub(crate) use project::{StoryProgram, compile_story_program};

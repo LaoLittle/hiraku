@@ -2117,6 +2117,13 @@ impl Vm {
         self.eval_template_with(template, |source| Ok(source.to_string()))
     }
 
+    pub fn lexical_value(&self, name: &str) -> Result<Option<Value>, VmError> {
+        self.template_captures()
+            .get(name)
+            .map(|value| self.objects.export(value))
+            .transpose()
+    }
+
     /// Rewrites a lazy text template before evaluating its expressions.
     ///
     /// Embeddings can use this boundary for localization. The rewrite runs on
@@ -3409,6 +3416,20 @@ mod tests {
         assert!(
             matches!(vm.global("deferred").as_ref(), Some(Value::TextTemplate(value)) if value.source == "Hello ${undefinedName}\n#ruby(\"reader\")[Alice]")
         );
+    }
+
+    #[test]
+    fn braces_are_not_script_interpolation() {
+        let code = compile(
+            "global let text = \"{a[i]}\"",
+            &BuiltinManifest::new(std::iter::empty::<(&str, BuiltinId)>()),
+        );
+        let mut vm = Vm::new(code).expect("VM");
+        while !matches!(
+            vm.step().expect("literal string"),
+            Some(VmEvent::Completed(_))
+        ) {}
+        assert_eq!(vm.global("text"), Some(Value::String("{a[i]}".into())));
     }
 
     #[test]

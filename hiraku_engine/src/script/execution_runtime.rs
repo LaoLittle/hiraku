@@ -530,9 +530,7 @@ impl ExecutionRuntime {
                         }
                         hiraku_script::linked_vm::PreparedInvocation::Native(mut call) => {
                             evaluate_call_templates(&mut call, |text| {
-                                state
-                                    .vm
-                                    .eval_template_value_with(text, |source| Ok(source.to_owned()))
+                                super::text::evaluate(&state.vm, text)
                             })?;
                             Ok(Some(ExecutionEvent::Call { execution, call }))
                         }
@@ -605,9 +603,7 @@ impl ExecutionRuntime {
                         .get(&execution)
                         .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
                     evaluate_call_templates(&mut call, |text| {
-                        state
-                            .vm
-                            .eval_template_value_with(text, |source| Ok(source.to_owned()))
+                        super::text::evaluate(&state.vm, text)
                     })?;
                     Ok(Some(ExecutionEvent::Call { execution, call }))
                 }
@@ -808,7 +804,10 @@ fn evaluate_statement_template(
     value: StatementValue,
 ) -> Result<StatementValue, TemplateError> {
     match value {
-        StatementValue::TextTemplate(text) => Ok(StatementValue::String(vm.eval_template(&text)?)),
+        StatementValue::TextTemplate(text) => Ok(StatementValue::String(super::text::evaluate(
+            vm,
+            &text.into(),
+        )?)),
         StatementValue::Value(_) => Ok(StatementValue::Commit),
         value => Ok(value),
     }
