@@ -1730,11 +1730,9 @@ mod storage_actions {
             return Ok(None);
         }
         Ok(match crate::storage::load_save_metadata(&slot) {
-            Ok(_) => {
-                crate::storage::load_save_data(&slot)
-                    .err()
-                    .map(|error| error.to_string())
-            }
+            Ok(_) => crate::storage::load_save_data(&slot)
+                .err()
+                .map(|error| error.to_string()),
             Err(error) => Some(error.to_string()),
         })
     }
@@ -1768,8 +1766,9 @@ mod history_actions {
 
     #[hks]
     fn rollback(context: &mut UiVmContext, id: i64) -> Result<UiEffectHandle, NativeError> {
-        let id = u64::try_from(id).ok().filter(|id| *id > 0)
-            .ok_or_else(|| NativeError::message("history.rollback expects a positive history entry ID"))?;
+        let id = u64::try_from(id).ok().filter(|id| *id > 0).ok_or_else(|| {
+            NativeError::message("history.rollback expects a positive history entry ID")
+        })?;
         Ok(context.insert_effect(UiEffect::HistoryRollback { id }))
     }
 }
@@ -3995,8 +3994,12 @@ canvas {
                     let label = "-"
                     text(label)
                 }"#,
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("placeholder UI builds");
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("placeholder UI builds");
         assert!(matches!(&screen.children[0], ScreenNode::Text(text) if text.text == "-"));
         assert!(matches!(&screen.children[1], ScreenNode::Button(button) if button.text == "-"));
         assert!(matches!(&screen.children[2], ScreenNode::Text(text) if text.text == "-"));
@@ -5245,10 +5248,14 @@ global fn viewer(imageName: String, title: String) -> UiNode {
     #[test]
     fn narration_history_rows_do_not_emit_speaker_artwork() {
         let entries = [("alice", "Hello"), ("", "A quiet room"), ("bob", "Goodbye")]
-            .into_iter().map(|(speaker, text)| StoredValue::Map(BTreeMap::from([
-                ("speaker".into(), StoredValue::String(speaker.into())),
-                ("text".into(), StoredValue::String(text.into())),
-            ]))).collect();
+            .into_iter()
+            .map(|(speaker, text)| {
+                StoredValue::Map(BTreeMap::from([
+                    ("speaker".into(), StoredValue::String(speaker.into())),
+                    ("text".into(), StoredValue::String(text.into())),
+                ]))
+            })
+            .collect();
         let screen = evaluate_ui_component_named(
             "memory://history.ui.hks",
             r#"import ui.widgets.*
@@ -5270,30 +5277,53 @@ global fn viewer(imageName: String, title: String) -> UiNode {
                     }
                 }
             }"#,
-            UiContext::new(BTreeMap::from([("history".into(), StoredValue::Map(BTreeMap::from([
-                ("entries".into(), StoredValue::Array(entries)),
-            ])))])),
-            &TextureCatalog::default(), &TermCatalog::default(),
-        ).expect("mixed history builds");
-        let ScreenNode::Column(list) = &screen.children[0] else { panic!("history list"); };
+            UiContext::new(BTreeMap::from([(
+                "history".into(),
+                StoredValue::Map(BTreeMap::from([(
+                    "entries".into(),
+                    StoredValue::Array(entries),
+                )])),
+            )])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("mixed history builds");
+        let ScreenNode::Column(list) = &screen.children[0] else {
+            panic!("history list");
+        };
         for (row, expected) in list.children.iter().zip([2, 1, 2]) {
-            let ScreenNode::Column(row) = row else { panic!("history row"); };
+            let ScreenNode::Column(row) = row else {
+                panic!("history row");
+            };
             assert_eq!(row.children.len(), expected);
         }
         let mut models = crate::ui::UiModels::default();
-        models.set("history", StoredValue::Map(BTreeMap::from([(
-            "entries".into(), StoredValue::Array(vec![StoredValue::Map(BTreeMap::from([
-                ("speaker".into(), StoredValue::String(String::new())),
-                ("text".into(), StoredValue::String("A quiet room".into())),
-            ]))]),
-        )])));
+        models.set(
+            "history",
+            StoredValue::Map(BTreeMap::from([(
+                "entries".into(),
+                StoredValue::Array(vec![StoredValue::Map(BTreeMap::from([
+                    ("speaker".into(), StoredValue::String(String::new())),
+                    ("text".into(), StoredValue::String("A quiet room".into())),
+                ]))]),
+            )])),
+        );
         let renderer = screen.composition.as_ref().expect("history renderer");
-        let next = renderer.with_models(&models)
-            .render(&renderer.globals, &TextureCatalog::default(), &TermCatalog::default())
+        let next = renderer
+            .with_models(&models)
+            .render(
+                &renderer.globals,
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
             .expect("updated narration builds");
-        let ScreenNode::Column(list) = &next.children[0] else { panic!("updated history list"); };
+        let ScreenNode::Column(list) = &next.children[0] else {
+            panic!("updated history list");
+        };
         assert_eq!(list.children.len(), 1);
-        let ScreenNode::Column(row) = &list.children[0] else { panic!("updated history row"); };
+        let ScreenNode::Column(row) = &list.children[0] else {
+            panic!("updated history row");
+        };
         assert_eq!(row.children.len(), 1);
         assert!(matches!(&row.children[0], ScreenNode::Text(text) if text.text == "A quiet room"));
     }

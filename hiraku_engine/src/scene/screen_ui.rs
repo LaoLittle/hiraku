@@ -2231,8 +2231,24 @@ pub fn update_builtin_ui_models(
         .enumerate()
         .map(|(index, entry)| {
             StoredValue::Map(BTreeMap::from([
-                ("id".into(), StoredValue::Int(dialogue_history.records.get(index).map_or(0, |record| record.id as i64))),
-                ("canRollback".into(), StoredValue::Bool(dialogue_history.records.get(index).is_some_and(|record| record.checkpoint.is_some()))),
+                (
+                    "id".into(),
+                    StoredValue::Int(
+                        dialogue_history
+                            .records
+                            .get(index)
+                            .map_or(0, |record| record.id as i64),
+                    ),
+                ),
+                (
+                    "canRollback".into(),
+                    StoredValue::Bool(
+                        dialogue_history
+                            .records
+                            .get(index)
+                            .is_some_and(|record| record.checkpoint.is_some()),
+                    ),
+                ),
                 (
                     "speaker".to_string(),
                     StoredValue::String(entry.speaker.clone()),
@@ -3169,32 +3185,50 @@ mod tests {
                     row { testimony("Objection"); text("Testimony").fontSize(96) }.gap(0).centered()
                 }.centered().size(.abs(1920, 120)).at(.abs(0, 1000))
             }"#,
-            UiContext::new(BTreeMap::from([("choice".into(), StoredValue::Map(BTreeMap::from([
-                ("options".into(), StoredValue::Array(vec![StoredValue::String("Route A".into())])),
-            ])))])), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("synthetic buttons compile");
+            UiContext::new(BTreeMap::from([(
+                "choice".into(),
+                StoredValue::Map(BTreeMap::from([(
+                    "options".into(),
+                    StoredValue::Array(vec![StoredValue::String("Route A".into())]),
+                )])),
+            )])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("synthetic buttons compile");
         let server = app.world().resource::<AssetServer>().clone();
         let root = app.world_mut().spawn(screen_root_node(&screen)).id();
         for child in &screen.children {
             let entity = spawn_screen_node_entity(
-            &mut app.world_mut().commands(), root, &server,
-            &UiFonts { regular: Handle::default(), _fonts: vec![] },
-            &UiStyle::default(), child, &mut vec![],
+                &mut app.world_mut().commands(),
+                root,
+                &server,
+                &UiFonts {
+                    regular: Handle::default(),
+                    _fonts: vec![],
+                },
+                &UiStyle::default(),
+                child,
+                &mut vec![],
             );
             app.world_mut().commands().entity(root).add_child(entity);
         }
         app.world_mut().flush();
-        for _ in 0..5 { app.update(); }
+        for _ in 0..5 {
+            app.update();
+        }
         let mut texts = app.world_mut().query::<(&Text, &ComputedNode)>();
-        let labels: Vec<_> = texts.iter(app.world())
+        let labels: Vec<_> = texts
+            .iter(app.world())
             .filter(|(text, _)| !text.0.is_empty())
-            .map(|(text, node)| (text.0.clone(), node.size())).collect();
+            .map(|(text, node)| (text.0.clone(), node.size()))
+            .collect();
         assert_eq!(labels.len(), 8, "{labels:?}");
         for (text, size) in labels {
             assert!(size.x > 0.0 && size.y > 0.0, "{text}: {size:?}");
         }
     }
-
 
     #[test]
     fn rich_history_rows_measure_content_instead_of_viewport_height() {

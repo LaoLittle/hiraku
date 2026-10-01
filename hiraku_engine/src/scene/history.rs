@@ -5,9 +5,16 @@ pub(crate) fn capture_checkpoint(
     scene: Res<SceneSharedState>,
     dialogue: Res<DialogueState>,
     mut history: ResMut<DialogueHistoryState>,
+    mut redraw: crate::redraw::Redraw,
 ) {
-    let Some(request) = dialogue.waiting.as_ref().and_then(|wait| wait.request) else { return; };
-    if runtime.wait_request != Some(request) || history.captured_request == Some(request) || history.records.is_empty() {
+    let Some(request) = dialogue.waiting.as_ref().and_then(|wait| wait.request) else {
+        return;
+    };
+    if runtime.story.is_none()
+        || runtime.wait_request != Some(request)
+        || history.captured_request == Some(request)
+        || history.records.is_empty()
+    {
         return;
     }
     history.captured_request = Some(request);
@@ -15,6 +22,7 @@ pub(crate) fn capture_checkpoint(
         Ok(checkpoint) => {
             if let Some(record) = history.records.last_mut() {
                 record.checkpoint = Some(std::sync::Arc::new(checkpoint));
+                redraw.request();
             }
         }
         Err(error) => warn!("could not capture dialogue history checkpoint: {error}"),

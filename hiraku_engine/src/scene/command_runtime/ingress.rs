@@ -278,9 +278,12 @@ pub fn drive_story_runtime(
         runtime.wait_request = None;
         let mut accepted = false;
         if let Some(story) = runtime.story.as_mut() {
-            history.pending_sources.extend(story.take_text_records());
-            let discard = history.pending_sources.len().saturating_sub(64);
-            history.pending_sources.drain(..discard);
+            let records = story.take_text_records();
+            if !records.is_empty() {
+                history.pending_sources.extend(records);
+                let discard = history.pending_sources.len().saturating_sub(64);
+                history.pending_sources.drain(..discard);
+            }
             if !story.is_waiting_for_host_response() {
                 // Host completions are asynchronous. Navigation, load, or a
                 // competing completion may have invalidated this request after

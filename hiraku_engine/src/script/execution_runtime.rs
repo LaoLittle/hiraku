@@ -549,7 +549,11 @@ impl ExecutionRuntime {
                         }
                         hiraku_script::linked_vm::PreparedInvocation::Native(mut call) => {
                             evaluate_call_templates(&mut call, |text| {
-                                super::text::evaluate_recorded(&state.vm, text, &mut self.text_records)
+                                super::text::evaluate_recorded(
+                                    &state.vm,
+                                    text,
+                                    &mut self.text_records,
+                                )
                             })?;
                             Ok(Some(ExecutionEvent::Call { execution, call }))
                         }
@@ -824,11 +828,9 @@ fn evaluate_statement_template(
     records: &mut Vec<super::text::RecordedText>,
 ) -> Result<StatementValue, TemplateError> {
     match value {
-        StatementValue::TextTemplate(text) => Ok(StatementValue::String(super::text::evaluate_recorded(
-            vm,
-            &text.into(),
-            records,
-        )?)),
+        StatementValue::TextTemplate(text) => Ok(StatementValue::String(
+            super::text::evaluate_recorded(vm, &text.into(), records)?,
+        )),
         StatementValue::Value(_) => Ok(StatementValue::Commit),
         value => Ok(value),
     }

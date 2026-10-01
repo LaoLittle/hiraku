@@ -15,16 +15,34 @@ pub(super) fn evaluate_recorded(
     let source = vm.eval_template_value_with(value, |source| Ok(source.to_owned()))?;
     let mut context = TextSnapshot::default();
     let mut bindings = vm.lexical_bindings();
-    bindings.extend(value.captures.iter().map(|(name, value)| (name.clone(), value.clone())));
+    bindings.extend(
+        value
+            .captures
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
     for (name, value) in bindings {
-        let value = vm.export_value(&value).map_or(TextValue::Opaque, |value| text_value(&value));
+        let value = vm
+            .export_value(&value)
+            .map_or(TextValue::Opaque, |value| text_value(&value));
         context.values.insert(name, Arc::new(value));
     }
-    let text = hiraku_text::template::LocalizableText { key: None, source, context: Arc::new(context) };
-    let rendered = text.render_with(|_, source| Ok(source.to_owned()))
-        .map_err(|error| TemplateError::InvalidExpression(error.to_string()))?.to_markup();
-    if records.len() >= 64 { records.remove(0); }
-    records.push(RecordedText { text, rendered: rendered.clone() });
+    let text = hiraku_text::template::LocalizableText {
+        key: None,
+        source,
+        context: Arc::new(context),
+    };
+    let rendered = text
+        .render_with(|_, source| Ok(source.to_owned()))
+        .map_err(|error| TemplateError::InvalidExpression(error.to_string()))?
+        .to_markup();
+    if records.len() >= 64 {
+        records.remove(0);
+    }
+    records.push(RecordedText {
+        text,
+        rendered: rendered.clone(),
+    });
     Ok(rendered)
 }
 

@@ -51,30 +51,90 @@ impl DialogueHistoryState {
     }
     fn push_record(&mut self) {
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).expect("history identifiers exhausted");
-        self.records.push(crate::state::HistoryRecord { id, checkpoint: None, text: Vec::new() });
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("history identifiers exhausted");
+        self.records.push(crate::state::HistoryRecord {
+            id,
+            checkpoint: None,
+            text: Vec::new(),
+        });
     }
     pub(super) fn record_text(&mut self, rendered: &str) {
-        let source = self.pending_sources.iter().position(|record| record.rendered == rendered && record.text.source != rendered)
-            .or_else(|| self.pending_sources.iter().position(|record| record.rendered == rendered));
-        let text = match source {
-            Some(index) => self.pending_sources.drain(..=index).last().expect("matched text source").text,
-            None => hiraku_text::template::LocalizableText { key: None, source: rendered.into(), context: Default::default() },
+        let source = self
+            .pending_sources
+            .iter()
+            .position(|record| record.rendered == rendered && record.text.source != rendered)
+            .or_else(|| {
+                self.pending_sources
+                    .iter()
+                    .position(|record| record.rendered == rendered)
+            });
+        let mut text = match source {
+            Some(index) => {
+                self.pending_sources
+                    .drain(..=index)
+                    .last()
+                    .expect("matched text source")
+                    .text
+            }
+            None => hiraku_text::template::LocalizableText {
+                key: None,
+                source: rendered.into(),
+                context: Default::default(),
+            },
         };
-        if let Some(record) = self.records.last_mut() { record.text.push(text); }
+        if let Some(previous) = self
+            .records
+            .iter()
+            .rev()
+            .flat_map(|record| record.text.iter().rev())
+            .next()
+            && previous.context == text.context
+        {
+            text.context = previous.context.clone();
+        }
+        if let Some(record) = self.records.last_mut() {
+            record.text.push(text);
+        }
     }
     pub(super) fn restore_records(&mut self, records: Vec<crate::state::HistoryRecord>) {
         if records.len() >= self.entries.len() {
-            self.records = records.into_iter().rev().take(self.entries.len()).collect::<Vec<_>>();
+            self.records = records
+                .into_iter()
+                .rev()
+                .take(self.entries.len())
+                .collect::<Vec<_>>();
             self.records.reverse();
-            self.next_id = self.records.iter().map(|record| record.id).max().unwrap_or(0).saturating_add(1).max(self.next_id);
+            self.next_id = self
+                .records
+                .iter()
+                .map(|record| record.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(self.next_id);
         }
     }
-    pub(super) fn rollback_save(&self, id: u64) -> Result<crate::state::SaveGameData, crate::storage::StorageError> {
-        let index = self.records.iter().position(|record| record.id == id)
-            .ok_or_else(|| crate::storage::StorageError::InvalidSave("history entry is no longer retained".into()))?;
-        let checkpoint = self.records[index].checkpoint.as_ref()
-            .ok_or_else(|| crate::storage::StorageError::InvalidSave("history entry has no restorable checkpoint".into()))?;
+    pub(super) fn rollback_save(
+        &self,
+        id: u64,
+    ) -> Result<crate::state::SaveGameData, crate::storage::StorageError> {
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.id == id)
+            .ok_or_else(|| {
+                crate::storage::StorageError::InvalidSave(
+                    "history entry is no longer retained".into(),
+                )
+            })?;
+        let checkpoint = self.records[index].checkpoint.as_ref().ok_or_else(|| {
+            crate::storage::StorageError::InvalidSave(
+                "history entry has no restorable checkpoint".into(),
+            )
+        })?;
         let mut save = (**checkpoint).clone();
         save.dialogue_history = self.entries[..=index].to_vec();
         save.history_records = self.records[..=index].to_vec();

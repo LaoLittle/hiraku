@@ -83,7 +83,11 @@ impl From<&SaveGameData> for proto::SaveGameData {
             scope: stored_entries_from_map(&data.scope),
             input_log: data.input_log.iter().map(Into::into).collect(),
             scene: Some((&data.scene).into()),
-            execution_state_bhson: snapshots::encode(&data.vm_snapshot, &data.script_call_stack, &data.history_records),
+            execution_state_bhson: snapshots::encode(
+                &data.vm_snapshot,
+                &data.script_call_stack,
+                &data.history_records,
+            ),
             pending_ui_screen: data.pending_ui_screen.clone(),
             pending_ui_arguments_hson: hson::to_vec(&data.pending_ui_arguments)
                 .expect("pending UI arguments must serialize to HSON"),

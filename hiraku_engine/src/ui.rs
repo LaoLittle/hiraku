@@ -94,7 +94,9 @@ pub enum UiEffect {
     Load {
         slot: String,
     },
-    HistoryRollback { id: u64 },
+    HistoryRollback {
+        id: u64,
+    },
     NextDialogue,
     SetVolume {
         channel: String,

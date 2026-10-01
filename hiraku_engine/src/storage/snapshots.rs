@@ -30,7 +30,12 @@ fn visit_heaps(
     for record in history {
         if let Some(checkpoint) = &mut record.checkpoint {
             let checkpoint = std::sync::Arc::make_mut(checkpoint);
-            visit_heaps(&mut checkpoint.vm_snapshot, &mut checkpoint.script_call_stack, &mut [], visitor);
+            visit_heaps(
+                &mut checkpoint.vm_snapshot,
+                &mut checkpoint.script_call_stack,
+                &mut [],
+                visitor,
+            );
         }
     }
 }
@@ -49,25 +54,38 @@ pub(super) fn encode(
         text_contexts: Vec::new(),
         text_references: Vec::new(),
     };
-    visit_heaps(&mut saved.current, &mut saved.callers, &mut saved.history, &mut |heap| {
-        let index = saved
-            .heaps
-            .iter()
-            .position(|previous| previous == heap)
-            .unwrap_or_else(|| {
-                saved.heaps.push(heap.clone());
-                saved.heaps.len() - 1
-            });
-        saved
-            .references
-            .push(u32::try_from(index).expect("snapshot heap table fits u32"));
-        *heap = ObjectHeap::default();
-    });
+    visit_heaps(
+        &mut saved.current,
+        &mut saved.callers,
+        &mut saved.history,
+        &mut |heap| {
+            let index = saved
+                .heaps
+                .iter()
+                .position(|previous| previous == heap)
+                .unwrap_or_else(|| {
+                    saved.heaps.push(heap.clone());
+                    saved.heaps.len() - 1
+                });
+            saved
+                .references
+                .push(u32::try_from(index).expect("snapshot heap table fits u32"));
+            *heap = ObjectHeap::default();
+        },
+    );
     for record in &mut saved.history {
         for text in &mut record.text {
-            let index = saved.text_contexts.iter().position(|context| context == &text.context)
-                .unwrap_or_else(|| { saved.text_contexts.push(text.context.clone()); saved.text_contexts.len() - 1 });
-            saved.text_references.push(u32::try_from(index).expect("text context table fits u32"));
+            let index = saved
+                .text_contexts
+                .iter()
+                .position(|context| context == &text.context)
+                .unwrap_or_else(|| {
+                    saved.text_contexts.push(text.context.clone());
+                    saved.text_contexts.len() - 1
+                });
+            saved
+                .text_references
+                .push(u32::try_from(index).expect("text context table fits u32"));
             text.context = Default::default();
         }
     }
@@ -76,29 +94,48 @@ pub(super) fn encode(
 
 pub(super) fn decode(
     bytes: &[u8],
-) -> Result<(Option<StoryRuntimeSnapshot>, Vec<ScriptCallFrameSnapshot>, Vec<crate::state::HistoryRecord>), StorageError> {
+) -> Result<
+    (
+        Option<StoryRuntimeSnapshot>,
+        Vec<ScriptCallFrameSnapshot>,
+        Vec<crate::state::HistoryRecord>,
+    ),
+    StorageError,
+> {
     let mut saved: SharedSnapshots = bhson::from_slice(bytes).map_err(|error| {
         StorageError::InvalidSave(format!("invalid shared execution snapshots: {error}"))
     })?;
     let mut references = saved.references.into_iter();
     let mut invalid = false;
     let mut ids = std::collections::BTreeSet::new();
-    if saved.history.len() > 128 || saved.history.iter().any(|record| record.id == 0 || !ids.insert(record.id)
-        || record.checkpoint.as_ref().is_some_and(|checkpoint| !checkpoint.history_records.is_empty() || !checkpoint.dialogue_history.is_empty())) {
-        return Err(StorageError::InvalidSave("invalid history checkpoint table".into()));
+    if saved.history.iter().any(|record| {
+        record.id == 0
+            || !ids.insert(record.id)
+            || record.checkpoint.as_ref().is_some_and(|checkpoint| {
+                !checkpoint.history_records.is_empty() || !checkpoint.dialogue_history.is_empty()
+            })
+    }) {
+        return Err(StorageError::InvalidSave(
+            "invalid history checkpoint table".into(),
+        ));
     }
-    visit_heaps(&mut saved.current, &mut saved.callers, &mut saved.history, &mut |heap| {
-        if *heap != ObjectHeap::default() {
-            invalid = true;
-        }
-        match references
-            .next()
-            .and_then(|id| saved.heaps.get(id as usize))
-        {
-            Some(shared) => *heap = shared.clone(),
-            None => invalid = true,
-        }
-    });
+    visit_heaps(
+        &mut saved.current,
+        &mut saved.callers,
+        &mut saved.history,
+        &mut |heap| {
+            if *heap != ObjectHeap::default() {
+                invalid = true;
+            }
+            match references
+                .next()
+                .and_then(|id| saved.heaps.get(id as usize))
+            {
+                Some(shared) => *heap = shared.clone(),
+                None => invalid = true,
+            }
+        },
+    );
     if invalid || references.next().is_some() {
         return Err(StorageError::InvalidSave(
             "invalid snapshot heap reference table".into(),
@@ -108,13 +145,24 @@ pub(super) fn decode(
     for record in &mut saved.history {
         for text in &mut record.text {
             if !text.context.values.is_empty() {
-                return Err(StorageError::InvalidSave("unexpected inline text context".into()));
+                return Err(StorageError::InvalidSave(
+                    "unexpected inline text context".into(),
+                ));
             }
-            text.context = references.next().and_then(|id| saved.text_contexts.get(id as usize)).cloned()
-                .ok_or_else(|| StorageError::InvalidSave("invalid history text context reference".into()))?;
+            text.context = references
+                .next()
+                .and_then(|id| saved.text_contexts.get(id as usize))
+                .cloned()
+                .ok_or_else(|| {
+                    StorageError::InvalidSave("invalid history text context reference".into())
+                })?;
         }
     }
-    if references.next().is_some() { return Err(StorageError::InvalidSave("excess history text context references".into())); }
+    if references.next().is_some() {
+        return Err(StorageError::InvalidSave(
+            "excess history text context references".into(),
+        ));
+    }
     Ok((saved.current, saved.callers, saved.history))
 }
 
@@ -162,11 +210,16 @@ mod tests {
         assert_eq!(current, Some(snapshot));
         assert_eq!(restored_callers, callers);
         let mut generations = Vec::new();
-        visit_heaps(&mut current, &mut restored_callers, &mut history, &mut |heap| {
-            if heap.live_objects() > 0 {
-                generations.push(heap.clone());
-            }
-        });
+        visit_heaps(
+            &mut current,
+            &mut restored_callers,
+            &mut history,
+            &mut |heap| {
+                if heap.live_objects() > 0 {
+                    generations.push(heap.clone());
+                }
+            },
+        );
         assert_eq!(generations.len(), 5);
         assert!(
             generations

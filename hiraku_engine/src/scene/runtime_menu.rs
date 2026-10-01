@@ -364,10 +364,14 @@ fn dispatch_ui_effects(
                     break;
                 }
             }
-            effect @ (crate::ui::UiEffect::Load { .. } | crate::ui::UiEffect::HistoryRollback { .. }) => {
+            effect @ (crate::ui::UiEffect::Load { .. }
+            | crate::ui::UiEffect::HistoryRollback { .. }) => {
                 let (slot, loaded) = match effect {
                     crate::ui::UiEffect::Load { slot } => (slot.clone(), load_save_data(slot)),
-                    crate::ui::UiEffect::HistoryRollback { id } => (format!("history:{id}"), ctx.dialogue_history.rollback_save(*id)),
+                    crate::ui::UiEffect::HistoryRollback { id } => (
+                        format!("history:{id}"),
+                        ctx.dialogue_history.rollback_save(*id),
+                    ),
                     _ => unreachable!(),
                 };
                 let save_data = match loaded {
@@ -411,7 +415,8 @@ fn dispatch_ui_effects(
                 );
                 ctx.dialogue_history
                     .restore(save_data.dialogue_history.clone());
-                ctx.dialogue_history.restore_records(save_data.history_records.clone());
+                ctx.dialogue_history
+                    .restore_records(save_data.history_records.clone());
                 // Mounted overlays belong to the saved presentation, not
                 // the session being replaced. Bootstrap will mount exactly
                 // the saved set; retaining future overlays exposes stale
