@@ -4,55 +4,20 @@ use crate::script::capabilities::StoryEffect;
 use crate::script::replay::{InputKind, ReplayJournal, ReplayPoint};
 use std::time::Duration;
 
-fn replay_signature(kind: &str, value: &impl serde::Serialize) -> Option<String> {
-    match hiraku_script::hson::to_string(value) {
-        Ok(value) => Some(format!("{kind}:{value}")),
-        Err(error) => {
-            warn!("could not encode replay boundary: {error}");
-            None
-        }
-    }
-}
-
 fn observe_replay_boundary(runtime: &mut ScriptRuntimeState, event: &StoryRuntimeEvent) {
     let script = runtime.current_script.clone().unwrap_or_default();
-    let journal = runtime.replay.get_or_insert_with(|| {
-        use std::hash::{BuildHasher, Hasher};
-        let seed = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        ReplayJournal::new(script.clone(), seed)
-    });
-    use crate::script::capabilities::{StoryEffect, StoryWait};
-    let signature = match event {
-        StoryRuntimeEvent::Effect(StoryEffect::Say { speaker, text }) => {
-            runtime.replay_dialogue = replay_signature("say", &(speaker, text)).unwrap_or_default();
-            None
-        }
-        StoryRuntimeEvent::Effect(StoryEffect::ContinueDialogue { text }) => {
-            runtime.replay_dialogue = replay_signature("append", text).unwrap_or_default();
-            None
-        }
-        StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance) => {
-            Some(format!("dialogue:{}", runtime.replay_dialogue))
-        }
-        StoryRuntimeEvent::Choice {
-            prompt,
-            options,
-            enabled,
-            parameters,
-        } => replay_signature("choice", &(prompt, options, enabled, parameters)),
-        StoryRuntimeEvent::OpenUi { path, arguments } => replay_signature("ui", &(path, arguments)),
-        StoryRuntimeEvent::RandomInt { min, max } => replay_signature("random", &(min, max)),
-        _ => None,
-    };
-    if journal.destination.is_none() {
-        if let Some(signature) = signature {
-            journal.destination = Some(ReplayPoint { script, signature });
+    let journal = runtime
+        .replay
+        .get_or_insert_with(|| ReplayJournal::new(script.clone(), 0));
+    match crate::script::replay::boundary(&script, &mut runtime.replay_dialogue, event) {
+        Ok(Some(point)) if journal.destination.is_none() => journal.destination = Some(point),
+        Ok(_) => (),
+        Err(error) => {
+            journal.complete = false;
+            warn!("could not record replay boundary: {error}");
         }
     }
 }
-
 fn record_replay_response(runtime: &mut ScriptRuntimeState, response: &ScriptResponse) {
     let Some(journal) = runtime.replay.as_mut() else {
         return;
@@ -75,8 +40,11 @@ fn record_replay_response(runtime: &mut ScriptRuntimeState, response: &ScriptRes
             };
             journal.input(kind, point, value.clone());
         }
+        ScriptResponse::UiResult(hiraku_script::Value::Unit) => {
+            journal.input(InputKind::UiUnit, point, StoredValue::Bool(true));
+        }
         ScriptResponse::UiResult(value) => {
-            if let Some(value) = hks_to_stored(value) {
+            if let Ok(value) = crate::script::ui_argument_to_stored(value) {
                 journal.input(InputKind::UiResult, point, value);
             } else {
                 journal.destination = None;
@@ -268,6 +236,7 @@ pub fn drive_story_runtime(
     vfs: Res<VfsResource>,
     user_settings: Res<UserSettings>,
     models: Res<crate::ui::UiModels>,
+    mut history: ResMut<DialogueHistoryState>,
 ) {
     for message in response_messages.read() {
         if let Some((task, effect)) = runtime.task_requests.remove(&message.request) {
@@ -309,6 +278,9 @@ pub fn drive_story_runtime(
         runtime.wait_request = None;
         let mut accepted = false;
         if let Some(story) = runtime.story.as_mut() {
+            history.pending_sources.extend(story.take_text_records());
+            let discard = history.pending_sources.len().saturating_sub(64);
+            history.pending_sources.drain(..discard);
             if !story.is_waiting_for_host_response() {
                 // Host completions are asynchronous. Navigation, load, or a
                 // competing completion may have invalidated this request after
@@ -346,6 +318,24 @@ pub fn drive_story_runtime(
             None => None,
         };
 
+        if let Some(story) = runtime.story.as_mut() {
+            let (inputs, unrecordable) = story.take_native_trace();
+            let script = runtime.current_script.clone().unwrap_or_default();
+            let journal = runtime
+                .replay
+                .get_or_insert_with(|| ReplayJournal::new(script.clone(), 0));
+            journal.complete &= !unrecordable;
+            for (signature, value) in inputs {
+                journal.input(
+                    InputKind::Native,
+                    ReplayPoint {
+                        script: script.clone(),
+                        signature,
+                    },
+                    value,
+                );
+            }
+        }
         if let Some(event) = event {
             let continue_batch = matches!(&event,
                 StoryRuntimeEvent::Effect(effect)
@@ -1134,6 +1124,50 @@ pub fn drive_story_runtime(
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+
+    #[test]
+    fn replay_does_not_silently_drop_unserializable_ui_result_fields() {
+        let mut runtime = ScriptRuntimeState::default();
+        let mut journal = ReplayJournal::recording("memory://alice.hks".into());
+        journal.destination = Some(ReplayPoint {
+            script: "memory://alice.hks".into(),
+            signature: "ui:form".into(),
+        });
+        runtime.replay = Some(journal);
+        record_replay_response(
+            &mut runtime,
+            &ScriptResponse::UiResult(hiraku_script::Value::Map(BTreeMap::from([
+                ("value".into(), hiraku_script::Value::Int(1)),
+                ("absent".into(), hiraku_script::Value::Unit),
+            ]))),
+        );
+        assert!(!runtime.replay.as_ref().expect("journal").complete);
+        assert!(runtime.replay.as_ref().expect("journal").events.is_empty());
+    }
+
+    #[test]
+    fn replay_records_unit_ui_results_without_confusing_them_with_null() {
+        let mut runtime = ScriptRuntimeState::default();
+        let mut journal = ReplayJournal::recording("memory://alice.hks".into());
+        journal.destination = Some(ReplayPoint {
+            script: "memory://alice.hks".into(),
+            signature: "ui:menu".into(),
+        });
+        runtime.replay = Some(journal);
+        record_replay_response(
+            &mut runtime,
+            &ScriptResponse::UiResult(hiraku_script::Value::Unit),
+        );
+        let journal = runtime.replay.expect("journal");
+        assert!(journal.complete);
+        assert!(matches!(
+            &journal.events[0],
+            crate::script::replay::ReplayEvent::Input {
+                kind: InputKind::UiUnit,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn consecutive_presentation_commands_are_queued_in_one_frame() {

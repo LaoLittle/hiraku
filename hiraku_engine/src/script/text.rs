@@ -2,6 +2,32 @@ use hiraku_script::{TemplateError, Value, Vm, runtime::TemplateValue};
 use hiraku_text::template::{Template, TextSnapshot, TextValue};
 use std::sync::Arc;
 
+pub(crate) struct RecordedText {
+    pub text: hiraku_text::template::LocalizableText,
+    pub rendered: String,
+}
+
+pub(super) fn evaluate_recorded(
+    vm: &Vm,
+    value: &TemplateValue,
+    records: &mut Vec<RecordedText>,
+) -> Result<String, TemplateError> {
+    let source = vm.eval_template_value_with(value, |source| Ok(source.to_owned()))?;
+    let mut context = TextSnapshot::default();
+    let mut bindings = vm.lexical_bindings();
+    bindings.extend(value.captures.iter().map(|(name, value)| (name.clone(), value.clone())));
+    for (name, value) in bindings {
+        let value = vm.export_value(&value).map_or(TextValue::Opaque, |value| text_value(&value));
+        context.values.insert(name, Arc::new(value));
+    }
+    let text = hiraku_text::template::LocalizableText { key: None, source, context: Arc::new(context) };
+    let rendered = text.render_with(|_, source| Ok(source.to_owned()))
+        .map_err(|error| TemplateError::InvalidExpression(error.to_string()))?.to_markup();
+    if records.len() >= 64 { records.remove(0); }
+    records.push(RecordedText { text, rendered: rendered.clone() });
+    Ok(rendered)
+}
+
 pub(super) fn evaluate(vm: &Vm, value: &TemplateValue) -> Result<String, TemplateError> {
     let source = vm.eval_template_value_with(value, |source| Ok(source.to_owned()))?;
     evaluate_with(&source, |root| {

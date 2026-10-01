@@ -220,7 +220,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     &script_runtime,
                     &shared_state,
                     &[],
-                    &dialogue_history.entries,
+                    &dialogue_history,
                 ) {
                     warn!("failed to save slot `{slot}`: {error}");
                 }
@@ -813,6 +813,20 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 };
                 next_story.preload_calls = navigation.should_preload(script_runtime.story.as_ref());
 
+                if !host_restart
+                    && let Some(journal) = script_runtime.replay.as_mut()
+                    && let Some(point) = journal.destination.clone()
+                {
+                    match hiraku_script::hson::to_string(&navigation) {
+                        Ok(request) => journal.input(
+                            crate::script::replay::InputKind::Navigation,
+                            point,
+                            StoredValue::String(request),
+                        ),
+                        Err(_) => journal.complete = false,
+                    }
+                }
+
                 let mut globals = if navigation.reset == NavigationReset::Session {
                     BTreeMap::new()
                 } else {
@@ -880,8 +894,6 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         // Restart re-executes startup, unlike an in-story
                         // session reset which keeps project UI registration.
                         script_runtime.ui_registry.clear();
-                        script_runtime.replay = None;
-                        script_runtime.replay_dialogue.clear();
                         video_player.stop_all();
                         *movie_waits = PendingMovieWaits::default();
                     }
@@ -903,6 +915,12 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     script_runtime.call_stack.clear();
                 }
                 script_runtime.story = Some(next_story);
+                if host_restart || navigation.reset == NavigationReset::Session {
+                    script_runtime.replay = Some(crate::script::replay::ReplayJournal::recording(
+                        target.clone(),
+                    ));
+                    script_runtime.replay_dialogue.clear();
+                }
                 if host_restart {
                     dependencies.loading = false;
                     dependencies.error = None;

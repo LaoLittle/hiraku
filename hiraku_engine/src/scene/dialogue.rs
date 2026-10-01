@@ -18,6 +18,10 @@ pub struct DialogueHistoryState {
     pub entries: Vec<DialogueSnapshot>,
     /// Maximum retained dialogue entries; zero disables history recording.
     pub max_entries: usize,
+    pub records: Vec<crate::state::HistoryRecord>,
+    next_id: u64,
+    pub(super) captured_request: Option<ScriptRequestId>,
+    pub(super) pending_sources: Vec<crate::script::text::RecordedText>,
 }
 
 impl Default for DialogueHistoryState {
@@ -25,6 +29,10 @@ impl Default for DialogueHistoryState {
         Self {
             entries: Vec::new(),
             max_entries: 128,
+            records: Vec::new(),
+            next_id: 1,
+            captured_request: None,
+            pending_sources: Vec::new(),
         }
     }
 }
@@ -34,15 +42,57 @@ impl DialogueHistoryState {
         let discard = entries.len().saturating_sub(self.max_entries);
         entries.drain(..discard);
         self.entries = entries;
+        self.records.clear();
+        self.captured_request = None;
+        self.pending_sources.clear();
+        for _ in 0..self.entries.len() {
+            self.push_record();
+        }
+    }
+    fn push_record(&mut self) {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).expect("history identifiers exhausted");
+        self.records.push(crate::state::HistoryRecord { id, checkpoint: None, text: Vec::new() });
+    }
+    pub(super) fn record_text(&mut self, rendered: &str) {
+        let source = self.pending_sources.iter().position(|record| record.rendered == rendered && record.text.source != rendered)
+            .or_else(|| self.pending_sources.iter().position(|record| record.rendered == rendered));
+        let text = match source {
+            Some(index) => self.pending_sources.drain(..=index).last().expect("matched text source").text,
+            None => hiraku_text::template::LocalizableText { key: None, source: rendered.into(), context: Default::default() },
+        };
+        if let Some(record) = self.records.last_mut() { record.text.push(text); }
+    }
+    pub(super) fn restore_records(&mut self, records: Vec<crate::state::HistoryRecord>) {
+        if records.len() >= self.entries.len() {
+            self.records = records.into_iter().rev().take(self.entries.len()).collect::<Vec<_>>();
+            self.records.reverse();
+            self.next_id = self.records.iter().map(|record| record.id).max().unwrap_or(0).saturating_add(1).max(self.next_id);
+        }
+    }
+    pub(super) fn rollback_save(&self, id: u64) -> Result<crate::state::SaveGameData, crate::storage::StorageError> {
+        let index = self.records.iter().position(|record| record.id == id)
+            .ok_or_else(|| crate::storage::StorageError::InvalidSave("history entry is no longer retained".into()))?;
+        let checkpoint = self.records[index].checkpoint.as_ref()
+            .ok_or_else(|| crate::storage::StorageError::InvalidSave("history entry has no restorable checkpoint".into()))?;
+        let mut save = (**checkpoint).clone();
+        save.dialogue_history = self.entries[..=index].to_vec();
+        save.history_records = self.records[..=index].to_vec();
+        Ok(save)
     }
     pub(super) fn push(&mut self, entry: DialogueSnapshot) {
         if self.max_entries == 0 {
             self.entries.clear();
+            self.records.clear();
             return;
         }
         let discard = (self.entries.len() + 1).saturating_sub(self.max_entries);
         self.entries.drain(..discard);
+        self.records.drain(..discard.min(self.records.len()));
         self.entries.push(entry);
+        self.push_record();
+        let text = self.entries.last().expect("new history entry").text.clone();
+        self.record_text(&text);
     }
 }
 

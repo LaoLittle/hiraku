@@ -1,6 +1,7 @@
 [package]
 name = "hiraku"
 description = "Hiraku visual-novel engine"
+readme = "../README.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

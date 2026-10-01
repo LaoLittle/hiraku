@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 33;
+pub const CURRENT_SAVE_VERSION: u32 = 35;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
@@ -92,6 +92,13 @@ pub struct DialogueSnapshot {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryRecord {
+    pub id: u64,
+    pub checkpoint: Option<std::sync::Arc<SaveGameData>>,
+    pub text: Vec<hiraku_text::template::LocalizableText>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TextEffectSnapshot {
     pub mode: String,
@@ -149,6 +156,8 @@ pub struct CurtainSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveGameData {
     #[serde(default)]
+    pub history_records: Vec<HistoryRecord>,
+    #[serde(default)]
     pub dialogue_history: Vec<DialogueSnapshot>,
     #[serde(default)]
     pub replay: Option<crate::script::replay::ReplayJournal>,
@@ -198,6 +207,7 @@ fn default_save_version() -> u32 {
 impl Default for SaveGameData {
     fn default() -> Self {
         Self {
+            history_records: Vec::new(),
             dialogue_history: Vec::new(),
             thumbnail_png: Vec::new(),
             version: CURRENT_SAVE_VERSION,

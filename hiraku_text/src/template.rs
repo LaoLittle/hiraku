@@ -20,6 +20,22 @@ pub struct TextSnapshot {
     pub values: BTreeMap<String, Arc<TextValue>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocalizableText {
+    pub key: Option<String>,
+    pub source: String,
+    pub context: Arc<TextSnapshot>,
+}
+
+impl LocalizableText {
+    pub fn render_with(
+        &self,
+        translate: impl FnOnce(Option<&str>, &str) -> Result<String, TextError>,
+    ) -> Result<Document, TextError> {
+        Template::parse(&translate(self.key.as_deref(), &self.source)?)?.render(&self.context)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectorStep {
     Field(String),

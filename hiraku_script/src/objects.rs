@@ -3,18 +3,19 @@
 use crate::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectId(pub u32);
 
 #[derive(Clone, Debug, Default)]
 pub struct ObjectHeap {
-    objects: BTreeMap<ObjectId, crate::nanbox::Slot>,
-    storage: crate::value_heap::ValueHeap,
+    objects: Arc<BTreeMap<ObjectId, crate::nanbox::Slot>>,
+    storage: Arc<crate::value_heap::ValueHeap>,
     // IDs are never reused, including after collection or snapshot restore.
     next_id: u32,
     last_collection: u32,
-    read_only: BTreeSet<ObjectId>,
+    read_only: Arc<BTreeSet<ObjectId>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -26,13 +27,14 @@ struct HeapSnapshot {
 
 impl PartialEq for ObjectHeap {
     fn eq(&self, other: &Self) -> bool {
-        self.next_id == other.next_id
-            && self.read_only == other.read_only
-            && self.objects.len() == other.objects.len()
-            && self
-                .objects
-                .keys()
-                .all(|id| self.get(*id) == other.get(*id))
+        self.shares_snapshot_with(other)
+            || (self.next_id == other.next_id
+                && self.read_only == other.read_only
+                && self.objects.len() == other.objects.len()
+                && self
+                    .objects
+                    .keys()
+                    .all(|id| self.get(*id) == other.get(*id)))
     }
 }
 impl Serialize for ObjectHeap {
@@ -44,7 +46,7 @@ impl Serialize for ObjectHeap {
                 .map(|(id, slot)| (*id, self.storage.unpack(*slot)))
                 .collect(),
             next_id: self.next_id,
-            read_only: self.read_only.clone(),
+            read_only: (*self.read_only).clone(),
         }
         .serialize(serializer)
     }
@@ -72,18 +74,26 @@ impl<'de> Deserialize<'de> for ObjectHeap {
         }
         let mut heap = Self {
             next_id: saved.next_id,
-            read_only: saved.read_only,
+            read_only: Arc::new(saved.read_only),
             ..Self::default()
         };
         for (id, value) in saved.objects {
-            let value = heap.storage.pack(value);
-            heap.objects.insert(id, value);
+            let value = Arc::make_mut(&mut heap.storage).pack(value);
+            Arc::make_mut(&mut heap.objects).insert(id, value);
         }
         Ok(heap)
     }
 }
 
 impl ObjectHeap {
+    /// Whether both snapshots retain the same immutable storage generation.
+    /// This identity is process-local; save files use table indices instead.
+    pub fn shares_snapshot_with(&self, other: &Self) -> bool {
+        self.next_id == other.next_id
+            && Arc::ptr_eq(&self.objects, &other.objects)
+            && Arc::ptr_eq(&self.storage, &other.storage)
+            && Arc::ptr_eq(&self.read_only, &other.read_only)
+    }
     /// Validate an entire execution-owned graph and its external roots before
     /// activation. Aliases and cycles are valid; dangling IDs are not. Every
     /// stored object is checked, including unreachable objects retained until
@@ -98,7 +108,7 @@ impl ObjectHeap {
 
     pub fn with_strings(strings: crate::SharedStrings) -> Self {
         Self {
-            storage: crate::value_heap::ValueHeap::with_strings(strings),
+            storage: Arc::new(crate::value_heap::ValueHeap::with_strings(strings)),
             ..Self::default()
         }
     }
@@ -157,8 +167,8 @@ impl ObjectHeap {
             .next_id
             .checked_add(1)
             .expect("object identifier space exhausted");
-        let value = self.storage.pack(value);
-        self.objects.insert(id, value);
+        let value = Arc::make_mut(&mut self.storage).pack(value);
+        Arc::make_mut(&mut self.objects).insert(id, value);
         Value::Object(id)
     }
 
@@ -190,19 +200,19 @@ impl ObjectHeap {
             .objects
             .get(&id)
             .ok_or(crate::VmError::InvalidObject(id))?;
-        self.storage.set_member(slot, name, value)
+        Arc::make_mut(&mut self.storage).set_member(slot, name, value)
     }
 
     pub fn replace(&mut self, id: ObjectId, value: Value) -> Result<(), crate::VmError> {
         if self.read_only.contains(&id) {
             return Err(crate::VmError::ReadOnlyValue);
         }
-        let slot = self
-            .objects
+        let slot = Arc::make_mut(&mut self.objects)
             .get_mut(&id)
             .ok_or(crate::VmError::InvalidObject(id))?;
-        self.storage.release(*slot);
-        *slot = self.storage.pack(value);
+        let storage = Arc::make_mut(&mut self.storage);
+        storage.release(*slot);
+        *slot = storage.pack(value);
         Ok(())
     }
 
@@ -213,7 +223,9 @@ impl ObjectHeap {
         while let Some(value) = pending.pop() {
             match value {
                 Value::Object(id) => {
-                    if self.read_only.insert(id) {
+                    if !self.read_only.contains(&id)
+                        && Arc::make_mut(&mut self.read_only).insert(id)
+                    {
                         pending.push(self.get(id)?);
                     }
                 }
@@ -277,7 +289,7 @@ impl ObjectHeap {
             } => {
                 let captures = if let Some(objects) = objects {
                     let base = self.next_id;
-                    self.read_only.extend(objects.read_only.iter().map(|id| {
+                    Arc::make_mut(&mut self.read_only).extend(objects.read_only.iter().map(|id| {
                         ObjectId(
                             id.0.checked_add(base)
                                 .expect("object identifier space exhausted"),
@@ -286,10 +298,10 @@ impl ObjectHeap {
                     self.next_id = base
                         .checked_add(objects.next_id)
                         .expect("object identifier space exhausted");
-                    for (id, slot) in objects.objects {
-                        let value = relocate(objects.storage.unpack(slot), base);
-                        let slot = self.storage.pack(value);
-                        self.objects.insert(
+                    for (id, slot) in objects.objects.iter() {
+                        let value = relocate(objects.storage.unpack(*slot), base);
+                        let slot = Arc::make_mut(&mut self.storage).pack(value);
+                        Arc::make_mut(&mut self.objects).insert(
                             ObjectId(
                                 id.0.checked_add(base)
                                     .expect("object identifier space exhausted"),
@@ -370,15 +382,20 @@ impl ObjectHeap {
             }
         }
         let previous = self.objects.len();
-        self.objects.retain(|id, slot| {
+        if marked.len() == previous {
+            self.last_collection = self.next_id;
+            return Ok(0);
+        }
+        let storage = Arc::make_mut(&mut self.storage);
+        Arc::make_mut(&mut self.objects).retain(|id, slot| {
             if marked.contains(id) {
                 true
             } else {
-                self.storage.release(*slot);
+                storage.release(*slot);
                 false
             }
         });
-        self.read_only.retain(|id| marked.contains(id));
+        Arc::make_mut(&mut self.read_only).retain(|id| marked.contains(id));
         self.last_collection = self.next_id;
         Ok(previous - self.objects.len())
     }
@@ -497,7 +514,7 @@ impl ObjectHeap {
                 };
                 target.replace(target_id, record)?;
                 if self.read_only.contains(id) {
-                    target.read_only.insert(target_id);
+                    Arc::make_mut(&mut target.read_only).insert(target_id);
                 }
                 reference
             }
@@ -720,6 +737,73 @@ fn relocate(value: Value, base: u32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_share_storage_until_a_field_or_allocator_changes() {
+        let mut heap = ObjectHeap::default();
+        let value = heap.import(Value::Map(BTreeMap::from([(
+            "score".into(),
+            Value::Int(1),
+        )])));
+        let Value::Object(id) = value else {
+            panic!("record identity")
+        };
+        let snapshot = heap.clone();
+        let repeated = heap.clone();
+        assert!(snapshot.shares_snapshot_with(&repeated));
+        assert!(snapshot.shares_snapshot_with(&heap));
+        heap.set_member(id, "score", Value::Int(2))
+            .expect("field write");
+        assert!(!snapshot.shares_snapshot_with(&heap));
+        assert_eq!(
+            snapshot.member(id, "score").expect("saved score"),
+            Value::Int(1)
+        );
+        assert_eq!(heap.member(id, "score").expect("live score"), Value::Int(2));
+        let written = heap.clone();
+        heap.allocate(Value::Int(3));
+        assert!(!heap.shares_snapshot_with(&written));
+        assert_eq!(written.live_objects(), 1);
+        assert_eq!(heap.live_objects(), 2);
+        let restored: ObjectHeap =
+            crate::hson::from_str(&crate::hson::to_string(&snapshot).expect("serialize"))
+                .expect("restore saved heap");
+        assert_eq!(restored, snapshot);
+    }
+
+    #[test]
+    fn collection_and_freezing_do_not_mutate_retained_generations() {
+        let mut heap = ObjectHeap::default();
+        let root = heap.import(Value::Map(BTreeMap::from([(
+            "name".into(),
+            Value::String("alice".into()),
+        )])));
+        let retained = heap.clone();
+        assert_eq!(heap.collect([&root]).expect("no dead objects"), 0);
+        assert!(retained.shares_snapshot_with(&heap));
+        heap.allocate(Value::String("bob".into()));
+        let before_collection = heap.clone();
+        assert_eq!(heap.collect([&root]).expect("collect"), 1);
+        assert_eq!(before_collection.live_objects(), 2);
+        assert_eq!(heap.live_objects(), 1);
+        let before_freeze = heap.clone();
+        heap.freeze(&root).expect("freeze live graph");
+        let Value::Object(id) = root else {
+            panic!("record identity")
+        };
+        assert!(
+            heap.set_member(id, "name", Value::String("bob".into()))
+                .is_err()
+        );
+        let mut mutable = before_freeze;
+        mutable
+            .set_member(id, "name", Value::String("bob".into()))
+            .expect("old graph is not frozen");
+        assert_eq!(
+            heap.member(id, "name").expect("frozen name"),
+            Value::String("alice".into())
+        );
+    }
 
     fn closure(captures: Vec<Value>, objects: Option<ObjectHeap>) -> Value {
         Value::Closure {

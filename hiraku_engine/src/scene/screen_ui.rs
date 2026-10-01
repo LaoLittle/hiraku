@@ -2228,8 +2228,11 @@ pub fn update_builtin_ui_models(
     let entries = dialogue_history
         .entries
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(index, entry)| {
             StoredValue::Map(BTreeMap::from([
+                ("id".into(), StoredValue::Int(dialogue_history.records.get(index).map_or(0, |record| record.id as i64))),
+                ("canRollback".into(), StoredValue::Bool(dialogue_history.records.get(index).is_some_and(|record| record.checkpoint.is_some()))),
                 (
                     "speaker".to_string(),
                     StoredValue::String(entry.speaker.clone()),

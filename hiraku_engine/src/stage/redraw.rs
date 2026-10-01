@@ -36,6 +36,16 @@ pub(crate) struct StageRedraw<'w, 's> {
 }
 
 impl StageRedraw<'_, '_> {
+    pub(super) fn generation(&self) -> u64 {
+        self.pending.as_ref().map_or(0, |pending| pending.requested)
+    }
+
+    pub(super) fn completed(&self, generation: u64) -> bool {
+        self.pending
+            .as_ref()
+            .is_none_or(|pending| pending.completed.load(Ordering::Acquire) >= generation)
+    }
+
     pub fn request(&mut self) {
         self.redraw.request();
         if let Some(pending) = self.pending.as_mut() {

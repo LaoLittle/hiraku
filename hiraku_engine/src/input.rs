@@ -10,6 +10,7 @@ use bevy::{
 use uuid::Uuid;
 
 use crate::{HirakuCanvas, HirakuInputTarget};
+pub(crate) mod touch_hold;
 
 /// Physical picking forwards canvas input after this frame's `First` bridge.
 /// Wake the next update to consume it; reactive runners otherwise wait for
@@ -515,6 +516,7 @@ pub(crate) fn bridge_virtual_pointers(
     scroll_nodes: Query<&Node, With<ScrollPosition>>,
     mut gestures: Local<HashMap<HirakuPointerId, TouchScrollGesture>>,
     mut drag_scrolls: MessageWriter<PointerScroll>,
+    holds: Option<Res<touch_hold::TouchHold>>,
 ) {
     let (Some(canvas), Some(target)) = (canvas, target) else {
         return;
@@ -547,6 +549,20 @@ pub(crate) fn bridge_virtual_pointers(
             position,
         };
         let id = sample.pointer.picking_id();
+        if holds
+            .as_ref()
+            .is_some_and(|holds| holds.consumed(sample.pointer))
+        {
+            output.write(PointerInput::new(id, location, PointerAction::Cancel));
+            if matches!(
+                sample.phase,
+                HirakuPointerPhase::Release | HirakuPointerPhase::Cancel
+            ) {
+                gestures.remove(&sample.pointer);
+                retire_touch_pointer(sample.pointer, &mut pointers, &mut commands);
+            }
+            continue;
+        }
         if matches!(sample.pointer, HirakuPointerId::Touch(_)) {
             if sample.phase == HirakuPointerPhase::Press {
                 gestures.insert(

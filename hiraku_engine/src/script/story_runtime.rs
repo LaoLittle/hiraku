@@ -21,6 +21,9 @@ use crate::script::capabilities::{
 /// Engine-facing whole-story driver. It translates generic VM boundaries into
 /// story effects without introducing a second executable representation.
 pub struct StoryRuntime {
+    native_trace: Vec<(String, crate::state::StoredValue)>,
+    native_replay: Option<VecDeque<(String, crate::state::StoredValue)>>,
+    unrecordable_input: bool,
     pub(crate) preload_calls: bool,
     plans: BTreeMap<ExecutionId, AnimationPlan>,
     execution: ExecutionRuntime,
@@ -108,7 +111,16 @@ pub struct StoryRuntimeSnapshot {
     blocked_wait: Option<StoryWait>,
 }
 
+impl StoryRuntimeSnapshot {
+    pub(crate) fn visit_heaps(&mut self, visitor: &mut impl FnMut(&mut hiraku_script::ObjectHeap)) {
+        self.execution.visit_heaps(visitor);
+    }
+}
+
 impl StoryRuntime {
+    pub(crate) fn take_text_records(&mut self) -> Vec<super::text::RecordedText> {
+        self.execution.take_text_records()
+    }
     fn call_native(
         &mut self,
         execution: ExecutionId,
@@ -122,7 +134,87 @@ impl StoryRuntime {
                 self.host.set_symbols(symbols.clone());
             }
         }
-        self.host.call(call)
+        let named = |names: &[&'static str]| {
+            names
+                .iter()
+                .copied()
+                .find(|name| hiraku_script::native::stable_builtin_id(name) == call.builtin)
+        };
+        if self.native_replay.is_some()
+            && named(&["profile.write", "profile.writeInt", "profile.writeBool"]).is_some()
+        {
+            return Ok(StoryCallOutcome::Return(Value::Unit));
+        }
+        let read = named(&["profile.read_any", "profile.readInt", "profile.readBool"]);
+        let Some(name) = read else {
+            return self.host.call(call);
+        };
+        let symbols = self
+            .execution
+            .symbols(execution)
+            .cloned()
+            .unwrap_or_default();
+        let arguments = call
+            .arguments
+            .iter()
+            .map(|arg| hiraku_script::persistence::to_value(&arg.value, &symbols))
+            .collect::<Result<Vec<_>, _>>();
+        let signature = arguments
+            .ok()
+            .and_then(|args| hiraku_script::hson::to_string(&args).ok())
+            .map(|args| format!("native:{name}:{args}"));
+        if let Some(inputs) = self.native_replay.as_mut() {
+            let Some((expected, value)) = inputs.pop_front() else {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "replay has no recorded native input",
+                ));
+            };
+            if signature.as_ref() != Some(&expected) {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "replay native input signature changed",
+                ));
+            }
+            self.native_trace.push((expected, value.clone()));
+            let crate::state::StoredValue::String(encoded) = value else {
+                return Err(CharacterCapabilityError::InvalidArguments(
+                    "invalid recorded native input",
+                ));
+            };
+            let value = hiraku_script::hson::parse(&encoded)
+                .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
+            let value = hiraku_script::persistence::from_value(value, &symbols)
+                .map_err(CharacterCapabilityError::Native)?;
+            return Ok(StoryCallOutcome::Return(value));
+        }
+        let outcome = self.host.call(call)?;
+        if let (Some(signature), StoryCallOutcome::Return(value)) = (signature, &outcome) {
+            match hiraku_script::persistence::to_value(value, &symbols).and_then(|value| {
+                hiraku_script::hson::to_string(&value).map_err(|error| error.to_string())
+            }) {
+                Ok(value) => self
+                    .native_trace
+                    .push((signature, crate::state::StoredValue::String(value))),
+                Err(_) => self.unrecordable_input = true,
+            }
+        } else {
+            self.unrecordable_input = true;
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn take_native_trace(&mut self) -> (Vec<(String, crate::state::StoredValue)>, bool) {
+        (
+            std::mem::take(&mut self.native_trace),
+            std::mem::take(&mut self.unrecordable_input),
+        )
+    }
+
+    pub(crate) fn replay_inputs(&mut self, inputs: Vec<(String, crate::state::StoredValue)>) {
+        self.native_replay = Some(inputs.into());
+    }
+
+    pub(crate) fn finish_replay(&mut self) {
+        self.native_replay = None;
     }
     fn build_plan(
         &mut self,
@@ -253,6 +345,9 @@ impl StoryRuntime {
 
     pub fn new(bytecode: impl Into<super::StoryProgram>) -> Result<Self, StoryRuntimeError> {
         Ok(Self {
+            native_trace: Vec::new(),
+            native_replay: None,
+            unrecordable_input: false,
             preload_calls: true,
             plans: BTreeMap::new(),
             execution: ExecutionRuntime::new(bytecode)?,
@@ -337,6 +432,9 @@ impl StoryRuntime {
             })
             .collect();
         let mut runtime = Self {
+            native_trace: Vec::new(),
+            native_replay: None,
+            unrecordable_input: false,
             preload_calls: snapshot.preload_calls,
             plans: snapshot.plans,
             awaiting_effects: snapshot.awaiting_effects,

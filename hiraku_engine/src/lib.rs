@@ -320,6 +320,19 @@ impl Plugin for HirakuPlugin {
             .add_message::<input::HirakuPointerInput>()
             .add_message::<input::HirakuScrollInput>()
             .add_message::<input::HirakuActionInput>()
+            .init_resource::<input::touch_hold::TouchHold>()
+            .init_resource::<input::touch_hold::HoldVisual>()
+            .add_systems(
+                First,
+                input::touch_hold::update
+                    .run_if(runtime_initialized)
+                    .after(bevy::time::TimeSystems)
+                    .before(input::bridge_virtual_pointers),
+            )
+            .add_systems(
+                Update,
+                input::touch_hold::render.run_if(runtime_initialized),
+            )
             .add_systems(
                 First,
                 input::bridge_virtual_pointers.before(bevy::picking::PickingSystems::Input),
@@ -645,6 +658,9 @@ impl Plugin for HirakuPlugin {
                         .after(animate_visual_tweens)
                         .after(reconcile_restored_bgm)
                         .in_set(HirakuRuntimeSystems),
+                    scene::history::capture_checkpoint
+                        .after(sync_scene_snapshot)
+                        .in_set(HirakuRuntimeSystems),
                 ),
             );
 
@@ -851,6 +867,9 @@ fn boot_runtime(
                 Ok(mut story) => {
                     story.set_globals(script::capabilities::engine_globals(&user_settings));
                     script_runtime.story = Some(story);
+                    script_runtime.replay = Some(script::replay::ReplayJournal::recording(
+                        startup_script.clone(),
+                    ));
                     script_runtime.current_script = Some(startup_script);
                 }
                 Err(error) => script::emit_script_diagnostic(

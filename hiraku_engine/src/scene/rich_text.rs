@@ -218,6 +218,7 @@ pub(crate) fn update(
                 let span = commands
                     .spawn((
                         TextSpan::new(text),
+                        Pickable::IGNORE,
                         span_font(&document, index as usize, &font),
                         span_color(&document, index, *color),
                         bevy::text::LineHeight::RelativeToFont(if annotated { 1.8 } else { 1.2 }),
@@ -559,6 +560,80 @@ mod tests {
                     .glyphs
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn text_sections_do_not_intercept_dialogue_or_button_picking() {
+        use bevy::picking::{
+            backend::{HitData, PointerHits},
+            hover::{HoverMap, PointerCaptureMap, PreviousHoverMap, generate_hovermap},
+            pointer::{PointerId, PointerInput},
+        };
+        let mut app = App::new();
+        app.init_resource::<UiModels>()
+            .init_resource::<HoverMap>()
+            .init_resource::<bevy::picking::pointer::PointerMap>()
+            .init_resource::<PreviousHoverMap>()
+            .init_resource::<PointerCaptureMap>()
+            .add_message::<PointerHits>()
+            .add_message::<PointerInput>()
+            .add_systems(Update, (update, generate_hovermap).chain());
+        let root = app
+            .world_mut()
+            .spawn((
+                Text::default(),
+                Pickable::IGNORE,
+                RichTextSource::new("*Alice*".into(), &crate::ui::ScreenLayout::default()),
+                TextFont::default(),
+                TextColor::WHITE,
+            ))
+            .id();
+        app.update();
+        let spans = app
+            .world()
+            .get::<RichTextSource>(root)
+            .expect("rich text")
+            .spans
+            .clone();
+        for &span in &spans {
+            let pickable = app
+                .world()
+                .get::<Pickable>(span)
+                .expect("text section picking policy");
+            assert!(!pickable.is_hoverable && !pickable.should_block_lower);
+        }
+        let pointer = PointerId::Custom(uuid::Uuid::from_u128(1));
+        app.world_mut().spawn(pointer);
+        let surface = app
+            .world_mut()
+            .spawn((super::super::DialogueAdvanceSurface, Pickable::default()))
+            .id();
+        let button = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                bevy::ui_widgets::Button,
+                Pickable::default(),
+            ))
+            .id();
+        for blocking in [None, Some(button)] {
+            let mut hits = vec![(spans[0], HitData::new(surface, 0.0, None, None))];
+            if let Some(blocking) = blocking {
+                hits.push((blocking, HitData::new(surface, 1.0, None, None)));
+            }
+            hits.push((surface, HitData::new(surface, 2.0, None, None)));
+            app.world_mut()
+                .write_message(PointerHits::new(pointer, hits, 0.0));
+            app.update();
+            let hover = app
+                .world()
+                .resource::<HoverMap>()
+                .get(&pointer)
+                .expect("hovered target");
+            assert!(!hover.contains_key(&spans[0]));
+            assert!(hover.contains_key(&blocking.unwrap_or(surface)));
+            assert_eq!(hover.len(), 1);
         }
     }
 

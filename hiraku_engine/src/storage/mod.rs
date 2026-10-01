@@ -24,6 +24,7 @@ const SAVE_NAMESPACE: &str = "hiraku.save";
 pub(crate) mod profile;
 mod runtime;
 mod slots;
+mod snapshots;
 mod user_settings;
 pub(crate) use runtime::{initialize_runtime_storage, poll_runtime_storage, storage_ready};
 pub use slots::{
@@ -82,16 +83,10 @@ impl From<&SaveGameData> for proto::SaveGameData {
             scope: stored_entries_from_map(&data.scope),
             input_log: data.input_log.iter().map(Into::into).collect(),
             scene: Some((&data.scene).into()),
-            vm_snapshot_hson: data
-                .vm_snapshot
-                .as_ref()
-                .and_then(|snapshot| hson::to_vec(snapshot).ok())
-                .unwrap_or_default(),
+            execution_state_bhson: snapshots::encode(&data.vm_snapshot, &data.script_call_stack, &data.history_records),
             pending_ui_screen: data.pending_ui_screen.clone(),
             pending_ui_arguments_hson: hson::to_vec(&data.pending_ui_arguments)
                 .expect("pending UI arguments must serialize to HSON"),
-            script_call_stack_hson: hson::to_vec(&data.script_call_stack)
-                .expect("script call stack snapshots must serialize to HSON"),
             ui_registry_hson: hson::to_vec(&data.ui_registry)
                 .expect("UI registry must serialize to HSON"),
             mounted_ui_overlays_hson: hson::to_vec(&data.mounted_ui_overlays)
@@ -104,24 +99,42 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
     type Error = StorageError;
 
     fn try_from(data: proto::SaveGameData) -> Result<Self, Self::Error> {
-        if data.version != CURRENT_SAVE_VERSION {
+        let replay: Option<crate::script::replay::ReplayJournal> = if data.replay_hson.is_empty() {
+            None
+        } else {
+            hson::from_slice(&data.replay_hson).map_err(|error| {
+                StorageError::InvalidSave(format!("invalid replay journal: {error}"))
+            })?
+        };
+        let compatible = data.version == CURRENT_SAVE_VERSION;
+        let replayable = replay
+            .as_ref()
+            .is_some_and(|journal| journal.playback().is_ok());
+        if !compatible && !replayable {
             return Err(StorageError::InvalidSave(format!(
                 "save format version {} is incompatible with runtime version {}; no supported session replay is available, so this save was not loaded",
                 data.version, CURRENT_SAVE_VERSION
             )));
         }
+        let (vm_snapshot, script_call_stack, history_records) =
+            if data.execution_state_bhson.is_empty() || !compatible {
+                (None, Vec::new(), Vec::new())
+            } else {
+                match snapshots::decode(&data.execution_state_bhson) {
+                    Ok(snapshots) => snapshots,
+                    Err(_) if replayable => (None, Vec::new(), Vec::new()),
+                    Err(error) => {
+                        return Err(error);
+                    }
+                }
+            };
         Ok(Self {
+            history_records,
             thumbnail_png: Vec::new(),
             dialogue_history: data.dialogue_history.into_iter().map(Into::into).collect(),
             version: data.version,
             resume_script: data.resume_script,
-            replay: if data.replay_hson.is_empty() {
-                None
-            } else {
-                hiraku_script::hson::from_slice(&data.replay_hson).map_err(|error| {
-                    StorageError::InvalidSave(format!("invalid replay journal: {error}"))
-                })?
-            },
+            replay,
             random_seed: data.random_seed,
             rng_state: data.rng_state.map(Into::into),
             time_seed: data.time_seed,
@@ -139,13 +152,7 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                 .map(TryInto::try_into)
                 .transpose()?
                 .unwrap_or_default(),
-            vm_snapshot: if data.vm_snapshot_hson.is_empty() || data.version < 7 {
-                None
-            } else {
-                Some(hson::from_slice(&data.vm_snapshot_hson).map_err(|error| {
-                    StorageError::InvalidSave(format!("invalid HSON VM snapshot: {error}"))
-                })?)
-            },
+            vm_snapshot,
             pending_ui_screen: data.pending_ui_screen,
             pending_ui_arguments: if data.pending_ui_arguments_hson.is_empty() {
                 Vec::new()
@@ -154,13 +161,7 @@ impl TryFrom<proto::SaveGameData> for SaveGameData {
                     StorageError::InvalidSave(format!("invalid pending UI arguments: {error}"))
                 })?
             },
-            script_call_stack: if data.script_call_stack_hson.is_empty() {
-                Vec::new()
-            } else {
-                hson::from_slice(&data.script_call_stack_hson).map_err(|error| {
-                    StorageError::InvalidSave(format!("invalid HSON script call stack: {error}"))
-                })?
-            },
+            script_call_stack,
             ui_registry: if data.ui_registry_hson.is_empty() {
                 BTreeMap::new()
             } else {
@@ -767,6 +768,29 @@ mod tests {
                 .to_string()
                 .contains("incompatible with runtime version")
         );
+    }
+
+    #[test]
+    fn incompatible_checkpoint_version_can_use_a_complete_replay_journal() {
+        let mut journal =
+            crate::script::replay::ReplayJournal::recording("memory://alice.hks".into());
+        journal.destination = Some(crate::script::replay::ReplayPoint {
+            script: "memory://alice.hks".into(),
+            signature: "dialogue:alice".into(),
+        });
+        let data = SaveGameData {
+            version: CURRENT_SAVE_VERSION - 1,
+            resume_script: "memory://alice.hks".into(),
+            replay: Some(journal),
+            ..Default::default()
+        };
+        let mut proto = proto::SaveGameData::from(&data);
+        proto.execution_state_bhson = b"not a supported checkpoint".to_vec();
+        let restored = SaveGameData::try_from(proto).expect("version-independent replay history");
+        assert!(restored.vm_snapshot.is_none());
+        assert!(restored.script_call_stack.is_empty());
+        assert_eq!(restored.replay, data.replay);
+        crate::script::ScriptBootstrap::from_save(&restored).expect("replay bootstrap");
     }
 
     #[test]

@@ -107,6 +107,7 @@ pub(super) fn sync(
     parents: Query<&ChildOf>,
     time: crate::scene::playback::StoryTime,
     mut redraw: super::redraw::StageRedraw,
+    views: Option<Res<super::views::StageViews>>,
 ) {
     let Some(state) = shared.0.spatial_stage.as_mut() else {
         return;
@@ -114,6 +115,7 @@ pub(super) fn sync(
     if !runtime.ready(state) || runtime.error.is_some() {
         return;
     }
+    let presented = views.as_ref().is_none_or(|views| views.presented(state));
     let Some(playback) = state.animation.as_mut() else {
         return;
     };
@@ -186,7 +188,7 @@ pub(super) fn sync(
     if !playback.completed || installed {
         redraw.request();
         // Do not consume a frame while the deferred graph is being installed.
-        if !installed {
+        if !installed && presented {
             playback.advance(time.delta_secs(), duration);
             for (entity, mut player, bound) in &mut players {
                 if parents

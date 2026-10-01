@@ -841,6 +841,7 @@ mod tests {
 
     #[test]
     fn view_targets_are_owned_by_stage_and_removed_on_close() {
+        use bevy::camera::RenderTarget;
         let mut app = App::new();
         app.init_resource::<Assets<Image>>()
             .init_resource::<crate::state::SceneSharedState>()
@@ -902,6 +903,64 @@ mod tests {
         assert_eq!(
             *tonemapping,
             bevy::core_pipeline::tonemapping::Tonemapping::None
+        );
+        let (surface, image) = app.world_mut()
+            .query_filtered::<(Entity, &crate::render::world_sprite::WorldSprite), With<super::super::views::ViewSurface>>()
+            .single(app.world()).map(|(entity, sprite)| (entity, sprite.image.clone()))
+            .expect("presented stage texture");
+        {
+            let mut shared = app
+                .world_mut()
+                .resource_mut::<crate::state::SceneSharedState>();
+            let stage = shared.0.spatial_stage.as_mut().expect("stage");
+            stage.id = 2;
+            stage.path = "bob.stage.hson".into();
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<crate::render::world_sprite::WorldSprite>(surface)
+                .expect("held surface")
+                .image,
+            image
+        );
+        assert!(
+            !app.world_mut()
+                .query_filtered::<&Camera, With<super::super::views::ViewCamera>>()
+                .single(app.world())
+                .expect("paused view")
+                .is_active
+        );
+        {
+            let mut runtime = app.world_mut().resource_mut::<StageRuntime>();
+            runtime.id = Some(2);
+            runtime.path = Some("bob.stage.hson".into());
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<crate::render::world_sprite::WorldSprite>(surface)
+                .expect("held surface")
+                .image,
+            image
+        );
+        let target = app
+            .world_mut()
+            .query_filtered::<&RenderTarget, With<super::super::views::ViewCamera>>()
+            .single(app.world())
+            .expect("new target")
+            .clone();
+        let RenderTarget::Image(target) = target else {
+            panic!("image target")
+        };
+        assert_ne!(Some(target.handle.clone()), image);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<crate::render::world_sprite::WorldSprite>(surface)
+                .expect("same surface")
+                .image,
+            Some(target.handle)
         );
         app.world_mut()
             .resource_mut::<crate::state::SceneSharedState>()

@@ -29,6 +29,18 @@ pub(super) struct StageViews {
     owner: Option<(u64, String)>,
     root: Option<Entity>,
     views: BTreeMap<String, ViewEntities>,
+    refresh_targets: bool,
+    handoff: Option<u64>,
+}
+
+impl StageViews {
+    pub(super) fn presented(&self, state: &super::runtime::StageSnapshot) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|(id, path)| *id == state.id && *path == state.path)
+            && !self.refresh_targets
+            && self.handoff.is_none()
+    }
 }
 
 pub(super) fn sync(
@@ -63,19 +75,52 @@ pub(super) fn sync(
     let owner = state.map(|s| (s.id, s.path.clone()));
     if owner != rendered.owner {
         redraw.request();
-        if let Some(root) = rendered.root.take() {
-            commands.entity(root).try_despawn();
+        rendered.handoff = None;
+        if owner.is_none() {
+            if let Some(root) = rendered.root.take() {
+                commands.entity(root).try_despawn();
+            }
+            rendered.views.clear();
         }
-        rendered.views.clear();
+        rendered.refresh_targets = owner.is_some() && !rendered.views.is_empty();
         rendered.owner = owner;
     }
     let Some(state) = state else { return };
     if !stage.ready(state) {
+        for entities in rendered.views.values() {
+            if let Ok((mut camera, ..)) = cameras.get_mut(entities.camera) {
+                camera.is_active = false;
+            }
+        }
+        redraw.request();
         return;
     }
+    rendered.views.retain(|name, entities| {
+        if state.views.contains_key(name) {
+            true
+        } else {
+            commands.entity(entities.camera).try_despawn();
+            commands.entity(entities.surface).try_despawn();
+            false
+        }
+    });
     let Ok(primary) = primary.single() else {
         return;
     };
+    if rendered
+        .handoff
+        .is_some_and(|generation| redraw.completed(generation))
+    {
+        for entities in rendered.views.values() {
+            if let Ok(mut surface) = surfaces.get_mut(entities.surface) {
+                surface.image = Some(entities._image.clone());
+            }
+        }
+        rendered.handoff = None;
+        redraw.request();
+    }
+    let refresh_targets = rendered.refresh_targets;
+    let mut new_targets = refresh_targets;
     let root = *rendered.root.get_or_insert_with(|| {
         commands
             .spawn((Transform::default(), Visibility::default()))
@@ -96,7 +141,20 @@ pub(super) fn sync(
                 .as_ref()
                 .map(|state| state.view(crate::script::CameraEffectScope::World)),
         );
-        if let Some(entities) = rendered.views.get(name) {
+        if let Some(entities) = rendered.views.get_mut(name) {
+            if refresh_targets {
+                let image = images.add(Image::new_target_texture(
+                    canvas.size.x,
+                    canvas.size.y,
+                    TextureFormat::Rgba8Unorm,
+                    Some(TextureFormat::Rgba8UnormSrgb),
+                ));
+                commands
+                    .entity(entities.camera)
+                    .try_insert(RenderTarget::Image(image.clone().into()));
+                entities._image = image;
+                redraw.request();
+            }
             if let Ok((
                 mut camera,
                 mut current_pose,
@@ -149,6 +207,7 @@ pub(super) fn sync(
             continue;
         }
         redraw.request();
+        new_targets = true;
         let image = images.add(Image::new_target_texture(
             canvas.size.x,
             canvas.size.y,
@@ -207,6 +266,10 @@ pub(super) fn sync(
                 _image: image,
             },
         );
+    }
+    if new_targets {
+        rendered.handoff = Some(redraw.generation());
+        rendered.refresh_targets = false;
     }
 }
 

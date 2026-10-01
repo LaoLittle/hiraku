@@ -29,11 +29,9 @@ pub struct SaveGameData {
     #[prost(message, optional, tag = "11")]
     pub rng_state: Option<RngState>,
     #[prost(bytes = "vec", tag = "12")]
-    pub vm_snapshot_hson: Vec<u8>,
+    pub execution_state_bhson: Vec<u8>,
     #[prost(string, optional, tag = "14")]
     pub pending_ui_screen: Option<String>,
-    #[prost(bytes = "vec", tag = "15")]
-    pub script_call_stack_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "16")]
     pub ui_registry_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "17")]

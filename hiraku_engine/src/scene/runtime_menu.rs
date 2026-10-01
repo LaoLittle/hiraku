@@ -357,15 +357,20 @@ fn dispatch_ui_effects(
                     } else {
                         &[]
                     },
-                    &ctx.dialogue_history.entries,
+                    &ctx.dialogue_history,
                 ) {
                     warn!("failed to save slot `{slot}`: {error}");
                     ctx.frontend.notice = Some(format!("Failed to save slot {slot}: {error}"));
                     break;
                 }
             }
-            crate::ui::UiEffect::Load { slot } => {
-                let save_data = match load_save_data(slot) {
+            effect @ (crate::ui::UiEffect::Load { .. } | crate::ui::UiEffect::HistoryRollback { .. }) => {
+                let (slot, loaded) = match effect {
+                    crate::ui::UiEffect::Load { slot } => (slot.clone(), load_save_data(slot)),
+                    crate::ui::UiEffect::HistoryRollback { id } => (format!("history:{id}"), ctx.dialogue_history.rollback_save(*id)),
+                    _ => unreachable!(),
+                };
+                let save_data = match loaded {
                     Ok(save_data) => save_data,
                     Err(error) => {
                         warn!("failed to load slot `{slot}`: {error}");
@@ -406,6 +411,7 @@ fn dispatch_ui_effects(
                 );
                 ctx.dialogue_history
                     .restore(save_data.dialogue_history.clone());
+                ctx.dialogue_history.restore_records(save_data.history_records.clone());
                 // Mounted overlays belong to the saved presentation, not
                 // the session being replaced. Bootstrap will mount exactly
                 // the saved set; retaining future overlays exposes stale
@@ -495,6 +501,12 @@ fn dispatch_ui_effects(
                 );
             }
             crate::ui::UiEffect::Navigate(navigation) => {
+                if navigation.reset != crate::script::navigation::NavigationReset::Session
+                    && let Some(journal) = ctx.script_runtime.replay.as_mut()
+                    && journal.destination.is_none()
+                {
+                    journal.complete = false;
+                }
                 ctx.pending_script_commands.enqueue(ScriptCommand::Runtime(
                     RuntimeCommand::Navigate {
                         request: navigation.clone(),

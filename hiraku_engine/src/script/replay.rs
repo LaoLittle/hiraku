@@ -9,8 +9,11 @@ pub const JOURNAL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputKind {
+    Native,
     Choice,
     UiResult,
+    UiUnit,
+    Navigation,
     Random,
     Time,
 }
@@ -73,6 +76,15 @@ fn extend_digest(previous: &str, point: &ReplayPoint) -> Result<String, ReplayEr
 }
 
 impl ReplayJournal {
+    pub(crate) fn recording(entry_script: String) -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let mut journal = Self::new(entry_script, seed);
+        journal.complete = true;
+        journal
+    }
     /// Deterministic draw from the saved seed and recorded draw ordinal. Bounds
     /// are half-open. Rejection sampling avoids modulo bias.
     pub fn random_int(&mut self, min: i64, max: i64) -> i64 {
@@ -174,6 +186,29 @@ pub struct ReplayCursor<'a> {
 }
 
 impl ReplayCursor<'_> {
+    pub(crate) fn next_kind(&self) -> Option<&InputKind> {
+        match self.journal.events.get(self.event) {
+            Some(ReplayEvent::Input { kind, .. }) => Some(kind),
+            _ => None,
+        }
+    }
+    pub(crate) fn exhausted(&self) -> bool {
+        self.event == self.journal.events.len() && self.dialogue_count == 0
+    }
+
+    pub(crate) fn native_inputs(&self, script: &str) -> Vec<(String, StoredValue)> {
+        self.journal.events[self.event..]
+            .iter()
+            .map_while(|event| match event {
+                ReplayEvent::Input {
+                    kind: InputKind::Native,
+                    point,
+                    value,
+                } if point.script == script => Some((point.signature.clone(), value.clone())),
+                _ => None,
+            })
+            .collect()
+    }
     fn mismatch(&self, reason: &str) -> ReplayError {
         ReplayError::Diverged {
             event: self.event,
@@ -234,6 +269,46 @@ impl ReplayCursor<'_> {
         }
         Ok(())
     }
+}
+
+pub(crate) fn boundary(
+    script: &str,
+    dialogue: &mut String,
+    event: &super::StoryRuntimeEvent,
+) -> Result<Option<ReplayPoint>, String> {
+    use super::{
+        StoryRuntimeEvent as Event,
+        capabilities::{StoryEffect, StoryWait},
+    };
+    fn encode<T: Serialize>(kind: &str, value: &T) -> Result<String, String> {
+        hiraku_script::hson::to_string(value)
+            .map(|value| format!("{kind}:{value}"))
+            .map_err(|e| e.to_string())
+    }
+    let value = match event {
+        Event::Effect(StoryEffect::Say { speaker, text }) => {
+            *dialogue = encode("say", &(speaker, text))?;
+            None
+        }
+        Event::Effect(StoryEffect::ContinueDialogue { text }) => {
+            *dialogue = encode("append", text)?;
+            None
+        }
+        Event::Wait(StoryWait::DialogueAdvance) => Some(format!("dialogue:{dialogue}")),
+        Event::Choice {
+            prompt,
+            options,
+            enabled,
+            parameters,
+        } => Some(encode("choice", &(prompt, options, enabled, parameters))?),
+        Event::OpenUi { path, arguments } => Some(encode("ui", &(path, arguments))?),
+        Event::RandomInt { min, max } => Some(encode("random", &(min, max))?),
+        _ => None,
+    };
+    Ok(value.map(|signature| ReplayPoint {
+        script: script.into(),
+        signature,
+    }))
 }
 
 #[cfg(test)]

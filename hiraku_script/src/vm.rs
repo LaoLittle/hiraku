@@ -2124,6 +2124,10 @@ impl Vm {
             .transpose()
     }
 
+    pub fn lexical_bindings(&self) -> BTreeMap<String, Value> {
+        self.template_captures()
+    }
+
     /// Rewrites a lazy text template before evaluating its expressions.
     ///
     /// Embeddings can use this boundary for localization. The rewrite runs on

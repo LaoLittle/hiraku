@@ -19,6 +19,44 @@ mod tests {
     use crate::script::story_runtime::{StoryRuntime, StoryRuntimeEvent};
 
     #[test]
+    fn stage_sequence_finishes_opening_before_starting_loop() {
+        let code = compile_story_bytecode(
+            "stage.hks",
+            r#"
+            let room = stage.open("room.stage.hson")
+            let sequence = seq {
+                room.play("opening")
+                room.play("idle").looped(true)
+            }
+            sequence.await()
+            "#,
+        )
+        .expect("typed stage sequence");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let Some(StoryRuntimeEvent::TaskEffect { task, effect }) = runtime.step().expect("open")
+        else {
+            panic!("stage load event");
+        };
+        runtime.complete_task_effect(task, &effect).expect("loaded");
+        let Some(StoryRuntimeEvent::TaskEffect { task, effect }) = runtime.step().expect("opening")
+        else {
+            panic!("opening event");
+        };
+        assert!(matches!(&effect, StoryEffect::Spatial(StageCommand::Play {
+            name, looping: false, ..
+        }) if name == "opening"));
+        assert!(runtime.step().expect("opening is still playing").is_none());
+        runtime.complete_task_effect(task, &effect).expect("opened");
+        let Some(StoryRuntimeEvent::TaskEffect { effect, .. }) = runtime.step().expect("idle")
+        else {
+            panic!("idle event");
+        };
+        assert!(matches!(&effect, StoryEffect::Spatial(StageCommand::Play {
+            name, looping: true, ..
+        }) if name == "idle"));
+    }
+
+    #[test]
     fn stage_animation_is_typed_and_waits_for_its_own_completion() {
         let code = compile_story_bytecode(
             "stage.hks",

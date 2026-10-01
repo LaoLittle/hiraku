@@ -19,10 +19,11 @@ mod execution_runtime;
 pub(crate) mod navigation;
 mod project;
 pub mod replay;
+mod replay_restore;
 mod runtime;
 mod stdlib;
 mod story_runtime;
-mod text;
+pub(crate) mod text;
 pub mod ui_runtime;
 mod ui_vm;
 pub(crate) use project::{StoryProgram, compile_story_program};
@@ -350,7 +351,12 @@ pub struct ScriptBootstrap {
 
 impl ScriptBootstrap {
     pub fn from_save(data: &SaveGameData) -> Result<Self, String> {
-        if data.vm_snapshot.is_none() {
+        if data.vm_snapshot.is_none()
+            && data
+                .replay
+                .as_ref()
+                .is_none_or(|journal| journal.playback().is_err())
+        {
             return Err("save has no restorable VM checkpoint; complete session replay is not available; the save was not loaded".into());
         }
         let mut values = data.globals.clone();
@@ -370,6 +376,25 @@ impl ScriptBootstrap {
 }
 
 pub fn start_story_runtime(
+    vfs: &VfsResource,
+    runtime: &mut ScriptRuntimeState,
+    bootstrap: ScriptBootstrap,
+    user_settings: &crate::storage::UserSettings,
+) -> Result<(), String> {
+    let checkpoint_error = if bootstrap.snapshot.is_some() {
+        match start_checkpoint_runtime(vfs, runtime, bootstrap.clone(), user_settings) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        }
+    } else {
+        "save has no VM checkpoint".into()
+    };
+    let recovered = replay_restore::prepare(vfs, bootstrap, user_settings)
+        .map_err(|error| format!("{checkpoint_error}\ndeterministic recovery failed: {error}"))?;
+    start_checkpoint_runtime(vfs, runtime, recovered, user_settings)
+}
+
+fn start_checkpoint_runtime(
     vfs: &VfsResource,
     runtime: &mut ScriptRuntimeState,
     bootstrap: ScriptBootstrap,
@@ -467,8 +492,19 @@ pub fn save_runtime_slot(
     runtime: &ScriptRuntimeState,
     shared_state: &SceneSharedState,
     thumbnail: &[u8],
-    history: &[crate::state::DialogueSnapshot],
+    history: &crate::scene::DialogueHistoryState,
 ) -> Result<(), StorageError> {
+    let mut data = capture_runtime_save(runtime, shared_state)?;
+    data.dialogue_history = history.entries.clone();
+    data.history_records = history.records.clone();
+    data.thumbnail_png = thumbnail.to_vec();
+    write_save_data_to_root(&save_root_path(), slot, &data)
+}
+
+pub(crate) fn capture_runtime_save(
+    runtime: &ScriptRuntimeState,
+    shared_state: &SceneSharedState,
+) -> Result<SaveGameData, StorageError> {
     let current_script = runtime.current_script.clone().unwrap_or_default();
     let values = runtime
         .story
@@ -496,9 +532,7 @@ pub fn save_runtime_slot(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let data = SaveGameData {
-        dialogue_history: history.to_vec(),
         replay: runtime.replay.clone(),
-        thumbnail_png: thumbnail.to_vec(),
         version: crate::state::CURRENT_SAVE_VERSION,
         resume_script: current_script,
         script_stack: script_call_stack
@@ -515,7 +549,7 @@ pub fn save_runtime_slot(
         mounted_ui_overlays: runtime.mounted_ui_overlays.clone(),
         ..Default::default()
     };
-    write_save_data_to_root(&save_root_path(), slot, &data)
+    Ok(data)
 }
 
 fn stored_value_to_hks(value: StoredValue) -> hiraku_script::Value {

@@ -1730,12 +1730,11 @@ mod storage_actions {
             return Ok(None);
         }
         Ok(match crate::storage::load_save_metadata(&slot) {
-            Ok(data) if data.version == crate::state::CURRENT_SAVE_VERSION => {
+            Ok(_) => {
                 crate::storage::load_save_data(&slot)
                     .err()
                     .map(|error| error.to_string())
             }
-            Ok(data) => Some(format!("Incompatible save version {}", data.version)),
             Err(error) => Some(error.to_string()),
         })
     }
@@ -1760,6 +1759,18 @@ mod storage_actions {
             return Err(NativeError::message("save slot must not be empty"));
         }
         Ok(context.insert_effect(UiEffect::Load { slot }))
+    }
+}
+
+#[hiraku_script::hks_module("history")]
+mod history_actions {
+    use super::*;
+
+    #[hks]
+    fn rollback(context: &mut UiVmContext, id: i64) -> Result<UiEffectHandle, NativeError> {
+        let id = u64::try_from(id).ok().filter(|id| *id > 0)
+            .ok_or_else(|| NativeError::message("history.rollback expects a positive history entry ID"))?;
+        Ok(context.insert_effect(UiEffect::HistoryRollback { id }))
     }
 }
 
@@ -2164,6 +2175,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     preference_actions::register_hks(&mut registry).expect("preference API registers once");
     storage_actions::register_hks(&mut registry)
         .expect("storage actions must be internally consistent");
+    history_actions::register_hks(&mut registry).expect("history API registers once");
     settings_actions::register_hks(&mut registry)
         .expect("settings actions must be internally consistent");
     story_actions::register_hks(&mut registry)

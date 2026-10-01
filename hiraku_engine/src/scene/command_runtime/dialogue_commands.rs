@@ -89,7 +89,9 @@ pub(super) fn dispatch_dialogue_command(
                     speaker: String::new(),
                     text,
                 });
+                dialogue_history.push(shared_state.0.dialogue.clone().expect("narration buffer"));
             } else {
+                dialogue_history.record_text(&text);
                 let previous_chars = shared_state
                     .0
                     .dialogue

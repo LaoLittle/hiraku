@@ -102,7 +102,20 @@ pub struct ExecutionRuntimeSnapshot {
     module_globals: BTreeMap<String, Value>,
 }
 
+impl ExecutionRuntimeSnapshot {
+    pub(crate) fn visit_heaps(&mut self, visitor: &mut impl FnMut(&mut hiraku_script::ObjectHeap)) {
+        visitor(&mut self.objects);
+        for execution in self.executions.values_mut() {
+            visitor(&mut execution.vm.objects);
+            for (_, caller) in &mut execution.callers {
+                visitor(&mut caller.objects);
+            }
+        }
+    }
+}
+
 pub struct ExecutionRuntime {
+    text_records: Vec<super::text::RecordedText>,
     objects: hiraku_script::ObjectHeap,
     linked: LinkedBytecode,
     program: hiraku_script::LinkedProgram,
@@ -172,6 +185,7 @@ impl ExecutionRuntime {
         );
         Ok(Self {
             objects: hiraku_script::ObjectHeap::default(),
+            text_records: Vec::new(),
             linked,
             program,
             entry,
@@ -279,6 +293,7 @@ impl ExecutionRuntime {
             .collect::<Result<_, hiraku_script::VmError>>()?;
         Ok(Self {
             linked,
+            text_records: Vec::new(),
             program,
             entry,
             module_globals: snapshot.module_globals,
@@ -322,6 +337,10 @@ impl ExecutionRuntime {
                 })
                 .collect(),
         }
+    }
+
+    pub(crate) fn take_text_records(&mut self) -> Vec<super::text::RecordedText> {
+        std::mem::take(&mut self.text_records)
     }
 
     /// Drop a child continuation. External effects remain owned by the host.
@@ -530,7 +549,7 @@ impl ExecutionRuntime {
                         }
                         hiraku_script::linked_vm::PreparedInvocation::Native(mut call) => {
                             evaluate_call_templates(&mut call, |text| {
-                                super::text::evaluate(&state.vm, text)
+                                super::text::evaluate_recorded(&state.vm, text, &mut self.text_records)
                             })?;
                             Ok(Some(ExecutionEvent::Call { execution, call }))
                         }
@@ -603,7 +622,7 @@ impl ExecutionRuntime {
                         .get(&execution)
                         .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
                     evaluate_call_templates(&mut call, |text| {
-                        super::text::evaluate(&state.vm, text)
+                        super::text::evaluate_recorded(&state.vm, text, &mut self.text_records)
                     })?;
                     Ok(Some(ExecutionEvent::Call { execution, call }))
                 }
@@ -613,7 +632,7 @@ impl ExecutionRuntime {
                             .executions
                             .get_mut(&execution)
                             .ok_or(ExecutionRuntimeError::UnknownExecution(execution))?;
-                        evaluate_statement_template(&mut state.vm, value)?
+                        evaluate_statement_template(&mut state.vm, value, &mut self.text_records)?
                     };
                     self.capture_globals(execution)?;
                     Ok(Some(ExecutionEvent::Statement { execution, value }))
@@ -802,11 +821,13 @@ impl From<VmError> for ExecutionRuntimeError {
 fn evaluate_statement_template(
     vm: &mut Vm,
     value: StatementValue,
+    records: &mut Vec<super::text::RecordedText>,
 ) -> Result<StatementValue, TemplateError> {
     match value {
-        StatementValue::TextTemplate(text) => Ok(StatementValue::String(super::text::evaluate(
+        StatementValue::TextTemplate(text) => Ok(StatementValue::String(super::text::evaluate_recorded(
             vm,
             &text.into(),
+            records,
         )?)),
         StatementValue::Value(_) => Ok(StatementValue::Commit),
         value => Ok(value),
