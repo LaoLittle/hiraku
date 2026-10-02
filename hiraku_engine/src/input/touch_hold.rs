@@ -2,8 +2,8 @@ use super::*;
 use crate::script::animation::Easing;
 use std::collections::HashSet;
 
-const DELAY: f64 = 0.15;
-const FILL: f64 = 0.3;
+const DELAY: f64 = 0.2;
+const FILL: f64 = 0.5;
 const MOTION_SLOP: f32 = 0.008;
 const IMAGE_SIZE: usize = 96;
 const CLOSE_CURVE: Easing = Easing::CubicBezier(0.25, 0.1, 0.25, 1.0);
@@ -395,7 +395,7 @@ mod tests {
             HirakuPointerPhase::Press,
             Vec2::splat(0.5),
         );
-        advance(&mut app, 451);
+        advance(&mut app, 701);
         assert!(
             app.world()
                 .resource::<TouchHold>()
@@ -438,7 +438,7 @@ mod tests {
             HirakuPointerPhase::Press,
             Vec2::splat(0.5),
         );
-        advance(&mut app, 451);
+        advance(&mut app, 701);
         let visual = app.world().resource::<HoldVisual>();
         let entity = visual.entity.expect("indicator node");
         let handle = visual.image.clone().expect("indicator texture");
@@ -512,9 +512,9 @@ mod tests {
             HirakuPointerPhase::Press,
             Vec2::splat(0.5),
         );
-        advance(&mut app, 149);
+        advance(&mut app, 199);
         assert!(app.world().resource::<TouchHold>().visual.is_none());
-        advance(&mut app, 151);
+        advance(&mut app, 251);
         assert!(
             (app.world().resource::<TouchHold>().visual.expect("ring").1 - CLOSE_CURVE.sample(0.5))
                 .abs()
@@ -526,7 +526,7 @@ mod tests {
                 .count(),
             0
         );
-        advance(&mut app, 151);
+        advance(&mut app, 251);
         assert!(app.world().resource::<TouchHold>().consumed(pointer));
         assert_eq!(
             actions
@@ -570,7 +570,7 @@ mod tests {
         picking
             .read(app.world().resource::<Messages<PointerInput>>())
             .for_each(drop);
-        advance(&mut app, 451);
+        advance(&mut app, 701);
         assert!(
             picking
                 .read(app.world().resource::<Messages<PointerInput>>())
@@ -671,9 +671,9 @@ mod tests {
             started: 1.0,
             active: false,
         };
-        assert_eq!(hold.progress(1.149), None);
-        assert!((hold.progress(1.3).expect("progress") - CLOSE_CURVE.sample(0.5)).abs() < 0.001);
-        assert_eq!(hold.progress(1.451), Some(1.0));
+        assert_eq!(hold.progress(1.199), None);
+        assert!((hold.progress(1.45).expect("progress") - CLOSE_CURVE.sample(0.5)).abs() < 0.001);
+        assert_eq!(hold.progress(1.701), Some(1.0));
     }
     #[test]
     fn bezier_animation_preserves_deadlines_and_smooth_breathing_turns() {
@@ -765,7 +765,7 @@ mod tests {
                 .entry(pointer.picking_id())
                 .or_default()
                 .insert(entity, HitData::new(entity, 0.0, None, None));
-            advance(&mut app, 451);
+            advance(&mut app, 701);
             assert_eq!(
                 app.world().resource::<TouchHold>().consumed(pointer),
                 kind == 0

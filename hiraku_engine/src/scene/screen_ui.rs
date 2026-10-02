@@ -54,6 +54,26 @@ pub(crate) struct FitText {
     width: f32,
 }
 
+#[derive(Component)]
+pub(crate) struct TextUnderlineImage;
+
+pub(crate) fn update_text_underlines(
+    texts: Query<&bevy::text::TextLayoutInfo>,
+    mut lines: Query<(&ChildOf, &mut Node), With<TextUnderlineImage>>,
+    mut redraw: crate::redraw::Redraw,
+) {
+    for (parent, mut node) in &mut lines {
+        let Ok(text) = texts.get(parent.parent()) else {
+            continue;
+        };
+        let width = px(text.size.x);
+        if node.width != width {
+            node.width = width;
+            redraw.request();
+        }
+    }
+}
+
 fn fitted_font_size(current: f32, maximum: f32, available: f32, measured: f32) -> f32 {
     if available <= 0.0 || measured <= 0.0 {
         return current;
@@ -755,7 +775,7 @@ fn spawn_screen_node_entity(
             align,
             layout,
         }) => {
-            let mut node = Node::default();
+            let mut node = Node { flex_shrink: 0.0, ..default() };
             apply_screen_layout(&mut node, layout);
             // Authored layout/visibility belongs to the wrapper. The text leaf
             // can hide during fitting without overriding .visible(...) or
@@ -774,7 +794,9 @@ fn spawn_screen_node_entity(
                     ..default()
                 };
             } else {
-                let constrained = layout.width.is_some() || layout.width_percent.is_some();
+                let constrained = !layout.fit_content
+                    || layout.width.is_some()
+                    || layout.width_percent.is_some();
                 node = Node {
                     width: if constrained { percent(100) } else { Val::Auto },
                     min_width: if constrained { px(0) } else { Val::Auto },
@@ -836,6 +858,29 @@ fn spawn_screen_node_entity(
                 });
             }
             commands.entity(wrapper).add_child(entity);
+            if let Some(underline) = &layout.text_underline {
+                let image = super::save_preview::load_image(asset_server, &underline.texture.path);
+                image_handles.push(image.clone());
+                let mut artwork = screen_image_node(image, underline.texture.rect, layout);
+                artwork.image_mode = NodeImageMode::Stretch;
+                let line = commands
+                    .spawn((
+                        ScreenUiNode,
+                        TextUnderlineImage,
+                        Pickable::IGNORE,
+                        artwork,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(0),
+                            top: px(underline.offset),
+                            width: px(0),
+                            height: px(underline.height),
+                            ..default()
+                        },
+                    ))
+                    .id();
+                commands.entity(entity).add_child(line);
+            }
             apply_live_layout_bindings(commands, wrapper, layout);
             wrapper
         }
@@ -2044,6 +2089,25 @@ pub(crate) fn initialize_scroll_anchors(
         commands
             .entity(entity)
             .try_remove::<crate::ui::InitialScrollAnchor>();
+    }
+}
+
+pub(crate) fn clamp_scroll_bounds(
+    mut scrollables: Query<
+        (&ComputedNode, &Node, &mut ScrollPosition),
+        (With<ScreenUiScrollable>, Changed<ComputedNode>),
+    >,
+    mut redraw: crate::redraw::Redraw,
+) {
+    for (computed, node, mut position) in &mut scrollables {
+        if computed.size().y <= 0.0 {
+            continue;
+        }
+        let next = position.0.clamp(Vec2::ZERO, scroll_limit(computed, node));
+        if position.0 != next {
+            position.0 = next;
+            redraw.request();
+        }
     }
 }
 
@@ -3778,6 +3842,83 @@ mod tests {
         assert_eq!(
             app.world().get::<Children>(root).expect("stable children")[0],
             child
+        );
+    }
+
+    #[test]
+    fn scroll_content_shrink_clamps_without_waiting_for_pointer_input() {
+        let mut app = App::new();
+        app.add_systems(Update, clamp_scroll_bounds);
+        let entity = app
+            .world_mut()
+            .spawn((
+                ScreenUiScrollable { speed: 80.0 },
+                ScrollPosition(Vec2::new(0.0, 600.0)),
+                ComputedNode {
+                    size: Vec2::new(200.0, 200.0),
+                    content_size: Vec2::new(200.0, 300.0),
+                    inverse_scale_factor: 1.0,
+                    ..default()
+                },
+                Node {
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<ScrollPosition>(entity).expect("scroll").y,
+            100.0
+        );
+        app.world_mut()
+            .get_mut::<ComputedNode>(entity)
+            .expect("layout")
+            .content_size
+            .y = 100.0;
+        app.update();
+        assert_eq!(
+            app.world().get::<ScrollPosition>(entity).expect("scroll").y,
+            0.0
+        );
+    }
+
+    #[test]
+    fn underline_uses_shaped_width_without_changing_text_layout() {
+        let mut app = App::new();
+        app.add_systems(Update, update_text_underlines);
+        let text = app
+            .world_mut()
+            .spawn(bevy::text::TextLayoutInfo {
+                size: Vec2::new(137.5, 40.0),
+                ..default()
+            })
+            .id();
+        let line = app
+            .world_mut()
+            .spawn((
+                TextUnderlineImage,
+                ChildOf(text),
+                Node {
+                    top: px(20),
+                    height: px(8),
+                    ..default()
+                },
+            ))
+            .id();
+        app.update();
+        let node = app.world().get::<Node>(line).expect("underline");
+        assert_eq!(node.width, px(137.5));
+        assert_eq!(node.top, px(20));
+        app.world_mut()
+            .get_mut::<bevy::text::TextLayoutInfo>(text)
+            .expect("shaped text")
+            .size
+            .x = 235.0;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(line).expect("underline").width,
+            px(235)
         );
     }
 

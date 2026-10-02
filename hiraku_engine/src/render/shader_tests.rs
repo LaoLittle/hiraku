@@ -208,7 +208,7 @@ fn embedded_wesl_modules_link_for_material_variants() {
             (true, false, 0),
             (true, true, 0),
         ] {
-            cache
+            let linked = cache
                 .get(
                     index,
                     shader,
@@ -224,6 +224,19 @@ fn embedded_wesl_modules_link_for_material_variants() {
                     ],
                 )
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
+            if name == "standard" && material {
+                let module = naga::front::wgsl::parse_str(&linked).expect("material WGSL");
+                for (_, function) in module.functions.iter() {
+                    for (_, expression) in function.expressions.iter() {
+                        if let naga::Expression::ImageSample { level, .. } = expression {
+                            assert!(
+                                matches!(level, naga::SampleLevel::Exact(_)),
+                                "material samples must not require implicit derivatives after per-pixel branches"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

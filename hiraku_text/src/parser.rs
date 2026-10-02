@@ -469,6 +469,15 @@ mod tests {
     }
 
     #[test]
+    fn timetable_text_preserves_ranges_and_multiple_linebreaks() {
+        let source = "6:00～10:00#br;Morning#br;#br;10:00～12:00#br;Activities#br;(Schedule)#br;#br;22:00～6:00#br;Night";
+        let document = parse(source).expect("plain timetable text");
+        assert!(document.text.contains("6:00～10:00"));
+        assert!(document.text.contains("Morning"));
+        assert!(document.text.contains("Night"));
+    }
+
+    #[test]
     fn tilde_quotes_and_linebreak_constants_are_literal() {
         assert_eq!(
             parse("Alice#br;Bob").expect("linebreak delimiter").text,

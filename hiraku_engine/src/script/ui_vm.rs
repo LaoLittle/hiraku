@@ -1193,6 +1193,34 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "underlineImage", receiver)]
+    fn ui_underline_image(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        image: String,
+        height: f64,
+        offset: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if !height.is_finite() || height <= 0.0 || !offset.is_finite() {
+            return Err(NativeError::message(
+                "underlineImage requires a positive height and finite offset",
+            ));
+        }
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Text(_)) {
+            return Err(NativeError::message("underlineImage requires text"));
+        }
+        draft.layout.text_underline = Some(crate::ui::TextUnderline {
+            texture: ScreenTexture {
+                path: image,
+                rect: None,
+            },
+            height: height as f32,
+            offset: offset as f32,
+        });
+        Ok(node)
+    }
+
     #[hks(name = "flipX", receiver)]
     fn ui_flip_x(
         context: &mut UiVmContext,
@@ -3147,6 +3175,10 @@ fn materialize_node(
             Ok(ScreenNode::Image(ScreenImageNode { texture, layout }))
         }
         UiDraftKind::Text(binding) => {
+            let mut layout = draft.layout.clone();
+            if let Some(underline) = &mut layout.text_underline {
+                underline.texture = resolve_texture(textures, &underline.texture.path)?;
+            }
             let (text, reactive) = match binding {
                 HksBindable::Value(value) => (resolve_ui_text(value, context)?, None),
                 HksBindable::Binding(binding) => {
@@ -3174,7 +3206,7 @@ fn materialize_node(
                 size: draft.text_size.unwrap_or(28.0),
                 color: draft.text_color,
                 align: draft.text_align,
-                layout: draft.layout,
+                layout,
             }))
         }
         UiDraftKind::Term(term) => {

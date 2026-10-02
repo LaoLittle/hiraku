@@ -35,9 +35,6 @@ fn slice_axis(uv: f32, source: f32, destination: f32, before: f32, after: f32) -
 }
 
 fn source(mesh: VertexOutput) -> EffectInput {
-    if material.clip_plane.w > 0.0 && dot(material.clip_plane.xy, mesh.world_position.xy) > material.clip_plane.z {
-        discard;
-    }
     let texture_size = vec2<f32>(textureDimensions(color_texture));
     let full_image = material.rect.z <= 0.0 || material.rect.w <= 0.0;
     let source_size = select(material.rect.zw, texture_size, full_image);
@@ -82,7 +79,7 @@ fn finish(mesh: VertexOutput, value: vec4<f32>) -> vec4<f32> {
     if material.dissolve.x != 0.0 {
         // Screen coordinates keep a full-canvas mask independent of the large
         // scene-covering quad and of camera zoom/projection.
-        let mask = textureSample(dissolve_texture, dissolve_sampler, mesh.position.xy / material.dissolve.zw);
+        let mask = textureSampleLevel(dissolve_texture, dissolve_sampler, mesh.position.xy / material.dissolve.zw, 0.0);
         let threshold = mask.r;
         // Both entering and leaving traverse the mask from low to high.
         let reversed = material.dissolve.x < 0.0;
@@ -107,9 +104,11 @@ fn finish(mesh: VertexOutput, value: vec4<f32>) -> vec4<f32> {
     if material.clip_axes.w > 0.0 {
         // World-space mask: picture translation/scale does not move the window.
         let uv = vec2<f32>(local.x, -local.y) / (2.0 * material.clip_bounds.zw) + 0.5;
-        color.a *= textureSample(clip_texture, clip_sampler, uv).a;
+        color.a *= textureSampleLevel(clip_texture, clip_sampler, uv, 0.0).a;
     }
-    if outside || color.a <= 0.0001 {
+    let clipped_by_plane = material.clip_plane.w > 0.0
+        && dot(material.clip_plane.xy, mesh.world_position.xy) > material.clip_plane.z;
+    if clipped_by_plane || outside || color.a <= 0.0001 {
         discard;
     }
     return color;

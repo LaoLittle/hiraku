@@ -313,6 +313,8 @@ pub struct InputNode {
 /// percent value wins. Position fields switch the node to absolute positioning.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScreenLayout {
+    #[serde(default)]
+    pub text_underline: Option<TextUnderline>,
     #[serde(skip)]
     pub(crate) reactive_size: Option<Box<PropertyComputation>>,
     #[serde(skip)]
@@ -414,6 +416,13 @@ pub struct ScreenLayout {
     /// Absolute bottom inset measured in percent of the UI viewport height.
     #[serde(default)]
     pub bottom_percent: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TextUnderline {
+    pub texture: ScreenTexture,
+    pub height: f32,
+    pub offset: f32,
 }
 
 /// Static text in an HKS screen.

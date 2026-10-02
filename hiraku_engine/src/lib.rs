@@ -552,7 +552,12 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 PostUpdate,
-                scene::screen_ui::initialize_scroll_anchors.after(bevy::ui::UiSystems::Layout),
+                (
+                    scene::screen_ui::clamp_scroll_bounds,
+                    scene::screen_ui::initialize_scroll_anchors,
+                )
+                    .chain()
+                    .after(bevy::ui::UiSystems::Layout),
             )
             .add_systems(
                 PostUpdate,
@@ -562,6 +567,7 @@ impl Plugin for HirakuPlugin {
                 PostUpdate,
                 (
                     scene::fit_screen_text,
+                    scene::screen_ui::update_text_underlines,
                     scene::rich_text::reveal_glyphs,
                     scene::rich_text::position_ruby,
                     scene::text_visibility::sync,
