@@ -631,6 +631,9 @@ impl Plugin for HirakuPlugin {
                         .in_set(HirakuRuntimeSystems),
                     animate_audio_fades.in_set(HirakuRuntimeSystems),
                     scene::poll_sfx_playback.in_set(HirakuRuntimeSystems),
+                    scene::poll_bgm_playback
+                        .before(sync_scene_snapshot)
+                        .in_set(HirakuRuntimeSystems),
                     animate_custom_effects.in_set(HirakuRuntimeSystems),
                     scene::pictures::sync_pictures
                         .before(hiraku_video::VideoPlaybackSystems)

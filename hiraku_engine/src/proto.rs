@@ -130,6 +130,10 @@ pub mod stored_value {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SceneSnapshot {
+    #[prost(bytes = "vec", tag = "19")]
+    pub input_permissions_hson: Vec<u8>,
+    #[prost(bool, tag = "18")]
+    pub story_input_blocked: bool,
     #[prost(bytes = "vec", tag = "17")]
     pub actor_blurs_hson: Vec<u8>,
     #[prost(bytes = "vec", tag = "16")]
@@ -218,6 +222,8 @@ pub struct AudioSnapshot {
     pub path: String,
     #[prost(float, tag = "2")]
     pub volume: f32,
+    #[prost(bool, tag = "3")]
+    pub looped: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]

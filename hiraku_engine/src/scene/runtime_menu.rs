@@ -1,4 +1,42 @@
 use super::*;
+use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
+
+type PreparedLoad = Result<(crate::state::SaveGameData, ScriptRuntimeState), String>;
+
+#[derive(Default)]
+pub struct PendingSaveLoad {
+    request: Option<SaveLoadRequest>,
+    task: Option<Task<PreparedLoad>>,
+    slot: String,
+}
+
+struct SaveLoadRequest {
+    slot: String,
+    history: Option<Result<crate::state::SaveGameData, String>>,
+    vfs: VfsResource,
+    settings: UserSettings,
+    program: Option<crate::script::StoryProgram>,
+}
+
+fn prepare_load(request: SaveLoadRequest) -> PreparedLoad {
+    let mut save = match request.history {
+        Some(result) => result?,
+        None => load_save_data(&request.slot).map_err(|e| e.to_string())?,
+    };
+    let bootstrap = ScriptBootstrap::take_from_save(&mut save)?;
+    let program = request
+        .program
+        .and_then(|p| p.for_path(&bootstrap.startup_script));
+    let mut runtime = ScriptRuntimeState::default();
+    crate::script::start_story_runtime_with_program(
+        &request.vfs,
+        &mut runtime,
+        bootstrap,
+        &request.settings,
+        program,
+    )?;
+    Ok((save, runtime))
+}
 
 /// Marker for an application-owned modal layered above Hiraku's script UI.
 #[derive(Component)]
@@ -137,8 +175,46 @@ pub fn handle_runtime_menu_buttons(
     mut redraw: crate::redraw::Redraw,
     mut ctx: RuntimeMenuContext,
     mut deferred: Local<Vec<crate::ui::UiEffect>>,
+    mut pending_load: Local<PendingSaveLoad>,
     dependencies: Option<Res<crate::dependencies::ScriptDependencies>>,
 ) {
+    // Give earlier effects a complete frame to submit their audio players,
+    // including on executors which run tasks on the browser's main thread.
+    if let Some(request) = pending_load.request.take() {
+        redraw.request();
+        ctx.clicks.clear();
+        ctx.widget_callbacks.clear();
+        pending_load.task =
+            Some(AsyncComputeTaskPool::get().spawn(async move { prepare_load(request) }));
+        return;
+    }
+    if let Some(task) = pending_load.task.as_mut() {
+        redraw.request();
+        ctx.clicks.clear();
+        ctx.widget_callbacks.clear();
+        if let Some(result) = check_ready(task) {
+            pending_load.task = None;
+            ctx.script_runtime.restore_pending = false;
+            match result {
+                Ok((save, runtime)) => {
+                    ctx.script_runtime.apply_restored(runtime);
+                    finish_load(&mut ctx, save);
+                    info!("loaded save slot `{}`", pending_load.slot);
+                }
+                Err(error) => {
+                    crate::script::emit_script_diagnostic(
+                        &format!("failed to restore slot `{}`", pending_load.slot),
+                        &error,
+                    );
+                    ctx.frontend.notice = Some(format!(
+                        "Failed to load slot {}: {error}",
+                        pending_load.slot
+                    ));
+                }
+            }
+        }
+        return;
+    }
     if dependencies.is_some_and(|d| d.loading) {
         ctx.clicks.clear();
         ctx.widget_callbacks.clear();
@@ -159,16 +235,17 @@ pub fn handle_runtime_menu_buttons(
         redraw.request();
         let effects = std::mem::take(&mut *deferred);
         let root = ctx.screen_state.active_root;
-        dispatch_ui_effects(&mut ctx, effects, &mut deferred, root);
+        dispatch_ui_effects(&mut ctx, effects, &mut deferred, &mut pending_load, root);
         ctx.clicks.clear();
         ctx.widget_callbacks.clear();
         return;
     }
-    if ctx
-        .script_runtime
-        .story
-        .as_ref()
-        .is_some_and(|story| story.blocks_ui_input())
+    if ctx.shared_state.0.story_input_blocked
+        || ctx
+            .script_runtime
+            .story
+            .as_ref()
+            .is_some_and(|story| story.blocks_ui_input())
     {
         // Consume, rather than defer, clicks made behind an unskippable movie.
         ctx.clicks.clear();
@@ -262,16 +339,15 @@ pub fn handle_runtime_menu_buttons(
         // A callback can change local UI state without emitting a story
         // command. Allow the dependent layout/visual systems to finish too.
         redraw.request();
-        let mut globals = ctx
-            .script_runtime
-            .story
-            .as_ref()
-            .map(|story| story.globals().clone())
-            .unwrap_or_default();
-        if let Some(root) = root
-            && let Ok(local) = ctx.local_states.get(root)
-        {
-            globals.extend(local.0.clone());
+        let story_globals = ctx.script_runtime.story.as_ref().map(|story| story.globals());
+        let local_globals = root.and_then(|root| ctx.local_states.get(root).ok());
+        let mut globals = std::collections::BTreeMap::new();
+        for name in callback.required_globals.iter() {
+            if let Some(value) = local_globals.and_then(|local| local.0.get(name))
+                .or_else(|| story_globals.and_then(|story| story.get(name)))
+            {
+                globals.insert(name.clone(), value.clone());
+            }
         }
         let (effects, updated) = match crate::script::evaluate_ui_callback_with_args(
             &callback,
@@ -295,17 +371,65 @@ pub fn handle_runtime_menu_buttons(
                 }
             }
         }
-        dispatch_ui_effects(&mut ctx, effects, &mut deferred, root);
+        dispatch_ui_effects(&mut ctx, effects, &mut deferred, &mut pending_load, root);
+        if pending_load.request.is_some() || pending_load.task.is_some() {
+            redraw.request();
+            break;
+        }
         if !crate::storage::storage_ready() {
             return;
         }
     }
 }
 
+fn finish_load(ctx: &mut RuntimeMenuContext, mut save: crate::state::SaveGameData) {
+    info!(
+        "restoring save presentation using {}",
+        if ctx.script_runtime.recovered_presentation.is_some() {
+            "deterministic replay"
+        } else {
+            "matching checkpoint"
+        }
+    );
+    ctx.script_runtime.restore_presentation(&mut save.scene);
+    abort_runtime_waiters(
+        &mut ctx.commands,
+        &mut ctx.waits,
+        &mut ctx.dialogue_state,
+        &mut ctx.choice_state,
+        &mut ctx.screen_state,
+        &mut ctx.pending_script_commands,
+        &mut ctx.pending_characters,
+        &mut ctx.animations,
+        &mut ctx.voice_state,
+        &ctx.choice_ui_roots,
+    );
+    ctx.dialogue_history.restore(save.dialogue_history);
+    ctx.dialogue_history.restore_records(save.history_records);
+    clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
+    clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
+    restore_frontend_scene(
+        &mut ctx.commands,
+        &ctx.asset_server,
+        &mut ctx.shared_state,
+        &mut ctx.stage,
+        &mut ctx.dialogue_state,
+        &mut ctx.choice_state,
+        &ctx.choice_ui_roots,
+        &mut ctx.dialogue_root,
+        &mut ctx.speaker_text,
+        &mut ctx.line_text,
+        &ctx.user_settings,
+        &mut ctx.frontend,
+        save.scene,
+    );
+}
+
 fn dispatch_ui_effects(
     ctx: &mut RuntimeMenuContext,
     effects: Vec<crate::ui::UiEffect>,
     deferred: &mut Vec<crate::ui::UiEffect>,
+    pending_load: &mut PendingSaveLoad,
     root: Option<Entity>,
 ) {
     if !crate::storage::storage_ready() {
@@ -324,11 +448,23 @@ fn dispatch_ui_effects(
                 ));
             }
             crate::ui::UiEffect::SetAutoDialogue(enabled) => {
+                if *enabled
+                    && (!ctx.shared_state.0.input_permissions.auto
+                        || ctx.shared_state.0.story_input_blocked)
+                {
+                    continue;
+                }
                 ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
                     SettingsCommand::AutoDialogue(*enabled),
                 ));
             }
             crate::ui::UiEffect::SetFastForward(enabled) => {
+                if *enabled
+                    && (!ctx.shared_state.0.input_permissions.fast_forward
+                        || ctx.shared_state.0.story_input_blocked)
+                {
+                    continue;
+                }
                 ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
                     SettingsCommand::FastForward(*enabled),
                 ));
@@ -366,80 +502,41 @@ fn dispatch_ui_effects(
             }
             effect @ (crate::ui::UiEffect::Load { .. }
             | crate::ui::UiEffect::HistoryRollback { .. }) => {
-                let (slot, loaded) = match effect {
-                    crate::ui::UiEffect::Load { slot } => (slot.clone(), load_save_data(slot)),
+                if matches!(effect, crate::ui::UiEffect::HistoryRollback { .. })
+                    && (!ctx.shared_state.0.input_permissions.rollback
+                        || ctx.shared_state.0.story_input_blocked)
+                {
+                    continue;
+                }
+                let (slot, history) = match effect {
+                    crate::ui::UiEffect::Load { slot } => (slot.clone(), None),
                     crate::ui::UiEffect::HistoryRollback { id } => (
                         format!("history:{id}"),
-                        ctx.dialogue_history.rollback_save(*id),
+                        Some(
+                            ctx.dialogue_history
+                                .rollback_save(*id)
+                                .map_err(|e| e.to_string()),
+                        ),
                     ),
                     _ => unreachable!(),
                 };
-                let save_data = match loaded {
-                    Ok(save_data) => save_data,
-                    Err(error) => {
-                        warn!("failed to load slot `{slot}`: {error}");
-                        ctx.frontend.notice = Some(format!("Failed to load slot {slot}: {error}"));
-                        break;
-                    }
-                };
-                // Compile and validate every saved continuation before
-                // touching the visible scene, modal stack or active waits.
-                // start_story_runtime commits only after all validation succeeds.
-                let prepared = ScriptBootstrap::from_save(&save_data).and_then(|bootstrap| {
-                    start_story_runtime(
-                        &ctx.vfs,
-                        &mut ctx.script_runtime,
-                        bootstrap,
-                        &ctx.user_settings,
-                    )
+                let program = ctx.script_runtime.story.as_ref().and_then(|story| {
+                    ctx.script_runtime
+                        .current_script
+                        .as_deref()
+                        .and_then(|path| story.program_for_path(path))
                 });
-                if let Err(error) = prepared {
-                    crate::script::emit_script_diagnostic(
-                        &format!("failed to restore slot `{slot}`"),
-                        &error,
-                    );
-                    ctx.frontend.notice = Some(format!("Failed to load slot {slot}: {error}"));
-                    break;
-                }
-                abort_runtime_waiters(
-                    &mut ctx.commands,
-                    &mut ctx.waits,
-                    &mut ctx.dialogue_state,
-                    &mut ctx.choice_state,
-                    &mut ctx.screen_state,
-                    &mut ctx.pending_script_commands,
-                    &mut ctx.pending_characters,
-                    &mut ctx.animations,
-                    &mut ctx.voice_state,
-                    &ctx.choice_ui_roots,
-                );
-                ctx.dialogue_history
-                    .restore(save_data.dialogue_history.clone());
-                ctx.dialogue_history
-                    .restore_records(save_data.history_records.clone());
-                // Mounted overlays belong to the saved presentation, not
-                // the session being replaced. Bootstrap will mount exactly
-                // the saved set; retaining future overlays exposes stale
-                // callbacks to globals which do not exist in this save.
-                clear_overlay_ui(&mut ctx.commands, &mut ctx.overlay_state);
-                clear_screen_ui(&mut ctx.commands, &mut ctx.screen_state);
-                restore_frontend_scene(
-                    &mut ctx.commands,
-                    &ctx.asset_server,
-                    &mut ctx.shared_state,
-                    &mut ctx.stage,
-                    &mut ctx.dialogue_state,
-                    &mut ctx.choice_state,
-                    &ctx.choice_ui_roots,
-                    &mut ctx.dialogue_root,
-                    &mut ctx.speaker_text,
-                    &mut ctx.line_text,
-                    &ctx.user_settings,
-                    &mut ctx.frontend,
-                    save_data.scene.clone(),
-                );
-                info!("loaded save slot `{slot}`");
-                // Remaining effects belong to the pre-load UI invocation.
+                pending_load.slot = slot.clone();
+                ctx.script_runtime.restore_pending = true;
+                pending_load.request = Some(SaveLoadRequest {
+                    slot,
+                    history,
+                    program,
+                    vfs: ctx.vfs.clone(),
+                    settings: ctx.user_settings.clone(),
+                });
+                // Earlier audio messages can now reach Bevy's playback systems
+                // without waiting for disk I/O, checkpoint decoding or replay.
                 break;
             }
             crate::ui::UiEffect::OpenUi {
@@ -520,6 +617,11 @@ fn dispatch_ui_effects(
                 ));
             }
             crate::ui::UiEffect::NextDialogue => {
+                if ctx.shared_state.0.story_input_blocked
+                    || !ctx.shared_state.0.input_permissions.advance
+                {
+                    continue;
+                }
                 advance_dialogue(
                     &mut ctx.dialogue_state,
                     &mut ctx.animations,
@@ -551,6 +653,38 @@ fn restore_image_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_callback_emits_sound_before_requesting_session_restore() {
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://slots.ui.hks",
+            r#"
+                import ui.widgets.*
+                canvas {
+                    button { text("Load") }.onClick { sfx("ui/load"); storage.load("alice") }
+                }
+            "#,
+            crate::script::ui_runtime::UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("compile load button");
+        let crate::ui::ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected button");
+        };
+        let (effects, _) = crate::script::evaluate_ui_callback_with_args(
+            button.on_click.as_ref().expect("click callback"),
+            &Default::default(),
+            &crate::ui::UiModels::default(),
+            Vec::new(),
+        )
+        .expect("evaluate without performing file I/O");
+        assert!(matches!(effects.as_slice(), [
+            crate::ui::UiEffect::PlaySfx { name, .. },
+            crate::ui::UiEffect::Load { slot },
+        ] if name == "ui/load" && slot == "alice"));
+    }
 
     #[test]
     fn restoring_button_artwork_preserves_rendering_configuration() {

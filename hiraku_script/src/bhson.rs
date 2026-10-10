@@ -27,9 +27,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_bytes: 64 * 1024 * 1024,
+            max_bytes: usize::MAX,
             max_depth: 128,
-            max_values: 1_000_000,
+            max_values: usize::MAX,
         }
     }
 }
@@ -422,6 +422,14 @@ mod tests {
             assert!(encode(&HsonValue::Float(value)).is_err());
             assert!(parse(&document(&[&[5][..], &value.to_le_bytes()].concat())).is_err());
         }
+    }
+
+    #[test]
+    fn default_limits_allow_more_than_one_million_values() {
+        assert_eq!(Limits::default().max_bytes, usize::MAX);
+        let value = HsonValue::Array(vec![HsonValue::Null; 1_000_001]);
+        let bytes = encode(&value).expect("encode a large document without a value cap");
+        assert_eq!(parse(&bytes).expect("decode the same document"), value);
     }
 
     #[test]

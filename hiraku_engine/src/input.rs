@@ -10,7 +10,9 @@ use bevy::{
 use uuid::Uuid;
 
 use crate::{HirakuCanvas, HirakuInputTarget};
+pub(crate) mod policy;
 pub(crate) mod touch_hold;
+pub use policy::InputPermissions;
 
 /// Physical picking forwards canvas input after this frame's `First` bridge.
 /// Wake the next update to consume it; reactive runners otherwise wait for

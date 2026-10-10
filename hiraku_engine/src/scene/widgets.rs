@@ -14,6 +14,8 @@ pub(crate) struct UiLocalState(pub BTreeMap<String, Value>);
 #[derive(Component)]
 pub(crate) struct ToggleCallback {
     pub root: Entity,
+    pub enabled: bool,
+    pub enabled_binding: Option<crate::ui::PropertyComputation>,
     pub callback: Option<UiCallback>,
     pub binding: Option<crate::ui::PropertyComputation>,
     pub revision: u64,
@@ -21,11 +23,13 @@ pub(crate) struct ToggleCallback {
 }
 
 pub(crate) fn sync_toggles(
+    mut commands: Commands,
     evaluator: Local<crate::script::UiPropertyEvaluator>,
     local_states: Query<&UiLocalState>,
     runtime: Res<ScriptRuntimeState>,
     models: Res<UiModels>,
     mut toggles: Query<(
+        Entity,
         &mut ToggleCallback,
         &mut ScreenUiToggle,
         &mut ImageNode,
@@ -37,7 +41,7 @@ pub(crate) fn sync_toggles(
         .as_ref()
         .map(|story| story.globals().clone())
         .unwrap_or_default();
-    for (mut model, mut toggle, mut image, mut node) in &mut toggles {
+    for (entity, mut model, mut toggle, mut image, mut node) in &mut toggles {
         let mut globals = globals.clone();
         if let Ok(local) = local_states.get(model.root) {
             globals.extend(local.0.clone());
@@ -45,8 +49,50 @@ pub(crate) fn sync_toggles(
         if model.revision == models.revision() && model.globals == globals {
             continue;
         }
+        let first = model.revision == u64::MAX;
+        let globals_changed = model.globals != globals;
         model.revision = models.revision();
         model.globals = globals.clone();
+        if let Some(mut binding) = model.enabled_binding.clone() {
+            if globals_changed {
+                binding.globals.extend(globals.clone());
+            }
+            let changed = crate::script::refresh_ui_property_models(&mut binding, &models);
+            model.enabled_binding = Some(binding.clone());
+            if first || globals_changed || changed {
+                match evaluator.evaluate(&binding, &models) {
+                    Ok(Value::Bool(enabled)) => {
+                        if model.enabled != enabled {
+                            model.enabled = enabled;
+                            if enabled {
+                                commands
+                                    .entity(entity)
+                                    .remove::<bevy::ui::InteractionDisabled>();
+                            } else {
+                                commands
+                                    .entity(entity)
+                                    .insert(bevy::ui::InteractionDisabled);
+                            }
+                        }
+                    }
+                    result => {
+                        let message = match result {
+                            Ok(_) => "toggle enabled state requires Bool".to_string(),
+                            Err(error) => error.to_string(),
+                        };
+                        crate::script::emit_script_diagnostic(
+                            "toggle enabled state failed",
+                            &message,
+                        );
+                        model.enabled = false;
+                        model.enabled_binding = None;
+                        commands
+                            .entity(entity)
+                            .insert(bevy::ui::InteractionDisabled);
+                    }
+                }
+            }
+        }
         let Some(mut binding) = model.binding.clone() else {
             continue;
         };

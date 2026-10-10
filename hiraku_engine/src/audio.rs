@@ -33,13 +33,15 @@ pub struct AudioDefinition {
 pub struct PreludeLoopAudio {
     prelude: AudioSource,
     loop_audio: AudioSource,
+    looped: bool,
 }
 
 impl PreludeLoopAudio {
-    pub fn new(prelude: AudioSource, loop_audio: AudioSource) -> Self {
+    pub fn new(prelude: AudioSource, loop_audio: AudioSource, looped: bool) -> Self {
         Self {
             prelude,
             loop_audio,
+            looped,
         }
     }
 }
@@ -50,6 +52,7 @@ pub struct PreludeLoopDecoder {
     prelude: Option<FileAudioDecoder>,
     loop_audio: AudioSource,
     loop_decoder: FileAudioDecoder,
+    looped: bool,
 }
 
 impl Iterator for PreludeLoopDecoder {
@@ -65,6 +68,9 @@ impl Iterator for PreludeLoopDecoder {
 
         if let Some(sample) = self.loop_decoder.next() {
             return Some(sample);
+        }
+        if !self.looped {
+            return None;
         }
 
         // Decoder has run out of samples,
@@ -117,6 +123,7 @@ impl Decodable for PreludeLoopAudio {
             prelude: Some(self.prelude.decoder()),
             loop_audio: self.loop_audio.clone(),
             loop_decoder: self.loop_audio.decoder(),
+            looped: self.looped,
         }
     }
 }

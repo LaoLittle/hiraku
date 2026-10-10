@@ -27,6 +27,9 @@ mod spatial_stage;
 /// Engine code dispatches these effects directly to ECS-facing systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StoryEffect {
+    InputEnabled(bool),
+    InputPermissions(crate::input::policy::InputPermissions),
+    ClearDialogueText,
     ShakeCamera {
         amplitude: [f32; 2],
         interval: f32,
@@ -100,10 +103,12 @@ pub enum StoryEffect {
     MountUiOverlay {
         name: String,
         component: String,
+        arguments: Vec<Value>,
         lifetime: Option<f32>,
     },
     UnmountUiOverlay {
         name: String,
+        fade_seconds: f32,
     },
     AdjustSetting {
         name: String,
@@ -113,6 +118,7 @@ pub enum StoryEffect {
         path: String,
         volume: f32,
         fade_in_ms: Option<u64>,
+        looped: bool,
     },
     Say {
         speaker: String,
@@ -389,6 +395,25 @@ fn story_registry() -> NativeRegistry<CharacterContext> {
     profile_api::register_hks(&mut registry).expect("profile API must register once");
     ui_api::register_hks(&mut registry)
         .expect("story UI API registration must be internally consistent");
+    for (name, parameters) in [
+        ("ui.mount", vec![ScriptType::String, ScriptType::String]),
+        (
+            "ui.mountFor",
+            vec![ScriptType::String, ScriptType::String, ScriptType::Float],
+        ),
+    ] {
+        registry
+            .set_signature(
+                hiraku_script::native::stable_builtin_id(name),
+                hiraku_script::FunctionSignature {
+                    receiver: None,
+                    parameters,
+                    variadic: Some(ScriptType::Any),
+                    result: ScriptType::Unit,
+                },
+            )
+            .expect("overlay mount API is registered");
+    }
     registry
         .set_signature(
             hiraku_script::native::stable_builtin_id("ui.open_any"),
@@ -542,48 +567,82 @@ mod ui_api {
         Ok(())
     }
 
-    #[hks]
+    #[hks(raw)]
     fn native_mount(
         context: &mut CharacterContext,
-        name: String,
-        component: String,
-    ) -> Result<(), NativeError> {
-        context.commands.push(StoryEffect::MountUiOverlay {
-            name,
-            component,
-            lifetime: None,
-        });
-        Ok(())
+        call: &BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        mount(context, call, false)
     }
 
     /// Presentation-owned lifetime, independent of the calling execution.
-    #[hks]
+    #[hks(raw)]
     fn native_mount_for(
         context: &mut CharacterContext,
-        name: String,
-        component: String,
-        seconds: f32,
-    ) -> Result<(), NativeError> {
-        if !seconds.is_finite() || seconds < 0.0 {
+        call: &BuiltinCall,
+    ) -> Result<Value, NativeError> {
+        mount(context, call, true)
+    }
+
+    fn mount(
+        context: &mut CharacterContext,
+        call: &BuiltinCall,
+        timed: bool,
+    ) -> Result<Value, NativeError> {
+        use hiraku_script::native::FromHksValue;
+        let prefix = if timed { 3 } else { 2 };
+        if call.arguments.len() < prefix {
             return Err(NativeError::message(
-                "overlay duration must be finite and non-negative",
+                "overlay mount is missing its name, component or duration",
             ));
         }
+        let name = String::from_hks_value(&call.arguments[0].value)?;
+        let component = String::from_hks_value(&call.arguments[1].value)?;
+        let lifetime = if timed {
+            let seconds = f32::from_hks_value(&call.arguments[2].value)?;
+            if !seconds.is_finite() || seconds < 0.0 {
+                return Err(NativeError::message(
+                    "overlay duration must be finite and non-negative",
+                ));
+            }
+            Some(seconds)
+        } else {
+            None
+        };
         context.commands.push(StoryEffect::MountUiOverlay {
             name,
             component,
-            lifetime: Some(seconds),
+            arguments: call.arguments[prefix..]
+                .iter()
+                .map(|argument| argument.value.clone())
+                .collect(),
+            lifetime,
         });
-        Ok(())
+        Ok(Value::Unit)
     }
 
     #[hks]
-    fn native_unmount(context: &mut CharacterContext, name: String) -> Result<(), NativeError> {
+    fn native_unmount(
+        context: &mut CharacterContext,
+        name: String,
+        seconds: Option<f64>,
+    ) -> Result<(), NativeError> {
+        let fade_seconds = overlay_fade_seconds(seconds)?;
         context
             .commands
-            .push(StoryEffect::UnmountUiOverlay { name });
+            .push(StoryEffect::UnmountUiOverlay { name, fade_seconds });
         Ok(())
     }
+}
+
+fn overlay_fade_seconds(seconds: Option<f64>) -> Result<f32, NativeError> {
+    let seconds = seconds.unwrap_or(0.0);
+    if !seconds.is_finite() || seconds < 0.0 || seconds > f32::MAX as f64 {
+        return Err(NativeError::message(
+            "UI fade requires finite non-negative seconds",
+        ));
+    }
+    Ok(seconds as f32)
 }
 
 /// Stateful native-function host for the HKS runtime.
@@ -1925,6 +1984,27 @@ mod native_api {
         Ok(())
     }
 
+    #[hks(name = "clear", selector = "printer")]
+    fn native_printer_clear(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.last_speaker = None;
+        context.dialogue_buffer = None;
+        context.commands.push(StoryEffect::ClearDialogueText);
+        Ok(())
+    }
+
+    #[hks(name = "hide", selector = "printer")]
+    fn native_printer_hide(
+        context: &mut CharacterContext,
+        seconds: Option<f64>,
+    ) -> Result<(), NativeError> {
+        let fade_seconds = overlay_fade_seconds(seconds)?;
+        context.commands.push(StoryEffect::UnmountUiOverlay {
+            name: "__role.dialogue".into(),
+            fade_seconds,
+        });
+        Ok(())
+    }
+
     #[hks]
     fn native_exit(context: &mut CharacterContext) -> Result<(), NativeError> {
         context.commands.push(StoryEffect::Exit);
@@ -2349,6 +2429,26 @@ mod native_api {
 mod story_api {
     use super::*;
 
+    #[hks(name = "inputEnabled")]
+    fn native_input_enabled(
+        context: &mut CharacterContext,
+        enabled: bool,
+    ) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::InputEnabled(enabled));
+        Ok(())
+    }
+
+    #[hks(name = "inputPermissions")]
+    fn native_input_permissions(
+        context: &mut CharacterContext,
+        permissions: crate::input::policy::InputPermissions,
+    ) -> Result<(), NativeError> {
+        context
+            .commands
+            .push(StoryEffect::InputPermissions(permissions));
+        Ok(())
+    }
+
     #[hks(name = "goto")]
     fn native_goto_story(
         context: &mut CharacterContext,
@@ -2402,6 +2502,73 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cinematic_input_and_printer_effects_are_typed_and_ordered() {
+        let code = compile_story_bytecode("cinematic.hks",
+            "story.inputEnabled(false)\nprinter.clear()\nprinter.hide(1.5)\nstory.inputEnabled(true)")
+            .expect("cinematic signatures");
+        let mut runtime = ExecutionRuntime::new(code).expect("runtime");
+        let mut host = StoryNativeHost::new();
+        while let Some(event) = runtime.step().expect("step") {
+            match event {
+                ExecutionEvent::Call { execution, call } => {
+                    let StoryCallOutcome::Return(value) = host.call(&call).expect("native call")
+                    else {
+                        panic!("expected ordinary native return");
+                    };
+                    runtime.resume(execution, value).expect("resume");
+                }
+                ExecutionEvent::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            host.drain_effects(),
+            vec![
+                StoryEffect::InputEnabled(false),
+                StoryEffect::ClearDialogueText,
+                StoryEffect::UnmountUiOverlay {
+                    name: "__role.dialogue".into(),
+                    fade_seconds: 1.5
+                },
+                StoryEffect::InputEnabled(true)
+            ]
+        );
+        assert!(compile_story_bytecode("invalid.hks", "story.inputEnabled(1)").is_err());
+        for seconds in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(overlay_fade_seconds(Some(seconds)).is_err());
+        }
+    }
+
+    #[test]
+    fn input_permissions_are_a_typed_record_not_ui_role_names() {
+        let code = compile_story_bytecode(
+            "input.hks",
+            "story.inputPermissions(.{ pause: false, auto: false, history: false })",
+        )
+        .expect("partial permission record");
+        let mut runtime = ExecutionRuntime::new(code).expect("runtime");
+        let mut host = StoryNativeHost::new();
+        let Some(ExecutionEvent::Call { call, .. }) = runtime.step().expect("step") else {
+            panic!("permissions call");
+        };
+        host.call(&call).expect("native permissions");
+        assert_eq!(
+            host.drain_effects(),
+            vec![StoryEffect::InputPermissions(
+                crate::input::InputPermissions {
+                    pause: false,
+                    auto: false,
+                    history: false,
+                    ..Default::default()
+                }
+            )]
+        );
+        assert!(
+            compile_story_bytecode("invalid.hks", "story.inputPermissions(.{ auto: 1 })").is_err()
+        );
+    }
 
     #[test]
     fn absolute_positions_require_finite_canvas_coordinates() {

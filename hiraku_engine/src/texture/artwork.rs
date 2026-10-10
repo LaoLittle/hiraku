@@ -179,13 +179,15 @@ mod tests {
     }
     #[test]
     fn sampling_metadata_never_expands_source_pixels() {
-        let image = Image::from_dynamic(
-            image::DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_pixel(
-                2,
-                1,
-                image::LumaA([128, 96]),
-            )),
-            true,
+        let image = Image::new_fill(
+            bevy::render::render_resource::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            bevy::render::render_resource::TextureDimension::D2,
+            &[128, 96],
+            TextureFormat::Rg8Unorm,
             default(),
         );
         assert_eq!(

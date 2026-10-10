@@ -85,6 +85,13 @@ pub(crate) fn script_command_from_effect(
     use capabilities::StoryEffect;
 
     Ok(match effect {
+        StoryEffect::InputEnabled(enabled) => {
+            ScriptCommand::Runtime(RuntimeCommand::InputEnabled(enabled))
+        }
+        StoryEffect::InputPermissions(permissions) => {
+            ScriptCommand::Runtime(RuntimeCommand::InputPermissions(permissions))
+        }
+        StoryEffect::ClearDialogueText => ScriptCommand::Dialogue(DialogueCommand::ClearText),
         StoryEffect::ShakeCamera {
             amplitude,
             interval,
@@ -346,11 +353,22 @@ pub struct ScriptBootstrap {
     pub pending_ui_screen: Option<String>,
     pub pending_ui_arguments: Vec<StoredValue>,
     pub ui_registry: BTreeMap<String, String>,
-    pub mounted_ui_overlays: BTreeMap<String, String>,
+    pub mounted_ui_overlays: BTreeMap<String, crate::state::MountedUiOverlay>,
 }
 
 impl ScriptBootstrap {
+    #[cfg(test)]
     pub fn from_save(data: &SaveGameData) -> Result<Self, String> {
+        Self::take_from_save(&mut data.clone())
+    }
+
+    pub(crate) fn take_from_save(data: &mut SaveGameData) -> Result<Self, String> {
+        if data.version != crate::state::CURRENT_SAVE_VERSION {
+            // History checkpoints bypass the storage decoder, but must obey
+            // the same presentation/execution compatibility boundary.
+            data.vm_snapshot = None;
+            data.script_call_stack.clear();
+        }
         if data.vm_snapshot.is_none()
             && data
                 .replay
@@ -359,39 +377,87 @@ impl ScriptBootstrap {
         {
             return Err("save has no restorable VM checkpoint; complete session replay is not available; the save was not loaded".into());
         }
-        let mut values = data.globals.clone();
-        values.extend(data.scope.clone());
+        let mut values = std::mem::take(&mut data.globals);
+        values.extend(std::mem::take(&mut data.scope));
         Ok(Self {
             startup_script: data.resume_script.clone(),
-            replay: data.replay.clone(),
+            replay: data.replay.take(),
             values,
-            snapshot: data.vm_snapshot.clone(),
-            call_stack: data.script_call_stack.clone(),
-            pending_ui_screen: data.pending_ui_screen.clone(),
-            pending_ui_arguments: data.pending_ui_arguments.clone(),
-            ui_registry: data.ui_registry.clone(),
-            mounted_ui_overlays: data.mounted_ui_overlays.clone(),
+            snapshot: data.vm_snapshot.take(),
+            call_stack: std::mem::take(&mut data.script_call_stack),
+            pending_ui_screen: data.pending_ui_screen.take(),
+            pending_ui_arguments: std::mem::take(&mut data.pending_ui_arguments),
+            ui_registry: std::mem::take(&mut data.ui_registry),
+            mounted_ui_overlays: std::mem::take(&mut data.mounted_ui_overlays),
         })
     }
 }
 
+#[cfg(test)]
 pub fn start_story_runtime(
     vfs: &VfsResource,
     runtime: &mut ScriptRuntimeState,
     bootstrap: ScriptBootstrap,
     user_settings: &crate::storage::UserSettings,
 ) -> Result<(), String> {
+    let program = runtime
+        .story
+        .as_ref()
+        .and_then(|story| story.program_for_path(&bootstrap.startup_script));
+    start_story_runtime_with_program(vfs, runtime, bootstrap, user_settings, program)
+}
+
+pub(crate) fn start_story_runtime_with_program(
+    vfs: &VfsResource,
+    runtime: &mut ScriptRuntimeState,
+    mut bootstrap: ScriptBootstrap,
+    user_settings: &crate::storage::UserSettings,
+    program: Option<StoryProgram>,
+) -> Result<(), String> {
+    runtime.recovered_presentation = None;
+    runtime.restore_batch_size = 0;
+    // Navigation already uses this immutable linked project. Loading a save
+    // must not recompile every module, or change source versions mid-session.
+    let program = match program {
+        Some(program) => program,
+        None => {
+            let source = vfs
+                .0
+                .read_text(&bootstrap.startup_script)
+                .map_err(|e| e.to_string())?;
+            compile_story_program(&vfs.0, &bootstrap.startup_script, &source)?
+        }
+    };
     let checkpoint_error = if bootstrap.snapshot.is_some() {
-        match start_checkpoint_runtime(vfs, runtime, bootstrap.clone(), user_settings) {
-            Ok(()) => return Ok(()),
-            Err(error) => error,
+        // Replay rebuilds these fields, so move the large checkpoint instead
+        // of deep-cloning its heap and every saved caller before restoring it.
+        let snapshot = bootstrap.snapshot.take();
+        let call_stack = std::mem::take(&mut bootstrap.call_stack);
+        let replay = bootstrap.replay.take();
+        bootstrap.values.clear();
+        let checkpoint = ScriptBootstrap {
+            snapshot,
+            call_stack,
+            ..bootstrap.clone()
+        };
+        match start_checkpoint_runtime(vfs, runtime, checkpoint, user_settings, program.clone()) {
+            Ok(()) => {
+                runtime.replay = replay;
+                return Ok(());
+            }
+            Err(error) => {
+                bootstrap.replay = replay;
+                error
+            }
         }
     } else {
         "save has no VM checkpoint".into()
     };
-    let recovered = replay_restore::prepare(vfs, bootstrap, user_settings)
+    let (recovered, program, presentation) = replay_restore::prepare(vfs, bootstrap, user_settings, program)
         .map_err(|error| format!("{checkpoint_error}\ndeterministic recovery failed: {error}"))?;
-    start_checkpoint_runtime(vfs, runtime, recovered, user_settings)
+    start_checkpoint_runtime(vfs, runtime, recovered, user_settings, program)?;
+    runtime.recovered_presentation = Some(presentation);
+    Ok(())
 }
 
 fn start_checkpoint_runtime(
@@ -399,6 +465,7 @@ fn start_checkpoint_runtime(
     runtime: &mut ScriptRuntimeState,
     bootstrap: ScriptBootstrap,
     user_settings: &crate::storage::UserSettings,
+    bytecode: StoryProgram,
 ) -> Result<(), String> {
     let ScriptBootstrap {
         replay,
@@ -411,11 +478,6 @@ fn start_checkpoint_runtime(
         ui_registry,
         mounted_ui_overlays,
     } = bootstrap;
-    let source = vfs
-        .0
-        .read_text(&startup_script)
-        .map_err(|error| error.to_string())?;
-    let bytecode = compile_story_program(&vfs.0, &startup_script, &source)?;
     let mut story = if let Some(snapshot) = snapshot {
         StoryRuntime::restore(bytecode, snapshot).map_err(|error| error.to_string())?
     } else {
@@ -449,11 +511,17 @@ fn start_checkpoint_runtime(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let restored_boundary = story.restored_boundary_event();
-    for (name, component) in &mounted_ui_overlays {
+    for (name, overlay) in &mounted_ui_overlays {
         story.enqueue_event(StoryRuntimeEvent::Effect(
             capabilities::StoryEffect::MountUiOverlay {
                 name: name.clone(),
-                component: component.clone(),
+                component: overlay.component.clone(),
+                arguments: overlay
+                    .arguments
+                    .iter()
+                    .cloned()
+                    .map(stored_value_to_hks)
+                    .collect(),
                 lifetime: None,
             },
         ));
@@ -495,8 +563,9 @@ pub fn save_runtime_slot(
     history: &crate::scene::DialogueHistoryState,
 ) -> Result<(), StorageError> {
     let mut data = capture_runtime_save(runtime, shared_state)?;
-    data.dialogue_history = history.entries.clone();
-    data.history_records = history.records.clone();
+    let (entries, records) = history.save_window();
+    data.dialogue_history = entries.to_vec();
+    data.history_records = records.to_vec();
     data.thumbnail_png = thumbnail.to_vec();
     write_save_data_to_root(&save_root_path(), slot, &data)
 }
@@ -506,17 +575,21 @@ pub(crate) fn capture_runtime_save(
     shared_state: &SceneSharedState,
 ) -> Result<SaveGameData, StorageError> {
     let current_script = runtime.current_script.clone().unwrap_or_default();
-    let values = runtime
-        .story
-        .as_ref()
-        .map(|story| hks_globals_to_stored(story.globals()))
-        .unwrap_or_default();
     let snapshot = runtime
         .story
         .as_ref()
         .map(StoryRuntime::snapshot)
         .transpose()
         .map_err(|error| StorageError::InvalidSave(error.to_string()))?;
+    let values = if snapshot.is_none() {
+        runtime
+            .story
+            .as_ref()
+            .map(|story| hks_globals_to_stored(story.globals()))
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
     let script_call_stack = runtime
         .call_stack
         .iter()

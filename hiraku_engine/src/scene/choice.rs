@@ -27,7 +27,12 @@ pub fn handle_choice_buttons(
     >,
     button_query: Query<&ChoiceButton>,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
+    scene: Option<Res<SceneSharedState>>,
 ) {
+    if scene.is_some_and(|scene| scene.0.story_input_blocked) {
+        clicks.clear();
+        return;
+    }
     for (interaction, mut color, _) in &mut interaction_query {
         match *interaction {
             PickingInteraction::Pressed => *color = ui_style.choice_button_pressed.into(),
@@ -52,12 +57,16 @@ pub fn handle_choice_action_input(
     mut choice_state: ResMut<ChoiceState>,
     choice_ui: Query<Entity, (With<ChoiceUi>, Without<ChildOf>)>,
     text_focus: Option<Res<crate::input::HirakuTextFocus>>,
+    scene: Option<Res<SceneSharedState>>,
 ) {
-    let selected = actions.read().find_map(|action| match action.0 {
-        crate::input::HirakuAction::Choice(index) => Some(index),
-        _ => None,
+    let selected = actions.read().fold(None, |selected, action| {
+        selected.or(match action.0 {
+            crate::input::HirakuAction::Choice(index) => Some(index),
+            _ => None,
+        })
     });
-    if !crate::storage::storage_ready()
+    if scene.is_some_and(|scene| scene.0.story_input_blocked)
+        || !crate::storage::storage_ready()
         || choice_state.waiting.is_none()
         || text_focus.is_some_and(|focus| focus.0.is_some())
     {

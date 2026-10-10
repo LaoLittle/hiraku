@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::script::StoryRuntimeSnapshot;
 
-pub const CURRENT_SAVE_VERSION: u32 = 35;
+pub const CURRENT_SAVE_VERSION: u32 = 41;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptCallFrameSnapshot {
@@ -22,6 +22,12 @@ pub enum StoredValue {
     String(String),
     Array(Vec<StoredValue>),
     Map(BTreeMap<String, StoredValue>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MountedUiOverlay {
+    pub component: String,
+    pub arguments: Vec<StoredValue>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -84,6 +90,7 @@ pub struct SpriteSnapshot {
 pub struct AudioSnapshot {
     pub path: String,
     pub volume: f32,
+    pub looped: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -114,6 +121,10 @@ pub struct CameraSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
+    #[serde(default)]
+    pub story_input_blocked: bool,
+    #[serde(default)]
+    pub input_permissions: crate::input::policy::InputPermissions,
     #[serde(default)]
     pub post_process: crate::effect::post_process::PostProcessSettings,
     #[serde(default)]
@@ -197,7 +208,7 @@ pub struct SaveGameData {
     #[serde(default)]
     pub ui_registry: BTreeMap<String, String>,
     #[serde(default)]
-    pub mounted_ui_overlays: BTreeMap<String, String>,
+    pub mounted_ui_overlays: BTreeMap<String, MountedUiOverlay>,
 }
 
 fn default_save_version() -> u32 {

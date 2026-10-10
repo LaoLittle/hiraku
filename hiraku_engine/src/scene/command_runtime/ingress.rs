@@ -254,7 +254,7 @@ pub fn drive_story_runtime(
         }
     }
 
-    if !crate::storage::storage_ready() || dependencies.loading {
+    if runtime.restore_pending || !crate::storage::storage_ready() || dependencies.loading {
         return;
     }
 
@@ -308,7 +308,8 @@ pub fn drive_story_runtime(
     // frame per effect exposes intermediate states (clear -> hide -> show).
     // Navigation and host waits remain barriers: later code must observe ECS
     // dispatch/results, not run ahead of them. Bound work for responsive input.
-    for _ in 0..256 {
+    let batch_size = 256usize.saturating_add(std::mem::take(&mut runtime.restore_batch_size));
+    for _ in 0..batch_size {
         let event = match runtime.story.as_mut() {
             Some(story) => match story.step() {
                 Ok(event) => event,
@@ -353,6 +354,7 @@ pub fn drive_story_runtime(
                     path,
                     volume,
                     fade_in_ms,
+                    looped,
                 }) => match audio
                     .as_deref()
                     .and_then(|catalog| catalog.resolve_music(&path))
@@ -363,6 +365,7 @@ pub fn drive_story_runtime(
                                 path: definition.path.clone(),
                                 prelude: definition.prelude.clone(),
                                 volume,
+                                looped,
                                 fade_in: fade_in_ms.map(std::time::Duration::from_millis),
                                 animation_id: None,
                             },
@@ -457,9 +460,13 @@ pub fn drive_story_runtime(
                             terms.as_deref(),
                         ) {
                             Ok(screen) => {
-                                runtime
-                                    .mounted_ui_overlays
-                                    .insert("__role.dialogue".into(), target);
+                                runtime.mounted_ui_overlays.insert(
+                                    "__role.dialogue".into(),
+                                    crate::state::MountedUiOverlay {
+                                        component: target,
+                                        arguments: Vec::new(),
+                                    },
+                                );
                                 pending_script_commands.enqueue(ScriptCommand::Ui(
                                     UiCommand::ShowOverlay {
                                         name: "__role.dialogue".into(),
@@ -482,6 +489,7 @@ pub fn drive_story_runtime(
                     crate::script::capabilities::StoryEffect::MountUiOverlay {
                         name,
                         component,
+                        arguments,
                         lifetime,
                     },
                 ) => {
@@ -497,22 +505,43 @@ pub fn drive_story_runtime(
                                     &component,
                                 )
                             });
-                    let overlay = evaluate_ui_at(
+                    let arguments = match arguments
+                        .iter()
+                        .map(crate::script::ui_argument_to_stored)
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(arguments) => arguments,
+                        Err(error) => {
+                            crate::script::emit_script_diagnostic(
+                                "invalid ui.mount arguments",
+                                &error.to_string(),
+                            );
+                            runtime.story = None;
+                            return;
+                        }
+                    };
+                    let overlay = evaluate_ui_at_with_arguments(
                         &target,
                         &runtime,
                         &vfs,
                         &user_settings,
                         textures.as_deref(),
                         terms.as_deref(),
+                        BTreeMap::new(),
+                        &arguments,
                     );
                     match overlay {
                         Ok(screen) => {
                             // Timed notifications are presentation-only, not
                             // persistent UI roles restored from a save.
                             if lifetime.is_none() {
-                                runtime
-                                    .mounted_ui_overlays
-                                    .insert(name.clone(), target.clone());
+                                runtime.mounted_ui_overlays.insert(
+                                    name.clone(),
+                                    crate::state::MountedUiOverlay {
+                                        component: target.clone(),
+                                        arguments,
+                                    },
+                                );
                             } else {
                                 runtime.mounted_ui_overlays.remove(&name);
                             }
@@ -531,11 +560,16 @@ pub fn drive_story_runtime(
                     }
                 }
                 StoryRuntimeEvent::Effect(
-                    crate::script::capabilities::StoryEffect::UnmountUiOverlay { name },
+                    crate::script::capabilities::StoryEffect::UnmountUiOverlay {
+                        name,
+                        fade_seconds,
+                    },
                 ) => {
                     runtime.mounted_ui_overlays.remove(&name);
-                    pending_script_commands
-                        .enqueue(ScriptCommand::Ui(UiCommand::HideOverlay { name }));
+                    pending_script_commands.enqueue(ScriptCommand::Ui(UiCommand::HideOverlay {
+                        name,
+                        fade_seconds,
+                    }));
                 }
                 StoryRuntimeEvent::Effect(
                     effect @ (crate::script::capabilities::StoryEffect::Say { .. }
@@ -566,7 +600,10 @@ pub fn drive_story_runtime(
                                 Ok(screen) => {
                                     runtime.mounted_ui_overlays.insert(
                                         dialogue_overlay.into(),
-                                        dialogue_component.clone(),
+                                        crate::state::MountedUiOverlay {
+                                            component: dialogue_component.clone(),
+                                            arguments: Vec::new(),
+                                        },
                                     );
                                     pending_script_commands.enqueue(ScriptCommand::Ui(
                                         UiCommand::ShowOverlay {
@@ -962,6 +999,7 @@ pub fn drive_story_runtime(
                         path,
                         volume,
                         fade_in_ms,
+                        looped,
                     } = &effect
                     else {
                         unreachable!()
@@ -977,6 +1015,7 @@ pub fn drive_story_runtime(
                                 path: definition.path.clone(),
                                 prelude: definition.prelude.clone(),
                                 volume: *volume,
+                                looped: *looped,
                                 fade_in: fade_in_ms.map(Duration::from_millis),
                                 animation_id: Some(id.clone()),
                             },

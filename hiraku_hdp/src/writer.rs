@@ -402,7 +402,7 @@ pub fn pack_directory_to_with(
         ));
     }
 
-    let mut volumes = vec![create_volume(output, 0, first_data_offset as u64)?];
+    let mut volume = create_volume(output, 0, first_data_offset as u64)?;
     let mut volume_sizes = vec![first_data_offset as u64];
     let mut entries = Vec::with_capacity(files.len());
     let mut encoded_chunk = Vec::new();
@@ -437,7 +437,7 @@ pub fn pack_directory_to_with(
                 encoded_chunk.len() as u64
             };
 
-            let mut volume_index = volumes.len() - 1;
+            let mut volume_index = volume_sizes.len() - 1;
             if options.max_volume_size.is_some_and(|limit| {
                 volume_sizes[volume_index].saturating_add(stored_size) > limit as u64
             }) {
@@ -448,18 +448,19 @@ pub fn pack_directory_to_with(
                     )));
                 }
                 volume_index += 1;
-                volumes.push(create_volume(output, volume_index, HEADER_SIZE as u64)?);
+                volume.flush()?;
+                drop(volume);
+                volume = create_volume(output, volume_index, HEADER_SIZE as u64)?;
                 volume_sizes.push(HEADER_SIZE as u64);
             }
 
             let offset = volume_sizes[volume_index];
-            let volume = &mut volumes[volume_index];
             volume.seek(SeekFrom::Start(offset))?;
             if method == CompressionMethod::STORED {
                 source.seek(SeekFrom::Start(source_offset))?;
                 copy_exact(
                     &mut source,
-                    volume,
+                    &mut volume,
                     decoded_size,
                     &mut copy_buffer,
                     &file.path,
@@ -489,7 +490,9 @@ pub fn pack_directory_to_with(
         });
     }
 
-    let volume_count = u32::try_from(volumes.len())
+    volume.flush()?;
+    drop(volume);
+    let volume_count = u32::try_from(volume_sizes.len())
         .map_err(|_| HdpError::InvalidFormat("too many volumes".into()))?;
     let encoded_index = encode_index(&entries)?;
     if encoded_index.len() != index_size {
@@ -498,7 +501,10 @@ pub fn pack_directory_to_with(
         ));
     }
     let index_checksum = checksum64(&encoded_index);
-    for (volume_index, volume) in volumes.iter_mut().enumerate() {
+    for (volume_index, size) in volume_sizes.iter().enumerate() {
+        let mut volume = fs::OpenOptions::new()
+            .write(true)
+            .open(volume_path(output, volume_index))?;
         volume.seek(SeekFrom::Start(0))?;
         volume.write_all(&encode_header(VolumeHeader {
             package_id,
@@ -519,10 +525,10 @@ pub fn pack_directory_to_with(
         if volume_index == 0 {
             volume.write_all(&encoded_index)?;
         }
-        volume.set_len(volume_sizes[volume_index])?;
+        volume.set_len(*size)?;
         volume.flush()?;
     }
-    remove_stale_volumes(output, volumes.len())?;
+    remove_stale_volumes(output, volume_sizes.len())?;
 
     Ok(WrittenPackage {
         index: PackageIndex {

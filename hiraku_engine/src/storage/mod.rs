@@ -59,21 +59,25 @@ fn save_storage(root: &Path) -> PlatformStorage {
 
 #[cfg(test)]
 fn encode_save_data(data: &SaveGameData) -> Vec<u8> {
-    proto::SaveGameData::from(data).encode_to_vec()
+    proto::SaveGameData::try_from(data)
+        .expect("encode test save")
+        .encode_to_vec()
 }
 
 fn decode_save_data(payload: &[u8]) -> Result<SaveGameData, StorageError> {
     proto::SaveGameData::decode(payload)?.try_into()
 }
 
-impl From<&SaveGameData> for proto::SaveGameData {
-    fn from(data: &SaveGameData) -> Self {
-        Self {
+impl TryFrom<&SaveGameData> for proto::SaveGameData {
+    type Error = StorageError;
+
+    fn try_from(data: &SaveGameData) -> Result<Self, Self::Error> {
+        Ok(Self {
             dialogue_history: data.dialogue_history.iter().map(Into::into).collect(),
             version: data.version,
             resume_script: data.resume_script.clone(),
             replay_hson: hiraku_script::hson::to_vec(&data.replay)
-                .expect("replay journals contain serializable input data"),
+                .map_err(|error| StorageError::HsonData(error.to_string()))?,
             random_seed: data.random_seed,
             time_seed: data.time_seed,
             rng_state: data.rng_state.as_ref().map(Into::into),
@@ -87,15 +91,15 @@ impl From<&SaveGameData> for proto::SaveGameData {
                 &data.vm_snapshot,
                 &data.script_call_stack,
                 &data.history_records,
-            ),
+            )?,
             pending_ui_screen: data.pending_ui_screen.clone(),
             pending_ui_arguments_hson: hson::to_vec(&data.pending_ui_arguments)
-                .expect("pending UI arguments must serialize to HSON"),
+                .map_err(|error| StorageError::HsonData(error.to_string()))?,
             ui_registry_hson: hson::to_vec(&data.ui_registry)
-                .expect("UI registry must serialize to HSON"),
+                .map_err(|error| StorageError::HsonData(error.to_string()))?,
             mounted_ui_overlays_hson: hson::to_vec(&data.mounted_ui_overlays)
-                .expect("mounted UI overlays must serialize to HSON"),
-        }
+                .map_err(|error| StorageError::HsonData(error.to_string()))?,
+        })
     }
 }
 
@@ -329,6 +333,9 @@ impl TryFrom<proto::StoredValue> for StoredValue {
 impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
+            story_input_blocked: scene.story_input_blocked,
+            input_permissions_hson: hson::to_vec(&scene.input_permissions)
+                .expect("serializable input permissions"),
             actor_blurs_hson: hson::to_vec(&scene.actor_blurs)
                 .expect("serializable actor blur timelines"),
             post_process_hson: hson::to_vec(&scene.post_process)
@@ -375,6 +382,14 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
 
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
+            story_input_blocked: scene.story_input_blocked,
+            input_permissions: if scene.input_permissions_hson.is_empty() {
+                Default::default()
+            } else {
+                hson::from_slice(&scene.input_permissions_hson).map_err(|error| {
+                    StorageError::InvalidSave(format!("invalid input permissions: {error}"))
+                })?
+            },
             post_process: if scene.post_process_hson.is_empty() {
                 Default::default()
             } else {
@@ -543,6 +558,7 @@ impl From<&AudioSnapshot> for proto::AudioSnapshot {
         Self {
             path: snapshot.path.clone(),
             volume: snapshot.volume,
+            looped: snapshot.looped,
         }
     }
 }
@@ -552,6 +568,7 @@ impl From<proto::AudioSnapshot> for AudioSnapshot {
         Self {
             path: snapshot.path,
             volume: snapshot.volume,
+            looped: snapshot.looped,
         }
     }
 }
@@ -662,7 +679,9 @@ mod tests {
             ],
             ..SaveGameData::default()
         };
-        let bytes = proto::SaveGameData::from(&data).encode_to_vec();
+        let bytes = proto::SaveGameData::try_from(&data)
+            .expect("encode save")
+            .encode_to_vec();
         let restored = SaveGameData::try_from(
             proto::SaveGameData::decode(bytes.as_slice()).expect("save payload"),
         )
@@ -675,6 +694,9 @@ mod tests {
     #[test]
     fn instance_catalog_identity_survives_scene_storage() {
         let mut scene = SceneSnapshot::default();
+        scene.story_input_blocked = true;
+        scene.input_permissions.auto = false;
+        scene.input_permissions.pause = false;
         let mut blur = crate::script::actor_blur::ActorBlur::new(
             0.0,
             8.0,
@@ -706,6 +728,8 @@ mod tests {
         let wire = proto::SceneSnapshot::from(&scene).encode_to_vec();
         let decoded = proto::SceneSnapshot::decode(wire.as_slice()).expect("scene wire format");
         let restored = SceneSnapshot::try_from(decoded).expect("scene restore");
+        assert!(restored.story_input_blocked);
+        assert_eq!(restored.input_permissions, scene.input_permissions);
         assert_eq!(
             restored.character_catalog_names,
             scene.character_catalog_names
@@ -793,7 +817,7 @@ mod tests {
             replay: Some(journal),
             ..Default::default()
         };
-        let mut proto = proto::SaveGameData::from(&data);
+        let mut proto = proto::SaveGameData::try_from(&data).expect("encode save");
         proto.execution_state_bhson = b"not a supported checkpoint".to_vec();
         let restored = SaveGameData::try_from(proto).expect("version-independent replay history");
         assert!(restored.vm_snapshot.is_none());
@@ -940,7 +964,13 @@ mod tests {
                 "dialogue".to_string(),
                 "hdp://main.hdp/ui/dialogue.ui.hks".to_string(),
             )]),
-            mounted_ui_overlays: BTreeMap::from([("clock".to_string(), "clockHud".to_string())]),
+            mounted_ui_overlays: BTreeMap::from([(
+                "clock".to_string(),
+                crate::state::MountedUiOverlay {
+                    component: "clockHud".to_string(),
+                    arguments: vec![StoredValue::Int(2)],
+                },
+            )]),
             ..Default::default()
         };
 

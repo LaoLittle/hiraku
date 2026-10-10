@@ -260,13 +260,15 @@ mod tests {
     #[test]
     fn atlas_builder_converts_gray_alpha_only_when_packing() {
         let mut images = Assets::<Image>::default();
-        let alice = images.add(Image::from_dynamic(
-            image::DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_pixel(
-                2,
-                2,
-                image::LumaA([128, 96]),
-            )),
-            true,
+        let alice = images.add(Image::new_fill(
+            Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[128, 96],
+            TextureFormat::Rg8Unorm,
             default(),
         ));
         let bob = images.add(image([10, 20, 30, 255]));

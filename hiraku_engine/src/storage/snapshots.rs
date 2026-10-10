@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use super::StorageError;
 use crate::{script::StoryRuntimeSnapshot, state::ScriptCallFrameSnapshot};
 
+mod tables;
+
 #[derive(Serialize, Deserialize)]
 struct SharedSnapshots {
     heaps: Vec<ObjectHeap>,
@@ -44,7 +46,7 @@ pub(super) fn encode(
     current: &Option<StoryRuntimeSnapshot>,
     callers: &[ScriptCallFrameSnapshot],
     history: &[crate::state::HistoryRecord],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, StorageError> {
     let mut saved = SharedSnapshots {
         heaps: Vec::new(),
         references: Vec::new(),
@@ -89,7 +91,7 @@ pub(super) fn encode(
             text.context = Default::default();
         }
     }
-    bhson::to_vec(&saved).expect("execution snapshots must serialize to BHSON")
+    tables::encode(saved)
 }
 
 pub(super) fn decode(
@@ -102,9 +104,7 @@ pub(super) fn decode(
     ),
     StorageError,
 > {
-    let mut saved: SharedSnapshots = bhson::from_slice(bytes).map_err(|error| {
-        StorageError::InvalidSave(format!("invalid shared execution snapshots: {error}"))
-    })?;
+    let mut saved = tables::decode(bytes)?;
     let mut references = saved.references.into_iter();
     let mut invalid = false;
     let mut ids = std::collections::BTreeSet::new();
@@ -186,6 +186,35 @@ mod tests {
     }
 
     #[test]
+    fn invalid_snapshot_values_return_an_error_instead_of_panicking() {
+        let records = vec![crate::state::HistoryRecord {
+            id: 1,
+            checkpoint: None,
+            text: vec![hiraku_text::template::LocalizableText {
+                key: None,
+                source: "Alice".into(),
+                context: std::sync::Arc::new(hiraku_text::template::TextSnapshot {
+                    values: std::collections::BTreeMap::from([(
+                        "score".into(),
+                        std::sync::Arc::new(hiraku_text::template::TextValue::Float(f64::NAN)),
+                    )]),
+                }),
+            }],
+        }];
+        let error = encode(&None, &[], &records).expect_err("non-finite values are invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to encode execution snapshots")
+        );
+        let data = crate::state::SaveGameData {
+            history_records: records,
+            ..Default::default()
+        };
+        assert!(super::super::proto::SaveGameData::try_from(&data).is_err());
+    }
+
+    #[test]
     fn repeated_snapshot_heaps_are_written_once_and_restore_as_shared_generations() {
         let snapshot = fixture();
         let callers = vec![
@@ -195,8 +224,8 @@ mod tests {
             };
             4
         ];
-        let bytes = encode(&Some(snapshot.clone()), &callers, &[]);
-        let saved: SharedSnapshots = bhson::from_slice(&bytes).expect("shared snapshot encoding");
+        let bytes = encode(&Some(snapshot.clone()), &callers, &[]).expect("encode snapshots");
+        let saved = tables::decode(&bytes).expect("shared snapshot encoding");
         assert_eq!(
             saved
                 .heaps
@@ -253,8 +282,8 @@ mod tests {
                 }],
             })
             .collect::<Vec<_>>();
-        let bytes = encode(&Some(snapshot.clone()), &[], &records);
-        let saved: SharedSnapshots = bhson::from_slice(&bytes).expect("wire format");
+        let bytes = encode(&Some(snapshot.clone()), &[], &records).expect("encode history");
+        let saved = tables::decode(&bytes).expect("wire format");
         assert_eq!(saved.text_contexts.len(), 1);
         let (current, _, restored) = decode(&bytes).expect("history roundtrip");
         assert_eq!(current, Some(snapshot.clone()));
@@ -272,9 +301,9 @@ mod tests {
 
     #[test]
     fn corrupt_reference_tables_are_rejected() {
-        let bytes = encode(&Some(fixture()), &[], &[]);
+        let bytes = encode(&Some(fixture()), &[], &[]).expect("encode fixture");
         for corruption in 0..3 {
-            let mut saved: SharedSnapshots = bhson::from_slice(&bytes).expect("fixture");
+            let mut saved = tables::decode(&bytes).expect("fixture");
             match corruption {
                 0 => {
                     saved.references.pop();
@@ -284,7 +313,7 @@ mod tests {
                 }
                 _ => saved.references.push(0),
             }
-            assert!(decode(&bhson::to_vec(&saved).expect("corrupted fixture")).is_err());
+            assert!(decode(&tables::encode(saved).expect("corrupted fixture")).is_err());
         }
     }
 }

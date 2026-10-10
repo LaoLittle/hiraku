@@ -247,7 +247,7 @@ fn picture_dissolve_mask(
         })
 }
 
-pub(super) fn apply_picture_command(
+pub(crate) fn apply_picture_command(
     pictures: &mut BTreeMap<String, PictureState>,
     command: PictureCommand,
 ) -> Result<(), String> {

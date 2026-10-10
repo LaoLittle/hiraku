@@ -154,12 +154,12 @@ impl StreamPackageBuilder {
             }
         }
         let package_id = checksum64(&identity);
-        let mut volumes = vec![create_volume(output, 0, first as u64)?];
+        let mut volume_file = create_volume(output, 0, first as u64)?;
         let mut sizes = vec![first as u64];
         let mut buffer = vec![0; 64 * 1024];
         for (bootstrap, file) in &mut files {
             for chunk in &mut file.chunks {
-                let mut volume = volumes.len() - 1;
+                let mut volume = sizes.len() - 1;
                 if self
                     .options
                     .max_volume_size
@@ -172,14 +172,16 @@ impl StreamPackageBuilder {
                         )));
                     }
                     volume += 1;
-                    volumes.push(create_volume(output, volume, HEADER_SIZE as u64)?);
+                    volume_file.flush()?;
+                    drop(volume_file);
+                    volume_file = create_volume(output, volume, HEADER_SIZE as u64)?;
                     sizes.push(HEADER_SIZE as u64);
                 }
                 self.spool.seek(SeekFrom::Start(chunk.offset))?;
-                volumes[volume].seek(SeekFrom::Start(sizes[volume]))?;
+                volume_file.seek(SeekFrom::Start(sizes[volume]))?;
                 copy_exact(
                     &mut self.spool,
-                    &mut volumes[volume],
+                    &mut volume_file,
                     chunk.stored_size,
                     &mut buffer,
                     &file.path,
@@ -195,9 +197,14 @@ impl StreamPackageBuilder {
             .map(|(_, entry)| entry)
             .collect::<Vec<_>>();
         let index = encode_index(&entries)?;
-        let volume_count = u32::try_from(volumes.len())
+        volume_file.flush()?;
+        drop(volume_file);
+        let volume_count = u32::try_from(sizes.len())
             .map_err(|_| HdpError::InvalidFormat("too many volumes".into()))?;
-        for (number, volume) in volumes.iter_mut().enumerate() {
+        for (number, size) in sizes.iter().enumerate() {
+            let mut volume = fs::OpenOptions::new()
+                .write(true)
+                .open(volume_path(output, number))?;
             volume.seek(SeekFrom::Start(0))?;
             volume.write_all(&encode_header(VolumeHeader {
                 package_id,
@@ -214,10 +221,10 @@ impl StreamPackageBuilder {
             if number == 0 {
                 volume.write_all(&index)?;
             }
-            volume.set_len(sizes[number])?;
+            volume.set_len(*size)?;
             volume.flush()?;
         }
-        remove_stale_volumes(output, volumes.len())?;
+        remove_stale_volumes(output, sizes.len())?;
         Ok(WrittenPackage {
             index: PackageIndex {
                 package_id,

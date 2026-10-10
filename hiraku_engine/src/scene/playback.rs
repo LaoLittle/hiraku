@@ -42,6 +42,7 @@ pub(crate) fn update_fast_forward(
     movies: Res<PendingMovieWaits>,
     dependencies: Res<crate::dependencies::ScriptDependencies>,
     focus: Res<crate::input::HirakuTextFocus>,
+    scene: Option<Res<SceneSharedState>>,
     mut redraw: crate::redraw::Redraw,
 ) {
     use crate::input::HirakuAction;
@@ -58,7 +59,9 @@ pub(crate) fn update_fast_forward(
             _ => {}
         }
     }
-    let stop = choice.waiting.is_some()
+    let stop = scene.is_some_and(|scene| {
+        scene.0.story_input_blocked || !scene.0.input_permissions.fast_forward
+    }) || choice.waiting.is_some()
         || screens.active_root.is_some()
         || screens.pending_root.is_some()
         || movies.is_waiting()
@@ -183,6 +186,59 @@ mod tests {
         app.update();
         assert!(!app.world().resource::<FastForward>().active);
         assert!(!app.world().resource::<DialogueState>().fast_forward_enabled);
+    }
+
+    #[test]
+    fn fast_forward_permission_does_not_block_regular_dialogue_input() {
+        let mut app = app();
+        app.init_resource::<SceneSharedState>();
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .input_permissions
+            .fast_forward = false;
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::ToggleFastForward));
+        app.update();
+        assert!(!app.world().resource::<FastForward>().active);
+        assert!(
+            app.world()
+                .resource::<SceneSharedState>()
+                .0
+                .input_permissions
+                .advance
+        );
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .input_permissions
+            .fast_forward = true;
+        app.update();
+        assert!(!app.world().resource::<FastForward>().active);
+    }
+
+    #[test]
+    fn cinematic_input_lock_consumes_fast_forward_without_rearming_on_unlock() {
+        let mut app = app();
+        app.init_resource::<SceneSharedState>();
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::ToggleFastForward));
+        app.update();
+        assert!(app.world().resource::<FastForward>().active);
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .story_input_blocked = true;
+        app.world_mut()
+            .write_message(HirakuActionInput(HirakuAction::FastForwardHeld(true)));
+        app.update();
+        assert!(!app.world().resource::<FastForward>().active);
+        app.world_mut()
+            .resource_mut::<SceneSharedState>()
+            .0
+            .story_input_blocked = false;
+        app.update();
+        assert!(!app.world().resource::<FastForward>().active);
     }
 
     #[test]

@@ -65,11 +65,17 @@ pub(crate) fn update(
     choice: Res<crate::scene::ChoiceState>,
     movies: Res<crate::scene::PendingMovieWaits>,
     dependencies: Res<crate::dependencies::ScriptDependencies>,
-    focus: Res<HirakuTextFocus>,
+    policy: (
+        Res<HirakuTextFocus>,
+        Option<Res<crate::state::SceneSharedState>>,
+    ),
     mut redraw: crate::redraw::Redraw,
 ) {
+    let (focus, scene) = policy;
     let now = time.elapsed_secs_f64();
-    let blocked = screens.active_root.is_some()
+    let blocked = scene.is_some_and(|scene| {
+        scene.0.story_input_blocked || !scene.0.input_permissions.fast_forward
+    }) || screens.active_root.is_some()
         || screens.pending_root.is_some()
         || choice.waiting.is_some()
         || movies.is_waiting()

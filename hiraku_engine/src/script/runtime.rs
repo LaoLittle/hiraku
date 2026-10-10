@@ -33,6 +33,10 @@ pub enum CameraProjectionMode {
 /// keeps the request/response boundary needed to coordinate the VM with Bevy systems.
 #[derive(Default, Resource)]
 pub struct ScriptRuntimeState {
+    pub(crate) recovered_presentation: Option<super::replay_restore::Presentation>,
+    pub(crate) restore_batch_size: usize,
+    /// Preparation runs separately; the live session remains intact until it succeeds.
+    pub(crate) restore_pending: bool,
     pub replay: Option<super::replay::ReplayJournal>,
     pub replay_dialogue: String,
     pub story: Option<StoryRuntime>,
@@ -46,13 +50,33 @@ pub struct ScriptRuntimeState {
     /// Non-modal UI mounts keyed by their stable script-provided mount name.
     /// Values retain the role or path used to mount so the component can be
     /// reconstructed after restoring a save.
-    pub mounted_ui_overlays: BTreeMap<String, String>,
+    pub mounted_ui_overlays: BTreeMap<String, crate::state::MountedUiOverlay>,
     pub response_inbox: BTreeMap<ScriptRequestId, ScriptResponse>,
     pub task_requests: BTreeMap<ScriptRequestId, (ExecutionId, super::capabilities::StoryEffect)>,
     next_request_id: u64,
 }
 
 impl ScriptRuntimeState {
+    pub(crate) fn restore_presentation(&mut self, scene: &mut crate::state::SceneSnapshot) {
+        if let Some(presentation) = self.recovered_presentation.take() {
+            *scene = crate::state::SceneSnapshot {
+                dialogue: presentation.dialogue,
+                actor_blurs: presentation.actor_blurs,
+                ..Default::default()
+            };
+            self.restore_batch_size = presentation.effects.len();
+            if let Some(story) = self.story.as_mut() {
+                story.prepend_effects(presentation.effects);
+            }
+        }
+    }
+
+    pub(crate) fn apply_restored(&mut self, mut prepared: Self) {
+        // Old ECS responses must never collide with a new session's requests.
+        prepared.next_request_id = self.next_request_id;
+        *self = prepared;
+    }
+
     pub fn allocate_request(&mut self) -> ScriptRequestId {
         self.next_request_id = self
             .next_request_id
@@ -81,5 +105,15 @@ mod tests {
         let mut runtime = ScriptRuntimeState::default();
         assert_eq!(runtime.allocate_request(), ScriptRequestId(1));
         assert_eq!(runtime.allocate_request(), ScriptRequestId(2));
+    }
+
+    #[test]
+    fn restored_sessions_do_not_reuse_previous_request_ids() {
+        let mut live = ScriptRuntimeState::default();
+        let previous = live.allocate_request();
+        live.restore_pending = true;
+        live.apply_restored(ScriptRuntimeState::default());
+        assert!(!live.restore_pending);
+        assert!(live.allocate_request() > previous);
     }
 }

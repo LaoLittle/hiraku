@@ -117,7 +117,7 @@ pub fn write_save_data_to_root(
             has_thumbnail: !data.thumbnail_png.is_empty(),
         },
     };
-    let snapshot = proto::SaveGameData::from(data);
+    let snapshot = proto::SaveGameData::try_from(data)?;
     let mut records = vec![GenerationRecord {
         key: format!("snapshot-{generation}"),
         extension: "sav".into(),

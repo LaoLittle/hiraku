@@ -4,6 +4,7 @@ use super::*;
 pub(crate) struct BgmChannel {
     pub path: String,
     pub volume: f32,
+    pub looped: bool,
 }
 
 /// Holds both file handles until the continuous prelude/loop source can be built.
@@ -12,6 +13,7 @@ pub(crate) struct BgmPrelude {
     pub prelude_audio: Handle<AudioSource>,
     pub loop_audio: Handle<AudioSource>,
     pub start_volume: f32,
+    pub looped: bool,
 }
 
 #[derive(Component)]
@@ -65,6 +67,23 @@ pub fn poll_sfx_playback(
         if failed || sink.is_some_and(|sink| sink.empty()) {
             if let Some(id) = &completion.animation_id {
                 animations.completed.insert(id.clone());
+            }
+            commands.entity(entity).try_despawn();
+        }
+    }
+}
+
+pub fn poll_bgm_playback(
+    mut commands: Commands,
+    mut stage: ResMut<StageState>,
+    mut shared_state: ResMut<SceneSharedState>,
+    tracks: Query<(Entity, &BgmChannel, &AudioSink)>,
+) {
+    for (entity, track, sink) in &tracks {
+        if !track.looped && sink.empty() {
+            if stage.bgm == Some(entity) {
+                stage.bgm = None;
+                shared_state.0.bgm = None;
             }
             commands.entity(entity).try_despawn();
         }
@@ -152,6 +171,7 @@ pub fn prepare_bgm_preludes(
         let audio = prelude_loop_audio.add(PreludeLoopAudio::new(
             prelude_source.clone(),
             loop_source.clone(),
+            prelude.looped,
         ));
         commands
             .entity(entity)
@@ -187,11 +207,13 @@ pub fn reconcile_restored_bgm(
                 BgmChannel {
                     path: snapshot.path,
                     volume: snapshot.volume,
+                    looped: snapshot.looped,
                 },
                 BgmPrelude {
                     prelude_audio: asset_server.load(prelude.clone()),
                     loop_audio,
                     start_volume: playback_volume,
+                    looped: snapshot.looped,
                 },
             ))
             .id()
@@ -201,9 +223,15 @@ pub fn reconcile_restored_bgm(
                 BgmChannel {
                     path: snapshot.path,
                     volume: snapshot.volume,
+                    looped: snapshot.looped,
                 },
                 bevy::audio::AudioPlayer::<AudioSource>(loop_audio),
-                PlaybackSettings::LOOP.with_volume(Volume::Linear(playback_volume)),
+                (if snapshot.looped {
+                    PlaybackSettings::LOOP
+                } else {
+                    PlaybackSettings::ONCE
+                })
+                .with_volume(Volume::Linear(playback_volume)),
             ))
             .id()
     };

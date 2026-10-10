@@ -28,6 +28,8 @@ pub enum ScriptCommand {
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
+    InputEnabled(bool),
+    InputPermissions(crate::input::policy::InputPermissions),
     SaveSlot(String),
     Log(String),
     Navigate {
@@ -67,6 +69,7 @@ pub enum StageCommand {
 
 #[derive(Debug)]
 pub enum DialogueCommand {
+    ClearText,
     Speed(f32),
     Say {
         speaker: String,
@@ -133,6 +136,7 @@ pub enum UiCommand {
     },
     HideOverlay {
         name: String,
+        fade_seconds: f32,
     },
 }
 
@@ -212,6 +216,7 @@ pub enum AudioCommand {
         path: String,
         prelude: Option<String>,
         volume: f32,
+        looped: bool,
         fade_in: Option<Duration>,
         animation_id: Option<String>,
     },

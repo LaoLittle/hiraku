@@ -16,6 +16,15 @@ impl ScreenFade {
             alpha: 0.0,
         }
     }
+    pub fn closing(seconds: f32) -> Self {
+        Self {
+            seconds,
+            alpha: 1.0,
+        }
+    }
+    pub fn dismiss(&mut self, seconds: f32) {
+        self.seconds = seconds;
+    }
     fn advance(&mut self, delta: f32, closing: bool) -> bool {
         let step = delta / self.seconds.max(f32::EPSILON);
         self.alpha = (self.alpha + if closing { -step } else { step }).clamp(0.0, 1.0);
@@ -26,6 +35,11 @@ impl ScreenFade {
 pub(crate) struct FadeResult {
     pub value: hiraku_script::Value,
     pub complete: bool,
+}
+
+#[derive(Component)]
+pub(crate) struct ClosingOverlay {
+    pub name: String,
 }
 
 pub(crate) fn finish(
@@ -55,11 +69,31 @@ pub(crate) fn tick(
     time: Res<Time>,
     mut commands: Commands,
     mut screen: ResMut<ScreenUiState>,
-    mut fades: Query<(Entity, &mut ScreenFade, Option<&FadeResult>)>,
+    overlays: Res<OverlayUiState>,
+    mut shared: Option<ResMut<SceneSharedState>>,
+    mut fades: Query<(
+        Entity,
+        &mut ScreenFade,
+        Option<&FadeResult>,
+        Option<&ClosingOverlay>,
+    )>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut redraw: crate::redraw::Redraw,
 ) {
-    for (root, mut fade, result) in &mut fades {
+    for (root, mut fade, result, overlay) in &mut fades {
+        if let Some(overlay) = overlay {
+            redraw.request();
+            if fade.advance(time.delta_secs(), true) {
+                commands.entity(root).try_despawn();
+                if overlay.name == "__role.dialogue" && !overlays.roots.contains_key(&overlay.name)
+                {
+                    if let Some(shared) = &mut shared {
+                        shared.0.dialogue = None;
+                    }
+                }
+            }
+            continue;
+        }
         if screen.active_root != Some(root) || screen.pending_root.is_some() {
             continue;
         }
@@ -220,10 +254,66 @@ mod tests {
     use super::*;
     use std::time::Duration;
     #[test]
+    fn overlay_dismissal_finishes_without_a_modal_and_preserves_replacements() {
+        for replaced in [false, true] {
+            let mut app = App::new();
+            app.init_resource::<Time>()
+                .init_resource::<ScreenUiState>()
+                .init_resource::<OverlayUiState>()
+                .init_resource::<SceneSharedState>()
+                .add_message::<ScriptResponseMessage>()
+                .add_systems(Update, tick);
+            app.world_mut()
+                .resource_mut::<SceneSharedState>()
+                .0
+                .dialogue = Some(crate::state::DialogueSnapshot {
+                speaker: "alice".into(),
+                text: "Hello".into(),
+            });
+            let old = app
+                .world_mut()
+                .spawn((
+                    ScreenFade::closing(0.2),
+                    ClosingOverlay {
+                        name: "__role.dialogue".into(),
+                    },
+                ))
+                .id();
+            if replaced {
+                let next = app.world_mut().spawn_empty().id();
+                app.world_mut()
+                    .resource_mut::<OverlayUiState>()
+                    .roots
+                    .insert("__role.dialogue".into(), next);
+            }
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(Duration::from_millis(100));
+            app.update();
+            assert!(app.world().get_entity(old).is_ok());
+            app.update();
+            assert!(app.world().get_entity(old).is_err());
+            assert_eq!(
+                app.world()
+                    .resource::<SceneSharedState>()
+                    .0
+                    .dialogue
+                    .is_some(),
+                replaced
+            );
+            assert!(
+                app.world()
+                    .resource::<Messages<ScriptResponseMessage>>()
+                    .is_empty()
+            );
+        }
+    }
+    #[test]
     fn nested_completion_resolves_story_once_after_fade() {
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<ScreenUiState>()
+            .init_resource::<OverlayUiState>()
             .add_message::<ScriptResponseMessage>()
             .add_message::<bevy::window::RequestRedraw>()
             .add_systems(Update, tick);

@@ -195,6 +195,7 @@ enum UiDraftKind {
 
 #[derive(Clone, Debug)]
 struct UiDraft {
+    overlay_order: i32,
     allowed_overlays: Vec<String>,
     fade_seconds: f32,
     timers_paused: bool,
@@ -247,6 +248,7 @@ struct UiDraft {
 impl UiDraft {
     fn new(kind: UiDraftKind, content: Option<UiVoidCallable>) -> Self {
         Self {
+            overlay_order: 10,
             allowed_overlays: Vec::new(),
             timers: Vec::new(),
             on_update: None,
@@ -1095,6 +1097,22 @@ mod native_ui {
             color_component(blue)?,
             color_component(alpha)?,
         ]);
+        Ok(node)
+    }
+
+    #[hks(name = "overlayOrder", receiver)]
+    fn overlay_order(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        order: i32,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Screen) {
+            return Err(NativeError::message(
+                "overlayOrder requires a screen or canvas root",
+            ));
+        }
+        draft.overlay_order = order;
         Ok(node)
     }
 
@@ -2120,6 +2138,12 @@ fn color_component(value: f64) -> Result<f32, NativeError> {
 
 fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
     let mut registry = NativeRegistry::new();
+    registry
+        .define_global(
+            "input",
+            crate::input::policy::InputPermissions::model_type(),
+        )
+        .expect("built-in input model must be defined once");
     crate::ui::ScrollAnchor::register_hks(&mut registry).expect("scroll anchor registration");
     UiPosition::register_hks(&mut registry)
         .expect("UiPosition registration must be internally consistent");
@@ -2265,7 +2289,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
         )
         .expect("history schema must not depend on whether it currently has entries");
     for (name, value) in values.story_values() {
-        if name == "time" || name == "dialogue" || name == "history" {
+        if name == "time" || name == "dialogue" || name == "history" || name == "input" {
             continue;
         }
         registry
@@ -2540,16 +2564,22 @@ pub(crate) fn evaluate_ui_callback_with_args(
     models: &crate::ui::UiModels,
     arguments: Vec<Value>,
 ) -> Result<(Vec<UiEffect>, BTreeMap<String, Value>), UiVmError> {
-    let mut current_globals = callback.globals.clone();
-    current_globals.extend(globals.clone());
-    for (name, value) in models.roots() {
-        current_globals.insert(name.to_owned(), stored_to_hks(value));
+    let mut current_globals = callback.globals.as_ref().clone();
+    for name in callback.required_globals.iter() {
+        if let Some(value) = globals.get(name) {
+            current_globals.insert(name.clone(), value.clone());
+        }
+        if let Some(value) = models.get(name) {
+            current_globals.insert(name.clone(), stored_to_hks(value));
+        }
     }
     let values = UiContext::default();
-    let registry = ui_registry(&values);
+    static CALLBACK_REGISTRY: std::sync::OnceLock<NativeRegistry<UiVmContext>> =
+        std::sync::OnceLock::new();
+    let registry = CALLBACK_REGISTRY.get_or_init(|| ui_registry(&UiContext::default()));
     let mut context = UiVmContext::new(values, TermCatalog::default());
     context.navigation_origin = callback.origin.clone();
-    let goto = registry.manifest().resolve_selector("story", "goto");
+    let goto = hiraku_script::native::stable_builtin_id("story.goto");
     let mut vm = LinkedVm::from_callable(callback.program.clone(), &callback.callable, arguments)
         .map_err(|error| UiVmError::Runtime(error.to_string()))?;
     vm.set_current_globals(&current_globals)
@@ -2581,7 +2611,7 @@ pub(crate) fn evaluate_ui_callback_with_args(
                 {
                     context.symbols = vm.symbols().clone();
                 }
-                if Some(call.builtin) == goto {
+                if call.builtin == goto {
                     let request = NavigationRequest::from_goto_call(&call)
                         .map_err(|error| UiVmError::Runtime(error.to_string()))?
                         .with_origin(context.navigation_origin.clone());
@@ -2637,20 +2667,39 @@ pub(crate) fn evaluate_ui_callback_with_args(
 }
 
 fn context_globals(context: &UiVmContext) -> BTreeMap<String, Value> {
+    context_globals_matching(context, |_| true)
+}
+
+fn context_globals_matching(
+    context: &UiVmContext,
+    required: impl Fn(&str) -> bool,
+) -> BTreeMap<String, Value> {
     let mut globals = context
         .values
         .story_values()
         .iter()
+        .filter(|(name, _)| required(name))
         .map(|(name, value)| (name.clone(), stored_to_hks(value)))
         .collect::<BTreeMap<_, _>>();
-    globals.insert(
-        "time".to_string(),
-        Value::Map(BTreeMap::from([
-            ("elapsedSeconds".to_string(), Value::Int(0)),
-            ("unixSeconds".to_string(), Value::Int(0)),
-        ])),
+    if required("input") {
+        globals.entry("input".into()).or_insert_with(|| {
+            stored_to_hks(&crate::input::policy::InputPermissions::default().model(false))
+        });
+    }
+    if required("time") {
+        globals.insert(
+            "time".to_string(),
+            Value::Map(BTreeMap::from([
+                ("elapsedSeconds".to_string(), Value::Int(0)),
+                ("unixSeconds".to_string(), Value::Int(0)),
+            ])),
+        );
+    }
+    globals.extend(
+        context.local_globals.iter()
+            .filter(|(name, _)| required(name))
+            .map(|(name, value)| (name.clone(), value.clone())),
     );
-    globals.extend(context.local_globals.clone());
     globals
 }
 
@@ -2796,6 +2845,7 @@ fn materialize_screen(
         validate_input_handler(handler, &ScriptType::Float, program)?;
     }
     Ok(ScreenSpec {
+        overlay_order: draft.overlay_order,
         on_update: draft
             .on_update
             .map(|handler| ui_callback(handler, program, context)),
@@ -2855,11 +2905,35 @@ fn ui_callback(
     program: &hiraku_script::LinkedProgram,
     context: &UiVmContext,
 ) -> UiCallback {
+    let mut required_globals = context.owned_globals.clone();
+    for module in program.modules.iter() {
+        for instruction in module.bytecode.instructions.iter()
+            .chain(module.bytecode.functions.iter()
+                .flat_map(|function| &function.instructions))
+            .chain(module.bytecode.regions.iter()
+                .flat_map(|region| &region.instructions))
+        {
+            let global = match instruction {
+                hiraku_script::Instruction::LoadGlobal { global, .. }
+                | hiraku_script::Instruction::StoreGlobal { global, .. }
+                | hiraku_script::Instruction::GlobalInitialized { global, .. } => *global,
+                _ => continue,
+            };
+            if let Some(name) = module.bytecode.globals.get(global as usize)
+                .and_then(|symbol| module.bytecode.symbols.resolve(*symbol))
+            {
+                required_globals.insert(name.to_owned());
+            }
+        }
+    }
     UiCallback {
         owned_globals: context.owned_globals.clone(),
         program: program.clone(),
-        callable: handler.into_value(),
-        globals: context_globals(context),
+        callable: std::sync::Arc::new(handler.into_value()),
+        globals: std::sync::Arc::new(context_globals_matching(context, |name| {
+            required_globals.contains(name)
+        })),
+        required_globals: std::sync::Arc::new(required_globals),
         origin: context.navigation_origin.clone(),
     }
 }
@@ -3269,6 +3343,16 @@ fn materialize_node(
             }))
         }
         UiDraftKind::Toggle(value) => {
+            let reactive_enabled = draft
+                .enabled_binding
+                .as_ref()
+                .map(|binding| reactive_binding(binding, program, context));
+            let enabled = if let Some(binding) = &reactive_enabled {
+                bool::from_hks_value(&evaluate_binding_value(binding, registry, context)?)
+                    .map_err(|error| UiVmError::Invalid(error.to_string()))?
+            } else {
+                draft.enabled
+            };
             if let Some(handler) = &draft.on_change {
                 validate_input_handler(handler, &ScriptType::Bool, program)?;
             }
@@ -3306,6 +3390,8 @@ fn materialize_node(
                 }
             };
             Ok(ScreenNode::Toggle(ToggleNode {
+                enabled,
+                reactive_enabled,
                 unchecked,
                 checked,
                 value,
@@ -3435,13 +3521,7 @@ fn materialize_node(
                 draft.layout.on_pressed_change =
                     Some(Box::new(ui_callback(handler.clone(), program, context)));
             }
-            let on_click = draft.on_click.map(|closure| UiCallback {
-                owned_globals: context.owned_globals.clone(),
-                program: program.clone(),
-                callable: closure.into_hks_value(),
-                globals: context_globals(context),
-                origin: context.navigation_origin.clone(),
-            });
+            let on_click = draft.on_click.map(|closure| ui_callback(closure.0, program, context));
             let (enabled, reactive_enabled) = if let Some(binding) = &draft.enabled_binding {
                 let reactive = reactive_binding(binding, program, context);
                 let value = evaluate_binding_value(&reactive, registry, context)?;
@@ -3676,6 +3756,109 @@ fn resolve_texture(textures: &TextureCatalog, name: &str) -> Result<ScreenTextur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[ignore = "headless callback setup benchmark"]
+    fn benchmark_frame_callback_setup() {
+        let screen = evaluate_ui_component_named(
+            "memory://timer.ui.hks",
+            r#"import ui.widgets.*
+global var elapsed: Float = 0.0
+canvas { text("Alice") }.onUpdate { delta: Float -> elapsed += delta }
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        ).expect("timer compiles");
+        let callback = screen.on_update.as_ref().expect("callback");
+        let mut models = crate::ui::UiModels::default();
+        models.set("history", StoredValue::Array((0..128).map(|_| {
+            StoredValue::Map(BTreeMap::from([
+                ("speaker".into(), StoredValue::String("Alice".into())),
+                ("text".into(), StoredValue::String("Bob".repeat(256))),
+            ]))
+        }).collect()));
+        let unused_globals: BTreeMap<String, Value> = BTreeMap::from([(
+            "unused".into(), stored_to_hks(models.get("history").expect("history")),
+        )]);
+        for redundant_setup in [true, false] {
+            let mut globals = BTreeMap::new();
+            let started = std::time::Instant::now();
+            for _ in 0..300 {
+                if redundant_setup {
+                    std::hint::black_box(ui_registry(&UiContext::default()));
+                    std::hint::black_box(unused_globals.clone());
+                    for (_, value) in models.roots() {
+                        std::hint::black_box(stored_to_hks(value));
+                    }
+                }
+                let (_, next) = evaluate_ui_callback_with_args(
+                    callback, &globals, &models, vec![Value::Number(0.016)],
+                ).expect("frame executes");
+                globals = next;
+            }
+            let Value::Number(elapsed) = globals["elapsed"] else { panic!("elapsed") };
+            assert!((elapsed - 4.8).abs() < 1e-9);
+            println!("redundant_setup={redundant_setup}: {:.3} ms/callback",
+                started.elapsed().as_secs_f64() * 1000.0 / 300.0);
+        }
+    }
+
+    #[test]
+    fn frame_callbacks_share_captures_and_ignore_unread_models() {
+        let screen = evaluate_ui_component_named(
+            "memory://timer.ui.hks",
+            r#"import ui.widgets.*
+global var elapsed: Float = 0.0
+canvas { text("Alice") }.onUpdate { delta: Float ->
+    elapsed += delta
+    if elapsed >= 1.0 { ui.close(elapsed) }
+}"#,
+            UiContext::new(BTreeMap::from([(
+                "unused".into(), StoredValue::String("Bob".repeat(1024)),
+            )])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        ).expect("timer UI compiles");
+        let callback = screen.on_update.as_ref().expect("frame callback");
+        assert!(callback.required_globals.contains("elapsed"));
+        assert!(!callback.required_globals.contains("unused"));
+        assert!(!callback.required_globals.contains("history"));
+        assert!(!callback.globals.contains_key("unused"));
+        let copy = callback.clone();
+        assert!(std::sync::Arc::ptr_eq(&callback.callable, &copy.callable));
+        assert!(std::sync::Arc::ptr_eq(&callback.globals, &copy.globals));
+        assert!(!screen.composition.as_ref().expect("composition")
+            .document.plan.structural_globals.contains("elapsed"));
+        let mut models = crate::ui::UiModels::default();
+        models.set("history", StoredValue::String("unused model".repeat(1024)));
+        let mut globals = BTreeMap::new();
+        for index in 0..4 {
+            let (effects, next) = evaluate_ui_callback_with_args(
+                callback, &globals, &models, vec![Value::Number(0.25)],
+            ).expect("frame callback executes");
+            assert_eq!(next["elapsed"], Value::Number((index + 1) as f64 * 0.25));
+            assert!(next.get("history").is_none_or(|value| *value == Value::Uninitialized));
+            assert_eq!(effects.len(), usize::from(index == 3));
+            globals = next;
+        }
+    }
+
+    #[test]
+    fn mounted_overlay_can_render_below_dialogue_without_becoming_modal() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://map.ui.hks",
+            "import ui.widgets.*\ncanvas { text(\"Alice\") }.overlayOrder(-10)",
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("ordered canvas");
+        assert_eq!(screen.overlay_order, -10);
+        assert!(!screen.pauses_scene);
+    }
 
     #[test]
     fn local_list_and_index_are_frozen_per_text_node() {
@@ -4366,6 +4549,94 @@ canvas {
         };
         assert_eq!(text.layout.width, Some(400.0));
         assert_eq!(text.layout.height, None);
+    }
+
+    #[test]
+    fn toggle_enabled_permission_is_materialized_and_remains_reactive() {
+        let source = r#"import ui.widgets.*
+            canvas { toggle(false) { image("save-thumbnail://alice") }.enabled(input.auto) }"#;
+        let permissions = crate::input::InputPermissions {
+            auto: false,
+            ..Default::default()
+        };
+        let screen = evaluate_ui_component_named(
+            "memory://toggle.ui.hks",
+            source,
+            UiContext::new(BTreeMap::from([("input".into(), permissions.model(false))])),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("disabled toggle");
+        let ScreenNode::Toggle(toggle) = &screen.children[0] else {
+            panic!("toggle")
+        };
+        assert!(!toggle.enabled);
+        let binding = toggle
+            .reactive_enabled
+            .as_ref()
+            .expect("reactive enabled state");
+        let mut models = crate::ui::UiModels::default();
+        models.set(
+            "input",
+            crate::input::InputPermissions::default().model(false),
+        );
+        assert_eq!(
+            evaluate_ui_reactive_binding(binding, &models).expect("updated permission"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn input_permissions_drive_button_state_and_callbacks_use_current_permissions() {
+        let source = r#"import ui.widgets.*
+            canvas {
+                button("tools") { text("Tools") }.enabled(input.pause)
+                    .onClick { if input.pause { preferences.setAutoDialogue(true) }; () }
+            }"#;
+        evaluate_ui_component_named(
+            "memory://defaults.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("default input model");
+        for allowed in [false, true] {
+            let policy = crate::input::InputPermissions {
+                pause: allowed,
+                ..Default::default()
+            };
+            let screen = evaluate_ui_component_named(
+                "memory://permissions.ui.hks",
+                source,
+                UiContext::new(BTreeMap::from([("input".into(), policy.model(false))])),
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("typed input UI");
+            let ScreenNode::Button(button) = &screen.children[0] else {
+                panic!("button")
+            };
+            assert_eq!(button.enabled, allowed);
+            let callback = button.on_click.as_ref().expect("callback");
+            let mut models = crate::ui::UiModels::default();
+            // Recheck the latest policy rather than the one captured at mount.
+            let changed = crate::input::InputPermissions {
+                pause: !allowed,
+                ..Default::default()
+            };
+            models.set("input", changed.model(false));
+            let (effects, _) =
+                evaluate_ui_callback(callback, &BTreeMap::new(), &models).expect("callback");
+            assert_eq!(
+                effects,
+                if allowed {
+                    vec![]
+                } else {
+                    vec![UiEffect::SetAutoDialogue(true)]
+                }
+            );
+        }
     }
 
     #[test]
@@ -5480,6 +5751,101 @@ global fn viewer(imageName: String, title: String) -> UiNode {
     }
 
     #[test]
+    fn timed_confirmation_completes_owner_with_selection_and_elapsed_time() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://confirmation.ui.hks",
+            r#"import ui.widgets.*
+                @ui
+                global fn main(result: String, spent: Float) -> UiNode {
+                    canvas {
+                        button { text("Alice") }.onClick {
+                            audio.stopVoice()
+                            ui.complete(.{ selection: result, spent: spent })
+                        }
+                        button { text("Bob") }.onClick { ui.close("") }
+                    }.pauseScene(true).fade(0.2)
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[StoredValue::String("alice".into()), StoredValue::Float(2.5)],
+        )
+        .expect("typed confirmation arguments");
+        let globals = &screen.composition.as_ref().expect("composition").globals;
+        let ScreenNode::Button(confirm) = &screen.children[0] else {
+            panic!("confirmation button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            confirm.on_click.as_ref().expect("confirmation callback"),
+            globals,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("complete the story-owned modal");
+        assert_eq!(
+            effects,
+            vec![
+                UiEffect::StopVoice,
+                UiEffect::CompleteUi {
+                    value: Value::Map(BTreeMap::from([
+                        ("selection".into(), Value::String("alice".into())),
+                        ("spent".into(), Value::Number(2.5)),
+                    ])),
+                }
+            ]
+        );
+        let ScreenNode::Button(cancel) = &screen.children[1] else {
+            panic!("cancel button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            cancel.on_click.as_ref().expect("cancel callback"),
+            globals,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("close only the confirmation");
+        assert_eq!(
+            effects,
+            vec![UiEffect::CloseUi {
+                value: Value::String("".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn testimony_callback_opens_confirmation_without_casting_navigation_result() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://testimony.ui.hks",
+            r#"import ui.widgets.*
+                global var elapsed: Float = 2.5
+                canvas {
+                    button { text("Alice") }.onClick {
+                        ui.open("confirmation.ui.hks", "alice", elapsed)
+                    }
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("testimony screen");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("testimony button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("testimony callback"),
+            &screen.composition.as_ref().expect("composition").globals,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("opening a child modal is an effect, not a synchronous result");
+        assert!(
+            matches!(effects.as_slice(), [UiEffect::OpenUi { role, arguments, .. }]
+            if role == "confirmation.ui.hks" && arguments == &vec![
+                StoredValue::String("alice".into()), StoredValue::Float(2.5)])
+        );
+    }
+
+    #[test]
     fn nested_confirmation_can_complete_its_owner_and_animate_without_story_builtins() {
         let screen = evaluate_ui_component_named_with_args(
             "memory://confirmation.ui.hks",
@@ -5689,6 +6055,59 @@ global fn card(label: String, count: Int) -> UiNode {
                 );
             }
         }
+    }
+
+    #[test]
+    fn final_detail_selection_updates_number_and_subtitle() {
+        let screen = evaluate_ui_component_named(
+            "memory://details.ui.hks",
+            r#"import ui.widgets.*
+global var number: String = "I"
+global var subtitle: String = "First rule"
+fn selectEntry(title: String) {
+    if title == "I First rule" { number = "I"; subtitle = "First rule" }
+    if title == "II Second rule" { number = "II"; subtitle = "Second rule" }
+    if title == "III Long rule" { number = "III"; subtitle = "A considerably longer rule" }
+    if title == "IV Fourth rule" { number = "IV"; subtitle = "Fourth rule" }
+    if title == "V Schedule" { number = "V"; subtitle = "Schedule" }
+}
+canvas {
+    text(number)
+    text(subtitle).size(.abs(501.4, 100)).fontSize(75).fitText().textAlign(0.5)
+    button { text("Schedule") }.onClick { selectEntry("V Schedule") }
+}"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("detail screen compiles");
+        let ScreenNode::Button(button) = &screen.children[2] else {
+            panic!("detail button")
+        };
+        let (_, globals) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("selection callback"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+        )
+        .expect("selection succeeds");
+        assert_eq!(globals.get("number"), Some(&Value::String("V".into())));
+        assert_eq!(
+            globals.get("subtitle"),
+            Some(&Value::String("Schedule".into()))
+        );
+        let next = screen
+            .composition
+            .expect("composition")
+            .render(
+                &globals,
+                &TextureCatalog::default(),
+                &TermCatalog::default(),
+            )
+            .expect("detail rerenders");
+        let ScreenNode::Text(text) = &next.children[1] else {
+            panic!("subtitle")
+        };
+        assert_eq!(text.text, "Schedule");
     }
 
     #[test]

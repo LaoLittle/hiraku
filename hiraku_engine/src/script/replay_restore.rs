@@ -7,18 +7,30 @@ use super::{
 use crate::{storage::UserSettings, vfs::VfsResource};
 use hiraku_script::Value;
 
+mod presentation;
+pub(crate) use presentation::Presentation;
+
 pub(super) fn prepare(
     vfs: &VfsResource,
     mut bootstrap: ScriptBootstrap,
     settings: &UserSettings,
-) -> Result<ScriptBootstrap, String> {
+    program: super::StoryProgram,
+) -> Result<(ScriptBootstrap, super::StoryProgram, Presentation), String> {
+    let mut presentation = Presentation::default();
+    // A session reset can start the journal after startup while retaining its
+    // project UI roles. Keep that baseline; registrations encountered in the
+    // current replay replace it. Mounted presentation is rebuilt from scratch.
+    bootstrap.mounted_ui_overlays.clear();
     let journal = bootstrap
         .replay
         .as_ref()
         .ok_or("save has no replay journal")?;
     let mut cursor = journal.playback().map_err(|e| e.to_string())?;
     let mut path = journal.entry_script.clone();
-    let mut story = create(vfs, &path)?;
+    let mut story = match program.for_path(&path) {
+        Some(program) => StoryRuntime::new(program).map_err(|e| e.to_string())?,
+        None => create(vfs, &path)?,
+    };
     story.set_globals(super::capabilities::engine_globals(settings));
     let mut callers: Vec<(String, StoryRuntime)> = Vec::new();
     let mut dialogue = String::new();
@@ -50,9 +62,69 @@ pub(super) fn prepare(
             continue;
         };
         idle_steps = 0;
+        if let StoryRuntimeEvent::Effect(effect) | StoryRuntimeEvent::TaskEffect { effect, .. } =
+            &event
+        {
+            presentation.record(effect.clone(), &path, vfs)?;
+            match effect {
+                StoryEffect::SetUiRole { role, component } => {
+                    bootstrap
+                        .ui_registry
+                        .insert(role.clone(), vfs.0.resolve_path(Some(&path), component));
+                }
+                StoryEffect::MountUiOverlay {
+                    name,
+                    component,
+                    arguments,
+                    lifetime: None,
+                } => {
+                    let arguments = arguments
+                        .iter()
+                        .map(super::hks_value_to_stored)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or("replayed overlay arguments cannot be serialized")?;
+                    bootstrap.mounted_ui_overlays.insert(
+                        name.clone(),
+                        crate::state::MountedUiOverlay {
+                            component: if bootstrap.ui_registry.contains_key(component) {
+                                component.clone()
+                            } else {
+                                vfs.0.resolve_path(Some(&path), component)
+                            },
+                            arguments,
+                        },
+                    );
+                }
+                StoryEffect::MountUiOverlay { name, lifetime: Some(_), .. }
+                | StoryEffect::UnmountUiOverlay { name, .. } => {
+                    bootstrap.mounted_ui_overlays.remove(name);
+                }
+                _ => (),
+            }
+        }
         if let Some(point) = boundary(&path, &mut dialogue, &event)? {
             if cursor.exhausted() {
                 cursor.finish(&point).map_err(|e| e.to_string())?;
+                if let StoryRuntimeEvent::OpenUi {
+                    path: target,
+                    arguments,
+                } = &event
+                {
+                    bootstrap.pending_ui_screen =
+                        Some(if bootstrap.ui_registry.contains_key(target) {
+                            target.clone()
+                        } else {
+                            vfs.0.resolve_path(Some(&path), target)
+                        });
+                    bootstrap.pending_ui_arguments = arguments
+                        .iter()
+                        .map(super::hks_value_to_stored)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or("replayed UI arguments cannot be serialized")?;
+                } else {
+                    bootstrap.pending_ui_screen = None;
+                    bootstrap.pending_ui_arguments.clear();
+                }
                 story.finish_replay();
                 bootstrap.startup_script = path;
                 bootstrap.snapshot = Some(story.snapshot().map_err(|e| e.to_string())?);
@@ -67,7 +139,10 @@ pub(super) fn prepare(
                     })
                     .collect::<Result<_, String>>()?;
                 bootstrap.values.clear();
-                return Ok(bootstrap);
+                let program = story
+                    .program_for_path(&bootstrap.startup_script)
+                    .ok_or("replayed destination is missing from the linked project")?;
+                return Ok((bootstrap, program, presentation.finish()));
             }
             if cursor.next_kind() == Some(&InputKind::Navigation) {
                 let crate::state::StoredValue::String(request) = cursor
@@ -122,6 +197,10 @@ pub(super) fn prepare(
             }
             StoryRuntimeEvent::Wait(_) => story.resume(Value::Unit).map_err(|e| e.to_string())?,
             StoryRuntimeEvent::Effect(StoryEffect::Navigate(request)) => {
+                if request.reset != NavigationReset::None {
+                    presentation = Presentation::default();
+                    bootstrap.mounted_ui_overlays.clear();
+                }
                 let next_path = vfs
                     .0
                     .resolve_path(request.origin.as_deref().or(Some(&path)), &request.path);
@@ -270,6 +349,246 @@ mod tests {
             }
         }
         panic!("fixture did not reach destination");
+    }
+
+    #[test]
+    fn timed_overlay_replacement_does_not_resurrect_a_persistent_overlay() {
+        let source = r#"
+            ui.mount("aliceOverlay", "ui/alice.ui.hks")
+            ui.mountFor("aliceOverlay", "ui/bob.ui.hks", 0.5)
+            ui.mount("bobOverlay", "ui/bob.ui.hks")
+            "done"
+        "#;
+        let mut save = record(&[("alice.hks", source)], 0);
+        let vfs = fixture(&[("alice.hks", source)]);
+        let program = super::super::compile_story_program(
+            &vfs.0, "hdp://fixture.hdp/alice.hks", source,
+        ).expect("compile fixture");
+        let (bootstrap, _, _) = prepare(
+            &vfs,
+            ScriptBootstrap::take_from_save(&mut save).expect("bootstrap"),
+            &UserSettings::default(),
+            program,
+        ).expect("replay overlay replacement");
+        assert!(!bootstrap.mounted_ui_overlays.contains_key("aliceOverlay"));
+        assert!(bootstrap.mounted_ui_overlays.contains_key("bobOverlay"));
+    }
+
+    #[test]
+    fn changed_script_rebuilds_presentation_instead_of_restoring_old_scene() {
+        let mut save = record(&[("alice.hks", "\"first\"\n\"second\"")], 1);
+        let source = r#"
+            ui.set("dialogue", "ui/dialogue.ui.hks")
+            let room = stage.open("room.stage.hson")
+            let alice = char("alice")
+            room.place(alice, "alice")
+            alice.blur(0).time(2)
+            "first"
+            "second"
+        "#;
+        let vfs = fixture(&[("alice.hks", source)]);
+        let mut runtime = ScriptRuntimeState::default();
+        start_story_runtime(
+            &vfs,
+            &mut runtime,
+            ScriptBootstrap::take_from_save(&mut save).expect("bootstrap"),
+            &UserSettings::default(),
+        )
+        .expect("recover changed script");
+        save.scene.overlay_alpha = 1.0;
+        save.scene
+            .character_positions
+            .insert("bob".into(), [99.0, 99.0]);
+        runtime.restore_presentation(&mut save.scene);
+        assert_eq!(save.scene.overlay_alpha, 0.0);
+        assert!(save.scene.character_positions.is_empty());
+        assert_eq!(
+            save.scene.dialogue.as_ref().expect("current dialogue").text,
+            "second"
+        );
+        assert_eq!(
+            runtime.ui_registry["dialogue"],
+            "hdp://fixture.hdp/ui/dialogue.ui.hks"
+        );
+        let blur = &save.scene.actor_blurs["alice"];
+        assert_eq!(blur.radius, 0.0);
+        assert_eq!(blur.target, 0.0);
+        assert_eq!(blur.animation.seconds(), 0.0);
+        let story = runtime.story.as_mut().expect("recovered execution");
+        let mut placed = false;
+        for _ in 0..32 {
+            match story.step().expect("restoration effect") {
+                Some(StoryRuntimeEvent::Effect(StoryEffect::Spatial(
+                    crate::stage::runtime::StageCommand::Place { actor, anchor, .. },
+                ))) => {
+                    assert_eq!(actor, "alice");
+                    assert_eq!(anchor, "alice");
+                    placed = true;
+                }
+                Some(StoryRuntimeEvent::Effect(StoryEffect::ActorBlur { .. })) => {
+                    panic!("historical blur must be folded before ECS dispatch")
+                }
+                Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance)) => break,
+                _ => (),
+            }
+        }
+        assert!(placed, "current stage bindings must reach ECS");
+    }
+
+    #[test]
+    fn obsolete_presentation_replays_even_when_bytecode_matches_and_clears_alias_blur() {
+        let source = r#"
+            let alice = char("alice")
+            let alias = char("alice").alias("alice-front")
+            alias.blur(9).time(0)
+            scene.hideCharacters(0).await()
+            let room = stage.open("room.stage.hson")
+            room.place(alice, "alice")
+            alice.e("neutral").at(.pos(0, 0)).scale(1).rotation(0).clip(null).blur(0).time(0).hide().await()
+            alice.show().time(0)
+            "first"
+        "#;
+        let mut save = record(&[("alice.hks", source)], 0);
+        // Earlier recovery could save new bytecode alongside the old scene.
+        save.version = crate::state::CURRENT_SAVE_VERSION - 1;
+        save.scene.actor_blurs.insert(
+            "alice".into(),
+            crate::script::actor_blur::ActorBlur::new(
+                9.0,
+                9.0,
+                super::super::animation::AnimationSpec::Linear(0.0, false),
+                None,
+            ),
+        );
+        let encoded = crate::proto::SaveGameData::try_from(&save).expect("encode old save");
+        let decoded = SaveGameData::try_from(encoded).expect("old save can replay");
+        assert!(
+            decoded.vm_snapshot.is_none(),
+            "storage must reject obsolete checkpoint state"
+        );
+        let bootstrap =
+            ScriptBootstrap::take_from_save(&mut save).expect("history checkpoint can replay");
+        assert!(
+            bootstrap.snapshot.is_none(),
+            "history must also reject obsolete checkpoint state"
+        );
+        let vfs = fixture(&[("alice.hks", source)]);
+        let mut runtime = ScriptRuntimeState::default();
+        start_story_runtime(&vfs, &mut runtime, bootstrap, &UserSettings::default())
+            .expect("replay matching bytecode");
+        assert!(runtime.recovered_presentation.is_some());
+        runtime.restore_presentation(&mut save.scene);
+        assert_eq!(save.scene.actor_blurs.len(), 1);
+        let blur = &save.scene.actor_blurs["alice"];
+        assert_eq!(blur.radius, 0.0);
+        assert_eq!(blur.target, 0.0);
+        assert_eq!(blur.animation.duration(), 0.0);
+    }
+
+    #[test]
+    fn recovered_pictures_load_only_the_final_image_and_do_not_replay_sound() {
+        let mut save = record(&[("alice.hks", "\"first\"")], 0);
+        let source = r#"
+            scene.picture("background", "room/old").at(.center).fade(1)
+            scene.picture("background", "room/current").at(.left).fade(1)
+            scene.transformPicture("background").at(.right).time(2)
+            sfx("sound/confirm")
+            voice("voice/alice")
+            "first"
+        "#;
+        let vfs = fixture(&[("alice.hks", source)]);
+        let mut runtime = ScriptRuntimeState::default();
+        start_story_runtime(
+            &vfs,
+            &mut runtime,
+            ScriptBootstrap::take_from_save(&mut save).expect("bootstrap"),
+            &UserSettings::default(),
+        )
+        .expect("recover");
+        let presentation = runtime
+            .recovered_presentation
+            .as_ref()
+            .expect("reconstruction");
+        let pictures = presentation
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                StoryEffect::Picture(crate::scene::pictures::PictureCommand::Show {
+                    path,
+                    position,
+                    seconds,
+                    ..
+                }) => Some((path, position, seconds)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].0, "room/current");
+        assert_eq!(*pictures[0].1, [75.0, 50.0]);
+        assert_eq!(*pictures[0].2, 0.0);
+        assert!(!presentation.effects.iter().any(|effect| matches!(
+            effect,
+            StoryEffect::PlaySfx { .. } | StoryEffect::PlayVoice { .. }
+        )));
+    }
+
+    #[test]
+    fn matching_checkpoint_keeps_saved_presentation() {
+        let source = "\"first\"\n\"second\"";
+        let mut save = record(&[("alice.hks", source)], 1);
+        let vfs = fixture(&[("alice.hks", source)]);
+        let mut runtime = ScriptRuntimeState::default();
+        start_story_runtime(
+            &vfs,
+            &mut runtime,
+            ScriptBootstrap::take_from_save(&mut save).expect("bootstrap"),
+            &UserSettings::default(),
+        )
+        .expect("checkpoint");
+        save.scene.overlay_alpha = 0.75;
+        runtime.restore_presentation(&mut save.scene);
+        assert_eq!(save.scene.overlay_alpha, 0.75);
+        assert_eq!(runtime.restore_batch_size, 0);
+    }
+
+    #[test]
+    fn checkpoint_load_reuses_the_active_linked_project_without_reading_sources() {
+        assert_cached_restore(false);
+    }
+
+    #[test]
+    fn replay_and_final_restore_reuse_the_same_linked_project() {
+        assert_cached_restore(true);
+    }
+
+    fn assert_cached_restore(replay: bool) {
+        let source = "\"first\"\n\"second\"";
+        let mut save = record(&[("alice.hks", source)], 1);
+        if replay {
+            save.vm_snapshot = None;
+        }
+        let path = "hdp://fixture.hdp/alice.hks";
+        let vfs = fixture(&[("alice.hks", source)]);
+        let mut live = ScriptRuntimeState::default();
+        live.story = Some(create(&vfs, path).expect("compile the active project"));
+        live.current_script = Some(path.into());
+        // Loading uses the session's immutable program, just like goto/call.
+        // Explicit project restart is the operation which recompiles sources.
+        let unreadable = fixture(&[("alice.hks", "let broken =")]);
+        let bootstrap = ScriptBootstrap::take_from_save(&mut save).expect("move saved execution");
+        assert!(save.vm_snapshot.is_none());
+        assert!(save.replay.is_none());
+        start_story_runtime(&unreadable, &mut live, bootstrap, &UserSettings::default())
+            .expect("restore without compiling the project again");
+        assert_eq!(live.current_script.as_deref(), Some(path));
+        assert!(matches!(
+            live.story
+                .as_mut()
+                .expect("restored runtime")
+                .step()
+                .expect("saved boundary"),
+            Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+        ));
     }
 
     #[test]

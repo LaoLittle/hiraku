@@ -16,6 +16,22 @@ pub(super) fn dispatch_dialogue_command(
     ui_style: &UiStyle,
 ) {
     match command {
+        DialogueCommand::ClearText => {
+            if let Some(waiting) = dialogue_state.waiting.take() {
+                complete_dialogue_wait(commands, animations, waiting);
+            }
+            dialogue_state.reveal = None;
+            if let Some(dialogue) = &mut shared_state.0.dialogue {
+                dialogue.speaker.clear();
+                dialogue.text.clear();
+            }
+            if let Ok(mut speaker_node) = speaker_text.single_mut() {
+                **speaker_node = String::new();
+            }
+            if let Ok(mut line_node) = line_text.single_mut() {
+                **line_node = String::new();
+            }
+        }
         DialogueCommand::Speed(multiplier) => {
             dialogue_state.effect.cps =
                 super::super::dialogue::DialogueTextEffect::default().cps * multiplier;

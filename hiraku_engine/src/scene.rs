@@ -38,7 +38,7 @@ use crate::{
         ScriptRequestId, ScriptResponse, ScriptResponseMessage, ScriptRuntimeState,
         SettingsCommand, StageCommand, StoryRuntime, UiCommand, UiContext, VideoCommand,
         VoicePlaybackMode, evaluate_ui_component_named_with_args, save_runtime_slot,
-        script_command_from_effect, start_story_runtime,
+        script_command_from_effect,
     },
     state::{
         AudioSnapshot, ChoiceOption, DialogueSnapshot, ImageLayerSnapshot, SceneSharedState,
@@ -96,7 +96,8 @@ use audio_runtime::{
     finish_active_voice, finish_all_voices,
 };
 pub use audio_runtime::{
-    animate_audio_fades, apply_live_audio_settings, poll_sfx_playback, poll_voice_playback,
+    animate_audio_fades, apply_live_audio_settings, poll_bgm_playback, poll_sfx_playback,
+    poll_voice_playback,
     prepare_bgm_preludes, reconcile_restored_bgm,
 };
 

@@ -19,7 +19,13 @@ pub(crate) fn capture_checkpoint(
     }
     history.captured_request = Some(request);
     match crate::script::capture_runtime_save(&runtime, &scene) {
-        Ok(checkpoint) => {
+        Ok(mut checkpoint) => {
+            if checkpoint.vm_snapshot.is_some() {
+                // The VM snapshot owns the authoritative globals, including
+                // object identity. Do not duplicate flattened copies per line.
+                checkpoint.globals.clear();
+                checkpoint.scope.clear();
+            }
             if let Some(record) = history.records.last_mut() {
                 record.checkpoint = Some(std::sync::Arc::new(checkpoint));
                 redraw.request();

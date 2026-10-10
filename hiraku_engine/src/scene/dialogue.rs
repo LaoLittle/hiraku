@@ -38,6 +38,14 @@ impl Default for DialogueHistoryState {
 }
 
 impl DialogueHistoryState {
+    pub(crate) fn save_window(&self) -> (&[DialogueSnapshot], &[crate::state::HistoryRecord]) {
+        let count = self.entries.len().min(self.max_entries);
+        (
+            &self.entries[self.entries.len() - count..],
+            &self.records[self.records.len().saturating_sub(count)..],
+        )
+    }
+
     pub(super) fn restore(&mut self, mut entries: Vec<DialogueSnapshot>) {
         let discard = entries.len().saturating_sub(self.max_entries);
         entries.drain(..discard);
@@ -164,6 +172,30 @@ impl DialogueHistoryState {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn saves_only_retain_the_current_history_window() {
+        let mut history = DialogueHistoryState::default();
+        for name in ["alice", "bob", "alice"] {
+            history.push(DialogueSnapshot {
+                speaker: name.into(),
+                text: "Hello".into(),
+            });
+        }
+        history.max_entries = 1;
+        let (entries, records) = history.save_window();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, history.records[2].id);
+        assert_eq!(
+            history.entries.len(),
+            3,
+            "saving does not mutate live history"
+        );
+        history.max_entries = 0;
+        let (entries, records) = history.save_window();
+        assert!(entries.is_empty() && records.is_empty());
+    }
 
     #[test]
     fn rollback_is_opt_in_and_discards_only_the_future_branch() {
@@ -346,7 +378,11 @@ pub struct DialogueAdvanceSurface;
 
 pub fn advance_dialogue_on_input(
     mut redraw: crate::redraw::Redraw,
-    dependencies: Option<Res<crate::dependencies::ScriptDependencies>>,
+    execution: (
+        Option<Res<ScriptRuntimeState>>,
+        Option<Res<crate::dependencies::ScriptDependencies>>,
+        Option<Res<SceneSharedState>>,
+    ),
     mut actions: MessageReader<crate::input::HirakuActionInput>,
     mut clicks: MessageReader<PointerClick>,
     mut dialogue_state: ResMut<DialogueState>,
@@ -361,6 +397,7 @@ pub fn advance_dialogue_on_input(
     preferences: Res<UserSettings>,
     voices: Res<VoiceState>,
 ) {
+    let (runtime, dependencies, scene) = execution;
     let action_advance = actions
         .read()
         .any(|action| action.0 == crate::input::HirakuAction::NextDialogue);
@@ -375,7 +412,9 @@ pub fn advance_dialogue_on_input(
 
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
-    if !crate::storage::storage_ready()
+    if scene.is_some_and(|scene| scene.0.story_input_blocked || !scene.0.input_permissions.advance)
+        || runtime.is_some_and(|runtime| runtime.restore_pending)
+        || !crate::storage::storage_ready()
         || dependencies.is_some_and(|d| d.loading)
         || choice_state.waiting.is_some()
         || screen_state.active_root.is_some()

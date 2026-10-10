@@ -18,6 +18,28 @@ impl From<Bytecode> for StoryProgram {
 }
 
 impl StoryProgram {
+    pub(crate) fn for_path(&self, path: &str) -> Option<Self> {
+        let Self::Project { program, .. } = self else {
+            return None;
+        };
+        let entry = program
+            .modules
+            .iter()
+            .find(|module| {
+                module
+                    .bytecode
+                    .debug
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.path == path)
+            })?
+            .id;
+        Some(Self::Project {
+            program: program.clone(),
+            entry,
+        })
+    }
+
     pub(super) fn link(self) -> Result<(LinkedProgram, ModuleId), ExecutionRuntimeError> {
         match self {
             Self::Single(code) => {

@@ -142,6 +142,10 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
     let mut camera_shake = ctx.camera_shake;
     let mut pending_script_commands = execution.pending_commands;
     let mut script_runtime = execution.runtime;
+    if script_runtime.restore_pending {
+        redraw.request();
+        return;
+    }
     let mut dialogue_state = ui.dialogue_state;
     let mut dialogue_history = ui.dialogue_history;
     let mut choice_state = ui.choice_state;
@@ -331,6 +335,36 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     }
                 }
             }
+            ScriptCommand::Runtime(RuntimeCommand::InputPermissions(permissions)) => {
+                if !permissions.auto {
+                    dialogue_state.auto_enabled = false;
+                }
+                if !permissions.fast_forward {
+                    dialogue_state.fast_forward_enabled = false;
+                    dialogue_state.fast_forward_held = false;
+                    commands.queue(|world: &mut World| {
+                        if let Some(mut pacing) =
+                            world.get_resource_mut::<super::playback::FastForward>()
+                        {
+                            pacing.active = false;
+                        }
+                    });
+                }
+                shared_state.0.input_permissions = permissions;
+            }
+            ScriptCommand::Runtime(RuntimeCommand::InputEnabled(enabled)) => {
+                shared_state.0.story_input_blocked = !enabled;
+                dialogue_state.fast_forward_enabled = false;
+                dialogue_state.fast_forward_held = false;
+                dialogue_state.auto_enabled = false;
+                commands.queue(|world: &mut World| {
+                    if let Some(mut pacing) =
+                        world.get_resource_mut::<super::playback::FastForward>()
+                    {
+                        pacing.active = false;
+                    }
+                });
+            }
             ScriptCommand::Runtime(RuntimeCommand::Log(message)) => info!("[hks] {message}"),
             ScriptCommand::Stage(StageCommand::SetBackground {
                 path,
@@ -512,6 +546,12 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         continue;
                     }
                     SettingsCommand::AutoDialogue(enabled) => {
+                        if *enabled
+                            && (shared_state.0.story_input_blocked
+                                || !shared_state.0.input_permissions.auto)
+                        {
+                            continue;
+                        }
                         if *enabled {
                             dialogue_state.fast_forward_enabled = false;
                             dialogue_state.fast_forward_held = false;
@@ -521,6 +561,12 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         continue;
                     }
                     SettingsCommand::FastForward(enabled) => {
+                        if *enabled
+                            && (shared_state.0.story_input_blocked
+                                || !shared_state.0.input_permissions.fast_forward)
+                        {
+                            continue;
+                        }
                         dialogue_state.fast_forward_enabled = *enabled;
                         dialogue_state.fast_forward_elapsed = 0.0;
                         if *enabled {

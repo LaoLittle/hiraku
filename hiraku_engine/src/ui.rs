@@ -122,8 +122,9 @@ pub use hiraku_ui::PropertyComputation;
 pub struct UiCallback {
     pub(crate) owned_globals: std::collections::BTreeSet<String>,
     pub(crate) program: hiraku_script::LinkedProgram,
-    pub(crate) callable: hiraku_script::Value,
-    pub(crate) globals: BTreeMap<String, hiraku_script::Value>,
+    pub(crate) callable: std::sync::Arc<hiraku_script::Value>,
+    pub(crate) globals: std::sync::Arc<BTreeMap<String, hiraku_script::Value>>,
+    pub(crate) required_globals: std::sync::Arc<std::collections::BTreeSet<String>>,
     pub(crate) origin: Option<String>,
 }
 
@@ -142,6 +143,8 @@ pub struct UiPhaseAnimation {
 /// `ui.open` blocks for a result, while `ui.mount` remains non-modal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSpec {
+    #[serde(default = "default_overlay_order")]
+    pub overlay_order: i32,
     /// Mount-owned frame callback, receiving elapsed seconds from the UI clock.
     #[serde(skip)]
     pub(crate) on_update: Option<UiCallback>,
@@ -198,6 +201,10 @@ pub struct ScreenSpec {
     /// Child nodes rendered inside the screen root or default panel.
     #[serde(default)]
     pub children: Vec<ScreenNode>,
+}
+
+fn default_overlay_order() -> i32 {
+    10
 }
 
 /// A single displayable in an HKS screen tree.
@@ -270,6 +277,10 @@ pub(crate) struct InitialScrollAnchor(pub ScrollAnchor);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToggleNode {
+    #[serde(default = "default_button_enabled")]
+    pub enabled: bool,
+    #[serde(skip)]
+    pub reactive_enabled: Option<PropertyComputation>,
     pub unchecked: ScreenImageNode,
     pub checked: ScreenImageNode,
     pub value: bool,

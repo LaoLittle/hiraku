@@ -68,9 +68,11 @@ pub(super) fn dispatch_ui_command(
             }
             let spawned =
                 spawn_screen_ui(commands, asset_server, ui_fonts, ui_style, &screen, false);
-            commands
-                .entity(spawned.root)
-                .insert((Visibility::Inherited, GlobalZIndex(SCREEN_ACTIVE_Z + 10)));
+            commands.entity(spawned.root).insert((
+                Visibility::Inherited,
+                GlobalZIndex(SCREEN_ACTIVE_Z.saturating_add(screen.overlay_order)),
+                super::super::screen_ui::OverlayOrder(screen.overlay_order),
+            ));
             if let Some(seconds) = lifetime {
                 commands
                     .entity(spawned.root)
@@ -80,9 +82,41 @@ pub(super) fn dispatch_ui_command(
             }
             overlay_state.roots.insert(name, spawned.root);
         }
-        UiCommand::HideOverlay { name } => {
+        UiCommand::HideOverlay { name, fade_seconds } => {
             if let Some(root) = overlay_state.roots.remove(&name) {
-                commands.entity(root).try_despawn();
+                if fade_seconds > 0.0 {
+                    commands.queue(move |world: &mut World| {
+                        if let Ok(mut entity) = world.get_entity_mut(root) {
+                            if let Some(mut fade) =
+                                entity.get_mut::<super::super::ui_visuals::ScreenFade>()
+                            {
+                                fade.dismiss(fade_seconds);
+                            } else {
+                                entity.insert(super::super::ui_visuals::ScreenFade::closing(
+                                    fade_seconds,
+                                ));
+                            }
+                            entity.insert(super::super::ui_visuals::ClosingOverlay { name });
+                        }
+                    });
+                } else {
+                    commands.entity(root).try_despawn();
+                    if name == "__role.dialogue" {
+                        commands.queue(|world: &mut World| {
+                            if world
+                                .get_resource::<OverlayUiState>()
+                                .is_some_and(|overlays| {
+                                    overlays.roots.contains_key("__role.dialogue")
+                                })
+                            {
+                                return;
+                            }
+                            if let Some(mut shared) = world.get_resource_mut::<SceneSharedState>() {
+                                shared.0.dialogue = None;
+                            }
+                        });
+                    }
+                }
             }
         }
     }

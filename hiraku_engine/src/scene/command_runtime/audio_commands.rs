@@ -339,6 +339,7 @@ pub(super) fn dispatch_audio_command(
             path,
             prelude,
             volume,
+            looped,
             fade_in,
             animation_id,
         } => {
@@ -361,11 +362,13 @@ pub(super) fn dispatch_audio_command(
                         BgmChannel {
                             path: path.clone(),
                             volume,
+                            looped,
                         },
                         BgmPrelude {
                             prelude_audio: asset_server.load(prelude),
                             loop_audio,
                             start_volume,
+                            looped,
                         },
                     ))
                     .id()
@@ -375,9 +378,15 @@ pub(super) fn dispatch_audio_command(
                         BgmChannel {
                             path: path.clone(),
                             volume,
+                            looped,
                         },
                         bevy::audio::AudioPlayer::<AudioSource>(loop_audio),
-                        PlaybackSettings::LOOP.with_volume(Volume::Linear(start_volume)),
+                        (if looped {
+                            PlaybackSettings::LOOP
+                        } else {
+                            PlaybackSettings::ONCE
+                        })
+                        .with_volume(Volume::Linear(start_volume)),
                     ))
                     .id()
             };
@@ -392,7 +401,11 @@ pub(super) fn dispatch_audio_command(
                 animations.completed.insert(animation_id);
             }
             stage.bgm = Some(bgm);
-            shared_state.0.bgm = Some(AudioSnapshot { path, volume });
+            shared_state.0.bgm = Some(AudioSnapshot {
+                path,
+                volume,
+                looped,
+            });
         }
         AudioCommand::StopBgm { fade, animation_id } => {
             let previous = stage.bgm.take();

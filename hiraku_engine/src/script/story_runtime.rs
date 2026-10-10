@@ -485,6 +485,12 @@ impl StoryRuntime {
         self.pending.push_back(event);
     }
 
+    pub(crate) fn prepend_effects(&mut self, effects: Vec<StoryEffect>) {
+        for effect in effects.into_iter().rev() {
+            self.pending.push_front(StoryRuntimeEvent::Effect(effect));
+        }
+    }
+
     /// Reconstructs the host-visible boundary represented by a restored VM.
     /// The engine must not infer every blocked state as dialogue input: a
     /// waiting choice needs its prompt and options mounted again.
@@ -2044,6 +2050,7 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
                 name: "clock".to_string(),
                 component: "ui/clock.ui.hks".to_string(),
+                arguments: Vec::new(),
                 lifetime: None,
             }))
         );
@@ -2051,6 +2058,7 @@ mod tests {
             runtime.step().expect("ui.unmount must run"),
             Some(StoryRuntimeEvent::Effect(StoryEffect::UnmountUiOverlay {
                 name: "clock".to_string(),
+                fade_seconds: 0.0,
             }))
         );
         assert_eq!(
@@ -2059,6 +2067,43 @@ mod tests {
                 path: "dialogue".to_string(),
                 arguments: vec![Value::String("Alice".to_string()), Value::Int(3)],
             })
+        );
+    }
+
+    #[test]
+    fn ui_mount_preserves_entry_arguments_without_waiting_for_a_result() {
+        let bytecode = compile_story_bytecode(
+            "memory://overlay-arguments.hks",
+            "ui.mount(\"panel\", \"ui/panel.ui.hks\", \"Alice\", 2)\nui.mountFor(\"notice\", \"ui/notice.ui.hks\", 1.5, \"Bob\", 3)",
+        ).expect("parameterized mounts compile");
+        let mut runtime = StoryRuntime::new(bytecode).expect("runtime");
+        for (name, component, lifetime, arguments) in [
+            (
+                "panel",
+                "ui/panel.ui.hks",
+                None,
+                vec![Value::String("Alice".into()), Value::Int(2)],
+            ),
+            (
+                "notice",
+                "ui/notice.ui.hks",
+                Some(1.5),
+                vec![Value::String("Bob".into()), Value::Int(3)],
+            ),
+        ] {
+            assert_eq!(
+                runtime.step().expect("mount event"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
+                    name: name.into(),
+                    component: component.into(),
+                    arguments,
+                    lifetime,
+                }))
+            );
+        }
+        assert_eq!(
+            runtime.step().expect("mounts do not await a host result"),
+            Some(StoryRuntimeEvent::Completed(Value::Unit))
         );
     }
 
@@ -2075,6 +2120,7 @@ mod tests {
             Some(StoryRuntimeEvent::Effect(StoryEffect::MountUiOverlay {
                 name: "notice".into(),
                 component: "ui/notice.ui.hks".into(),
+                arguments: Vec::new(),
                 lifetime: Some(3.0),
             }),)
         );
@@ -2268,7 +2314,7 @@ mod tests {
         let effects = host.drain_effects();
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            StoryEffect::PlayBgm { path, volume, fade_in_ms: Some(600) }
+            StoryEffect::PlayBgm { path, volume, fade_in_ms: Some(600), looped: true }
                 if path == "music/theme" && (*volume - 0.75).abs() < f32::EPSILON
         )));
         assert!(effects.iter().any(|effect| matches!(

@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 authors = ["LaoLittle"]
 license = "MIT OR Apache-2.0"
@@ -86,20 +86,20 @@ path = "hiraku_text"
 version = "0.1.0"
 
 [workspace.dependencies.bevy]
-version = "0.20.0-rc.2"
+version = "0.20"
 default-features = false
 features = ["3d", "audio", "ui", "vorbis", "jpeg"]
 
 [workspace.dependencies.time]
-version = "0.3.55"
+version = "0.3"
 features = ["wasm-bindgen"]
 
 [workspace.dependencies.rand_pcg]
-version = "0.10.2"
+version = "0.10"
 default-features = false
 
 [workspace.dependencies.crossbeam-channel]
-version = "0.5.17"
+version = "0.5"
 
 [profile.app-release]
 inherits = "release"

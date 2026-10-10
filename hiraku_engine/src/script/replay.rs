@@ -5,6 +5,9 @@
 use crate::state::StoredValue;
 use serde::{Deserialize, Serialize};
 
+mod events;
+pub use events::ReplayEvents;
+
 pub const JOURNAL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -44,7 +47,7 @@ pub struct ReplayJournal {
     pub version: u32,
     pub entry_script: String,
     pub random_seed: u64,
-    pub events: Vec<ReplayEvent>,
+    pub events: ReplayEvents,
     /// Exact pending boundary. An unanswered choice is a destination, not an input.
     pub destination: Option<ReplayPoint>,
     /// False for partial recordings or sessions started from a legacy checkpoint.
@@ -135,7 +138,7 @@ impl ReplayJournal {
             version: JOURNAL_VERSION,
             entry_script,
             random_seed,
-            events: Vec::new(),
+            events: ReplayEvents::default(),
             destination: None,
             complete: false,
         }
@@ -197,8 +200,10 @@ impl ReplayCursor<'_> {
     }
 
     pub(crate) fn native_inputs(&self, script: &str) -> Vec<(String, StoredValue)> {
-        self.journal.events[self.event..]
+        self.journal
+            .events
             .iter()
+            .skip(self.event)
             .map_while(|event| match event {
                 ReplayEvent::Input {
                     kind: InputKind::Native,

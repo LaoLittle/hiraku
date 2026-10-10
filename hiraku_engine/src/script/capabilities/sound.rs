@@ -55,7 +55,7 @@ impl SoundState {
                 volume: 1.0,
                 fade_in_ms: None,
                 channel_name: None,
-                looped: false,
+                looped: channel == Channel::Music,
             }),
         );
         Ok(AudioHandle(self.next))
@@ -95,6 +95,7 @@ impl SoundState {
                     path,
                     volume,
                     fade_in_ms,
+                    looped,
                 },
                 Channel::Sfx if channel_name.is_some() => StoryEffect::PlaySfxChannel {
                     channel: channel_name.expect("named channel matched"),
@@ -234,7 +235,8 @@ mod tests {
                 StoryEffect::PlayBgm {
                     path: "music/theme".into(),
                     volume: 1.0,
-                    fade_in_ms: None
+                    fade_in_ms: None,
+                    looped: true
                 },
                 StoryEffect::PlaySfx {
                     path: "sound/bell".into(),
@@ -300,6 +302,37 @@ mod tests {
             runtime.step().expect("dialogue wait"),
             Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
         );
+    }
+
+    #[test]
+    fn one_shot_music_keeps_loop_policy_through_runtime_snapshot() {
+        let code =
+            compile_story_bytecode("music.hks", "bgm(\"music/alice\").looped(false)\n\"Bob\"")
+                .expect("one-shot music must type-check");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+        let saved = runtime.snapshot().expect("save before playback");
+        let mut restored = StoryRuntime::restore(code, saved).expect("restore");
+        for runtime in [&mut runtime, &mut restored] {
+            assert!(matches!(
+                runtime.step().expect("music"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::PlayBgm {
+                    looped: false,
+                    ..
+                }))
+            ));
+            assert!(matches!(
+                runtime.step().expect("dialogue"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::Say { .. }))
+            ));
+        }
+        let scene = crate::state::AudioSnapshot {
+            path: "music/alice".into(),
+            volume: 0.5,
+            looped: false,
+        };
+        let encoded = crate::proto::AudioSnapshot::from(&scene);
+        let decoded = crate::state::AudioSnapshot::from(encoded);
+        assert!(!decoded.looped);
     }
 
     #[test]
@@ -403,14 +436,15 @@ mod api {
     fn looped(
         context: &mut CharacterContext,
         AudioHandle(id): AudioHandle,
+        enabled: Option<bool>,
     ) -> Result<AudioHandle, NativeError> {
         let sound = context.sound.pending(id)?;
-        if sound.channel_name.is_none() {
+        if sound.channel != Channel::Music && sound.channel_name.is_none() {
             return Err(NativeError::message(
-                "looped requires sfx(...).channel(name)",
+                "looped requires bgm(...) or sfx(...).channel(name)",
             ));
         }
-        sound.looped = true;
+        sound.looped = enabled.unwrap_or(true);
         Ok(AudioHandle(id))
     }
 

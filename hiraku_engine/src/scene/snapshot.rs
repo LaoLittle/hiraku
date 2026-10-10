@@ -106,6 +106,7 @@ pub fn sync_scene_snapshot(
             bgms.get(entity).ok().map(|bgm| AudioSnapshot {
                 path: bgm.path.clone(),
                 volume: bgm.volume,
+                looped: bgm.looped,
             })
         });
     }

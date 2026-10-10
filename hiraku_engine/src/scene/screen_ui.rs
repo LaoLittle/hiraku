@@ -58,15 +58,15 @@ pub(crate) struct FitText {
 pub(crate) struct TextUnderlineImage;
 
 pub(crate) fn update_text_underlines(
-    texts: Query<&bevy::text::TextLayoutInfo>,
+    texts: Query<(&bevy::text::TextLayoutInfo, &ComputedNode)>,
     mut lines: Query<(&ChildOf, &mut Node), With<TextUnderlineImage>>,
     mut redraw: crate::redraw::Redraw,
 ) {
     for (parent, mut node) in &mut lines {
-        let Ok(text) = texts.get(parent.parent()) else {
+        let Ok((text, computed)) = texts.get(parent.parent()) else {
             continue;
         };
-        let width = px(text.size.x);
+        let width = px(text.size.x * computed.inverse_scale_factor());
         if node.width != width {
             node.width = width;
             redraw.request();
@@ -82,10 +82,11 @@ fn fitted_font_size(current: f32, maximum: f32, available: f32, measured: f32) -
 }
 
 /// Uses shaped glyph bounds, not character counts (which break proportional
-/// fonts and localized text). Bevy stores text bounds in logical pixels;
-/// convert the physical UI node width before comparing, including on HiDPI.
+/// fonts and localized text). Bevy stores both text bounds and computed node
+/// bounds in physical pixels; convert both to authored logical UI coordinates.
 pub(crate) fn fit_screen_text(
     mut redraw: crate::redraw::Redraw,
+    containers: Query<&ComputedNode>,
     mut texts: Query<(
         &mut FitText,
         &Text,
@@ -95,18 +96,31 @@ pub(crate) fn fit_screen_text(
         &mut TextFont,
         &mut Visibility,
         &mut Node,
+        Option<&ChildOf>,
     )>,
 ) {
-    for (mut fit, text, rich, node, measured, mut font, mut visibility, mut layout) in &mut texts {
+    for (mut fit, text, rich, node, measured, mut font, mut visibility, mut layout, parent) in
+        &mut texts
+    {
         let bevy::text::FontSize::Px(current) = font.font_size else {
             continue;
         };
-        if node.size().x <= 0.0 || measured.size.x <= 0.0 {
+        let content = rich.map_or(text.0.as_str(), |rich| rich.source.as_str());
+        // The wrapper owns the available space. Centering the text leaf moves
+        // its edges across pixel boundaries, so its rounded width can alternate
+        // by one pixel even when the wrapper is unchanged.
+        let container = parent
+            .and_then(|parent| containers.get(parent.parent()).ok())
+            .unwrap_or(node);
+        let width = container.size().x * container.inverse_scale_factor();
+        if width <= 0.0 || measured.size.x <= 0.0 {
             visibility.set_if_neq(Visibility::Hidden);
+            if !content.is_empty() {
+                redraw.request();
+            }
             continue;
         }
-        let width = node.size().x * node.inverse_scale_factor();
-        let content = rich.map_or(text.0.as_str(), |rich| rich.source.as_str());
+        let measured_width = measured.size.x * node.inverse_scale_factor();
         if fit.content.as_deref() != Some(content) || (fit.width - width).abs() > 0.01 {
             fit.content = Some(content.to_owned());
             fit.width = width;
@@ -121,8 +135,8 @@ pub(crate) fn fit_screen_text(
         }
         // Shaping rounds bounds to pixels. Never grow a fitted label merely
         // to fill a subpixel gap: that can oscillate across adjacent sizes.
-        let next = if measured.size.x > width {
-            fitted_font_size(current, fit.maximum, width, measured.size.x)
+        let next = if measured_width > width {
+            fitted_font_size(current, fit.maximum, width, measured_width)
         } else {
             current
         };
@@ -133,7 +147,7 @@ pub(crate) fn fit_screen_text(
         } else {
             // NoWrap shapes against unbounded bounds: Justify cannot align
             // the line in the authored box. Move the absolute text leaf.
-            let left = px((width - measured.size.x).max(0.0) * fit.align);
+            let left = px((width - measured_width).max(0.0) * fit.align);
             if layout.left != left {
                 layout.left = left;
                 visibility.set_if_neq(Visibility::Hidden);
@@ -183,6 +197,15 @@ pub(super) fn clear_overlay_ui(commands: &mut Commands, overlay_state: &mut Over
     for (_, root) in overlay_state.roots.drain() {
         commands.entity(root).try_despawn();
     }
+    commands.queue(|world: &mut World| {
+        let mut query = world.query_filtered::<Entity, With<super::ui_visuals::ClosingOverlay>>();
+        let retired: Vec<_> = query.iter(world).collect();
+        for root in retired {
+            if let Ok(entity) = world.get_entity_mut(root) {
+                entity.despawn();
+            }
+        }
+    });
 }
 
 pub fn cleanup_stale_screen_ui(
@@ -326,7 +349,6 @@ pub fn recompose_screen_ui(
                 .iter()
                 .any(|name| composition.rendered.get(name) != local.0.get(name))
         {
-            composition.rendered = local.0.clone();
             continue;
         }
         let belongs_to_root = |mut entity: Entity| {
@@ -396,6 +418,7 @@ pub fn recompose_screen_ui(
             screen_root_node(&screen),
             screen_root_background(&screen),
             AllowedOverlays(screen.allowed_overlays.clone()),
+            OverlayOrder(screen.overlay_order),
         ));
     }
 }
@@ -403,13 +426,16 @@ pub fn recompose_screen_ui(
 #[derive(Component)]
 pub(crate) struct AllowedOverlays(Vec<String>);
 
+#[derive(Component)]
+pub(crate) struct OverlayOrder(pub(crate) i32);
+
 /// Retain mounted overlay entities across modal replacements; only explicitly
 /// admitted overlays are lifted above the current modal and receive input.
 pub(crate) fn sync_allowed_overlays(
     mut state: ResMut<ScreenUiState>,
     overlays: Res<OverlayUiState>,
     policies: Query<&AllowedOverlays>,
-    mut layers: Query<&mut GlobalZIndex>,
+    mut layers: Query<(&mut GlobalZIndex, Option<&OverlayOrder>)>,
 ) {
     let policy = state.active_root.and_then(|root| policies.get(root).ok());
     let mut allowed = Vec::new();
@@ -418,11 +444,11 @@ pub(crate) fn sync_allowed_overlays(
         if admitted {
             allowed.push(root);
         }
-        if let Ok(mut layer) = layers.get_mut(root) {
+        if let Ok((mut layer, order)) = layers.get_mut(root) {
             let z = if admitted {
                 SCREEN_MODAL_ACTIVE_Z + state.stack.len() as i32 * 3 + 1
             } else {
-                SCREEN_ACTIVE_Z + 10
+                SCREEN_ACTIVE_Z.saturating_add(order.map_or(10, |order| order.0))
             };
             if layer.0 != z {
                 layer.0 = z;
@@ -722,6 +748,30 @@ pub(super) fn apply_screen_layout(node: &mut Node, layout: &ScreenLayout) {
     if let Some(bottom) = layout.bottom_percent {
         node.bottom = vh(bottom);
     }
+    if let Some(frame) = layout.keyframes.first() {
+        let (origin, u, v) = match *frame {
+            crate::ui::UiKeyframe::Rect(_, x, y, w, h, _) => (
+                Vec2::new(x as f32, y as f32),
+                Vec2::new(w as f32, 0.0),
+                Vec2::new(0.0, h as f32),
+            ),
+            crate::ui::UiKeyframe::Quad(_, x, y, ux, uy, vx, vy, _)
+            | crate::ui::UiKeyframe::QuadStepAlpha(_, x, y, ux, uy, vx, vy, _) => (
+                Vec2::new(x as f32, y as f32),
+                Vec2::new(ux as f32, uy as f32),
+                Vec2::new(vx as f32, vy as f32),
+            ),
+        };
+        let (bounds, _, _) = crate::render::ui_quad::projection(origin, u, v);
+        node.position_type = PositionType::Absolute;
+        node.flex_shrink = 0.0;
+        node.left = px(bounds.min.x);
+        node.top = px(bounds.min.y);
+        node.right = Val::Auto;
+        node.bottom = Val::Auto;
+        node.width = px(bounds.width());
+        node.height = px(bounds.height());
+    }
 }
 
 fn screen_text_font(ui_fonts: &UiFonts, size: f32, layout: &ScreenLayout) -> TextFont {
@@ -757,6 +807,28 @@ fn spawn_screen_node_entity(
     node: &ScreenNode,
     image_handles: &mut Vec<Handle<Image>>,
 ) -> Entity {
+    spawn_screen_node_in_container(
+        commands,
+        root,
+        asset_server,
+        ui_fonts,
+        ui_style,
+        node,
+        image_handles,
+        false,
+    )
+}
+
+fn spawn_screen_node_in_container(
+    commands: &mut Commands,
+    root: Entity,
+    asset_server: &AssetServer,
+    ui_fonts: &UiFonts,
+    ui_style: &UiStyle,
+    node: &ScreenNode,
+    image_handles: &mut Vec<Handle<Image>>,
+    fill_text_width: bool,
+) -> Entity {
     match node {
         ScreenNode::Input(input) => super::widgets::spawn_input(
             commands,
@@ -775,8 +847,18 @@ fn spawn_screen_node_entity(
             align,
             layout,
         }) => {
-            let mut node = Node { flex_shrink: 0.0, ..default() };
+            let mut node = Node {
+                flex_shrink: 0.0,
+                ..default()
+            };
             apply_screen_layout(&mut node, layout);
+            let fill_text_width = fill_text_width
+                && !layout.fit_content
+                && layout.width.is_none()
+                && layout.width_percent.is_none();
+            if fill_text_width {
+                node.width = percent(100);
+            }
             // Authored layout/visibility belongs to the wrapper. The text leaf
             // can hide during fitting without overriding .visible(...) or
             // removing its box from Bevy layout.
@@ -794,9 +876,8 @@ fn spawn_screen_node_entity(
                     ..default()
                 };
             } else {
-                let constrained = !layout.fit_content
-                    || layout.width.is_some()
-                    || layout.width_percent.is_some();
+                let constrained =
+                    fill_text_width || layout.width.is_some() || layout.width_percent.is_some();
                 node = Node {
                     width: if constrained { percent(100) } else { Val::Auto },
                     min_width: if constrained { px(0) } else { Val::Auto },
@@ -1453,7 +1534,7 @@ fn spawn_screen_node_entity(
                 .children
                 .iter()
                 .map(|child| {
-                    spawn_screen_node_entity(
+                    spawn_screen_node_in_container(
                         commands,
                         root,
                         asset_server,
@@ -1461,6 +1542,7 @@ fn spawn_screen_node_entity(
                         ui_style,
                         child,
                         image_handles,
+                        true,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1525,11 +1607,18 @@ fn spawn_screen_node_entity(
                 .entity(entity)
                 .insert(super::widgets::ToggleCallback {
                     root,
+                    enabled: toggle.enabled,
+                    enabled_binding: toggle.reactive_enabled.clone(),
                     callback: toggle.on_change.clone(),
                     binding: toggle.reactive_value.clone(),
                     revision: u64::MAX,
                     globals: BTreeMap::new(),
                 });
+            if !toggle.enabled {
+                commands
+                    .entity(entity)
+                    .insert(bevy::ui::InteractionDisabled);
+            }
             entity
         }
         ScreenNode::Spacer(SpacerNode {
@@ -2185,6 +2274,7 @@ pub fn handle_screen_toggles(
         loop {
             if let Ok(toggle) = toggles.get(entity) {
                 if let Ok(handler) = callbacks.get(entity)
+                    && handler.enabled
                     && let Some(callback) = &handler.callback
                 {
                     output.write(super::widgets::UiCallbackRequest {
@@ -2241,6 +2331,10 @@ pub fn update_builtin_ui_models(
         );
     }
 
+    models.set(
+        "input",
+        scene.0.input_permissions.model(scene.0.story_input_blocked),
+    );
     let dialogue = scene.0.dialogue.as_ref();
     let text = dialogue
         .map(|value| value.text.as_str())
@@ -2760,6 +2854,71 @@ pub(super) fn should_clear_stale_screen_before_command(command: &ScriptCommand) 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn keyframe_images_overlay_instead_of_participating_in_flex_layout() {
+        use super::*;
+        for (x, y, width, height) in [(0.0, 0.0, 2560.0, 1440.0), (440.0, 240.0, 1380.0, 730.0)] {
+            let mut node = Node::default();
+            apply_screen_layout(&mut node, &ScreenLayout {
+                keyframes: vec![crate::ui::UiKeyframe::Rect(0.0, x, y, width, height, 1.0)],
+                ..default()
+            });
+            assert_eq!(node.position_type, PositionType::Absolute);
+            assert_eq!(node.flex_shrink, 0.0);
+            assert_eq!(node.left, px(x as f32));
+            assert_eq!(node.top, px(y as f32));
+            assert_eq!(node.width, px(width as f32));
+            assert_eq!(node.height, px(height as f32));
+        }
+    }
+
+    #[test]
+    fn reflected_keyframe_quad_starts_at_its_projected_bounds() {
+        use super::*;
+        let mut node = Node::default();
+        apply_screen_layout(&mut node, &ScreenLayout {
+            keyframes: vec![crate::ui::UiKeyframe::Quad(0.0, 100.0, 20.0, -80.0, 0.0, 0.0, 40.0, 1.0)],
+            ..default()
+        });
+        assert_eq!(node.position_type, PositionType::Absolute);
+        assert_eq!(node.left, px(20.0));
+        assert_eq!(node.top, px(20.0));
+        assert_eq!(node.width, px(80.0));
+        assert_eq!(node.height, px(40.0));
+    }
+
+    #[test]
+    fn mounted_underlay_retains_its_explicit_order_during_modal_sync() {
+        use super::*;
+        let mut app = App::new();
+        app.init_resource::<ScreenUiState>()
+            .init_resource::<OverlayUiState>()
+            .add_systems(Update, sync_allowed_overlays);
+        let root = app
+            .world_mut()
+            .spawn((GlobalZIndex(0), OverlayOrder(-10)))
+            .id();
+        app.world_mut()
+            .resource_mut::<OverlayUiState>()
+            .roots
+            .insert("map".into(), root);
+        app.update();
+        assert_eq!(
+            app.world().get::<GlobalZIndex>(root).expect("underlay").0,
+            SCREEN_ACTIVE_Z - 10
+        );
+        let modal = app.world_mut().spawn(AllowedOverlays(Vec::new())).id();
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(modal);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<GlobalZIndex>(root)
+                .expect("retained underlay")
+                .0,
+            SCREEN_ACTIVE_Z - 10
+        );
+    }
+
+    #[test]
     fn admitted_overlay_retains_entity_and_nested_modal_revokes_access() {
         use super::*;
         let mut app = App::new();
@@ -2852,6 +3011,185 @@ mod tests {
     }
 
     #[test]
+    fn fitted_text_requests_layout_until_a_nonempty_label_is_measured() {
+        let mut app = App::new();
+        app.add_message::<bevy::window::RequestRedraw>()
+            .add_systems(Update, fit_screen_text);
+        let entity = app
+            .world_mut()
+            .spawn((
+                FitText {
+                    maximum: 75.0,
+                    align: 0.5,
+                    ..default()
+                },
+                Node::default(),
+                Text::new("Alice"),
+                ComputedNode {
+                    size: Vec2::new(500.0, 100.0),
+                    ..default()
+                },
+                bevy::text::TextLayoutInfo::default(),
+                TextFont::from_font_size(75.0),
+                Visibility::Hidden,
+            ))
+            .id();
+        let mut cursor =
+            bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
+        app.update();
+        assert_eq!(
+            cursor
+                .read(
+                    app.world()
+                        .resource::<Messages<bevy::window::RequestRedraw>>()
+                )
+                .count(),
+            1
+        );
+        app.world_mut()
+            .get_mut::<bevy::text::TextLayoutInfo>(entity)
+            .expect("text layout")
+            .size = Vec2::new(200.0, 75.0);
+        app.update();
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Inherited
+        );
+        cursor
+            .read(
+                app.world()
+                    .resource::<Messages<bevy::window::RequestRedraw>>(),
+            )
+            .for_each(drop);
+        app.update();
+        assert_eq!(
+            cursor
+                .read(
+                    app.world()
+                        .resource::<Messages<bevy::window::RequestRedraw>>()
+                )
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn fitted_text_remains_visible_when_leaf_pixel_rounding_changes() {
+        let mut app = App::new();
+        app.add_message::<bevy::window::RequestRedraw>()
+            .add_systems(Update, fit_screen_text);
+        let parent = app
+            .world_mut()
+            .spawn(ComputedNode {
+                size: Vec2::new(501.0, 100.0),
+                ..default()
+            })
+            .id();
+        let label = app
+            .world_mut()
+            .spawn((
+                FitText {
+                    maximum: 75.0,
+                    align: 0.5,
+                    ..default()
+                },
+                Node::default(),
+                Text::new("Alice"),
+                ComputedNode {
+                    size: Vec2::new(501.0, 100.0),
+                    ..default()
+                },
+                bevy::text::TextLayoutInfo {
+                    size: Vec2::new(225.0, 90.0),
+                    ..default()
+                },
+                TextFont::from_font_size(75.0),
+                Visibility::Hidden,
+            ))
+            .id();
+        app.world_mut().entity_mut(parent).add_child(label);
+        app.update();
+        app.update();
+        let mut cursor =
+            bevy::ecs::message::MessageCursor::<bevy::window::RequestRedraw>::default();
+        cursor
+            .read(
+                app.world()
+                    .resource::<Messages<bevy::window::RequestRedraw>>(),
+            )
+            .for_each(drop);
+        for rounded_width in [502.0, 501.0, 502.0, 501.0] {
+            app.world_mut()
+                .get_mut::<ComputedNode>(label)
+                .expect("text bounds")
+                .size
+                .x = rounded_width;
+            app.update();
+            assert_eq!(
+                *app.world().get::<Visibility>(label).expect("visibility"),
+                Visibility::Inherited
+            );
+            assert_eq!(
+                app.world().get::<Node>(label).expect("text node").left,
+                px(138)
+            );
+            assert_eq!(
+                cursor
+                    .read(
+                        app.world()
+                            .resource::<Messages<bevy::window::RequestRedraw>>()
+                    )
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn fitted_title_preserves_font_and_center_when_canvas_is_scaled_down() {
+        let mut app = App::new();
+        app.add_systems(Update, fit_screen_text);
+        let entity = app
+            .world_mut()
+            .spawn((
+                FitText {
+                    maximum: 75.0,
+                    align: 0.5,
+                    ..default()
+                },
+                Node::default(),
+                Text::new("Alice"),
+                ComputedNode {
+                    size: Vec2::new(125.0, 25.0),
+                    inverse_scale_factor: 4.0,
+                    ..default()
+                },
+                bevy::text::TextLayoutInfo {
+                    size: Vec2::new(100.0, 18.75),
+                    ..default()
+                },
+                TextFont::from_font_size(75.0),
+                Visibility::Hidden,
+            ))
+            .id();
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(entity).expect("text node").left,
+            px(50)
+        );
+        assert_eq!(
+            app.world().get::<TextFont>(entity).expect("font").font_size,
+            bevy::text::FontSize::Px(75.0)
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Inherited
+        );
+    }
+
+    #[test]
     fn fitted_title_centers_shaped_line_inside_its_box() {
         let mut app = App::new();
         app.add_systems(Update, fit_screen_text);
@@ -2874,7 +3212,7 @@ mod tests {
                     ..default()
                 },
                 bevy::text::TextLayoutInfo {
-                    size: Vec2::new(200.0, 75.0),
+                    size: Vec2::new(400.0, 150.0),
                     ..default()
                 },
                 TextFont::from_font_size(75.0),
@@ -2972,7 +3310,7 @@ mod tests {
                     ..default()
                 },
                 bevy::text::TextLayoutInfo {
-                    size: Vec2::new(750.0, 75.0),
+                    size: Vec2::new(1500.0, 150.0),
                     ..default()
                 },
                 TextFont::from_font_size(75.0),
@@ -2996,7 +3334,7 @@ mod tests {
             .get_mut::<bevy::text::TextLayoutInfo>(entity)
             .expect("layout")
             .size
-            .x = 500.0;
+            .x = 1000.0;
         app.update();
         assert_eq!(
             *app.world().get::<Visibility>(entity).expect("visibility"),
@@ -3006,7 +3344,7 @@ mod tests {
             .get_mut::<bevy::text::TextLayoutInfo>(entity)
             .expect("layout")
             .size
-            .x = 499.0;
+            .x = 998.0;
         app.update();
         assert_eq!(
             app.world()
@@ -3170,6 +3508,7 @@ mod tests {
             bevy::text::TextPlugin,
         ));
         app.init_resource::<bevy::ui::UiScale>()
+            .init_resource::<Assets<Image>>()
             .init_resource::<bevy::ui::ui_surface::UiSurface>()
             .init_resource::<UiModels>()
             .add_message::<bevy::window::RequestRedraw>()
@@ -3207,6 +3546,9 @@ mod tests {
                         .after(bevy::text::detect_text_needs_rerender)
                         .after(bevy::text::load_font_assets_into_font_collection),
                     bevy::ui::ui_layout_system.in_set(UiSystems::Layout),
+                    bevy::ui::widget::text_system.after(UiSystems::Layout),
+                    fit_screen_text.after(bevy::ui::widget::text_system),
+                    update_text_underlines.after(fit_screen_text),
                 ),
             );
         app.world_mut().spawn((
@@ -3244,7 +3586,11 @@ mod tests {
                 }.size(.abs(1297, 900))
                 heading("Heading")
                 text("Placeholder").at(.rel(51, 34)).fontSize(36)
+                text("A considerably longer rule for Alice and Bob").at(.abs(384.3, 720.5)).size(.abs(501.4, 100)).fontSize(75).fitText().textAlign(0.5)
                 text("0.5").at(.rel(47, 16)).size(.rel(4, 3)).fontSize(40)
+                scrollable {
+                    text("Scrollable Alice and Bob #br; More text on the next line #br; Another long line that wraps within the viewport").fontSize(36)
+                }.at(.abs(0, 0)).size(.abs(240, 100))
                 column {
                     row { testimony("Objection"); text("Testimony").fontSize(96) }.gap(0).centered()
                 }.centered().size(.abs(1920, 120)).at(.abs(0, 1000))
@@ -3279,6 +3625,26 @@ mod tests {
             app.world_mut().commands().entity(root).add_child(entity);
         }
         app.world_mut().flush();
+        let label = app
+            .world_mut()
+            .query_filtered::<Entity, With<FitText>>()
+            .single(app.world())
+            .expect("fitted label");
+        let line = app
+            .world_mut()
+            .spawn((
+                TextUnderlineImage,
+                ImageNode::default(),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(109),
+                    width: px(0),
+                    height: px(36.5),
+                    ..default()
+                },
+            ))
+            .id();
+        app.world_mut().entity_mut(label).add_child(line);
         for _ in 0..5 {
             app.update();
         }
@@ -3288,10 +3654,51 @@ mod tests {
             .filter(|(text, _)| !text.0.is_empty())
             .map(|(text, node)| (text.0.clone(), node.size()))
             .collect();
-        assert_eq!(labels.len(), 8, "{labels:?}");
+        let (_, scroll_text_size) = labels
+            .iter()
+            .find(|(text, _)| text.starts_with("Scrollable"))
+            .expect("scrollable text");
+        assert!(
+            (scroll_text_size.x - 240.0).abs() < 1.0,
+            "{scroll_text_size:?}"
+        );
+        assert!(
+            scroll_text_size.y > 100.0,
+            "scroll text must not shrink to its viewport: {scroll_text_size:?}"
+        );
+        assert_eq!(labels.len(), 10, "{labels:?}");
         for (text, size) in labels {
             assert!(size.x > 0.0 && size.y > 0.0, "{text}: {size:?}");
         }
+        let mut fitted = app.world_mut().query::<(
+            &FitText,
+            &Visibility,
+            &TextFont,
+            &bevy::text::TextLayoutInfo,
+        )>();
+        for (_, visibility, font, measured) in fitted.iter(app.world()) {
+            assert_eq!(*visibility, Visibility::Inherited, "{font:?}: {measured:?}");
+        }
+        let entity = app
+            .world_mut()
+            .query_filtered::<Entity, With<FitText>>()
+            .single(app.world())
+            .expect("fitted label");
+        app.world_mut()
+            .get_mut::<super::super::rich_text::RichTextSource>(entity)
+            .expect("rich source")
+            .source = "Alice".into();
+        for _ in 0..12 {
+            app.update();
+        }
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).expect("visibility"),
+            Visibility::Inherited
+        );
+        assert_eq!(
+            app.world().get::<TextFont>(entity).expect("font").font_size,
+            bevy::text::FontSize::Px(75.0)
+        );
     }
 
     #[test]
@@ -3698,6 +4105,51 @@ mod tests {
     }
 
     #[test]
+    fn timer_updates_do_not_copy_or_rebuild_structural_state() {
+        use super::*;
+        use crate::script::ui_runtime::UiContext;
+        let screen = crate::script::evaluate_ui_component_named_with_args(
+            "memory://timer.ui.hks",
+            r#"import ui.widgets.*
+global var elapsed: Float = 0.0
+global var shown: Bool = true
+canvas { if shown { text("Alice") } }
+    .onUpdate { delta: Float -> elapsed += delta }
+"#,
+            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
+        ).expect("timer UI");
+        let renderer = screen.composition.expect("composition");
+        assert!(!renderer.document.plan.structural_globals.contains("elapsed"));
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_resource::<TextureCatalog>()
+            .init_resource::<TermCatalog>()
+            .init_resource::<UiStyle>()
+            .init_resource::<UiModels>()
+            .init_resource::<crate::input::HirakuTextFocus>()
+            .insert_resource(UiFonts { regular: Handle::default(), _fonts: vec![] })
+            .add_systems(Update, recompose_screen_ui);
+        let child = app.world_mut().spawn(Text::new("Alice")).id();
+        let root = app.world_mut().spawn((
+            Node::default(),
+            super::super::widgets::UiLocalState(renderer.globals.clone()),
+            ScreenComposition { rendered: renderer.globals.clone(), renderer },
+        )).add_child(child).id();
+        for tick in 1..=100 {
+            app.world_mut().get_mut::<super::super::widgets::UiLocalState>(root)
+                .expect("local state").0.insert("elapsed".into(), hiraku_script::Value::Number(tick as f64));
+            app.update();
+            assert_eq!(app.world().get::<Children>(root).expect("children")[0], child);
+            assert_eq!(app.world().get::<ScreenComposition>(root).expect("composition")
+                .rendered["elapsed"], hiraku_script::Value::Number(0.0));
+        }
+        app.world_mut().get_mut::<super::super::widgets::UiLocalState>(root)
+            .expect("local state").0.insert("shown".into(), hiraku_script::Value::Bool(false));
+        app.update();
+        assert!(app.world().get_entity(child).is_err());
+    }
+
+    #[test]
     fn structural_rebuild_commits_before_rich_text_materialization() {
         let model = |visible| {
             StoredValue::Map(BTreeMap::from([(
@@ -3889,10 +4341,13 @@ mod tests {
         app.add_systems(Update, update_text_underlines);
         let text = app
             .world_mut()
-            .spawn(bevy::text::TextLayoutInfo {
-                size: Vec2::new(137.5, 40.0),
-                ..default()
-            })
+            .spawn((
+                bevy::text::TextLayoutInfo {
+                    size: Vec2::new(137.5, 40.0),
+                    ..default()
+                },
+                ComputedNode::default(),
+            ))
             .id();
         let line = app
             .world_mut()
@@ -3918,6 +4373,23 @@ mod tests {
         app.update();
         assert_eq!(
             app.world().get::<Node>(line).expect("underline").width,
+            px(235)
+        );
+        app.world_mut()
+            .get_mut::<ComputedNode>(text)
+            .expect("text layout")
+            .inverse_scale_factor = 0.5;
+        app.world_mut()
+            .get_mut::<bevy::text::TextLayoutInfo>(text)
+            .expect("shaped text")
+            .size
+            .x = 470.0;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<Node>(line)
+                .expect("scaled underline")
+                .width,
             px(235)
         );
     }
@@ -4967,7 +5439,7 @@ mod tests {
         // no image assets or game scripts are needed for this regression.
         let screen = crate::script::evaluate_ui_component_named_with_args(
             "memory://toggle_state.ui.hks",
-            "import ui.widgets.*\nglobal var enabled: Bool = false\nscreen { checkbox(${enabled}).onChange { value: Bool -> enabled = value } }",
+            "import ui.widgets.*\nglobal var enabled: Bool = false\nscreen { checkbox(${enabled}).enabled(input.auto).onChange { value: Bool -> enabled = value } }",
             crate::script::UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("local Bool state compiles");
         let ScreenNode::Input(input) = &screen.children[0] else {
@@ -4982,6 +5454,8 @@ mod tests {
             .entity_mut(toggle)
             .insert(super::widgets::ToggleCallback {
                 root,
+                enabled: true,
+                enabled_binding: input.reactive_enabled.clone(),
                 callback: Some(callback.clone()),
                 binding: input.reactive_value.clone(),
                 revision: u64::MAX,
@@ -5024,6 +5498,29 @@ mod tests {
                 if checked { px(75) } else { px(100) }
             );
             assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        }
+        for enabled in [false, true] {
+            let permissions = crate::input::InputPermissions {
+                auto: enabled,
+                ..Default::default()
+            };
+            app.world_mut()
+                .resource_mut::<UiModels>()
+                .set("input", permissions.model(false));
+            app.update();
+            assert_eq!(
+                app.world()
+                    .get::<super::widgets::ToggleCallback>(toggle)
+                    .expect("toggle callback")
+                    .enabled,
+                enabled
+            );
+            assert_eq!(
+                app.world()
+                    .get::<bevy::ui::InteractionDisabled>(toggle)
+                    .is_some(),
+                !enabled
+            );
         }
     }
 
