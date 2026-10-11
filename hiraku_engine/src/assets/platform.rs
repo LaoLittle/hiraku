@@ -4,13 +4,21 @@ use bevy::asset::AssetPath;
 use hiraku_hdp::{Archive, HdpError};
 use std::path::Path;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 pub(super) fn open_local(root: &Path, path: &AssetPath<'_>) -> Option<Result<Archive, HdpError>> {
     if path.source() != &bevy::asset::io::AssetSourceId::Default {
         return None;
     }
     let path = root.join(path.path());
     path.is_file().then(|| Archive::open(path))
+}
+
+#[cfg(target_os = "android")]
+pub(super) fn open_local(_root: &Path, path: &AssetPath<'_>) -> Option<Result<Archive, HdpError>> {
+    if path.source() != &bevy::asset::io::AssetSourceId::Default {
+        return None;
+    }
+    crate::vfs::android_archive(path.path()).map(Ok)
 }
 
 #[cfg(target_arch = "wasm32")]

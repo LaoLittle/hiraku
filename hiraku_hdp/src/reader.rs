@@ -24,6 +24,30 @@ pub struct Archive {
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HdpError> {
         let path = path.as_ref();
+        let count = Self::read_volume_count(&mut fs::File::open(path)?)?;
+        let mut files = vec![path.to_path_buf()];
+        for volume in 1..count {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(format!(".{volume:03}"));
+            files.push(PathBuf::from(name));
+        }
+        Self::open_volume_paths(files)
+    }
+
+    pub fn read_volume_count(reader: &mut impl Read) -> Result<u32, HdpError> {
+        let mut bytes = [0; HEADER_SIZE];
+        reader.read_exact(&mut bytes)?;
+        let header = decode_header(&bytes)?;
+        if header.volume_index != 0 {
+            return Err(HdpError::InvalidFormat(
+                "select the main HDP volume, not a continuation volume".into(),
+            ));
+        }
+        Ok(header.volume_count)
+    }
+
+    pub fn open_volume_paths(files: Vec<PathBuf>) -> Result<Self, HdpError> {
+        let path = files.first().ok_or(HdpError::MissingVolume(0))?;
         let mut first = fs::File::open(path)?;
         let mut header_bytes = vec![0; HEADER_SIZE];
         first.read_exact(&mut header_bytes)?;
@@ -39,11 +63,10 @@ impl Archive {
         header_bytes.resize(prefix_size, 0);
         first.read_exact(&mut header_bytes[HEADER_SIZE..])?;
         let index = Self::read_index(&header_bytes)?;
-        let mut files = vec![path.to_path_buf()];
-        for volume in 1..index.volume_count {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(format!(".{volume:03}"));
-            files.push(PathBuf::from(name));
+        if files.len() != index.volume_count as usize {
+            return Err(HdpError::InvalidFormat(
+                "provided volume count does not match HDP index".into(),
+            ));
         }
         let archive = Self {
             volumes: (0..index.volume_count).map(|_| OnceLock::new()).collect(),

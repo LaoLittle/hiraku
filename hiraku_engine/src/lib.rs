@@ -687,6 +687,7 @@ impl Plugin for HirakuPlugin {
 /// `AssetPlugin` is built. After adding `DefaultPlugins`, add
 /// [`HirakuPluginGroup`] to install Hiraku's materials and runtime systems.
 pub fn configure_runtime_app(app: &mut App, config: RuntimeLaunchConfig) {
+    vfs::register_platform_asset_source(app, &config.asset_root);
     let asset_root_path = std::path::PathBuf::from(&config.asset_root);
     let asset_mode = config.asset_mode;
     let archive_store = vfs::HdpArchiveStore::default();

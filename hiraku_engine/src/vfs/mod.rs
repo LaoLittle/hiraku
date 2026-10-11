@@ -18,6 +18,10 @@ use thiserror::Error;
 use crate::data::evaluate_hson_map;
 
 mod settings;
+mod platform;
+pub(crate) use platform::register_asset_source as register_platform_asset_source;
+#[cfg(target_os = "android")]
+pub(crate) use platform::android_archive;
 use settings::{SettingsFile, ensure_empty_data_map, settings_from_data, take_data_string};
 
 pub const DEFAULT_ASSET_ROOT: &str = "assets";
@@ -564,7 +568,7 @@ impl HdpVfs {
         }
 
         let full_path = self.root.join(path);
-        std::fs::read(&full_path)
+        platform::read(&self.root, Path::new(path))
             .map_err(|err| map_fs_not_found(err, full_path.display().to_string()))
     }
 
@@ -601,32 +605,9 @@ impl HdpVfs {
                 .map_err(reader_to_vfs_error);
         }
 
-        let directory = PathBuf::from(path);
-        let full_path = self.root.join(&directory);
-        let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&full_path)
-            .map_err(|err| map_fs_not_found(err, full_path.display().to_string()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let child = entry.path();
-            let name = child
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| VfsError::NotFound(child.display().to_string()))?;
-            let path = self
-                .root
-                .join(&directory)
-                .join(name)
-                .strip_prefix(&self.root)
-                .unwrap_or(child.as_path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            paths.push(path);
-        }
-        Ok(paths)
+        platform::list_files(&self.root, Path::new(path), false)
+            .map(|paths| paths.into_iter().map(|path| path.to_string_lossy().replace('\\', "/")).collect())
+            .map_err(|err| map_fs_not_found(err, self.root.join(path).display().to_string()))
     }
 
     pub fn list_files_recursive(&self, path: &str) -> Result<Vec<String>, VfsError> {
@@ -637,10 +618,9 @@ impl HdpVfs {
             return Err(VfsError::NotFound(archive_name));
         }
 
-        let full_path = self.root.join(path);
-        let mut paths = Vec::new();
-        collect_files_recursive(&full_path, &self.root, &mut paths)?;
-        Ok(paths)
+        platform::list_files(&self.root, Path::new(path), true)
+            .map(|paths| paths.into_iter().map(|path| path.to_string_lossy().replace('\\', "/")).collect())
+            .map_err(|err| map_fs_not_found(err, self.root.join(path).display().to_string()))
     }
 
     fn list_virtual_directory(&self, path: &Path) -> Result<Vec<PathBuf>, AssetReaderError> {
@@ -667,30 +647,6 @@ impl HdpVfs {
             Err(err) => Err(err),
         }
     }
-}
-
-fn collect_files_recursive(
-    directory: &Path,
-    root: &Path,
-    paths: &mut Vec<String>,
-) -> Result<(), VfsError> {
-    for entry in std::fs::read_dir(directory)
-        .map_err(|err| map_fs_not_found(err, directory.display().to_string()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            collect_files_recursive(&path, root, paths)?;
-        } else if entry.file_type()?.is_file() {
-            paths.push(
-                path.strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
-        }
-    }
-    Ok(())
 }
 
 fn list_archive_files(package: &Archive, archive: &str, entry: &str) -> Vec<String> {

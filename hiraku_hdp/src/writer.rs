@@ -733,6 +733,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_volume_paths_support_document_descriptors_without_filename_conventions() {
+        let directory = TestDirectory::new();
+        let payload = (0u8..=255).cycle().take(4096).collect::<Vec<_>>();
+        let mut builder = PackageBuilder::new();
+        builder
+            .add_file("alice.bin", payload.clone())
+            .expect("add synthetic asset");
+        let package = builder
+            .build(PackOptions {
+                chunk_size: 256,
+                max_volume_size: Some(1024),
+                compression: CompressionOptions {
+                    method: CompressionMethod::STORED,
+                    ..Default::default()
+                },
+            })
+            .expect("build split fixture");
+        assert!(package.volumes.len() > 1);
+        let paths = package
+            .volumes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let path = directory.path.join(format!("document-{index}"));
+                fs::write(&path, bytes).expect("write synthetic document");
+                path
+            })
+            .collect::<Vec<_>>();
+        let count = Archive::read_volume_count(&mut package.volumes[0].as_slice())
+            .expect("inspect main volume");
+        assert_eq!(count as usize, paths.len());
+        assert!(Archive::read_volume_count(&mut package.volumes[1].as_slice()).is_err());
+        let archive = Archive::open_volume_paths(paths.clone()).expect("open explicit volumes");
+        assert_eq!(archive.resident_bytes(), 0);
+        assert_eq!(
+            archive.read_file("alice.bin").expect("read across volumes"),
+            payload
+        );
+        assert!(Archive::open_volume_paths(paths[..paths.len() - 1].to_vec()).is_err());
+        let mut reordered = paths;
+        reordered.swap(0, 1);
+        assert!(Archive::open_volume_paths(reordered).is_err());
+    }
+
+    #[test]
     fn roundtrips_stored_and_zstd_chunks() {
         let mut builder = PackageBuilder::new();
         builder.add_file("empty.hson", []).unwrap();

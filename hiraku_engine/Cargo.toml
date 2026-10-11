@@ -31,5 +31,8 @@ time.workspace = true
 blake3 = "1"
 rand_pcg.workspace = true
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+
 [dev-dependencies]
 naga = { version = "30", features = ["wgsl-in", "glsl-in", "wgsl-out"] }
