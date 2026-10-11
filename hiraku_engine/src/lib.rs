@@ -287,6 +287,7 @@ impl Plugin for HirakuPlugin {
         scene::screen_ui::configure_screen_ui_phases(app);
         app.add_plugins(stage::StagePlugin);
         render::ui_quad::register(app);
+        render::text_wipe::register(app);
         app.add_plugins(texture::ArtworkPlugin);
         effect::custom::load_internal_shaders(app);
         effect::transition::load_internal_shaders(app);

@@ -72,6 +72,8 @@ pub(crate) struct RichGlyphs {
     decorations: Vec<bevy::text::RunGeometry>,
     scale: f32,
     shown: Option<u32>,
+    decorations_shown: Option<u32>,
+    wipe: Option<crate::render::text_wipe::TextWipe>,
 }
 
 /// Preserve the complete shaped layout, exposing only revealed glyphs to the
@@ -79,24 +81,72 @@ pub(crate) struct RichGlyphs {
 /// would reveal the shadows of hidden letters. This also avoids reshaping on
 /// every typewriter tick and keeps line breaks fixed throughout the reveal.
 pub(crate) fn reveal_glyphs(
+    mut commands: Commands,
+    dialogue: Option<Res<super::DialogueState>>,
     mut roots: Query<(
+        Entity,
         &RichTextSource,
         &mut bevy::text::TextLayoutInfo,
         &mut RichGlyphs,
     )>,
 ) {
-    for (rich, mut layout, mut cache) in &mut roots {
+    for (entity, rich, mut layout, mut cache) in &mut roots {
         let shaped = layout.is_changed();
         if shaped {
             cache.glyphs.clone_from(&layout.glyphs);
             cache.decorations.clone_from(&layout.run_geometry);
             cache.scale = layout.scale_factor;
         }
-        if shaped || cache.shown != Some(rich.previous_count) {
+        let progress = dialogue.as_ref().and_then(|state| {
+            if state.effect.mode != super::dialogue::DialogueTextEffectMode::Wipe
+                || !rich
+                    .expression
+                    .as_ref()
+                    .is_some_and(|expression| expression.dependencies.contains("dialogue"))
+            {
+                return None;
+            }
+            let reveal = state.reveal.as_ref()?;
+            (reveal.next_index == rich.previous_count as usize
+                && reveal.next_index < reveal.total_chars)
+                .then(|| (reveal.accumulator / reveal.interval).clamp(0.0, 1.0))
+        });
+        let wipe = progress.map(|progress| {
+            crate::render::text_wipe::TextWipe(
+                cache
+                    .glyphs
+                    .iter()
+                    .filter(|glyph| glyph.section_index == rich.previous_count + 1)
+                    .map(|glyph| crate::render::text_wipe::GlyphWipe {
+                        rect: glyph.atlas_info.rect,
+                        position: glyph.position,
+                        progress,
+                    })
+                    .collect(),
+            )
+        });
+        let shown = rich
+            .previous_count
+            .saturating_add(u32::from(wipe.is_some()));
+        let wipe_changed = cache.wipe != wipe;
+        if wipe_changed {
+            if let Some(wipe) = &wipe {
+                commands.entity(entity).try_insert(wipe.clone());
+            } else {
+                commands
+                    .entity(entity)
+                    .remove::<crate::render::text_wipe::TextWipe>();
+            }
+            cache.wipe = wipe;
+        }
+        if shaped
+            || cache.shown != Some(shown)
+            || cache.decorations_shown != Some(rich.previous_count)
+        {
             layout.glyphs = cache
                 .glyphs
                 .iter()
-                .filter(|glyph| glyph.section_index <= rich.previous_count)
+                .filter(|glyph| glyph.section_index <= shown)
                 .cloned()
                 .collect();
             layout.run_geometry = cache
@@ -105,7 +155,10 @@ pub(crate) fn reveal_glyphs(
                 .filter(|run| run.section_index <= rich.previous_count)
                 .cloned()
                 .collect();
-            cache.shown = Some(rich.previous_count);
+            cache.shown = Some(shown);
+            cache.decorations_shown = Some(rich.previous_count);
+        } else if wipe_changed {
+            layout.set_changed();
         }
     }
 }
@@ -782,6 +835,97 @@ mod tests {
             section_index,
             line_index: 0,
         }
+    }
+
+    #[test]
+    fn wipe_moves_within_a_glyph_without_reshaping_and_cleans_up_on_completion() {
+        let mut app = App::new();
+        app.init_resource::<super::super::DialogueState>()
+            .add_systems(PostUpdate, reveal_glyphs);
+        app.world_mut()
+            .resource_mut::<super::super::DialogueState>()
+            .reveal = Some(super::super::dialogue::DialogueRevealState {
+            spans: Vec::new(),
+            total_chars: 2,
+            next_index: 0,
+            accumulator: 0.25,
+            interval: 1.0,
+            fade_seconds: 0.0,
+            animation_id: None,
+        });
+        let mut source = RichTextSource::new("AB".into(), &crate::ui::ScreenLayout::default());
+        source.count = Some(0);
+        source.expression = Some(PropertyComputation {
+            program: hiraku_script::LinkedProgram {
+                modules: Vec::new().into(),
+            },
+            getter: hiraku_script::Value::Unit,
+            globals: Default::default(),
+            dependencies: ["dialogue".to_string()].into(),
+        });
+        let root = app
+            .world_mut()
+            .spawn((
+                source,
+                bevy::text::TextLayoutInfo {
+                    glyphs: (1..=2).map(glyph).collect(),
+                    ..default()
+                },
+                RichGlyphs::default(),
+            ))
+            .id();
+        for fraction in [0.25, 0.75] {
+            app.world_mut()
+                .resource_mut::<super::super::DialogueState>()
+                .reveal
+                .as_mut()
+                .expect("active reveal")
+                .accumulator = fraction;
+            app.update();
+            let wipe = app
+                .world()
+                .get::<crate::render::text_wipe::TextWipe>(root)
+                .expect("wipe");
+            assert_eq!(wipe.0.len(), 1);
+            assert_eq!(wipe.0[0].progress, fraction);
+            assert_eq!(
+                app.world()
+                    .get::<RichGlyphs>(root)
+                    .expect("cache")
+                    .glyphs
+                    .len(),
+                2
+            );
+            assert_eq!(
+                app.world()
+                    .get::<bevy::text::TextLayoutInfo>(root)
+                    .expect("layout")
+                    .glyphs
+                    .len(),
+                1
+            );
+        }
+        app.world_mut()
+            .resource_mut::<super::super::DialogueState>()
+            .reveal = None;
+        app.world_mut()
+            .get_mut::<RichTextSource>(root)
+            .expect("source")
+            .previous_count = 2;
+        app.update();
+        assert!(
+            app.world()
+                .get::<crate::render::text_wipe::TextWipe>(root)
+                .is_none()
+        );
+        assert_eq!(
+            app.world()
+                .get::<bevy::text::TextLayoutInfo>(root)
+                .expect("layout")
+                .glyphs
+                .len(),
+            2
+        );
     }
 
     #[test]

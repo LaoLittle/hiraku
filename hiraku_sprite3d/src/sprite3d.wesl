@@ -23,6 +23,24 @@ fn compose(dst: vec4<f32>, src: vec4<f32>, multiply: bool) -> vec4<f32> {
     return vec4<f32>(src.rgb + dst.rgb * (1.0 - src.a), alpha);
 }
 
+fn covered_texel(pixel: vec2<i32>) -> vec4<f32> {
+    let color = decode_color(textureLoad(atlas, pixel, 0), sampling.x);
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+fn sample_layer(uv: vec2<f32>, origin: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
+    let pixel = origin + clamp(uv * size, vec2<f32>(0.5), max(size - 0.5, vec2<f32>(0.5))) - 0.5;
+    let sampled = decode_color(textureSampleLevel(atlas, atlas_sampler, (pixel + 0.5) / vec2<f32>(textureDimensions(atlas)), 0.0), sampling.x);
+    if sampled.a <= 0.0 { return vec4<f32>(0.0); }
+    if sampled.a >= 1.0 { return sampled; }
+    let lower = vec2<i32>(floor(pixel));
+    let upper = min(lower + vec2<i32>(1), vec2<i32>(origin + size - 1.0));
+    let fraction = fract(pixel);
+    let top = mix(covered_texel(lower), covered_texel(vec2<i32>(upper.x, lower.y)), fraction.x);
+    let bottom = mix(covered_texel(vec2<i32>(lower.x, upper.y)), covered_texel(upper), fraction.x);
+    return mix(top, bottom, fraction.y);
+}
+
 fn composed_color(composed_uv: vec2<f32>) -> vec4<f32> {
     let dimensions = vec2<f32>(textureDimensions(atlas));
     var masks: array<f32, 8>;
@@ -42,22 +60,22 @@ fn composed_color(composed_uv: vec2<f32>) -> vec4<f32> {
         uv = select(uv, vec2<f32>(1.0) - uv, layer.flip.xy > vec2<f32>(0.0));
         let origin = select(layer.rect.xy, vec2<f32>(0.0), layer.rect.z <= 0.0);
         let size = select(layer.rect.zw, dimensions, layer.rect.z <= 0.0);
-        // Clamp to source texel centers, avoiding adjacent atlas entries.
-        let sample_uv = (origin + clamp(uv * size, vec2<f32>(0.5), max(size - 0.5, vec2<f32>(0.5)))) / dimensions;
-        let texel = decode_color(textureSampleLevel(atlas, atlas_sampler, sample_uv, 0.0), sampling.x) * select(0.0, 1.0, inside);
-        let sample_color = texel * layer.tint;
+        var texel = vec4<f32>(0.0);
+        if inside { texel = sample_layer(uv, origin, size); }
+        let sample_color = texel * vec4<f32>(layer.tint.rgb * layer.tint.a, layer.tint.a);
         var alpha = sample_color.a;
+        var coverage = 1.0;
         let mode = u32(layer.modes.y);
         let reference = u32(layer.modes.z);
         if mode != 0u && reference >= 1u && reference <= 8u {
-            if mode == 1u { alpha *= masks[reference - 1u]; }
+            if mode == 1u { coverage = masks[reference - 1u]; alpha *= coverage; }
             else {
                 let coverage = select(select(0.0, alpha, alpha > layer.modes.w), select(0.0, 1.0, texel.a > layer.modes.w), mode >= 4u);
                 masks[reference - 1u] = max(masks[reference - 1u], coverage);
             }
         }
         if mode != 2u && mode != 4u {
-            result = compose(result, vec4<f32>(sample_color.rgb * alpha, alpha), layer.modes.x > 0.0);
+            result = compose(result, vec4<f32>(sample_color.rgb * coverage, alpha), layer.modes.x > 0.0);
         }
         if replacing {
             result = mix(outgoing, result, layer.flip.z);

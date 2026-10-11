@@ -340,12 +340,13 @@ pub struct DialogueTextEffect {
 pub enum DialogueTextEffectMode {
     Instant,
     TypewriterFade,
+    Wipe,
 }
 
 impl Default for DialogueTextEffect {
     fn default() -> Self {
         Self {
-            mode: DialogueTextEffectMode::TypewriterFade,
+            mode: DialogueTextEffectMode::Wipe,
             cps: 30.0,
             fade_seconds: 0.12,
         }
@@ -759,6 +760,7 @@ pub(super) fn text_effect_snapshot(effect: &DialogueTextEffect) -> TextEffectSna
         mode: match effect.mode {
             DialogueTextEffectMode::Instant => "instant".to_string(),
             DialogueTextEffectMode::TypewriterFade => "typewriter_fade".to_string(),
+            DialogueTextEffectMode::Wipe => "wipe".to_string(),
         },
         cps: effect.cps,
         fade_seconds: effect.fade_seconds,
@@ -771,6 +773,8 @@ pub(super) fn dialogue_text_effect_from_snapshot(
     let mut effect = DialogueTextEffect::default();
     if snapshot.mode == "instant" {
         effect.mode = DialogueTextEffectMode::Instant;
+    } else if snapshot.mode == "typewriter_fade" {
+        effect.mode = DialogueTextEffectMode::TypewriterFade;
     }
     if snapshot.cps > 0.0 {
         effect.cps = snapshot.cps;
