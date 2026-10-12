@@ -1,12 +1,15 @@
 use std::{
     ffi::CString,
     io,
-    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    os::fd::{BorrowedFd, OwnedFd},
+    os::unix::fs::FileExt,
     path::{Component, Path, PathBuf},
+    pin::Pin,
     sync::{
         OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
 };
 
 use bevy::{
@@ -14,7 +17,7 @@ use bevy::{
         AssetApp,
         io::{
             AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceId, PathStream, Reader,
-            VecReader, file::FileAssetReader,
+            ReaderNotSeekableError, SeekableReader, VecReader,
         },
     },
     prelude::App,
@@ -25,8 +28,7 @@ use hiraku_hdp::Archive;
 
 struct SelectedPackage {
     archive: Archive,
-    paths: Vec<PathBuf>,
-    _descriptors: Vec<OwnedFd>,
+    main: std::fs::File,
 }
 
 #[derive(Default)]
@@ -201,8 +203,36 @@ pub(super) fn list_files(_root: &Path, path: &Path, recursive: bool) -> io::Resu
     apk_files(path, recursive)
 }
 
-struct AndroidAssetReader {
-    files: FileAssetReader,
+struct AndroidAssetReader;
+
+struct DocumentReader {
+    file: std::fs::File,
+    offset: u64,
+}
+
+impl futures_lite::io::AsyncRead for DocumentReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bytes: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            match self.file.read_at(bytes, self.offset) {
+                Ok(count) => {
+                    self.offset += count as u64;
+                    return Poll::Ready(Ok(count));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+}
+
+impl Reader for DocumentReader {
+    fn seekable(&mut self) -> Result<&mut dyn SeekableReader, ReaderNotSeekableError> {
+        Err(ReaderNotSeekableError)
+    }
 }
 
 impl AssetReader for AndroidAssetReader {
@@ -214,8 +244,10 @@ impl AssetReader for AndroidAssetReader {
             Err(error) => return Err(reader_error(error, path)),
         }
         let package = wait_for_selection().await?;
-        let reader = self.files.read(&package.paths[0]).await?;
-        Ok(Box::new(reader))
+        Ok(Box::new(DocumentReader {
+            file: package.main.try_clone()?,
+            offset: 0,
+        }))
     }
 
     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<VecReader, AssetReaderError> {
@@ -259,11 +291,7 @@ fn reader_error(error: io::Error, path: &Path) -> AssetReaderError {
 pub(super) fn register_asset_source(app: &mut App, _root: &str) {
     app.register_asset_source(
         AssetSourceId::Default,
-        AssetSourceBuilder::new(|| {
-            Box::new(AndroidAssetReader {
-                files: FileAssetReader::new("/"),
-            })
-        }),
+        AssetSourceBuilder::new(|| Box::new(AndroidAssetReader)),
     );
 }
 
@@ -310,20 +338,17 @@ pub extern "system" fn Java_org_hiraku_app_HdpPicker_install<'local>(
         let mut raw = vec![0; descriptors.len(env)?];
         descriptors.get_region(env, 0, &mut raw)?;
         let result = (|| -> Result<SelectedPackage, hiraku_hdp::HdpError> {
-            let descriptors = raw
+            let files = raw
                 .into_iter()
                 .map(duplicate_descriptor)
+                .map(|result| result.map(std::fs::File::from))
                 .collect::<io::Result<Vec<_>>>()?;
-            let paths = descriptors
-                .iter()
-                .map(|fd| PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())))
-                .collect::<Vec<_>>();
-            let archive = Archive::open_volume_paths(paths.clone())?;
-            Ok(SelectedPackage {
-                archive,
-                paths,
-                _descriptors: descriptors,
-            })
+            let main = files
+                .first()
+                .ok_or(hiraku_hdp::HdpError::MissingVolume(0))?
+                .try_clone()?;
+            let archive = Archive::open_volume_files(files)?;
+            Ok(SelectedPackage { archive, main })
         })();
         match result {
             Ok(package) => {

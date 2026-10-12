@@ -82,6 +82,7 @@ enum TokenKind {
     MinusEqual,
     StarEqual,
     SlashEqual,
+    PercentEqual,
     BangEqual,
     LessEqual,
     GreaterEqual,
@@ -97,6 +98,7 @@ enum TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,
     Dollar,
     At,
     LParen,
@@ -225,6 +227,7 @@ impl<'a> TokenAdapter<'a> {
                             TokenKind::Minus => Some(TokenKind::MinusEqual),
                             TokenKind::Star => Some(TokenKind::StarEqual),
                             TokenKind::Slash => Some(TokenKind::SlashEqual),
+                            TokenKind::Percent => Some(TokenKind::PercentEqual),
                             TokenKind::Bang => Some(TokenKind::BangEqual),
                             TokenKind::Lt => Some(TokenKind::LessEqual),
                             TokenKind::Gt => Some(TokenKind::GreaterEqual),
@@ -238,35 +241,7 @@ impl<'a> TokenAdapter<'a> {
                     }
                     TokenKind::Equal
                 }
-                RawToken::Percent => {
-                    if let Some(Token {
-                        kind: TokenKind::Integer(value),
-                        span: number_span,
-                    }) = tokens.last_mut()
-                        && number_span.end == start
-                    {
-                        let value = *value as f64;
-                        number_span.end = span.end;
-                        tokens.last_mut().expect("numeric token exists").kind =
-                            TokenKind::Number(value, NumberUnit::Percent);
-                        continue;
-                    }
-                    if let Some(Token {
-                        kind: TokenKind::Number(_, unit),
-                        span: number_span,
-                    }) = tokens.last_mut()
-                        && number_span.end == start
-                    {
-                        *unit = NumberUnit::Percent;
-                        number_span.end = span.end;
-                        continue;
-                    }
-                    errors.push(ParseError {
-                        message: "`%` must follow a numeric literal".to_string(),
-                        span,
-                    });
-                    continue;
-                }
+                RawToken::Percent => TokenKind::Percent,
                 RawToken::Literal {
                     kind: LiteralKind::Int { empty_int, .. },
                     suffix_start,
@@ -625,6 +600,7 @@ impl Parser {
             TokenKind::MinusEqual => Some(Some(BinaryOp::Subtract)),
             TokenKind::StarEqual => Some(Some(BinaryOp::Multiply)),
             TokenKind::SlashEqual => Some(Some(BinaryOp::Divide)),
+            TokenKind::PercentEqual => Some(Some(BinaryOp::Remainder)),
             _ => None,
         };
         if let Some(operator) = assignment {
@@ -1701,6 +1677,7 @@ impl Parser {
             let operator = match self.current().kind {
                 TokenKind::Star => BinaryOp::Multiply,
                 TokenKind::Slash => BinaryOp::Divide,
+                TokenKind::Percent => BinaryOp::Remainder,
                 _ => break,
             };
             self.advance();
@@ -2603,28 +2580,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_tuple_and_percent_positions() {
-        let expression = expression("camera.zoom(1.2, at: (20%, 30%))");
+    fn parses_remainder_in_tuples_and_rejects_percent_literals() {
+        let expression = expression("sample((20 % 3, 30%4))");
         let ExprKind::Call { arguments, .. } = expression.kind else {
             panic!("expected call");
         };
-        let ExprKind::Tuple(values) = &arguments[1].value.kind else {
+        let ExprKind::Tuple(values) = &arguments[0].value.kind else {
             panic!("expected position tuple");
         };
         assert!(matches!(
             values[0].kind,
-            ExprKind::Number {
-                value: 20.0,
-                unit: NumberUnit::Percent
+            ExprKind::Binary {
+                op: BinaryOp::Remainder,
+                ..
             }
         ));
         assert!(matches!(
             values[1].kind,
-            ExprKind::Number {
-                value: 30.0,
-                unit: NumberUnit::Percent
+            ExprKind::Binary {
+                op: BinaryOp::Remainder,
+                ..
             }
         ));
+        assert!(parse_program("let value = 20%").is_err());
+        assert!(parse_program("sample(20%, 30%)").is_err());
     }
 
     #[test]

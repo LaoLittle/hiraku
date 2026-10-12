@@ -154,6 +154,8 @@ pub struct ScreenSpec {
     #[serde(default)]
     pub fade_seconds: f32,
     #[serde(default)]
+    pub content_fade_seconds: f32,
+    #[serde(default)]
     pub pauses_scene: bool,
     #[serde(default)]
     pub timers_paused: bool,

@@ -733,6 +733,72 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
+    fn authorized_volume_handles_read_after_unlink_without_shared_seek_cursors() {
+        use std::io::{Seek, SeekFrom};
+        let directory = TestDirectory::new();
+        let payload = (0u8..=255).cycle().take(4096).collect::<Vec<_>>();
+        let mut builder = PackageBuilder::new();
+        builder
+            .add_file("alice.bin", payload.clone())
+            .expect("synthetic asset");
+        let package = builder
+            .build(PackOptions {
+                chunk_size: 256,
+                max_volume_size: Some(1024),
+                compression: CompressionOptions {
+                    method: CompressionMethod::STORED,
+                    ..Default::default()
+                },
+            })
+            .expect("split package");
+        assert!(package.volumes.len() > 1);
+        let mut files = Vec::new();
+        for (index, bytes) in package.volumes.iter().enumerate() {
+            let path = directory.path.join(format!("document-{index}"));
+            fs::write(&path, bytes).expect("fixture volume");
+            let mut file = File::open(&path).expect("authorized handle");
+            file.seek(SeekFrom::Start(7)).expect("provider cursor");
+            files.push(file);
+            fs::remove_file(&path).expect("remove fixture path while retaining its handle");
+        }
+        let mut cursor = files[0].try_clone().expect("shared file description");
+        let archive = Archive::open_volume_files(files).expect("open handles, not paths");
+        assert!(archive.is_complete());
+        assert_eq!(archive.resident_bytes(), 0);
+        assert!(archive.is_volume_available(1));
+        assert!(!archive.is_volume_available(package.volumes.len() as u32));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let archive = archive.clone();
+                let payload = &payload;
+                scope.spawn(move || {
+                    for _ in 0..10 {
+                        assert_eq!(
+                            archive
+                                .read_file("alice.bin")
+                                .expect("concurrent range read"),
+                            *payload
+                        );
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            cursor
+                .stream_position()
+                .expect("provider cursor remains unchanged"),
+            7
+        );
+        assert!(
+            archive
+                .provide_volume(0, package.volumes[0].clone().into())
+                .is_err()
+        );
+        assert!(Archive::open_volume_files(Vec::new()).is_err());
+    }
+
+    #[test]
     fn explicit_volume_paths_support_document_descriptors_without_filename_conventions() {
         let directory = TestDirectory::new();
         let payload = (0u8..=255).cycle().take(4096).collect::<Vec<_>>();

@@ -331,6 +331,7 @@ pub fn recompose_screen_ui(
     models: Res<UiModels>,
     interactions: Query<(Entity, &PickingInteraction)>,
     parents: Query<&ChildOf>,
+    mut redraw: crate::redraw::Redraw,
     mut screens: Query<(
         Entity,
         Option<&Children>,
@@ -362,6 +363,7 @@ pub fn recompose_screen_ui(
                 entity = parent.parent();
             }
         };
+        redraw.request();
         // Never invalidate an active drag or text-edit session. Existing
         // property updates continue; structural changes commit after release.
         if focus.0.is_some_and(belongs_to_root)
@@ -396,10 +398,49 @@ pub fn recompose_screen_ui(
             &screen,
             &mut handles,
         );
-        for child in children.into_iter().flat_map(|children| children.iter()) {
-            commands.entity(child).try_despawn();
+        let previous: Vec<_> = children
+            .into_iter()
+            .flat_map(|children| children.iter())
+            .collect();
+        if screen.content_fade_seconds > 0.0 && !previous.is_empty() {
+            let wrapper = commands
+                .spawn((
+                    screen_root_node(&screen),
+                    Pickable::IGNORE,
+                    super::ui_visuals::ScreenFade::new(screen.content_fade_seconds),
+                    super::ui_visuals::ContentTransition {
+                        previous: previous.clone(),
+                        images: handles.clone(),
+                    },
+                ))
+                .id();
+            commands.entity(wrapper).add_children(&next);
+            commands.entity(root).add_child(wrapper);
+            for &child in &previous {
+                commands
+                    .entity(child)
+                    .remove::<super::ui_visuals::ContentTransition>();
+            }
+            commands.queue(move |world: &mut World| {
+                let mut pending = previous;
+                while let Some(entity) = pending.pop() {
+                    if let Some(children) = world.get::<Children>(entity) {
+                        pending.extend(children.iter());
+                    }
+                    if let Ok(mut entity) = world.get_entity_mut(entity) {
+                        entity.insert(Pickable::IGNORE);
+                    }
+                }
+            });
+        } else {
+            for child in previous {
+                commands.entity(child).try_despawn();
+            }
+            commands.entity(root).add_children(&next);
         }
-        commands.entity(root).add_children(&next);
+        commands
+            .entity(root)
+            .insert(crate::render::ui_quad::UiImageAssets(handles.clone()));
         if let Some(callback) = &screen.on_update {
             commands.entity(root).insert((
                 super::ui_timers::UiUpdate(callback.clone()),
@@ -3936,6 +3977,7 @@ mod tests {
             .init_resource::<crate::input::HirakuTextFocus>()
             .init_resource::<ScreenUiState>()
             .init_resource::<UiModels>()
+            .add_message::<bevy::window::RequestRedraw>()
             .insert_resource(UiFonts {
                 regular: Handle::default(),
                 _fonts: vec![],
@@ -3967,11 +4009,13 @@ mod tests {
             app.world().get_entity(old).is_ok(),
             "editing must retain its target"
         );
+        assert!(!app.world().resource::<Messages<bevy::window::RequestRedraw>>().is_empty());
         app.world_mut()
             .resource_mut::<crate::input::HirakuTextFocus>()
             .0 = None;
         app.update();
         assert!(app.world().get_entity(old).is_err());
+        assert!(!app.world().resource::<Messages<bevy::window::RequestRedraw>>().is_empty());
         assert_eq!(
             app.world().resource::<ScreenUiState>().active_root,
             Some(root)

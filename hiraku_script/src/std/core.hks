@@ -167,6 +167,29 @@ protocol Divide<Rhs> {
     fn divide(self, rhs: Rhs) -> Self.Output
 }
 
+protocol Remainder<Rhs> {
+    type Output
+    fn remainder(self, rhs: Rhs) -> Self.Output
+}
+
+extend Int: Remainder<Int> {
+    type Output = Int
+    @inline
+    fn remainder(self, rhs: Int) -> Output { intrinsics.int.remainder(self, rhs) }
+}
+
+extend UInt: Remainder<UInt> {
+    type Output = UInt
+    @inline
+    fn remainder(self, rhs: UInt) -> Output { intrinsics.uint.remainder(self, rhs) }
+}
+
+extend Float: Remainder<Float> {
+    type Output = Float
+    @inline
+    fn remainder(self, rhs: Float) -> Output { intrinsics.float.remainder(self, rhs) }
+}
+
 protocol Equal<Rhs> {
     type Output
     fn equal(self, rhs: Rhs) -> Self.Output

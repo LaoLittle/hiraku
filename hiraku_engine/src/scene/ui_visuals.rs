@@ -42,6 +42,12 @@ pub(crate) struct ClosingOverlay {
     pub name: String,
 }
 
+#[derive(Component)]
+pub(crate) struct ContentTransition {
+    pub previous: Vec<Entity>,
+    pub images: Vec<Handle<Image>>,
+}
+
 pub(crate) fn finish(
     commands: &mut Commands,
     screen: &mut ScreenUiState,
@@ -71,16 +77,44 @@ pub(crate) fn tick(
     mut screen: ResMut<ScreenUiState>,
     overlays: Res<OverlayUiState>,
     mut shared: Option<ResMut<SceneSharedState>>,
+    images: Res<Assets<Image>>,
+    hierarchy: Query<(&ChildOf, &Children)>,
     mut fades: Query<(
         Entity,
         &mut ScreenFade,
         Option<&FadeResult>,
         Option<&ClosingOverlay>,
+        Option<&ContentTransition>,
     )>,
     mut responses: MessageWriter<ScriptResponseMessage>,
     mut redraw: crate::redraw::Redraw,
 ) {
-    for (root, mut fade, result, overlay) in &mut fades {
+    for (root, mut fade, result, overlay, content) in &mut fades {
+        if let Some(content) = content {
+            redraw.request();
+            if content
+                .images
+                .iter()
+                .any(|handle| !images.contains(handle.id()))
+            {
+                continue;
+            }
+            fade.advance(time.delta_secs(), false);
+            if fade.alpha == 1.0 {
+                for &previous in &content.previous {
+                    commands.entity(previous).try_despawn();
+                }
+                if let Ok((parent, children)) = hierarchy.get(root) {
+                    commands
+                        .entity(parent.parent())
+                        .add_children(&children.iter().collect::<Vec<_>>());
+                    commands.entity(root).try_despawn();
+                } else {
+                    commands.entity(root).remove::<ContentTransition>();
+                }
+            }
+            continue;
+        }
         if let Some(overlay) = overlay {
             redraw.request();
             if fade.advance(time.delta_secs(), true) {
@@ -254,10 +288,82 @@ mod tests {
     use super::*;
     use std::time::Duration;
     #[test]
+    fn content_crossfade_waits_for_images_keeps_old_content_and_flattens_after_completion() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<ScreenUiState>()
+            .init_resource::<OverlayUiState>()
+            .add_message::<ScriptResponseMessage>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .add_systems(Update, tick);
+        let image = app.world().resource::<Assets<Image>>().reserve_handle();
+        let old = app.world_mut().spawn_empty().id();
+        let next = app.world_mut().spawn_empty().id();
+        let wrapper = app
+            .world_mut()
+            .spawn((
+                ScreenFade::new(0.2),
+                ContentTransition {
+                    previous: vec![old],
+                    images: vec![image.clone()],
+                },
+            ))
+            .add_child(next)
+            .id();
+        let root = app
+            .world_mut()
+            .spawn_empty()
+            .add_children(&[old, wrapper])
+            .id();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(100));
+        app.update();
+        assert_eq!(
+            app.world().get::<ScreenFade>(wrapper).expect("fade").alpha,
+            0.0
+        );
+        assert!(
+            !app.world()
+                .resource::<Messages<bevy::window::RequestRedraw>>()
+                .is_empty()
+        );
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .insert(image.id(), Image::default())
+            .expect("reserved image");
+        app.update();
+        assert_eq!(
+            app.world().get::<ScreenFade>(wrapper).expect("fade").alpha,
+            0.5
+        );
+        assert!(app.world().get_entity(old).is_ok());
+        app.update();
+        assert!(app.world().get_entity(old).is_err());
+        assert!(app.world().get_entity(wrapper).is_err());
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(next)
+                .expect("retained content")
+                .parent(),
+            root
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(root)
+                .expect("flat content")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn overlay_dismissal_finishes_without_a_modal_and_preserves_replacements() {
         for replaced in [false, true] {
             let mut app = App::new();
             app.init_resource::<Time>()
+                .init_resource::<Assets<Image>>()
                 .init_resource::<ScreenUiState>()
                 .init_resource::<OverlayUiState>()
                 .init_resource::<SceneSharedState>()
@@ -312,6 +418,7 @@ mod tests {
     fn nested_completion_resolves_story_once_after_fade() {
         let mut app = App::new();
         app.init_resource::<Time>()
+            .init_resource::<Assets<Image>>()
             .init_resource::<ScreenUiState>()
             .init_resource::<OverlayUiState>()
             .add_message::<ScriptResponseMessage>()

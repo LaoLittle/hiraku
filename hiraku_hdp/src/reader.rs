@@ -19,6 +19,7 @@ pub struct Archive {
     volumes: Vec<OnceLock<Arc<[u8]>>>,
     /// File-backed packages retain paths and the index, not compressed payloads.
     files: Option<Vec<PathBuf>>,
+    handles: Option<Arc<Vec<fs::File>>>,
 }
 
 impl Archive {
@@ -72,6 +73,7 @@ impl Archive {
             volumes: (0..index.volume_count).map(|_| OnceLock::new()).collect(),
             index,
             files: Some(files),
+            handles: None,
         };
         archive.validate_index()?;
         for (position, path) in archive
@@ -84,6 +86,50 @@ impl Archive {
             let mut file = fs::File::open(path)?;
             let mut header = [0; HEADER_SIZE];
             file.read_exact(&mut header)?;
+            archive.validate_volume_extent(position, &header, file.metadata()?.len())?;
+        }
+        Ok(archive)
+    }
+
+    /// Retains already-authorized volume handles without reopening their paths.
+    /// Reads use explicit offsets, so cloned archives do not share a seek cursor.
+    pub fn open_volume_files(files: Vec<fs::File>) -> Result<Self, HdpError> {
+        let first = files.first().ok_or(HdpError::MissingVolume(0))?;
+        let mut prefix = vec![0; HEADER_SIZE];
+        crate::platform::read_exact_at(first, &mut prefix, 0)?;
+        let header = decode_header(&prefix)?;
+        let index_size = usize::try_from(header.index_size)
+            .map_err(|_| HdpError::InvalidFormat("index is too large".into()))?;
+        let prefix_size = HEADER_SIZE
+            .checked_add(index_size)
+            .ok_or_else(|| HdpError::InvalidFormat("index offset overflow".into()))?;
+        if prefix_size as u64 > first.metadata()?.len() {
+            return Err(HdpError::InvalidFormat("truncated package index".into()));
+        }
+        prefix.resize(prefix_size, 0);
+        crate::platform::read_exact_at(first, &mut prefix[HEADER_SIZE..], HEADER_SIZE as u64)?;
+        let index = Self::read_index(&prefix)?;
+        if files.len() != index.volume_count as usize {
+            return Err(HdpError::InvalidFormat(
+                "provided volume count does not match HDP index".into(),
+            ));
+        }
+        let archive = Self {
+            volumes: (0..index.volume_count).map(|_| OnceLock::new()).collect(),
+            index,
+            files: None,
+            handles: Some(Arc::new(files)),
+        };
+        archive.validate_index()?;
+        for (position, file) in archive
+            .handles
+            .as_ref()
+            .expect("handle-backed archive")
+            .iter()
+            .enumerate()
+        {
+            let mut header = [0; HEADER_SIZE];
+            crate::platform::read_exact_at(file, &mut header, 0)?;
             archive.validate_volume_extent(position, &header, file.metadata()?.len())?;
         }
         Ok(archive)
@@ -107,6 +153,7 @@ impl Archive {
             index,
             volumes,
             files: None,
+            handles: None,
         };
         archive.validate_index()?;
         archive.validate_volume(0)?;
@@ -130,7 +177,7 @@ impl Archive {
 
     /// Validates and publishes one physical volume. Each slot can be filled once.
     pub fn provide_volume(&self, position: u32, volume: Arc<[u8]>) -> Result<(), HdpError> {
-        if self.files.is_some() {
+        if self.files.is_some() || self.handles.is_some() {
             return Err(HdpError::InvalidFormat(
                 "cannot publish bytes to a file-backed archive".into(),
             ));
@@ -152,6 +199,9 @@ impl Archive {
     }
 
     pub fn is_volume_available(&self, volume: u32) -> bool {
+        if let Some(handles) = &self.handles {
+            return (volume as usize) < handles.len();
+        }
         if let Some(files) = &self.files {
             return (volume as usize) < files.len();
         }
@@ -161,7 +211,9 @@ impl Archive {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.files.is_some() || self.volumes.iter().all(|volume| volume.get().is_some())
+        self.files.is_some()
+            || self.handles.is_some()
+            || self.volumes.iter().all(|volume| volume.get().is_some())
     }
 
     fn first_missing_volume(&self) -> Option<u32> {
@@ -358,7 +410,20 @@ impl Archive {
             return Err(HdpError::UnsupportedEncryption(chunk.encryption.id()));
         }
         let disk_bytes;
-        let stored = if let Some(files) = &self.files {
+        let stored = if let Some(handles) = &self.handles {
+            let file = handles
+                .get(chunk.volume as usize)
+                .ok_or(HdpError::MissingVolume(chunk.volume))?;
+            let length =
+                usize::try_from(chunk.stored_size).map_err(|_| HdpError::CorruptChunk {
+                    path: path.into(),
+                    chunk: chunk_index,
+                })?;
+            let mut bytes = vec![0; length];
+            crate::platform::read_exact_at(file, &mut bytes, chunk.offset)?;
+            disk_bytes = bytes;
+            disk_bytes.as_slice()
+        } else if let Some(files) = &self.files {
             let file_path = files
                 .get(chunk.volume as usize)
                 .ok_or(HdpError::MissingVolume(chunk.volume))?;

@@ -303,6 +303,7 @@ pub enum BinaryOp {
     Subtract,
     Multiply,
     Divide,
+    Remainder,
     Equal,
     NotEqual,
     Less,

@@ -2737,7 +2737,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
                 }
                 if matches!(
                     op,
-                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Remainder
                 ) {
                     let left_type = self.expression_type(left);
                     let right_type = self.expression_type(right);
@@ -3096,7 +3100,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             && let ExprKind::Binary { left, op, right } = &expression.kind
             && matches!(
                 op,
-                BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+                BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Remainder
             )
         {
             let left = self.lower_expression_expected(left, expected);
@@ -3133,7 +3141,11 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             if let ExprKind::Binary { left, op, right } = &expression.kind
                 && matches!(
                     op,
-                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Remainder
                 )
             {
                 let left = self.lower_expression_expected(left, expected);
@@ -4029,7 +4041,12 @@ impl<'hir, 'manifest> Lowerer<'hir, 'manifest> {
             HirExprKind::Binary {
                 left,
                 right,
-                op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide,
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Remainder,
             } => {
                 let mut sources = self.numeric_sources(left);
                 sources.extend(self.numeric_sources(right));
@@ -4720,14 +4737,20 @@ fn binary_type(op: BinaryOp, left: &ScriptType, right: &ScriptType) -> ScriptTyp
         | BinaryOp::LessEqual
         | BinaryOp::Greater
         | BinaryOp::GreaterEqual => ScriptType::Bool,
-        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Remainder
             if left == right && matches!(left, ScriptType::Int | ScriptType::UInt) =>
         {
             left.clone()
         }
-        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
-            ScriptType::Float
-        }
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Remainder => ScriptType::Float,
         BinaryOp::Colon => ScriptType::Any,
     }
 }

@@ -97,13 +97,14 @@ fn evaluate_expression(
     context: &mut impl TemplateContext,
 ) -> Result<Value, TemplateError> {
     let program = crate::parse_program(source).map_err(|errors| {
-        TemplateError::InvalidExpression(
+        TemplateError::InvalidExpression(format!(
+            "`{source}`: {}",
             errors
                 .into_iter()
                 .map(|error| error.message)
                 .collect::<Vec<_>>()
-                .join("; "),
-        )
+                .join("; ")
+        ))
     })?;
     let [Stmt::Expr(expression)] = program.statements.as_slice() else {
         return Err(TemplateError::InvalidExpression(
@@ -200,6 +201,7 @@ fn evaluate_ast(
                 | BinaryOp::Subtract
                 | BinaryOp::Multiply
                 | BinaryOp::Divide
+                | BinaryOp::Remainder
                 | BinaryOp::Less
                 | BinaryOp::LessEqual
                 | BinaryOp::Greater
@@ -213,10 +215,11 @@ fn evaluate_ast(
                         BinaryOp::Add => Ok(Value::Number(left + right)),
                         BinaryOp::Subtract => Ok(Value::Number(left - right)),
                         BinaryOp::Multiply => Ok(Value::Number(left * right)),
-                        BinaryOp::Divide if right == 0.0 => Err(
+                        BinaryOp::Divide | BinaryOp::Remainder if right == 0.0 => Err(
                             TemplateError::UnsupportedExpression("division by zero".to_string()),
                         ),
                         BinaryOp::Divide => Ok(Value::Number(left / right)),
+                        BinaryOp::Remainder => Ok(Value::Number(left % right)),
                         BinaryOp::Less => Ok(Value::Bool(left < right)),
                         BinaryOp::LessEqual => Ok(Value::Bool(left <= right)),
                         BinaryOp::Greater => Ok(Value::Bool(left > right)),

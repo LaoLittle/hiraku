@@ -198,6 +198,7 @@ struct UiDraft {
     overlay_order: i32,
     allowed_overlays: Vec<String>,
     fade_seconds: f32,
+    content_fade_seconds: f32,
     timers_paused: bool,
     pauses_scene: bool,
     timers: Vec<(f32, HksCallable)>,
@@ -258,6 +259,7 @@ impl UiDraft {
             size_width_override: false,
             timers_paused: false,
             fade_seconds: 0.0,
+            content_fade_seconds: 0.0,
             pauses_scene: false,
             kind,
             slider_skin: None,
@@ -520,6 +522,27 @@ mod native_ui {
             ));
         }
         draft.fade_seconds = seconds as f32;
+        Ok(node)
+    }
+
+    #[hks(name = "contentFade", receiver)]
+    fn content_fade(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        seconds: f64,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Screen) {
+            return Err(NativeError::message(
+                "contentFade requires a screen or canvas",
+            ));
+        }
+        if !seconds.is_finite() || !(0.0..=60.0).contains(&seconds) {
+            return Err(NativeError::message(
+                "content fade duration must be within 0..60 seconds",
+            ));
+        }
+        draft.content_fade_seconds = seconds as f32;
         Ok(node)
     }
 
@@ -2852,6 +2875,7 @@ fn materialize_screen(
         allowed_overlays: draft.allowed_overlays,
         timers_paused: draft.timers_paused,
         fade_seconds: draft.fade_seconds,
+        content_fade_seconds: draft.content_fade_seconds,
         pauses_scene: draft.pauses_scene,
         timers: draft
             .timers
@@ -5853,11 +5877,12 @@ global fn viewer(imageName: String, title: String) -> UiNode {
                 canvas {
                     button { text("Alice") }.hoverBrightness(1.33333).onClick { ui.complete("bob") }
                     text("Track").keyframes([.rect(0, 0, 0, 20, 10, 0), .rect(1, 100, 0, 20, 10, 1)])
-                }.fade(0.2)
+                }.fade(0.2).contentFade(0.3)
             "#,
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
         ).expect("confirmation and keyframes compile");
         assert_eq!(screen.fade_seconds, 0.2);
+        assert_eq!(screen.content_fade_seconds, 0.3);
         let ScreenNode::Button(button) = &screen.children[0] else {
             panic!("confirmation button")
         };

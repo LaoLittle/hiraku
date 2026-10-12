@@ -104,6 +104,7 @@ fn evaluate_scalar(
                             BinaryOp::Subtract => a.checked_sub(b),
                             BinaryOp::Multiply => a.checked_mul(b),
                             BinaryOp::Divide => a.checked_div(b),
+                            BinaryOp::Remainder => a.checked_rem(b),
                             _ => None,
                         }
                         .ok_or_else(fail)?
@@ -148,6 +149,7 @@ fn evaluate_scalar(
                         | BinaryOp::Subtract
                         | BinaryOp::Multiply
                         | BinaryOp::Divide
+                        | BinaryOp::Remainder
                             if !execute =>
                         {
                             0.0
@@ -156,6 +158,7 @@ fn evaluate_scalar(
                         BinaryOp::Subtract => a - b,
                         BinaryOp::Multiply => a * b,
                         BinaryOp::Divide if b != 0.0 => a / b,
+                        BinaryOp::Remainder if b != 0.0 => a % b,
                         BinaryOp::Equal
                         | BinaryOp::NotEqual
                         | BinaryOp::Less

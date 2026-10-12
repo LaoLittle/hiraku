@@ -2599,6 +2599,12 @@ pub(crate) fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result
                     }
                     Value::$kind(a.checked_div(b).ok_or(VmError::IntegerOverflow)?)
                 }
+                BinaryOp::Remainder => {
+                    if b == 0 {
+                        return Err(VmError::DivisionByZero);
+                    }
+                    Value::$kind(a.checked_rem(b).ok_or(VmError::IntegerOverflow)?)
+                }
                 _ => return Err(VmError::TypeMismatch("invalid integer operator")),
             });
         }};
@@ -2614,11 +2620,15 @@ pub(crate) fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result
         )),
         BinaryOp::Equal => Ok(Value::Bool(left == right)),
         BinaryOp::NotEqual => Ok(Value::Bool(left != right)),
-        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Remainder => {
             let (Value::Number(left), Value::Number(right)) = (left, right) else {
                 return Err(VmError::TypeMismatch("arithmetic expects Number operands"));
             };
-            if op == BinaryOp::Divide && *right == 0.0 {
+            if matches!(op, BinaryOp::Divide | BinaryOp::Remainder) && *right == 0.0 {
                 return Err(VmError::DivisionByZero);
             }
             Ok(Value::Number(match op {
@@ -2626,6 +2636,7 @@ pub(crate) fn binary(op: crate::BinaryOp, left: &Value, right: &Value) -> Result
                 BinaryOp::Subtract => left - right,
                 BinaryOp::Multiply => left * right,
                 BinaryOp::Divide => left / right,
+                BinaryOp::Remainder => left % right,
                 _ => unreachable!(),
             }))
         }
@@ -3096,6 +3107,59 @@ mod tests {
         assert_eq!(vm.global("absent").as_ref(), Some(&Value::Optional(None)));
         assert_eq!(vm.global("arithmetic").as_ref(), Some(&Value::UInt(14)));
         assert_eq!(vm.global("converted").as_ref(), Some(&Value::UInt(12)));
+    }
+
+    #[test]
+    fn remainder_supports_numeric_types_precedence_and_compound_assignment() {
+        let manifest = BuiltinManifest::new(Vec::<(String, BuiltinId)>::new());
+        let code = compile(
+            r#"
+            global var signed: Int = -17
+            signed %= 5
+            global let unsigned: UInt = 18446744073709551615 % 12
+            global let float: Float = 7.5 % 2.0
+            global let precedence = 2 + 9 % 4 * 3
+            global let adjacent = 10%3
+            global let template = "remainder: ${10 % 3}"
+        "#,
+            &manifest,
+        );
+        let mut vm = Vm::new(code).expect("VM");
+        loop {
+            if matches!(
+                vm.step().expect("remainder executes"),
+                Some(VmEvent::Completed(_))
+            ) {
+                break;
+            }
+        }
+        assert_eq!(vm.global("signed"), Some(Value::Int(-2)));
+        assert_eq!(vm.global("unsigned"), Some(Value::UInt(3)));
+        assert_eq!(vm.global("float"), Some(Value::Number(1.5)));
+        assert_eq!(vm.global("precedence"), Some(Value::Int(5)));
+        assert_eq!(vm.global("adjacent"), Some(Value::Int(1)));
+        assert_eq!(
+            vm.global("template"),
+            Some(Value::String("remainder: 1".into()))
+        );
+        for (left, right) in [
+            (Value::Int(1), Value::Int(0)),
+            (Value::UInt(1), Value::UInt(0)),
+            (Value::Number(1.0), Value::Number(0.0)),
+        ] {
+            assert_eq!(
+                binary(crate::BinaryOp::Remainder, &left, &right),
+                Err(VmError::DivisionByZero)
+            );
+        }
+        assert_eq!(
+            binary(
+                crate::BinaryOp::Remainder,
+                &Value::Int(i64::MIN),
+                &Value::Int(-1)
+            ),
+            Err(VmError::IntegerOverflow)
+        );
     }
 
     #[test]
