@@ -2719,7 +2719,9 @@ fn context_globals_matching(
         );
     }
     globals.extend(
-        context.local_globals.iter()
+        context
+            .local_globals
+            .iter()
             .filter(|(name, _)| required(name))
             .map(|(name, value)| (name.clone(), value.clone())),
     );
@@ -2931,11 +2933,24 @@ fn ui_callback(
 ) -> UiCallback {
     let mut required_globals = context.owned_globals.clone();
     for module in program.modules.iter() {
-        for instruction in module.bytecode.instructions.iter()
-            .chain(module.bytecode.functions.iter()
-                .flat_map(|function| &function.instructions))
-            .chain(module.bytecode.regions.iter()
-                .flat_map(|region| &region.instructions))
+        for instruction in module
+            .bytecode
+            .instructions
+            .iter()
+            .chain(
+                module
+                    .bytecode
+                    .functions
+                    .iter()
+                    .flat_map(|function| &function.instructions),
+            )
+            .chain(
+                module
+                    .bytecode
+                    .regions
+                    .iter()
+                    .flat_map(|region| &region.instructions),
+            )
         {
             let global = match instruction {
                 hiraku_script::Instruction::LoadGlobal { global, .. }
@@ -2943,7 +2958,10 @@ fn ui_callback(
                 | hiraku_script::Instruction::GlobalInitialized { global, .. } => *global,
                 _ => continue,
             };
-            if let Some(name) = module.bytecode.globals.get(global as usize)
+            if let Some(name) = module
+                .bytecode
+                .globals
+                .get(global as usize)
                 .and_then(|symbol| module.bytecode.symbols.resolve(*symbol))
             {
                 required_globals.insert(name.to_owned());
@@ -3545,7 +3563,9 @@ fn materialize_node(
                 draft.layout.on_pressed_change =
                     Some(Box::new(ui_callback(handler.clone(), program, context)));
             }
-            let on_click = draft.on_click.map(|closure| ui_callback(closure.0, program, context));
+            let on_click = draft
+                .on_click
+                .map(|closure| ui_callback(closure.0, program, context));
             let (enabled, reactive_enabled) = if let Some(binding) = &draft.enabled_binding {
                 let reactive = reactive_binding(binding, program, context);
                 let value = evaluate_binding_value(&reactive, registry, context)?;
@@ -3794,17 +3814,26 @@ canvas { text("Alice") }.onUpdate { delta: Float -> elapsed += delta }
             UiContext::default(),
             &TextureCatalog::default(),
             &TermCatalog::default(),
-        ).expect("timer compiles");
+        )
+        .expect("timer compiles");
         let callback = screen.on_update.as_ref().expect("callback");
         let mut models = crate::ui::UiModels::default();
-        models.set("history", StoredValue::Array((0..128).map(|_| {
-            StoredValue::Map(BTreeMap::from([
-                ("speaker".into(), StoredValue::String("Alice".into())),
-                ("text".into(), StoredValue::String("Bob".repeat(256))),
-            ]))
-        }).collect()));
+        models.set(
+            "history",
+            StoredValue::Array(
+                (0..128)
+                    .map(|_| {
+                        StoredValue::Map(BTreeMap::from([
+                            ("speaker".into(), StoredValue::String("Alice".into())),
+                            ("text".into(), StoredValue::String("Bob".repeat(256))),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        );
         let unused_globals: BTreeMap<String, Value> = BTreeMap::from([(
-            "unused".into(), stored_to_hks(models.get("history").expect("history")),
+            "unused".into(),
+            stored_to_hks(models.get("history").expect("history")),
         )]);
         for redundant_setup in [true, false] {
             let mut globals = BTreeMap::new();
@@ -3818,14 +3847,22 @@ canvas { text("Alice") }.onUpdate { delta: Float -> elapsed += delta }
                     }
                 }
                 let (_, next) = evaluate_ui_callback_with_args(
-                    callback, &globals, &models, vec![Value::Number(0.016)],
-                ).expect("frame executes");
+                    callback,
+                    &globals,
+                    &models,
+                    vec![Value::Number(0.016)],
+                )
+                .expect("frame executes");
                 globals = next;
             }
-            let Value::Number(elapsed) = globals["elapsed"] else { panic!("elapsed") };
+            let Value::Number(elapsed) = globals["elapsed"] else {
+                panic!("elapsed")
+            };
             assert!((elapsed - 4.8).abs() < 1e-9);
-            println!("redundant_setup={redundant_setup}: {:.3} ms/callback",
-                started.elapsed().as_secs_f64() * 1000.0 / 300.0);
+            println!(
+                "redundant_setup={redundant_setup}: {:.3} ms/callback",
+                started.elapsed().as_secs_f64() * 1000.0 / 300.0
+            );
         }
     }
 
@@ -3840,11 +3877,13 @@ canvas { text("Alice") }.onUpdate { delta: Float ->
     if elapsed >= 1.0 { ui.close(elapsed) }
 }"#,
             UiContext::new(BTreeMap::from([(
-                "unused".into(), StoredValue::String("Bob".repeat(1024)),
+                "unused".into(),
+                StoredValue::String("Bob".repeat(1024)),
             )])),
             &TextureCatalog::default(),
             &TermCatalog::default(),
-        ).expect("timer UI compiles");
+        )
+        .expect("timer UI compiles");
         let callback = screen.on_update.as_ref().expect("frame callback");
         assert!(callback.required_globals.contains("elapsed"));
         assert!(!callback.required_globals.contains("unused"));
@@ -3853,17 +3892,32 @@ canvas { text("Alice") }.onUpdate { delta: Float ->
         let copy = callback.clone();
         assert!(std::sync::Arc::ptr_eq(&callback.callable, &copy.callable));
         assert!(std::sync::Arc::ptr_eq(&callback.globals, &copy.globals));
-        assert!(!screen.composition.as_ref().expect("composition")
-            .document.plan.structural_globals.contains("elapsed"));
+        assert!(
+            !screen
+                .composition
+                .as_ref()
+                .expect("composition")
+                .document
+                .plan
+                .structural_globals
+                .contains("elapsed")
+        );
         let mut models = crate::ui::UiModels::default();
         models.set("history", StoredValue::String("unused model".repeat(1024)));
         let mut globals = BTreeMap::new();
         for index in 0..4 {
             let (effects, next) = evaluate_ui_callback_with_args(
-                callback, &globals, &models, vec![Value::Number(0.25)],
-            ).expect("frame callback executes");
+                callback,
+                &globals,
+                &models,
+                vec![Value::Number(0.25)],
+            )
+            .expect("frame callback executes");
             assert_eq!(next["elapsed"], Value::Number((index + 1) as f64 * 0.25));
-            assert!(next.get("history").is_none_or(|value| *value == Value::Uninitialized));
+            assert!(
+                next.get("history")
+                    .is_none_or(|value| *value == Value::Uninitialized)
+            );
             assert_eq!(effects.len(), usize::from(index == 3));
             globals = next;
         }
@@ -4722,8 +4776,13 @@ canvas {
         .expect("confirmation builds");
         for (index, expected) in [
             UiEffect::CloseUi { value: Value::Unit },
-            UiEffect::CompleteUi { value: Value::String("confirmed".into()) },
-        ].into_iter().enumerate() {
+            UiEffect::CompleteUi {
+                value: Value::String("confirmed".into()),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let ScreenNode::Button(button) = &screen.children[index] else {
                 panic!("confirmation response must be a button");
             };

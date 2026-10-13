@@ -97,8 +97,7 @@ use audio_runtime::{
 };
 pub use audio_runtime::{
     animate_audio_fades, apply_live_audio_settings, poll_bgm_playback, poll_sfx_playback,
-    poll_voice_playback,
-    prepare_bgm_preludes, reconcile_restored_bgm,
+    poll_voice_playback, prepare_bgm_preludes, reconcile_restored_bgm,
 };
 
 pub(crate) use character::apply_character_ease;

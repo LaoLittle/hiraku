@@ -17,11 +17,11 @@ use thiserror::Error;
 
 use crate::data::evaluate_hson_map;
 
-mod settings;
 mod platform;
-pub(crate) use platform::register_asset_source as register_platform_asset_source;
+mod settings;
 #[cfg(target_os = "android")]
 pub(crate) use platform::android_archive;
+pub(crate) use platform::register_asset_source as register_platform_asset_source;
 use settings::{SettingsFile, ensure_empty_data_map, settings_from_data, take_data_string};
 
 pub const DEFAULT_ASSET_ROOT: &str = "assets";
@@ -606,7 +606,12 @@ impl HdpVfs {
         }
 
         platform::list_files(&self.root, Path::new(path), false)
-            .map(|paths| paths.into_iter().map(|path| path.to_string_lossy().replace('\\', "/")).collect())
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .collect()
+            })
             .map_err(|err| map_fs_not_found(err, self.root.join(path).display().to_string()))
     }
 
@@ -619,7 +624,12 @@ impl HdpVfs {
         }
 
         platform::list_files(&self.root, Path::new(path), true)
-            .map(|paths| paths.into_iter().map(|path| path.to_string_lossy().replace('\\', "/")).collect())
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .collect()
+            })
             .map_err(|err| map_fs_not_found(err, self.root.join(path).display().to_string()))
     }
 

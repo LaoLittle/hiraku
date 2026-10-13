@@ -9,8 +9,8 @@ mod codec;
 pub mod dependencies;
 mod error;
 mod format;
-mod reader;
 mod platform;
+mod reader;
 mod writer;
 
 pub use codec::{CompressionMethod, CompressionOptions, EncryptionMethod};

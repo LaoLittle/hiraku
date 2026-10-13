@@ -2899,10 +2899,13 @@ mod tests {
         use super::*;
         for (x, y, width, height) in [(0.0, 0.0, 2560.0, 1440.0), (440.0, 240.0, 1380.0, 730.0)] {
             let mut node = Node::default();
-            apply_screen_layout(&mut node, &ScreenLayout {
-                keyframes: vec![crate::ui::UiKeyframe::Rect(0.0, x, y, width, height, 1.0)],
-                ..default()
-            });
+            apply_screen_layout(
+                &mut node,
+                &ScreenLayout {
+                    keyframes: vec![crate::ui::UiKeyframe::Rect(0.0, x, y, width, height, 1.0)],
+                    ..default()
+                },
+            );
             assert_eq!(node.position_type, PositionType::Absolute);
             assert_eq!(node.flex_shrink, 0.0);
             assert_eq!(node.left, px(x as f32));
@@ -2916,10 +2919,15 @@ mod tests {
     fn reflected_keyframe_quad_starts_at_its_projected_bounds() {
         use super::*;
         let mut node = Node::default();
-        apply_screen_layout(&mut node, &ScreenLayout {
-            keyframes: vec![crate::ui::UiKeyframe::Quad(0.0, 100.0, 20.0, -80.0, 0.0, 0.0, 40.0, 1.0)],
-            ..default()
-        });
+        apply_screen_layout(
+            &mut node,
+            &ScreenLayout {
+                keyframes: vec![crate::ui::UiKeyframe::Quad(
+                    0.0, 100.0, 20.0, -80.0, 0.0, 0.0, 40.0, 1.0,
+                )],
+                ..default()
+            },
+        );
         assert_eq!(node.position_type, PositionType::Absolute);
         assert_eq!(node.left, px(20.0));
         assert_eq!(node.top, px(20.0));
@@ -4009,13 +4017,21 @@ mod tests {
             app.world().get_entity(old).is_ok(),
             "editing must retain its target"
         );
-        assert!(!app.world().resource::<Messages<bevy::window::RequestRedraw>>().is_empty());
+        assert!(
+            !app.world()
+                .resource::<Messages<bevy::window::RequestRedraw>>()
+                .is_empty()
+        );
         app.world_mut()
             .resource_mut::<crate::input::HirakuTextFocus>()
             .0 = None;
         app.update();
         assert!(app.world().get_entity(old).is_err());
-        assert!(!app.world().resource::<Messages<bevy::window::RequestRedraw>>().is_empty());
+        assert!(
+            !app.world()
+                .resource::<Messages<bevy::window::RequestRedraw>>()
+                .is_empty()
+        );
         assert_eq!(
             app.world().resource::<ScreenUiState>().active_root,
             Some(root)
@@ -4160,10 +4176,20 @@ global var shown: Bool = true
 canvas { if shown { text("Alice") } }
     .onUpdate { delta: Float -> elapsed += delta }
 "#,
-            UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
-        ).expect("timer UI");
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("timer UI");
         let renderer = screen.composition.expect("composition");
-        assert!(!renderer.document.plan.structural_globals.contains("elapsed"));
+        assert!(
+            !renderer
+                .document
+                .plan
+                .structural_globals
+                .contains("elapsed")
+        );
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
             .init_resource::<TextureCatalog>()
@@ -4171,24 +4197,48 @@ canvas { if shown { text("Alice") } }
             .init_resource::<UiStyle>()
             .init_resource::<UiModels>()
             .init_resource::<crate::input::HirakuTextFocus>()
-            .insert_resource(UiFonts { regular: Handle::default(), _fonts: vec![] })
+            .insert_resource(UiFonts {
+                regular: Handle::default(),
+                _fonts: vec![],
+            })
             .add_systems(Update, recompose_screen_ui);
         let child = app.world_mut().spawn(Text::new("Alice")).id();
-        let root = app.world_mut().spawn((
-            Node::default(),
-            super::super::widgets::UiLocalState(renderer.globals.clone()),
-            ScreenComposition { rendered: renderer.globals.clone(), renderer },
-        )).add_child(child).id();
+        let root = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                super::super::widgets::UiLocalState(renderer.globals.clone()),
+                ScreenComposition {
+                    rendered: renderer.globals.clone(),
+                    renderer,
+                },
+            ))
+            .add_child(child)
+            .id();
         for tick in 1..=100 {
-            app.world_mut().get_mut::<super::super::widgets::UiLocalState>(root)
-                .expect("local state").0.insert("elapsed".into(), hiraku_script::Value::Number(tick as f64));
+            app.world_mut()
+                .get_mut::<super::super::widgets::UiLocalState>(root)
+                .expect("local state")
+                .0
+                .insert("elapsed".into(), hiraku_script::Value::Number(tick as f64));
             app.update();
-            assert_eq!(app.world().get::<Children>(root).expect("children")[0], child);
-            assert_eq!(app.world().get::<ScreenComposition>(root).expect("composition")
-                .rendered["elapsed"], hiraku_script::Value::Number(0.0));
+            assert_eq!(
+                app.world().get::<Children>(root).expect("children")[0],
+                child
+            );
+            assert_eq!(
+                app.world()
+                    .get::<ScreenComposition>(root)
+                    .expect("composition")
+                    .rendered["elapsed"],
+                hiraku_script::Value::Number(0.0)
+            );
         }
-        app.world_mut().get_mut::<super::super::widgets::UiLocalState>(root)
-            .expect("local state").0.insert("shown".into(), hiraku_script::Value::Bool(false));
+        app.world_mut()
+            .get_mut::<super::super::widgets::UiLocalState>(root)
+            .expect("local state")
+            .0
+            .insert("shown".into(), hiraku_script::Value::Bool(false));
         app.update();
         assert!(app.world().get_entity(child).is_err());
     }

@@ -453,8 +453,10 @@ pub(crate) fn start_story_runtime_with_program(
     } else {
         "save has no VM checkpoint".into()
     };
-    let (recovered, program, presentation) = replay_restore::prepare(vfs, bootstrap, user_settings, program)
-        .map_err(|error| format!("{checkpoint_error}\ndeterministic recovery failed: {error}"))?;
+    let (recovered, program, presentation) =
+        replay_restore::prepare(vfs, bootstrap, user_settings, program).map_err(|error| {
+            format!("{checkpoint_error}\ndeterministic recovery failed: {error}")
+        })?;
     start_checkpoint_runtime(vfs, runtime, recovered, user_settings, program)?;
     runtime.recovered_presentation = Some(presentation);
     Ok(())

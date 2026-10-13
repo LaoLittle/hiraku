@@ -347,7 +347,10 @@ impl Lowerer<'_> {
                 self.bind(Value::Str(value.to_untyped().leaf_text().as_str().into()))
             }
             Expr::ListItem(value)
-                if value.body().exprs().all(|expr| matches!(expr, Expr::Space(_))) =>
+                if value
+                    .body()
+                    .exprs()
+                    .all(|expr| matches!(expr, Expr::Space(_))) =>
             {
                 let range = self.range(expr);
                 self.bind(Value::Str(self.source.text()[range].into()))
@@ -517,7 +520,8 @@ mod tests {
             assert_eq!(parse(source).expect("literal label").text, expected);
             assert_eq!(
                 parse_with_snapshot(source, &TextSnapshot::default())
-                    .expect("literal template label").text,
+                    .expect("literal template label")
+                    .text,
                 expected,
             );
         }

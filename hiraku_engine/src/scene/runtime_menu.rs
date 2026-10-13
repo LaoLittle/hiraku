@@ -339,11 +339,16 @@ pub fn handle_runtime_menu_buttons(
         // A callback can change local UI state without emitting a story
         // command. Allow the dependent layout/visual systems to finish too.
         redraw.request();
-        let story_globals = ctx.script_runtime.story.as_ref().map(|story| story.globals());
+        let story_globals = ctx
+            .script_runtime
+            .story
+            .as_ref()
+            .map(|story| story.globals());
         let local_globals = root.and_then(|root| ctx.local_states.get(root).ok());
         let mut globals = std::collections::BTreeMap::new();
         for name in callback.required_globals.iter() {
-            if let Some(value) = local_globals.and_then(|local| local.0.get(name))
+            if let Some(value) = local_globals
+                .and_then(|local| local.0.get(name))
                 .or_else(|| story_globals.and_then(|story| story.get(name)))
             {
                 globals.insert(name.clone(), value.clone());
