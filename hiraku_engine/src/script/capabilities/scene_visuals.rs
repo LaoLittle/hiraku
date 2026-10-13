@@ -1937,9 +1937,12 @@ mod tests {
         let code = compile_story_bytecode(
             "presentation.hks",
             r#"
+            fn artwork(texture: String) {
+                scene.picture("panel", texture).size(500, 500).fade(400)
+            }
             global fn present(texture: String) -> Task {
                 par {
-                    scene.picture("panel", texture).size(500, 500).fade(400)
+                    artwork(texture)
                     scene.transformPicture("panel").y(60).time(0.4).easing(.easeOut)
                 }
             }

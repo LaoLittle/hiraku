@@ -4700,6 +4700,44 @@ canvas {
     }
 
     #[test]
+    fn confirmation_cancel_closes_only_the_modal_and_accept_completes_the_owner() {
+        let source = r#"
+            import ui.widgets.*
+            fn response(label: String, accepted: Bool) -> UiNode {
+                button { column { text(label) }.size(.abs(505, 144)) }
+                    .onClick {
+                        if accepted { ui.complete("confirmed") } else { ui.close() }
+                        ()
+                    }
+            }
+            screen { response("Cancel", false); response("Confirm", true) }
+        "#;
+        let screen = evaluate_ui_component_named(
+            "memory://confirmation.ui.hks",
+            source,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("confirmation builds");
+        for (index, expected) in [
+            UiEffect::CloseUi { value: Value::Unit },
+            UiEffect::CompleteUi { value: Value::String("confirmed".into()) },
+        ].into_iter().enumerate() {
+            let ScreenNode::Button(button) = &screen.children[index] else {
+                panic!("confirmation response must be a button");
+            };
+            let (effects, _) = evaluate_ui_callback(
+                button.on_click.as_ref().expect("response callback"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default(),
+            )
+            .expect("confirmation callback");
+            assert_eq!(effects, vec![expected]);
+        }
+    }
+
+    #[test]
     fn ui_close_returns_owned_data_and_preserves_unit_and_null() {
         for (expression, expected) in [
             ("ui.close()", Value::Unit),

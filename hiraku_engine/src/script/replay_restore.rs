@@ -95,7 +95,11 @@ pub(super) fn prepare(
                         },
                     );
                 }
-                StoryEffect::MountUiOverlay { name, lifetime: Some(_), .. }
+                StoryEffect::MountUiOverlay {
+                    name,
+                    lifetime: Some(_),
+                    ..
+                }
                 | StoryEffect::UnmountUiOverlay { name, .. } => {
                     bootstrap.mounted_ui_overlays.remove(name);
                 }
@@ -361,15 +365,16 @@ mod tests {
         "#;
         let mut save = record(&[("alice.hks", source)], 0);
         let vfs = fixture(&[("alice.hks", source)]);
-        let program = super::super::compile_story_program(
-            &vfs.0, "hdp://fixture.hdp/alice.hks", source,
-        ).expect("compile fixture");
+        let program =
+            super::super::compile_story_program(&vfs.0, "hdp://fixture.hdp/alice.hks", source)
+                .expect("compile fixture");
         let (bootstrap, _, _) = prepare(
             &vfs,
             ScriptBootstrap::take_from_save(&mut save).expect("bootstrap"),
             &UserSettings::default(),
             program,
-        ).expect("replay overlay replacement");
+        )
+        .expect("replay overlay replacement");
         assert!(!bootstrap.mounted_ui_overlays.contains_key("aliceOverlay"));
         assert!(bootstrap.mounted_ui_overlays.contains_key("bobOverlay"));
     }
@@ -638,6 +643,54 @@ mod tests {
                 .expect("runtime")
                 .step()
                 .expect("restored boundary"),
+            Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
+        ));
+    }
+
+    #[test]
+    fn changed_presentation_helper_replays_to_the_same_dialogue() {
+        let source = r#"
+            global fn present(texture: String) -> Task {
+                par {
+                    scene.picture("panel", texture).size(500, 500).fade(400)
+                    scene.transformPicture("panel").y(60).time(0.4).easing(.easeOut)
+                }
+            }
+            present("image/alice").await()
+            "first"
+            "second"
+        "#;
+        let save = record(&[("alice.hks", source)], 1);
+        let changed = r#"
+            fn artwork(texture: String) {
+                scene.picture("panel", texture).size(600, 600).fade(300)
+            }
+            global fn present(texture: String) -> Task {
+                par {
+                    artwork(texture)
+                    scene.transformPicture("panel").y(70).time(0.3).easing(.easeOut)
+                }
+            }
+            present("image/alice").await()
+            "first"
+            "second"
+        "#;
+        let vfs = fixture(&[("alice.hks", changed)]);
+        let mut live = ScriptRuntimeState::default();
+        start_story_runtime(
+            &vfs,
+            &mut live,
+            ScriptBootstrap::from_save(&save).expect("bootstrap"),
+            &UserSettings::default(),
+        )
+        .expect("presentation changes must not invalidate semantic replay");
+        assert!(live.recovered_presentation.is_some());
+        assert!(matches!(
+            live.story
+                .as_mut()
+                .expect("runtime")
+                .step()
+                .expect("boundary"),
             Some(StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance))
         ));
     }

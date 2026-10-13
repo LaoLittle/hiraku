@@ -383,14 +383,6 @@ pub fn handle_runtime_menu_buttons(
 }
 
 fn finish_load(ctx: &mut RuntimeMenuContext, mut save: crate::state::SaveGameData) {
-    info!(
-        "restoring save presentation using {}",
-        if ctx.script_runtime.recovered_presentation.is_some() {
-            "deterministic replay"
-        } else {
-            "matching checkpoint"
-        }
-    );
     ctx.script_runtime.restore_presentation(&mut save.scene);
     abort_runtime_waiters(
         &mut ctx.commands,
