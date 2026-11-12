@@ -245,6 +245,7 @@ pub fn drive_story_runtime(
     user_settings: Res<UserSettings>,
     models: Res<crate::ui::UiModels>,
     mut history: ResMut<DialogueHistoryState>,
+    save_captures: Query<(), With<super::super::save_preview::PendingSaveCapture>>,
 ) {
     for message in response_messages.read() {
         if let Some((task, effect)) = runtime.task_requests.remove(&message.request) {
@@ -260,6 +261,10 @@ pub fn drive_story_runtime(
         } else {
             runtime.accept_response(message.clone());
         }
+    }
+    if !save_captures.is_empty() {
+        redraw.request();
+        return;
     }
 
     if runtime.restore_pending || !crate::storage::storage_ready() || dependencies.loading {

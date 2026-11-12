@@ -33,6 +33,7 @@ fn native_property_reads_are_explicit_and_unknown_hosts_remain_conservative() {
         RenderOptions::plain(),
     )
     .expect("sample property compiles");
+    assert!(document.plan.native_calls.contains("sample"));
     let module = &document.program.modules[document.entry.0 as usize];
     let callable = Value::Function {
         module: Some(document.entry.0),

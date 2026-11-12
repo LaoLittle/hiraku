@@ -113,6 +113,9 @@ pub fn pack_directory(
 fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), ToolError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        if entry.file_name() == ".hiraku-editor.hson" || entry.file_name() == ".hiraku-editor-recovery" {
+            continue;
+        }
         let ty = entry.file_type()?;
         if ty.is_symlink() {
             return Err(
@@ -138,6 +141,17 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn editor_drafts_are_not_package_inputs() {
+        let dir = tempfile::tempdir().expect("fixture");
+        fs::write(dir.path().join("alice.hks"), "\"Alice\"").unwrap();
+        fs::write(dir.path().join(".hiraku-editor.hson"), "private draft").unwrap();
+        fs::create_dir(dir.path().join(".hiraku-editor-recovery")).expect("Recovery folder");
+        fs::write(dir.path().join(".hiraku-editor-recovery/backup.hson"), "private recovery").expect("Recovery fixture");
+        let mut paths = Vec::new();
+        collect(dir.path(), dir.path(), &mut paths).unwrap();
+        assert_eq!(paths, ["alice.hks"]);
+    }
     #[test]
     fn image_estimates_read_only_the_png_header_and_unknown_formats_stay_lazy() {
         let dir = tempfile::tempdir().expect("fixture");

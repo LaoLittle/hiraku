@@ -120,9 +120,14 @@ pub struct SceneCommandContext<'w, 's> {
     pub voice_state: ResMut<'w, VoiceState>,
     pub pending_characters: ResMut<'w, PendingCharacterShows>,
     pub waits: ResMut<'w, PendingWaits>,
+    pub save_captures: Query<'w, 's, (), With<super::save_preview::PendingSaveCapture>>,
 }
 
 pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneCommandContext) {
+    if !ctx.save_captures.is_empty() {
+        redraw.request();
+        return;
+    }
     let mut dependencies = ctx.dependencies;
     let ui = ctx.ui;
     let execution = ctx.execution;
@@ -223,14 +228,19 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
 
         match command {
             ScriptCommand::Runtime(RuntimeCommand::SaveSlot(slot)) => {
-                if let Err(error) = save_runtime_slot(
-                    &slot,
-                    &script_runtime,
-                    &shared_state,
-                    &[],
-                    &dialogue_history,
+                match crate::script::capture_runtime_save_with_history(
+                    &script_runtime, &shared_state, &dialogue_history,
                 ) {
-                    warn!("failed to save slot `{slot}`: {error}");
+                    Ok(data) => {
+                        super::save_preview::capture_slot(
+                            &mut commands, &render_assets.canvas, slot, data,
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        warn!("failed to save slot `{slot}`: {error}");
+                        frontend.notice = Some(format!("Failed to save slot {slot}: {error}"));
+                    }
                 }
             }
             ScriptCommand::Stage(StageCommand::Clip(mut clip)) => {

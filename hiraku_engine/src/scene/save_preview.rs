@@ -43,7 +43,9 @@ pub(crate) struct PendingSaveCapture {
 
 impl PendingSaveCapture {
     fn publish(&mut self, image: Option<&Image>) -> Result<(), String> {
-        let Some(mut data) = self.data.take() else { return Ok(()) };
+        let Some(mut data) = self.data.take() else {
+            return Ok(());
+        };
         if let Some(image) = image {
             match encode(image) {
                 Ok(png) => data.thumbnail_png = png,
@@ -62,23 +64,31 @@ pub(crate) fn capture_slot(
     data: crate::state::SaveGameData,
 ) {
     let pending = commands.spawn_empty().id();
-    let screenshot = commands.spawn(Screenshot::image(canvas.image.clone())).observe(
-        move |event: On<ScreenshotCaptured>,
-              mut commands: Commands,
-              mut captures: Query<&mut PendingSaveCapture>,
-              mut models: ResMut<crate::ui::UiModels>,
-              mut frontend: ResMut<super::FrontendState>| {
-            let Ok(mut capture) = captures.get_mut(pending) else { return };
-            if capture.screenshot != event.entity || capture.data.is_none() { return; }
-            if let Err(error) = capture.publish(Some(&event.image)) {
-                warn!("failed to save slot `{}`: {error}", capture.slot);
-                frontend.notice = Some(format!("Failed to save slot {}: {error}", capture.slot));
-            } else {
-                models.invalidate_service("storage");
-            }
-            commands.entity(pending).try_despawn();
-        },
-    ).id();
+    let screenshot = commands
+        .spawn(Screenshot::image(canvas.image.clone()))
+        .observe(
+            move |event: On<ScreenshotCaptured>,
+                  mut commands: Commands,
+                  mut captures: Query<&mut PendingSaveCapture>,
+                  mut models: ResMut<crate::ui::UiModels>,
+                  mut frontend: ResMut<super::FrontendState>| {
+                let Ok(mut capture) = captures.get_mut(pending) else {
+                    return;
+                };
+                if capture.screenshot != event.entity || capture.data.is_none() {
+                    return;
+                }
+                if let Err(error) = capture.publish(Some(&event.image)) {
+                    warn!("failed to save slot `{}`: {error}", capture.slot);
+                    frontend.notice =
+                        Some(format!("Failed to save slot {}: {error}", capture.slot));
+                } else {
+                    models.invalidate_service("storage");
+                }
+                commands.entity(pending).try_despawn();
+            },
+        )
+        .id();
     commands.entity(pending).insert(PendingSaveCapture {
         slot,
         root: crate::storage::save_root_path(),
@@ -98,8 +108,13 @@ pub(crate) fn tick_captures(
     for (entity, mut capture) in &mut captures {
         redraw.request();
         capture.frames += 1;
-        if capture.frames < 180 { continue; }
-        warn!("save `{}` thumbnail capture timed out; retaining the checkpoint without an image", capture.slot);
+        if capture.frames < 180 {
+            continue;
+        }
+        warn!(
+            "save `{}` thumbnail capture timed out; retaining the checkpoint without an image",
+            capture.slot
+        );
         if let Err(error) = capture.publish(None) {
             warn!("failed to save slot `{}`: {error}", capture.slot);
             frontend.notice = Some(format!("Failed to save slot {}: {error}", capture.slot));
@@ -202,5 +217,78 @@ mod tests {
         let png = encode(&source).expect("encode thumbnail");
         let image = image::load_from_memory(&png).expect("decode thumbnail");
         assert_eq!((image.width(), image.height()), (480, 270));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn autosave_publishes_the_captured_checkpoint_with_its_preview_only_once() {
+        use prost::Message;
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Index {
+            metadata: Metadata,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Metadata {
+            has_thumbnail: bool,
+        }
+
+        let image = Image::from_dynamic(image::DynamicImage::new_rgb8(1920, 1080), true, default());
+        for preview in [Some(&image), None] {
+            let root =
+                std::env::temp_dir().join(format!("hiraku-autosave-{}", uuid::Uuid::new_v4()));
+            let mut runtime = crate::script::ScriptRuntimeState::default();
+            runtime.current_script = Some("alice.hks".into());
+            let data =
+                crate::script::capture_runtime_save_with_history(&runtime, &default(), &default())
+                    .expect("capture checkpoint");
+            let mut pending = PendingSaveCapture {
+                slot: "auto".into(),
+                root: root.clone(),
+                data: Some(data),
+                screenshot: Entity::PLACEHOLDER,
+                frames: 0,
+            };
+            runtime.current_script = Some("bob.hks".into());
+            pending
+                .publish(preview)
+                .expect("publish captured checkpoint");
+            let files = std::fs::read_dir(&root)
+                .expect("published slot")
+                .map(|entry| entry.expect("slot record").path())
+                .collect::<Vec<_>>();
+            let record = |extension: &str| {
+                files
+                    .iter()
+                    .find(|path| path.extension().is_some_and(|value| value == extension))
+            };
+            let snapshot =
+                std::fs::read(record("sav").expect("snapshot record")).expect("read snapshot");
+            let snapshot =
+                crate::proto::SaveGameData::decode(snapshot.as_slice()).expect("decode checkpoint");
+            assert_eq!(snapshot.resume_script, "alice.hks");
+            let index: Index = hiraku_script::hson::from_slice(
+                &std::fs::read(record("hson").expect("slot index")).expect("read slot index"),
+            )
+            .expect("decode slot index");
+            assert_eq!(index.metadata.has_thumbnail, preview.is_some());
+            if let Some(path) = record("png") {
+                let png = image::open(path).expect("decode saved preview");
+                assert_eq!((png.width(), png.height()), (480, 270));
+            } else {
+                assert!(preview.is_none(), "captured preview must be published");
+            }
+            pending
+                .publish(preview)
+                .expect("ignore duplicate completion");
+            let remaining = std::fs::read_dir(&root)
+                .expect("unchanged slot")
+                .map(|entry| entry.expect("slot record").path())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(remaining, files.into_iter().collect());
+            std::fs::remove_dir_all(root).expect("remove synthetic slot");
+        }
     }
 }

@@ -100,26 +100,48 @@ impl UiDocument {
         manifest: &BuiltinManifest,
         options: RenderOptions,
     ) -> Result<Self, UiCompileError> {
-        let source = sources
-            .iter()
-            .find(|source| source.path == path)
-            .ok_or_else(|| {
-                UiCompileError(format!("UI document `{path}` is missing from the project"))
-            })?;
         let mut source_map = SourceMap::new();
         for source in &sources {
             source_map.insert(&source.path, &source.source);
         }
-        let id = source_map.insert(path, &source.source);
+        if source_map
+            .get(&hiraku_script::SourceId::new(path))
+            .is_none()
+        {
+            source_map.insert(path, "");
+        }
+        Self::compile_checked(path, sources, manifest)
+            .map_err(|errors| UiCompileError(render_diagnostics(&errors, &source_map, options)))
+    }
+
+    pub fn compile_checked(
+        path: &str,
+        sources: Vec<ScriptSource>,
+        manifest: &BuiltinManifest,
+    ) -> Result<Self, Vec<hiraku_script::Diagnostic>> {
+        use hiraku_script::{Diagnostic, DiagnosticLabel, SourceId};
+        let entry_error = |message: String, span: Option<hiraku_script::Span>| {
+            vec![Diagnostic::error(message).with_code("HKS-UI").with_label(
+                DiagnosticLabel::primary(
+                    SourceId::new(path),
+                    span.map_or(0..0, |span| span.range()),
+                ),
+            )]
+        };
+        let source = sources
+            .iter()
+            .find(|source| source.path == path)
+            .ok_or_else(|| {
+                entry_error(
+                    format!("UI document `{path}` is missing from the project"),
+                    None,
+                )
+            })?;
         let parsed = parse_program(&source.source).map_err(|errors| {
-            UiCompileError(render_diagnostics(
-                &errors
-                    .into_iter()
-                    .map(|error| error.diagnostic(id.clone()))
-                    .collect::<Vec<_>>(),
-                &source_map,
-                options,
-            ))
+            errors
+                .into_iter()
+                .map(|error| error.diagnostic(SourceId::new(path)))
+                .collect::<Vec<_>>()
         })?;
         let entries = parsed
             .statements
@@ -136,40 +158,32 @@ impl UiDocument {
                 };
                 attributes
                     .iter()
-                    .any(|attribute| attribute.name == "ui")
-                    .then_some((*exported, name.clone()))
+                    .find(|attribute| attribute.name == "ui")
+                    .map(|attribute| (*exported, name.clone(), attribute.span))
             })
             .collect::<Vec<_>>();
         if entries.len() > 1 {
-            return Err(UiCompileError(
+            return Err(entry_error(
                 "a UI module may declare only one `@ui` entrypoint".into(),
+                Some(entries[1].2),
             ));
         }
-        if entries.first().is_some_and(|(exported, _)| !exported) {
-            return Err(UiCompileError(
+        if entries.first().is_some_and(|(exported, _, _)| !exported) {
+            return Err(entry_error(
                 "the `@ui` entrypoint must be declared with `global fn`".into(),
+                Some(entries[0].2),
             ));
         }
         let mut compiler = UiCompiler::default();
-        let project = hiraku_script::project::compile_project_with_hir_pass(
-            sources.clone(),
-            manifest,
-            &mut compiler,
-        )
-        .map_err(|errors| {
-            let diagnostics = errors
-                .into_iter()
-                .map(|error| {
-                    let source = sources.iter().find(|source| source.path == error.path);
-                    let id = source_map.insert(
-                        &error.path,
-                        source.map(|source| source.source.as_str()).unwrap_or(""),
-                    );
-                    error.error.diagnostic(id)
-                })
-                .collect::<Vec<_>>();
-            UiCompileError(render_diagnostics(&diagnostics, &source_map, options))
-        })?;
+        let project =
+            hiraku_script::project::compile_project_with_hir_pass(sources, manifest, &mut compiler)
+                .map_err(|errors| {
+                    let diagnostics = errors
+                        .into_iter()
+                        .map(|error| error.error.diagnostic(SourceId::new(error.path)))
+                        .collect::<Vec<_>>();
+                    diagnostics
+                })?;
         let entry = project.paths[path];
         let bytecode = &project.program.modules[entry.0 as usize].bytecode;
         let owned_globals = bytecode
@@ -181,9 +195,9 @@ impl UiDocument {
             .collect();
         let entry_symbol = entries
             .first()
-            .map(|(_, name)| {
+            .map(|(_, name, _)| {
                 bytecode.symbols.find(name).ok_or_else(|| {
-                    UiCompileError(format!("UI entrypoint `{name}` was not interned"))
+                    entry_error(format!("UI entrypoint `{name}` was not interned"), None)
                 })
             })
             .transpose()?;
@@ -191,6 +205,8 @@ impl UiDocument {
         // dependency tracking exists, conservatively include their reads.
         let mut plan = compiler.plans.remove(path).unwrap_or_default();
         for dependency in compiler.plans.values() {
+            plan.native_calls
+                .extend(dependency.native_calls.iter().cloned());
             plan.read_globals
                 .extend(dependency.read_globals.iter().cloned());
             plan.structural_globals
@@ -200,7 +216,10 @@ impl UiDocument {
         }
         Ok(Self {
             entry_type_origins: project.type_origins.get(&entry).cloned().ok_or_else(|| {
-                UiCompileError("compiled UI entry is missing its type provenance".into())
+                entry_error(
+                    "compiled UI entry is missing its type provenance".into(),
+                    None,
+                )
             })?,
             program: project.program,
             entry,

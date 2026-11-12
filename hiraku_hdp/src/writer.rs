@@ -663,7 +663,7 @@ fn collect_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), HdpE
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_name() == ".DS_Store" {
+        if entry.file_name() == ".DS_Store" || entry.file_name() == ".hiraku-editor.hson" {
             continue;
         }
         if entry.file_type()?.is_dir() {

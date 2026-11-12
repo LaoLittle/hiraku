@@ -2,6 +2,7 @@
 //! Open document buffers are authoritative; the server never writes project files.
 pub mod analysis;
 pub mod completion;
+pub mod semantic;
 use hiraku_script::{
     Stmt,
     cst::{SyntaxKind, SyntaxTree, statement_span},

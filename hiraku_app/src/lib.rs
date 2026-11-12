@@ -110,6 +110,10 @@ fn bridge_host_actions(
     if focus.0.is_some() {
         return;
     }
+    if keys.just_pressed(KeyCode::Escape) {
+        actions.write(HirakuActionInput(HirakuAction::Back));
+        return;
+    }
     if keys.any_just_pressed([KeyCode::Enter, KeyCode::Space]) {
         actions.write(HirakuActionInput(HirakuAction::NextDialogue));
     }
@@ -378,6 +382,29 @@ pub fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_forwards_only_back_and_leaves_text_cancel_to_the_editor() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<hiraku_engine::input::HirakuTextFocus>()
+            .add_message::<HirakuActionInput>()
+            .add_systems(Update, bridge_host_actions);
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::Escape);
+            keys.press(KeyCode::Enter);
+        }
+        app.update();
+        let mut reader = bevy::ecs::message::MessageCursor::<HirakuActionInput>::default();
+        let actions = reader.read(app.world().resource::<Messages<HirakuActionInput>>())
+            .map(|event| event.0).collect::<Vec<_>>();
+        assert_eq!(actions, vec![HirakuAction::Back]);
+        let field = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<hiraku_engine::input::HirakuTextFocus>().0 = Some(field);
+        app.update();
+        assert_eq!(reader.read(app.world().resource::<Messages<HirakuActionInput>>()).count(), 0);
+    }
     use bevy::{
         camera::NormalizedRenderTarget,
         picking::{backend::HitData, pointer::Location},

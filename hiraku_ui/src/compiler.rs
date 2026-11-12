@@ -21,6 +21,7 @@ pub struct RegionSite {
 
 #[derive(Clone, Debug, Default)]
 pub struct CompositionPlan {
+    pub native_calls: BTreeSet<String>,
     pub sites: Vec<RegionSite>,
     /// Conservative reads outside extracted property computations.
     pub structural_globals: BTreeSet<String>,
@@ -240,6 +241,11 @@ impl<'h> Lower<'_, 'h> {
                 type_bindings,
             } => {
                 let callee = self.expr(callee);
+                if let ResolvedFunction::Builtin(id) = function
+                    && let Some(name) = self.manifest.callable_name(id)
+                {
+                    self.plan.native_calls.insert(name.to_owned());
+                }
                 let signature = match function {
                     ResolvedFunction::Builtin(id) => self.manifest.signature(id).cloned(),
                     _ => None,

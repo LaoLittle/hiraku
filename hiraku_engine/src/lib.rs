@@ -429,6 +429,12 @@ impl Plugin for HirakuPlugin {
             .init_resource::<scene::save_preview::SavePreview>()
             .add_systems(
                 Update,
+                scene::save_preview::tick_captures
+                    .before(drive_story_runtime)
+                    .in_set(HirakuRuntimeSystems),
+            )
+            .add_systems(
+                Update,
                 scene::widgets::input_events
                     .after(cleanup_stale_screen_ui)
                     .before(handle_runtime_menu_buttons)
