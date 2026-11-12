@@ -97,6 +97,10 @@ impl<C> NativeRegistry<C> {
         Ok(())
     }
 
+    pub fn signature(&self, builtin: BuiltinId) -> Option<&FunctionSignature> {
+        self.signatures.get(&builtin)
+    }
+
     pub fn set_signature(
         &mut self,
         builtin: BuiltinId,

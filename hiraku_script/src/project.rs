@@ -103,6 +103,17 @@ pub fn compile_project_with_policy(
     compile_project_impl(sources, natives, None, Some(policy))
 }
 
+/// Combines an embedding's trusted HIR pass with its normal linker capability
+/// policy. The pass is not a script capability and does not grant one.
+pub fn compile_project_with_policy_and_hir_pass(
+    sources: Vec<ScriptSource>,
+    natives: &BuiltinManifest,
+    policy: &ProjectLinkPolicy,
+    pass: &mut dyn crate::hir::HirPass,
+) -> Result<CompiledProject, Vec<ProjectError>> {
+    compile_project_impl(sources, natives, Some(pass), Some(policy))
+}
+
 pub fn compile_project(
     sources: Vec<ScriptSource>,
     natives: &BuiltinManifest,

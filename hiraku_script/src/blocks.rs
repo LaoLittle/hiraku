@@ -14,6 +14,13 @@ pub struct SourceBlock {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSourceRange {
+    pub name: String,
+    pub marker: Option<crate::Span>,
+    pub content: crate::Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockDocument {
     pub symbols: SymbolManifest,
     pub preamble: String,
@@ -70,6 +77,27 @@ impl std::error::Error for BlockDocumentError {}
 /// Splits top-level `// @block(id)` comments into stable editor blocks.
 /// Markers inside braces or string literals are deliberately ignored.
 pub fn parse_block_document(source: &str) -> Result<BlockDocument, BlockDocumentError> {
+    let ranges = block_source_ranges(source)?;
+    let mut interner = SymbolInterner::new();
+    let blocks = ranges
+        .iter()
+        .map(|range| SourceBlock {
+            id: BlockId(interner.intern(&range.name)),
+            source: source[range.content.range()].trim().to_string(),
+        })
+        .collect();
+    Ok(BlockDocument {
+        symbols: interner.manifest(),
+        preamble: ranges
+            .first()
+            .and_then(|range| range.marker)
+            .map(|marker| source[..marker.start].trim().to_string())
+            .unwrap_or_default(),
+        blocks,
+    })
+}
+
+pub fn block_source_ranges(source: &str) -> Result<Vec<BlockSourceRange>, BlockDocumentError> {
     let mut offset = 0usize;
     let mut brace_depth = 0usize;
     let mut markers = Vec::<(String, usize, usize)>::new();
@@ -91,29 +119,24 @@ pub fn parse_block_document(source: &str) -> Result<BlockDocument, BlockDocument
                         .map(|_| offset + 2)
                         .or_else(|| source[offset..].strip_prefix('\n').map(|_| offset + 1))
                         .unwrap_or(offset);
-                    markers.push((id, start, content_start));
+                    markers.push((id, line_start, content_start));
                 }
             }
             _ => {}
         }
     }
 
-    let mut interner = SymbolInterner::new();
     if markers.is_empty() {
-        let id = BlockId(interner.intern("main"));
-        return Ok(BlockDocument {
-            symbols: interner.manifest(),
-            preamble: String::new(),
-            blocks: vec![SourceBlock {
-                id,
-                source: source.trim().to_string(),
-            }],
-        });
+        return Ok(vec![BlockSourceRange {
+            name: "main".into(),
+            marker: None,
+            content: crate::Span::new_with_end(0, source.len()),
+        }]);
     }
 
     let mut seen = BTreeSet::new();
     let mut blocks = Vec::with_capacity(markers.len());
-    for (index, (name, _, content_start)) in markers.iter().enumerate() {
+    for (index, (name, marker_start, content_start)) in markers.iter().enumerate() {
         if !seen.insert(name.clone()) {
             return Err(BlockDocumentError::DuplicateId(name.clone()));
         }
@@ -121,16 +144,13 @@ pub fn parse_block_document(source: &str) -> Result<BlockDocument, BlockDocument
             .get(index + 1)
             .map(|(_, marker_start, _)| *marker_start)
             .unwrap_or(source.len());
-        blocks.push(SourceBlock {
-            id: BlockId(interner.intern(name)),
-            source: source[*content_start..end].trim().to_string(),
+        blocks.push(BlockSourceRange {
+            name: name.clone(),
+            marker: Some(crate::Span::new_with_end(*marker_start, *content_start)),
+            content: crate::Span::new_with_end(*content_start, end),
         });
     }
-    Ok(BlockDocument {
-        symbols: interner.manifest(),
-        preamble: source[..markers[0].1].trim().to_string(),
-        blocks,
-    })
+    Ok(blocks)
 }
 
 fn parse_marker(comment: &str, offset: usize) -> Result<Option<String>, BlockDocumentError> {
@@ -214,5 +234,31 @@ if true {
         let error = parse_block_document("// @block(a)\n\"one\"\n// @block(a)\n\"two\"")
             .expect_err("duplicate IDs must be rejected");
         assert_eq!(error, BlockDocumentError::DuplicateId("a".into()));
+    }
+
+    #[test]
+    fn source_ranges_preserve_crlf_unicode_and_empty_blocks() {
+        let source = "global let name = \"Alice\"\r\n  // @block(first)\r\n\"λ\"\r\n\r\n    // @block(empty)\r\n// @block(last)\n\"Bob\"";
+        let ranges = block_source_ranges(source).expect("ranges");
+        assert_eq!(&source[ranges[0].content.range()], "\"λ\"\r\n\r\n");
+        assert_eq!(
+            &source[ranges[1].marker.unwrap().range()],
+            "    // @block(empty)\r\n"
+        );
+        assert_eq!(ranges[1].content.start, ranges[1].content.end);
+        assert_eq!(&source[ranges[2].content.range()], "\"Bob\"");
+        for range in ranges {
+            assert!(source.get(range.content.range()).is_some());
+        }
+    }
+
+    #[test]
+    fn an_unmarked_file_is_one_lossless_region() {
+        let source = " \n\"Alice\" // @block(not-a-marker)\n ";
+        let [range] = block_source_ranges(source).unwrap().try_into().unwrap();
+        let range: BlockSourceRange = range;
+        assert_eq!(range.name, "main");
+        assert_eq!(range.marker, None);
+        assert_eq!(&source[range.content.range()], source);
     }
 }

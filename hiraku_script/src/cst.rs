@@ -46,7 +46,14 @@ pub struct SyntaxTree {
 }
 impl SyntaxTree {
     pub fn parse(source: impl Into<Arc<str>>) -> Self {
-        let source = source.into();
+        Self::parse_with(source.into(), parse_program)
+    }
+
+    pub fn parse_literal(source: impl Into<Arc<str>>) -> Self {
+        Self::parse_with(source.into(), crate::parse::parse_literal_program)
+    }
+
+    fn parse_with(source: Arc<str>, parse: fn(&str) -> Result<Program, Vec<ParseError>>) -> Self {
         let mut tree = Self {
             source: source.clone(),
             tokens: Vec::new(),
@@ -110,7 +117,7 @@ impl SyntaxTree {
         for id in stack {
             tree.nodes[id].span.end = source.len();
         }
-        match parse_program(&source) {
+        match parse(&source) {
             Ok(ast) => {
                 let spans = ast
                     .statements

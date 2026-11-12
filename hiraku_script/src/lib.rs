@@ -80,7 +80,7 @@ pub mod debug;
 pub mod project;
 pub use project::{
     CompiledProject, ProjectError, ProjectLinkPolicy, ScriptSource, compile_project,
-    compile_project_with_policy,
+    compile_project_with_policy, compile_project_with_policy_and_hir_pass,
 };
 pub mod parse;
 pub mod register;
@@ -96,7 +96,10 @@ pub use ast::{
     Argument, BinaryOp, Block, CastMode, Expr, ExprKind, FunctionParameter, MapField, NumberUnit,
     Program, Stmt, SyntaxWarning, TypeExpr, TypeExprKind, TypeField,
 };
-pub use blocks::{BlockDocument, BlockDocumentError, BlockId, SourceBlock, parse_block_document};
+pub use blocks::{
+    BlockDocument, BlockDocumentError, BlockId, BlockSourceRange, SourceBlock, block_source_ranges,
+    parse_block_document,
+};
 pub use hir::{
     HirArena, HirArgument, HirBlock, HirExpr, HirExprKind, HirFunction, HirFunctionId, HirGlobal,
     HirGlobalId, HirLiteral, HirLocal, HirLocalId, HirPlace, HirProgram, HirStmt, HirStmtKind,
