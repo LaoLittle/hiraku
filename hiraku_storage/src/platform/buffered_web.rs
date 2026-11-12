@@ -13,7 +13,11 @@ pub struct BufferedStorage {
 }
 struct Job {
     namespace: String,
-    records: Vec<GenerationRecord>,
+    operation: Operation,
+}
+enum Operation {
+    Publish(Vec<GenerationRecord>),
+    Remove(Vec<crate::RemovalRecord>),
 }
 struct State {
     status: RuntimeStorageStatus,
@@ -35,6 +39,40 @@ fn failure(message: impl Into<String>) -> StorageError {
 }
 
 impl BufferedStorage {
+    pub fn enqueue_remove(
+        &self,
+        records: Vec<crate::RemovalRecord>,
+    ) -> Result<WriteQueued, StorageError> {
+        crate::validate_removal(&records)?;
+        let start = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if !matches!(
+                state.status,
+                RuntimeStorageStatus::Ready | RuntimeStorageStatus::Writing
+            ) {
+                return Err(failure("storage is not available for writes"));
+            }
+            let cache = state
+                .cache
+                .get_mut(&self.namespace)
+                .ok_or_else(|| failure("unknown storage domain"))?;
+            for record in &records {
+                cache.remove(&record.key);
+            }
+            state.jobs.push_back(Job {
+                namespace: self.namespace.clone(),
+                operation: Operation::Remove(records),
+            });
+            let start = state.status == RuntimeStorageStatus::Ready;
+            state.status = RuntimeStorageStatus::Writing;
+            Ok(start)
+        })?;
+        if start {
+            wasm_bindgen_futures::spawn_local(flush());
+        }
+        Ok(WriteQueued)
+    }
+
     pub fn new(
         root: impl Into<PathBuf>,
         namespace: impl Into<String>,
@@ -99,7 +137,7 @@ impl BufferedStorage {
             }
             state.jobs.push_back(Job {
                 namespace: self.namespace.clone(),
-                records,
+                operation: Operation::Publish(records),
             });
             let start = state.status == RuntimeStorageStatus::Ready;
             state.status = RuntimeStorageStatus::Writing;
@@ -162,10 +200,12 @@ async fn flush() {
             job.map(|job| (state.project.clone(), job))
         });
         let Some((project, job)) = job else { return };
-        if let Err(error) = backend(&project, &job.namespace)
-            .write_generation(&job.records)
-            .await
-        {
+        let storage = backend(&project, &job.namespace);
+        let result = match job.operation {
+            Operation::Publish(records) => storage.write_generation(&records).await,
+            Operation::Remove(records) => storage.remove_records(&records).await,
+        };
+        if let Err(error) = result {
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 state.jobs.clear();

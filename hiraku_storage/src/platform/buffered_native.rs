@@ -5,6 +5,15 @@ use std::path::PathBuf;
 #[derive(Clone, Debug)]
 pub struct BufferedStorage(PlatformStorage);
 impl BufferedStorage {
+    /// Removes in caller order; place a publication record before its payloads.
+    pub fn enqueue_remove(
+        &self,
+        records: Vec<crate::RemovalRecord>,
+    ) -> Result<WriteQueued, StorageError> {
+        self.0.remove_records(&records)?;
+        Ok(WriteQueued)
+    }
+
     pub fn enqueue_generation(
         &self,
         records: Vec<crate::GenerationRecord>,

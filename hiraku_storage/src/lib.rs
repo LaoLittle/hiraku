@@ -34,6 +34,29 @@ pub struct GenerationRecord {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RemovalRecord {
+    pub key: String,
+    pub extension: String,
+}
+
+pub(crate) fn validate_removal(records: &[RemovalRecord]) -> Result<(), StorageError> {
+    if records.is_empty() {
+        return Err(StorageError::InvalidKey);
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for record in records {
+        validate_key(&record.key)?;
+        if record.extension.is_empty()
+            || !record.extension.bytes().all(|c| c.is_ascii_alphanumeric())
+            || !keys.insert(&record.key)
+        {
+            return Err(StorageError::InvalidKey);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_generation(records: &[GenerationRecord]) -> Result<(), StorageError> {
     if records.is_empty() {
         return Err(StorageError::InvalidKey);

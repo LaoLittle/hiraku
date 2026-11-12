@@ -10,6 +10,22 @@ pub struct PlatformStorage {
 }
 
 impl PlatformStorage {
+    pub(super) fn remove_records(
+        &self,
+        records: &[crate::RemovalRecord],
+    ) -> Result<(), StorageError> {
+        crate::validate_removal(records)?;
+        for record in records {
+            let path = native_path(&self.root, &record.key, &record.extension)?;
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn publish_generation(
         &self,
         records: &[crate::GenerationRecord],
@@ -112,6 +128,59 @@ fn native_path(root: &Path, key: &str, extension: &str) -> Result<PathBuf, Stora
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_validates_the_entire_batch_before_deleting_and_preserves_other_records() {
+        let root = std::env::temp_dir().join(format!(
+            "hiraku-remove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ));
+        let storage = PlatformStorage::new(&root, "test", "hson");
+        storage.write("alice", b"alice").expect("synthetic index");
+        storage.write("bob", b"bob").expect("unrelated index");
+        let record = |key: &str| crate::RemovalRecord {
+            key: key.into(),
+            extension: "hson".into(),
+        };
+        assert!(
+            storage
+                .remove_records(&[record("alice"), record("../bob")])
+                .is_err()
+        );
+        assert!(
+            storage
+                .contains("alice")
+                .expect("validation must precede deletion")
+        );
+        storage
+            .remove_records(&[record("alice")])
+            .expect("delete synthetic index");
+        storage
+            .remove_records(&[record("alice")])
+            .expect("missing records are idempotent");
+        assert!(!storage.contains("alice").expect("removed"));
+        assert_eq!(
+            storage.read("bob").expect("other index"),
+            Some(b"bob".to_vec())
+        );
+        std::fs::create_dir(root.join("alice.hson"))
+            .expect("synthetic publication removal failure");
+        assert!(
+            storage
+                .remove_records(&[record("alice"), record("bob")])
+                .is_err()
+        );
+        assert!(
+            storage
+                .contains("bob")
+                .expect("later records survive an earlier I/O failure")
+        );
+        std::fs::remove_dir_all(&root).expect("remove synthetic directory");
+    }
 
     #[test]
     fn generation_collision_preserves_published_index() {

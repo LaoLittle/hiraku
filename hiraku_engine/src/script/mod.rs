@@ -584,12 +584,21 @@ pub fn save_runtime_slot(
     thumbnail: &[u8],
     history: &crate::scene::DialogueHistoryState,
 ) -> Result<(), StorageError> {
+    let mut data = capture_runtime_save_with_history(runtime, shared_state, history)?;
+    data.thumbnail_png = thumbnail.to_vec();
+    write_save_data_to_root(&save_root_path(), slot, &data)
+}
+
+pub(crate) fn capture_runtime_save_with_history(
+    runtime: &ScriptRuntimeState,
+    shared_state: &SceneSharedState,
+    history: &crate::scene::DialogueHistoryState,
+) -> Result<SaveGameData, StorageError> {
     let mut data = capture_runtime_save(runtime, shared_state)?;
     let (entries, records) = history.save_window();
     data.dialogue_history = entries.to_vec();
     data.history_records = records.to_vec();
-    data.thumbnail_png = thumbnail.to_vec();
-    write_save_data_to_root(&save_root_path(), slot, &data)
+    Ok(data)
 }
 
 pub(crate) fn capture_runtime_save(

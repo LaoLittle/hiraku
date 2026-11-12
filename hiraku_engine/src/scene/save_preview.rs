@@ -32,6 +32,85 @@ pub fn capture(commands: &mut Commands, canvas: &crate::HirakuCanvas, preview: &
     preview.capture = Some(entity);
 }
 
+#[derive(Component)]
+pub(crate) struct PendingSaveCapture {
+    slot: String,
+    root: std::path::PathBuf,
+    data: Option<crate::state::SaveGameData>,
+    screenshot: Entity,
+    frames: u32,
+}
+
+impl PendingSaveCapture {
+    fn publish(&mut self, image: Option<&Image>) -> Result<(), String> {
+        let Some(mut data) = self.data.take() else { return Ok(()) };
+        if let Some(image) = image {
+            match encode(image) {
+                Ok(png) => data.thumbnail_png = png,
+                Err(error) => warn!("failed to capture save `{}` thumbnail: {error}", self.slot),
+            }
+        }
+        crate::storage::write_save_data_to_root(&self.root, &self.slot, &data)
+            .map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) fn capture_slot(
+    commands: &mut Commands,
+    canvas: &crate::HirakuCanvas,
+    slot: String,
+    data: crate::state::SaveGameData,
+) {
+    let pending = commands.spawn_empty().id();
+    let screenshot = commands.spawn(Screenshot::image(canvas.image.clone())).observe(
+        move |event: On<ScreenshotCaptured>,
+              mut commands: Commands,
+              mut captures: Query<&mut PendingSaveCapture>,
+              mut models: ResMut<crate::ui::UiModels>,
+              mut frontend: ResMut<super::FrontendState>| {
+            let Ok(mut capture) = captures.get_mut(pending) else { return };
+            if capture.screenshot != event.entity || capture.data.is_none() { return; }
+            if let Err(error) = capture.publish(Some(&event.image)) {
+                warn!("failed to save slot `{}`: {error}", capture.slot);
+                frontend.notice = Some(format!("Failed to save slot {}: {error}", capture.slot));
+            } else {
+                models.invalidate_service("storage");
+            }
+            commands.entity(pending).try_despawn();
+        },
+    ).id();
+    commands.entity(pending).insert(PendingSaveCapture {
+        slot,
+        root: crate::storage::save_root_path(),
+        data: Some(data),
+        screenshot,
+        frames: 0,
+    });
+}
+
+pub(crate) fn tick_captures(
+    mut commands: Commands,
+    mut captures: Query<(Entity, &mut PendingSaveCapture)>,
+    mut models: ResMut<crate::ui::UiModels>,
+    mut frontend: ResMut<super::FrontendState>,
+    mut redraw: crate::redraw::Redraw,
+) {
+    for (entity, mut capture) in &mut captures {
+        redraw.request();
+        capture.frames += 1;
+        if capture.frames < 180 { continue; }
+        warn!("save `{}` thumbnail capture timed out; retaining the checkpoint without an image", capture.slot);
+        if let Err(error) = capture.publish(None) {
+            warn!("failed to save slot `{}`: {error}", capture.slot);
+            frontend.notice = Some(format!("Failed to save slot {}: {error}", capture.slot));
+        } else {
+            models.invalidate_service("storage");
+        }
+        commands.entity(capture.screenshot).try_despawn();
+        commands.entity(entity).try_despawn();
+    }
+}
+
 fn encode(image: &Image) -> Result<Vec<u8>, String> {
     let dynamic = image
         .clone()

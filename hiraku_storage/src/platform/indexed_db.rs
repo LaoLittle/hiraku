@@ -15,53 +15,98 @@ pub struct AsyncPlatformStorage {
 }
 
 impl AsyncPlatformStorage {
-    pub(super) async fn write_generation(&self, records: &[crate::GenerationRecord]) -> Result<(), StorageError> {
+    pub(super) async fn remove_records(
+        &self,
+        records: &[crate::RemovalRecord],
+    ) -> Result<(), StorageError> {
+        crate::validate_removal(records)?;
+        let db = self.open().await?;
+        let tx =
+            db.0.transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite)
+                .map_err(js_error)?;
+        let completion = TransactionWait::new(tx.clone());
+        let store = tx.object_store(STORE).map_err(js_error)?;
+        for record in records {
+            store
+                .delete(&record.key.as_str().into())
+                .map_err(js_error)?;
+        }
+        completion.wait().await
+    }
+
+    pub(super) async fn write_generation(
+        &self,
+        records: &[crate::GenerationRecord],
+    ) -> Result<(), StorageError> {
         crate::validate_generation(records)?;
         let db = self.open().await?;
-        let tx = db.0.transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite).map_err(js_error)?;
+        let tx =
+            db.0.transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite)
+                .map_err(js_error)?;
         let completion = TransactionWait::new(tx.clone());
         let store = tx.object_store(STORE).map_err(js_error)?;
         for (index, record) in records.iter().enumerate() {
             let bytes = Uint8Array::from(record.payload.as_slice());
             if index + 1 == records.len() {
-                store.put_with_key(&bytes, &record.key.as_str().into()).map_err(js_error)?;
+                store
+                    .put_with_key(&bytes, &record.key.as_str().into())
+                    .map_err(js_error)?;
             } else {
-                store.add_with_key(&bytes, &record.key.as_str().into()).map_err(js_error)?;
+                store
+                    .add_with_key(&bytes, &record.key.as_str().into())
+                    .map_err(js_error)?;
             }
         }
         completion.wait().await
     }
     /// Import legacy records once, without overwriting any IndexedDB record.
     /// Data and marker commit in the same transaction; localStorage is retained.
-    pub(super) async fn initialize_legacy(&self, namespace: &str) -> Result<std::collections::BTreeMap<String, Vec<u8>>, StorageError> {
+    pub(super) async fn initialize_legacy(
+        &self,
+        namespace: &str,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>, StorageError> {
         const MARKER: &str = "__hiraku_local_storage_import_v1";
         let mut data = self.read_all().await?;
-        if data.remove(MARKER).is_some() { return Ok(data) }
+        if data.remove(MARKER).is_some() {
+            return Ok(data);
+        }
         let window = web_sys::window().ok_or_else(|| error("window unavailable"))?;
         let legacy = window.local_storage().map_err(js_error)?;
         let mut imported = std::collections::BTreeMap::new();
         if let Some(legacy) = legacy {
             let prefix = format!("{namespace}.");
             for index in 0..legacy.length().map_err(js_error)? {
-                let Some(full_key) = legacy.key(index).map_err(js_error)? else { continue };
-                let Some(key) = full_key.strip_prefix(&prefix) else { continue };
+                let Some(full_key) = legacy.key(index).map_err(js_error)? else {
+                    continue;
+                };
+                let Some(key) = full_key.strip_prefix(&prefix) else {
+                    continue;
+                };
                 validate_key(key)?;
-                if key == MARKER || data.contains_key(key) { continue }
+                if key == MARKER || data.contains_key(key) {
+                    continue;
+                }
                 if let Some(payload) = legacy.get_item(&full_key).map_err(js_error)? {
                     imported.insert(key.to_owned(), super::wasm::decode_hex(&payload)?);
                 }
             }
         }
         let db = self.open().await?;
-        let tx = db.0.transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite).map_err(js_error)?;
+        let tx =
+            db.0.transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite)
+                .map_err(js_error)?;
         let completion = TransactionWait::new(tx.clone());
         let store = tx.object_store(STORE).map_err(js_error)?;
         for (key, payload) in &imported {
             // A concurrent initializer can win this race. add aborts rather
             // than overwriting it; restarting safely repeats the migration.
-            store.add_with_key(&Uint8Array::from(payload.as_slice()), &key.as_str().into()).map_err(js_error)?;
+            store
+                .add_with_key(&Uint8Array::from(payload.as_slice()), &key.as_str().into())
+                .map_err(js_error)?;
         }
-        store.put_with_key(&Uint8Array::from(&b"1"[..]), &MARKER.into()).map_err(js_error)?;
+        store
+            .put_with_key(&Uint8Array::from(&b"1"[..]), &MARKER.into())
+            .map_err(js_error)?;
         completion.wait().await?;
         data.extend(imported);
         Ok(data)
@@ -69,7 +114,9 @@ impl AsyncPlatformStorage {
 
     async fn read_all(&self) -> Result<std::collections::BTreeMap<String, Vec<u8>>, StorageError> {
         let db = self.open().await?;
-        let tx = db.0.transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly).map_err(js_error)?;
+        let tx =
+            db.0.transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly)
+                .map_err(js_error)?;
         let completion = TransactionWait::new(tx.clone());
         let store = tx.object_store(STORE).map_err(js_error)?;
         let keys = RequestWait::new(store.get_all_keys().map_err(js_error)?);
@@ -80,12 +127,19 @@ impl AsyncPlatformStorage {
         let keys = js_sys::Array::from(&keys?);
         let values = js_sys::Array::from(&values?);
         committed?;
-        if keys.length() != values.length() { return Err(error("inconsistent IndexedDB snapshot")) }
+        if keys.length() != values.length() {
+            return Err(error("inconsistent IndexedDB snapshot"));
+        }
         let mut data = std::collections::BTreeMap::new();
         for index in 0..keys.length() {
-            let key = keys.get(index).as_string().ok_or_else(|| error("non-string storage key"))?;
+            let key = keys
+                .get(index)
+                .as_string()
+                .ok_or_else(|| error("non-string storage key"))?;
             let value = values.get(index);
-            if !value.is_instance_of::<Uint8Array>() { return Err(StorageError::Corrupt("non-binary storage record".into())) }
+            if !value.is_instance_of::<Uint8Array>() {
+                return Err(StorageError::Corrupt("non-binary storage record".into()));
+            }
             data.insert(key, Uint8Array::new(&value).to_vec());
         }
         Ok(data)
