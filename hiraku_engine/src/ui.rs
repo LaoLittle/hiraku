@@ -46,13 +46,31 @@ pub enum UiShaderBlend {
     Additive,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UiShaderAlphaBlend {
+    #[default]
+    Inherit,
+    Over,
+    Replace,
+    Preserve,
+    Additive,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiShaderSpec {
     #[serde(default)]
     pub blend: UiShaderBlend,
+    #[serde(default)]
+    pub alpha_blend: UiShaderAlphaBlend,
     pub path: String,
     pub textures: Vec<String>,
     pub keys: Vec<UiShaderKeyframe>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiTrackReference {
+    pub path: String,
+    pub name: String,
 }
 
 /// A typed side effect dispatched after a UI button accepts a click.
@@ -71,6 +89,7 @@ pub enum UiEffect {
         channel: String,
     },
     StopVoice,
+    VoicePaused(bool),
     PlaySfx {
         name: String,
         #[serde(default = "default_ui_effect_volume")]
@@ -89,6 +108,9 @@ pub enum UiEffect {
         value: hiraku_script::Value,
     },
     Save {
+        slot: String,
+    },
+    DeleteSave {
         slot: String,
     },
     Load {
@@ -148,6 +170,10 @@ pub struct ScreenSpec {
     /// Mount-owned frame callback, receiving elapsed seconds from the UI clock.
     #[serde(skip)]
     pub(crate) on_update: Option<UiCallback>,
+    #[serde(skip)]
+    pub(crate) on_advance: Option<UiCallback>,
+    #[serde(skip)]
+    pub(crate) on_back: Option<UiCallback>,
     /// Mounted overlays explicitly allowed above this modal screen.
     #[serde(default)]
     pub allowed_overlays: Vec<String>,
@@ -342,6 +368,8 @@ pub struct ScreenLayout {
     #[serde(default)]
     pub keyframes: Vec<UiKeyframe>,
     #[serde(default)]
+    pub track: Option<UiTrackReference>,
+    #[serde(default)]
     pub shader: Option<UiShaderSpec>,
     /// Intrinsic content measurement instead of container defaults such as 100% width.
     #[serde(default)]
@@ -499,9 +527,28 @@ impl StoredValue {
 pub struct UiModels {
     roots: BTreeMap<String, StoredValue>,
     revision: u64,
+    pub(crate) service_revisions: BTreeMap<&'static str, u64>,
+    pub(crate) countdowns: BTreeMap<String, std::time::Duration>,
 }
 
 impl UiModels {
+    pub(crate) fn set_countdowns(&mut self, countdowns: BTreeMap<String, std::time::Duration>) {
+        if self.countdowns != countdowns {
+            self.countdowns = countdowns;
+            self.invalidate_service("clock");
+        }
+    }
+    pub(crate) fn invalidate_service(&mut self, name: &'static str) {
+        let revision = self.service_revisions.entry(name).or_default();
+        *revision = revision
+            .checked_add(1)
+            .expect("UI service revision must not be exhausted");
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("UI model revision must not be exhausted");
+    }
+
     pub fn set(&mut self, name: impl Into<String>, value: StoredValue) {
         let name = name.into();
         assert!(

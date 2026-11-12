@@ -85,6 +85,14 @@ pub fn poll_bgm_playback(
                 stage.bgm = None;
                 shared_state.0.bgm = None;
             }
+            let name = stage
+                .music_channels
+                .iter()
+                .find_map(|(name, active)| (*active == entity).then(|| name.clone()));
+            if let Some(name) = name {
+                stage.music_channels.remove(&name);
+                shared_state.0.music_channels.remove(&name);
+            }
             commands.entity(entity).try_despawn();
         }
     }
@@ -190,52 +198,62 @@ pub fn reconcile_restored_bgm(
     user_settings: Res<UserSettings>,
     mut stage: ResMut<StageState>,
 ) {
-    let Some(snapshot) = stage.pending_bgm_restore.take() else {
-        return;
-    };
-    let playback_volume = apply_volume_setting(
-        snapshot.volume,
-        user_settings.bgm_volume * user_settings.master_volume,
-    );
-    let loop_audio = asset_server.load(snapshot.path.clone());
-    let entity = if let Some(prelude) = audio
-        .resolve_music_path(&snapshot.path)
-        .and_then(|definition| definition.prelude.as_ref())
-    {
-        commands
-            .spawn((
-                BgmChannel {
-                    path: snapshot.path,
-                    volume: snapshot.volume,
-                    looped: snapshot.looped,
-                },
-                BgmPrelude {
-                    prelude_audio: asset_server.load(prelude.clone()),
-                    loop_audio,
-                    start_volume: playback_volume,
-                    looped: snapshot.looped,
-                },
-            ))
-            .id()
-    } else {
-        commands
-            .spawn((
-                BgmChannel {
-                    path: snapshot.path,
-                    volume: snapshot.volume,
-                    looped: snapshot.looped,
-                },
-                bevy::audio::AudioPlayer::<AudioSource>(loop_audio),
-                (if snapshot.looped {
-                    PlaybackSettings::LOOP
-                } else {
-                    PlaybackSettings::ONCE
-                })
-                .with_volume(Volume::Linear(playback_volume)),
-            ))
-            .id()
-    };
-    stage.bgm = Some(entity);
+    let mut restored: Vec<_> = std::mem::take(&mut stage.pending_music_restore)
+        .into_iter()
+        .map(|(name, snapshot)| (Some(name), snapshot))
+        .collect();
+    if let Some(snapshot) = stage.pending_bgm_restore.take() {
+        restored.push((None, snapshot));
+    }
+    for (channel, snapshot) in restored {
+        let playback_volume = apply_volume_setting(
+            snapshot.volume,
+            user_settings.bgm_volume * user_settings.master_volume,
+        );
+        let loop_audio = asset_server.load(snapshot.path.clone());
+        let entity = if let Some(prelude) = audio
+            .resolve_music_path(&snapshot.path)
+            .and_then(|definition| definition.prelude.as_ref())
+        {
+            commands
+                .spawn((
+                    BgmChannel {
+                        path: snapshot.path,
+                        volume: snapshot.volume,
+                        looped: snapshot.looped,
+                    },
+                    BgmPrelude {
+                        prelude_audio: asset_server.load(prelude.clone()),
+                        loop_audio,
+                        start_volume: playback_volume,
+                        looped: snapshot.looped,
+                    },
+                ))
+                .id()
+        } else {
+            commands
+                .spawn((
+                    BgmChannel {
+                        path: snapshot.path,
+                        volume: snapshot.volume,
+                        looped: snapshot.looped,
+                    },
+                    bevy::audio::AudioPlayer::<AudioSource>(loop_audio),
+                    (if snapshot.looped {
+                        PlaybackSettings::LOOP
+                    } else {
+                        PlaybackSettings::ONCE
+                    })
+                    .with_volume(Volume::Linear(playback_volume)),
+                ))
+                .id()
+        };
+        if let Some(channel) = channel {
+            stage.music_channels.insert(channel, entity);
+        } else {
+            stage.bgm = Some(entity);
+        }
+    }
 }
 
 pub fn apply_live_audio_settings(

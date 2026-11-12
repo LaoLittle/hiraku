@@ -8,11 +8,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let asset = EngineAudioSource::from_bytes(std::fs::read(&path)?)?;
         let decoder = asset.decoder();
         let channels = decoder.channels().get() as usize;
-        let duration = decoder.total_duration().ok_or("unknown audio duration")?;
-        let limit = (duration.as_secs_f64()
-            * f64::from(decoder.sample_rate().get())
-            * channels as f64) as usize
-            * 3;
+        let sample_count = match decoder.total_duration() {
+            Some(duration) => {
+                (duration.as_secs_f64() * f64::from(decoder.sample_rate().get()) * channels as f64)
+                    as usize
+            }
+            None => asset.decoder().count(),
+        };
+        if sample_count == 0 {
+            return Err("audio contains no samples".into());
+        }
+        let limit = sample_count
+            .checked_mul(3)
+            .ok_or("audio sample count overflow")?;
         // Exercise the same buffering, repetition and format conversion as Bevy.
         let (mixer, mut output) = rodio::mixer::mixer(decoder.channels(), decoder.sample_rate());
         mixer.add(decoder.repeat_infinite());

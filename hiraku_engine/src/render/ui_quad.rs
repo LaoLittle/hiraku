@@ -17,6 +17,9 @@ pub(crate) fn register(app: &mut App) {
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 #[bind_group_data(UiQuadKey)]
 pub(crate) struct UiQuadMaterial {
+    #[uniform(14)]
+    pub image_uv_rect: Vec4,
+    pub image_pixel_rect: Option<Rect>,
     #[uniform(15)]
     pub sampling: UVec4,
     #[uniform(0)]
@@ -41,12 +44,32 @@ pub(crate) struct UiQuadMaterial {
     pub texture3: Handle<Image>,
     pub shader: Option<Handle<Shader>>,
     pub blend: crate::ui::UiShaderBlend,
+    pub alpha_blend: crate::ui::UiShaderAlphaBlend,
+}
+
+pub(crate) fn image_uv_rect(rect: Option<Rect>, image_size: Vec2) -> Vec4 {
+    if image_size.x <= 0. || image_size.y <= 0. {
+        return Vec4::ZERO;
+    }
+    rect.map_or(Vec4::new(0., 0., 1., 1.), |rect| {
+        let min = rect.min / image_size;
+        let max = rect.max / image_size;
+        Vec4::new(min.x, min.y, max.x, max.y)
+    })
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UiQuadKey(Option<Handle<Shader>>, crate::ui::UiShaderBlend);
+pub(crate) struct UiQuadKey(
+    Option<Handle<Shader>>,
+    crate::ui::UiShaderBlend,
+    crate::ui::UiShaderAlphaBlend,
+);
 impl From<&UiQuadMaterial> for UiQuadKey {
     fn from(material: &UiQuadMaterial) -> Self {
-        Self(material.shader.clone(), material.blend)
+        Self(
+            material.shader.clone(),
+            material.blend,
+            material.alpha_blend,
+        )
     }
 }
 impl UiMaterial for UiQuadMaterial {
@@ -93,12 +116,42 @@ impl UiMaterial for UiQuadMaterial {
                 }
             }
         }
+        if key.bind_group_data.2 != crate::ui::UiShaderAlphaBlend::Inherit {
+            if let Some(fragment) = &mut descriptor.fragment {
+                for target in fragment.targets.iter_mut().flatten() {
+                    let blend = target
+                        .blend
+                        .get_or_insert(bevy::render::render_resource::BlendState::ALPHA_BLENDING);
+                    blend.alpha = alpha_blend_component(key.bind_group_data.2, blend.alpha);
+                }
+            }
+        }
         if let Some(shader) = key.bind_group_data.0 {
             if let Some(fragment) = &mut descriptor.fragment {
                 fragment.shader = shader;
                 fragment.entry_point = Some("main".into());
             }
         }
+    }
+}
+
+fn alpha_blend_component(
+    mode: crate::ui::UiShaderAlphaBlend,
+    inherited: bevy::render::render_resource::BlendComponent,
+) -> bevy::render::render_resource::BlendComponent {
+    use crate::ui::UiShaderAlphaBlend;
+    use bevy::render::render_resource::{BlendComponent, BlendFactor, BlendOperation};
+    let (src_factor, dst_factor) = match mode {
+        UiShaderAlphaBlend::Inherit => return inherited,
+        UiShaderAlphaBlend::Over => (BlendFactor::One, BlendFactor::OneMinusSrcAlpha),
+        UiShaderAlphaBlend::Replace => (BlendFactor::One, BlendFactor::Zero),
+        UiShaderAlphaBlend::Preserve => (BlendFactor::Zero, BlendFactor::One),
+        UiShaderAlphaBlend::Additive => (BlendFactor::One, BlendFactor::One),
+    };
+    BlendComponent {
+        src_factor,
+        dst_factor,
+        operation: BlendOperation::Add,
     }
 }
 
@@ -114,6 +167,7 @@ pub(crate) struct UiShaderSource {
     pub textures: Vec<Handle<Image>>,
     pub keys: Vec<crate::ui::UiShaderKeyframe>,
     pub blend: crate::ui::UiShaderBlend,
+    pub alpha_blend: crate::ui::UiShaderAlphaBlend,
 }
 pub(crate) fn valid_shader_keys(keys: &[crate::ui::UiShaderKeyframe]) -> bool {
     use crate::ui::UiShaderKeyframe::At;
@@ -171,6 +225,49 @@ pub(crate) fn projection(origin: Vec2, u: Vec2, v: Vec2) -> (Rect, Vec4, Vec4) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn projected_image_preserves_atlas_region_without_changing_local_uvs() {
+        assert_eq!(
+            image_uv_rect(
+                Some(Rect::from_corners(
+                    Vec2::new(128., 0.),
+                    Vec2::new(256., 128.)
+                )),
+                Vec2::splat(256.)
+            ),
+            Vec4::new(0.5, 0., 1., 0.5)
+        );
+        assert_eq!(
+            image_uv_rect(None, Vec2::splat(256.)),
+            Vec4::new(0., 0., 1., 1.)
+        );
+        assert_eq!(image_uv_rect(Some(Rect::default()), Vec2::ZERO), Vec4::ZERO);
+    }
+
+    #[test]
+    fn alpha_policy_is_independent_from_color_blending() {
+        use crate::ui::UiShaderAlphaBlend;
+        use bevy::render::render_resource::{BlendComponent, BlendFactor, BlendOperation};
+        let inherited = BlendComponent {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::One,
+            operation: BlendOperation::Add,
+        };
+        assert_eq!(
+            alpha_blend_component(UiShaderAlphaBlend::Inherit, inherited),
+            inherited
+        );
+        let replace = alpha_blend_component(UiShaderAlphaBlend::Replace, inherited);
+        assert_eq!(replace.src_factor, BlendFactor::One);
+        assert_eq!(replace.dst_factor, BlendFactor::Zero);
+        let preserve = alpha_blend_component(UiShaderAlphaBlend::Preserve, inherited);
+        assert_eq!(preserve.src_factor, BlendFactor::Zero);
+        assert_eq!(preserve.dst_factor, BlendFactor::One);
+        let over = alpha_blend_component(UiShaderAlphaBlend::Over, inherited);
+        assert_eq!(over.src_factor, BlendFactor::One);
+        assert_eq!(over.dst_factor, BlendFactor::OneMinusSrcAlpha);
+    }
+
     #[test]
     fn shader_parameter_tracks_validate_and_interpolate() {
         use crate::ui::UiShaderKeyframe::At;

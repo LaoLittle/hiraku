@@ -71,6 +71,10 @@ pub enum StageCommand {
 pub enum DialogueCommand {
     ClearText,
     Speed(f32),
+    Present {
+        speaker: String,
+        text: String,
+    },
     Say {
         speaker: String,
         text: String,
@@ -142,6 +146,12 @@ pub enum UiCommand {
 
 #[derive(Debug)]
 pub enum CharacterCommand {
+    Tint {
+        actor_id: String,
+        color: [f32; 4],
+        animation: super::AnimationSpec,
+        animation_id: Option<String>,
+    },
     Blur {
         actor_id: String,
         radius: f32,
@@ -186,6 +196,7 @@ pub enum AnimationCommand {
     Delay {
         duration: Duration,
         done: ScriptRequestId,
+        interruptible: bool,
     },
     Wait {
         ids: Vec<String>,
@@ -213,6 +224,7 @@ pub enum AudioCommand {
         animation_id: Option<String>,
     },
     PlayBgm {
+        channel: Option<String>,
         path: String,
         prelude: Option<String>,
         volume: f32,
@@ -225,6 +237,7 @@ pub enum AudioCommand {
         animation_id: Option<String>,
     },
     StopVoice,
+    VoicePaused(bool),
     PlayVoice {
         path: String,
         volume: f32,

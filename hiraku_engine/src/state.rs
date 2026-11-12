@@ -122,6 +122,8 @@ pub struct CameraSnapshot {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SceneSnapshot {
     #[serde(default)]
+    pub voice_paused: bool,
+    #[serde(default)]
     pub story_input_blocked: bool,
     #[serde(default)]
     pub input_permissions: crate::input::policy::InputPermissions,
@@ -135,6 +137,8 @@ pub struct SceneSnapshot {
     #[serde(default)]
     pub actor_blurs: BTreeMap<String, crate::script::actor_blur::ActorBlur>,
     #[serde(default)]
+    pub actor_tints: BTreeMap<String, crate::script::actor_tint::ActorTint>,
+    #[serde(default)]
     pub curtain: Option<CurtainSnapshot>,
     #[serde(default)]
     pub pictures: BTreeMap<String, crate::scene::pictures::PictureState>,
@@ -147,6 +151,8 @@ pub struct SceneSnapshot {
     pub character_catalog_names: BTreeMap<String, String>,
     pub overlay_alpha: f32,
     pub bgm: Option<AudioSnapshot>,
+    #[serde(default)]
+    pub music_channels: BTreeMap<String, AudioSnapshot>,
     pub dialogue: Option<DialogueSnapshot>,
     #[serde(default)]
     pub text_effect: TextEffectSnapshot,

@@ -501,6 +501,8 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<UiQuadMaterial>>()
             .add(UiQuadMaterial {
+                image_uv_rect: Vec4::new(0., 0., 1., 1.),
+                image_pixel_rect: None,
                 sampling: UVec4::ZERO,
                 color: LinearRgba::WHITE,
                 uv_u: Vec4::X,
@@ -513,6 +515,7 @@ mod tests {
                 texture3: Handle::default(),
                 shader: None,
                 blend: crate::ui::UiShaderBlend::Alpha,
+                alpha_blend: crate::ui::UiShaderAlphaBlend::Inherit,
             });
         let entity = app
             .world_mut()

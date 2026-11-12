@@ -134,6 +134,7 @@ impl StageLight {
         commands: &mut Commands,
         parent: Entity,
         shading: super::StageShading,
+        name: &str,
     ) {
         let StageLightKind::Spot {
             color: [r, g, b],
@@ -157,6 +158,16 @@ impl StageLight {
             ChildOf(parent),
             super::runtime::StageSurface,
             super::views::spatial_layer(),
+            super::lights::StageLightIdentity {
+                name: name.to_owned(),
+                authored: shading.light_color(Color::srgb(r, g, b)),
+            },
         ));
     }
+}
+
+pub(super) fn valid_light_color(color: [f32; 3]) -> bool {
+    color
+        .into_iter()
+        .all(|v| v.is_finite() && (0.0..=1.0).contains(&v))
 }

@@ -54,7 +54,7 @@ fn install_runtime_systems(app: &mut App) {
     app.add_systems(
         PostUpdate,
         (
-            advance_actor_blurs,
+            advance_actor_appearance,
             advance_group_fades,
             compose_groups,
             retire_hidden_groups,
@@ -67,17 +67,39 @@ fn install_runtime_systems(app: &mut App) {
     );
 }
 
-fn advance_actor_blurs(
+fn actor_color(tint: [f32; 4], opacity: f32, dissolve: bool) -> Color {
+    Color::srgba(
+        tint[0],
+        tint[1],
+        tint[2],
+        tint[3] * if dissolve { 1.0 } else { opacity },
+    )
+}
+
+fn advance_actor_appearance(
     time: crate::scene::playback::StoryTime,
     mut shared: ResMut<SceneSharedState>,
     mut animations: ResMut<AnimationState>,
     mut redraw: crate::redraw::Redraw,
 ) {
+    let delta = time.delta_secs();
+    if delta <= 0.0 || (!shared.0.actor_blurs.values().any(|blur| blur.elapsed < blur.animation.duration())
+        && !shared.0.actor_tints.values().any(|tint| tint.elapsed < tint.animation.duration())) {
+        return;
+    }
     for blur in shared.0.actor_blurs.values_mut() {
         if blur.elapsed < blur.animation.duration() {
             redraw.request();
-            if blur.advance(time.delta_secs()) {
+            if blur.advance(delta) {
                 complete_missing_animation(&mut animations, blur.animation_id.take());
+            }
+        }
+    }
+    for tint in shared.0.actor_tints.values_mut() {
+        if tint.elapsed < tint.animation.duration() {
+            redraw.request();
+            if tint.advance(delta) {
+                complete_missing_animation(&mut animations, tint.animation_id.take());
             }
         }
     }
@@ -439,6 +461,11 @@ fn compose_groups(
                 layer.bounds.max = (layer.bounds.max * size + Vec2::splat(blur)) / padded_size;
             }
         }
+        let tint = shared
+            .0
+            .actor_tints
+            .get(&identity.actor_id)
+            .map_or([1.0; 4], |tint| tint.color);
         let sprite = Sprite3d {
             blur,
             clip: shared.0.clips.actor(&identity.actor_id),
@@ -449,16 +476,7 @@ fn compose_groups(
             image: Some(image),
             layers,
             custom_size: Some(padded_size),
-            color: Color::linear_rgba(
-                1.0,
-                1.0,
-                1.0,
-                if group.dissolve.is_some() {
-                    1.0
-                } else {
-                    group.alpha
-                },
-            ),
+            color: actor_color(tint, group.alpha, group.dissolve.is_some()),
             ..default()
         };
         // Per-part layers order composition only. Actor ordering belongs to
@@ -723,6 +741,16 @@ fn build_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_tint_modulates_group_opacity_without_double_applying_dissolve() {
+        let tint = [1.0, 0.25, 0.5, 0.5];
+        let faded = actor_color(tint, 0.4, false).to_srgba();
+        assert_eq!(faded.green, 0.25);
+        assert_eq!(faded.alpha, 0.2);
+        let dissolved = actor_color(tint, 0.4, true).to_srgba();
+        assert_eq!(dissolved.alpha, 0.5);
+    }
 
     #[test]
     fn hidden_actor_cache_follows_execution_not_time_and_preserves_story_identity() {

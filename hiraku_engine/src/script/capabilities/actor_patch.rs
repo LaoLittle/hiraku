@@ -31,6 +31,19 @@ pub(super) fn apply(
     let scale: Option<f64> = field(&fields, "scaleValue")?;
     let focus: Option<bool> = field(&fields, "focused")?;
     let blur: Option<f64> = field(&fields, "blurValue")?;
+    let tint: Option<Vec<i64>> = field(&fields, "tintValue")?;
+    let tint = tint
+        .map(|channels| {
+            if channels.len() != 4 || channels.iter().any(|value| !(0..=255).contains(value)) {
+                return Err(NativeError::message(
+                    "Actor.tint requires four color bytes in 0..255",
+                ));
+            }
+            Ok(std::array::from_fn::<_, 4, _>(|i| {
+                channels[i] as f32 / 255.0
+            }))
+        })
+        .transpose()?;
     let rotation: Option<f64> = field(&fields, "rotationValue")?;
     let depth: Option<f64> = field(&fields, "depthValue")?;
     let clip: Option<Option<String>> = field(&fields, "clipValue")?;
@@ -52,7 +65,7 @@ pub(super) fn apply(
             "Actor.blur requires a finite, non-negative radius",
         ));
     }
-    let blur_only = blur.is_some()
+    let appearance_only = (blur.is_some() || tint.is_some())
         && expressions.is_empty()
         && position.is_none()
         && scale.is_none()
@@ -133,10 +146,10 @@ pub(super) fn apply(
     if let Some(amplitude) = jitter {
         native_api::native_actor_jitter(context, actor, amplitude, jitter_interval)?;
     }
-    if let Some(seconds) = seconds.filter(|_| hide_ms.is_none() && !blur_only) {
+    if let Some(seconds) = seconds.filter(|_| hide_ms.is_none() && !appearance_only) {
         native_api::actor_time(context, actor, seconds)?;
     }
-    if let Some(easing) = easing.filter(|_| !blur_only) {
+    if let Some(easing) = easing.filter(|_| !appearance_only) {
         native_api::actor_easing(context, actor, easing)?;
     }
     if let Some(hide_ms) = hide_ms {
@@ -157,10 +170,25 @@ pub(super) fn apply(
             animation,
         });
     }
-    if wait && blur_only {
+    if let Some(color) = tint {
+        let animation = AnimationSpec::Linear(0.3, false)
+            .with_time(seconds.unwrap_or(0.3))?
+            .with_easing(easing.unwrap_or(Easing::Linear))?;
+        let actor_id = context
+            .actor_mut(actor.0)
+            .map_err(|error| NativeError::message(error.to_string()))?
+            .display_instance
+            .clone();
+        context.commands.push(StoryEffect::ActorTint {
+            actor_id,
+            color,
+            animation,
+        });
+    }
+    if wait && appearance_only {
         context.await_effects = true;
     }
-    if wait && !blur_only {
+    if wait && !appearance_only {
         native_api::await_actor(context, actor)?;
     }
     context
@@ -172,6 +200,47 @@ pub(super) fn apply(
 mod tests {
     use super::*;
     use crate::script::{StoryRuntime, StoryRuntimeEvent};
+
+    #[test]
+    fn tint_uses_the_common_animation_wait_without_showing_or_moving() {
+        let code = compile_story_bytecode(
+            "test.hks",
+            r#"
+            let alice = char("alice")
+            alice.tint(255, 0, 0, 255).time(0.6).await()
+            alice.tint(255, 255, 255, 255).time(0)
+        "#,
+        )
+        .expect("typed tint API");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let Some(StoryRuntimeEvent::TaskEffect { task, effect }) = runtime.step().expect("tint")
+        else {
+            panic!("tint task")
+        };
+        assert!(
+            matches!(&effect, StoryEffect::ActorTint { actor_id, color, animation }
+            if actor_id == "alice" && *color == [1.0, 0.0, 0.0, 1.0] && animation.duration() == 0.6)
+        );
+        assert!(runtime.step().expect("waiting").is_none());
+        runtime
+            .complete_task_effect(task, &effect)
+            .expect("complete tint");
+        assert!(
+            matches!(runtime.step().expect("white"), Some(StoryRuntimeEvent::Effect(StoryEffect::ActorTint { color, .. })) if color == [1.0; 4])
+        );
+    }
+
+    #[test]
+    fn tint_rejects_out_of_range_bytes_before_submitting_effects() {
+        let code = compile_story_bytecode("test.hks", "char(\"alice\").tint(256, 0, 0, 255)")
+            .expect("integer signature");
+        let mut runtime = StoryRuntime::new(code).expect("runtime");
+        let error = runtime.step().expect_err("invalid color byte");
+        assert!(error.to_string().contains("0..255"));
+        assert!(
+            compile_story_bytecode("test.hks", "char(\"alice\").tint(\"red\", 0, 0, 255)").is_err()
+        );
+    }
 
     #[test]
     fn actor_local_blur_is_awaitable_without_changing_placement_or_showing() {

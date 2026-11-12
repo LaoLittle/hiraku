@@ -127,6 +127,17 @@ pub struct ExecutionRuntime {
 }
 
 impl ExecutionRuntime {
+    pub(super) fn entry_path(&self) -> Option<&str> {
+        self.program
+            .modules
+            .get(self.entry.0 as usize)?
+            .bytecode
+            .debug
+            .source
+            .as_ref()
+            .map(|source| source.path.as_str())
+    }
+
     pub(super) fn symbols(
         &self,
         execution: ExecutionId,
@@ -346,6 +357,23 @@ impl ExecutionRuntime {
     /// Drop a child continuation. External effects remain owned by the host.
     pub fn cancel_child(&mut self, execution: ExecutionId) -> bool {
         !execution.is_main() && self.executions.remove(&execution).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_with_callable(
+        &mut self,
+        callback: &Value,
+    ) -> Result<(), ExecutionRuntimeError> {
+        let replacement = self.spawn(callback, ExecutionMode::Interactive)?;
+        let mut state = self
+            .executions
+            .remove(&replacement)
+            .expect("newly spawned replacement execution exists");
+        state.mode = ExecutionMode::Main;
+        self.executions.clear();
+        self.executions.insert(ExecutionId::MAIN, state);
+        self.text_records.clear();
+        Ok(())
     }
 
     pub fn spawn(
@@ -885,6 +913,92 @@ fn globals_from_values(bytecode: &Bytecode, values: &[Value]) -> BTreeMap<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_abandons_a_host_wait_and_children_and_restores_captured_values() {
+        use hiraku_script::native::{HksCallable, NativeRegistry};
+        #[derive(Default)]
+        struct Context {
+            handler: Option<Value>,
+            values: Vec<i64>,
+        }
+        let mut natives = NativeRegistry::<Context>::new();
+        natives
+            .register_fn("install", |context: &mut Context, callback: HksCallable| {
+                context.handler = Some(callback.into_value());
+                Ok(())
+            })
+            .expect("install");
+        natives
+            .register_fn("hold", |_: &mut Context| Ok(()))
+            .expect("hold");
+        natives
+            .register_fn("record", |context: &mut Context, value: i64| {
+                context.values.push(value);
+                Ok(())
+            })
+            .expect("record");
+        let project = hiraku_script::compile_project(
+            vec![hiraku_script::ScriptSource {
+                path: "alice.hks".into(),
+                namespace: None,
+                source: r#"
+            let alice = .{ score: 5 }
+            install({ alice.score += 1; record(alice.score) })
+            hold()
+            record(99)
+        "#
+                .into(),
+            }],
+            &natives.manifest(),
+        )
+        .expect("program");
+        let code = crate::script::StoryProgram::Project {
+            entry: project.paths["alice.hks"],
+            program: project.program,
+        };
+        let mut runtime = ExecutionRuntime::new(code.clone()).expect("runtime");
+        let mut context = Context::default();
+        loop {
+            match runtime.step().expect("step") {
+                Some(ExecutionEvent::Call { execution, call }) => {
+                    if call.builtin == natives.manifest().resolve("hold").expect("hold id") {
+                        break;
+                    }
+                    let value = natives.call(&mut context, &call).expect("native");
+                    runtime.resume(execution, value).expect("resume");
+                }
+                Some(_) => (),
+                None => panic!("expected host wait"),
+            }
+        }
+        let callback = context.handler.as_ref().expect("callback");
+        let child = runtime
+            .spawn(callback, ExecutionMode::Interactive)
+            .expect("child");
+        runtime.pause(child).expect("pause child");
+        runtime.replace_with_callable(callback).expect("replace");
+        assert_eq!(runtime.executions.len(), 1);
+        assert!(runtime.executions.contains_key(&ExecutionId::MAIN));
+        let bytes = hiraku_script::bhson::to_vec(&runtime.snapshot()).expect("encode replacement");
+        let snapshot = hiraku_script::bhson::from_slice(&bytes).expect("decode replacement");
+        runtime = ExecutionRuntime::restore(code, snapshot).expect("restore replacement");
+        loop {
+            match runtime.step().expect("replacement step") {
+                Some(ExecutionEvent::Call { execution, call }) => {
+                    let value = natives.call(&mut context, &call).expect("native");
+                    runtime.resume(execution, value).expect("resume");
+                }
+                Some(ExecutionEvent::Completed { execution, .. }) => {
+                    assert!(execution.is_main());
+                    break;
+                }
+                Some(_) => (),
+                None => panic!("expected replacement completion"),
+            }
+        }
+        assert_eq!(context.values, [6]);
+    }
 
     #[test]
     fn project_callback_executes_in_its_owner_and_restores_host_wait() {

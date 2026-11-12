@@ -78,6 +78,7 @@ fn extract(
                 Option<&Mesh3d>,
                 Option<&MeshMaterial3d<StandardMaterial>>,
                 Option<&MeshMaterial3d<super::shading::GammaStageMaterial>>,
+                Option<&MeshMaterial3d<super::effects::StageEffectMaterial>>,
                 Option<&ViewVisibility>,
             ),
             With<super::runtime::StageSurface>,
@@ -115,9 +116,9 @@ fn extract(
                 .count();
             surfaces_ready = stage.ready(state) && cameras.len() == expected_views;
         }
-        for (entity, mesh, material, gamma_material, visibility) in &surfaces {
+        for (entity, mesh, material, gamma_material, effect_material, visibility) in &surfaces {
             if mesh.is_some()
-                && (material.is_some() || gamma_material.is_some())
+                && (material.is_some() || gamma_material.is_some() || effect_material.is_some())
                 && visibility.is_some_and(|visible| visible.get())
             {
                 visible_entities.push(entity);
@@ -129,6 +130,9 @@ fn extract(
                 materials.push(material.id().untyped());
             }
             if let Some(material) = gamma_material {
+                materials.push(material.id().untyped());
+            }
+            if let Some(material) = effect_material {
                 materials.push(material.id().untyped());
             }
         }

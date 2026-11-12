@@ -9,14 +9,36 @@ use crate::state::StoredValue;
 pub struct UiContext {
     story: BTreeMap<String, StoredValue>,
     preferences: crate::storage::UserSettings,
+    service_revisions: BTreeMap<&'static str, u64>,
+    countdowns: BTreeMap<String, std::time::Duration>,
 }
 
 impl UiContext {
+    pub(crate) fn countdown_remaining(&self, name: &str) -> Option<f64> {
+        self.countdowns
+            .get(name)
+            .map(std::time::Duration::as_secs_f64)
+    }
+
+    pub(crate) fn with_countdowns(
+        mut self,
+        countdowns: BTreeMap<String, std::time::Duration>,
+    ) -> Self {
+        self.countdowns = countdowns;
+        self
+    }
     pub fn new(story: BTreeMap<String, StoredValue>) -> Self {
         Self {
             story,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn service_revision(&self, service: &str) -> u64 {
+        self.service_revisions
+            .get(service)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Host settings are native context, not implicit script global declarations.
@@ -46,6 +68,8 @@ impl UiContext {
     }
 
     pub(crate) fn update_models(&mut self, models: &crate::ui::UiModels) {
+        self.service_revisions.clone_from(&models.service_revisions);
+        self.countdowns.clone_from(&models.countdowns);
         self.story.extend(
             models
                 .roots()

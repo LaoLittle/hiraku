@@ -135,12 +135,15 @@ pub(super) fn sync(
     for (name, view) in &state.views {
         let Some(preset) = &view.camera else { continue };
         let visible = view.alpha > 0.0 || view.fade.is_some();
-        let (pose, next) = view_camera(
+        let (mut pose, next) = view_camera(
             preset,
             camera_state
                 .as_ref()
                 .map(|state| state.view(crate::script::CameraEffectScope::World)),
         );
+        if let Some(shake) = &view.shake {
+            pose.translation += pose.rotation * shake.offset();
+        }
         if let Some(entities) = rendered.views.get_mut(name) {
             if refresh_targets {
                 let image = images.add(Image::new_target_texture(
@@ -237,6 +240,15 @@ pub(super) fn sync(
                 ChildOf(root),
             ))
             .id();
+        if stage
+            .definition
+            .as_ref()
+            .is_some_and(|definition| !definition.effects.is_empty())
+        {
+            commands
+                .entity(camera)
+                .insert(bevy::core_pipeline::prepass::DepthPrepass);
+        }
         if let Some(brightness) = ambient {
             commands.entity(camera).insert(AmbientLight {
                 brightness,

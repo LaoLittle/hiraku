@@ -130,6 +130,12 @@ pub mod stored_value {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SceneSnapshot {
+    #[prost(bool, tag = "22")]
+    pub voice_paused: bool,
+    #[prost(bytes = "vec", tag = "21")]
+    pub actor_tints_hson: Vec<u8>,
+    #[prost(btree_map = "string, message", tag = "20")]
+    pub music_channels: ::std::collections::BTreeMap<String, AudioSnapshot>,
     #[prost(bytes = "vec", tag = "19")]
     pub input_permissions_hson: Vec<u8>,
     #[prost(bool, tag = "18")]

@@ -138,11 +138,11 @@ pub fn validate_ui_document_with_arguments(
     let source = vfs.read_text(path).map_err(|error| error.to_string())?;
     let textures = texture::load_texture_catalog(&vfs).map_err(|error| error.to_string())?;
     let terms = glossary::load_term_catalog(&vfs).map_err(|error| error.to_string())?;
-    script::evaluate_ui_component_named_with_args(
+    let screen = script::evaluate_ui_component_named_with_args(
         path, &source, context, &textures, &terms, arguments,
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    scene::ui_tracks::validate_document(&vfs, &screen.children)
 }
 
 use std::sync::Arc;
@@ -312,6 +312,8 @@ impl Plugin for HirakuPlugin {
             std::path::PathBuf::from(&app.world().resource::<RuntimeLaunchConfig>().asset_root);
 
         app.init_asset::<HdpArchive>()
+            .init_asset::<scene::ui_tracks::UiTracks>()
+            .init_asset_loader::<scene::ui_tracks::UiTracksLoader>()
             .init_asset::<BytesAsset>()
             .init_asset::<TextureAtlasLayout>()
             .add_audio_source::<audio::PreludeLoopAudio>()
@@ -412,11 +414,15 @@ impl Plugin for HirakuPlugin {
             )
             .add_systems(
                 PreUpdate,
-                scene::clock::advance.in_set(HirakuRuntimeSystems),
+                (scene::clock::advance, scene::clock::advance_story_timers)
+                    .chain()
+                    .in_set(HirakuRuntimeSystems),
             )
             .add_systems(
                 Update,
-                scene::clock::pause_voices.in_set(HirakuRuntimeSystems),
+                scene::clock::pause_voices
+                    .after(process_script_commands)
+                    .in_set(HirakuRuntimeSystems),
             )
             .add_message::<input::HirakuTextInput>()
             .init_resource::<input::HirakuTextFocus>()
@@ -431,8 +437,10 @@ impl Plugin for HirakuPlugin {
             .add_systems(
                 Update,
                 (
+                    scene::ui_tracks::attach,
                     scene::screen_ui::cleanup_ui_sounds,
                     scene::ui_timers::pressed_changes,
+                    scene::ui_timers::actions,
                     scene::ui_timers::update,
                     scene::ui_timers::tick,
                 )

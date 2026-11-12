@@ -13,6 +13,41 @@ pub struct DialogueState {
     pub effect: DialogueTextEffect,
 }
 
+impl DialogueState {
+    pub(super) fn set_fast_forward(&mut self, enabled: bool) {
+        self.fast_forward_enabled = enabled;
+        self.fast_forward_elapsed = 0.0;
+        if enabled {
+            self.auto_enabled = false;
+        } else {
+            self.fast_forward_held = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod playback_control_tests {
+    use super::DialogueState;
+
+    #[test]
+    fn cancelling_fast_forward_clears_toggle_hold_and_elapsed() {
+        let mut state = DialogueState {
+            fast_forward_enabled: true,
+            fast_forward_held: true,
+            fast_forward_elapsed: 0.5,
+            ..Default::default()
+        };
+        state.set_fast_forward(false);
+        assert!(!state.fast_forward_enabled);
+        assert!(!state.fast_forward_held);
+        assert_eq!(state.fast_forward_elapsed, 0.0);
+        state.auto_enabled = true;
+        state.set_fast_forward(true);
+        assert!(state.fast_forward_enabled);
+        assert!(!state.auto_enabled);
+    }
+}
+
 #[derive(Resource)]
 pub struct DialogueHistoryState {
     pub entries: Vec<DialogueSnapshot>,
@@ -383,6 +418,7 @@ pub fn advance_dialogue_on_input(
         Option<Res<ScriptRuntimeState>>,
         Option<Res<crate::dependencies::ScriptDependencies>>,
         Option<Res<SceneSharedState>>,
+        Option<ResMut<super::animation_runtime::PendingWaits>>,
     ),
     mut actions: MessageReader<crate::input::HirakuActionInput>,
     mut clicks: MessageReader<PointerClick>,
@@ -398,10 +434,11 @@ pub fn advance_dialogue_on_input(
     preferences: Res<UserSettings>,
     voices: Res<VoiceState>,
 ) {
-    let (runtime, dependencies, scene) = execution;
-    let action_advance = actions
-        .read()
-        .any(|action| action.0 == crate::input::HirakuAction::NextDialogue);
+    let (runtime, dependencies, scene, mut waits) = execution;
+    let mut action_advance = false;
+    for action in actions.read() {
+        action_advance |= action.0 == crate::input::HirakuAction::NextDialogue;
+    }
     let mut pointer_advance = false;
     for click in clicks.read() {
         // Bevy UI picking decides which surface owns the click. Never infer
@@ -414,7 +451,9 @@ pub fn advance_dialogue_on_input(
     // Always drain both readers above so input produced while a modal is open
     // cannot be replayed after it closes.
     if scene.is_some_and(|scene| scene.0.story_input_blocked || !scene.0.input_permissions.advance)
-        || runtime.is_some_and(|runtime| runtime.restore_pending)
+        || runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.restore_pending)
         || !crate::storage::storage_ready()
         || dependencies.is_some_and(|d| d.loading)
         || choice_state.waiting.is_some()
@@ -441,6 +480,19 @@ pub fn advance_dialogue_on_input(
     if advance {
         dialogue_state.fast_forward_enabled = false;
         dialogue_state.fast_forward_held = false;
+        if let Some(request) = runtime.as_ref().and_then(|runtime| runtime.wait_request)
+            && let Some(wait) = waits.as_mut().and_then(|waits| waits.interrupt(request))
+        {
+            if let Some(id) = wait.animation_id {
+                animations.completed.insert(id);
+            }
+            responses.write(ScriptResponseMessage {
+                request: wait.done,
+                response: ScriptResponse::Continue,
+            });
+            redraw.request();
+            return;
+        }
     }
     let skipping = dialogue_state.fast_forward_enabled || dialogue_state.fast_forward_held;
     if skipping && dialogue_state.waiting.is_some() {
@@ -802,6 +854,80 @@ pub(super) fn complete_dialogue_wait(
 #[cfg(test)]
 mod preference_tests {
     use super::*;
+
+    #[test]
+    fn advance_interrupts_foreground_delay_without_advancing_dialogue_or_background_waits() {
+        use super::super::animation_runtime::{PendingWait, PendingWaits};
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<DialogueState>()
+            .init_resource::<AnimationState>()
+            .init_resource::<PendingWaits>()
+            .init_resource::<ScriptRuntimeState>()
+            .init_resource::<ChoiceState>()
+            .init_resource::<ScreenUiState>()
+            .init_resource::<VoiceState>()
+            .init_resource::<UserSettings>()
+            .add_message::<crate::input::HirakuActionInput>()
+            .add_message::<PointerClick>()
+            .add_message::<ScriptResponseMessage>()
+            .add_systems(Update, advance_dialogue_on_input);
+        app.world_mut()
+            .resource_mut::<ScriptRuntimeState>()
+            .wait_request = Some(ScriptRequestId(2));
+        for (request, interruptible) in [(1, false), (2, true), (3, true)] {
+            app.world_mut()
+                .resource_mut::<PendingWaits>()
+                .items
+                .push(PendingWait {
+                    timer: Timer::new(std::time::Duration::from_secs(1), TimerMode::Once),
+                    animation_id: None,
+                    done: ScriptRequestId(request),
+                    interruptible,
+                });
+        }
+        app.world_mut().resource_mut::<DialogueState>().waiting = Some(PendingDialogueAdvance {
+            animation_id: Some("alice/dialogue".into()),
+            request: None,
+        });
+        let modal = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = Some(modal);
+        for _ in 0..2 {
+            app.world_mut()
+                .write_message(crate::input::HirakuActionInput(
+                    crate::input::HirakuAction::NextDialogue,
+                ));
+        }
+        app.update();
+        assert_eq!(app.world().resource::<PendingWaits>().items.len(), 3);
+        app.world_mut().resource_mut::<ScreenUiState>().active_root = None;
+        app.update();
+        assert_eq!(app.world().resource::<PendingWaits>().items.len(), 3);
+        app.world_mut()
+            .write_message(crate::input::HirakuActionInput(
+                crate::input::HirakuAction::NextDialogue,
+            ));
+        app.update();
+        app.update();
+        assert!(app.world().resource::<DialogueState>().waiting.is_some());
+        assert_eq!(
+            app.world()
+                .resource::<PendingWaits>()
+                .items
+                .iter()
+                .map(|wait| wait.done)
+                .collect::<Vec<_>>(),
+            vec![ScriptRequestId(1), ScriptRequestId(3)]
+        );
+        let mut reader = bevy::ecs::message::MessageCursor::<ScriptResponseMessage>::default();
+        assert_eq!(
+            reader
+                .read(app.world().resource::<Messages<ScriptResponseMessage>>())
+                .map(|response| response.request)
+                .collect::<Vec<_>>(),
+            vec![ScriptRequestId(2)]
+        );
+    }
 
     #[test]
     fn fast_forward_reveals_and_completes_one_dialogue_wait() {

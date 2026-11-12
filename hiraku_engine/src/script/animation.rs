@@ -458,6 +458,27 @@ pub fn register_animation_api<C: 'static>(
     registry: &mut NativeRegistry<C>,
 ) -> Result<(), RegistrationError> {
     Easing::register_hks(registry)?;
+    let receiver = <Easing as hiraku_script::native::HksScriptType>::hks_script_type(registry);
+    let evaluate = registry.register_selector_fn(
+        "Easing",
+        "evaluate",
+        |_: &mut C, curve: Easing, progress: f64| {
+            curve.validate()?;
+            if !progress.is_finite() {
+                return Err(NativeError::message("easing progress must be finite"));
+            }
+            Ok(curve.sample(progress as f32) as f64)
+        },
+    )?;
+    registry.set_signature(
+        evaluate,
+        hiraku_script::FunctionSignature {
+            receiver: Some(receiver),
+            parameters: vec![hiraku_script::ScriptType::Float],
+            variadic: None,
+            result: hiraku_script::ScriptType::Float,
+        },
+    )?;
     AnimationPhase::register_hks(registry)?;
     Ok(())
 }

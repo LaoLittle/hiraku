@@ -1,8 +1,13 @@
 //! Data-driven 3D stages. Anchors and camera presets are scene data, not
 //! story-specific trial mechanics. Explicit views allocate on-demand cameras.
 mod animation;
+mod shake;
+pub use shake::StageCameraShake;
 mod definition;
 pub use animation::{StageAnimation, StagePlayback};
+mod effects;
+mod lights;
+pub use effects::{StageEffect, StageEffectPlayback, StageEffectQuad, StageEmission};
 mod model;
 mod shading;
 pub use model::{StageAlpha, StageLight, StageLightKind, StageMaterial};
@@ -26,6 +31,7 @@ pub struct StagePlugin;
 impl Plugin for StagePlugin {
     fn build(&self, app: &mut App) {
         shading::register(app);
+        effects::register(app);
         redraw::register(app);
         app.init_asset::<StageDefinition>()
             .init_asset_loader::<StageLoader>();
@@ -46,6 +52,12 @@ impl Plugin for StagePlugin {
         app.add_systems(
             PostUpdate,
             runtime::prepare_surfaces.run_if(crate::runtime_initialized),
+        );
+        app.add_systems(
+            PostUpdate,
+            lights::sync
+                .after(runtime::prepare_surfaces)
+                .run_if(crate::runtime_initialized),
         );
         app.add_systems(
             PostUpdate,
@@ -106,6 +118,39 @@ impl AssetLoader for StageLoader {
                 .map_err(|error| StageError::Invalid(error.to_string()))?;
             stage.animation_handles.push(context.load(path));
         }
+        for effect in stage.effects.values_mut() {
+            let shader = context
+                .path()
+                .resolve_embed_str(&effect.shader)
+                .map_err(|error| StageError::Invalid(error.to_string()))?;
+            let shader = context.load(shader);
+            stage.effect_shaders.push(shader.clone());
+            effect.shader_handle = Some(shader);
+            for path in &effect.textures {
+                let path = context
+                    .path()
+                    .resolve_embed_str(path)
+                    .map_err(|error| StageError::Invalid(error.to_string()))?;
+                let image = context
+                    .load_builder()
+                    .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+                        settings.is_srgb = false;
+                        settings.sampler = bevy::image::ImageSampler::Descriptor(
+                            bevy::image::ImageSamplerDescriptor {
+                                address_mode_u: bevy::image::ImageAddressMode::Repeat,
+                                address_mode_v: bevy::image::ImageAddressMode::Repeat,
+                                mag_filter: bevy::image::ImageFilterMode::Linear,
+                                min_filter: bevy::image::ImageFilterMode::Linear,
+                                mipmap_filter: bevy::image::ImageFilterMode::Linear,
+                                ..default()
+                            },
+                        );
+                    })
+                    .load(path);
+                stage.effect_images.push(image.clone());
+                effect.texture_handles.push(image);
+            }
+        }
         Ok(stage)
     }
 
@@ -130,6 +175,14 @@ impl StageDefinition {
         if self.scene.is_some() && self.scene_handle.is_none() {
             return Err(StageError::Invalid(
                 "stage scene must be loaded through AssetServer before instantiation".into(),
+            ));
+        }
+        if self.effects.values().any(|effect| {
+            effect.shader_handle.is_none() || effect.texture_handles.len() != effect.textures.len()
+        }) {
+            return Err(StageError::Invalid(
+                "stage effect dependencies must be loaded through AssetServer before instantiation"
+                    .into(),
             ));
         }
         let root = commands

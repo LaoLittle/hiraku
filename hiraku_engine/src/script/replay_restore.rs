@@ -106,6 +106,12 @@ pub(super) fn prepare(
                 _ => (),
             }
         }
+        // The recorded deadline replaces this host wait, not its response.
+        // Leave animations suspended too: completing them here would execute
+        // script statements which never ran before the live interruption.
+        if story.replay_deadline_due() {
+            continue;
+        }
         if let Some(point) = boundary(&path, &mut dialogue, &event)? {
             if cursor.exhausted() {
                 cursor.finish(&point).map_err(|e| e.to_string())?;
@@ -353,6 +359,62 @@ mod tests {
             }
         }
         panic!("fixture did not reach destination");
+    }
+
+    #[test]
+    fn replayed_deadline_replaces_delay_animation_and_unanswered_ui_without_a_fake_response() {
+        use crate::script::replay::ReplayJournal;
+        for wait in [
+            "sleep(30)",
+            "camera().zoom(0.5).time(30).await()",
+            "ui.open(\"alice.ui.hks\")",
+        ] {
+            let source = format!(
+                "clock.countdown(1).gotoOnExpire(\"bob.hks\")\n{wait}\n\"must not execute\""
+            );
+            let vfs = fixture(&[("alice.hks", &source), ("bob.hks", "\"Bob\"")]);
+            let path = "hdp://fixture.hdp/alice.hks";
+            let mut live = create(&vfs, path).expect("live runtime");
+            assert!(live.step().expect("initial wait").is_some());
+            live.advance_time(std::time::Duration::from_secs(2));
+            assert!(matches!(
+                live.step().expect("expiry"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(_)))
+            ));
+            let mut journal = ReplayJournal::recording(path.into());
+            for (signature, value) in live.take_native_trace().0 {
+                journal.input(
+                    InputKind::Native,
+                    ReplayPoint {
+                        script: path.into(),
+                        signature,
+                    },
+                    value,
+                );
+            }
+            let destination = "hdp://fixture.hdp/bob.hks";
+            let mut bob = create(&vfs, destination).expect("destination runtime");
+            let mut dialogue = String::new();
+            for _ in 0..8 {
+                let event = bob.step().expect("destination event").expect("dialogue");
+                if let Some(point) =
+                    boundary(destination, &mut dialogue, &event).expect("destination point")
+                {
+                    journal.destination = Some(point);
+                    break;
+                }
+            }
+            let mut save = SaveGameData {
+                resume_script: destination.into(),
+                replay: Some(journal),
+                ..Default::default()
+            };
+            let bootstrap = ScriptBootstrap::take_from_save(&mut save).expect("bootstrap");
+            let program = bob.program_for_path(destination).expect("linked program");
+            let (bootstrap, _, _) = prepare(&vfs, bootstrap, &UserSettings::default(), program)
+                .expect("replay interruption");
+            assert_eq!(bootstrap.startup_script, destination);
+        }
     }
 
     #[test]

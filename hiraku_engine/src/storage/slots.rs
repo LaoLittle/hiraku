@@ -62,6 +62,33 @@ pub fn save_slot_exists(slot: &str) -> Result<bool, StorageError> {
     slot_exists_at(&root, slot)
 }
 
+pub fn delete_save_slot(slot: &str) -> Result<(), StorageError> {
+    delete_slot_at(&save_root_path(), slot)
+}
+
+fn delete_slot_at(root: &Path, slot: &str) -> Result<(), StorageError> {
+    let key = index_key(slot)?;
+    let index = match read_index(root, slot) {
+        Ok(index) => index,
+        Err(StorageError::InvalidSave(_) | StorageError::HsonData(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let mut records = vec![hiraku_storage::RemovalRecord {
+        key,
+        extension: "hson".into(),
+    }];
+    if let Some(index) = index {
+        for (kind, extension) in [("snapshot", "sav"), ("thumbnail", "png")] {
+            records.push(hiraku_storage::RemovalRecord {
+                key: format!("{kind}-{}", index.generation),
+                extension: extension.into(),
+            });
+        }
+    }
+    save_storage(root).enqueue_remove(records)?;
+    Ok(())
+}
+
 fn slot_exists_at(root: &Path, slot: &str) -> Result<bool, StorageError> {
     Ok(store(root, "hson").contains(&index_key(slot)?)?)
 }
@@ -107,6 +134,11 @@ pub fn write_save_data_to_root(
     data: &SaveGameData,
 ) -> Result<(), StorageError> {
     let key = index_key(slot)?;
+    let previous = match read_index(root, slot) {
+        Ok(index) => index,
+        Err(StorageError::InvalidSave(_) | StorageError::HsonData(_)) => None,
+        Err(error) => return Err(error),
+    };
     let generation = uuid::Uuid::new_v4().simple().to_string();
     let index = SlotIndex {
         format: 1,
@@ -136,6 +168,22 @@ pub fn write_save_data_to_root(
         payload: hson::to_vec(&index).map_err(|error| StorageError::HsonData(error.to_string()))?,
     });
     save_storage(root).enqueue_generation(records)?;
+    if let Some(previous) = previous {
+        let retired = [("snapshot", "sav"), ("thumbnail", "png")]
+            .into_iter()
+            .map(|(kind, extension)| hiraku_storage::RemovalRecord {
+                key: format!("{kind}-{}", previous.generation),
+                extension: extension.into(),
+            })
+            .collect();
+        // The publication precedes reclamation in the storage queue. Never
+        // remove the old generation before a replacement has been published.
+        if let Err(error) = save_storage(root).enqueue_remove(retired) {
+            bevy::log::warn!(
+                "slot `{slot}` was saved, but its retired generation could not be reclaimed: {error}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -145,6 +193,117 @@ mod tests {
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("hiraku-slots-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn repeated_overwrite_reclaims_only_the_replaced_generation_and_its_preview() {
+        let root = temp_root();
+        let mut data = SaveGameData {
+            thumbnail_png: vec![137, 80, 78, 71],
+            ..Default::default()
+        };
+        write_save_data_to_root(&root, "bob", &data).expect("independent slot");
+        let bob = require_index(&root, "bob").expect("independent generation");
+        write_save_data_to_root(&root, "alice", &data).expect("initial generation");
+        for _ in 0..8 {
+            let previous = require_index(&root, "alice").expect("previous index");
+            write_save_data_to_root(&root, "alice", &data).expect("publish before reclaiming");
+            let current = require_index(&root, "alice").expect("current index");
+            assert_ne!(current.generation, previous.generation);
+            assert!(load_save_data_from_root(&root, "alice").is_ok());
+            assert_eq!(
+                thumbnail_from_root(&root, "alice").expect("current preview"),
+                data.thumbnail_png
+            );
+            assert!(
+                !root
+                    .join(format!("snapshot-{}.sav", previous.generation))
+                    .exists()
+            );
+            assert!(
+                !root
+                    .join(format!("thumbnail-{}.png", previous.generation))
+                    .exists()
+            );
+            assert!(
+                root.join(format!("snapshot-{}.sav", bob.generation))
+                    .exists()
+            );
+            assert!(
+                root.join(format!("thumbnail-{}.png", bob.generation))
+                    .exists()
+            );
+        }
+        let previous = require_index(&root, "alice").expect("last illustrated generation");
+        data.thumbnail_png.clear();
+        write_save_data_to_root(&root, "alice", &data).expect("overwrite without a preview");
+        assert!(
+            thumbnail_from_root(&root, "alice")
+                .expect("empty preview")
+                .is_empty()
+        );
+        assert!(
+            !root
+                .join(format!("thumbnail-{}.png", previous.generation))
+                .exists()
+        );
+        assert_eq!(std::fs::read_dir(&root).expect("test directory").count(), 5);
+        std::fs::remove_dir_all(root).expect("remove synthetic generations");
+    }
+
+    #[test]
+    fn a_cleanup_error_does_not_report_a_published_replacement_as_a_failed_save() {
+        let root = temp_root();
+        let data = SaveGameData::default();
+        write_save_data_to_root(&root, "alice", &data).expect("initial slot");
+        let previous = require_index(&root, "alice").expect("initial index");
+        let old_snapshot = root.join(format!("snapshot-{}.sav", previous.generation));
+        std::fs::remove_file(&old_snapshot).expect("remove synthetic payload");
+        std::fs::create_dir(&old_snapshot)
+            .expect("simulate an obsolete payload that cannot be unlinked");
+        write_save_data_to_root(&root, "alice", &data)
+            .expect("replacement was published successfully");
+        let current = require_index(&root, "alice").expect("replacement index");
+        assert_ne!(current.generation, previous.generation);
+        assert!(load_save_data_from_root(&root, "alice").is_ok());
+        std::fs::remove_dir_all(root).expect("remove synthetic generations");
+    }
+
+    #[test]
+    fn deleting_a_slot_removes_its_generation_without_decoding_or_touching_other_slots() {
+        let root = temp_root();
+        let data = SaveGameData {
+            thumbnail_png: vec![137, 80, 78, 71],
+            ..Default::default()
+        };
+        for slot in ["alice", "bob"] {
+            write_save_data_to_root(&root, slot, &data).expect("write synthetic slot");
+        }
+        let index = require_index(&root, "alice").expect("slot index");
+        store(&root, "sav")
+            .enqueue_write(&format!("snapshot-{}", index.generation), b"corrupt")
+            .expect("corrupt synthetic snapshot");
+        delete_slot_at(&root, "alice").expect("delete without decoding snapshot");
+        assert!(!slot_exists_at(&root, "alice").expect("deleted index"));
+        assert!(
+            !store(&root, "sav")
+                .contains(&format!("snapshot-{}", index.generation))
+                .expect("deleted snapshot")
+        );
+        assert!(slot_exists_at(&root, "bob").expect("other slot retained"));
+        assert!(
+            !store(&root, "png")
+                .contains(&format!("thumbnail-{}", index.generation))
+                .expect("deleted preview")
+        );
+        delete_slot_at(&root, "alice").expect("repeated deletion is idempotent");
+        assert!(delete_slot_at(&root, "../bob").is_err());
+        store(&root, "hson")
+            .enqueue_write(&index_key("alice").expect("key"), b"corrupt")
+            .expect("corrupt synthetic index");
+        delete_slot_at(&root, "alice").expect("delete malformed index");
+        assert!(!slot_exists_at(&root, "alice").expect("malformed slot removed"));
+        std::fs::remove_dir_all(&root).expect("remove synthetic test directory");
     }
 
     #[test]

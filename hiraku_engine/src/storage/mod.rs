@@ -28,7 +28,7 @@ mod snapshots;
 mod user_settings;
 pub(crate) use runtime::{initialize_runtime_storage, poll_runtime_storage, storage_ready};
 pub use slots::{
-    load_save_data, load_save_metadata, load_save_thumbnail, save_slot_exists,
+    delete_save_slot, load_save_data, load_save_metadata, load_save_thumbnail, save_slot_exists,
     write_save_data_to_root,
 };
 pub use user_settings::{PreferenceChange, UserSettings, read_user_settings, write_user_settings};
@@ -334,10 +334,13 @@ impl From<&SceneSnapshot> for proto::SceneSnapshot {
     fn from(scene: &SceneSnapshot) -> Self {
         Self {
             story_input_blocked: scene.story_input_blocked,
+            voice_paused: scene.voice_paused,
             input_permissions_hson: hson::to_vec(&scene.input_permissions)
                 .expect("serializable input permissions"),
             actor_blurs_hson: hson::to_vec(&scene.actor_blurs)
                 .expect("serializable actor blur timelines"),
+            actor_tints_hson: hson::to_vec(&scene.actor_tints)
+                .expect("serializable actor tint timelines"),
             post_process_hson: hson::to_vec(&scene.post_process)
                 .expect("serializable layer effects"),
             spatial_stage_hson: hson::to_vec(&scene.spatial_stage)
@@ -370,6 +373,11 @@ impl From<&SceneSnapshot> for proto::SceneSnapshot {
                 .collect(),
             overlay_alpha: scene.overlay_alpha,
             bgm: scene.bgm.as_ref().map(Into::into),
+            music_channels: scene
+                .music_channels
+                .iter()
+                .map(|(name, audio)| (name.clone(), audio.into()))
+                .collect(),
             dialogue: scene.dialogue.as_ref().map(Into::into),
             text_effect: Some((&scene.text_effect).into()),
             camera: Some((&scene.camera).into()),
@@ -383,6 +391,7 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
     fn try_from(scene: proto::SceneSnapshot) -> Result<Self, Self::Error> {
         Ok(Self {
             story_input_blocked: scene.story_input_blocked,
+            voice_paused: scene.voice_paused,
             input_permissions: if scene.input_permissions_hson.is_empty() {
                 Default::default()
             } else {
@@ -424,6 +433,20 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
                 }
                 blurs
             },
+            actor_tints: {
+                let tints: BTreeMap<String, crate::script::actor_tint::ActorTint> =
+                    if scene.actor_tints_hson.is_empty() {
+                        BTreeMap::new()
+                    } else {
+                        hson::from_slice(&scene.actor_tints_hson).map_err(|error| {
+                            StorageError::InvalidSave(format!("invalid actor tint state: {error}"))
+                        })?
+                    };
+                for tint in tints.values() {
+                    tint.validate().map_err(StorageError::InvalidSave)?;
+                }
+                tints
+            },
             actor_depths: scene.actor_depths,
             clips: hson::from_slice(&scene.clips_hson).map_err(|error| {
                 StorageError::InvalidSave(format!("invalid clip state: {error}"))
@@ -460,6 +483,11 @@ impl TryFrom<proto::SceneSnapshot> for SceneSnapshot {
                 .collect(),
             overlay_alpha: scene.overlay_alpha,
             bgm: scene.bgm.map(Into::into),
+            music_channels: scene
+                .music_channels
+                .into_iter()
+                .map(|(name, audio)| (name, audio.into()))
+                .collect(),
             dialogue: scene.dialogue.map(Into::into),
             text_effect: scene.text_effect.map(Into::into).unwrap_or_default(),
             camera: scene
@@ -695,6 +723,7 @@ mod tests {
     fn instance_catalog_identity_survives_scene_storage() {
         let mut scene = SceneSnapshot::default();
         scene.story_input_blocked = true;
+        scene.voice_paused = true;
         scene.input_permissions.auto = false;
         scene.input_permissions.pause = false;
         let mut blur = crate::script::actor_blur::ActorBlur::new(
@@ -729,6 +758,7 @@ mod tests {
         let decoded = proto::SceneSnapshot::decode(wire.as_slice()).expect("scene wire format");
         let restored = SceneSnapshot::try_from(decoded).expect("scene restore");
         assert!(restored.story_input_blocked);
+        assert!(restored.voice_paused);
         assert_eq!(restored.input_permissions, scene.input_permissions);
         assert_eq!(
             restored.character_catalog_names,

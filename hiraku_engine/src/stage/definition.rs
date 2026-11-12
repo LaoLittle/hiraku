@@ -156,6 +156,14 @@ impl StageCameraPose {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StageDefinition {
     pub scene: Option<String>,
+    #[serde(default)]
+    pub effects: BTreeMap<String, super::StageEffect>,
+    #[serde(skip)]
+    #[dependency]
+    pub(super) effect_shaders: Vec<Handle<Shader>>,
+    #[serde(skip)]
+    #[dependency]
+    pub(super) effect_images: Vec<Handle<Image>>,
     /// Named model clips and optional material opacity curves, in seconds.
     #[serde(default)]
     pub animations: BTreeMap<String, super::animation::StageAnimation>,
@@ -193,6 +201,11 @@ pub struct StageDefinition {
 }
 impl StageDefinition {
     pub fn validate(&self) -> Result<(), String> {
+        for (name, effect) in &self.effects {
+            if name.trim().is_empty() || !effect.validate() {
+                return Err(format!("invalid stage effect `{name}`"));
+            }
+        }
         if !self.animations.is_empty() && self.scene.is_none() {
             return Err("stage animations require a model scene".into());
         }

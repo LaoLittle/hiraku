@@ -7,6 +7,7 @@ pub(crate) struct Presentation {
     pub effects: Vec<StoryEffect>,
     pub dialogue: Option<crate::state::DialogueSnapshot>,
     pub actor_blurs: std::collections::BTreeMap<String, crate::script::actor_blur::ActorBlur>,
+    pub actor_tints: std::collections::BTreeMap<String, crate::script::actor_tint::ActorTint>,
     pictures: std::collections::BTreeMap<String, crate::scene::pictures::PictureState>,
 }
 
@@ -22,7 +23,7 @@ impl Presentation {
         use StoryEffect::*;
         let instant = super::super::animation::AnimationSpec::Linear(0.0, false);
         match &mut effect {
-            Say { speaker, text } => {
+            Say { speaker, text } | PresentDialogue { speaker, text } => {
                 self.dialogue = Some(crate::state::DialogueSnapshot {
                     speaker: speaker.clone(),
                     text: text.clone(),
@@ -58,6 +59,15 @@ impl Presentation {
                 self.actor_blurs.insert(actor_id.clone(), blur);
                 return Ok(());
             }
+            ActorTint {
+                actor_id, color, ..
+            } => {
+                let mut tint =
+                    crate::script::actor_tint::ActorTint::new(*color, *color, instant, None);
+                tint.advance(0.0);
+                self.actor_tints.insert(actor_id.clone(), tint);
+                return Ok(());
+            }
             SetBackground { fade_in_ms, .. } | PlayBgm { fade_in_ms, .. } => *fade_in_ms = None,
             SetCurtain { fade_ms, .. } => *fade_ms = None,
             SetCamera { duration_ms, .. } => *duration_ms = 0,
@@ -65,12 +75,16 @@ impl Presentation {
                 Spatial::Open { path: target, .. } => {
                     *target = vfs.0.resolve_path(Some(path), target)
                 }
-                Spatial::Camera { animation, .. } | Spatial::View { animation, .. } => {
-                    *animation = instant
-                }
+                Spatial::Camera { animation, .. }
+                | Spatial::View { animation, .. }
+                | Spatial::Shake { animation, .. } => *animation = instant,
                 Spatial::Play { looping: false, .. } => return Ok(()),
                 Spatial::Play { looping: true, .. } => (),
-                Spatial::Close { .. } | Spatial::Place { .. } | Spatial::Clip { .. } => (),
+                Spatial::Close { .. }
+                | Spatial::Place { .. }
+                | Spatial::Clip { .. }
+                | Spatial::LightColor { .. } => (),
+                Spatial::Effect { .. } => (),
             },
             Picture(command) => match command {
                 Picture::Show { seconds, .. }
@@ -92,9 +106,11 @@ impl Presentation {
             | Clip(_)
             | SetActorDepth { .. }
             | StopActorMotion { .. }
-            | DialogueSpeed(_) => (),
+            | DialogueSpeed(_)
+            | VoicePaused(_) => (),
             // Input, persistence, transient audio and notifications must not be replayed into ECS.
             ShakeCamera { .. }
+            | FastForward(_)
             | MovieBackground { .. }
             | StopMovie
             | Log(_)

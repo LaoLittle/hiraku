@@ -57,11 +57,31 @@ pub struct ScriptRuntimeState {
 }
 
 impl ScriptRuntimeState {
+    pub(crate) fn overlay_matches(
+        &self,
+        name: &str,
+        component: &str,
+        arguments: &[crate::state::StoredValue],
+    ) -> bool {
+        self.mounted_ui_overlays
+            .get(name)
+            .is_some_and(|overlay| overlay.component == component && overlay.arguments == arguments)
+    }
+
+    pub(crate) fn cancel_pending_requests(&mut self) {
+        self.pending_ui_screen = None;
+        self.pending_ui_arguments.clear();
+        self.wait_request = None;
+        self.response_inbox.clear();
+        self.task_requests.clear();
+    }
+
     pub(crate) fn restore_presentation(&mut self, scene: &mut crate::state::SceneSnapshot) {
         if let Some(presentation) = self.recovered_presentation.take() {
             *scene = crate::state::SceneSnapshot {
                 dialogue: presentation.dialogue,
                 actor_blurs: presentation.actor_blurs,
+                actor_tints: presentation.actor_tints,
                 ..Default::default()
             };
             self.restore_batch_size = presentation.effects.len();
@@ -86,8 +106,11 @@ impl ScriptRuntimeState {
     }
 
     pub fn accept_response(&mut self, message: ScriptResponseMessage) {
-        self.response_inbox
-            .insert(message.request, message.response);
+        if self.wait_request == Some(message.request) {
+            self.response_inbox
+                .entry(message.request)
+                .or_insert(message.response);
+        }
     }
 
     pub fn take_response(&mut self, request: ScriptRequestId) -> Option<ScriptResponse> {
@@ -99,6 +122,25 @@ impl ScriptRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_overlay_identity_includes_component_and_arguments() {
+        use crate::state::{MountedUiOverlay, StoredValue};
+        let mut runtime = ScriptRuntimeState::default();
+        let arguments = vec![StoredValue::Int(1)];
+        runtime.mounted_ui_overlays.insert(
+            "alice".into(),
+            MountedUiOverlay {
+                component: "alice.ui.hks".into(),
+                arguments: arguments.clone(),
+            },
+        );
+        assert!(runtime.overlay_matches("alice", "alice.ui.hks", &arguments));
+        assert!(!runtime.overlay_matches("alice", "bob.ui.hks", &arguments));
+        assert!(!runtime.overlay_matches("alice", "alice.ui.hks", &[StoredValue::Int(2)]));
+        runtime.mounted_ui_overlays.remove("alice");
+        assert!(!runtime.overlay_matches("alice", "alice.ui.hks", &arguments));
+    }
 
     #[test]
     fn script_request_ids_are_stable_and_monotonic() {
@@ -115,5 +157,46 @@ mod tests {
         live.apply_restored(ScriptRuntimeState::default());
         assert!(!live.restore_pending);
         assert!(live.allocate_request() > previous);
+    }
+
+    #[test]
+    fn cancelled_requests_cannot_resume_a_new_wait_or_accumulate_in_the_inbox() {
+        let mut runtime = ScriptRuntimeState::default();
+        let old = runtime.allocate_request();
+        runtime.wait_request = Some(old);
+        runtime.pending_ui_screen = Some("alice.hks".into());
+        runtime.accept_response(ScriptResponseMessage {
+            request: old,
+            response: ScriptResponse::Continue,
+        });
+        runtime.cancel_pending_requests();
+        assert!(runtime.pending_ui_screen.is_none());
+        assert!(runtime.response_inbox.is_empty());
+        let current = runtime.allocate_request();
+        assert!(current > old);
+        runtime.wait_request = Some(current);
+        runtime.accept_response(ScriptResponseMessage {
+            request: old,
+            response: ScriptResponse::Continue,
+        });
+        assert!(runtime.response_inbox.is_empty());
+        runtime.accept_response(ScriptResponseMessage {
+            request: current,
+            response: ScriptResponse::Continue,
+        });
+        runtime.accept_response(ScriptResponseMessage {
+            request: current,
+            response: ScriptResponse::Choice(crate::state::StoredValue::String("bob".into())),
+        });
+        assert!(matches!(
+            runtime.take_response(current),
+            Some(ScriptResponse::Continue)
+        ));
+        runtime.wait_request = None;
+        runtime.accept_response(ScriptResponseMessage {
+            request: current,
+            response: ScriptResponse::Continue,
+        });
+        assert!(runtime.response_inbox.is_empty());
     }
 }

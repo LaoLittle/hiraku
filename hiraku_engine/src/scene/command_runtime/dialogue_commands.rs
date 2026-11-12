@@ -15,6 +15,11 @@ pub(super) fn dispatch_dialogue_command(
     ui_fonts: &UiFonts,
     ui_style: &UiStyle,
 ) {
+    let waits_for_input = matches!(command, DialogueCommand::Say { .. });
+    let animation_id = match &command {
+        DialogueCommand::Say { animation_id, .. } => animation_id.clone(),
+        _ => None,
+    };
     match command {
         DialogueCommand::ClearText => {
             if let Some(waiting) = dialogue_state.waiting.take() {
@@ -36,11 +41,7 @@ pub(super) fn dispatch_dialogue_command(
             dialogue_state.effect.cps =
                 super::super::dialogue::DialogueTextEffect::default().cps * multiplier;
         }
-        DialogueCommand::Say {
-            speaker,
-            text,
-            animation_id,
-        } => {
+        DialogueCommand::Say { speaker, text, .. } | DialogueCommand::Present { speaker, text } => {
             if let Some(waiting) = dialogue_state.waiting.take() {
                 complete_dialogue_wait(commands, animations, waiting);
             }
@@ -65,7 +66,7 @@ pub(super) fn dispatch_dialogue_command(
             } else {
                 set_dialogue_model_reveal(dialogue_state, &text, 0, None);
             }
-            dialogue_state.waiting = Some(PendingDialogueAdvance {
+            dialogue_state.waiting = waits_for_input.then_some(PendingDialogueAdvance {
                 animation_id,
                 request: None,
             });

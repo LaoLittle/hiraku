@@ -63,7 +63,7 @@ pub struct RuntimeMenuContext<'w, 's> {
     pub script_runtime: ResMut<'w, ScriptRuntimeState>,
     pub frontend: ResMut<'w, FrontendState>,
     pub user_settings: Res<'w, UserSettings>,
-    pub models: Res<'w, crate::ui::UiModels>,
+    pub models: ResMut<'w, crate::ui::UiModels>,
     pub effects: MessageWriter<'w, super::screen_ui::UiEffectMessage>,
     pub ui_style: Res<'w, UiStyle>,
     pub dialogue_history: ResMut<'w, DialogueHistoryState>,
@@ -439,6 +439,11 @@ fn dispatch_ui_effects(
             crate::ui::UiEffect::StopVoice => {
                 finish_all_voices(&mut ctx.commands, &mut ctx.animations, &mut ctx.voice_state);
             }
+            crate::ui::UiEffect::VoicePaused(paused) => {
+                ctx.pending_script_commands.enqueue(ScriptCommand::Audio(
+                    crate::script::AudioCommand::VoicePaused(*paused),
+                ));
+            }
             crate::ui::UiEffect::SetPreference(change) => {
                 ctx.pending_script_commands.enqueue(ScriptCommand::Settings(
                     SettingsCommand::Preference(change.clone()),
@@ -494,6 +499,16 @@ fn dispatch_ui_effects(
                 ) {
                     warn!("failed to save slot `{slot}`: {error}");
                     ctx.frontend.notice = Some(format!("Failed to save slot {slot}: {error}"));
+                    break;
+                }
+                ctx.models.invalidate_service("storage");
+            }
+            crate::ui::UiEffect::DeleteSave { slot } => {
+                let result = crate::storage::delete_save_slot(slot);
+                ctx.models.invalidate_service("storage");
+                if let Err(error) = result {
+                    warn!("failed to delete slot `{slot}`: {error}");
+                    ctx.frontend.notice = Some(format!("Failed to delete slot {slot}: {error}"));
                     break;
                 }
             }

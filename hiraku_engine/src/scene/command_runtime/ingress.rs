@@ -173,7 +173,15 @@ pub(crate) fn evaluate_ui_at_with_arguments(
     evaluate_ui_component_named_with_args(
         target,
         &source,
-        UiContext::new(values).with_preferences(user_settings.clone()),
+        UiContext::new(values)
+            .with_preferences(user_settings.clone())
+            .with_countdowns(
+                runtime
+                    .story
+                    .as_ref()
+                    .map(|story| story.named_countdowns())
+                    .unwrap_or_default(),
+            ),
         textures,
         terms,
         arguments,
@@ -351,6 +359,7 @@ pub fn drive_story_runtime(
             observe_replay_boundary(&mut runtime, &event);
             match event {
                 StoryRuntimeEvent::Effect(crate::script::capabilities::StoryEffect::PlayBgm {
+                    channel,
                     path,
                     volume,
                     fade_in_ms,
@@ -362,6 +371,7 @@ pub fn drive_story_runtime(
                     Some(definition) => {
                         pending_script_commands.enqueue(ScriptCommand::Audio(
                             AudioCommand::PlayBgm {
+                                channel,
                                 path: definition.path.clone(),
                                 prelude: definition.prelude.clone(),
                                 volume,
@@ -520,6 +530,9 @@ pub fn drive_story_runtime(
                             return;
                         }
                     };
+                    if lifetime.is_none() && runtime.overlay_matches(&name, &target, &arguments) {
+                        continue;
+                    }
                     let overlay = evaluate_ui_at_with_arguments(
                         &target,
                         &runtime,
@@ -573,6 +586,7 @@ pub fn drive_story_runtime(
                 }
                 StoryRuntimeEvent::Effect(
                     effect @ (crate::script::capabilities::StoryEffect::Say { .. }
+                    | crate::script::capabilities::StoryEffect::PresentDialogue { .. }
                     | crate::script::capabilities::StoryEffect::ContinueDialogue { .. }),
                 ) => {
                     let Some(dialogue_component) = runtime.ui_registry.get("dialogue").cloned()
@@ -650,6 +664,7 @@ pub fn drive_story_runtime(
                 }
                 StoryRuntimeEvent::Wait(crate::script::capabilities::StoryWait::Delay {
                     duration_ms,
+                    interruptible,
                 }) => {
                     let request = runtime.allocate_request();
                     runtime.wait_request = Some(request);
@@ -657,6 +672,7 @@ pub fn drive_story_runtime(
                         AnimationCommand::Delay {
                             duration: Duration::from_millis(duration_ms),
                             done: request,
+                            interruptible,
                         },
                     ));
                 }
@@ -916,20 +932,28 @@ pub fn drive_story_runtime(
                 },
                 StoryRuntimeEvent::TaskEffect {
                     task,
-                    effect: crate::script::capabilities::StoryEffect::Delay { duration_ms },
+                    effect:
+                        crate::script::capabilities::StoryEffect::Delay {
+                            duration_ms,
+                            interruptible,
+                        },
                 } => {
                     let request = runtime.allocate_request();
                     runtime.task_requests.insert(
                         request,
                         (
                             task,
-                            crate::script::capabilities::StoryEffect::Delay { duration_ms },
+                            crate::script::capabilities::StoryEffect::Delay {
+                                duration_ms,
+                                interruptible,
+                            },
                         ),
                     );
                     pending_script_commands.enqueue(ScriptCommand::Animation(
                         AnimationCommand::Delay {
                             duration: Duration::from_millis(duration_ms),
                             done: request,
+                            interruptible,
                         },
                     ));
                 }
@@ -996,6 +1020,7 @@ pub fn drive_story_runtime(
                     effect: effect @ crate::script::capabilities::StoryEffect::PlayBgm { .. },
                 } => {
                     let crate::script::capabilities::StoryEffect::PlayBgm {
+                        channel,
                         path,
                         volume,
                         fade_in_ms,
@@ -1012,6 +1037,7 @@ pub fn drive_story_runtime(
                         let id = format!("hks-bgm-{}", request.0);
                         pending_script_commands.enqueue(ScriptCommand::Audio(
                             AudioCommand::PlayBgm {
+                                channel: channel.clone(),
                                 path: definition.path.clone(),
                                 prelude: definition.prelude.clone(),
                                 volume: *volume,
@@ -1067,6 +1093,9 @@ pub fn drive_story_runtime(
                             animation_id, ..
                         })
                         | ScriptCommand::Character(CharacterCommand::Blur {
+                            animation_id, ..
+                        })
+                        | ScriptCommand::Character(CharacterCommand::Tint {
                             animation_id, ..
                         })
                         | ScriptCommand::Dialogue(DialogueCommand::Say { animation_id, .. })
@@ -1209,6 +1238,56 @@ mod batch_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_deadline_is_dispatched_while_the_host_wait_has_no_response() {
+        let code = crate::script::compile_story_bytecode(
+            "alice.hks",
+            "clock.countdown(1).gotoOnExpire(\"bob.hks\")\nsleep(30)\n\"must not execute\"",
+        )
+        .expect("deadline story");
+        let mut runtime = ScriptRuntimeState::default();
+        runtime.story = Some(StoryRuntime::new(code).expect("runtime"));
+        runtime.current_script = Some("alice.hks".into());
+        let mut app = App::new();
+        app.init_resource::<crate::dependencies::ScriptDependencies>()
+            .insert_resource(runtime)
+            .add_message::<ScriptResponseMessage>()
+            .init_resource::<PendingScriptCommands>()
+            .insert_resource(VfsResource(std::sync::Arc::new(crate::vfs::HdpVfs::new(
+                "unused-fixture-root",
+            ))))
+            .init_resource::<UserSettings>()
+            .init_resource::<crate::ui::UiModels>()
+            .init_resource::<DialogueHistoryState>()
+            .add_systems(Update, drive_story_runtime);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ScriptRuntimeState>()
+                .wait_request
+                .is_some()
+        );
+        app.world_mut()
+            .resource_mut::<ScriptRuntimeState>()
+            .story
+            .as_mut()
+            .expect("waiting story")
+            .advance_time(Duration::from_secs(2));
+        app.update();
+        assert!(matches!(
+            app.world()
+                .resource::<PendingScriptCommands>()
+                .items
+                .back()
+                .expect("deadline navigation")
+                .command,
+            ScriptCommand::Runtime(RuntimeCommand::Navigate { .. })
+        ));
+        assert!(app.world().resource::<ScriptRuntimeState>().replay.as_ref().expect("journal").events.iter().any(|event|
+            matches!(event, crate::script::replay::ReplayEvent::Input { kind: InputKind::Native, point, .. }
+                if point.signature.starts_with("clock-expiry:"))));
     }
 
     #[test]

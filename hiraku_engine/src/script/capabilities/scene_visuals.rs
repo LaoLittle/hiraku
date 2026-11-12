@@ -885,7 +885,9 @@ mod api {
         match context.scene_visuals.pending.get(&handle.0) {
             Some((
                 SceneVisualTarget::Spatial(
-                    StageCommand::Camera { animation, .. } | StageCommand::View { animation, .. },
+                    StageCommand::Camera { animation, .. }
+                    | StageCommand::View { animation, .. }
+                    | StageCommand::Shake { animation, .. },
                 ),
                 _,
             )) => Ok(*animation),
@@ -911,7 +913,9 @@ mod api {
         match context.scene_visuals.pending.get_mut(&handle.0) {
             Some((
                 SceneVisualTarget::Spatial(
-                    StageCommand::Camera { animation, .. } | StageCommand::View { animation, .. },
+                    StageCommand::Camera { animation, .. }
+                    | StageCommand::View { animation, .. }
+                    | StageCommand::Shake { animation, .. },
                 ),
                 _,
             )) => *animation = spec,
@@ -1284,6 +1288,16 @@ mod api {
     fn sleep(context: &mut CharacterContext, seconds: f64) -> Result<(), NativeError> {
         context.commands.push(StoryEffect::Delay {
             duration_ms: milliseconds(seconds)?,
+            interruptible: false,
+        });
+        Ok(())
+    }
+
+    #[hks(name = "sleepOrAdvance")]
+    fn sleep_or_advance(context: &mut CharacterContext, seconds: f64) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::Delay {
+            duration_ms: milliseconds(seconds)?,
+            interruptible: true,
         });
         Ok(())
     }
@@ -1291,6 +1305,23 @@ mod api {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interruptible_sleep_has_an_explicit_host_wait_policy() {
+        let source = "sleepOrAdvance(1.25)";
+        let mut runtime = runtime(source);
+        let wait = StoryRuntimeEvent::Wait(StoryWait::Delay {
+            duration_ms: 1250,
+            interruptible: true,
+        });
+        assert_eq!(event(&mut runtime), wait);
+        let snapshot = runtime.snapshot().expect("snapshot at interruptible wait");
+        let code = compile_story_bytecode("test.hks", source).expect("compile restored wait");
+        let mut restored = StoryRuntime::restore(code, snapshot).expect("restore wait");
+        assert_eq!(restored.restored_boundary_event(), Some(wait));
+        restored
+            .resume(Value::Unit)
+            .expect("advance completes delay");
+    }
     #[test]
     fn picture_dissolve_is_typed_and_retains_the_rule_in_its_effect() {
         use super::*;
@@ -2666,7 +2697,10 @@ mod tests {
                 seconds: 1.2,
             }))
         );
-        let wait = StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms: 1800 });
+        let wait = StoryRuntimeEvent::Wait(StoryWait::Delay {
+            duration_ms: 1800,
+            interruptible: false,
+        });
         assert_eq!(event(&mut runtime), wait);
         assert!(runtime.step().expect("wait stays idle").is_none());
         let snapshot = runtime.snapshot().expect("snapshot at wait");
@@ -2700,7 +2734,11 @@ mod tests {
             ));
             let StoryRuntimeEvent::TaskEffect {
                 task,
-                effect: StoryEffect::Delay { duration_ms: 100 },
+                effect:
+                    StoryEffect::Delay {
+                        duration_ms: 100,
+                        interruptible: false,
+                    },
             } = event(&mut runtime)
             else {
                 panic!("first delay");
@@ -2712,7 +2750,10 @@ mod tests {
             assert!(matches!(
                 event(&mut runtime),
                 StoryRuntimeEvent::TaskEffect {
-                    effect: StoryEffect::Delay { duration_ms: 200 },
+                    effect: StoryEffect::Delay {
+                        duration_ms: 200,
+                        interruptible: false
+                    },
                     ..
                 }
             ));
@@ -2740,7 +2781,10 @@ mod tests {
         runtime.resume(Value::Int(0)).expect("select option");
         assert_eq!(
             event(&mut runtime),
-            StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms: 100 })
+            StoryRuntimeEvent::Wait(StoryWait::Delay {
+                duration_ms: 100,
+                interruptible: false
+            })
         );
         assert!(runtime.step().expect("branch waits").is_none());
         runtime.resume(Value::Unit).expect("timer completes");

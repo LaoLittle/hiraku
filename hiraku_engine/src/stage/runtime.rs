@@ -5,6 +5,16 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StageCommand {
+    Effect {
+        id: u64,
+        name: String,
+        enabled: bool,
+    },
+    LightColor {
+        id: u64,
+        name: String,
+        color: Option<[f32; 3]>,
+    },
     Play {
         id: u64,
         playback: u64,
@@ -29,6 +39,18 @@ pub enum StageCommand {
         name: String,
         animation: AnimationSpec,
     },
+    Shake {
+        #[serde(default = "super::shake::default_randomized")]
+        randomized: bool,
+        id: u64,
+        view: String,
+        motion: u64,
+        force: Vec3,
+        frequency: u32,
+        damping: f32,
+        seed: u32,
+        animation: AnimationSpec,
+    },
     View {
         id: u64,
         view: String,
@@ -49,11 +71,17 @@ pub struct StageSnapshot {
     pub views: BTreeMap<String, StageViewSnapshot>,
     pub actors: BTreeMap<String, String>,
     #[serde(default)]
+    pub light_colors: BTreeMap<String, [f32; 3]>,
+    #[serde(default)]
+    pub effects: BTreeMap<String, super::StageEffectPlayback>,
+    #[serde(default)]
     pub animation: Option<super::animation::StagePlayback>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct StageViewSnapshot {
+    #[serde(default)]
+    pub shake: Option<super::StageCameraShake>,
     #[serde(default)]
     pub clip: super::ViewClip,
     pub camera: Option<StageCamera>,
@@ -102,6 +130,12 @@ impl StageSnapshot {
                 .actors
                 .iter()
                 .any(|(actor, anchor)| actor.trim().is_empty() || anchor.trim().is_empty())
+            || self.light_colors.iter().any(|(name, color)| {
+                name.trim().is_empty() || !super::model::valid_light_color(*color)
+            })
+            || self.effects.iter().any(|(name, effect)| {
+                name.trim().is_empty() || !effect.elapsed.is_finite() || effect.elapsed < 0.0
+            })
         {
             return Err("invalid spatial stage state".into());
         }
@@ -115,6 +149,9 @@ impl StageSnapshot {
             | StageCommand::Clip { id, .. }
             | StageCommand::View { id, .. }
             | StageCommand::Camera { id, .. }
+            | StageCommand::Shake { id, .. }
+            | StageCommand::LightColor { id, .. }
+            | StageCommand::Effect { id, .. }
             | StageCommand::Place { id, .. } => Some(*id),
         };
         if let Some(id) = id {
@@ -123,6 +160,30 @@ impl StageSnapshot {
             }
         }
         match command {
+            StageCommand::Effect { name, enabled, .. } => {
+                if name.trim().is_empty() {
+                    return Err("stage effect name must not be empty".into());
+                }
+                let effects = &mut state.as_mut().ok_or("stage is not open")?.effects;
+                let effect = effects.entry(name).or_default();
+                if enabled && !effect.enabled {
+                    effect.elapsed = 0.0;
+                }
+                effect.enabled = enabled;
+            }
+            StageCommand::LightColor { name, color, .. } => {
+                if name.trim().is_empty()
+                    || color.is_some_and(|color| !super::model::valid_light_color(color))
+                {
+                    return Err("invalid stage light color".into());
+                }
+                let colors = &mut state.as_mut().ok_or("stage is not open")?.light_colors;
+                if let Some(color) = color {
+                    colors.insert(name, color);
+                } else {
+                    colors.remove(&name);
+                }
+            }
             StageCommand::Play {
                 playback,
                 name,
@@ -140,13 +201,12 @@ impl StageSnapshot {
                 if !clip.valid() {
                     return Err("invalid stage view clip".into());
                 }
-                state
-                    .as_mut()
-                    .ok_or("stage is not open")?
-                    .views
-                    .get_mut(&view)
-                    .ok_or("configure a stage view camera before clipping it")?
-                    .clip = clip;
+                let views = &mut state.as_mut().ok_or("stage is not open")?.views;
+                if let Some(view) = views.get_mut(&view) {
+                    view.clip = clip;
+                } else if !matches!(clip, super::clip::ViewClip::Full) {
+                    return Err("configure a stage view camera before clipping it".into());
+                }
             }
             StageCommand::Open { id, path } => {
                 *state = Some(Self {
@@ -160,6 +220,8 @@ impl StageSnapshot {
                         },
                     )]),
                     actors: BTreeMap::new(),
+                    light_colors: BTreeMap::new(),
+                    effects: BTreeMap::new(),
                     animation: None,
                 });
             }
@@ -180,6 +242,43 @@ impl StageSnapshot {
                     .or_insert_with(|| StageViewSnapshot { order, ..default() })
                     .request = Some((name, animation));
             }
+            StageCommand::Shake {
+                randomized,
+                view,
+                motion,
+                force,
+                frequency,
+                damping,
+                seed,
+                animation,
+                ..
+            } => {
+                if view.trim().is_empty()
+                    || motion == 0
+                    || !force.is_finite()
+                    || frequency == 0
+                    || !damping.is_finite()
+                    || damping < 0.0
+                    || !valid_animation(animation)
+                {
+                    return Err("invalid stage camera shake".into());
+                }
+                let stage = state.as_mut().ok_or("stage is not open")?;
+                let view = stage
+                    .views
+                    .get_mut(&view)
+                    .ok_or("configure a stage view camera before shaking it")?;
+                view.shake = (animation.duration() > 0.0).then_some(super::StageCameraShake {
+                    randomized,
+                    motion,
+                    force,
+                    frequency,
+                    damping,
+                    seed,
+                    animation,
+                    elapsed: 0.0,
+                });
+            }
             StageCommand::View {
                 view,
                 visible,
@@ -189,12 +288,14 @@ impl StageSnapshot {
                 if !valid_animation(animation) {
                     return Err("invalid stage view animation".into());
                 }
-                let view = state
-                    .as_mut()
-                    .ok_or("stage is not open")?
-                    .views
-                    .get_mut(&view)
-                    .ok_or("configure a stage view camera before showing it")?;
+                let views = &mut state.as_mut().ok_or("stage is not open")?.views;
+                let Some(view) = views.get_mut(&view) else {
+                    return if visible {
+                        Err("configure a stage view camera before showing it".into())
+                    } else {
+                        Ok(())
+                    };
+                };
                 let to = if visible { 1.0 } else { 0.0 };
                 if animation.duration() == 0.0 {
                     view.alpha = to;
@@ -222,7 +323,7 @@ impl StageSnapshot {
 
 impl StageViewSnapshot {
     fn valid(&self) -> bool {
-        if !self.clip.valid() {
+        if !self.clip.valid() || self.shake.as_ref().is_some_and(|shake| !shake.valid()) {
             return false;
         }
         !(self
@@ -304,6 +405,8 @@ pub(crate) fn sync(
     >,
     instances: Query<(&bevy::world_serialization::WorldInstance, &ChildOf)>,
     spawner: Option<Res<WorldInstanceSpawner>>,
+    mut meshes: Option<ResMut<Assets<Mesh>>>,
+    mut effect_materials: Option<ResMut<Assets<super::effects::StageEffectMaterial>>>,
 ) {
     let path = shared
         .0
@@ -357,6 +460,16 @@ pub(crate) fn sync(
         };
         match definition.spawn(&mut commands) {
             Ok(root) => {
+                if !definition.effects.is_empty() {
+                    let (Some(meshes), Some(materials)) = (&mut meshes, &mut effect_materials)
+                    else {
+                        commands.entity(root).try_despawn();
+                        runtime.error =
+                            Some("stage effects require StagePlugin's material resources".into());
+                        return;
+                    };
+                    super::effects::spawn(definition, root, &mut commands, meshes, materials);
+                }
                 runtime.root = Some(root);
                 runtime.definition = Some(definition.clone());
             }
@@ -391,6 +504,25 @@ pub(crate) fn sync(
         .definition
         .as_ref()
         .expect("loaded stage definition");
+    for name in stage.light_colors.keys() {
+        if !definition.lights.contains_key(name) {
+            runtime.error = Some(format!("unknown stage light `{name}`"));
+            return;
+        }
+    }
+    for (name, playback) in &mut stage.effects {
+        if !definition.effects.contains_key(name) {
+            runtime.error = Some(format!("unknown stage effect `{name}`"));
+            return;
+        }
+        if playback.enabled {
+            let delta = time.delta_secs();
+            playback.elapsed += f64::from(delta);
+            if delta > 0.0 {
+                redraw.request();
+            }
+        }
+    }
     for anchor in stage.actors.values() {
         if let Err(error) = definition.anchor(anchor) {
             runtime.error = Some(error.to_string());
@@ -398,14 +530,18 @@ pub(crate) fn sync(
         }
     }
     for view in stage.views.values_mut() {
-        if view.tween.is_some() || view.fade.is_some() || view.request.is_some() {
+        if view.tween.is_some()
+            || view.fade.is_some()
+            || view.request.is_some()
+            || view.shake.is_some()
+        {
             redraw.request();
         }
         if let Err(error) = tick_view(view, definition, time.delta_secs()) {
             runtime.error = Some(error);
             return;
         }
-        if view.tween.is_some() || view.fade.is_some() {
+        if view.tween.is_some() || view.fade.is_some() || view.shake.is_some() {
             redraw.request();
         }
     }
@@ -431,6 +567,13 @@ fn tick_view(
     definition: &StageDefinition,
     delta: f32,
 ) -> Result<(), String> {
+    if stage
+        .shake
+        .as_mut()
+        .is_some_and(|shake| shake.advance(delta))
+    {
+        stage.shake = None;
+    }
     if stage.camera.is_none() {
         stage.camera = definition.cameras.get(&definition.default_camera).cloned();
         stage.camera_name = Some(definition.default_camera.clone());
@@ -525,7 +668,7 @@ pub(crate) fn prepare_surfaces(
                     .iter_ancestors(entity)
                     .any(|ancestor| ancestor == root)
                 {
-                    light.spawn(&mut commands, entity, definition.shading);
+                    light.spawn(&mut commands, entity, definition.shading, name.as_str());
                     redraw.request();
                     commands.entity(entity).insert(StageLightMarker);
                 }
@@ -720,6 +863,124 @@ fn interpolate_camera(from: &StageCamera, to: &StageCamera, t: f32) -> StageCame
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shake_is_transient_and_does_not_write_back_into_the_authored_camera() {
+        let definition: StageDefinition = hiraku_script::hson::from_str(r#".{
+            defaultCamera: "wide", cameras: .{
+                wide: .{ pose: .{ position: (0, 0, 10) }, projection: .{ kind: "perspective", fov: 60, near: 0.1, far: 100 } }
+            }
+        }"#).expect("stage fixture");
+        let mut state = None;
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::Open {
+                id: 1,
+                path: "room.stage.hson".into(),
+            },
+        )
+        .expect("open");
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::Shake {
+                id: 1,
+                randomized: true,
+                view: "main".into(),
+                motion: 3,
+                force: Vec3::new(0.4, -0.2, 0.0),
+                frequency: 50,
+                damping: 1.0,
+                seed: 17,
+                animation: AnimationSpec::Linear(3.0, false),
+            },
+        )
+        .expect("shake");
+        let state = state.as_mut().expect("stage");
+        let view = state.views.get_mut("main").expect("main");
+        tick_view(view, &definition, 0.03).expect("sample");
+        assert_ne!(view.shake.as_ref().expect("shaking").offset(), Vec3::ZERO);
+        assert_eq!(
+            view.camera
+                .as_ref()
+                .expect("camera")
+                .pose
+                .transform()
+                .translation,
+            Vec3::new(0.0, 0.0, 10.0)
+        );
+        let bytes = hiraku_script::bhson::to_vec(state).expect("save stage");
+        let mut restored: StageSnapshot =
+            hiraku_script::bhson::from_slice(&bytes).expect("restore stage");
+        restored.validate().expect("valid restored stage");
+        let view = restored.views.get_mut("main").expect("main");
+        tick_view(view, &definition, 3.0).expect("complete shake");
+        assert!(view.shake.is_none());
+        assert_eq!(
+            view.camera
+                .as_ref()
+                .expect("camera")
+                .pose
+                .transform()
+                .translation,
+            Vec3::new(0.0, 0.0, 10.0)
+        );
+    }
+
+    #[test]
+    fn absent_view_can_be_hidden_and_reset_but_not_shown() {
+        let mut state = None;
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::Open {
+                id: 1,
+                path: "stages/room.stage.hson".into(),
+            },
+        )
+        .expect("open");
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::View {
+                id: 1,
+                view: "overlay".into(),
+                visible: false,
+                animation: AnimationSpec::Linear(0.35, false),
+            },
+        )
+        .expect("hide absent view");
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::Clip {
+                id: 1,
+                view: "overlay".into(),
+                clip: ViewClip::Full,
+            },
+        )
+        .expect("reset absent view");
+        assert_eq!(state.as_ref().expect("stage").views.len(), 1);
+        assert!(
+            StageSnapshot::apply(
+                &mut state,
+                StageCommand::View {
+                    id: 1,
+                    view: "overlay".into(),
+                    visible: true,
+                    animation: AnimationSpec::Linear(0.0, false),
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            StageSnapshot::apply(
+                &mut state,
+                StageCommand::Clip {
+                    id: 1,
+                    view: "overlay".into(),
+                    clip: ViewClip::Left(0.5, 0.0),
+                }
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn presentation_projection_detects_inherited_zoom_without_resetting_computed_area() {
@@ -978,6 +1239,203 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn effect_state_roundtrips_without_restarting_on_duplicate_enable() {
+        let mut state = None;
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::Open {
+                id: 1,
+                path: "room.stage.hson".into(),
+            },
+        )
+        .expect("open");
+        let command = |enabled| StageCommand::Effect {
+            id: 1,
+            name: "alice".into(),
+            enabled,
+        };
+        StageSnapshot::apply(&mut state, command(true)).expect("enable");
+        state
+            .as_mut()
+            .expect("stage")
+            .effects
+            .get_mut("alice")
+            .expect("effect")
+            .elapsed = 2.75;
+        let bytes = hiraku_script::bhson::to_vec(&state).expect("serialize");
+        let mut restored: Option<StageSnapshot> =
+            hiraku_script::bhson::from_slice(&bytes).expect("restore");
+        restored
+            .as_ref()
+            .expect("stage")
+            .validate()
+            .expect("valid state");
+        StageSnapshot::apply(&mut restored, command(true)).expect("duplicate enable");
+        assert_eq!(
+            restored.as_ref().expect("stage").effects["alice"].elapsed,
+            2.75
+        );
+        StageSnapshot::apply(&mut restored, command(false)).expect("disable");
+        assert!(!restored.as_ref().expect("stage").effects["alice"].enabled);
+        StageSnapshot::apply(&mut restored, command(true)).expect("restart");
+        assert_eq!(
+            restored.as_ref().expect("stage").effects["alice"].elapsed,
+            0.0
+        );
+        restored
+            .as_mut()
+            .expect("stage")
+            .effects
+            .get_mut("alice")
+            .expect("effect")
+            .elapsed = f64::NAN;
+        assert!(restored.as_ref().expect("stage").validate().is_err());
+    }
+
+    #[test]
+    fn named_light_overrides_restore_and_reset_without_changing_other_lights() {
+        let mut app = App::new();
+        app.add_message::<bevy::window::RequestRedraw>();
+        app.init_resource::<StageRuntime>()
+            .init_resource::<crate::state::SceneSharedState>()
+            .add_systems(Update, super::super::lights::sync);
+        let root = app.world_mut().spawn(StageRoot).id();
+        let authored = Color::linear_rgb(0.7, 0.6, 0.5);
+        let light = app
+            .world_mut()
+            .spawn((
+                SpotLight {
+                    color: authored,
+                    ..default()
+                },
+                super::super::lights::StageLightIdentity {
+                    name: "alice".into(),
+                    authored,
+                },
+                ChildOf(root),
+            ))
+            .id();
+        let external = app
+            .world_mut()
+            .spawn((
+                SpotLight {
+                    color: authored,
+                    ..default()
+                },
+                super::super::lights::StageLightIdentity {
+                    name: "alice".into(),
+                    authored,
+                },
+            ))
+            .id();
+        let mut state = None;
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::Open {
+                id: 1,
+                path: "room.stage.hson".into(),
+            },
+        )
+        .expect("open");
+        StageSnapshot::apply(
+            &mut state,
+            StageCommand::LightColor {
+                id: 1,
+                name: "alice".into(),
+                color: Some([1.0, 0.4, 0.2]),
+            },
+        )
+        .expect("override");
+        let bytes = hiraku_script::bhson::to_vec(&state).expect("serialize light state");
+        let restored: Option<StageSnapshot> =
+            hiraku_script::bhson::from_slice(&bytes).expect("restore light state");
+        restored
+            .as_ref()
+            .expect("stage")
+            .validate()
+            .expect("valid restored stage");
+        app.world_mut()
+            .resource_mut::<crate::state::SceneSharedState>()
+            .0
+            .spatial_stage = restored;
+        {
+            let mut runtime = app.world_mut().resource_mut::<StageRuntime>();
+            runtime.root = Some(root);
+            runtime.path = Some("room.stage.hson".into());
+            runtime.id = Some(1);
+            runtime.instantiated = true;
+            runtime.definition = Some(hiraku_script::hson::from_str(r#".{
+                shading: "gamma", defaultCamera: "wide", cameras: .{
+                    wide: .{ pose: .{ position: (0, 0, 10) }, projection: .{ kind: "perspective", fov: 60, near: 0.1, far: 100 } }
+                }
+            }"#).expect("fixture stage"));
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<SpotLight>(light).expect("light").color,
+            Color::linear_rgb(1.0, 0.4, 0.2)
+        );
+        assert_eq!(
+            app.world()
+                .get::<SpotLight>(external)
+                .expect("external")
+                .color,
+            authored
+        );
+        {
+            let mut shared = app
+                .world_mut()
+                .resource_mut::<crate::state::SceneSharedState>();
+            StageSnapshot::apply(
+                &mut shared.0.spatial_stage,
+                StageCommand::LightColor {
+                    id: 1,
+                    name: "alice".into(),
+                    color: None,
+                },
+            )
+            .expect("reset");
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<SpotLight>(light).expect("light").color,
+            authored
+        );
+    }
+
+    #[test]
+    fn light_commands_reject_stale_handles_and_invalid_colors() {
+        let mut stage = None;
+        StageSnapshot::apply(
+            &mut stage,
+            StageCommand::Open {
+                id: 1,
+                path: "room.stage.hson".into(),
+            },
+        )
+        .expect("open");
+        for (id, name, color) in [
+            (2, "alice", [1.0, 1.0, 1.0]),
+            (1, "", [1.0, 1.0, 1.0]),
+            (1, "alice", [-0.1, 1.0, 1.0]),
+            (1, "alice", [f32::NAN, 1.0, 1.0]),
+        ] {
+            assert!(
+                StageSnapshot::apply(
+                    &mut stage,
+                    StageCommand::LightColor {
+                        id,
+                        name: name.into(),
+                        color: Some(color)
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(stage.expect("stage").light_colors.is_empty());
     }
 
     #[test]

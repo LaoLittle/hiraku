@@ -78,11 +78,7 @@ pub(crate) fn compile_story_program(
         .map_err(|error| error.to_string())?
     {
         // UI files have their own capability manifest and module domain.
-        if !file.ends_with(".hks")
-            || file.ends_with(".ui.hks")
-            || file.contains("/ui/")
-            || file.starts_with("ui/")
-        {
+        if crate::authoring::script_domain(&file) != Some(crate::authoring::ScriptDomain::Story) {
             continue;
         }
         let text = if file == path {
@@ -119,27 +115,60 @@ fn compile_sources(sources: Vec<ScriptSource>, entry: &str) -> Result<StoryProgr
 }
 
 pub(super) fn compile_library_project(
-    mut sources: Vec<ScriptSource>,
+    sources: Vec<ScriptSource>,
     options: hiraku_script::RenderOptions,
 ) -> Result<hiraku_script::CompiledProject, String> {
-    if sources
-        .iter()
-        .any(|source| source.path == super::stdlib::DIALOGUE_PATH)
-    {
-        return Err("user source cannot replace the embedded dialogue library".into());
-    }
-    sources.push(super::stdlib::dialogue_source());
-    sources.push(super::stdlib::profile_source());
     let mut source_map = hiraku_script::SourceMap::new();
-    let ids = sources
-        .iter()
-        .map(|source| {
-            (
-                source.path.clone(),
-                source_map.insert(&source.path, &source.source),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    for source in sources.iter().chain(
+        [
+            super::stdlib::dialogue_source(),
+            super::stdlib::profile_source(),
+        ]
+        .iter(),
+    ) {
+        let id = hiraku_script::SourceId::new(&source.path);
+        if source_map.get(&id).is_none() {
+            source_map.insert(&source.path, &source.source);
+        }
+    }
+    compile_library_project_checked(sources).map_err(|errors| {
+        let diagnostics = errors
+            .into_iter()
+            .map(|error| {
+                error
+                    .error
+                    .diagnostic(hiraku_script::SourceId::new(error.path))
+            })
+            .collect::<Vec<_>>();
+        hiraku_script::render_diagnostics(&diagnostics, &source_map, options)
+    })
+}
+
+pub(crate) fn compile_library_project_checked(
+    sources: Vec<ScriptSource>,
+) -> Result<hiraku_script::CompiledProject, Vec<hiraku_script::ProjectError>> {
+    compile_library_project_with_pass(sources, None)
+}
+
+pub(crate) fn compile_library_project_with_pass(
+    mut sources: Vec<ScriptSource>,
+    pass: Option<&mut dyn hiraku_script::hir::HirPass>,
+) -> Result<hiraku_script::CompiledProject, Vec<hiraku_script::ProjectError>> {
+    for library in [
+        super::stdlib::dialogue_source(),
+        super::stdlib::profile_source(),
+    ] {
+        if sources.iter().any(|source| source.path == library.path) {
+            return Err(vec![hiraku_script::ProjectError {
+                path: library.path,
+                error: hiraku_script::CompileError {
+                    message: "user source cannot replace an embedded engine library".into(),
+                    span: None,
+                },
+            }]);
+        }
+        sources.push(library);
+    }
     let mut policy = hiraku_script::ProjectLinkPolicy::default();
     policy.grant(
         super::stdlib::DIALOGUE_PATH,
@@ -149,15 +178,12 @@ pub(super) fn compile_library_project(
         super::stdlib::DIALOGUE_PATH,
         super::stdlib::ACTOR_CAPABILITY,
     );
-    let project = hiraku_script::compile_project_with_policy(sources, &story_manifest(), &policy)
-        .map_err(|errors| {
-        let diagnostics = errors
-            .into_iter()
-            .map(|error| error.error.diagnostic(ids[&error.path].clone()))
-            .collect::<Vec<_>>();
-        hiraku_script::render_diagnostics(&diagnostics, &source_map, options)
-    })?;
-    Ok(project)
+    let manifest = story_manifest();
+    if let Some(pass) = pass {
+        hiraku_script::compile_project_with_policy_and_hir_pass(sources, &manifest, &policy, pass)
+    } else {
+        hiraku_script::compile_project_with_policy(sources, &manifest, &policy)
+    }
 }
 
 #[cfg(test)]

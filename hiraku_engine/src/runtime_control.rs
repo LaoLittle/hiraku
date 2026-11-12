@@ -22,6 +22,27 @@ pub enum RuntimeControl {
     RestartSavedProject,
 }
 
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuntimeExitPolicy {
+    #[default]
+    ExitApplication,
+    NotifyHost,
+}
+
+#[derive(Message, Clone, Copy, Debug)]
+pub struct RuntimeExitRequested;
+
+pub(crate) fn request_exit(
+    policy: &RuntimeExitPolicy,
+    requests: &mut MessageWriter<RuntimeExitRequested>,
+    application: &mut MessageWriter<AppExit>,
+) {
+    requests.write(RuntimeExitRequested);
+    if *policy == RuntimeExitPolicy::ExitApplication {
+        application.write(AppExit::Success);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RestartState {
     #[default]
@@ -49,6 +70,8 @@ struct RestartTask(Option<Task<PreparedRestart>>);
 
 pub(crate) fn install(app: &mut App) {
     app.add_message::<RuntimeControl>()
+        .add_message::<RuntimeExitRequested>()
+        .init_resource::<RuntimeExitPolicy>()
         .init_resource::<RuntimeControlStatus>()
         .init_resource::<RestartTask>()
         .add_systems(
@@ -143,6 +166,42 @@ fn report_current_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_exit_notifies_the_host_without_terminating_its_application() {
+        fn emit(
+            policy: Res<RuntimeExitPolicy>,
+            mut requests: MessageWriter<RuntimeExitRequested>,
+            mut exit: MessageWriter<AppExit>,
+        ) {
+            request_exit(&policy, &mut requests, &mut exit);
+        }
+        for policy in [
+            RuntimeExitPolicy::ExitApplication,
+            RuntimeExitPolicy::NotifyHost,
+        ] {
+            let mut app = App::new();
+            app.insert_resource(policy)
+                .add_message::<RuntimeExitRequested>()
+                .add_message::<AppExit>()
+                .add_systems(Update, emit);
+            app.update();
+            let mut requests = bevy::ecs::message::MessageCursor::<RuntimeExitRequested>::default();
+            assert_eq!(
+                requests
+                    .read(app.world().resource::<Messages<RuntimeExitRequested>>())
+                    .count(),
+                1
+            );
+            let mut exits = bevy::ecs::message::MessageCursor::<AppExit>::default();
+            assert_eq!(
+                exits
+                    .read(app.world().resource::<Messages<AppExit>>())
+                    .count(),
+                usize::from(policy == RuntimeExitPolicy::ExitApplication)
+            );
+        }
+    }
 
     #[test]
     fn failed_restart_preserves_pending_game_commands() {

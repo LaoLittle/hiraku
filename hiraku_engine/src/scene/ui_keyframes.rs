@@ -74,6 +74,7 @@ pub(crate) fn tick(
         Option<&UiShaderSource>,
     )>,
     mut materials: Option<ResMut<Assets<UiQuadMaterial>>>,
+    images: Option<Res<Assets<Image>>>,
     mut redraw: crate::redraw::Redraw,
 ) {
     for (entity, mut track, mut node, mut opacity, image, material, source) in &mut tracks {
@@ -95,6 +96,15 @@ pub(crate) fn tick(
         if source.is_some() || track.projected {
             if let Some(materials) = materials.as_mut() {
                 if let Some(mut material) = material.and_then(|m| materials.get_mut(&m.0)) {
+                    material.image_uv_rect = images
+                        .as_ref()
+                        .and_then(|images| images.get(&material.image))
+                        .map_or(Vec4::ZERO, |image| {
+                            crate::render::ui_quad::image_uv_rect(
+                                material.image_pixel_rect,
+                                image.size_f32(),
+                            )
+                        });
                     material.uv_u = u;
                     material.uv_v = v;
                     material.clock = Vec4::new(track.elapsed as f32, 0., 0., 0.);
@@ -109,12 +119,21 @@ pub(crate) fn tick(
                             .unwrap_or_else(|| image.image.clone())
                     };
                     let handle = materials.add(UiQuadMaterial {
+                        image_uv_rect: images
+                            .as_ref()
+                            .and_then(|images| images.get(&image.image))
+                            .map_or(Vec4::ZERO, |asset| {
+                                crate::render::ui_quad::image_uv_rect(image.rect, asset.size_f32())
+                            }),
+                        image_pixel_rect: image.rect,
                         sampling: UVec4::ZERO,
                         color: image.color.to_linear(),
                         uv_u: u,
                         uv_v: v,
                         image: image.image.clone(),
                         blend: source.map_or(crate::ui::UiShaderBlend::Alpha, |s| s.blend),
+                        alpha_blend: source
+                            .map_or(crate::ui::UiShaderAlphaBlend::Inherit, |s| s.alpha_blend),
                         parameters: source
                             .map_or(Vec4::ZERO, |s| shader_parameters(&s.keys, track.elapsed)),
                         clock: Vec4::new(track.elapsed as f32, 0., 0., 0.),

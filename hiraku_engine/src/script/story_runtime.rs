@@ -21,6 +21,7 @@ use crate::script::capabilities::{
 /// Engine-facing whole-story driver. It translates generic VM boundaries into
 /// story effects without introducing a second executable representation.
 pub struct StoryRuntime {
+    event_count: u64,
     native_trace: Vec<(String, crate::state::StoredValue)>,
     native_replay: Option<VecDeque<(String, crate::state::StoredValue)>>,
     unrecordable_input: bool,
@@ -28,6 +29,7 @@ pub struct StoryRuntime {
     plans: BTreeMap<ExecutionId, AnimationPlan>,
     execution: ExecutionRuntime,
     host: StoryNativeHost,
+    restored_events: VecDeque<StoryRuntimeEvent>,
     pending: VecDeque<StoryRuntimeEvent>,
     active_task_effects: BTreeMap<ExecutionId, Vec<StoryEffect>>,
     deferred_task_completions: BTreeMap<ExecutionId, Value>,
@@ -93,6 +95,8 @@ pub enum StoryRuntimeEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryRuntimeSnapshot {
+    #[serde(default)]
+    event_count: u64,
     preload_calls: bool,
     plans: BTreeMap<ExecutionId, AnimationPlan>,
     awaiting_effects: std::collections::BTreeSet<ExecutionId>,
@@ -126,6 +130,7 @@ impl StoryRuntime {
         execution: ExecutionId,
         call: &hiraku_script::BuiltinCall,
     ) -> Result<StoryCallOutcome, CharacterCapabilityError> {
+        self.host.ensure_origin(self.execution.entry_path());
         if ["profile.read_any", "profile.write"]
             .iter()
             .any(|name| hiraku_script::native::stable_builtin_id(name) == call.builtin)
@@ -145,7 +150,12 @@ impl StoryRuntime {
         {
             return Ok(StoryCallOutcome::Return(Value::Unit));
         }
-        let read = named(&["profile.read_any", "profile.readInt", "profile.readBool"]);
+        let read = named(&[
+            "profile.read_any",
+            "profile.readInt",
+            "profile.readBool",
+            "Countdown.remaining",
+        ]);
         let Some(name) = read else {
             return self.host.call(call);
         };
@@ -155,9 +165,22 @@ impl StoryRuntime {
             .cloned()
             .unwrap_or_default();
         let arguments = call
-            .arguments
+            .receiver
             .iter()
-            .map(|arg| hiraku_script::persistence::to_value(&arg.value, &symbols))
+            .filter(|_| self.host.has_native_receiver(call.builtin))
+            .chain(call.arguments.iter().map(|arg| &arg.value))
+            .map(|value| match value {
+                Value::Handle { type_id, id } => {
+                    Ok(hiraku_script::hson::HsonValue::Map(BTreeMap::from([(
+                        "nativeHandle".into(),
+                        hiraku_script::hson::HsonValue::Array(vec![
+                            hiraku_script::hson::HsonValue::Unsigned(*type_id as u64),
+                            hiraku_script::hson::HsonValue::Unsigned(*id),
+                        ]),
+                    )])))
+                }
+                _ => hiraku_script::persistence::to_value(value, &symbols),
+            })
             .collect::<Result<Vec<_>, _>>();
         let signature = arguments
             .ok()
@@ -184,6 +207,11 @@ impl StoryRuntime {
                 .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
             let value = hiraku_script::persistence::from_value(value, &symbols)
                 .map_err(CharacterCapabilityError::Native)?;
+            if name == "Countdown.remaining" {
+                self.host
+                    .restore_clock_observation(call, &value)
+                    .map_err(|error| CharacterCapabilityError::Native(error.to_string()))?;
+            }
             return Ok(StoryCallOutcome::Return(value));
         }
         let outcome = self.host.call(call)?;
@@ -345,6 +373,7 @@ impl StoryRuntime {
 
     pub fn new(bytecode: impl Into<super::StoryProgram>) -> Result<Self, StoryRuntimeError> {
         Ok(Self {
+            event_count: 0,
             native_trace: Vec::new(),
             native_replay: None,
             unrecordable_input: false,
@@ -352,6 +381,7 @@ impl StoryRuntime {
             plans: BTreeMap::new(),
             execution: ExecutionRuntime::new(bytecode)?,
             host: StoryNativeHost::new(),
+            restored_events: VecDeque::new(),
             pending: VecDeque::new(),
             active_task_effects: BTreeMap::new(),
             deferred_task_completions: BTreeMap::new(),
@@ -367,10 +397,11 @@ impl StoryRuntime {
     }
 
     pub fn snapshot(&self) -> Result<StoryRuntimeSnapshot, StoryRuntimeError> {
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || !self.restored_events.is_empty() {
             return Err(StoryRuntimeError::NotAtSnapshotBoundary);
         }
         Ok(StoryRuntimeSnapshot {
+            event_count: self.event_count,
             preload_calls: self.preload_calls,
             plans: self.plans.clone(),
             awaiting_effects: self.awaiting_effects.clone(),
@@ -421,7 +452,7 @@ impl StoryRuntime {
         snapshot
             .active_task_effects
             .retain(|_, effects| !effects.is_empty());
-        let pending = snapshot
+        let restored_events = snapshot
             .active_task_effects
             .iter()
             .flat_map(|(task, effects)| {
@@ -432,6 +463,7 @@ impl StoryRuntime {
             })
             .collect();
         let mut runtime = Self {
+            event_count: snapshot.event_count,
             native_trace: Vec::new(),
             native_replay: None,
             unrecordable_input: false,
@@ -440,7 +472,8 @@ impl StoryRuntime {
             awaiting_effects: snapshot.awaiting_effects,
             execution: ExecutionRuntime::restore(bytecode, snapshot.execution)?,
             host: StoryNativeHost::restore(snapshot.host),
-            pending,
+            pending: VecDeque::new(),
+            restored_events,
             active_task_effects: snapshot.active_task_effects,
             deferred_task_completions: snapshot.deferred_task_completions,
             completed_groups: snapshot.completed_groups,
@@ -481,13 +514,22 @@ impl StoryRuntime {
         }
     }
 
+    pub(crate) fn advance_time(&mut self, delta: std::time::Duration) -> bool {
+        self.host.advance_time(delta)
+    }
+
+    pub(crate) fn named_countdowns(&self) -> BTreeMap<String, std::time::Duration> {
+        self.host.named_countdowns()
+    }
+
     pub(crate) fn enqueue_event(&mut self, event: StoryRuntimeEvent) {
-        self.pending.push_back(event);
+        self.restored_events.push_back(event);
     }
 
     pub(crate) fn prepend_effects(&mut self, effects: Vec<StoryEffect>) {
         for effect in effects.into_iter().rev() {
-            self.pending.push_front(StoryRuntimeEvent::Effect(effect));
+            self.restored_events
+                .push_front(StoryRuntimeEvent::Effect(effect));
         }
     }
 
@@ -663,7 +705,111 @@ impl StoryRuntime {
         Ok(())
     }
 
+    fn deadline_signature(&self, id: u64) -> Option<String> {
+        let request = self.host.deadline_navigation(id)?;
+        let encoded = hiraku_script::hson::to_vec(request).ok()?;
+        Some(format!(
+            "clock-expiry:{}:{id}:{}",
+            self.event_count,
+            blake3::hash(&encoded).to_hex()
+        ))
+    }
+
+    pub(crate) fn replay_deadline_due(&self) -> bool {
+        self.native_replay
+            .as_ref()
+            .and_then(|inputs| inputs.front())
+            .filter(|(signature, _)| signature.starts_with("clock-expiry:"))
+            .is_some_and(|(signature, _)| {
+                let mut parts = signature.split(':');
+                parts.next();
+                parts.next().and_then(|v| v.parse::<u64>().ok()) == Some(self.event_count)
+                    && parts
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .is_some_and(|id| self.host.deadline_navigation(id).is_some())
+            })
+    }
+
+    fn expired_navigation(
+        &mut self,
+    ) -> Result<Option<super::navigation::NavigationRequest>, StoryRuntimeError> {
+        let invalid = || {
+            StoryRuntimeError::Capability(CharacterCapabilityError::Native(
+                "recorded deadline does not match this story execution".into(),
+            ))
+        };
+        let id = if let Some(inputs) = &self.native_replay {
+            let Some((signature, value)) = inputs
+                .front()
+                .filter(|(s, _)| s.starts_with("clock-expiry:"))
+            else {
+                return Ok(None);
+            };
+            let mut parts = signature.split(':');
+            parts.next();
+            let count = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(invalid)?;
+            let id = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(invalid)?;
+            if count < self.event_count {
+                return Err(invalid());
+            }
+            if count > self.event_count || self.host.deadline_navigation(id).is_none() {
+                return Ok(None);
+            }
+            if self.deadline_signature(id).as_ref() != Some(signature)
+                || value != &crate::state::StoredValue::Bool(true)
+            {
+                return Err(invalid());
+            }
+            id
+        } else {
+            let Some(id) = self.host.due_navigation() else {
+                return Ok(None);
+            };
+            id
+        };
+        let signature = self.deadline_signature(id).ok_or_else(invalid)?;
+        let request = self.host.expire_navigation(id).ok_or_else(invalid)?;
+        if let Some(inputs) = &mut self.native_replay {
+            inputs.pop_front();
+        }
+        self.native_trace
+            .push((signature, crate::state::StoredValue::Bool(true)));
+        self.terminated = true;
+        Ok(Some(request))
+    }
+
     pub fn step(&mut self) -> Result<Option<StoryRuntimeEvent>, StoryRuntimeError> {
+        if self.terminated {
+            return Ok(None);
+        }
+        if let Some(request) = self.expired_navigation()? {
+            return Ok(Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(
+                request,
+            ))));
+        }
+        if let Some(event) = self.restored_events.pop_front() {
+            self.mark_host_boundary(&event);
+            return Ok(Some(event));
+        }
+        let event = self.step_inner()?;
+        if event.is_some() {
+            self.event_count = self.event_count.checked_add(1).ok_or_else(|| {
+                StoryRuntimeError::Capability(CharacterCapabilityError::Native(
+                    "story event counter exhausted".into(),
+                ))
+            })?;
+        }
+        Ok(event)
+    }
+
+    fn step_inner(&mut self) -> Result<Option<StoryRuntimeEvent>, StoryRuntimeError> {
         if self.terminated {
             return Ok(None);
         }
@@ -847,9 +993,13 @@ impl StoryRuntime {
                     .drain_effects()
                     .into_iter()
                     .map(|effect| match effect {
-                        StoryEffect::Delay { duration_ms } => {
-                            StoryRuntimeEvent::Wait(StoryWait::Delay { duration_ms })
-                        }
+                        StoryEffect::Delay {
+                            duration_ms,
+                            interruptible,
+                        } => StoryRuntimeEvent::Wait(StoryWait::Delay {
+                            duration_ms,
+                            interruptible,
+                        }),
                         effect => StoryRuntimeEvent::Effect(effect),
                     }),
             );
@@ -1030,10 +1180,16 @@ impl StoryRuntime {
         let mut interactive_delay = None;
         let task_mode = self.execution.mode(task);
         for effect in self.host.drain_effects() {
-            if let StoryEffect::Delay { duration_ms } = effect
+            if let StoryEffect::Delay {
+                duration_ms,
+                interruptible,
+            } = effect
                 && task_mode == Some(ExecutionMode::Interactive)
             {
-                interactive_delay = Some(StoryWait::Delay { duration_ms });
+                interactive_delay = Some(StoryWait::Delay {
+                    duration_ms,
+                    interruptible,
+                });
                 continue;
             }
             // An interactive option follows ordinary story semantics: starting
@@ -1086,6 +1242,7 @@ fn animation_effect(effect: &StoryEffect) -> bool {
             | StoryEffect::HideCharacter { .. }
             | StoryEffect::ActorMotion { .. }
             | StoryEffect::ActorBlur { .. }
+            | StoryEffect::ActorTint { .. }
             | StoryEffect::SetCurtain { .. }
             | StoryEffect::Picture(_)
             | StoryEffect::PlayBgm { .. }
@@ -1135,6 +1292,104 @@ mod tests {
     };
 
     #[test]
+    fn deadline_navigation_interrupts_a_host_wait_and_replays_without_advancing_time() {
+        for wait in ["sleep(30)", "camera().zoom(0.5).time(30).await()"] {
+            let code = compile_story_bytecode("alice.hks", &format!(
+                "let timer = clock.countdown(1).gotoOnExpire(\"bob.hks\")\n{wait}\n\"must not execute\""
+            )).expect("deadline compiles");
+            let mut live = StoryRuntime::new(code.clone()).expect("live runtime");
+            let boundary = live
+                .step()
+                .expect("host boundary")
+                .expect("wait or animation");
+            assert!(matches!(
+                boundary,
+                StoryRuntimeEvent::Wait(StoryWait::Delay { .. })
+                    | StoryRuntimeEvent::TaskEffect { .. }
+            ));
+            let snapshot = live.snapshot().expect("waiting deadline snapshot");
+            live = StoryRuntime::restore(code.clone(), snapshot).expect("restore deadline");
+            if !matches!(boundary, StoryRuntimeEvent::TaskEffect { .. }) {
+                live.enqueue_event(boundary.clone());
+            }
+            let count = live.event_count;
+            assert_eq!(
+                live.step().expect("redispatch restored presentation"),
+                Some(boundary.clone())
+            );
+            assert_eq!(
+                live.event_count, count,
+                "redispatch is not new script execution"
+            );
+            live.advance_time(std::time::Duration::from_secs(2));
+            let expired = live.step().expect("expiry").expect("navigation");
+            assert!(
+                matches!(&expired, StoryRuntimeEvent::Effect(StoryEffect::Navigate(request)) if request.path == "bob.hks" && request.preload == Some(false))
+            );
+            assert!(live.resume(Value::Unit).is_err());
+            assert_eq!(live.step().expect("terminated deadline"), None);
+            let (trace, incomplete) = live.take_native_trace();
+            assert!(!incomplete);
+            assert_eq!(trace.len(), 1);
+            let mut replay = StoryRuntime::new(code).expect("replay runtime");
+            replay.replay_inputs(trace.clone());
+            assert_eq!(replay.step().expect("replay boundary"), Some(boundary));
+            assert!(replay.replay_deadline_due());
+            assert_eq!(replay.step().expect("recorded expiry"), Some(expired));
+            assert_eq!(replay.take_native_trace().0, trace);
+            let mut invalid = StoryRuntime::new(compile_story_bytecode("alice.hks", &format!(
+                "let timer = clock.countdown(1).gotoOnExpire(\"bob.hks\")\n{wait}\n\"must not execute\""
+            )).expect("same program")).expect("invalid replay runtime");
+            let mut altered = trace;
+            altered[0].1 = crate::state::StoredValue::Bool(false);
+            invalid.replay_inputs(altered);
+            invalid.step().expect("wait preceding altered input");
+            assert!(
+                invalid.step().is_err(),
+                "invalid deadline records must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deadline_keeps_its_registration_origin_across_a_called_script() {
+        let source = compile_story_bytecode(
+            "alice.hks",
+            "clock.countdown(1).gotoOnExpire(\"bob.hks\")\nsleep(30)",
+        )
+        .expect("caller");
+        let mut caller = StoryRuntime::new(source).expect("caller runtime");
+        caller.step().expect("register deadline");
+        let source = compile_story_bytecode("nested/alice.hks", "sleep(30)").expect("callee");
+        let mut callee = StoryRuntime::new(source).expect("callee runtime");
+        callee.inherit_native_state(&caller, false);
+        callee.step().expect("callee wait");
+        callee.advance_time(std::time::Duration::from_secs(2));
+        assert!(
+            matches!(callee.step().expect("deadline"), Some(StoryRuntimeEvent::Effect(StoryEffect::Navigate(request)))
+            if request.origin.as_deref() == Some("alice.hks") && request.path == "bob.hks")
+        );
+    }
+
+    #[test]
+    fn a_paused_or_disposed_deadline_does_not_navigate() {
+        for suffix in ["pause()", "dispose()"] {
+            let code = compile_story_bytecode(
+                "alice.hks",
+                &format!("clock.countdown(1).gotoOnExpire(\"bob.hks\").{suffix}\nsleep(30)"),
+            )
+            .expect("deadline lifecycle compiles");
+            let mut runtime = StoryRuntime::new(code).expect("runtime");
+            assert!(matches!(
+                runtime.step().expect("wait"),
+                Some(StoryRuntimeEvent::Wait(_))
+            ));
+            runtime.advance_time(std::time::Duration::from_secs(50));
+            assert_eq!(runtime.step().expect("inactive deadline"), None);
+        }
+    }
+
+    #[test]
     fn plans_finish_script_evaluation_before_first_effect_and_restore_without_closure_frames() {
         let code = compile_story_bytecode(
             "plan.hks",
@@ -1180,7 +1435,10 @@ mod tests {
         assert!(matches!(
             runtime.step().expect("next recorded step"),
             Some(StoryRuntimeEvent::TaskEffect {
-                effect: StoryEffect::Delay { duration_ms: 200 },
+                effect: StoryEffect::Delay {
+                    duration_ms: 200,
+                    interruptible: false
+                },
                 ..
             })
         ));
@@ -2314,7 +2572,7 @@ mod tests {
         let effects = host.drain_effects();
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            StoryEffect::PlayBgm { path, volume, fade_in_ms: Some(600), looped: true }
+            StoryEffect::PlayBgm { path, volume, fade_in_ms: Some(600), looped: true, .. }
                 if path == "music/theme" && (*volume - 0.75).abs() < f32::EPSILON
         )));
         assert!(effects.iter().any(|effect| matches!(
@@ -2355,6 +2613,45 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn nonblocking_dialogue_proceeds_to_explicit_timeline_wait() {
+        let bytecode = compile_story_bytecode(
+            "scene.hks",
+            r#"
+            presentDialogue("alice", "Hello, Bob")
+            sleep(1)
+            presentDialogue("bob", "Hello, Alice")
+        "#,
+        )
+        .expect("presentation story compiles");
+        let mut runtime = StoryRuntime::new(bytecode.clone()).expect("runtime initializes");
+        let mut presented = false;
+        while let Some(event) = runtime.step().expect("presentation executes") {
+            match event {
+                StoryRuntimeEvent::Effect(StoryEffect::PresentDialogue { text, .. }) => {
+                    assert_eq!(text, "Hello, Bob");
+                    presented = true;
+                }
+                StoryRuntimeEvent::Wait(StoryWait::DialogueAdvance) => {
+                    panic!("presentation must not await input")
+                }
+                StoryRuntimeEvent::Wait(_) => break,
+                _ => {}
+            }
+        }
+        assert!(presented);
+        let snapshot = runtime.snapshot().expect("timeline wait is resumable");
+        let mut restored = StoryRuntime::restore(bytecode, snapshot).expect("timeline restores");
+        restored
+            .resume(Value::Unit)
+            .expect("explicit delay completes");
+        assert!(matches!(
+            restored.step().expect("following presentation executes"),
+            Some(StoryRuntimeEvent::Effect(StoryEffect::PresentDialogue { text, .. }))
+                if text == "Hello, Alice"
+        ));
     }
 
     #[test]

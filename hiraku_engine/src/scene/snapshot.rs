@@ -110,6 +110,19 @@ pub fn sync_scene_snapshot(
             })
         });
     }
+    snapshot.music_channels = stage.pending_music_restore.clone();
+    for (name, entity) in &stage.music_channels {
+        if let Ok(bgm) = bgms.get(*entity) {
+            snapshot.music_channels.insert(
+                name.clone(),
+                AudioSnapshot {
+                    path: bgm.path.clone(),
+                    volume: bgm.volume,
+                    looped: bgm.looped,
+                },
+            );
+        }
+    }
 
     if let Ok((overlay_sprite, tween, pending)) = overlay.single() {
         snapshot.overlay_alpha = overlay_sprite.color.alpha();
@@ -200,6 +213,10 @@ pub(super) fn restore_scene_snapshot(
         commands.entity(bgm).try_despawn();
     }
     stage.pending_bgm_restore = snapshot.bgm.clone();
+    for (_, entity) in std::mem::take(&mut stage.music_channels) {
+        commands.entity(entity).try_despawn();
+    }
+    stage.pending_music_restore = snapshot.music_channels.clone();
 
     if let Some(background) = snapshot.background.as_ref() {
         stage.background = Some(

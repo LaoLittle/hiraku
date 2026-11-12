@@ -5,6 +5,33 @@ mod redraw_tests {
     use super::*;
 
     #[test]
+    fn advance_only_removes_the_matching_interruptible_wait_once() {
+        let make_wait = |request, interruptible| PendingWait {
+            timer: Timer::new(std::time::Duration::from_secs(1), TimerMode::Once),
+            animation_id: None,
+            done: ScriptRequestId(request),
+            interruptible,
+        };
+        let mut waits = PendingWaits {
+            items: vec![make_wait(1, false), make_wait(2, true), make_wait(3, true)],
+        };
+        assert!(waits.interrupt(ScriptRequestId(1)).is_none());
+        assert!(waits.interrupt(ScriptRequestId(4)).is_none());
+        assert_eq!(
+            waits
+                .interrupt(ScriptRequestId(2))
+                .expect("matching wait")
+                .done,
+            ScriptRequestId(2)
+        );
+        assert!(waits.interrupt(ScriptRequestId(2)).is_none());
+        assert_eq!(
+            waits.items.iter().map(|wait| wait.done).collect::<Vec<_>>(),
+            vec![ScriptRequestId(1), ScriptRequestId(3)]
+        );
+    }
+
+    #[test]
     fn timed_wait_requests_its_completion_frame_then_becomes_idle() {
         let mut app = App::new();
         app.init_resource::<Time>()
@@ -19,6 +46,7 @@ mod redraw_tests {
             .push(PendingWait {
                 timer: Timer::new(std::time::Duration::from_millis(200), TimerMode::Once),
                 animation_id: None,
+                interruptible: false,
                 done: ScriptRequestId(1),
             });
         let mut redraws =
@@ -53,6 +81,16 @@ pub struct PendingWaits {
     pub items: Vec<PendingWait>,
 }
 
+impl PendingWaits {
+    pub fn interrupt(&mut self, request: ScriptRequestId) -> Option<PendingWait> {
+        let index = self
+            .items
+            .iter()
+            .position(|wait| wait.done == request && wait.interruptible)?;
+        Some(self.items.remove(index))
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct AnimationState {
     pub completed: HashSet<String>,
@@ -68,6 +106,7 @@ pub struct PendingWait {
     pub timer: Timer,
     pub animation_id: Option<String>,
     pub done: ScriptRequestId,
+    pub interruptible: bool,
 }
 
 pub struct PendingAnimationWait {

@@ -11,6 +11,7 @@ use crate::{
 
 pub(crate) mod actor_blur;
 pub(crate) mod actor_motion;
+pub(crate) mod actor_tint;
 pub(crate) mod animation;
 mod animation_plan;
 pub(crate) mod capabilities;
@@ -26,11 +27,13 @@ mod story_runtime;
 pub(crate) mod text;
 pub mod ui_runtime;
 mod ui_vm;
+pub(crate) use project::compile_library_project_with_pass;
 pub(crate) use project::{StoryProgram, compile_story_program};
 pub(crate) use stdlib::dialogue_source;
 pub(crate) use stdlib::profile_source;
 pub(crate) use ui_vm::UiComposition;
 pub(crate) use ui_vm::authoring_api as ui_authoring_api;
+pub(crate) use ui_vm::check_ui_source;
 pub(crate) use ui_vm::ui_argument_to_stored;
 pub(crate) use ui_vm::ui_geometry;
 pub(crate) use ui_vm::validate_ui_source;
@@ -91,6 +94,9 @@ pub(crate) fn script_command_from_effect(
         StoryEffect::InputPermissions(permissions) => {
             ScriptCommand::Runtime(RuntimeCommand::InputPermissions(permissions))
         }
+        StoryEffect::FastForward(enabled) => {
+            ScriptCommand::Settings(SettingsCommand::FastForward(enabled))
+        }
         StoryEffect::ClearDialogueText => ScriptCommand::Dialogue(DialogueCommand::ClearText),
         StoryEffect::ShakeCamera {
             amplitude,
@@ -113,6 +119,7 @@ pub(crate) fn script_command_from_effect(
             animation_id: None,
         }),
         StoryEffect::StopVoice => ScriptCommand::Audio(AudioCommand::StopVoice),
+        StoryEffect::VoicePaused(paused) => ScriptCommand::Audio(AudioCommand::VoicePaused(paused)),
         StoryEffect::Exit => ScriptCommand::Runtime(RuntimeCommand::Exit),
         StoryEffect::Navigate(navigation) => ScriptCommand::Runtime(RuntimeCommand::Navigate {
             request: navigation,
@@ -127,6 +134,9 @@ pub(crate) fn script_command_from_effect(
             text,
             animation_id: None,
         }),
+        StoryEffect::PresentDialogue { speaker, text } => {
+            ScriptCommand::Dialogue(DialogueCommand::Present { speaker, text })
+        }
         StoryEffect::ContinueDialogue { text } => {
             ScriptCommand::Dialogue(DialogueCommand::Continue {
                 text,
@@ -255,6 +265,16 @@ pub(crate) fn script_command_from_effect(
         } => ScriptCommand::Character(CharacterCommand::Blur {
             actor_id,
             radius,
+            animation,
+            animation_id: None,
+        }),
+        StoryEffect::ActorTint {
+            actor_id,
+            color,
+            animation,
+        } => ScriptCommand::Character(CharacterCommand::Tint {
+            actor_id,
+            color,
             animation,
             animation_id: None,
         }),

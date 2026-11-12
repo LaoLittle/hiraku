@@ -203,6 +203,8 @@ struct UiDraft {
     pauses_scene: bool,
     timers: Vec<(f32, HksCallable)>,
     on_update: Option<HksCallable>,
+    on_advance: Option<HksCallable>,
+    on_back: Option<HksCallable>,
     on_pressed_change: Option<HksCallable>,
     size_binding: Option<HksBinding<UiSize>>,
     position_binding: Option<HksBinding<UiPosition>>,
@@ -253,6 +255,8 @@ impl UiDraft {
             allowed_overlays: Vec::new(),
             timers: Vec::new(),
             on_update: None,
+            on_advance: None,
+            on_back: None,
             on_pressed_change: None,
             size_binding: None,
             position_binding: None,
@@ -574,6 +578,31 @@ mod native_ui {
         Ok(node)
     }
 
+    #[hks(name = "track", receiver)]
+    fn track(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        path: String,
+        name: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        if name.is_empty() || path.is_empty() {
+            return Err(NativeError::message(
+                "track requires a non-empty asset path and track name",
+            ));
+        }
+        let path =
+            bevy::asset::AssetPath::parse(context.navigation_origin.as_deref().unwrap_or(""))
+                .resolve_embed_str(&path)
+                .map_err(|e| NativeError::message(e.to_string()))?
+                .to_string();
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Image(_)) {
+            return Err(NativeError::message("track requires an image node"));
+        }
+        draft.layout.track = Some(crate::ui::UiTrackReference { path, name });
+        Ok(node)
+    }
+
     /// Read-only collection size; the registry preserves the element type.
     #[hks(raw)]
     fn count(
@@ -639,6 +668,7 @@ mod native_ui {
             textures,
             keys,
             blend: crate::ui::UiShaderBlend::Alpha,
+            alpha_blend: crate::ui::UiShaderAlphaBlend::Inherit,
         });
         Ok(node)
     }
@@ -662,6 +692,33 @@ mod native_ui {
             _ => {
                 return Err(NativeError::message(
                     "UI shader blend must be alpha, multiply or additive",
+                ));
+            }
+        };
+        Ok(node)
+    }
+
+    #[hks(name = "alphaBlend", receiver)]
+    fn alpha_blend(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        mode: String,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let shader = context
+            .node_mut(node)?
+            .layout
+            .shader
+            .as_mut()
+            .ok_or_else(|| NativeError::message("alphaBlend requires shader(...) on an image"))?;
+        shader.alpha_blend = match mode.as_str() {
+            "inherit" => crate::ui::UiShaderAlphaBlend::Inherit,
+            "over" => crate::ui::UiShaderAlphaBlend::Over,
+            "replace" => crate::ui::UiShaderAlphaBlend::Replace,
+            "preserve" => crate::ui::UiShaderAlphaBlend::Preserve,
+            "additive" => crate::ui::UiShaderAlphaBlend::Additive,
+            _ => {
+                return Err(NativeError::message(
+                    "UI shader alphaBlend must be inherit, over, replace, preserve or additive",
                 ));
             }
         };
@@ -750,6 +807,36 @@ mod native_ui {
             return Err(NativeError::message("onUpdate requires a screen or canvas"));
         }
         draft.on_update = Some(handler.0);
+        Ok(node)
+    }
+
+    #[hks(name = "onAdvance", receiver)]
+    fn on_advance(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        handler: UiVoidCallable,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Screen) {
+            return Err(NativeError::message(
+                "onAdvance requires a screen or canvas",
+            ));
+        }
+        draft.on_advance = Some(handler.0);
+        Ok(node)
+    }
+
+    #[hks(name = "onBack", receiver)]
+    fn on_back(
+        context: &mut UiVmContext,
+        node: UiNodeHandle,
+        handler: UiVoidCallable,
+    ) -> Result<UiNodeHandle, NativeError> {
+        let draft = context.node_mut(node)?;
+        if !matches!(draft.kind, UiDraftKind::Screen) {
+            return Err(NativeError::message("onBack requires a screen or canvas"));
+        }
+        draft.on_back = Some(handler.0);
         Ok(node)
     }
 
@@ -1767,6 +1854,16 @@ fn validate_ui_result(value: &Value) -> Result<(), NativeError> {
     }
 }
 
+#[hiraku_script::hks_module("clock")]
+mod clock_queries {
+    use super::*;
+
+    #[hks]
+    fn remaining(context: &mut UiVmContext, name: String) -> Result<Option<f64>, NativeError> {
+        Ok(context.values.countdown_remaining(&name))
+    }
+}
+
 #[hiraku_script::hks_module("storage")]
 mod storage_actions {
     use super::*;
@@ -1818,6 +1915,16 @@ mod storage_actions {
             return Err(NativeError::message("save slot must not be empty"));
         }
         Ok(context.insert_effect(UiEffect::Save { slot }))
+    }
+
+    #[hks]
+    fn native_delete(
+        context: &mut UiVmContext,
+        slot: String,
+    ) -> Result<UiEffectHandle, NativeError> {
+        hiraku_storage::validate_key(&slot)
+            .map_err(|error| NativeError::message(error.to_string()))?;
+        Ok(context.insert_effect(UiEffect::DeleteSave { slot }))
     }
 
     #[hks]
@@ -1933,6 +2040,16 @@ mod preference_actions {
 #[hiraku_script::hks_module("audio")]
 mod settings_actions {
     use super::*;
+
+    #[hks(name = "pauseVoice")]
+    fn pause_voice(context: &mut UiVmContext) -> Result<UiEffectHandle, NativeError> {
+        Ok(context.insert_effect(UiEffect::VoicePaused(true)))
+    }
+
+    #[hks(name = "resumeVoice")]
+    fn resume_voice(context: &mut UiVmContext) -> Result<UiEffectHandle, NativeError> {
+        Ok(context.insert_effect(UiEffect::VoicePaused(false)))
+    }
 
     #[hks(name = "stopVoice")]
     fn stop_voice(context: &mut UiVmContext) -> Result<UiEffectHandle, NativeError> {
@@ -2247,6 +2364,7 @@ fn ui_registry(values: &UiContext) -> NativeRegistry<UiVmContext> {
             .expect("UI close signature is registered");
     }
     preference_actions::register_hks(&mut registry).expect("preference API registers once");
+    clock_queries::register_hks(&mut registry).expect("clock queries register once");
     storage_actions::register_hks(&mut registry)
         .expect("storage actions must be internally consistent");
     history_actions::register_hks(&mut registry).expect("history API registers once");
@@ -2406,13 +2524,31 @@ pub(crate) struct UiComposition {
 
 impl UiComposition {
     pub(crate) fn models_changed(&self, models: &crate::ui::UiModels) -> bool {
-        self.document.plan.structural_paths.iter().any(|path| {
-            let root = path.split('.').next().expect("dependency root");
-            // Invocation inputs can exist only in UiContext, not in UiModels.
-            !self.document.owned_globals.contains(root)
-                && models.get(root).is_some()
-                && models.get(path) != self.values.story_value(path)
-        })
+        let clock_changed = self.document.plan.native_calls.contains("clock.remaining")
+            && self.values.service_revision("clock")
+                != models
+                    .service_revisions
+                    .get("clock")
+                    .copied()
+                    .unwrap_or_default();
+        let storage_changed = ["storage.exists", "storage.thumbnail", "storage.problem"]
+            .iter()
+            .any(|name| self.document.plan.native_calls.contains(*name))
+            && self.values.service_revision("storage")
+                != models
+                    .service_revisions
+                    .get("storage")
+                    .copied()
+                    .unwrap_or_default();
+        clock_changed
+            || storage_changed
+            || self.document.plan.structural_paths.iter().any(|path| {
+                let root = path.split('.').next().expect("dependency root");
+                // Invocation inputs can exist only in UiContext, not in UiModels.
+                !self.document.owned_globals.contains(root)
+                    && models.get(root).is_some()
+                    && models.get(path) != self.values.story_value(path)
+            })
     }
 
     pub(crate) fn with_models(&self, models: &crate::ui::UiModels) -> Self {
@@ -2513,6 +2649,16 @@ pub(crate) fn validate_ui_source(path: &str, source: &str) -> Result<(), String>
     )
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+pub(crate) fn check_ui_source(path: &str, source: &str) -> Vec<hiraku_script::Diagnostic> {
+    hiraku_ui::UiDocument::compile_checked(
+        path,
+        ui_sources(path, source),
+        &ui_registry(&UiContext::default()).manifest(),
+    )
+    .err()
+    .unwrap_or_default()
 }
 
 fn collect_nodes(
@@ -2825,7 +2971,8 @@ impl UiPropertyEvaluator {
                 binding.globals.insert(name.clone(), stored_to_hks(value));
             }
         }
-        let values = UiContext::default();
+        let mut values = UiContext::default();
+        values.update_models(models);
         let mut context = UiVmContext::new(values, TermCatalog::default());
         evaluate_binding_value(&binding, &self.registry, &mut context)
     }
@@ -2873,6 +3020,12 @@ fn materialize_screen(
         overlay_order: draft.overlay_order,
         on_update: draft
             .on_update
+            .map(|handler| ui_callback(handler, program, context)),
+        on_advance: draft
+            .on_advance
+            .map(|handler| ui_callback(handler, program, context)),
+        on_back: draft
+            .on_back
             .map(|handler| ui_callback(handler, program, context)),
         allowed_overlays: draft.allowed_overlays,
         timers_paused: draft.timers_paused,
@@ -3261,7 +3414,7 @@ fn materialize_node(
         UiDraftKind::Image(path) => {
             let mut layout = draft.layout;
             if let Some(shader) = &mut layout.shader {
-                if layout.keyframes.is_empty() {
+                if layout.keyframes.is_empty() && layout.track.is_none() {
                     return Err(UiVmError::Invalid(
                         "shader images require a keyframe timeline".into(),
                     ));
@@ -3278,15 +3431,16 @@ fn materialize_node(
             }
             let texture = resolve_texture(textures, &path)?;
             if (layout.shader.is_some()
+                || layout.track.is_some()
                 || layout.keyframes.iter().any(|key| {
                     matches!(
                         key,
                         crate::ui::UiKeyframe::Quad(..) | crate::ui::UiKeyframe::QuadStepAlpha(..)
                     )
                 }))
-                && (texture.rect.is_some() || layout.flip_x)
+                && layout.flip_x
             {
-                return Err(UiVmError::Invalid("projected shader tracks require whole, unflipped images; encode reflection in quad axes".into()));
+                return Err(UiVmError::Invalid("projected shader tracks require unflipped images; encode reflection in quad axes".into()));
             }
             Ok(ScreenNode::Image(ScreenImageNode { texture, layout }))
         }
@@ -3920,6 +4074,84 @@ canvas { text("Alice") }.onUpdate { delta: Float ->
             );
             assert_eq!(effects.len(), usize::from(index == 3));
             globals = next;
+        }
+    }
+
+    #[test]
+    fn advance_callback_skips_only_hold_and_preserves_the_exit_fade() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+global var elapsed: Float = 0.0
+fn advance() { if elapsed >= 1.0 && elapsed < 3.0 { elapsed = 3.0 } }
+canvas { text("Alice") }.onAdvance(advance).onUpdate { delta: Float -> elapsed += delta }
+"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("advance callback compiles");
+        let models = crate::ui::UiModels::default();
+        let mut globals = BTreeMap::new();
+        let (_, next) = evaluate_ui_callback_with_args(
+            screen.on_advance.as_ref().expect("advance"),
+            &globals,
+            &models,
+            vec![],
+        )
+        .expect("ignore entrance press");
+        globals.extend(next);
+        assert_eq!(globals.get("elapsed"), Some(&Value::Number(0.0)));
+        let (_, next) = evaluate_ui_callback_with_args(
+            screen.on_update.as_ref().expect("update"),
+            &globals,
+            &models,
+            vec![Value::Number(1.5)],
+        )
+        .expect("enter hold");
+        globals.extend(next);
+        let (_, next) = evaluate_ui_callback_with_args(
+            screen.on_advance.as_ref().expect("advance"),
+            &globals,
+            &models,
+            vec![],
+        )
+        .expect("skip hold");
+        globals.extend(next);
+        assert_eq!(globals.get("elapsed"), Some(&Value::Number(3.0)));
+        let (_, next) = evaluate_ui_callback_with_args(
+            screen.on_update.as_ref().expect("update"),
+            &globals,
+            &models,
+            vec![Value::Number(0.5)],
+        )
+        .expect("exit progresses");
+        globals.extend(next);
+        let (_, next) = evaluate_ui_callback_with_args(
+            screen.on_advance.as_ref().expect("advance"),
+            &globals,
+            &models,
+            vec![],
+        )
+        .expect("ignore exit press");
+        globals.extend(next);
+        assert_eq!(globals.get("elapsed"), Some(&Value::Number(3.5)));
+        for source in [
+            "import ui.widgets.*; canvas {}.onAdvance { value: Float -> }",
+            "import ui.widgets.*; text(\"Bob\").onAdvance {}",
+            "import ui.widgets.*; canvas {}.onBack { value: Float -> }",
+            "import ui.widgets.*; text(\"Bob\").onBack {}",
+        ] {
+            assert!(
+                evaluate_ui_component_named(
+                    "memory://bob.ui.hks",
+                    source,
+                    UiContext::default(),
+                    &TextureCatalog::default(),
+                    &TermCatalog::default()
+                )
+                .is_err()
+            );
         }
     }
 
@@ -4665,6 +4897,131 @@ canvas {
     }
 
     #[test]
+    fn script_menu_back_only_closes_its_overlay_without_completing_the_story_wait() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+                canvas { text("Alice") }
+                    .overlay(0, 0, 0, 0.72).onBack { ui.close() }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("script-owned menu builds");
+        let (effects, _) = evaluate_ui_callback(
+            screen.on_back.as_ref().expect("menu Back handler"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+        )
+        .expect("menu Back callback");
+        assert_eq!(effects, vec![UiEffect::CloseUi { value: Value::Unit }]);
+    }
+
+    #[test]
+    fn opening_a_script_menu_cancels_auto_and_skip_before_opening_when_allowed() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+                canvas {
+                    button { text("Alice") }.onClick {
+                        if input.pause {
+                            preferences.setAutoDialogue(false)
+                            preferences.setFastForward(false)
+                            sfx("alice")
+                            ui.open("bob.ui.hks")
+                        }
+                        ()
+                    }
+                }.onBack {
+                    if dialogue.visible && input.pause {
+                        preferences.setAutoDialogue(false)
+                        preferences.setFastForward(false)
+                        sfx("alice")
+                        ui.open("bob.ui.hks")
+                    }
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("script-owned menu callback");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("menu button")
+        };
+        for allowed in [true, false, true] {
+            let mut models = crate::ui::UiModels::default();
+            models.set(
+                "input",
+                crate::input::InputPermissions {
+                    pause: allowed,
+                    ..Default::default()
+                }
+                .model(false),
+            );
+            let (effects, _) = evaluate_ui_callback(
+                button.on_click.as_ref().expect("callback"),
+                &BTreeMap::new(),
+                &models,
+            )
+            .expect("menu callback");
+            if !allowed {
+                assert!(effects.is_empty());
+                models.set(
+                    "dialogue",
+                    StoredValue::Map(BTreeMap::from([(
+                        "visible".into(),
+                        StoredValue::Bool(true),
+                    )])),
+                );
+                let (effects, _) = evaluate_ui_callback(
+                    screen.on_back.as_ref().expect("overlay Back callback"),
+                    &BTreeMap::new(),
+                    &models,
+                )
+                .expect("disabled overlay Back callback");
+                assert!(effects.is_empty());
+                continue;
+            }
+            assert_eq!(
+                &effects[..3],
+                &[
+                    UiEffect::SetAutoDialogue(false),
+                    UiEffect::SetFastForward(false),
+                    UiEffect::PlaySfx {
+                        name: "alice".into(),
+                        volume: 1.0
+                    },
+                ]
+            );
+            assert!(
+                matches!(&effects[3..], [UiEffect::OpenUi { role, .. }] if role == "bob.ui.hks")
+            );
+            for visible in [false, true] {
+                models.set(
+                    "dialogue",
+                    StoredValue::Map(BTreeMap::from([(
+                        "visible".into(),
+                        StoredValue::Bool(visible),
+                    )])),
+                );
+                let (back_effects, _) = evaluate_ui_callback(
+                    screen.on_back.as_ref().expect("overlay Back callback"),
+                    &BTreeMap::new(),
+                    &models,
+                )
+                .expect("overlay Back callback evaluates against current dialogue state");
+                if visible {
+                    assert_eq!(back_effects, effects);
+                } else {
+                    assert!(back_effects.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn input_permissions_drive_button_state_and_callbacks_use_current_permissions() {
         let source = r#"import ui.widgets.*
             canvas {
@@ -4745,6 +5102,103 @@ canvas {
     }
 
     #[test]
+    fn countdown_queries_refresh_only_the_observing_composition() {
+        let path = "memory://alice.ui.hks";
+        let registry = ui_registry(&UiContext::default());
+        let document = hiraku_ui::UiDocument::compile(
+            path,
+            ui_sources(path, "import ui.widgets.*; canvas { text((clock.remaining(\"alice\") ?: 0.0).toString()) }"),
+            &registry.manifest(), RenderOptions::plain(),
+        ).expect("read-only clock UI");
+        assert!(document.plan.native_calls.contains("clock.remaining"));
+        let composition = UiComposition {
+            document,
+            values: UiContext::default(),
+            path: path.into(),
+            arguments: vec![],
+            globals: BTreeMap::new(),
+        };
+        let mut models = crate::ui::UiModels::default();
+        assert!(!composition.models_changed(&models));
+        models.set_countdowns(BTreeMap::from([(
+            "alice".into(),
+            std::time::Duration::from_secs(5),
+        )]));
+        assert!(composition.models_changed(&models));
+        let current = composition.with_models(&models);
+        assert_eq!(current.values.countdown_remaining("alice"), Some(5.0));
+        assert_eq!(current.values.countdown_remaining("bob"), None);
+        assert!(!current.models_changed(&models));
+        let revision = models.revision();
+        models.set_countdowns(models.countdowns.clone());
+        assert_eq!(models.revision(), revision);
+        models.invalidate_service("storage");
+        assert!(!current.models_changed(&models));
+        let mut unrelated = composition.clone();
+        unrelated.document = hiraku_ui::UiDocument::compile(
+            path,
+            ui_sources(path, "import ui.widgets.*; canvas { text(\"Bob\") }"),
+            &registry.manifest(),
+            RenderOptions::plain(),
+        )
+        .expect("unrelated UI");
+        assert!(!unrelated.models_changed(&models));
+        models.set_countdowns(BTreeMap::new());
+        assert!(current.models_changed(&models));
+        assert_eq!(
+            current
+                .with_models(&models)
+                .values
+                .countdown_remaining("alice"),
+            None
+        );
+    }
+
+    #[test]
+    fn slot_queries_refresh_only_when_the_storage_service_changes() {
+        let path = "memory://alice.ui.hks";
+        let registry = ui_registry(&UiContext::default());
+        let document = hiraku_ui::UiDocument::compile(
+            path,
+            ui_sources(
+                path,
+                "import ui.widgets.*; canvas { if storage.exists(\"alice\") { text(\"Bob\") } }",
+            ),
+            &registry.manifest(),
+            RenderOptions::plain(),
+        )
+        .expect("storage reader compiles without accessing a slot");
+        assert!(document.plan.native_calls.contains("storage.exists"));
+        let composition = UiComposition {
+            document,
+            values: UiContext::default(),
+            path: path.into(),
+            arguments: vec![],
+            globals: BTreeMap::new(),
+        };
+        let mut models = crate::ui::UiModels::default();
+        assert!(!composition.models_changed(&models));
+        models.invalidate_service("bob");
+        assert!(!composition.models_changed(&models));
+        models.invalidate_service("storage");
+        assert!(composition.models_changed(&models));
+        let updated = composition.with_models(&models);
+        assert!(!updated.models_changed(&models));
+        assert!(updated.values.story_value("storage").is_none());
+        models.invalidate_service("storage");
+        assert!(updated.models_changed(&models));
+        let mut unrelated = composition.clone();
+        unrelated.document = hiraku_ui::UiDocument::compile(
+            path,
+            ui_sources(path, "import ui.widgets.*; canvas { text(\"Alice\") }"),
+            &registry.manifest(),
+            RenderOptions::plain(),
+        )
+        .expect("unrelated UI");
+        assert!(!unrelated.models_changed(&models));
+    }
+
+    #[test]
     fn save_thumbnail_sources_do_not_require_a_texture_descriptor() {
         let textures = TextureCatalog::default();
         let source = resolve_texture(&textures, "save-thumbnail://manual-1")
@@ -4754,30 +5208,92 @@ canvas {
     }
 
     #[test]
+    fn confirmed_slot_deletion_is_a_deferred_effect_and_does_not_resume_or_load_the_story() {
+        let screen = evaluate_ui_component_named(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+                canvas {
+                    button { text("Alice") }.onClick {
+                        sfx("alice")
+                        storage.delete("bob")
+                        ui.close()
+                    }
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("delete action compiles without accessing storage");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("delete button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("delete callback"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+        )
+        .expect("delete queues effects, without deleting a real slot");
+        assert_eq!(
+            effects,
+            vec![
+                UiEffect::PlaySfx {
+                    name: "alice".into(),
+                    volume: 1.0
+                },
+                UiEffect::DeleteSave { slot: "bob".into() },
+                UiEffect::CloseUi { value: Value::Unit },
+            ]
+        );
+    }
+
+    #[test]
     fn confirmation_cancel_closes_only_the_modal_and_accept_completes_the_owner() {
         let source = r#"
             import ui.widgets.*
-            fn response(label: String, accepted: Bool) -> UiNode {
+            fn response(label: String, result: String, accepted: Bool) -> UiNode {
                 button { column { text(label) }.size(.abs(505, 144)) }
                     .onClick {
-                        if accepted { ui.complete("confirmed") } else { ui.close() }
+                        if accepted { sfx("alice"); ui.complete(result) }
+                        else { sfx("bob"); ui.close() }
                         ()
                     }
             }
-            screen { response("Cancel", false); response("Confirm", true) }
+            @ui
+            global fn confirmation(result: String) -> UiNode {
+                screen { response("Cancel", result, false); response("Confirm", result, true) }
+                    .onBack { sfx("bob"); ui.close() }
+            }
         "#;
-        let screen = evaluate_ui_component_named(
+        let screen = evaluate_ui_component_named_with_args(
             "memory://confirmation.ui.hks",
             source,
             UiContext::default(),
             &TextureCatalog::default(),
             &TermCatalog::default(),
+            &[StoredValue::String("alice".into())],
         )
         .expect("confirmation builds");
+        let (effects, _) = evaluate_ui_callback(
+            screen.on_back.as_ref().expect("back callback"),
+            &BTreeMap::new(),
+            &crate::ui::UiModels::default(),
+        )
+        .expect("back cancels the confirmation");
+        assert_eq!(
+            effects,
+            vec![
+                UiEffect::PlaySfx {
+                    name: "bob".into(),
+                    volume: 1.0
+                },
+                UiEffect::CloseUi { value: Value::Unit },
+            ]
+        );
         for (index, expected) in [
             UiEffect::CloseUi { value: Value::Unit },
             UiEffect::CompleteUi {
-                value: Value::String("confirmed".into()),
+                value: Value::String("alice".into()),
             },
         ]
         .into_iter()
@@ -4792,7 +5308,16 @@ canvas {
                 &crate::ui::UiModels::default(),
             )
             .expect("confirmation callback");
-            assert_eq!(effects, vec![expected]);
+            assert_eq!(
+                effects,
+                vec![
+                    UiEffect::PlaySfx {
+                        name: if index == 0 { "bob" } else { "alice" }.into(),
+                        volume: 1.0,
+                    },
+                    expected,
+                ]
+            );
         }
     }
 
@@ -5658,6 +6183,7 @@ global fn viewer(imageName: String, title: String) -> UiNode {
                         .keyframes([.quad(0, 0, 0, 20, 0, 0, 30, 1), .quad(1, 20, 0, -20, 0, 0, 30, 0)])
                         .shader("shaders/fade.wgsl", [], [.at(0, 1, 0, 0, 0), .at(1, 0, 0, 0, 0)])
                         .blend("multiply")
+                        .alphaBlend("replace")
                 }
             "#,
             UiContext::default(), &TextureCatalog::default(), &TermCatalog::default(), &[],
@@ -5667,8 +6193,33 @@ global fn viewer(imageName: String, title: String) -> UiNode {
         };
         let shader = image.layout.shader.as_ref().expect("shader spec");
         assert_eq!(shader.blend, crate::ui::UiShaderBlend::Multiply);
+        assert_eq!(shader.alpha_blend, crate::ui::UiShaderAlphaBlend::Replace);
         assert_eq!(shader.path, "memory://screens/shaders/fade.wgsl");
         assert_eq!(shader.keys.len(), 2);
+    }
+
+    #[test]
+    fn projected_images_reference_typed_tracks_without_building_frames_in_the_vm() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://screens/alice.ui.hks",
+            r#"import ui.widgets.* canvas {
+                image("save-thumbnail://alice")
+                    .track("alice.ui-tracks.hson", "bob")
+                    .shader("fade.wgsl", [], [.at(0, 1, 1, 1, 1)])
+            }"#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("track reference compiles");
+        let ScreenNode::Image(image) = &screen.children[0] else {
+            panic!("image node")
+        };
+        let track = image.layout.track.as_ref().expect("track");
+        assert_eq!(track.path, "memory://screens/alice.ui-tracks.hson");
+        assert_eq!(track.name, "bob");
+        assert!(image.layout.keyframes.is_empty());
     }
 
     #[test]
@@ -5868,6 +6419,79 @@ global fn viewer(imageName: String, title: String) -> UiNode {
             vec![UiEffect::CloseUi {
                 value: Value::String("bob".into())
             }]
+        );
+    }
+
+    #[test]
+    fn testimony_advance_callback_respects_live_input_permissions() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+                canvas {}.onAdvance {
+                    if input.advance {
+                        audio.stopVoice()
+                        ui.close(.{ selection: "", spent: 1.5 })
+                    }
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("typed testimony advance");
+        let callback = screen.on_advance.as_ref().expect("advance callback");
+        let globals = &screen.composition.as_ref().expect("composition").globals;
+        for allowed in [false, true, false] {
+            let mut models = crate::ui::UiModels::default();
+            let permissions = crate::input::InputPermissions {
+                advance: allowed,
+                ..Default::default()
+            };
+            models.set("input", permissions.model(false));
+            let (effects, _) =
+                evaluate_ui_callback(callback, globals, &models).expect("read current permissions");
+            if allowed {
+                assert!(matches!(
+                    effects.as_slice(),
+                    [UiEffect::StopVoice, UiEffect::CloseUi { .. }]
+                ));
+            } else {
+                assert!(effects.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ui_voice_controls_use_the_same_ordered_pause_state_as_story() {
+        let screen = evaluate_ui_component_named_with_args(
+            "memory://alice.ui.hks",
+            r#"import ui.widgets.*
+                canvas {
+                    button { text("Alice") }.onClick {
+                        audio.pauseVoice()
+                        audio.resumeVoice()
+                    }
+                }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+            &[],
+        )
+        .expect("voice control UI");
+        let ScreenNode::Button(button) = &screen.children[0] else {
+            panic!("expected button")
+        };
+        let (effects, _) = evaluate_ui_callback(
+            button.on_click.as_ref().expect("callback"),
+            &screen.composition.as_ref().expect("composition").globals,
+            &crate::ui::UiModels::default(),
+        )
+        .expect("voice control callback");
+        assert_eq!(
+            effects,
+            vec![UiEffect::VoicePaused(true), UiEffect::VoicePaused(false)]
         );
     }
 
@@ -6551,6 +7175,68 @@ screen {
                 origin: Some("memory://ui/menu.ui.hks".into()),
             })]
         );
+    }
+
+    #[test]
+    fn navigation_confirmation_only_resets_presentation_after_acceptance() {
+        let screen = evaluate_ui_component_named(
+            "memory://ui/confirmation.ui.hks",
+            r#"import ui.widgets.*
+                fn response(accepted: Bool) -> UiNode {
+                    button { text("Alice") }.onClick {
+                        if accepted {
+                            sfx("alice")
+                            story.goto("../bob.hks", .{ reset: .presentation })
+                        } else {
+                            sfx("bob")
+                            ui.close()
+                        }
+                        ()
+                    }
+                }
+                canvas { response(false); response(true) }
+            "#,
+            UiContext::default(),
+            &TextureCatalog::default(),
+            &TermCatalog::default(),
+        )
+        .expect("navigation confirmation");
+        for (index, expected) in [
+            vec![
+                UiEffect::PlaySfx {
+                    name: "bob".into(),
+                    volume: 1.0,
+                },
+                UiEffect::CloseUi { value: Value::Unit },
+            ],
+            vec![
+                UiEffect::PlaySfx {
+                    name: "alice".into(),
+                    volume: 1.0,
+                },
+                UiEffect::Navigate(NavigationRequest {
+                    path: "../bob.hks".into(),
+                    kind: super::super::navigation::NavigationKind::Goto,
+                    reset: super::super::navigation::NavigationReset::Presentation,
+                    preload: None,
+                    origin: Some("memory://ui/confirmation.ui.hks".into()),
+                }),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ScreenNode::Button(button) = &screen.children[index] else {
+                panic!("confirmation button")
+            };
+            let (effects, _) = evaluate_ui_callback(
+                button.on_click.as_ref().expect("confirmation callback"),
+                &BTreeMap::new(),
+                &crate::ui::UiModels::default(),
+            )
+            .expect("confirmation response");
+            assert_eq!(effects, expected);
+        }
     }
 
     #[test]

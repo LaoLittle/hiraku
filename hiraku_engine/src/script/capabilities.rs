@@ -16,6 +16,7 @@ use crate::script::{CameraEffectScope, CameraProjectionMode};
 use crate::storage::UserSettings;
 
 mod actor_patch;
+mod clock;
 mod movie;
 mod post_process;
 mod scene_visuals;
@@ -29,6 +30,7 @@ mod spatial_stage;
 pub enum StoryEffect {
     InputEnabled(bool),
     InputPermissions(crate::input::policy::InputPermissions),
+    FastForward(bool),
     ClearDialogueText,
     ShakeCamera {
         amplitude: [f32; 2],
@@ -64,6 +66,7 @@ pub enum StoryEffect {
         fade_ms: u64,
     },
     StopVoice,
+    VoicePaused(bool),
     StopSfxChannel {
         channel: String,
         fade_ms: u64,
@@ -87,6 +90,8 @@ pub enum StoryEffect {
     },
     Delay {
         duration_ms: u64,
+        #[serde(default)]
+        interruptible: bool,
     },
     SetCurtain {
         color: [u8; 3],
@@ -115,12 +120,17 @@ pub enum StoryEffect {
         delta: f32,
     },
     PlayBgm {
+        channel: Option<String>,
         path: String,
         volume: f32,
         fade_in_ms: Option<u64>,
         looped: bool,
     },
     Say {
+        speaker: String,
+        text: String,
+    },
+    PresentDialogue {
         speaker: String,
         text: String,
     },
@@ -157,6 +167,11 @@ pub enum StoryEffect {
         radius: f32,
         animation: AnimationSpec,
     },
+    ActorTint {
+        actor_id: String,
+        color: [f32; 4],
+        animation: AnimationSpec,
+    },
     ShowCharacter {
         rotation: f32,
         placement_animation: Option<AnimationSpec>,
@@ -176,8 +191,15 @@ pub enum StoryEffect {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoryWait {
     DialogueAdvance,
-    Movie { path: String, fade_out_ms: u64 },
-    Delay { duration_ms: u64 },
+    Movie {
+        path: String,
+        fade_out_ms: u64,
+    },
+    Delay {
+        duration_ms: u64,
+        #[serde(default)]
+        interruptible: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +351,7 @@ fn setting_number(fields: &BTreeMap<String, Value>, name: &str) -> Result<f32, S
 
 fn registry() -> NativeRegistry<CharacterContext> {
     let mut registry = NativeRegistry::new();
+    clock::register(&mut registry);
     scene_visuals::register(&mut registry);
     post_process::register(&mut registry);
     spatial_stage::register(&mut registry);
@@ -358,6 +381,7 @@ fn registry() -> NativeRegistry<CharacterContext> {
         .expect("story native API registration must be internally consistent");
     for name in [
         "intrinsics.engine.say",
+        "intrinsics.engine.presentDialogue",
         "intrinsics.engine.continueDialogue",
     ] {
         let id = registry
@@ -716,6 +740,11 @@ impl Default for StoryNativeHost {
 }
 
 impl StoryNativeHost {
+    pub(crate) fn ensure_origin(&mut self, origin: Option<&str>) {
+        if self.context.origin.is_none() {
+            self.context.origin = origin.map(str::to_owned);
+        }
+    }
     pub(super) fn set_symbols(&mut self, symbols: hiraku_script::symbol::SymbolManifest) {
         self.context.symbols = symbols;
     }
@@ -962,7 +991,14 @@ impl StoryNativeHost {
             next_camera_handle: self.context.next_camera_handle,
             pending_cameras: self.context.pending_cameras.clone(),
             scene_visuals: self.context.scene_visuals.clone(),
+            clock: self.context.clock.clone(),
         }
+    }
+
+    pub(crate) fn has_native_receiver(&self, builtin: BuiltinId) -> bool {
+        self.registry
+            .signature(builtin)
+            .is_some_and(|signature| signature.receiver.is_some())
     }
 
     pub fn reset_presentation(&mut self) {
@@ -979,6 +1015,7 @@ impl StoryNativeHost {
         let controls = StoryControlBuiltins::new(&registry.manifest());
         Self {
             context: CharacterContext {
+                origin: None,
                 symbols: Default::default(),
                 await_effects: snapshot.await_effects,
                 next_handle: snapshot.next_handle,
@@ -993,6 +1030,7 @@ impl StoryNativeHost {
                 next_camera_handle: snapshot.next_camera_handle,
                 pending_cameras: snapshot.pending_cameras,
                 scene_visuals: snapshot.scene_visuals,
+                clock: snapshot.clock,
             },
             registry,
             controls,
@@ -1006,6 +1044,8 @@ fn is_callable(value: &Value) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoryNativeHostSnapshot {
+    #[serde(default)]
+    clock: clock::ClockState,
     await_effects: bool,
     scene_visuals: scene_visuals::SceneVisualState,
     next_handle: u64,
@@ -1053,6 +1093,8 @@ struct PendingCamera {
 
 #[derive(Default)]
 struct CharacterContext {
+    origin: Option<String>,
+    clock: clock::ClockState,
     symbols: hiraku_script::symbol::SymbolManifest,
     await_effects: bool,
     scene_visuals: scene_visuals::SceneVisualState,
@@ -2292,6 +2334,21 @@ mod native_api {
         Ok(())
     }
 
+    #[hks(name = "intrinsics.engine.presentDialogue")]
+    fn native_present_dialogue(
+        context: &mut CharacterContext,
+        speaker: String,
+        text: TextTemplate,
+    ) -> Result<(), NativeError> {
+        let text = text.into_string();
+        context.last_speaker = Some(speaker.clone());
+        context.dialogue_buffer = Some(text.clone());
+        context
+            .commands
+            .push(StoryEffect::PresentDialogue { speaker, text });
+        Ok(())
+    }
+
     #[hks(name = "intrinsics.engine.continueDialogue")]
     fn native_continue_dialogue(
         context: &mut CharacterContext,
@@ -2429,6 +2486,15 @@ mod native_api {
 mod story_api {
     use super::*;
 
+    #[hks(name = "setFastForward")]
+    fn native_fast_forward(
+        context: &mut CharacterContext,
+        enabled: bool,
+    ) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::FastForward(enabled));
+        Ok(())
+    }
+
     #[hks(name = "inputEnabled")]
     fn native_input_enabled(
         context: &mut CharacterContext,
@@ -2502,6 +2568,28 @@ pub enum CharacterCapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn story_fast_forward_uses_the_shared_playback_command() {
+        let code = compile_story_bytecode("alice.hks", "story.setFastForward(false)")
+            .expect("typed playback control");
+        let mut runtime = ExecutionRuntime::new(code).expect("runtime");
+        let mut host = StoryNativeHost::new();
+        let Some(ExecutionEvent::Call { call, .. }) = runtime.step().expect("step") else {
+            panic!("playback control call");
+        };
+        host.call(&call).expect("native playback control");
+        let effects = host.drain_effects();
+        assert_eq!(effects, vec![StoryEffect::FastForward(false)]);
+        assert!(matches!(
+            crate::script::script_command_from_effect(effects[0].clone(), None)
+                .expect("shared playback dispatch"),
+            crate::script::ScriptCommand::Settings(crate::script::SettingsCommand::FastForward(
+                false
+            ))
+        ));
+        assert!(compile_story_bytecode("bob.hks", "story.setFastForward(1)").is_err());
+    }
 
     #[test]
     fn cinematic_input_and_printer_effects_are_typed_and_ordered() {

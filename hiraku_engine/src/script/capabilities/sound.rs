@@ -92,6 +92,7 @@ impl SoundState {
             } = sound;
             effects.push(match channel {
                 Channel::Music => StoryEffect::PlayBgm {
+                    channel: channel_name,
                     path,
                     volume,
                     fade_in_ms,
@@ -123,6 +124,18 @@ pub(super) fn register(registry: &mut NativeRegistry<CharacterContext>) {
 #[hiraku_script::hks_module("audio")]
 mod channel_api {
     use super::*;
+    #[hks(name = "pauseVoice")]
+    fn pause_voice(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::VoicePaused(true));
+        Ok(())
+    }
+
+    #[hks(name = "resumeVoice")]
+    fn resume_voice(context: &mut CharacterContext) -> Result<(), NativeError> {
+        context.commands.push(StoryEffect::VoicePaused(false));
+        Ok(())
+    }
+
     #[hks(name = "volume")]
     fn volume(
         context: &mut CharacterContext,
@@ -172,6 +185,37 @@ mod tests {
     use super::*;
     use crate::script::capabilities::{StoryWait, compile_story_bytecode};
     use crate::script::{StoryRuntime, StoryRuntimeEvent};
+
+    #[test]
+    fn voice_pause_and_resume_are_ordered_typed_effects() {
+        let code = compile_story_bytecode("alice.hks", "audio.pauseVoice()\naudio.resumeVoice()")
+            .expect("voice controls compile");
+        let mut runtime = StoryRuntime::new(code).expect("story runtime");
+        for expected in [true, false] {
+            assert!(matches!(runtime.step().expect("voice control"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::VoicePaused(paused))) if paused == expected));
+        }
+    }
+
+    #[test]
+    fn named_music_remains_music_through_runtime_restore() {
+        let code = compile_story_bytecode("audio.hks",
+            "bgm(\"music/alice\").channel(\"alice\")\nbgm(\"music/bob\").channel(\"bob\")\naudio.stop(\"alice\", 1000)\n\"Bob\"")
+            .expect("named music compiles");
+        let mut runtime = StoryRuntime::new(code.clone()).expect("runtime");
+        let snapshot = runtime.snapshot().expect("snapshot");
+        let mut restored = StoryRuntime::restore(code, snapshot).expect("restore");
+        for runtime in [&mut runtime, &mut restored] {
+            for name in ["alice", "bob"] {
+                assert!(matches!(runtime.step().expect("music effect"),
+                    Some(StoryRuntimeEvent::Effect(StoryEffect::PlayBgm { channel: Some(channel), .. }))
+                    if channel == name));
+            }
+            assert!(matches!(runtime.step().expect("stop"),
+                Some(StoryRuntimeEvent::Effect(StoryEffect::StopSfxChannel { channel, fade_ms: 1000 }))
+                if channel == "alice"));
+        }
+    }
 
     #[test]
     fn story_can_stop_an_active_voice() {
@@ -233,6 +277,7 @@ mod tests {
             effects,
             vec![
                 StoryEffect::PlayBgm {
+                    channel: None,
                     path: "music/theme".into(),
                     volume: 1.0,
                     fade_in_ms: None,
@@ -425,8 +470,10 @@ mod api {
             return Err(NativeError::message("audio channel must not be empty"));
         }
         let sound = context.sound.pending(id)?;
-        if sound.channel != Channel::Sfx {
-            return Err(NativeError::message("channel is supported on sfx playback"));
+        if sound.channel == Channel::Voice {
+            return Err(NativeError::message(
+                "named channels require bgm or sfx playback",
+            ));
         }
         sound.channel_name = Some(name);
         Ok(AudioHandle(id))

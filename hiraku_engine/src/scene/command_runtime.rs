@@ -103,6 +103,8 @@ pub struct SceneCommandContext<'w, 's> {
     pub dependencies: ResMut<'w, crate::dependencies::ScriptDependencies>,
     pub commands: Commands<'w, 's>,
     pub app_exit: MessageWriter<'w, AppExit>,
+    pub exit_policy: Res<'w, crate::runtime_control::RuntimeExitPolicy>,
+    pub exit_requests: MessageWriter<'w, crate::runtime_control::RuntimeExitRequested>,
     pub asset_server: Res<'w, AssetServer>,
     pub render_assets: RenderAssetCommandContext<'w>,
     pub vfs: Res<'w, VfsResource>,
@@ -127,6 +129,8 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
     let mut render_assets = ctx.render_assets;
     let mut commands = ctx.commands;
     let mut app_exit = ctx.app_exit;
+    let exit_policy = ctx.exit_policy;
+    let mut exit_requests = ctx.exit_requests;
     let asset_server = ctx.asset_server;
     let images = render_assets.images;
     let vfs = ctx.vfs;
@@ -567,11 +571,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                         {
                             continue;
                         }
-                        dialogue_state.fast_forward_enabled = *enabled;
-                        dialogue_state.fast_forward_elapsed = 0.0;
-                        if *enabled {
-                            dialogue_state.auto_enabled = false;
-                        }
+                        dialogue_state.set_fast_forward(*enabled);
                         continue;
                     }
                     _ => {}
@@ -642,6 +642,12 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 }
             }
             ScriptCommand::Character(CharacterCommand::Hide { actor_id, fade_ms }) => {
+                for (id, tint) in &mut shared_state.0.actor_tints {
+                    if actor_id.as_ref().is_none_or(|actor| actor == id) {
+                        tint.advance(tint.animation.duration());
+                        complete_missing_animation(&mut animations, tint.animation_id.take());
+                    }
+                }
                 for (id, blur) in &mut shared_state.0.actor_blurs {
                     if actor_id.as_ref().is_none_or(|actor| actor == id) {
                         blur.advance(blur.animation.duration());
@@ -661,6 +667,28 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     actor_id.as_deref(),
                     fade_ms,
                 );
+            }
+            ScriptCommand::Character(CharacterCommand::Tint {
+                actor_id,
+                color,
+                animation,
+                animation_id,
+            }) => {
+                let previous = shared_state.0.actor_tints.remove(&actor_id);
+                if let Some(previous) = &previous {
+                    complete_missing_animation(&mut animations, previous.animation_id.clone());
+                }
+                let mut tint = crate::script::actor_tint::ActorTint::new(
+                    previous.map_or([1.0; 4], |tint| tint.color),
+                    color,
+                    animation,
+                    animation_id,
+                );
+                if animation.duration() <= 0.0 {
+                    tint.advance(0.0);
+                    complete_missing_animation(&mut animations, tint.animation_id.take());
+                }
+                shared_state.0.actor_tints.insert(actor_id, tint);
             }
             ScriptCommand::Character(CharacterCommand::Blur {
                 actor_id,
@@ -777,10 +805,15 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
             ScriptCommand::Stage(StageCommand::AwaitCurtain { done }) => {
                 commands.spawn(super::curtain::CurtainWait(done));
             }
-            ScriptCommand::Animation(AnimationCommand::Delay { duration, done }) => {
+            ScriptCommand::Animation(AnimationCommand::Delay {
+                duration,
+                done,
+                interruptible,
+            }) => {
                 waits.items.push(super::animation_runtime::PendingWait {
                     timer: Timer::new(duration, TimerMode::Once),
                     animation_id: None,
+                    interruptible,
                     done,
                 });
             }
@@ -811,7 +844,11 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                 dispatch_video_command(command, &asset_server, &mut video_player, &mut movie_waits)
             }
             ScriptCommand::Runtime(RuntimeCommand::Exit) => {
-                app_exit.write(AppExit::Success);
+                crate::runtime_control::request_exit(
+                    &exit_policy,
+                    &mut exit_requests,
+                    &mut app_exit,
+                );
             }
             ScriptCommand::Runtime(RuntimeCommand::Navigate {
                 request: navigation,
@@ -903,11 +940,7 @@ pub fn process_script_commands(mut redraw: crate::redraw::Redraw, ctx: SceneComm
                     waits.items.clear();
                     animations.waits.clear();
                     pending_script_commands.clear();
-                    script_runtime.pending_ui_screen = None;
-                    script_runtime.pending_ui_arguments.clear();
-                    script_runtime.wait_request = None;
-                    script_runtime.response_inbox.clear();
-                    script_runtime.task_requests.clear();
+                    script_runtime.cancel_pending_requests();
                 }
 
                 if navigation.reset != NavigationReset::None {

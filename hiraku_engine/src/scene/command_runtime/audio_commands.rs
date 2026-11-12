@@ -3,6 +3,18 @@ use super::*;
 use std::time::Duration;
 
 pub(in crate::scene) fn stop_sfx_channel(world: &mut World, channel: &str, duration: Duration) {
+    let music = world
+        .resource_mut::<StageState>()
+        .music_channels
+        .remove(channel);
+    world
+        .resource_mut::<SceneSharedState>()
+        .0
+        .music_channels
+        .remove(channel);
+    if music.is_some() {
+        stop_music(world, music, duration, None);
+    }
     let entities: Vec<_> = world
         .query::<(Entity, &NamedSfxChannel)>()
         .iter(world)
@@ -41,11 +53,14 @@ pub(in crate::scene) fn stop_sfx_channel(world: &mut World, channel: &str, durat
 }
 
 fn set_sfx_channel_volume(world: &mut World, channel: &str, volume: f32, duration: Duration) {
-    let entities: Vec<_> = world
+    let mut entities: Vec<_> = world
         .query::<(Entity, &NamedSfxChannel)>()
         .iter(world)
         .filter_map(|(entity, name)| (name.0 == channel).then_some(entity))
         .collect();
+    if let Some(entity) = world.resource::<StageState>().music_channels.get(channel) {
+        entities.push(*entity);
+    }
     for entity in entities {
         let from = world
             .get::<AudioFade>(entity)
@@ -53,9 +68,22 @@ fn set_sfx_channel_volume(world: &mut World, channel: &str, volume: f32, duratio
             .unwrap_or_else(|| {
                 world
                     .get::<SfxChannel>(entity)
-                    .map_or(1.0, |sound| sound.volume)
+                    .map(|sound| sound.volume)
+                    .or_else(|| world.get::<BgmChannel>(entity).map(|sound| sound.volume))
+                    .unwrap_or(1.0)
             });
         if let Some(mut sound) = world.get_mut::<SfxChannel>(entity) {
+            sound.volume = volume;
+        }
+        if let Some(mut sound) = world.get_mut::<BgmChannel>(entity) {
+            sound.volume = volume;
+        }
+        if let Some(sound) = world
+            .resource_mut::<SceneSharedState>()
+            .0
+            .music_channels
+            .get_mut(channel)
+        {
             sound.volume = volume;
         }
         if let Some(id) = world
@@ -70,6 +98,61 @@ fn set_sfx_channel_volume(world: &mut World, channel: &str, volume: f32, duratio
             timer: Timer::new(duration, TimerMode::Once),
             animation_id: None,
         });
+    }
+}
+
+fn retarget_music(
+    world: &mut World,
+    entity: Entity,
+    volume: f32,
+    duration: Option<Duration>,
+    done: Option<String>,
+) {
+    let Some(sound) = world.get::<BgmChannel>(entity) else {
+        if let Some(id) = done {
+            world.resource_mut::<AnimationState>().completed.insert(id);
+        }
+        return;
+    };
+    let from = world
+        .get::<AudioFade>(entity)
+        .map(|fade| fade.from + (fade.to - fade.from) * tween_fraction(&fade.timer))
+        .unwrap_or(sound.volume);
+    if let Some(id) = world
+        .get::<AudioFade>(entity)
+        .and_then(|fade| fade.animation_id.clone())
+    {
+        world.resource_mut::<AnimationState>().completed.insert(id);
+    }
+    world
+        .get_mut::<BgmChannel>(entity)
+        .expect("existing music")
+        .volume = volume;
+    let settings = world.resource::<UserSettings>();
+    let gain = settings.bgm_volume * settings.master_volume;
+    let fading = duration.is_some_and(|duration| !duration.is_zero());
+    let playback = apply_volume_setting(if fading { from } else { volume }, gain);
+    if let Some(mut sink) = world.get_mut::<AudioSink>(entity) {
+        sink.set_volume(Volume::Linear(playback));
+    }
+    if let Some(mut settings) = world.get_mut::<PlaybackSettings>(entity) {
+        settings.volume = Volume::Linear(playback);
+    }
+    if let Some(mut prelude) = world.get_mut::<BgmPrelude>(entity) {
+        prelude.start_volume = playback;
+    }
+    if fading {
+        world.entity_mut(entity).insert(AudioFade {
+            from,
+            to: volume,
+            timer: Timer::new(duration.expect("nonzero fade"), TimerMode::Once),
+            animation_id: done,
+        });
+    } else {
+        world.entity_mut(entity).remove::<AudioFade>();
+        if let Some(id) = done {
+            world.resource_mut::<AnimationState>().completed.insert(id);
+        }
     }
 }
 
@@ -128,10 +211,157 @@ fn stop_music(world: &mut World, entity: Option<Entity>, duration: Duration, don
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn music_gain_change_preserves_pending_playback_and_settles_fade_waiters() {
+        let mut world = World::new();
+        world.init_resource::<AnimationState>();
+        world.init_resource::<UserSettings>();
+        let audio = Handle::<AudioSource>::default();
+        let entity = world
+            .spawn((
+                BgmChannel {
+                    path: "music/alice".into(),
+                    volume: 0.8,
+                    looped: true,
+                },
+                bevy::audio::AudioPlayer(audio.clone()),
+                PlaybackSettings::LOOP,
+                AudioFade {
+                    from: 0.0,
+                    to: 0.8,
+                    timer: Timer::from_seconds(2.0, TimerMode::Once),
+                    animation_id: Some("previous".into()),
+                },
+            ))
+            .id();
+        retarget_music(
+            &mut world,
+            entity,
+            0.4,
+            Some(Duration::from_secs(1)),
+            Some("next".into()),
+        );
+        assert_eq!(
+            world
+                .get::<bevy::audio::AudioPlayer<AudioSource>>(entity)
+                .expect("same player")
+                .0,
+            audio
+        );
+        assert_eq!(world.get::<BgmChannel>(entity).expect("music").volume, 0.4);
+        assert_eq!(world.get::<AudioFade>(entity).expect("new fade").from, 0.0);
+        assert!(
+            world
+                .resource::<AnimationState>()
+                .completed
+                .contains("previous")
+        );
+        assert!(
+            !world
+                .resource::<AnimationState>()
+                .completed
+                .contains("next")
+        );
+        retarget_music(
+            &mut world,
+            entity,
+            0.2,
+            Some(Duration::ZERO),
+            Some("immediate".into()),
+        );
+        assert!(world.get::<AudioFade>(entity).is_none());
+        assert!(
+            world
+                .resource::<AnimationState>()
+                .completed
+                .contains("next")
+        );
+        assert!(
+            world
+                .resource::<AnimationState>()
+                .completed
+                .contains("immediate")
+        );
+        assert_eq!(
+            world
+                .get::<PlaybackSettings>(entity)
+                .expect("pending settings")
+                .volume,
+            Volume::Linear(0.2)
+        );
+        assert_eq!(
+            world
+                .get::<bevy::audio::AudioPlayer<AudioSource>>(entity)
+                .expect("same player")
+                .0,
+            audio
+        );
+    }
+
+    #[test]
+    fn named_music_gain_and_stop_do_not_affect_other_tracks() {
+        let mut world = World::new();
+        world.init_resource::<AnimationState>();
+        world.init_resource::<StageState>();
+        world.init_resource::<SceneSharedState>();
+        for name in ["alice", "bob"] {
+            let entity = world
+                .spawn(BgmChannel {
+                    path: format!("music/{name}"),
+                    volume: 0.8,
+                    looped: true,
+                })
+                .id();
+            world
+                .resource_mut::<StageState>()
+                .music_channels
+                .insert(name.into(), entity);
+            world
+                .resource_mut::<SceneSharedState>()
+                .0
+                .music_channels
+                .insert(
+                    name.into(),
+                    AudioSnapshot {
+                        path: format!("music/{name}"),
+                        volume: 0.8,
+                        looped: true,
+                    },
+                );
+        }
+        let alice = world.resource::<StageState>().music_channels["alice"];
+        let bob = world.resource::<StageState>().music_channels["bob"];
+        set_sfx_channel_volume(&mut world, "alice", 0.3, Duration::from_secs(2));
+        assert_eq!(world.get::<BgmChannel>(alice).expect("music").volume, 0.3);
+        assert!(world.get::<SfxChannel>(alice).is_none());
+        assert_eq!(world.get::<AudioFade>(alice).expect("fade").from, 0.8);
+        assert_eq!(
+            world.get::<BgmChannel>(bob).expect("other music").volume,
+            0.8
+        );
+        let encoded = crate::proto::SceneSnapshot::from(&world.resource::<SceneSharedState>().0);
+        let decoded = crate::state::SceneSnapshot::try_from(encoded).expect("music snapshot");
+        assert_eq!(decoded.music_channels["alice"].volume, 0.3);
+        assert_eq!(decoded.music_channels["bob"].path, "music/bob");
+        stop_sfx_channel(&mut world, "alice", Duration::ZERO);
+        assert!(world.get_entity(alice).is_err());
+        assert!(world.get_entity(bob).is_ok());
+        assert!(
+            !world
+                .resource::<SceneSharedState>()
+                .0
+                .music_channels
+                .contains_key("alice")
+        );
+        assert_eq!(world.resource::<StageState>().music_channels["bob"], bob);
+    }
     #[test]
     fn channel_gain_retargets_current_fade_without_replacing_playback() {
         let mut world = World::new();
         world.init_resource::<AnimationState>();
+        world.init_resource::<StageState>();
+        world.init_resource::<SceneSharedState>();
         let mut timer = Timer::from_seconds(2.0, TimerMode::Once);
         timer.tick(Duration::from_secs(1));
         let entity = world
@@ -209,6 +439,8 @@ mod tests {
     fn stopping_pending_sound_settles_only_its_named_channel() {
         let mut world = World::new();
         world.init_resource::<AnimationState>();
+        world.init_resource::<StageState>();
+        world.init_resource::<SceneSharedState>();
         let alice = world
             .spawn((
                 NamedSfxChannel("alice".into()),
@@ -336,6 +568,7 @@ pub(super) fn dispatch_audio_command(
             }
         }
         AudioCommand::PlayBgm {
+            channel,
             path,
             prelude,
             volume,
@@ -343,11 +576,38 @@ pub(super) fn dispatch_audio_command(
             fade_in,
             animation_id,
         } => {
+            let current = match channel.as_ref() {
+                Some(name) => shared_state
+                    .0
+                    .music_channels
+                    .get(name)
+                    .zip(stage.music_channels.get(name).copied()),
+                None => shared_state.0.bgm.as_ref().zip(stage.bgm),
+            };
+            if let Some((snapshot, entity)) =
+                current.filter(|(snapshot, _)| snapshot.path == path && snapshot.looped == looped)
+            {
+                let mut snapshot = snapshot.clone();
+                snapshot.volume = volume;
+                if let Some(name) = channel {
+                    shared_state.0.music_channels.insert(name, snapshot);
+                } else {
+                    shared_state.0.bgm = Some(snapshot);
+                }
+                commands.queue(move |world: &mut World| {
+                    retarget_music(world, entity, volume, fade_in, animation_id)
+                });
+                return;
+            }
             let playback_volume = apply_volume_setting(
                 volume,
                 user_settings.bgm_volume * user_settings.master_volume,
             );
-            if let Some(previous) = stage.bgm.take() {
+            let previous = match channel.as_ref() {
+                Some(name) => stage.music_channels.remove(name),
+                None => stage.bgm.take(),
+            };
+            if let Some(previous) = previous {
                 retire_bgm(commands, previous);
             }
             let start_volume = if fade_in.is_some() {
@@ -400,12 +660,18 @@ pub(super) fn dispatch_audio_command(
             } else if let Some(animation_id) = animation_id {
                 animations.completed.insert(animation_id);
             }
-            stage.bgm = Some(bgm);
-            shared_state.0.bgm = Some(AudioSnapshot {
+            let snapshot = AudioSnapshot {
                 path,
                 volume,
                 looped,
-            });
+            };
+            if let Some(channel) = channel {
+                stage.music_channels.insert(channel.clone(), bgm);
+                shared_state.0.music_channels.insert(channel, snapshot);
+            } else {
+                stage.bgm = Some(bgm);
+                shared_state.0.bgm = Some(snapshot);
+            }
         }
         AudioCommand::StopBgm { fade, animation_id } => {
             let previous = stage.bgm.take();
@@ -415,6 +681,9 @@ pub(super) fn dispatch_audio_command(
         }
         AudioCommand::StopVoice => {
             finish_all_voices(commands, animations, voice_state);
+        }
+        AudioCommand::VoicePaused(paused) => {
+            shared_state.0.voice_paused = paused;
         }
         AudioCommand::PlayVoice {
             path,
@@ -436,13 +705,21 @@ pub(super) fn dispatch_audio_command(
                         volume,
                     },
                     bevy::audio::AudioPlayer::<AudioSource>(asset_server.load(path)),
-                    PlaybackSettings::ONCE.with_volume(Volume::Linear(playback_volume)),
+                    PlaybackSettings {
+                        paused: shared_state.0.voice_paused,
+                        ..PlaybackSettings::ONCE.with_volume(Volume::Linear(playback_volume))
+                    },
                 ))
                 .id();
             let active = ActiveVoice {
                 entity: voice,
                 animation_id,
             };
+            if shared_state.0.voice_paused {
+                commands
+                    .entity(voice)
+                    .insert(super::super::clock::ManagedVoicePause);
+            }
             match mode {
                 VoicePlaybackMode::Exclusive => voice_state.active = Some(active),
                 VoicePlaybackMode::Concurrent => {

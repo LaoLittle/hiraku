@@ -86,7 +86,11 @@ pub fn complete(
                                         animation.id == *playback && !animation.completed
                                     }))
                         }
-                        StageCommand::Clip { id, .. } => state.id == *id && !spatial.ready(state),
+                        StageCommand::Clip { id, .. }
+                        | StageCommand::LightColor { id, .. }
+                        | StageCommand::Effect { id, .. } => {
+                            state.id == *id && !spatial.ready(state)
+                        }
                         StageCommand::Open { id, .. } | StageCommand::Place { id, .. } => {
                             state.id == *id && !spatial.ready(state)
                         }
@@ -97,6 +101,15 @@ pub fn complete(
                                         v.request.as_ref().is_some_and(|r| &r.0 == name)
                                             || (v.camera_name.as_ref() == Some(name)
                                                 && v.tween.is_some())
+                                    }))
+                        }
+                        StageCommand::Shake {
+                            id, view, motion, ..
+                        } => {
+                            state.id == *id
+                                && (!spatial.ready(state)
+                                    || state.views.get(view).is_some_and(|v| {
+                                        v.shake.as_ref().is_some_and(|s| s.motion == *motion)
                                     }))
                         }
                         StageCommand::View { id, view, .. } => {

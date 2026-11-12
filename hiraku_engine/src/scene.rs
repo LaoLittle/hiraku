@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 pub mod clock;
 pub(crate) mod text_visibility;
 pub(crate) mod ui_keyframes;
+pub(crate) mod ui_tracks;
 pub(crate) mod ui_visuals;
 
 use crate::audio::EngineAudioSource as AudioSource;
@@ -279,6 +280,8 @@ pub struct StageState {
     pub pending_character_restore: Vec<SpriteSnapshot>,
     pub pending_bgm_restore: Option<AudioSnapshot>,
     pub bgm: Option<Entity>,
+    pub music_channels: BTreeMap<String, Entity>,
+    pub pending_music_restore: BTreeMap<String, AudioSnapshot>,
 }
 
 #[derive(Resource, Default)]

@@ -441,6 +441,22 @@ pub fn recompose_screen_ui(
         commands
             .entity(root)
             .insert(crate::render::ui_quad::UiImageAssets(handles.clone()));
+        if let Some(callback) = &screen.on_advance {
+            commands
+                .entity(root)
+                .try_insert(super::ui_timers::UiAdvance(callback.clone()));
+        } else {
+            commands
+                .entity(root)
+                .remove::<super::ui_timers::UiAdvance>();
+        }
+        if let Some(callback) = &screen.on_back {
+            commands
+                .entity(root)
+                .try_insert(super::ui_timers::UiBack(callback.clone()));
+        } else {
+            commands.entity(root).remove::<super::ui_timers::UiBack>();
+        }
         if let Some(callback) = &screen.on_update {
             commands.entity(root).insert((
                 super::ui_timers::UiUpdate(callback.clone()),
@@ -533,6 +549,16 @@ pub(super) fn spawn_screen_ui(
         .id();
 
     let mut image_handles = Vec::new();
+    if let Some(callback) = &screen.on_advance {
+        commands
+            .entity(root)
+            .try_insert(super::ui_timers::UiAdvance(callback.clone()));
+    }
+    if let Some(callback) = &screen.on_back {
+        commands
+            .entity(root)
+            .try_insert(super::ui_timers::UiBack(callback.clone()));
+    }
     if let Some(callback) = &screen.on_update {
         commands
             .entity(root)
@@ -1232,6 +1258,9 @@ fn spawn_screen_node_in_container(
                 .spawn((ScreenUiNode, Pickable::IGNORE, image, node))
                 .id();
             apply_live_layout_bindings(commands, entity, layout);
+            if let Some(track) = &layout.track {
+                super::ui_tracks::mount(commands, asset_server, root, entity, track);
+            }
             if let Some(shader) = &layout.shader {
                 let handle: Handle<Shader> = asset_server.load(shader.path.clone());
                 let dependency = handle.clone();
@@ -1259,6 +1288,7 @@ fn spawn_screen_node_in_container(
                         textures,
                         keys: shader.keys.clone(),
                         blend: shader.blend,
+                        alpha_blend: shader.alpha_blend,
                     });
             }
             entity
