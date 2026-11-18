@@ -31,6 +31,26 @@ time.workspace = true
 blake3 = "1"
 rand_pcg.workspace = true
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+mach2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Worker", "DedicatedWorkerGlobalScope", "MessageEvent", "ErrorEvent"] }
+serde-wasm-bindgen = "0.6"
+serde_bytes = "0.11"
+futures-channel = "0.3"
+gloo-timers = "0.3"
+wgpu-types = { version = "30", features = ["serde"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.22"
 

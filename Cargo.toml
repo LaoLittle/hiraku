@@ -18,7 +18,8 @@ members = [
     "hiraku_uastc",
     "hiraku_uastc/build", 
     "hiraku_tools",
-    "hiraku_text"
+    "hiraku_text",
+    "hiraku_worker"
 ]
 
 [workspace.package]
